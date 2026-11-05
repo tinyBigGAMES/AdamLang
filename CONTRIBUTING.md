@@ -46,7 +46,7 @@ Adam is written in Adam. For source-code contributions, follow the existing proj
 - Put each local variable declaration and each imported unit on its own line.
 - Prefer `const` parameters where appropriate.
 - Avoid Adam keywords as identifiers.
-- Name units `Adam.<Area>.<Concern>`, types `T<Name>`, constants `ADAM_<NAME>`.
+- Name units `Adam.<Area>.<Concern>`, types by what they are with no prefix (`Lexer`), constants `ADAM_<NAME>`.
 - Keep source readable, deterministic, and straightforward to maintain.
 
 ## Licensing contributions
