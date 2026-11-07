@@ -23,6 +23,17 @@
                 error) lowers it, picks its backend and generates its exe
                 into the output folder; PrintReports and ExitCode close the
                 compile out
+  BuildPhase    the phases a compile tells its listener about, in their
+                order: Parse, Analyze (Check's), Lower, Generate, Link
+                (Build's)
+  PhaseListener told by the Compiler as each phase ends while no error is
+                reported (SetListener; none by default), with that
+                phase's counts read from what the phase made: Parse the
+                AST's modules and the loaded files' lines, Analyze none,
+                Lower the SSA's functions, Generate the code sections'
+                bytes, Link the exe written and the libraries it imports.
+                After the first error it hears nothing more. The Compiler
+                still prints nothing: the listener (the CLI's) does
 
   Build's output folder (BNF sec 2, @outputpath): the one the command line
   gives, else the main module's @outputpath (resolved at its directive),
@@ -54,8 +65,8 @@ import System.SysUtils, System.Windows, Adam.Core.Common, Adam.Core.Messages, Ad
   Adam.Target.Registry,
   Adam.Compiler.SourceText, Adam.Compiler.Diagnostics, Adam.Compiler.SourceFiles,
   Adam.Compiler.AST, Adam.Compiler.Parser, Adam.Compiler.Semantics, Adam.Compiler.Layout,
-  Adam.Compiler.Symbols, Adam.Backend.Ssa, Adam.Backend.Lowering, Adam.Backend.Targets,
-  Adam.Backend.Generate;
+  Adam.Compiler.Symbols, Adam.Backend.Ssa, Adam.Backend.Lowering, Adam.Backend.Sections,
+  Adam.Backend.Targets, Adam.Backend.Generate;
 
 exported const
   ADAM_ERR_DRIVER_001: string = "DR0001";
@@ -154,6 +165,21 @@ begin
 end;
 
 exported type
+  // The phases a compile reports as each ends, in their order (see the header)
+  BuildPhase = choices(Parse, Analyze, Lower, Generate, Link);
+
+  // Told as each phase ends with no error reported (see the header); this one hears
+  // nothing: a caller that shows the phases overrides PhaseEnded
+  PhaseListener = object
+    // APhase ended. Parse: AFirst modules, ASecond lines. Analyze: nothing. Lower: AFirst
+    // functions. Generate: AFirst code bytes. Link: AText the exe's path, AFirst the
+    // libraries it imports. A count a phase has not is 0, a text ""
+    virtual method PhaseEnded(const APhase: BuildPhase; const AFirst: int64;
+      const ASecond: int64; const AText: string);
+    begin
+    end;
+  end;
+
   // One compile (see the header)
   Compiler = object
     hidden FReports: ref Diagnostics;
@@ -164,6 +190,45 @@ exported type
     hidden FChecked: bool;
     hidden FOverrideTarget: string;
     hidden FExePath: string;
+    hidden FListener: ref PhaseListener;
+
+    // Tells the listener (when there is one) APhase ended, while no error is reported
+    hidden method DoPhaseEnded(const APhase: BuildPhase; const AFirst: int64;
+      const ASecond: int64; const AText: string);
+    begin
+      if (self.FListener = nil) or self.FReports.HasErrors() then
+        return;
+      end;
+      self.FListener.PhaseEnded(APhase, AFirst, ASecond, AText);
+    end;
+
+    // The lines of every file the build loaded
+    hidden const method DoLineCount(): int64;
+    var
+      LLines: int64;
+      LI: int64;
+    begin
+      LLines := 0;
+      for LI := 0 to self.FSources.Count - 1 do
+        LLines := LLines + int64(self.FSources[LI].LineCount);
+      end;
+      return LLines;
+    end;
+
+    // The bytes of every code section in ASet
+    hidden const method DoCodeBytes(const ASet: ref SectionSet): int64;
+    var
+      LBytes: int64;
+      LId: int64;
+    begin
+      LBytes := 0;
+      for LId := 1 to ASet.SectionCount - 1 do
+        if ASet.SectionAt(LId).Kind = SectionKind.Code then
+          LBytes := LBytes + ASet.SectionAt(LId).Size();
+        end;
+      end;
+      return LBytes;
+    end;
 
     // Adds the folder APath ($P: adam.exe's folder) as the next module path. When the
     // folder of adam.exe cannot be told, ACode warns with ATemplate and imports are looked
@@ -199,7 +264,14 @@ exported type
       self.FChecked := false;
       self.FOverrideTarget := "";
       self.FExePath := "";
+      self.FListener := nil;
       self.DoAddStdPath();
+    end;
+
+    // AListener is told as each phase ends (see the header); nil for none. Before Check
+    method SetListener(const AListener: ref PhaseListener);
+    begin
+      self.FListener := AListener;
     end;
 
     // The triple ATriple (a target the registry has, three-part) as the build's target,
@@ -262,11 +334,14 @@ exported type
       if self.FMain = 0 then
         return;
       end;
+      self.DoPhaseEnded(BuildPhase.Parse, self.FTree.CountOf(ADAM_AST_PROGRAM, NodeRole.Module),
+        self.DoLineCount(), "");
       self.FTarget := PickTarget(self.FTree, self.FMain, self.FReports);
       ResolveNames(self.FTree, self.FReports);
       CheckTypes(self.FTree, self.FTarget, self.FReports);
       CheckLayouts(self.FTree, self.FTarget, self.FReports);
       NameSymbols(self.FTree, self.FTarget, self.FReports);
+      self.DoPhaseEnded(BuildPhase.Analyze, 0, 0, "");
     end;
 
     // The resolved path of the first argument of every directive spelled ASpelling in the
@@ -331,6 +406,8 @@ exported type
       LModule: ref IrModule;
       LProblems: StringArray;
       LBackend: ref Backend;
+      LSet: ref SectionSet;
+      LLibraries: StringArray;
       LBytes: ByteArray;
       LDir: string;
       LExe: string;
@@ -354,11 +431,17 @@ exported type
       if len(LProblems) > 0 then
         raise(ADAM_DRIVER_FAULT_IR + JoinStrings(LProblems, "; "));
       end;
+      // Function ids start at 1: id 0 is none (Adam.Backend.Ssa)
+      self.DoPhaseEnded(BuildPhase.Lower, LModule.FunctionCount - 1, 0, "");
       LBackend := PickBackend(self.FTree.Triple, self.FTree[self.FMain].Place, self.FReports);
       if LBackend = nil then
         return;
       end;
-      LBytes := GenerateExe(LModule, LBackend, self.DoLibraryPaths(), self.FTree, self.FReports);
+      LSet := GenerateSections(LModule, LBackend);
+      self.DoPhaseEnded(BuildPhase.Generate, self.DoCodeBytes(LSet), 0, "");
+      setlength(LLibraries, 0);
+      LBytes := LinkSections(LModule, LSet, LBackend, self.DoLibraryPaths(), self.FTree,
+        self.FReports, LLibraries);
       if self.FReports.HasErrors() then
         return;
       end;
@@ -380,6 +463,7 @@ exported type
         return;
       end;
       self.FExePath := LExe;
+      self.DoPhaseEnded(BuildPhase.Link, len(LLibraries), 0, LExe);
     end;
 
     // Prints every report, one line each, in the order made
