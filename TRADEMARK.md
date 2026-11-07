@@ -3,7 +3,7 @@
 **Project:** Adam™ Programming Language  
 **Project steward:** tinyBigGAMES™ LLC  
 **Official website:** https://adamlang.org  
-**Official repository:** https://github.com/tinyBigGAMES/Adam
+**Official repository:** https://github.com/tinyBigGAMES/AdamLang
 
 ## Purpose
 

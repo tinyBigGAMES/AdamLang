@@ -3,7 +3,7 @@
 Copyright © 2026-present tinyBigGAMES™ LLC.
 
 Official website: https://adamlang.org  
-Official repository: https://github.com/tinyBigGAMES/Adam
+Official repository: https://github.com/tinyBigGAMES/AdamLang
 
 ## Original project
 

@@ -6,7 +6,7 @@ Adam is created and maintained by tinyBigGAMES™ LLC with help from its communi
 
 ## Before you begin
 
-- Read the repository [README](https://github.com/tinyBigGAMES/Adam?tab=readme-ov-file) and [LICENSE](LICENSE).
+- Read the repository [README](https://github.com/tinyBigGAMES/AdamLang?tab=readme-ov-file) and [LICENSE](LICENSE).
 - Search existing GitHub issues and pull requests before creating a duplicate.
 - For substantial language changes, compiler architecture changes, or major new features, open an issue to discuss the proposal before investing significant effort.
 - Keep changes focused and explain the reason for them.
