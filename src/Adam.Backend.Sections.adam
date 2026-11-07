@@ -1,0 +1,686 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Backend.Sections.adam - where the three target parts meet (DESIGN sec 12)
+
+  The arch part encodes into sections, the ABI part's unwind data goes into
+  sections, the format part writes and links them. Nothing here knows a
+  target: a section is a name, a kind, an alignment and bytes; a symbol is
+  a name with a place; a relocation asks for a symbol's address in one of
+  three forms; an import is a routine a library exports.
+
+  SectionSet      the arenas: sections, symbols, imports, each by id (0 is
+                  none, ids never reused), names found through maps, every
+                  list in the order made (the order the format part writes:
+                  determinism follows from the AST's order alone)
+  Section         a name, a kind, an alignment, its bytes (a Zeroed section
+                  has only a size) and the relocations into those bytes
+  SectionSymbol   a name and where it is: Defined (a section and an
+                  offset), Undefined (another object or library defines it;
+                  the linker resolves it) or Import (an import's id); the AST
+                  node that needs it, for the linker's errors (DESIGN sec 11);
+                  a Defined one may be internal (a module's private routine:
+                  bound to its object alone)
+  SectionReloc    at Offset in its section, Width(Kind) bytes receive the
+                  symbol's address plus Addend:
+                    Rel32  S + Addend - (P + 4), P the field's own address
+                           (a call or a rip-relative operand)
+                    Rva32  S + Addend - the image base (unwind tables)
+                    Abs64  S + Addend (a pointer in data)
+  SectionImport   a library and the routine it exports
+
+  Every misuse (an id naming nothing, a symbol defined twice, a relocation
+  outside its section's bytes, bytes into a Zeroed section, an alignment
+  that is no power of two) is a compiler bug and raises at the call that
+  makes it, never later. Dump writes the set as text for rows.
+*******************************************************************************/
+
+module unit Adam.Backend.Sections;
+
+import System.SysUtils, Adam.Core.Containers;
+
+exported const
+  // Raised (an invariant broken) by an id that names nothing
+  ADAM_SECTIONS_FAULT_NO_SECTION: string = "Sections: no section ";
+  ADAM_SECTIONS_FAULT_NO_SYMBOL: string = "Sections: no symbol ";
+  ADAM_SECTIONS_FAULT_NO_IMPORT: string = "Sections: no import ";
+  ADAM_SECTIONS_FAULT_NO_BYTE: string = "Sections: no byte ";
+  ADAM_SECTIONS_FAULT_NO_RELOC: string = "Sections: no relocation ";
+  // Raised by the other misuses (see the header)
+  ADAM_SECTIONS_FAULT_SECTION_TWICE: string = "Sections: a second section named ";
+  ADAM_SECTIONS_FAULT_DEFINED_TWICE: string = "Sections: a second definition of ";
+  ADAM_SECTIONS_FAULT_ZEROED: string = "Sections: bytes into the zeroed section ";
+  ADAM_SECTIONS_FAULT_ALIGN: string = "Sections: an alignment that is no power of two: ";
+  ADAM_SECTIONS_FAULT_RELOC_PLACE: string = "Sections: a relocation outside the bytes of ";
+  ADAM_SECTIONS_FAULT_OFFSET: string = "Sections: an offset outside ";
+  ADAM_SECTIONS_FAULT_INTERNAL: string = "Sections: an internal symbol not defined: ";
+  // An arena's first storage, doubled each time it is full
+  ADAM_SECTIONS_FIRST_CAPACITY: int64 = 16;
+  // Dump's bytes per line, and its hex digits
+  ADAM_SECTIONS_DUMP_BYTES: int64 = 16;
+  ADAM_SECTIONS_HEX_DIGITS: string = "0123456789ABCDEF";
+
+exported type
+  // What a section holds: code, constants, writable data, or zeroed storage (no bytes)
+  SectionKind = choices(Code, ReadOnly, Data, Zeroed);
+
+  // Where a symbol is (see the header)
+  SymbolKind = choices(Defined, Undefined, Import);
+
+  // How a relocation writes its symbol's address (see the header)
+  RelocKind = choices(Rel32, Rva32, Abs64);
+
+// The name of AKind, as Dump prints it
+exported routine SectionKindText(const AKind: SectionKind): string;
+begin
+  match AKind of
+    SectionKind.Code: return "code";
+    SectionKind.ReadOnly: return "readonly";
+    SectionKind.Data: return "data";
+    SectionKind.Zeroed: return "zeroed";
+  end;
+  return "";
+end;
+
+// The name of AKind, as Dump prints it
+exported routine SymbolKindText(const AKind: SymbolKind): string;
+begin
+  match AKind of
+    SymbolKind.Defined: return "defined";
+    SymbolKind.Undefined: return "undefined";
+    SymbolKind.Import: return "import";
+  end;
+  return "";
+end;
+
+// The name of AKind, as Dump prints it
+exported routine RelocKindText(const AKind: RelocKind): string;
+begin
+  match AKind of
+    RelocKind.Rel32: return "rel32";
+    RelocKind.Rva32: return "rva32";
+    RelocKind.Abs64: return "abs64";
+  end;
+  return "";
+end;
+
+// How many bytes a relocation of AKind writes
+exported routine RelocWidth(const AKind: RelocKind): int64;
+begin
+  match AKind of
+    RelocKind.Rel32: return 4;
+    RelocKind.Rva32: return 4;
+    RelocKind.Abs64: return 8;
+  end;
+  return 0;
+end;
+
+// The hex digit of the low 4 bits of AValue
+routine DoHexDigit(const AValue: uint64): string;
+begin
+  return Substring(ADAM_SECTIONS_HEX_DIGITS, int64(AValue & uint64(15)), 1);
+end;
+
+// AValue as two upper-case hex digits
+routine DoHexByte(const AValue: uint8): string;
+begin
+  return DoHexDigit(uint64(AValue) shr uint64(4)) + DoHexDigit(uint64(AValue));
+end;
+
+// AValue as "0x1F" (no leading zeros; 0 is "0x0")
+exported routine HexText(const AValue: int64): string;
+var
+  LValue: uint64;
+  LText: string;
+begin
+  LValue := uint64(AValue);
+  if LValue = 0 then
+    return "0x0";
+  end;
+  LText := "";
+  while LValue <> 0 do
+    LText := DoHexDigit(LValue) + LText;
+    LValue := LValue shr uint64(4);
+  end;
+  return "0x" + LText;
+end;
+
+// The new length of an arena holding ACount ids in ALength places: ALength while there is
+// room for one more, else doubled (at least the first capacity)
+routine DoCapacity(const ACount: int64; const ALength: int64): int64;
+begin
+  if ACount < ALength then
+    return ALength;
+  end;
+  if ALength * 2 < ADAM_SECTIONS_FIRST_CAPACITY then
+    return ADAM_SECTIONS_FIRST_CAPACITY;
+  end;
+  return ALength * 2;
+end;
+
+exported type
+  // A fixup in a section's bytes (see the header)
+  SectionReloc = object
+    Offset: int64;
+    Kind: RelocKind;
+    Symbol: int64;
+    Addend: int64;
+
+    init(const AOffset: int64; const AKind: RelocKind; const ASymbol: int64; const AAddend: int64);
+    begin
+      self.Offset := AOffset;
+      self.Kind := AKind;
+      self.Symbol := ASymbol;
+      self.Addend := AAddend;
+    end;
+  end;
+
+  // A name, a kind, an alignment, bytes and the relocations into them (see the header)
+  Section = object
+    SectionName: string;
+    Kind: SectionKind;
+    Align: int64;
+    hidden FBytes: array of uint8;
+    hidden FCount: int64;
+    hidden FZeroSize: int64;
+    hidden FRelocs: array of ref SectionReloc;
+    hidden FRelocCount: int64;
+
+    init(const ASectionName: string; const AKind: SectionKind; const AAlign: int64);
+    begin
+      self.SectionName := ASectionName;
+      self.Kind := AKind;
+      self.Align := AAlign;
+      self.FCount := 0;
+      self.FZeroSize := 0;
+      self.FRelocCount := 0;
+    end;
+
+    // The section's size in bytes: its bytes, or a Zeroed section's reserved size
+    const method Size(): int64;
+    begin
+      if self.Kind = SectionKind.Zeroed then
+        return self.FZeroSize;
+      end;
+      return self.FCount;
+    end;
+
+    // The byte at AIndex (0-based); raises outside the bytes (a Zeroed section has none)
+    property Bytes[AIndex: int64]: uint8
+      read
+      begin
+        if (AIndex < 0) or (AIndex >= self.FCount) then
+          raise(ADAM_SECTIONS_FAULT_NO_BYTE + IntToStr(AIndex) + " in " + self.SectionName);
+        end;
+        return self.FBytes[AIndex];
+      end;
+
+    property RelocCount: int64 read FRelocCount;
+
+    // The relocation at AIndex (0-based, in the order added); raises outside the list
+    const method RelocAt(const AIndex: int64): ref SectionReloc;
+    begin
+      if (AIndex < 0) or (AIndex >= self.FRelocCount) then
+        raise(ADAM_SECTIONS_FAULT_NO_RELOC + IntToStr(AIndex) + " in " + self.SectionName);
+      end;
+      return self.FRelocs[AIndex];
+    end;
+
+    // Raises for a section that holds no bytes
+    hidden const method DoNeedBytes();
+    begin
+      if self.Kind = SectionKind.Zeroed then
+        raise(ADAM_SECTIONS_FAULT_ZEROED + self.SectionName);
+      end;
+    end;
+
+    // Appends the low ACount bytes of AValue, least significant first
+    hidden method DoPut(const AValue: uint64; const ACount: int64);
+    begin
+      self.DoNeedBytes();
+      // Room for all ACount bytes first (the store doubles), then one write
+      if self.FCount + ACount > len(self.FBytes) then
+        setlength(self.FBytes, self.FCount * 2 + 64);
+      end;
+      PutLe(self.FBytes, self.FCount, AValue, ACount);
+      self.FCount := self.FCount + ACount;
+    end;
+
+    // Appends one byte, or 2, 4, 8 little-endian bytes of AValue
+    method Put8(const AValue: uint64);
+    begin
+      self.DoPut(AValue, 1);
+    end;
+
+    method Put16(const AValue: uint64);
+    begin
+      self.DoPut(AValue, 2);
+    end;
+
+    method Put32(const AValue: uint64);
+    begin
+      self.DoPut(AValue, 4);
+    end;
+
+    method Put64(const AValue: uint64);
+    begin
+      self.DoPut(AValue, 8);
+    end;
+
+    // Grows the section by ACount bytes: zero bytes, or a Zeroed section's reserved size
+    method PutZeros(const ACount: int64);
+    var
+      LI: int64;
+    begin
+      if self.Kind = SectionKind.Zeroed then
+        self.FZeroSize := self.FZeroSize + ACount;
+        return;
+      end;
+      for LI := 1 to ACount do
+        self.DoPut(0, 1);
+      end;
+    end;
+
+    // Pads the section with AFill bytes (a Zeroed one with reserved size) until its size is
+    // a multiple of AAlign; raises for an alignment that is no power of two
+    method AlignTo(const AAlign: int64; const AFill: uint8);
+    begin
+      if not IsPowerOfTwo(AAlign) then
+        raise(ADAM_SECTIONS_FAULT_ALIGN + IntToStr(AAlign));
+      end;
+      while (self.Size() & (AAlign - 1)) <> 0 do
+        if self.Kind = SectionKind.Zeroed then
+          self.FZeroSize := self.FZeroSize + 1;
+        else
+          self.DoPut(uint64(AFill), 1);
+        end;
+      end;
+    end;
+
+    // Overwrites the 4 bytes at AOffset with AValue, little-endian (a jump's displacement
+    // once its target is placed); raises when they are not all inside the bytes
+    method Patch32(const AOffset: int64; const AValue: uint64);
+    begin
+      self.DoNeedBytes();
+      if (AOffset < 0) or (AOffset + 4 > self.FCount) then
+        raise(ADAM_SECTIONS_FAULT_NO_BYTE + IntToStr(AOffset) + " in " + self.SectionName);
+      end;
+      PutLe(self.FBytes, AOffset, AValue, 4);
+    end;
+
+    // Records a relocation already checked by SectionSet.AddReloc
+    method AddRelocChecked(const AReloc: ref SectionReloc);
+    begin
+      if self.FRelocCount = len(self.FRelocs) then
+        setlength(self.FRelocs, self.FRelocCount * 2 + 8);
+      end;
+      self.FRelocs[self.FRelocCount] := AReloc;
+      self.FRelocCount := self.FRelocCount + 1;
+    end;
+  end;
+
+  // A name and where it is (see the header)
+  SectionSymbol = object
+    SymbolName: string;
+    Kind: SymbolKind;
+    // Defined: the section and the offset in it
+    SectionId: int64;
+    Offset: int64;
+    // Import: the import's id
+    ImportId: int64;
+    // The AST node that needs it (its definition, or the first reference); 0 for none
+    Node: int64;
+    // Defined: bound to its object alone (a module's private routine), never resolving
+    // another object's reference (see MakeInternal)
+    Internal: bool;
+
+    init(const ASymbolName: string; const AKind: SymbolKind; const ANode: int64);
+    begin
+      self.SymbolName := ASymbolName;
+      self.Kind := AKind;
+      self.SectionId := 0;
+      self.Offset := 0;
+      self.ImportId := 0;
+      self.Node := ANode;
+      self.Internal := false;
+    end;
+  end;
+
+  // A routine a library exports (see the header)
+  SectionImport = object
+    Library: string;
+    ImportName: string;
+    // The symbol that stands for it in relocations
+    Symbol: int64;
+    Node: int64;
+
+    init(const ALibrary: string; const AImportName: string; const ANode: int64);
+    begin
+      self.Library := ALibrary;
+      self.ImportName := AImportName;
+      self.Symbol := 0;
+      self.Node := ANode;
+    end;
+  end;
+
+  // Sections, symbols and imports of one object (see the header)
+  SectionSet = object
+    hidden FSections: array of ref Section;
+    hidden FSectionCount: int64;
+    hidden FSymbols: array of ref SectionSymbol;
+    hidden FSymbolCount: int64;
+    hidden FImports: array of ref SectionImport;
+    hidden FImportCount: int64;
+    hidden FSectionNames: ref StringIdMap;
+    hidden FSymbolNames: ref StringIdMap;
+    hidden FImportKeys: ref StringIdMap;
+
+    init();
+    begin
+      self.FSectionCount := 1;
+      self.FSymbolCount := 1;
+      self.FImportCount := 1;
+      self.FSectionNames := ref StringIdMap();
+      self.FSymbolNames := ref StringIdMap();
+      self.FImportKeys := ref StringIdMap();
+    end;
+
+    // How many ids each arena has handed out, id 0 included
+    property SectionCount: int64 read FSectionCount;
+    property SymbolCount: int64 read FSymbolCount;
+    property ImportCount: int64 read FImportCount;
+
+    const method IsSection(const AId: int64): bool;
+    begin
+      return (AId >= 1) and (AId < self.FSectionCount);
+    end;
+
+    const method IsSymbol(const AId: int64): bool;
+    begin
+      return (AId >= 1) and (AId < self.FSymbolCount);
+    end;
+
+    const method IsImport(const AId: int64): bool;
+    begin
+      return (AId >= 1) and (AId < self.FImportCount);
+    end;
+
+    // The entity an id names; each raises when the id names nothing
+    const method SectionAt(const AId: int64): ref Section;
+    begin
+      if not self.IsSection(AId) then
+        raise(ADAM_SECTIONS_FAULT_NO_SECTION + IntToStr(AId));
+      end;
+      return self.FSections[AId];
+    end;
+
+    const method SymbolAt(const AId: int64): ref SectionSymbol;
+    begin
+      if not self.IsSymbol(AId) then
+        raise(ADAM_SECTIONS_FAULT_NO_SYMBOL + IntToStr(AId));
+      end;
+      return self.FSymbols[AId];
+    end;
+
+    const method ImportAt(const AId: int64): ref SectionImport;
+    begin
+      if not self.IsImport(AId) then
+        raise(ADAM_SECTIONS_FAULT_NO_IMPORT + IntToStr(AId));
+      end;
+      return self.FImports[AId];
+    end;
+
+    // The id of the section named AName; 0 for none
+    const method FindSection(const AName: string): int64;
+    begin
+      return self.FSectionNames.Find(AName);
+    end;
+
+    // The id of the Defined or Undefined symbol named AName; 0 for none (imports are found
+    // by FindImport: an import's name may also be an Adam routine's)
+    const method FindSymbol(const AName: string): int64;
+    begin
+      return self.FSymbolNames.Find(AName);
+    end;
+
+    // The id of the import of AName from ALibrary; 0 for none
+    const method FindImport(const ALibrary: string; const AName: string): int64;
+    begin
+      return self.FImportKeys.Find(self.DoImportKey(ALibrary, AName));
+    end;
+
+    // The import map's key: the library and the name, apart by a byte no file name holds
+    hidden const method DoImportKey(const ALibrary: string; const AName: string): string;
+    begin
+      return ALibrary + "|" + AName;
+    end;
+
+    // A new symbol of AKind; returns its id
+    hidden method DoAddSymbol(const AName: string; const AKind: SymbolKind; const ANode: int64): int64;
+    var
+      LId: int64;
+    begin
+      setlength(self.FSymbols, DoCapacity(self.FSymbolCount, len(self.FSymbols)));
+      LId := self.FSymbolCount;
+      self.FSymbols[LId] := ref SectionSymbol(AName, AKind, ANode);
+      self.FSymbolCount := LId + 1;
+      return LId;
+    end;
+
+    // A new section; raises for a name already made or an alignment that is no power of two
+    method AddSection(const AName: string; const AKind: SectionKind; const AAlign: int64): int64;
+    var
+      LId: int64;
+    begin
+      if self.FSectionNames.Find(AName) <> 0 then
+        raise(ADAM_SECTIONS_FAULT_SECTION_TWICE + AName);
+      end;
+      if not IsPowerOfTwo(AAlign) then
+        raise(ADAM_SECTIONS_FAULT_ALIGN + IntToStr(AAlign));
+      end;
+      setlength(self.FSections, DoCapacity(self.FSectionCount, len(self.FSections)));
+      LId := self.FSectionCount;
+      self.FSections[LId] := ref Section(AName, AKind, AAlign);
+      self.FSectionCount := LId + 1;
+      self.FSectionNames.Put(AName, LId);
+      return LId;
+    end;
+
+    // Defines AName at AOffset in section ASection (0 .. its size); a symbol referred to
+    // before (Undefined) becomes this definition and keeps its id. Raises for a second
+    // definition, a section naming nothing or an offset outside it. Returns the symbol's id
+    method DefineSymbol(const AName: string; const ASection: int64; const AOffset: int64;
+      const ANode: int64): int64;
+    var
+      LId: int64;
+      LSymbol: ref SectionSymbol;
+    begin
+      if (AOffset < 0) or (AOffset > self.SectionAt(ASection).Size()) then
+        raise(ADAM_SECTIONS_FAULT_OFFSET + self.SectionAt(ASection).SectionName + ": " +
+          IntToStr(AOffset));
+      end;
+      LId := self.FSymbolNames.Find(AName);
+      if LId = 0 then
+        LId := self.DoAddSymbol(AName, SymbolKind.Defined, ANode);
+        self.FSymbolNames.Put(AName, LId);
+      else
+        if self.FSymbols[LId].Kind = SymbolKind.Defined then
+          raise(ADAM_SECTIONS_FAULT_DEFINED_TWICE + AName);
+        end;
+      end;
+      LSymbol := self.FSymbols[LId];
+      LSymbol.Kind := SymbolKind.Defined;
+      LSymbol.SectionId := ASection;
+      LSymbol.Offset := AOffset;
+      LSymbol.Node := ANode;
+      return LId;
+    end;
+
+    // The Defined symbol AId bound to its object alone (a module's private routine): the
+    // format part writes it local. Raises for an id naming nothing or a symbol not defined
+    method MakeInternal(const AId: int64);
+    begin
+      if not self.IsSymbol(AId) then
+        raise(ADAM_SECTIONS_FAULT_NO_SYMBOL + IntToStr(AId));
+      end;
+      if self.FSymbols[AId].Kind <> SymbolKind.Defined then
+        raise(ADAM_SECTIONS_FAULT_INTERNAL + self.FSymbols[AId].SymbolName);
+      end;
+      self.FSymbols[AId].Internal := true;
+    end;
+
+    // The symbol named AName, made Undefined (ANode its first reference) when there is none
+    // yet; a later DefineSymbol fills it in. Returns its id
+    method ReferSymbol(const AName: string; const ANode: int64): int64;
+    var
+      LId: int64;
+    begin
+      LId := self.FSymbolNames.Find(AName);
+      if LId = 0 then
+        LId := self.DoAddSymbol(AName, SymbolKind.Undefined, ANode);
+        self.FSymbolNames.Put(AName, LId);
+      end;
+      return LId;
+    end;
+
+    // The symbol of the import of AName from ALibrary, made (with its import) when there is
+    // none yet; ANode is its first reference (the `external` declaration). Returns the
+    // symbol's id
+    method ImportSymbol(const ALibrary: string; const AName: string; const ANode: int64): int64;
+    var
+      LKey: string;
+      LImport: int64;
+      LSymbol: int64;
+    begin
+      LKey := self.DoImportKey(ALibrary, AName);
+      LImport := self.FImportKeys.Find(LKey);
+      if LImport <> 0 then
+        return self.FImports[LImport].Symbol;
+      end;
+      setlength(self.FImports, DoCapacity(self.FImportCount, len(self.FImports)));
+      LImport := self.FImportCount;
+      self.FImports[LImport] := ref SectionImport(ALibrary, AName, ANode);
+      self.FImportCount := LImport + 1;
+      self.FImportKeys.Put(LKey, LImport);
+      LSymbol := self.DoAddSymbol(AName, SymbolKind.Import, ANode);
+      self.FSymbols[LSymbol].ImportId := LImport;
+      self.FImports[LImport].Symbol := LSymbol;
+      return LSymbol;
+    end;
+
+    // A relocation at AOffset in section ASection against symbol ASymbol; raises for an id
+    // naming nothing or a field (RelocWidth(AKind) bytes) not inside the section's bytes
+    method AddReloc(const ASection: int64; const AOffset: int64; const AKind: RelocKind;
+      const ASymbol: int64; const AAddend: int64);
+    var
+      LSection: ref Section;
+    begin
+      LSection := self.SectionAt(ASection);
+      if not self.IsSymbol(ASymbol) then
+        raise(ADAM_SECTIONS_FAULT_NO_SYMBOL + IntToStr(ASymbol));
+      end;
+      if LSection.Kind = SectionKind.Zeroed then
+        raise(ADAM_SECTIONS_FAULT_ZEROED + LSection.SectionName);
+      end;
+      if (AOffset < 0) or (AOffset + RelocWidth(AKind) > LSection.Size()) then
+        raise(ADAM_SECTIONS_FAULT_RELOC_PLACE + LSection.SectionName + ": " + IntToStr(AOffset));
+      end;
+      LSection.AddRelocChecked(ref SectionReloc(AOffset, AKind, ASymbol, AAddend));
+    end;
+
+    // "y3 main" or "y3 puts", as Dump names a symbol
+    hidden const method DoSymbolRef(const AId: int64): string;
+    begin
+      return "y" + IntToStr(AId) + " " + self.FSymbols[AId].SymbolName;
+    end;
+
+    // One section's lines: its header, its bytes ADAM_SECTIONS_DUMP_BYTES a line, its
+    // relocations
+    hidden const method DoDumpSection(const AId: int64): string;
+    var
+      LSection: ref Section;
+      LText: string;
+      LI: int64;
+      LReloc: ref SectionReloc;
+    begin
+      LSection := self.FSections[AId];
+      LText := "section s" + IntToStr(AId) + " " + LSection.SectionName + " " +
+        SectionKindText(LSection.Kind) + " align " + IntToStr(LSection.Align) + " size " +
+        IntToStr(LSection.Size()) + "\n";
+      if LSection.Kind <> SectionKind.Zeroed then
+        for LI := 0 to LSection.Size() - 1 do
+          if (LI mod ADAM_SECTIONS_DUMP_BYTES) = 0 then
+            LText := LText + "  " + HexText(LI) + ":";
+          end;
+          LText := LText + " " + DoHexByte(LSection.Bytes[LI]);
+          if ((LI mod ADAM_SECTIONS_DUMP_BYTES) = ADAM_SECTIONS_DUMP_BYTES - 1) or
+            (LI = LSection.Size() - 1) then
+            LText := LText + "\n";
+          end;
+        end;
+      end;
+      for LI := 0 to LSection.RelocCount - 1 do
+        LReloc := LSection.RelocAt(LI);
+        LText := LText + "  reloc " + HexText(LReloc.Offset) + " " + RelocKindText(LReloc.Kind) +
+          " " + self.DoSymbolRef(LReloc.Symbol) + " addend " + IntToStr(LReloc.Addend) + "\n";
+      end;
+      return LText;
+    end;
+
+    // One symbol's line
+    hidden const method DoDumpSymbol(const AId: int64): string;
+    var
+      LSymbol: ref SectionSymbol;
+      LText: string;
+    begin
+      LSymbol := self.FSymbols[AId];
+      LText := "symbol " + self.DoSymbolRef(AId) + " " + SymbolKindText(LSymbol.Kind);
+      // A Defined symbol names its place, an Import its import; an Undefined one has neither
+      if LSymbol.Kind = SymbolKind.Defined then
+        LText := LText + " s" + IntToStr(LSymbol.SectionId) + " " + HexText(LSymbol.Offset);
+        if LSymbol.Internal then
+          LText := LText + " internal";
+        end;
+      end;
+      if LSymbol.Kind = SymbolKind.Import then
+        LText := LText + " m" + IntToStr(LSymbol.ImportId);
+      end;
+      return LText + " node " + IntToStr(LSymbol.Node) + "\n";
+    end;
+
+    // The set as text: sections (bytes and relocations), symbols, imports, in id order
+    const method Dump(): string;
+    var
+      LText: string;
+      LI: int64;
+      LImport: ref SectionImport;
+    begin
+      LText := "";
+      for LI := 1 to self.FSectionCount - 1 do
+        LText := LText + self.DoDumpSection(LI);
+      end;
+      for LI := 1 to self.FSymbolCount - 1 do
+        LText := LText + self.DoDumpSymbol(LI);
+      end;
+      for LI := 1 to self.FImportCount - 1 do
+        LImport := self.FImports[LI];
+        LText := LText + "import m" + IntToStr(LI) + " " + LImport.Library + " " +
+          LImport.ImportName + " y" + IntToStr(LImport.Symbol) + "\n";
+      end;
+      return LText;
+    end;
+  end;
+
+end.

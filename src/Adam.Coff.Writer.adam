@@ -1,0 +1,625 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Coff.Writer.adam - a SectionSet as COFF object bytes (DESIGN sec 7)
+
+  Every layout fact is Microsoft's "PE Format" page (COFF File Header,
+  Section Table, COFF Relocations, COFF Symbol Table, Auxiliary Format 5,
+  COFF String Table); the relocation-count overflow is that page's
+  IMAGE_SCN_LNK_NRELOC_OVFL as LLVM's COFF writer spells it out (from 0xFFFF
+  relocations the count field holds 0xFFFF and an extra first record's
+  VirtualAddress holds the count, that record included).
+
+  CoffMachine     what COFF records of an arch: the Machine field, the
+                  relocation type each RelocKind becomes and the page size an
+                  image's sections align to (CoffMachineAmd64)
+  WriteCoffObject the object, laid out in this order: the file header, the
+                  section table, then per section its raw data (at a 4-byte
+                  boundary) and its relocations, then the symbol table and
+                  the string table. Deterministic: TimeDateStamp 0, every
+                  list in the SectionSet's id order, no checksum.
+
+  Section number i is the SectionSet's section id i. Symbols: first each
+  section's STATIC symbol with its section-definition record (index
+  2 (i - 1)), then the SectionSet's symbols in id order, each EXTERNAL (an
+  internal one STATIC): a Defined one at its offset (Type 0x20 in a code
+  section), an Undefined one in section 0, an Import as the undefined
+  __imp_<name> its IAT slot goes by (one record per name). A relocation's
+  addend is written into its field (COFF keeps addends in place): Rel32 as
+  REL32 and Rva32 as ADDR32NB in 4 bytes, Abs64 as ADDR64 in 8. A name over
+  8 bytes goes to the string table (a section's as "/" and its decimal
+  offset), each name once.
+
+  Every fact COFF cannot hold (more sections than a section number, an
+  alignment over 8192, a size or file offset past 32 bits, an empty name or
+  one with a zero byte, a relocation field that is not zero, an addend its
+  field cannot hold, an import whose __imp_ name a symbol already has, a
+  section name's string offset past 7 digits) is a compiler bug and raises,
+  naming it.
+*******************************************************************************/
+
+module unit Adam.Coff.Writer;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Sections;
+
+exported const
+  // Raised (see the header)
+  ADAM_COFF_FAULT_NO_INPUT: string = "COFF writer: no sections or no machine";
+  ADAM_COFF_FAULT_SECTIONS: string = "COFF writer: more sections than a section number holds: ";
+  ADAM_COFF_FAULT_ALIGN: string = "COFF writer: an alignment over 8192 bytes: ";
+  ADAM_COFF_FAULT_SIZE: string = "COFF writer: past 32 bits: ";
+  ADAM_COFF_FAULT_NAME: string = "COFF writer: a name that is empty or holds a zero byte: ";
+  ADAM_COFF_FAULT_FIELD: string = "COFF writer: a relocation field that is not zero: ";
+  ADAM_COFF_FAULT_ADDEND: string = "COFF writer: an addend its field does not hold: ";
+  ADAM_COFF_FAULT_IMPORT: string = "COFF writer: an import whose symbol name is taken: ";
+  ADAM_COFF_FAULT_STRING_OFFSET: string = "COFF writer: a section name past 7 digits of string offset: ";
+  // Record sizes (PE Format: COFF File Header, Section Table, COFF Relocations, COFF Symbol Table)
+  ADAM_COFF_FILE_HEADER_SIZE: int64 = 20;
+  ADAM_COFF_SECTION_HEADER_SIZE: int64 = 40;
+  ADAM_COFF_RELOC_SIZE: int64 = 10;
+  ADAM_COFF_SYMBOL_SIZE: int64 = 18;
+  // The bytes a name field holds; a section name past it is "/" and up to 7 decimal digits
+  ADAM_COFF_NAME_SIZE: int64 = 8;
+  ADAM_COFF_MAX_STRING_OFFSET: int64 = 9999999;
+  // The string table's size field, counted in its size
+  ADAM_COFF_STRINGS_SIZE_FIELD: int64 = 4;
+  // Raw data starts at a 4-byte boundary ("for best performance")
+  ADAM_COFF_RAW_ALIGN: int64 = 4;
+  // SectionNumber is a signed 16-bit field; numbers below 1 are special
+  ADAM_COFF_MAX_SECTIONS: int64 = 32767;
+  // The largest IMAGE_SCN_ALIGN_* value
+  ADAM_COFF_MAX_ALIGN: int64 = 8192;
+  // A 32-bit field's largest value (sizes, file offsets, symbol values)
+  ADAM_COFF_MAX_32: int64 = 0xFFFFFFFF;
+  // NumberOfRelocations' value when the count is in the first record
+  ADAM_COFF_RELOC_OVERFLOW: int64 = 0xFFFF;
+  // The Machine field and the relocation types (x64 Processors)
+  ADAM_COFF_MACHINE_AMD64: int64 = 0x8664;
+  ADAM_COFF_REL_AMD64_ADDR64: int64 = 0x0001;
+  ADAM_COFF_REL_AMD64_ADDR32NB: int64 = 0x0003;
+  ADAM_COFF_REL_AMD64_REL32: int64 = 0x0004;
+  // x64's page size, an image's SectionAlignment ("the page size for the architecture")
+  ADAM_COFF_PAGE_AMD64: int64 = 4096;
+  // Section Flags
+  ADAM_COFF_SCN_CNT_CODE: int64 = 0x00000020;
+  ADAM_COFF_SCN_CNT_INITIALIZED_DATA: int64 = 0x00000040;
+  ADAM_COFF_SCN_CNT_UNINITIALIZED_DATA: int64 = 0x00000080;
+  ADAM_COFF_SCN_LNK_NRELOC_OVFL: int64 = 0x01000000;
+  ADAM_COFF_SCN_MEM_EXECUTE: int64 = 0x20000000;
+  ADAM_COFF_SCN_MEM_READ: int64 = 0x40000000;
+  ADAM_COFF_SCN_MEM_WRITE: int64 = 0x80000000;
+  // IMAGE_SCN_ALIGN_<2^k>BYTES is (k + 1) in bits 20..23
+  ADAM_COFF_SCN_ALIGN_SHIFT: int64 = 20;
+  // Type (function) and storage classes (COFF Symbol Table)
+  ADAM_COFF_SYM_DTYPE_FUNCTION: int64 = 0x20;
+  ADAM_COFF_SYM_CLASS_EXTERNAL: int64 = 2;
+  ADAM_COFF_SYM_CLASS_STATIC: int64 = 3;
+  // The name an import's IAT slot goes by
+  ADAM_COFF_IMPORT_PREFIX: string = "__imp_";
+
+exported type
+  // What COFF records of an arch (see the header)
+  CoffMachine = object
+    Machine: int64;
+    RelocRel32: int64;
+    RelocRva32: int64;
+    RelocAbs64: int64;
+    // The arch's page: an image's SectionAlignment (the linker, Adam.Coff.Linker)
+    PageSize: int64;
+
+    init(const AMachine: int64; const ARelocRel32: int64; const ARelocRva32: int64;
+      const ARelocAbs64: int64; const APageSize: int64);
+    begin
+      self.Machine := AMachine;
+      self.RelocRel32 := ARelocRel32;
+      self.RelocRva32 := ARelocRva32;
+      self.RelocAbs64 := ARelocAbs64;
+      self.PageSize := APageSize;
+    end;
+
+    // The relocation type a relocation of AKind is written as
+    const method RelocType(const AKind: RelocKind): int64;
+    begin
+      match AKind of
+        RelocKind.Rel32: return self.RelocRel32;
+        RelocKind.Rva32: return self.RelocRva32;
+        RelocKind.Abs64: return self.RelocAbs64;
+      end;
+      return 0;
+    end;
+  end;
+
+// x64: IMAGE_FILE_MACHINE_AMD64; Rel32 REL32, Rva32 ADDR32NB, Abs64 ADDR64; 4 KB pages
+exported routine CoffMachineAmd64(): ref CoffMachine;
+begin
+  return ref CoffMachine(ADAM_COFF_MACHINE_AMD64, ADAM_COFF_REL_AMD64_REL32,
+    ADAM_COFF_REL_AMD64_ADDR32NB, ADAM_COFF_REL_AMD64_ADDR64, ADAM_COFF_PAGE_AMD64);
+end;
+
+// Raises unless AName has bytes and none of them is zero
+routine DoCheckName(const AName: string);
+var
+  LI: int64;
+begin
+  if len(AName) = 0 then
+    raise(ADAM_COFF_FAULT_NAME + "empty");
+  end;
+  for LI := 0 to len(AName) - 1 do
+    if uint8(AName[LI]) = 0 then
+      raise(ADAM_COFF_FAULT_NAME + IntToStr(LI) + " in a name of " + IntToStr(len(AName)) +
+        " bytes");
+    end;
+  end;
+end;
+
+// The IMAGE_SCN_* flags of a section of AKind with alignment AAlign (a power of two up to
+// 8192), with IMAGE_SCN_LNK_NRELOC_OVFL when AOverflow
+routine DoSectionFlags(const AKind: SectionKind; const AAlign: int64; const AOverflow: bool): int64;
+var
+  LFlags: int64;
+  LLog: int64;
+begin
+  LFlags := 0;
+  match AKind of
+    SectionKind.Code:
+      LFlags := ADAM_COFF_SCN_CNT_CODE | ADAM_COFF_SCN_MEM_EXECUTE | ADAM_COFF_SCN_MEM_READ;
+    SectionKind.ReadOnly:
+      LFlags := ADAM_COFF_SCN_CNT_INITIALIZED_DATA | ADAM_COFF_SCN_MEM_READ;
+    SectionKind.Data:
+      LFlags := ADAM_COFF_SCN_CNT_INITIALIZED_DATA | ADAM_COFF_SCN_MEM_READ |
+        ADAM_COFF_SCN_MEM_WRITE;
+    SectionKind.Zeroed:
+      LFlags := ADAM_COFF_SCN_CNT_UNINITIALIZED_DATA | ADAM_COFF_SCN_MEM_READ |
+        ADAM_COFF_SCN_MEM_WRITE;
+  end;
+  // AAlign = 2^LLog becomes (LLog + 1) in the alignment bits
+  LLog := 0;
+  while (int64(1) shl LLog) < AAlign do
+    LLog := LLog + 1;
+  end;
+  LFlags := LFlags | ((LLog + 1) shl ADAM_COFF_SCN_ALIGN_SHIFT);
+  if AOverflow then
+    LFlags := LFlags | ADAM_COFF_SCN_LNK_NRELOC_OVFL;
+  end;
+  return LFlags;
+end;
+
+// True when a section with ACount relocations keeps the count in its first record
+routine DoOverflows(const ACount: int64): bool;
+begin
+  return ACount >= ADAM_COFF_RELOC_OVERFLOW;
+end;
+
+// The relocation records a section with ACount relocations writes
+routine DoRelocRecords(const ACount: int64): int64;
+begin
+  if DoOverflows(ACount) then
+    return ACount + 1;
+  end;
+  return ACount;
+end;
+
+// The NumberOfRelocations field (header and section-definition record) of ACount relocations
+routine DoRelocCountField(const ACount: int64): int64;
+begin
+  if DoOverflows(ACount) then
+    return ADAM_COFF_RELOC_OVERFLOW;
+  end;
+  return ACount;
+end;
+
+type
+  // One object's writing (see the header)
+  CoffWriter = object
+    hidden FSet: ref SectionSet;
+    hidden FMachine: ref CoffMachine;
+    hidden FBytes: ByteArray;
+    hidden FSectionCount: int64;
+    // Per section id: its raw data's and its relocations' file offsets (0: none) and its
+    // name's string offset (0: the name fits its field)
+    hidden FRawAt: Int64Array;
+    hidden FRelocAt: Int64Array;
+    hidden FSectionName: Int64Array;
+    // Per symbol id: its record's index and its name's string offset (0: fits)
+    hidden FSymbolIndex: Int64Array;
+    hidden FSymbolName: Int64Array;
+    // An import's __imp_ name -> the first symbol id that has it
+    hidden FImportNames: ref StringIdMap;
+    // The string table after its size field, and each name's offset in it
+    hidden FStrings: string;
+    hidden FStringOffsets: ref StringIdMap;
+    hidden FRecordCount: int64;
+    hidden FSymbolsAt: int64;
+    hidden FStringsAt: int64;
+
+    init(const ASet: ref SectionSet; const AMachine: ref CoffMachine);
+    begin
+      self.FSet := ASet;
+      self.FMachine := AMachine;
+      self.FSectionCount := ASet.SectionCount - 1;
+      self.FImportNames := ref StringIdMap();
+      self.FStrings := "";
+      self.FStringOffsets := ref StringIdMap();
+      self.FRecordCount := 0;
+      self.FSymbolsAt := 0;
+      self.FStringsAt := 0;
+      setlength(self.FRawAt, ASet.SectionCount);
+      setlength(self.FRelocAt, ASet.SectionCount);
+      setlength(self.FSectionName, ASet.SectionCount);
+      setlength(self.FSymbolIndex, ASet.SymbolCount);
+      setlength(self.FSymbolName, ASet.SymbolCount);
+    end;
+
+    // The name symbol AId has in the object: an import's __imp_ name, else its own
+    hidden const method DoSymbolName(const AId: int64): string;
+    var
+      LSymbol: ref SectionSymbol;
+    begin
+      LSymbol := self.FSet.SymbolAt(AId);
+      if LSymbol.Kind = SymbolKind.Import then
+        return ADAM_COFF_IMPORT_PREFIX + self.FSet.ImportAt(LSymbol.ImportId).ImportName;
+      end;
+      return LSymbol.SymbolName;
+    end;
+
+    // The string offset of AName: 0 when it fits a name field, else its place in the string
+    // table (added the first time)
+    hidden method DoStringOffset(const AName: string): int64;
+    var
+      LOffset: int64;
+    begin
+      if len(AName) <= ADAM_COFF_NAME_SIZE then
+        return 0;
+      end;
+      LOffset := self.FStringOffsets.Find(AName);
+      if LOffset <> 0 then
+        return LOffset;
+      end;
+      LOffset := ADAM_COFF_STRINGS_SIZE_FIELD + len(self.FStrings);
+      self.FStrings := self.FStrings + AName;
+      setlength(self.FStrings, len(self.FStrings) + 1);
+      self.FStrings[len(self.FStrings) - 1] := char(0);
+      self.FStringOffsets.Put(AName, LOffset);
+      return LOffset;
+    end;
+
+    // Raises for what COFF cannot hold of the sections: their count, an alignment, a size, a
+    // name (see the header)
+    hidden method DoCheckSections();
+    var
+      LId: int64;
+      LSection: ref Section;
+    begin
+      if self.FSectionCount > ADAM_COFF_MAX_SECTIONS then
+        raise(ADAM_COFF_FAULT_SECTIONS + IntToStr(self.FSectionCount));
+      end;
+      for LId := 1 to self.FSectionCount do
+        LSection := self.FSet.SectionAt(LId);
+        DoCheckName(LSection.SectionName);
+        if LSection.Align > ADAM_COFF_MAX_ALIGN then
+          raise(ADAM_COFF_FAULT_ALIGN + LSection.SectionName + " " + IntToStr(LSection.Align));
+        end;
+        if LSection.Size() > ADAM_COFF_MAX_32 then
+          raise(ADAM_COFF_FAULT_SIZE + LSection.SectionName + " " + IntToStr(LSection.Size()));
+        end;
+      end;
+    end;
+
+    // Places every section's raw data and relocations after the headers; the symbol table
+    // follows them
+    hidden method DoPlaceSections();
+    var
+      LAt: int64;
+      LId: int64;
+      LSection: ref Section;
+    begin
+      LAt := ADAM_COFF_FILE_HEADER_SIZE + ADAM_COFF_SECTION_HEADER_SIZE * self.FSectionCount;
+      for LId := 1 to self.FSectionCount do
+        LSection := self.FSet.SectionAt(LId);
+        self.FRawAt[LId] := 0;
+        self.FRelocAt[LId] := 0;
+        // A zeroed or empty section has no raw data
+        if (LSection.Kind <> SectionKind.Zeroed) and (LSection.Size() > 0) then
+          LAt := AlignUp(LAt, ADAM_COFF_RAW_ALIGN);
+          self.FRawAt[LId] := LAt;
+          LAt := LAt + LSection.Size();
+        end;
+        if LSection.RelocCount > 0 then
+          self.FRelocAt[LId] := LAt;
+          LAt := LAt + ADAM_COFF_RELOC_SIZE * DoRelocRecords(LSection.RelocCount);
+        end;
+      end;
+      self.FSymbolsAt := LAt;
+    end;
+
+    // Gives every symbol its record: the sections' (two records each) first, then the
+    // SectionSet's in id order, the imports of one __imp_ name sharing one
+    hidden method DoNumberSymbols();
+    var
+      LId: int64;
+      LName: string;
+      LFirst: int64;
+    begin
+      self.FRecordCount := 2 * self.FSectionCount;
+      for LId := 1 to self.FSet.SymbolCount - 1 do
+        LName := self.DoSymbolName(LId);
+        DoCheckName(LName);
+        LFirst := 0;
+        if self.FSet.SymbolAt(LId).Kind = SymbolKind.Import then
+          LFirst := self.FImportNames.Find(LName);
+          if LFirst = 0 then
+            // The __imp_ name must be no Defined or Undefined symbol's name too
+            if self.FSet.FindSymbol(LName) <> 0 then
+              raise(ADAM_COFF_FAULT_IMPORT + LName);
+            end;
+            self.FImportNames.Put(LName, LId);
+          end;
+        end;
+        if LFirst <> 0 then
+          self.FSymbolIndex[LId] := self.FSymbolIndex[LFirst];
+        else
+          self.FSymbolIndex[LId] := self.FRecordCount;
+          self.FRecordCount := self.FRecordCount + 1;
+        end;
+      end;
+    end;
+
+    // The string table: the sections' long names first, then the symbols', in id order
+    hidden method DoNameStrings();
+    var
+      LId: int64;
+      LSection: ref Section;
+    begin
+      for LId := 1 to self.FSectionCount do
+        LSection := self.FSet.SectionAt(LId);
+        self.FSectionName[LId] := self.DoStringOffset(LSection.SectionName);
+        if self.FSectionName[LId] > ADAM_COFF_MAX_STRING_OFFSET then
+          raise(ADAM_COFF_FAULT_STRING_OFFSET + LSection.SectionName + " " +
+            IntToStr(self.FSectionName[LId]));
+        end;
+      end;
+      for LId := 1 to self.FSet.SymbolCount - 1 do
+        self.FSymbolName[LId] := self.DoStringOffset(self.DoSymbolName(LId));
+      end;
+    end;
+
+    // Writes the low ACount bytes of AValue at AAt, least significant first
+    hidden method DoPut(const AAt: int64; const AValue: uint64; const ACount: int64);
+    begin
+      PutLe(self.FBytes, AAt, AValue, ACount);
+    end;
+
+    // Writes the bytes of AText at AAt
+    hidden method DoPutText(const AAt: int64; const AText: string);
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(AText) - 1 do
+        self.FBytes[AAt + LI] := uint8(AText[LI]);
+      end;
+    end;
+
+    // A symbol record's name field at AAt: AName itself, or zeros and AOffset in the string
+    // table
+    hidden method DoPutSymbolName(const AAt: int64; const AName: string; const AOffset: int64);
+    begin
+      if AOffset = 0 then
+        self.DoPutText(AAt, AName);
+      else
+        self.DoPut(AAt, 0, 4);
+        self.DoPut(AAt + 4, uint64(AOffset), 4);
+      end;
+    end;
+
+    // The file header
+    hidden method DoHeader();
+    begin
+      self.DoPut(0, uint64(self.FMachine.Machine), 2);
+      self.DoPut(2, uint64(self.FSectionCount), 2);
+      // TimeDateStamp 0 (no meaningful time: deterministic), no optional header, no flags
+      self.DoPut(4, 0, 4);
+      self.DoPut(8, uint64(self.FSymbolsAt), 4);
+      self.DoPut(12, uint64(self.FRecordCount), 4);
+      self.DoPut(16, 0, 2);
+      self.DoPut(18, 0, 2);
+    end;
+
+    // Section AId's header (VirtualSize, VirtualAddress and line numbers stay zero)
+    hidden method DoSectionHeader(const AId: int64);
+    var
+      LAt: int64;
+      LSection: ref Section;
+    begin
+      LAt := ADAM_COFF_FILE_HEADER_SIZE + ADAM_COFF_SECTION_HEADER_SIZE * (AId - 1);
+      LSection := self.FSet.SectionAt(AId);
+      if self.FSectionName[AId] = 0 then
+        self.DoPutText(LAt, LSection.SectionName);
+      else
+        self.DoPutText(LAt, "/" + IntToStr(self.FSectionName[AId]));
+      end;
+      self.DoPut(LAt + 16, uint64(LSection.Size()), 4);
+      self.DoPut(LAt + 20, uint64(self.FRawAt[AId]), 4);
+      self.DoPut(LAt + 24, uint64(self.FRelocAt[AId]), 4);
+      self.DoPut(LAt + 32, uint64(DoRelocCountField(LSection.RelocCount)), 2);
+      self.DoPut(LAt + 36, uint64(DoSectionFlags(LSection.Kind, LSection.Align,
+        DoOverflows(LSection.RelocCount))), 4);
+    end;
+
+    // Writes AReloc's addend into its field at AAt (the field's file offset); raises when the
+    // section's field is not zero or the addend does not fit it
+    hidden method DoPutAddend(const ASection: ref Section; const AReloc: ref SectionReloc;
+      const AAt: int64);
+    var
+      LI: int64;
+      LWidth: int64;
+      LFits: bool;
+    begin
+      LWidth := RelocWidth(AReloc.Kind);
+      for LI := 0 to LWidth - 1 do
+        if ASection.Bytes[AReloc.Offset + LI] <> 0 then
+          raise(ADAM_COFF_FAULT_FIELD + ASection.SectionName + " " + HexText(AReloc.Offset));
+        end;
+      end;
+      LFits := true;
+      if AReloc.Kind = RelocKind.Rel32 then
+        LFits := (AReloc.Addend >= -2147483648) and (AReloc.Addend <= 2147483647);
+      end;
+      if AReloc.Kind = RelocKind.Rva32 then
+        LFits := (AReloc.Addend >= 0) and (AReloc.Addend <= ADAM_COFF_MAX_32);
+      end;
+      if not LFits then
+        raise(ADAM_COFF_FAULT_ADDEND + ASection.SectionName + " " + HexText(AReloc.Offset) + " " +
+          RelocKindText(AReloc.Kind) + " " + IntToStr(AReloc.Addend));
+      end;
+      self.DoPut(AAt, uint64(AReloc.Addend), LWidth);
+    end;
+
+    // Section AId's raw data (its bytes, each relocation's addend in its field) and its
+    // relocation records
+    hidden method DoSectionBody(const AId: int64);
+    var
+      LSection: ref Section;
+      LReloc: ref SectionReloc;
+      LAt: int64;
+      LI: int64;
+    begin
+      LSection := self.FSet.SectionAt(AId);
+      if self.FRawAt[AId] <> 0 then
+        for LI := 0 to LSection.Size() - 1 do
+          self.FBytes[self.FRawAt[AId] + LI] := LSection.Bytes[LI];
+        end;
+      end;
+      if LSection.RelocCount = 0 then
+        return;
+      end;
+      LAt := self.FRelocAt[AId];
+      // The overflow record: the count (itself included) in VirtualAddress, symbol 0, type 0
+      if DoOverflows(LSection.RelocCount) then
+        self.DoPut(LAt, uint64(LSection.RelocCount + 1), 4);
+        LAt := LAt + ADAM_COFF_RELOC_SIZE;
+      end;
+      for LI := 0 to LSection.RelocCount - 1 do
+        LReloc := LSection.RelocAt(LI);
+        self.DoPutAddend(LSection, LReloc, self.FRawAt[AId] + LReloc.Offset);
+        self.DoPut(LAt, uint64(LReloc.Offset), 4);
+        self.DoPut(LAt + 4, uint64(self.FSymbolIndex[LReloc.Symbol]), 4);
+        self.DoPut(LAt + 8, uint64(self.FMachine.RelocType(LReloc.Kind)), 2);
+        LAt := LAt + ADAM_COFF_RELOC_SIZE;
+      end;
+    end;
+
+    // Section AId's STATIC symbol and its section-definition record (Auxiliary Format 5:
+    // Length, NumberOfRelocations; no line numbers, checksum, COMDAT number or selection)
+    hidden method DoSectionSymbol(const AId: int64);
+    var
+      LAt: int64;
+      LSection: ref Section;
+    begin
+      LAt := self.FSymbolsAt + ADAM_COFF_SYMBOL_SIZE * 2 * (AId - 1);
+      LSection := self.FSet.SectionAt(AId);
+      self.DoPutSymbolName(LAt, LSection.SectionName, self.FSectionName[AId]);
+      self.DoPut(LAt + 12, uint64(AId), 2);
+      self.DoPut(LAt + 16, uint64(ADAM_COFF_SYM_CLASS_STATIC), 1);
+      self.DoPut(LAt + 17, 1, 1);
+      LAt := LAt + ADAM_COFF_SYMBOL_SIZE;
+      self.DoPut(LAt, uint64(LSection.Size()), 4);
+      self.DoPut(LAt + 4, uint64(DoRelocCountField(LSection.RelocCount)), 2);
+    end;
+
+    // Symbol AId's record (an import sharing an earlier one's __imp_ name writes nothing)
+    hidden method DoSymbol(const AId: int64);
+    var
+      LAt: int64;
+      LSymbol: ref SectionSymbol;
+      LName: string;
+    begin
+      LSymbol := self.FSet.SymbolAt(AId);
+      LName := self.DoSymbolName(AId);
+      if (LSymbol.Kind = SymbolKind.Import) and (self.FImportNames.Find(LName) <> AId) then
+        return;
+      end;
+      LAt := self.FSymbolsAt + ADAM_COFF_SYMBOL_SIZE * self.FSymbolIndex[AId];
+      self.DoPutSymbolName(LAt, LName, self.FSymbolName[AId]);
+      if LSymbol.Kind = SymbolKind.Defined then
+        self.DoPut(LAt + 8, uint64(LSymbol.Offset), 4);
+        self.DoPut(LAt + 12, uint64(LSymbol.SectionId), 2);
+        if self.FSet.SectionAt(LSymbol.SectionId).Kind = SectionKind.Code then
+          self.DoPut(LAt + 14, uint64(ADAM_COFF_SYM_DTYPE_FUNCTION), 2);
+        end;
+      end;
+      // An internal symbol (a module's private routine) is the object's own: STATIC
+      if LSymbol.Internal then
+        self.DoPut(LAt + 16, uint64(ADAM_COFF_SYM_CLASS_STATIC), 1);
+        return;
+      end;
+      self.DoPut(LAt + 16, uint64(ADAM_COFF_SYM_CLASS_EXTERNAL), 1);
+    end;
+
+    // The string table: its size (the size field included), then the names
+    hidden method DoStringTable();
+    begin
+      self.DoPut(self.FStringsAt, uint64(ADAM_COFF_STRINGS_SIZE_FIELD + len(self.FStrings)), 4);
+      self.DoPutText(self.FStringsAt + ADAM_COFF_STRINGS_SIZE_FIELD, self.FStrings);
+    end;
+
+    // The object's bytes (see the header)
+    method Run(): ByteArray;
+    var
+      LTotal: int64;
+      LI: int64;
+    begin
+      self.DoCheckSections();
+      self.DoPlaceSections();
+      self.DoNumberSymbols();
+      self.DoNameStrings();
+      self.FStringsAt := self.FSymbolsAt + ADAM_COFF_SYMBOL_SIZE * self.FRecordCount;
+      LTotal := self.FStringsAt + ADAM_COFF_STRINGS_SIZE_FIELD + len(self.FStrings);
+      if LTotal > ADAM_COFF_MAX_32 then
+        raise(ADAM_COFF_FAULT_SIZE + "the object " + IntToStr(LTotal));
+      end;
+      // Every byte no field writes (padding, unused fields) is zero
+      setlength(self.FBytes, LTotal);
+      for LI := 0 to LTotal - 1 do
+        self.FBytes[LI] := 0;
+      end;
+      self.DoHeader();
+      for LI := 1 to self.FSectionCount do
+        self.DoSectionHeader(LI);
+        self.DoSectionBody(LI);
+        self.DoSectionSymbol(LI);
+      end;
+      for LI := 1 to self.FSet.SymbolCount - 1 do
+        self.DoSymbol(LI);
+      end;
+      self.DoStringTable();
+      return self.FBytes;
+    end;
+  end;
+
+// ASections as one COFF object for the arch AMachine describes (see the header); raises for a
+// nil input and for what COFF cannot hold
+exported routine WriteCoffObject(const ASections: ref SectionSet;
+  const AMachine: ref CoffMachine): ByteArray;
+var
+  LWriter: ref CoffWriter;
+begin
+  if (ASections = nil) or (AMachine = nil) then
+    raise(ADAM_COFF_FAULT_NO_INPUT);
+  end;
+  LWriter := ref CoffWriter(ASections, AMachine);
+  return LWriter.Run();
+end;
+
+end.

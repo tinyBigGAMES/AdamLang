@@ -1,0 +1,805 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Compiler.Literals.adam - A string or character literal's value
+
+  DecodeString     a string literal ("..." or a raw R"d(...)d") -> its value
+  DecodeChar       a character literal ('...') -> its value
+  IsLibraryName    the shape of a library name (@linklibrary, external)
+
+  The escape rules are PaskalCPP's (TPCCString, clang's values): simple and
+  quote escapes, \e, octal (1-3 digits, \o{...}), hex (greedy, \x{...}),
+  \u (4 digits, \u{...}), \U (8 digits), \N{name} (Adam.Compiler.UnicodeNames);
+  an unknown escape is its character, backslash dropped, with a warning.
+  A raw string's body is copied as written, CR LF read as LF.
+
+  A literal is narrow or wide by the type it converts to (BNF sec 9), which
+  only Semantics knows, so a literal is decoded once into BOTH values: the
+  narrow one (UTF-8 bytes; a numeric escape is one byte, at most 0xFF) and
+  the wide one (UTF-16 units; a numeric escape is one unit, at most
+  0xFFFF). What neither encoding takes is an error now (Status Error, the
+  parser's PR0009 / PR0054); a fault both share and keep a value through is
+  a warning now (Status Warning: PR0021 / PR0064); a fault of ONE encoding is
+  kept beside the value (NarrowFault / WideFault) for Semantics to report
+  once the type has picked that encoding. The input is a token's spelling
+  (splices already removed by SourceText, reported by the lexer).
+*******************************************************************************/
+
+module unit Adam.Compiler.Literals;
+
+import System.SysUtils, Adam.Core.Messages, Adam.Compiler.UnicodeNames;
+
+exported type
+  // A literal's fault in one encoding only; Reason "" = none. IsWarning: the encoding keeps
+  // its value (a multi-character char literal), else it has none
+  EncodingFault = record
+    Reason: string;
+    IsWarning: bool;
+  end;
+
+  // Ok; Warning = both values kept and Reason names the fault they share; Error = no value
+  // in either encoding, Reason says why
+  LiteralStatus = choices(Ok, Warning, Error);
+
+  // One literal decoded for both encodings (see the header). A faulted encoding's value is
+  // empty. CharValue: a char literal's narrow value (one element: its byte; several: each
+  // element's low byte shifted in, 32 bits kept, as clang)
+  DecodedLiteral = record
+    Status: LiteralStatus;
+    Reason: string;
+    Narrow: string;
+    Wide: wstring;
+    NarrowFault: EncodingFault;
+    WideFault: EncodingFault;
+    CharValue: uint64;
+  end;
+
+const
+  // The largest numeric escape a narrow / a wide literal holds (one byte / one wchar unit)
+  ADAM_LITERALS_NARROW_MAX: uint64 = 0xFF;
+  ADAM_LITERALS_WIDE_MAX: uint64 = 0xFFFF;
+  // A numeric escape is read up to 32 bits: past it no encoding holds it
+  ADAM_LITERALS_NUMERIC_MAX: uint64 = 0xFFFFFFFF;
+  // The last code point
+  ADAM_LITERALS_UNICODE_MAX: uint64 = 0x10FFFF;
+  // The last code point a narrow char holds as a source character or a \u escape
+  ADAM_LITERALS_CHAR_ASCII_MAX: uint64 = 0x7F;
+  // A multi-character char literal keeps 32 bits; more than 4 elements is "too long"
+  ADAM_LITERALS_MULTI_MASK: uint64 = 0xFFFFFFFF;
+  ADAM_LITERALS_MULTI_MAX: int64 = 4;
+
+type
+  // One element of a literal: a code point (a source character, a simple or quote
+  // escape, \u \U \N, an unknown escape's character) or a numeric escape's code unit
+  Element = record
+    Value: uint64;
+    IsNumeric: bool;
+    IsOctal: bool;
+  end;
+
+// The byte at AIndex of AText as a number
+routine DoByte(const AText: string; const AIndex: int64): uint32;
+begin
+  return uint32(uint8(AText[AIndex]));
+end;
+
+// ATemplate with its first {} hole filled by AArg (a reason with its part named)
+routine DoFill(const ATemplate: string; const AArg: string): string;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(ATemplate) - 2 do
+    if (ATemplate[LI] = '{') and (ATemplate[LI + 1] = '}') then
+      return Substring(ATemplate, 0, LI) + AArg +
+        Substring(ATemplate, LI + 2, len(ATemplate) - LI - 2);
+    end;
+  end;
+  return ATemplate;
+end;
+
+// The code point at AIndex (a whole UTF-8 sequence), AIndex past it
+routine DoCodeAt(const AText: string; var AIndex: int64): uint64;
+begin
+  return uint64(DecodeUtf8Char(AText, AIndex));
+end;
+
+// An octal (ABase 8) or hex (ABase 16, either case: clang) digit's value into AValue
+routine DoDigitValue(const AByte: uint32; const ABase: uint32; var AValue: uint32): bool;
+begin
+  AValue := 0;
+  if (AByte >= 0x30) and (AByte <= 0x39) then
+    AValue := AByte - 0x30;
+  else
+    if (ABase = 16) and (AByte >= 0x61) and (AByte <= 0x66) then
+      AValue := AByte - 0x61 + 10;
+    else
+      if (ABase = 16) and (AByte >= 0x41) and (AByte <= 0x46) then
+        AValue := AByte - 0x41 + 10;
+      else
+        return false;
+      end;
+    end;
+  end;
+  return AValue < ABase;
+end;
+
+// A simple escape's value into AValue: the quotes, '?' and '\' are themselves, the
+// control escapes their byte, \e and \E the GNU escape (0x1B); false for any other byte
+routine DoSimpleEscape(const AByte: uint32; var AValue: uint64): bool;
+begin
+  AValue := uint64(AByte);
+  if (AByte = 0x22) or (AByte = 0x27) or (AByte = 0x3F) or (AByte = 0x5C) then
+    return true;
+  end;
+  AValue := 0;
+  if AByte = 0x61 then
+    AValue := 0x07;
+  end;
+  if AByte = 0x62 then
+    AValue := 0x08;
+  end;
+  if AByte = 0x66 then
+    AValue := 0x0C;
+  end;
+  if AByte = 0x6E then
+    AValue := 0x0A;
+  end;
+  if AByte = 0x72 then
+    AValue := 0x0D;
+  end;
+  if AByte = 0x74 then
+    AValue := 0x09;
+  end;
+  if AByte = 0x76 then
+    AValue := 0x0B;
+  end;
+  if (AByte = 0x65) or (AByte = 0x45) then
+    AValue := 0x1B;
+  end;
+  return AValue <> 0;
+end;
+
+// AText[AIndex] is the '{' of \o{} \x{} \u{}: reads ABase digits up to the '}' (any count,
+// leading zeros fine) into AValue, AIndex past the '}'. A value past ALimit sets AOverflow
+// while the digits are still read (clang never wraps). Faults in clang's order: a bad
+// digit, then a missing '}', then none at all (false, AReason)
+routine DoDelimited(const AText: string; const ALast: int64; var AIndex: int64;
+  const ABase: uint32; const ALimit: uint64; var AValue: uint64; var AOverflow: bool;
+  var AReason: string): bool;
+var
+  LDigit: uint32;
+  LCount: int64;
+  LStart: int64;
+  LAcc: uint64;
+begin
+  AValue := 0;
+  AOverflow := false;
+  AReason := "";
+  LCount := 0;
+  LAcc := 0;
+  AIndex := AIndex + 1;
+  while (AIndex <= ALast) and (AText[AIndex] <> '}') do
+    if not DoDigitValue(DoByte(AText, AIndex), ABase, LDigit) then
+      LStart := AIndex;
+      DoCodeAt(AText, AIndex);
+      AReason := DoFill(ADAM_MSG_LITERALS_INVALID_DIGIT, Substring(AText, LStart, AIndex - LStart));
+      return false;
+    end;
+    // The accumulator stops at the first overflow: it never passes ALimit * 16
+    if not AOverflow then
+      LAcc := (LAcc * uint64(ABase)) + uint64(LDigit);
+      if LAcc > ALimit then
+        AOverflow := true;
+      end;
+    end;
+    LCount := LCount + 1;
+    AIndex := AIndex + 1;
+  end;
+  if AIndex > ALast then
+    AReason := ADAM_MSG_LITERALS_EXPECTED_CLOSE;
+    return false;
+  end;
+  if LCount = 0 then
+    AReason := ADAM_MSG_LITERALS_DELIM_EMPTY;
+    return false;
+  end;
+  AIndex := AIndex + 1;
+  if not AOverflow then
+    AValue := LAcc;
+  end;
+  return true;
+end;
+
+// An octal escape: 1-3 digits, greedy (\1011 = 'A' '1', \18 = 0x01 '8'); three octal
+// digits reach 511 at most. AIndex is at its first digit
+routine DoOctal(const AText: string; const ALast: int64; var AIndex: int64;
+  var AElem: Element);
+var
+  LValue: uint64;
+  LCount: int64;
+  LDigit: uint32;
+begin
+  LValue := 0;
+  LCount := 0;
+  while (AIndex <= ALast) and (LCount < 3) and DoDigitValue(DoByte(AText, AIndex), 8, LDigit) do
+    LValue := (LValue * 8) + uint64(LDigit);
+    LCount := LCount + 1;
+    AIndex := AIndex + 1;
+  end;
+  AElem.Value := LValue;
+  AElem.IsNumeric := true;
+  AElem.IsOctal := true;
+end;
+
+// \o{octal+} (only braced): AIndex at the 'o'
+routine DoOctalBraced(const AText: string; const ALast: int64; var AIndex: int64;
+  var AElem: Element; var AReason: string): bool;
+var
+  LValue: uint64;
+  LOverflow: bool;
+begin
+  AIndex := AIndex + 1;
+  if (AIndex > ALast) or (AText[AIndex] <> '{') then
+    AReason := DoFill(ADAM_MSG_LITERALS_EXPECTED_BRACE, "o");
+    return false;
+  end;
+  if not DoDelimited(AText, ALast, AIndex, 8, ADAM_LITERALS_NUMERIC_MAX, LValue, LOverflow, AReason) then
+    return false;
+  end;
+  if LOverflow then
+    AReason := ADAM_MSG_LITERALS_OCTAL_RANGE;
+    return false;
+  end;
+  AElem.Value := LValue;
+  AElem.IsNumeric := true;
+  AElem.IsOctal := true;
+  return true;
+end;
+
+// \x{hex+} or greedy hex digits: a code unit, not a code point. AIndex at the 'x'
+routine DoHexEscape(const AText: string; const ALast: int64; var AIndex: int64;
+  var AElem: Element; var AReason: string): bool;
+var
+  LValue: uint64;
+  LOverflow: bool;
+  LCount: int64;
+  LDigit: uint32;
+begin
+  AIndex := AIndex + 1;
+  LValue := 0;
+  LOverflow := false;
+  if (AIndex <= ALast) and (AText[AIndex] = '{') then
+    if not DoDelimited(AText, ALast, AIndex, 16, ADAM_LITERALS_NUMERIC_MAX, LValue, LOverflow, AReason) then
+      return false;
+    end;
+  else
+    LCount := 0;
+    while (AIndex <= ALast) and DoDigitValue(DoByte(AText, AIndex), 16, LDigit) do
+      // Stops growing at the first overflow, so 32 bits never overflow the accumulator
+      if not LOverflow then
+        LValue := (LValue * 16) + uint64(LDigit);
+        if LValue > ADAM_LITERALS_NUMERIC_MAX then
+          LOverflow := true;
+        end;
+      end;
+      LCount := LCount + 1;
+      AIndex := AIndex + 1;
+    end;
+    if LCount = 0 then
+      AReason := DoFill(ADAM_MSG_LITERALS_NO_HEX_DIGITS, "x");
+      return false;
+    end;
+  end;
+  if LOverflow then
+    AReason := ADAM_MSG_LITERALS_HEX_RANGE;
+    return false;
+  end;
+  AElem.Value := LValue;
+  AElem.IsNumeric := true;
+  return true;
+end;
+
+// \u{hex+}, or exactly 4 (\u) / 8 (\U) hex digits; \U has no braced form. A surrogate or
+// a value past U+10FFFF is no character. AIndex at the 'u' / 'U'
+routine DoUcn(const AText: string; const ALast: int64; var AIndex: int64; var AElem: Element;
+  var AReason: string): bool;
+var
+  LWide: bool;
+  LValue: uint64;
+  LOverflow: bool;
+  LCount: int64;
+  LWant: int64;
+  LDigit: uint32;
+begin
+  LWide := AText[AIndex] = 'U';
+  AIndex := AIndex + 1;
+  LValue := 0;
+  LOverflow := false;
+  if (not LWide) and (AIndex <= ALast) and (AText[AIndex] = '{') then
+    if not DoDelimited(AText, ALast, AIndex, 16, ADAM_LITERALS_UNICODE_MAX, LValue, LOverflow, AReason) then
+      return false;
+    end;
+  else
+    LWant := 4;
+    if LWide then
+      LWant := 8;
+    end;
+    LCount := 0;
+    while (AIndex <= ALast) and (LCount < LWant) and DoDigitValue(DoByte(AText, AIndex), 16, LDigit) do
+      if not LOverflow then
+        LValue := (LValue * 16) + uint64(LDigit);
+        if LValue > ADAM_LITERALS_UNICODE_MAX then
+          LOverflow := true;
+        end;
+      end;
+      LCount := LCount + 1;
+      AIndex := AIndex + 1;
+    end;
+    // No digit and a short run are different faults in clang
+    if LCount = 0 then
+      if LWide then
+        AReason := DoFill(ADAM_MSG_LITERALS_NO_HEX_DIGITS, "U");
+      else
+        AReason := DoFill(ADAM_MSG_LITERALS_NO_HEX_DIGITS, "u");
+      end;
+      return false;
+    end;
+    if LCount < LWant then
+      AReason := ADAM_MSG_LITERALS_INCOMPLETE_UCN;
+      return false;
+    end;
+  end;
+  if LOverflow or ((LValue >= 0xD800) and (LValue <= 0xDFFF)) then
+    AReason := ADAM_MSG_LITERALS_INVALID_UCN;
+    return false;
+  end;
+  AElem.Value := LValue;
+  return true;
+end;
+
+// \N{name}: the name runs to the next '}', matched exactly. AIndex at the 'N'
+routine DoNamed(const AText: string; const ALast: int64; var AIndex: int64; var AElem: Element;
+  var AReason: string): bool;
+var
+  LStart: int64;
+  LEnd: int64;
+  LName: string;
+  LCode: uint32;
+begin
+  AIndex := AIndex + 1;
+  if (AIndex > ALast) or (AText[AIndex] <> '{') then
+    AReason := DoFill(ADAM_MSG_LITERALS_EXPECTED_BRACE, "N");
+    return false;
+  end;
+  LStart := AIndex + 1;
+  LEnd := LStart;
+  while (LEnd <= ALast) and (AText[LEnd] <> '}') do
+    LEnd := LEnd + 1;
+  end;
+  if LEnd > ALast then
+    AReason := ADAM_MSG_LITERALS_INCOMPLETE_UCN;
+    return false;
+  end;
+  if LEnd = LStart then
+    AReason := ADAM_MSG_LITERALS_DELIM_EMPTY;
+    return false;
+  end;
+  LName := Substring(AText, LStart, LEnd - LStart);
+  LCode := 0;
+  if not LookupUnicodeName(LName, LCode) then
+    AReason := DoFill(ADAM_MSG_LITERALS_UNKNOWN_NAME, LName);
+    return false;
+  end;
+  AIndex := LEnd + 1;
+  AElem.Value := uint64(LCode);
+  return true;
+end;
+
+// The one escape engine. AText[AIndex] is the character after '\' (AIndex <= ALast: the
+// caller checked); AIndex steps past the escape and AElem is its value. False = an error
+// (AReason). An unknown escape is its character and sets AWarning when none is set yet
+routine DoEscape(const AText: string; const ALast: int64; var AIndex: int64; var AElem: Element;
+  var AWarning: string; var AReason: string): bool;
+var
+  LByte: uint32;
+  LStart: int64;
+begin
+  AReason := "";
+  AElem.Value := 0;
+  AElem.IsNumeric := false;
+  AElem.IsOctal := false;
+  LByte := DoByte(AText, AIndex);
+  if DoSimpleEscape(LByte, AElem.Value) then
+    AIndex := AIndex + 1;
+    return true;
+  end;
+  if (LByte >= 0x30) and (LByte <= 0x37) then
+    DoOctal(AText, ALast, AIndex, AElem);
+    return true;
+  end;
+  if LByte = 0x6F then
+    return DoOctalBraced(AText, ALast, AIndex, AElem, AReason);
+  end;
+  if LByte = 0x78 then
+    return DoHexEscape(AText, ALast, AIndex, AElem, AReason);
+  end;
+  if (LByte = 0x75) or (LByte = 0x55) then
+    return DoUcn(AText, ALast, AIndex, AElem, AReason);
+  end;
+  if LByte = 0x4E then
+    return DoNamed(AText, ALast, AIndex, AElem, AReason);
+  end;
+
+  // Unknown (\q, \(, \8, a multi-byte character): the character itself, backslash dropped,
+  // and a warning (clang's -Wunknown-escape-sequence)
+  LStart := AIndex;
+  AElem.Value := DoCodeAt(AText, AIndex);
+  if AWarning = "" then
+    AWarning := DoFill(ADAM_MSG_LITERALS_UNKNOWN_ESCAPE, Substring(AText, LStart, AIndex - LStart));
+  end;
+  return true;
+end;
+
+// Why a numeric escape does not fit an encoding (clang's words by its base)
+routine DoRangeReason(const AElem: Element): string;
+begin
+  if AElem.IsOctal then
+    return ADAM_MSG_LITERALS_OCTAL_RANGE;
+  end;
+  return ADAM_MSG_LITERALS_HEX_RANGE;
+end;
+
+// AFault set to an error AReason unless it holds one already (the first fault is kept)
+routine DoFault(var AFault: EncodingFault; const AReason: string);
+begin
+  if AFault.Reason = "" then
+    AFault.Reason := AReason;
+    AFault.IsWarning := false;
+  end;
+end;
+
+// AResult empty, its buffers sized for ACapacity bytes / units (a literal's value never
+// has more than its spelling has bytes)
+routine DoStart(var AResult: DecodedLiteral; const ACapacity: int64);
+begin
+  AResult.Status := LiteralStatus.Ok;
+  AResult.Reason := "";
+  AResult.NarrowFault.Reason := "";
+  AResult.NarrowFault.IsWarning := false;
+  AResult.WideFault.Reason := "";
+  AResult.WideFault.IsWarning := false;
+  AResult.CharValue := 0;
+  // Sized by length (a wstring takes no narrow ""), filled by the decoder, cut at the end
+  setlength(AResult.Narrow, ACapacity);
+  setlength(AResult.Wide, ACapacity);
+end;
+
+// AResult as an error: no value in either encoding, AReason why
+routine DoError(var AResult: DecodedLiteral; const AReason: string);
+begin
+  AResult.Status := LiteralStatus.Error;
+  AResult.Reason := AReason;
+  setlength(AResult.Narrow, 0);
+  setlength(AResult.Wide, 0);
+  AResult.NarrowFault.Reason := "";
+  AResult.NarrowFault.IsWarning := false;
+  AResult.WideFault.Reason := "";
+  AResult.WideFault.IsWarning := false;
+  AResult.CharValue := 0;
+end;
+
+// AElem appended to both values: a code point as UTF-8 / UTF-16, a numeric escape as one
+// byte / one unit where it fits, else a fault of that encoding
+routine DoPut(const AElem: Element; var AResult: DecodedLiteral; var ANarrowAt: int64;
+  var AWideAt: int64);
+begin
+  if not AElem.IsNumeric then
+    if AResult.NarrowFault.Reason = "" then
+      EncodeUtf8Char(AResult.Narrow, ANarrowAt, uint32(AElem.Value));
+    end;
+    if AResult.WideFault.Reason = "" then
+      EncodeUtf16Char(AResult.Wide, AWideAt, uint32(AElem.Value));
+    end;
+    return;
+  end;
+  if AElem.Value <= ADAM_LITERALS_NARROW_MAX then
+    if AResult.NarrowFault.Reason = "" then
+      AResult.Narrow[ANarrowAt] := char(uint8(AElem.Value));
+      ANarrowAt := ANarrowAt + 1;
+    end;
+  else
+    DoFault(AResult.NarrowFault, DoRangeReason(AElem));
+  end;
+  if AElem.Value <= ADAM_LITERALS_WIDE_MAX then
+    if AResult.WideFault.Reason = "" then
+      AResult.Wide[AWideAt] := wchar(uint16(AElem.Value));
+      AWideAt := AWideAt + 1;
+    end;
+  else
+    DoFault(AResult.WideFault, DoRangeReason(AElem));
+  end;
+end;
+
+// The values cut to what was written, a faulted encoding's value emptied; an error when
+// neither encoding has a value, a warning when AWarning names a shared fault. The error's
+// reason is the narrow one (the default encoding's), except a character too large for
+// both: then it names both, since the parser cannot tell which type the literal gets
+routine DoFinish(var AResult: DecodedLiteral; const ANarrowAt: int64; const AWideAt: int64;
+  const AWarning: string);
+var
+  LNarrowError: bool;
+  LWideError: bool;
+  LReason: string;
+begin
+  setlength(AResult.Narrow, ANarrowAt);
+  setlength(AResult.Wide, AWideAt);
+  LNarrowError := (AResult.NarrowFault.Reason <> "") and (not AResult.NarrowFault.IsWarning);
+  LWideError := (AResult.WideFault.Reason <> "") and (not AResult.WideFault.IsWarning);
+  if LNarrowError and LWideError then
+    // A copy: DoError clears the field a const parameter would still point at
+    LReason := AResult.NarrowFault.Reason;
+    if (LReason = ADAM_MSG_LITERALS_CHAR_TOO_LARGE) and
+      (AResult.WideFault.Reason = ADAM_MSG_LITERALS_WIDE_TOO_LARGE) then
+      LReason := ADAM_MSG_LITERALS_BOTH_TOO_LARGE;
+    end;
+    DoError(AResult, LReason);
+    return;
+  end;
+  if LNarrowError then
+    setlength(AResult.Narrow, 0);
+  end;
+  if LWideError then
+    setlength(AResult.Wide, 0);
+  end;
+  if AWarning <> "" then
+    AResult.Status := LiteralStatus.Warning;
+    AResult.Reason := AWarning;
+  end;
+end;
+
+// A "..." string's body (Decode checked the shape): its elements into both values
+routine DoDecodeNormal(const AText: string; var AResult: DecodedLiteral);
+var
+  LIndex: int64;
+  LLast: int64;
+  LNarrowAt: int64;
+  LWideAt: int64;
+  LElem: Element;
+  LWarning: string;
+  LReason: string;
+begin
+  LNarrowAt := 0;
+  LWideAt := 0;
+  LWarning := "";
+  LLast := len(AText) - 2;
+  LIndex := 1;
+  while LIndex <= LLast do
+    if AText[LIndex] = '\\' then
+      LIndex := LIndex + 1;
+      // A '\' cannot end the body: it would have escaped the closing quote
+      if LIndex > LLast then
+        DoError(AResult, ADAM_MSG_LITERALS_BAD_SHAPE);
+        return;
+      end;
+      LReason := "";
+      if not DoEscape(AText, LLast, LIndex, LElem, LWarning, LReason) then
+        DoError(AResult, LReason);
+        return;
+      end;
+    else
+      LElem.Value := DoCodeAt(AText, LIndex);
+      LElem.IsNumeric := false;
+      LElem.IsOctal := false;
+    end;
+    DoPut(LElem, AResult, LNarrowAt, LWideAt);
+  end;
+
+  // Numeric escapes can spell bytes that are no UTF-8: the narrow value must be text
+  setlength(AResult.Narrow, LNarrowAt);
+  if (AResult.NarrowFault.Reason = "") and (not IsUtf8(AResult.Narrow)) then
+    DoFault(AResult.NarrowFault, ADAM_MSG_LITERALS_NOT_UTF8);
+  end;
+  DoFinish(AResult, LNarrowAt, LWideAt, LWarning);
+end;
+
+// A raw string R"d(body)d": the body as written, CR LF read as LF, a lone CR kept
+routine DoDecodeRaw(const AText: string; var AResult: DecodedLiteral);
+var
+  LOpen: int64;
+  LDelimiter: string;
+  LBodyLast: int64;
+  LIndex: int64;
+  LNarrowAt: int64;
+  LWideAt: int64;
+  LElem: Element;
+begin
+  LOpen := 2;
+  while (LOpen < len(AText)) and (AText[LOpen] <> '(') do
+    LOpen := LOpen + 1;
+  end;
+  if LOpen >= len(AText) then
+    DoError(AResult, ADAM_MSG_LITERALS_BAD_SHAPE);
+    return;
+  end;
+  LDelimiter := Substring(AText, 2, LOpen - 2);
+  if not EndsStr(")" + LDelimiter + "\"", AText) then
+    DoError(AResult, ADAM_MSG_LITERALS_BAD_SHAPE);
+    return;
+  end;
+  // The closing ')' sits at len - delimiter - 2; the body is what lies between
+  LBodyLast := len(AText) - len(LDelimiter) - 3;
+  if LBodyLast < LOpen then
+    DoError(AResult, ADAM_MSG_LITERALS_BAD_SHAPE);
+    return;
+  end;
+  LNarrowAt := 0;
+  LWideAt := 0;
+  LElem.IsNumeric := false;
+  LElem.IsOctal := false;
+  LIndex := LOpen + 1;
+  while LIndex <= LBodyLast do
+    if (DoByte(AText, LIndex) = 0x0D) and (LIndex < LBodyLast) and
+      (DoByte(AText, LIndex + 1) = 0x0A) then
+      LIndex := LIndex + 1;
+    else
+      LElem.Value := DoCodeAt(AText, LIndex);
+      DoPut(LElem, AResult, LNarrowAt, LWideAt);
+    end;
+  end;
+  DoFinish(AResult, LNarrowAt, LWideAt, "");
+end;
+
+// Decodes the string literal spelled ASpelling ("..." or R"d(...)d", splices removed) into
+// AResult, both encodings (see the header)
+exported routine DecodeString(const ASpelling: string; var AResult: DecodedLiteral);
+begin
+  DoStart(AResult, len(ASpelling));
+  if StartsStr("R\"", ASpelling) then
+    DoDecodeRaw(ASpelling, AResult);
+    return;
+  end;
+  if (len(ASpelling) < 2) or (ASpelling[0] <> '"') or (ASpelling[len(ASpelling) - 1] <> '"') then
+    DoError(AResult, ADAM_MSG_LITERALS_BAD_SHAPE);
+    return;
+  end;
+  DoDecodeNormal(ASpelling, AResult);
+end;
+
+// One element of a char literal judged for both encodings (BNF sec 9, clang's rules): a
+// narrow char holds a numeric escape up to 0xFF or a code point up to U+007F; a wchar (16
+// bits) holds one up to 0xFFFF
+routine DoCharElement(const AElem: Element; var AResult: DecodedLiteral);
+begin
+  if AElem.IsNumeric then
+    if AElem.Value > ADAM_LITERALS_NARROW_MAX then
+      DoFault(AResult.NarrowFault, DoRangeReason(AElem));
+    end;
+    if AElem.Value > ADAM_LITERALS_WIDE_MAX then
+      DoFault(AResult.WideFault, DoRangeReason(AElem));
+    end;
+    return;
+  end;
+  if AElem.Value > ADAM_LITERALS_CHAR_ASCII_MAX then
+    DoFault(AResult.NarrowFault, ADAM_MSG_LITERALS_CHAR_TOO_LARGE);
+  end;
+  if AElem.Value > ADAM_LITERALS_WIDE_MAX then
+    DoFault(AResult.WideFault, ADAM_MSG_LITERALS_WIDE_TOO_LARGE);
+  end;
+end;
+
+// Decodes the character literal spelled ASpelling ('...', splices removed) into AResult,
+// both encodings: Narrow / Wide hold its element(s), CharValue the narrow value. Several
+// elements are a multi-character literal: a warning of the narrow encoding (clang's
+// -Wmultichar; "too long" past 4) and a fault of the wide one
+exported routine DecodeChar(const ASpelling: string; var AResult: DecodedLiteral);
+var
+  LIndex: int64;
+  LLast: int64;
+  LNarrowAt: int64;
+  LWideAt: int64;
+  LElem: Element;
+  LWarning: string;
+  LReason: string;
+  LCount: int64;
+  LMulti: uint64;
+  LFirst: uint64;
+begin
+  DoStart(AResult, len(ASpelling));
+  if (len(ASpelling) < 2) or (ASpelling[0] <> '\'') or (ASpelling[len(ASpelling) - 1] <> '\'') then
+    DoError(AResult, ADAM_MSG_LITERALS_BAD_SHAPE);
+    return;
+  end;
+  LNarrowAt := 0;
+  LWideAt := 0;
+  LWarning := "";
+  LCount := 0;
+  LMulti := 0;
+  LFirst := 0;
+  LLast := len(ASpelling) - 2;
+  LIndex := 1;
+  while LIndex <= LLast do
+    // One element: an escape, or one source character (a code point)
+    if ASpelling[LIndex] = '\\' then
+      LIndex := LIndex + 1;
+      if LIndex > LLast then
+        DoError(AResult, ADAM_MSG_LITERALS_BAD_SHAPE);
+        return;
+      end;
+      LReason := "";
+      if not DoEscape(ASpelling, LLast, LIndex, LElem, LWarning, LReason) then
+        DoError(AResult, LReason);
+        return;
+      end;
+    else
+      LElem.Value := DoCodeAt(ASpelling, LIndex);
+      LElem.IsNumeric := false;
+      LElem.IsOctal := false;
+    end;
+    DoCharElement(LElem, AResult);
+    DoPut(LElem, AResult, LNarrowAt, LWideAt);
+    if LCount = 0 then
+      LFirst := LElem.Value;
+    end;
+    LCount := LCount + 1;
+    // The multi-char value (clang): each element's low byte shifted in, 32 bits kept
+    LMulti := ((LMulti shl 8) | (LElem.Value & 0xFF)) & ADAM_LITERALS_MULTI_MASK;
+  end;
+
+  if LCount = 0 then
+    DoError(AResult, ADAM_MSG_LITERALS_CHAR_EMPTY);
+    return;
+  end;
+  if LCount = 1 then
+    AResult.CharValue := LFirst;
+  else
+    AResult.CharValue := LMulti;
+    DoFault(AResult.WideFault, ADAM_MSG_LITERALS_WIDE_MULTI);
+    if AResult.NarrowFault.Reason = "" then
+      AResult.NarrowFault.IsWarning := true;
+      if LCount > ADAM_LITERALS_MULTI_MAX then
+        AResult.NarrowFault.Reason := ADAM_MSG_LITERALS_TOO_LONG;
+      else
+        AResult.NarrowFault.Reason := ADAM_MSG_LITERALS_MULTI;
+      end;
+    end;
+  end;
+  DoFinish(AResult, LNarrowAt, LWideAt, LWarning);
+  if (AResult.Status <> LiteralStatus.Error) and (AResult.NarrowFault.Reason <> "") and
+    (not AResult.NarrowFault.IsWarning) then
+    AResult.CharValue := 0;
+  end;
+end;
+
+// True when AText has a library name's shape (BNF sec 2: @linklibrary and an external
+// clause's library): not empty, no blank or control character, no path separator or
+// drive colon. "user32", "name.lib" and "name.dll" are names; a path is not
+exported routine IsLibraryName(const AText: string): bool;
+var
+  LI: int64;
+  LByte: uint32;
+begin
+  if AText = "" then
+    return false;
+  end;
+  for LI := 0 to len(AText) - 1 do
+    LByte := DoByte(AText, LI);
+    if (LByte <= 0x20) or (LByte = 0x2F) or (LByte = 0x5C) or (LByte = 0x3A) then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+end.

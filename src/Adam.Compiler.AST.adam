@@ -1,0 +1,1542 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Compiler.AST.adam - The whole-program AST (DESIGN sec 3)
+
+  NodeKind      what a node is: one value per construct of BNF sec 1-8, plus
+                the program, the system scope (builtin types, intrinsics),
+                the holder of the types Semantics makes, an error node over a
+                span the parser skipped, and a generic instance (sec 10, M10)
+  NodeRole      the part a node plays in its parent (Condition, Then, Param,
+                ...): a parent keeps its children in source order, each with
+                its role, so a walk over every child is one loop
+  OperatorKind  an operator by meaning; the spelling stays in Node.Text
+                ("or" and "||" are both LogicalOr, "mod" and "%" Modulo)
+  NodeFlag      a word written on a declaration or an expression (public or
+                exported: Public; hidden, virtual, var, const, packed,
+                downto, ->, ...)
+  ConstValue    a constant's value, as Semantics folds it
+  Linkage       the linkage Semantics settles (an overload demoted to cpplink)
+  Node          one node: its kind, its place (embedded SourcePlace) and
+                physical byte range, what the parser read, and the Resolved*
+                fields every later phase writes, declared here up front
+  NodeList      a list of node ids: Adam.Core.Containers' Int64List
+  SyntaxTree    the arena: every node of the program by id, and the tree's
+                structure (each node's parent, role and children). Id 0 is
+                no node, 1 the program, 2 the system scope, 3 the holder of
+                derived types; the modules follow as the parser adds them
+
+  The AST is the single source of truth: a phase reads it and writes what it
+  resolves into the Resolved* fields, and nothing shadows it. A cross link (a
+  name to its declaration, an expression to its type) is a node id, never a
+  pointer: the arena is the one owner of every node, and a walk goes in id
+  or source order, so nothing depends on an address (DESIGN sec 5). A node
+  has one parent; the structure changes only through SyntaxTree (Attach,
+  ReplaceChild), which keeps parent, role and child list in step. A broken
+  invariant (an id that is no node, a node attached twice, a cycle) raises:
+  it is a compiler defect, never a user's error.
+
+  Where each construct keeps its parts (the roles; a role in brackets is
+  optional, a star repeats; a node's own text is the name it declares or
+  the spelling it was written with):
+    Module          Directive* Import* Declaration* [Initialize] [Finalize]
+                    [Body] Test*; Node.Module is its kind
+    routine         Param* [ReturnType] [External | Local* Body]
+                    GenericParam*; flags Clink / Cpplink / Variadic
+    var / const     TypeOf [Initializer | ConstructorArgument*] [External]
+    type decl       GenericParam* TypeOf (the type it defines)
+    record, object  [Parent] Implements* Member* [Align]; flags Packed, Final
+    array           [LowBound HighBound] Element; set: Element or the bounds
+    statements      if: Condition Then* Else*; while: Condition Statement*;
+                    for: Iterator Start Limit Statement* (flag Downto);
+                    repeat: Statement* Condition; match: Subject Arm* Else*,
+                    an arm Label* Statement*, a label LowBound [HighBound];
+                    guard: Statement* Except* Finally*; return: [Value]
+    expressions     assign: Target Source; binary: Left Right; unary and
+                    postfix: Operand; call: Callee Argument*; index: Operand
+                    Index; member: Operand (the member in Text, flag Arrow);
+                    is / as / casts: Operand TypeOf (a cast's arguments past
+                    the first Argument*, reported); ?: Condition Then Else;
+                    owner new: TypeOf Argument*; varargs: [Argument] [TypeOf];
+                    set literal: Element*, a SetElement LowBound [HighBound];
+                    record literal: TypeOf Argument*, a FieldInit Value
+    type exprs      pointer type, own / ref / weak: Element (flag
+                    ConstTarget); array: as above; routine type: Param*
+                    [ReturnType], a Param TypeOf (flag VarParam / ConstParam)
+*******************************************************************************/
+
+module unit Adam.Compiler.AST;
+
+import System.SysUtils, Adam.Core.Common, Adam.Core.Containers, Adam.Compiler.SourceText, Adam.Compiler.Literals;
+
+exported const
+  // The fixed ids: no node, the program, the system scope, derived types
+  ADAM_AST_NO_NODE: int64 = 0;
+  ADAM_AST_PROGRAM: int64 = 1;
+  ADAM_AST_SYSTEM: int64 = 2;
+  ADAM_AST_DERIVED: int64 = 3;
+
+  // How many nodes the arena makes room for first (then it doubles)
+  ADAM_AST_FIRST_CAPACITY: int64 = 256;
+
+const
+  // Invariant texts: a compiler defect, raised (never a diagnostic)
+  ADAM_AST_FAULT_NO_NODE: string = "AST: there is no node #";
+  ADAM_AST_FAULT_ATTACHED: string = "AST: node is attached already: #";
+  ADAM_AST_FAULT_DETACHED: string = "AST: node has no parent: #";
+  ADAM_AST_FAULT_CYCLE: string = "AST: attaching would make a cycle: #";
+  ADAM_AST_FAULT_NO_ROLE: string = "AST: a child needs a role: #";
+  ADAM_AST_FAULT_FIXED_ID: string = "AST: a fixed node did not get its id: #";
+
+exported type
+  // What a node is (BNF sec 1-8; sec 10's instance for M10)
+  NodeKind = choices(
+    None, Error,
+    Program, SystemScope, BuiltinTypeDecl, IntrinsicDecl, DerivedTypes,
+    Module, Import, Directive, InitializeSection, FinalizeSection, TestBlock,
+    VarDecl, ConstDecl, TypeDecl, RoutineDecl, ForwardRoutine, ForwardType,
+    Param, ExternalClause, GenericParam,
+    RecordType, ObjectType, InterfaceType, OverlayType, AnonRecord, AnonOverlay,
+    ChoicesType, ChoiceValue, ArrayType, PointerType, SetType, RoutineType,
+    NamedType, BuiltinTypeName, OwnType, RefType, WeakType,
+    FieldDecl, EmbedDecl, MethodDecl, PropertyDecl, PropertyRead, PropertyWrite,
+    InitDecl, CopyDecl, DoneDecl, OperatorDecl,
+    Block, IfStatement, WhileStatement, ForStatement, RepeatStatement,
+    MatchStatement, MatchArm, MatchLabel, GuardStatement, ReturnStatement,
+    LeaveStatement, SkipStatement, ExpressionStatement,
+    AssignExpression, ConditionalExpression, BinaryExpression, UnaryExpression,
+    PostfixExpression, IsExpression, AsExpression, CallExpression,
+    IndexExpression, MemberExpression, NameExpression, ParenExpression,
+    IntLiteral, FloatLiteral, StringLiteral, CharLiteral, BoolLiteral,
+    NilLiteral, SelfExpression, ParentExpression, OwnNew, RefNew, WeakNew,
+    VarargsExpression, TypeCast, PointerCast, SetLiteral, SetElement,
+    RecordLiteral, FieldInit,
+    GenericInstance);
+
+  // The part a node plays in its parent
+  NodeRole = choices(
+    None, Module, System, Derived, SystemDecl, DerivedType,
+    Import, Directive, Declaration, Initialize, Finalize, Body, Test,
+    Argument, TypeOf, ReturnType, Initializer, ConstructorArgument, Param,
+    External, GenericParam, TypeArgument, Local, Statement,
+    Parent, Implements, Member, Element, LowBound, HighBound, Align, BitWidth,
+    Read, Write, Condition, Then, Else, Iterator, Start, Limit, Subject, Arm,
+    Label, Except, Finally, Value, Target, Source, Left, Right, Operand,
+    Callee, Index);
+
+  // An operator by meaning (BNF sec 6; an operator declaration's symbol too)
+  OperatorKind = choices(
+    None,
+    Assign, AddAssign, SubtractAssign, MultiplyAssign, DivideAssign,
+    ModuloAssign, BitAndAssign, BitOrAssign, ShiftLeftAssign, ShiftRightAssign,
+    LogicalOr, LogicalAnd, Equal, NotEqual, Less, LessEqual, Greater,
+    GreaterEqual, Compare, In,
+    Add, Subtract, BitOr, Xor, ShiftLeft, ShiftRight,
+    Multiply, Divide, IntDivide, Modulo, BitAnd,
+    LogicalNot, Negate, Plus, AddressOf, BitNot, Deref, Increment, Decrement);
+
+  // A word written on a node. VarParam / ConstParam: a parameter's mode;
+  // ConstTarget: ptr to const; Arrow: a member reached by ->; Recovered: a
+  // node the parser built while recovering (Semantics is silent on it);
+  // ExceptPart: a guard written with an except part (an empty one too, which
+  // leaves no Except child); ElsePart: a match written with an else part (an
+  // empty one too, which leaves no Else child). NodeFlagsText loops to the
+  // last value: a value appended here moves that bound (and ast_vocab's)
+  NodeFlag = choices(
+    Public, Hidden, Virtual, Override, Final, Abstract, ConstMethod,
+    Clink, Cpplink, Variadic, VarParam, ConstParam, Packed, ConstTarget,
+    Downto, Arrow, DefaultProperty, Recovered, ExceptPart, ElsePart);
+
+  NodeFlags = set of NodeFlag;
+
+  // What a folded constant holds (Unknown: not folded, or no constant)
+  ConstKind = choices(Unknown, Signed, Unsigned, Float, Boolean, Char, String, Nil, Set);
+
+  // A constant's value: Bits holds an integer (two's complement for Signed),
+  // a char's code or a bool (0 / 1); Float a float; Text a string's bytes or
+  // a set's members
+  ConstValue = record
+    Kind: ConstKind;
+    Bits: uint64;
+    Float: float64;
+    Text: string;
+  end;
+
+  // The linkage Semantics settles (Unset: not yet, or none applies)
+  Linkage = choices(Unset, C, Cpp);
+
+  // The runtime unit's routines the code of a managed type's operations calls (DESIGN sec
+  // 8), which no single node names: Semantics finds each once (SyntaxTree.RuntimeRoutineOf),
+  // Lowering calls it. StrRelease drops a string reference, StrAssign stores one (a ref
+  // added, the old one released), StrWrite writes a string's bytes to stdout, StrTake
+  // stores a reference already held into a hidden slot, StrConcat joins two strings and
+  // StrFromChar makes a char's string (both hand back a reference the caller holds),
+  // StrLength is a string's length (len), StrCompare orders two strings (-1, 0, 1),
+  // StrUnique makes a string variable's block its own before a write into its bytes (copy
+  // on write), StrSetLength is setlength on a string variable. StrRelease, StrAssign,
+  // StrTake and StrLength serve wstrings too (the block layout is one); the WStr* values
+  // are the wstring twins of the routines that depend on the unit size, WStrToUtf8 is
+  // utf8() (a reference the caller holds). StrAddRef adds a holder (a value parameter's own
+  // copy, a returned text or dynamic array); ManagedRelease and ManagedAssign release / copy
+  // the texts and dynamic arrays of a value whose type holds them at fixed offsets (a
+  // record, a static array: the compiler's managed map of the type). A dynamic array shares
+  // StrAddRef / StrTake / StrLength with the texts (the block layout is one); ArrRelease,
+  // ArrAssign, ArrUnique and ArrSetLength are its twins of StrRelease, StrAssign, StrUnique
+  // and StrSetLength, each taking the array type's element map. A ref shares StrAddRef with
+  // them; RefNew makes its block from the object type's ref descriptor, RefRelease and
+  // RefAssign are its twins of StrRelease and StrAssign (the last release ends the object).
+  // AbstractCall fills an abstract method's vtable slot (a call reaching it ends the
+  // process). FrameHandler is the platform unit's (Target.RuntimeUnit): the routine the OS
+  // calls for a frame whose unwind data holds a guard's scope table (a guard's finally run
+  // as its frame unwinds). Unhandled reports a raise nothing caught and ends the process
+  // (the entry's catch block calls it); Catch, the platform unit's, is the filter of the
+  // entry's catching scope (true for the runtime's own exception). SetRange raises a set
+  // literal's run-time item that lies outside its set (pcpp's EXC_SET_RANGE). A new value goes
+  // last and moves the high bound of SyntaxTree's FRuntimeRoutines
+  RuntimeRoutine = choices(StrRelease, StrAssign, StrWrite, StrTake, StrConcat, StrFromChar,
+    StrLength, StrCompare, StrUnique, StrSetLength, WStrConcat, WStrFromChar, WStrCompare,
+    WStrUnique, WStrSetLength, WStrToUtf8, StrAddRef, ManagedRelease, ManagedAssign,
+    ArrRelease, ArrAssign, ArrUnique, ArrSetLength, RefNew, RefRelease, RefAssign, AbstractCall,
+    FrameHandler, Unhandled, Catch, SetRange);
+
+  // How a print / println placeholder places its text in its width (std::format's align;
+  // None: the form's own, a number right, a text left)
+  FormatAlign = choices(None, Left, Center, Right);
+
+  // The sign a print / println placeholder writes before a number (None: as Minus)
+  FormatSign = choices(None, Minus, Plus, Space);
+
+  // One level of a print / println placeholder's spec (std::format's standard format
+  // spec, libc++'s __parser fields; DefaultFormatSpec gives the unwritten one): Fill the
+  // fill's UTF-8 (one code point; "" is a space); Width as written (0: none) or the
+  // argument holding it (WidthArgument, -1: none); Precision as written (-1: none) or the
+  // argument holding it (PrecisionArgument, -1: none); Alternate `#`, ZeroPad `0`,
+  // Localized `L`, ClearBrackets a range's `n`; Presentation the type letter ("": none,
+  // "?" the debug form)
+  FormatSpec = record
+    Fill: string;
+    Align: FormatAlign;
+    Sign: FormatSign;
+    Alternate: bool;
+    ZeroPad: bool;
+    Width: int32;
+    WidthArgument: int32;
+    Precision: int32;
+    PrecisionArgument: int32;
+    Localized: bool;
+    ClearBrackets: bool;
+    Presentation: string;
+  end;
+
+  // One placeholder of a print / println format: Text the format's text before it (its
+  // braces undoubled), Argument the argument it prints (0: the first after the format),
+  // Specs its spec by level: Specs[0] its own, then a range's element spec, that
+  // element's element spec, ... (one level per `:`)
+  FormatItem = record
+    Text: string;
+    Argument: int32;
+    Specs: array of FormatSpec;
+  end;
+
+  // A print / println format as Semantics read it once (SM0502): its placeholders in
+  // order and the text after the last one (braces undoubled). Node.ResolvedFormat /
+  // SyntaxTree.FormatOf; Lowering only reads it
+  FormatPlan = record
+    Items: array of FormatItem;
+    Tail: string;
+  end;
+
+// A placeholder spec nothing was written into: no fill, align, sign, width, precision or
+// type (std::format's defaults)
+exported routine DefaultFormatSpec(): FormatSpec;
+var
+  LSpec: FormatSpec;
+begin
+  LSpec.Fill := "";
+  LSpec.Align := FormatAlign.None;
+  LSpec.Sign := FormatSign.None;
+  LSpec.Alternate := false;
+  LSpec.ZeroPad := false;
+  LSpec.Width := 0;
+  LSpec.WidthArgument := -1;
+  LSpec.Precision := -1;
+  LSpec.PrecisionArgument := -1;
+  LSpec.Localized := false;
+  LSpec.ClearBrackets := false;
+  LSpec.Presentation := "";
+  return LSpec;
+end;
+
+// The name of AKind, as a row or a dump prints it
+exported routine NodeKindText(const AKind: NodeKind): string;
+begin
+  match AKind of
+    NodeKind.None: return "None";
+    NodeKind.Error: return "Error";
+    NodeKind.Program: return "Program";
+    NodeKind.SystemScope: return "SystemScope";
+    NodeKind.BuiltinTypeDecl: return "BuiltinTypeDecl";
+    NodeKind.IntrinsicDecl: return "IntrinsicDecl";
+    NodeKind.DerivedTypes: return "DerivedTypes";
+    NodeKind.Module: return "Module";
+    NodeKind.Import: return "Import";
+    NodeKind.Directive: return "Directive";
+    NodeKind.InitializeSection: return "InitializeSection";
+    NodeKind.FinalizeSection: return "FinalizeSection";
+    NodeKind.TestBlock: return "TestBlock";
+    NodeKind.VarDecl: return "VarDecl";
+    NodeKind.ConstDecl: return "ConstDecl";
+    NodeKind.TypeDecl: return "TypeDecl";
+    NodeKind.RoutineDecl: return "RoutineDecl";
+    NodeKind.ForwardRoutine: return "ForwardRoutine";
+    NodeKind.ForwardType: return "ForwardType";
+    NodeKind.Param: return "Param";
+    NodeKind.ExternalClause: return "ExternalClause";
+    NodeKind.GenericParam: return "GenericParam";
+    NodeKind.RecordType: return "RecordType";
+    NodeKind.ObjectType: return "ObjectType";
+    NodeKind.InterfaceType: return "InterfaceType";
+    NodeKind.OverlayType: return "OverlayType";
+    NodeKind.AnonRecord: return "AnonRecord";
+    NodeKind.AnonOverlay: return "AnonOverlay";
+    NodeKind.ChoicesType: return "ChoicesType";
+    NodeKind.ChoiceValue: return "ChoiceValue";
+    NodeKind.ArrayType: return "ArrayType";
+    NodeKind.PointerType: return "PointerType";
+    NodeKind.SetType: return "SetType";
+    NodeKind.RoutineType: return "RoutineType";
+    NodeKind.NamedType: return "NamedType";
+    NodeKind.BuiltinTypeName: return "BuiltinTypeName";
+    NodeKind.OwnType: return "OwnType";
+    NodeKind.RefType: return "RefType";
+    NodeKind.WeakType: return "WeakType";
+    NodeKind.FieldDecl: return "FieldDecl";
+    NodeKind.EmbedDecl: return "EmbedDecl";
+    NodeKind.MethodDecl: return "MethodDecl";
+    NodeKind.PropertyDecl: return "PropertyDecl";
+    NodeKind.PropertyRead: return "PropertyRead";
+    NodeKind.PropertyWrite: return "PropertyWrite";
+    NodeKind.InitDecl: return "InitDecl";
+    NodeKind.CopyDecl: return "CopyDecl";
+    NodeKind.DoneDecl: return "DoneDecl";
+    NodeKind.OperatorDecl: return "OperatorDecl";
+    NodeKind.Block: return "Block";
+    NodeKind.IfStatement: return "IfStatement";
+    NodeKind.WhileStatement: return "WhileStatement";
+    NodeKind.ForStatement: return "ForStatement";
+    NodeKind.RepeatStatement: return "RepeatStatement";
+    NodeKind.MatchStatement: return "MatchStatement";
+    NodeKind.MatchArm: return "MatchArm";
+    NodeKind.MatchLabel: return "MatchLabel";
+    NodeKind.GuardStatement: return "GuardStatement";
+    NodeKind.ReturnStatement: return "ReturnStatement";
+    NodeKind.LeaveStatement: return "LeaveStatement";
+    NodeKind.SkipStatement: return "SkipStatement";
+    NodeKind.ExpressionStatement: return "ExpressionStatement";
+    NodeKind.AssignExpression: return "AssignExpression";
+    NodeKind.ConditionalExpression: return "ConditionalExpression";
+    NodeKind.BinaryExpression: return "BinaryExpression";
+    NodeKind.UnaryExpression: return "UnaryExpression";
+    NodeKind.PostfixExpression: return "PostfixExpression";
+    NodeKind.IsExpression: return "IsExpression";
+    NodeKind.AsExpression: return "AsExpression";
+    NodeKind.CallExpression: return "CallExpression";
+    NodeKind.IndexExpression: return "IndexExpression";
+    NodeKind.MemberExpression: return "MemberExpression";
+    NodeKind.NameExpression: return "NameExpression";
+    NodeKind.ParenExpression: return "ParenExpression";
+    NodeKind.IntLiteral: return "IntLiteral";
+    NodeKind.FloatLiteral: return "FloatLiteral";
+    NodeKind.StringLiteral: return "StringLiteral";
+    NodeKind.CharLiteral: return "CharLiteral";
+    NodeKind.BoolLiteral: return "BoolLiteral";
+    NodeKind.NilLiteral: return "NilLiteral";
+    NodeKind.SelfExpression: return "SelfExpression";
+    NodeKind.ParentExpression: return "ParentExpression";
+    NodeKind.OwnNew: return "OwnNew";
+    NodeKind.RefNew: return "RefNew";
+    NodeKind.WeakNew: return "WeakNew";
+    NodeKind.VarargsExpression: return "VarargsExpression";
+    NodeKind.TypeCast: return "TypeCast";
+    NodeKind.PointerCast: return "PointerCast";
+    NodeKind.SetLiteral: return "SetLiteral";
+    NodeKind.SetElement: return "SetElement";
+    NodeKind.RecordLiteral: return "RecordLiteral";
+    NodeKind.FieldInit: return "FieldInit";
+    NodeKind.GenericInstance: return "GenericInstance";
+  end;
+  return "";
+end;
+
+// The Adam words for AKind, as a message to a user names the construct (BNF's terms,
+// lowercase, no article): "while statement", "routine", "binary operator". NodeKindText
+// is the dump's name; this is the user's
+exported routine NodeKindWords(const AKind: NodeKind): string;
+begin
+  match AKind of
+    NodeKind.None: return "nothing";
+    NodeKind.Error: return "faulty construct";
+    NodeKind.Program: return "program";
+    NodeKind.SystemScope: return "system scope";
+    NodeKind.BuiltinTypeDecl: return "built-in type";
+    NodeKind.IntrinsicDecl: return "intrinsic";
+    NodeKind.DerivedTypes: return "derived types";
+    NodeKind.Module: return "module";
+    NodeKind.Import: return "import";
+    NodeKind.Directive: return "directive";
+    NodeKind.InitializeSection: return "initialize section";
+    NodeKind.FinalizeSection: return "finalize section";
+    NodeKind.TestBlock: return "test block";
+    NodeKind.VarDecl: return "variable";
+    NodeKind.ConstDecl: return "constant";
+    NodeKind.TypeDecl: return "type declaration";
+    NodeKind.RoutineDecl: return "routine";
+    NodeKind.ForwardRoutine: return "forward routine";
+    NodeKind.ForwardType: return "forward type";
+    NodeKind.Param: return "parameter";
+    NodeKind.ExternalClause: return "external clause";
+    NodeKind.GenericParam: return "generic parameter";
+    NodeKind.RecordType: return "record type";
+    NodeKind.ObjectType: return "object type";
+    NodeKind.InterfaceType: return "interface type";
+    NodeKind.OverlayType: return "overlay type";
+    NodeKind.AnonRecord: return "anonymous record";
+    NodeKind.AnonOverlay: return "anonymous overlay";
+    NodeKind.ChoicesType: return "choices type";
+    NodeKind.ChoiceValue: return "choice value";
+    NodeKind.ArrayType: return "array type";
+    NodeKind.PointerType: return "pointer type";
+    NodeKind.SetType: return "set type";
+    NodeKind.RoutineType: return "routine type";
+    NodeKind.NamedType: return "type name";
+    NodeKind.BuiltinTypeName: return "built-in type name";
+    NodeKind.OwnType: return "own type";
+    NodeKind.RefType: return "ref type";
+    NodeKind.WeakType: return "weak type";
+    NodeKind.FieldDecl: return "field";
+    NodeKind.EmbedDecl: return "embedded field";
+    NodeKind.MethodDecl: return "method";
+    NodeKind.PropertyDecl: return "property";
+    NodeKind.PropertyRead: return "property read";
+    NodeKind.PropertyWrite: return "property write";
+    NodeKind.InitDecl: return "init method";
+    NodeKind.CopyDecl: return "copy method";
+    NodeKind.DoneDecl: return "done method";
+    NodeKind.OperatorDecl: return "operator declaration";
+    NodeKind.Block: return "block";
+    NodeKind.IfStatement: return "if statement";
+    NodeKind.WhileStatement: return "while statement";
+    NodeKind.ForStatement: return "for statement";
+    NodeKind.RepeatStatement: return "repeat statement";
+    NodeKind.MatchStatement: return "match statement";
+    NodeKind.MatchArm: return "match arm";
+    NodeKind.MatchLabel: return "match label";
+    NodeKind.GuardStatement: return "guard statement";
+    NodeKind.ReturnStatement: return "return statement";
+    NodeKind.LeaveStatement: return "leave statement";
+    NodeKind.SkipStatement: return "skip statement";
+    NodeKind.ExpressionStatement: return "expression statement";
+    NodeKind.AssignExpression: return "assignment operator";
+    NodeKind.ConditionalExpression: return "conditional expression";
+    NodeKind.BinaryExpression: return "binary operator";
+    NodeKind.UnaryExpression: return "unary operator";
+    NodeKind.PostfixExpression: return "postfix operator";
+    NodeKind.IsExpression: return "is test";
+    NodeKind.AsExpression: return "as cast";
+    NodeKind.CallExpression: return "call";
+    NodeKind.IndexExpression: return "index";
+    NodeKind.MemberExpression: return "member access";
+    NodeKind.NameExpression: return "name";
+    NodeKind.ParenExpression: return "parenthesized expression";
+    NodeKind.IntLiteral: return "integer literal";
+    NodeKind.FloatLiteral: return "float literal";
+    NodeKind.StringLiteral: return "string literal";
+    NodeKind.CharLiteral: return "char literal";
+    NodeKind.BoolLiteral: return "bool literal";
+    NodeKind.NilLiteral: return "nil";
+    NodeKind.SelfExpression: return "self";
+    NodeKind.ParentExpression: return "parent";
+    NodeKind.OwnNew: return "own new expression";
+    NodeKind.RefNew: return "ref new expression";
+    NodeKind.WeakNew: return "weak new expression";
+    NodeKind.VarargsExpression: return "varargs";
+    NodeKind.TypeCast: return "type cast";
+    NodeKind.PointerCast: return "pointer cast";
+    NodeKind.SetLiteral: return "set literal";
+    NodeKind.SetElement: return "set element";
+    NodeKind.RecordLiteral: return "record literal";
+    NodeKind.FieldInit: return "field initializer";
+    NodeKind.GenericInstance: return "generic instance";
+  end;
+  return "";
+end;
+
+// The name of ARole, as a row or a dump prints it
+exported routine NodeRoleText(const ARole: NodeRole): string;
+begin
+  match ARole of
+    NodeRole.None: return "None";
+    NodeRole.Module: return "Module";
+    NodeRole.System: return "System";
+    NodeRole.Derived: return "Derived";
+    NodeRole.SystemDecl: return "SystemDecl";
+    NodeRole.DerivedType: return "DerivedType";
+    NodeRole.Import: return "Import";
+    NodeRole.Directive: return "Directive";
+    NodeRole.Declaration: return "Declaration";
+    NodeRole.Initialize: return "Initialize";
+    NodeRole.Finalize: return "Finalize";
+    NodeRole.Body: return "Body";
+    NodeRole.Test: return "Test";
+    NodeRole.Argument: return "Argument";
+    NodeRole.TypeOf: return "TypeOf";
+    NodeRole.ReturnType: return "ReturnType";
+    NodeRole.Initializer: return "Initializer";
+    NodeRole.ConstructorArgument: return "ConstructorArgument";
+    NodeRole.Param: return "Param";
+    NodeRole.External: return "External";
+    NodeRole.GenericParam: return "GenericParam";
+    NodeRole.TypeArgument: return "TypeArgument";
+    NodeRole.Local: return "Local";
+    NodeRole.Statement: return "Statement";
+    NodeRole.Parent: return "Parent";
+    NodeRole.Implements: return "Implements";
+    NodeRole.Member: return "Member";
+    NodeRole.Element: return "Element";
+    NodeRole.LowBound: return "LowBound";
+    NodeRole.HighBound: return "HighBound";
+    NodeRole.Align: return "Align";
+    NodeRole.BitWidth: return "BitWidth";
+    NodeRole.Read: return "Read";
+    NodeRole.Write: return "Write";
+    NodeRole.Condition: return "Condition";
+    NodeRole.Then: return "Then";
+    NodeRole.Else: return "Else";
+    NodeRole.Iterator: return "Iterator";
+    NodeRole.Start: return "Start";
+    NodeRole.Limit: return "Limit";
+    NodeRole.Subject: return "Subject";
+    NodeRole.Arm: return "Arm";
+    NodeRole.Label: return "Label";
+    NodeRole.Except: return "Except";
+    NodeRole.Finally: return "Finally";
+    NodeRole.Value: return "Value";
+    NodeRole.Target: return "Target";
+    NodeRole.Source: return "Source";
+    NodeRole.Left: return "Left";
+    NodeRole.Right: return "Right";
+    NodeRole.Operand: return "Operand";
+    NodeRole.Callee: return "Callee";
+    NodeRole.Index: return "Index";
+  end;
+  return "";
+end;
+
+// The name of AOperator, as a row or a dump prints it
+exported routine OperatorKindText(const AOperator: OperatorKind): string;
+begin
+  match AOperator of
+    OperatorKind.None: return "None";
+    OperatorKind.Assign: return "Assign";
+    OperatorKind.AddAssign: return "AddAssign";
+    OperatorKind.SubtractAssign: return "SubtractAssign";
+    OperatorKind.MultiplyAssign: return "MultiplyAssign";
+    OperatorKind.DivideAssign: return "DivideAssign";
+    OperatorKind.ModuloAssign: return "ModuloAssign";
+    OperatorKind.BitAndAssign: return "BitAndAssign";
+    OperatorKind.BitOrAssign: return "BitOrAssign";
+    OperatorKind.ShiftLeftAssign: return "ShiftLeftAssign";
+    OperatorKind.ShiftRightAssign: return "ShiftRightAssign";
+    OperatorKind.LogicalOr: return "LogicalOr";
+    OperatorKind.LogicalAnd: return "LogicalAnd";
+    OperatorKind.Equal: return "Equal";
+    OperatorKind.NotEqual: return "NotEqual";
+    OperatorKind.Less: return "Less";
+    OperatorKind.LessEqual: return "LessEqual";
+    OperatorKind.Greater: return "Greater";
+    OperatorKind.GreaterEqual: return "GreaterEqual";
+    OperatorKind.Compare: return "Compare";
+    OperatorKind.In: return "In";
+    OperatorKind.Add: return "Add";
+    OperatorKind.Subtract: return "Subtract";
+    OperatorKind.BitOr: return "BitOr";
+    OperatorKind.Xor: return "Xor";
+    OperatorKind.ShiftLeft: return "ShiftLeft";
+    OperatorKind.ShiftRight: return "ShiftRight";
+    OperatorKind.Multiply: return "Multiply";
+    OperatorKind.Divide: return "Divide";
+    OperatorKind.IntDivide: return "IntDivide";
+    OperatorKind.Modulo: return "Modulo";
+    OperatorKind.BitAnd: return "BitAnd";
+    OperatorKind.LogicalNot: return "LogicalNot";
+    OperatorKind.Negate: return "Negate";
+    OperatorKind.Plus: return "Plus";
+    OperatorKind.AddressOf: return "AddressOf";
+    OperatorKind.BitNot: return "BitNot";
+    OperatorKind.Deref: return "Deref";
+    OperatorKind.Increment: return "Increment";
+    OperatorKind.Decrement: return "Decrement";
+  end;
+  return "";
+end;
+
+// The name of AFlag, as a row or a dump prints it
+exported routine NodeFlagText(const AFlag: NodeFlag): string;
+begin
+  match AFlag of
+    NodeFlag.Public: return "Public";
+    NodeFlag.Hidden: return "Hidden";
+    NodeFlag.Virtual: return "Virtual";
+    NodeFlag.Override: return "Override";
+    NodeFlag.Final: return "Final";
+    NodeFlag.Abstract: return "Abstract";
+    NodeFlag.ConstMethod: return "ConstMethod";
+    NodeFlag.Clink: return "Clink";
+    NodeFlag.Cpplink: return "Cpplink";
+    NodeFlag.Variadic: return "Variadic";
+    NodeFlag.VarParam: return "VarParam";
+    NodeFlag.ConstParam: return "ConstParam";
+    NodeFlag.Packed: return "Packed";
+    NodeFlag.ConstTarget: return "ConstTarget";
+    NodeFlag.Downto: return "Downto";
+    NodeFlag.Arrow: return "Arrow";
+    NodeFlag.DefaultProperty: return "DefaultProperty";
+    NodeFlag.Recovered: return "Recovered";
+    NodeFlag.ExceptPart: return "ExceptPart";
+    NodeFlag.ElsePart: return "ElsePart";
+  end;
+  return "";
+end;
+
+// The names of the flags in AFlags, in NodeFlag's order, joined by ','
+exported routine NodeFlagsText(const AFlags: NodeFlags): string;
+var
+  LFlag: NodeFlag;
+  LText: string;
+begin
+  LText := "";
+  // NodeFlag's first to its last value (a value appended to NodeFlag moves this bound)
+  for LFlag := NodeFlag.Public to NodeFlag.ElsePart do
+    if LFlag in AFlags then
+      if LText <> "" then
+        LText := LText + ",";
+      end;
+      LText := LText + NodeFlagText(LFlag);
+    end;
+  end;
+  return LText;
+end;
+
+// The name of AKind, as a row or a dump prints it
+exported routine ConstKindText(const AKind: ConstKind): string;
+begin
+  match AKind of
+    ConstKind.Unknown: return "Unknown";
+    ConstKind.Signed: return "Signed";
+    ConstKind.Unsigned: return "Unsigned";
+    ConstKind.Float: return "Float";
+    ConstKind.Boolean: return "Boolean";
+    ConstKind.Char: return "Char";
+    ConstKind.String: return "String";
+    ConstKind.Nil: return "Nil";
+    ConstKind.Set: return "Set";
+  end;
+  return "";
+end;
+
+// AValue as a dump prints it: its kind, ':' and the value
+exported routine ConstValueText(const AValue: ConstValue): string;
+var
+  LText: string;
+begin
+  LText := ConstKindText(AValue.Kind) + ":";
+  match AValue.Kind of
+    ConstKind.Signed: LText := LText + IntToStr(int64(AValue.Bits));
+    ConstKind.Unsigned: LText := LText + UIntToStr(AValue.Bits);
+    ConstKind.Float: LText := LText + FloatToStr(AValue.Float);
+    ConstKind.Boolean: LText := LText + BoolToStr(AValue.Bits <> 0);
+    ConstKind.Char: LText := LText + UIntToStr(AValue.Bits);
+    ConstKind.String: LText := LText + "\"" + AValue.Text + "\"";
+    ConstKind.Set: LText := LText + "[" + AValue.Text + "]";
+  else
+    // Unknown and Nil carry no value
+  end;
+  return LText;
+end;
+
+// The name of ALinkage, as a row or a dump prints it
+exported routine LinkageText(const ALinkage: Linkage): string;
+begin
+  match ALinkage of
+    Linkage.Unset: return "Unset";
+    Linkage.C: return "C";
+    Linkage.Cpp: return "Cpp";
+  end;
+  return "";
+end;
+
+// AText with every control byte and DEL written as \xNN, so a decoded value stays on its
+// dump line; when AText is not UTF-8 (a char's numeric escape byte) every byte from 0x80
+// on is written so too, so the dump stays text
+routine DoVisible(const AText: string): string;
+var
+  LText: string;
+  LI: int64;
+  LByte: uint32;
+  LHighToo: bool;
+begin
+  LText := "";
+  LHighToo := not IsUtf8(AText);
+  for LI := 0 to len(AText) - 1 do
+    LByte := uint32(uint8(AText[LI]));
+    if (LByte < 0x20) or (LByte = 0x7F) or (LHighToo and (LByte >= 0x80)) then
+      LText := LText + "\\x" + IntToHex(uint64(LByte), 2);
+    else
+      LText := LText + AText[LI];
+    end;
+  end;
+  return LText;
+end;
+
+// True when AWide is exactly ANarrow's text as UTF-16 (the usual case: nothing to show
+// beside the narrow value)
+routine DoWideIsNarrow(const ANarrow: string; const AWide: wstring): bool;
+var
+  LUnits: wstring;
+  LIndex: int64;
+  LAt: int64;
+  LI: int64;
+begin
+  setlength(LUnits, len(ANarrow) + 1);
+  LIndex := 0;
+  LAt := 0;
+  while LIndex < len(ANarrow) do
+    EncodeUtf16Char(LUnits, LAt, DecodeUtf8Char(ANarrow, LIndex));
+  end;
+  if LAt <> len(AWide) then
+    return false;
+  end;
+  for LI := 0 to LAt - 1 do
+    if LUnits[LI] <> AWide[LI] then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// AWide's units as hex, a blank between them
+routine DoUnitsText(const AWide: wstring): string;
+var
+  LText: string;
+  LI: int64;
+begin
+  LText := "";
+  for LI := 0 to len(AWide) - 1 do
+    if LI > 0 then
+      LText := LText + " ";
+    end;
+    LText := LText + IntToHex(uint64(uint16(AWide[LI])), 4);
+  end;
+  return LText;
+end;
+
+// An encoding's fault as a dump shows it: " <ATag>fault[reason]", " <ATag>warn[reason]",
+// "" for none
+routine DoFaultText(const ATag: string; const AFault: EncodingFault): string;
+begin
+  if AFault.Reason = "" then
+    return "";
+  end;
+  if AFault.IsWarning then
+    return " " + ATag + "warn[" + AFault.Reason + "]";
+  end;
+  return " " + ATag + "fault[" + AFault.Reason + "]";
+end;
+
+exported type
+  // One node. The parser fills its kind, place, byte range and the fields
+  // under "read"; the Resolved* fields are written by the phase named beside
+  // each and read by every phase after it, never re-derived. A link field
+  // holds a node id (0: none); a layout field is -1 until it is laid out
+  Node = object
+    // Where it was written: the file, the line and the byte column of its
+    // first token ([StartOffset, EndOffset) is its physical byte range)
+    embed Place: SourcePlace;
+    Kind: NodeKind;
+    StartOffset: int64;
+    EndOffset: int64;
+
+    // What the parser read: the name a declaration declares, a name, a
+    // dotted name, a member or a directive as written, a literal's spelling,
+    // an operator's spelling; a string or char literal's decoded value in
+    // both encodings (Decoded the narrow UTF-8 bytes, DecodedWide the UTF-16
+    // units: the type it converts to picks one, BNF sec 9) and the fault of
+    // each encoding that has one (Adam.Compiler.Literals; Semantics reports
+    // the picked one's); a path directive's argument resolved once (empty
+    // when it could not be); the operator by meaning; the words written on
+    // it; a module's kind; an integer literal's value, a char literal's
+    // narrow value, and a number literal's suffix
+    Text: string;
+    Decoded: string;
+    DecodedWide: wstring;
+    NarrowFault: EncodingFault;
+    WideFault: EncodingFault;
+    ResolvedPath: string;
+    Op: OperatorKind;
+    Flags: NodeFlags;
+    Module: ModuleKind;
+    IntValue: uint64;
+    Suffix: string;
+
+    // Scopes / Semantics (M1.8): the declaration a name or a member means;
+    // the module a dotted prefix or an import names; the loop, match or
+    // routine a leave, skip or return leaves
+    ResolvedDecl: int64;
+    ResolvedUnit: int64;
+    ResolvedJump: int64;
+
+    // Semantics (M1.9): the type of an expression, or of what a declaration
+    // declares; the type a value converts to where it is used (0: none); the
+    // embed a member is reached through (M1.9b; 0: its own or a parent's)
+    ResolvedType: int64;
+    ResolvedConvert: int64;
+    ResolvedEmbed: int64;
+
+    // Semantics (M1.10): the routine, method, init or operator a call or an
+    // operator runs; a folded constant; the linkage settled; the symbol the
+    // linker sees (the C name, or the Itanium mangled one)
+    ResolvedCallee: int64;
+    ResolvedConst: ConstValue;
+    ResolvedLinkage: Linkage;
+    ResolvedSymbol: string;
+
+    // Semantics (M1.10): a type's size and alignment, a field's offset in
+    // its record, a bitfield's bit offset and width, a virtual method's
+    // slot in its vtable. Also (Adam.Compiler.Layout): an object's or an
+    // interface's ResolvedSlot is the number of slots its vtable has; an
+    // aggregate body's ResolvedSize its data size (no tail padding); a
+    // Parent node's ResolvedOffset where the parent part sits
+    ResolvedSize: int64;
+    ResolvedAlign: int64;
+    ResolvedOffset: int64;
+    ResolvedBitOffset: int32;
+    ResolvedBitWidth: int32;
+    ResolvedSlot: int32;
+
+    // Semantics (M10): the generic instance a use of a generic names
+    ResolvedInstance: int64;
+
+    // Semantics (M3.8f): a print / println call's format as read (SyntaxTree.FormatOf;
+    // 0: none read)
+    ResolvedFormat: int64;
+
+    // Every field but the place back to its first value: nothing read,
+    // nothing resolved
+    hidden method DoReset(const AKind: NodeKind; const AStart: int64; const AEnd: int64);
+    begin
+      self.Kind := AKind;
+      self.StartOffset := AStart;
+      self.EndOffset := AEnd;
+      self.Text := "";
+      self.Decoded := "";
+      setlength(self.DecodedWide, 0);
+      self.NarrowFault.Reason := "";
+      self.NarrowFault.IsWarning := false;
+      self.WideFault.Reason := "";
+      self.WideFault.IsWarning := false;
+      self.ResolvedPath := "";
+      self.Op := OperatorKind.None;
+      self.Flags := [];
+      self.Module := ModuleKind.None;
+      self.IntValue := 0;
+      self.Suffix := "";
+      self.ResolvedDecl := 0;
+      self.ResolvedUnit := 0;
+      self.ResolvedJump := 0;
+      self.ResolvedType := 0;
+      self.ResolvedConvert := 0;
+      self.ResolvedEmbed := 0;
+      self.ResolvedCallee := 0;
+      self.ResolvedConst.Kind := ConstKind.Unknown;
+      self.ResolvedConst.Bits := 0;
+      self.ResolvedConst.Float := 0.0;
+      self.ResolvedConst.Text := "";
+      self.ResolvedLinkage := Linkage.Unset;
+      self.ResolvedSymbol := "";
+      self.ResolvedSize := -1;
+      self.ResolvedAlign := -1;
+      self.ResolvedOffset := -1;
+      self.ResolvedBitOffset := -1;
+      self.ResolvedBitWidth := -1;
+      self.ResolvedSlot := -1;
+      self.ResolvedInstance := 0;
+      self.ResolvedFormat := 0;
+    end;
+
+    // A None node with no place
+    init();
+    begin
+      self.DoReset(NodeKind.None, 0, 0);
+    end;
+
+    init(const AKind: NodeKind; const APlace: SourcePlace; const AStart: int64; const AEnd: int64);
+    begin
+      self.Place := APlace;
+      self.DoReset(AKind, AStart, AEnd);
+    end;
+
+    // True when AFlag was written on the node
+    const method HasFlag(const AFlag: NodeFlag): bool;
+    begin
+      return AFlag in self.Flags;
+    end;
+
+    // Records that AFlag was written on the node
+    method AddFlag(const AFlag: NodeFlag);
+    begin
+      self.Flags += [AFlag];
+    end;
+  end;
+
+  // A list of node ids, in the order added: the one hand-written int64
+  // list (Adam.Core.Containers, until M10's generics), named for its use
+  NodeList = Int64List;
+
+  // The arena: every node of the whole program by id, and the structure of
+  // the tree. Ids are handed out in order and never reused; a node made by a
+  // later phase (a derived type, a conversion) is added like any other. The
+  // tree has one owner: it cannot be copied (it declares a done)
+  SyntaxTree = object
+    hidden FNodes: array of ref Node;
+    hidden FParents: array of int64;
+    hidden FRoles: array of NodeRole;
+    hidden FChildren: array of ref NodeList;
+    hidden FCount: int64;
+    hidden FTriple: string;
+    hidden FRuntime: int64;
+    // By RuntimeRoutine: the runtime unit's routine (0: none, or not found yet)
+    hidden FRuntimeRoutines: array[RuntimeRoutine.StrRelease..RuntimeRoutine.SetRange] of int64;
+    // The formats Semantics read, in order: a call's ResolvedFormat is its index + 1
+    hidden FFormats: array of FormatPlan;
+
+    // Raises unless AId names a node (1 .. Count - 1; 0 is no node)
+    hidden const method DoCheck(const AId: int64);
+    begin
+      if (AId < 1) or (AId >= self.FCount) then
+        raise(ADAM_AST_FAULT_NO_NODE + IntToStr(AId));
+      end;
+    end;
+
+    // Room for one more node in every arena array (they double when full)
+    hidden method DoGrow();
+    var
+      LCapacity: int64;
+    begin
+      if self.FCount < len(self.FNodes) then
+        return;
+      end;
+      LCapacity := len(self.FNodes) * 2;
+      if LCapacity < ADAM_AST_FIRST_CAPACITY then
+        LCapacity := ADAM_AST_FIRST_CAPACITY;
+      end;
+      setlength(self.FNodes, LCapacity);
+      setlength(self.FParents, LCapacity);
+      setlength(self.FRoles, LCapacity);
+      setlength(self.FChildren, LCapacity);
+    end;
+
+    // How many ids are taken, id 0 included
+    property Count: int64 read FCount;
+
+    // The program's target triple, normalized (arch-os-abi), as the main module settled it
+    // (its @target, else the command line's); empty before the main module is parsed. The
+    // Driver picks the program's Target from it
+    property Triple: string read FTriple;
+
+    // Records ATriple as the program's target triple (the parser, once, for the main module)
+    method SetTriple(const ATriple: string);
+    begin
+      self.FTriple := ATriple;
+    end;
+
+    // The runtime unit's Module node (DESIGN sec 8: the Driver loads it into every program as
+    // an implicit import; Semantics writes its routines into what needs them); 0 when the
+    // program was parsed without it
+    property Runtime: int64 read FRuntime;
+
+    // Records ARuntime as the runtime unit's Module node (the parser, once)
+    method SetRuntime(const ARuntime: int64);
+    begin
+      self.FRuntime := ARuntime;
+    end;
+
+    // The runtime unit's routine AKind's RoutineDecl, as Semantics found it; 0 when the
+    // program has no runtime unit or it declares no such routine (Lowering then reports what
+    // needed it)
+    const method RuntimeRoutineOf(const AKind: RuntimeRoutine): int64;
+    begin
+      return self.FRuntimeRoutines[AKind];
+    end;
+
+    // Records ADecl as the runtime unit's routine AKind (Semantics, once per kind)
+    method SetRuntimeRoutine(const AKind: RuntimeRoutine; const ADecl: int64);
+    begin
+      self.FRuntimeRoutines[AKind] := ADecl;
+    end;
+
+    // The format Semantics read for the print / println call AId (its ResolvedFormat); an
+    // empty plan when it read none
+    const method FormatOf(const AId: int64): FormatPlan;
+    var
+      LNone: FormatPlan;
+    begin
+      self.DoCheck(AId);
+      if self.FNodes[AId].ResolvedFormat = 0 then
+        return LNone;
+      end;
+      return self.FFormats[self.FNodes[AId].ResolvedFormat - 1];
+    end;
+
+    // Records APlan as the format of the print / println call AId (Semantics, once per call)
+    method SetFormat(const AId: int64; const APlan: FormatPlan);
+    var
+      LCount: int64;
+    begin
+      self.DoCheck(AId);
+      LCount := len(self.FFormats);
+      setlength(self.FFormats, LCount + 1);
+      self.FFormats[LCount] := APlan;
+      self.FNodes[AId].ResolvedFormat := LCount + 1;
+    end;
+
+    // The node AId; raises for 0 and for an id that is no node
+    property Items[AId: int64]: ref Node
+      read
+      begin
+        self.DoCheck(AId);
+        return self.FNodes[AId];
+      end;
+      default;
+
+    // A new node, attached to nothing (parent 0, role None); its id
+    method Add(const AKind: NodeKind; const APlace: SourcePlace; const AStart: int64;
+      const AEnd: int64): int64;
+    var
+      LId: int64;
+    begin
+      self.DoGrow();
+      LId := self.FCount;
+      self.FNodes[LId] := ref Node(AKind, APlace, AStart, AEnd);
+      self.FParents[LId] := ADAM_AST_NO_NODE;
+      self.FRoles[LId] := NodeRole.None;
+      self.FChildren[LId] := ref NodeList();
+      self.FCount := LId + 1;
+      return LId;
+    end;
+
+    // The parent of AId (0 for the program and for a detached node)
+    const method ParentOf(const AId: int64): int64;
+    begin
+      self.DoCheck(AId);
+      return self.FParents[AId];
+    end;
+
+    // The role AId plays in its parent (None when it has no parent)
+    const method RoleOf(const AId: int64): NodeRole;
+    begin
+      self.DoCheck(AId);
+      return self.FRoles[AId];
+    end;
+
+    // How many children AId has, every role together
+    const method ChildCount(const AId: int64): int64;
+    begin
+      self.DoCheck(AId);
+      return self.FChildren[AId].Count;
+    end;
+
+    // The child of AId at AIndex in source order; raises outside the list
+    const method ChildAt(const AId: int64; const AIndex: int64): int64;
+    begin
+      self.DoCheck(AId);
+      return self.FChildren[AId].Items[AIndex];
+    end;
+
+    // The child of AId that is the AIndex-th (0-based) with ARole; 0 when
+    // there is none
+    const method NthOf(const AId: int64; const ARole: NodeRole; const AIndex: int64): int64;
+    var
+      LList: ref NodeList;
+      LSeen: int64;
+      LI: int64;
+      LChild: int64;
+    begin
+      self.DoCheck(AId);
+      LList := self.FChildren[AId];
+      LSeen := 0;
+      for LI := 0 to LList.Count - 1 do
+        LChild := LList.Items[LI];
+        if self.FRoles[LChild] = ARole then
+          if LSeen = AIndex then
+            return LChild;
+          end;
+          LSeen := LSeen + 1;
+        end;
+      end;
+      return ADAM_AST_NO_NODE;
+    end;
+
+    // The first child of AId with ARole; 0 when there is none
+    const method FirstOf(const AId: int64; const ARole: NodeRole): int64;
+    begin
+      return self.NthOf(AId, ARole, 0);
+    end;
+
+    // How many children of AId have ARole
+    const method CountOf(const AId: int64; const ARole: NodeRole): int64;
+    var
+      LList: ref NodeList;
+      LCount: int64;
+      LI: int64;
+    begin
+      self.DoCheck(AId);
+      LList := self.FChildren[AId];
+      LCount := 0;
+      for LI := 0 to LList.Count - 1 do
+        if self.FRoles[LList.Items[LI]] = ARole then
+          LCount := LCount + 1;
+        end;
+      end;
+      return LCount;
+    end;
+
+    // True when AAncestor is above AId in the tree (a node is not its own)
+    const method IsAncestor(const AAncestor: int64; const AId: int64): bool;
+    var
+      LAt: int64;
+    begin
+      self.DoCheck(AAncestor);
+      self.DoCheck(AId);
+      LAt := self.FParents[AId];
+      while LAt <> ADAM_AST_NO_NODE do
+        if LAt = AAncestor then
+          return true;
+        end;
+        LAt := self.FParents[LAt];
+      end;
+      return false;
+    end;
+
+    // Raises unless AChild may go under AParent: it has no parent yet, it is
+    // not the program, and AParent is neither AChild nor below it
+    hidden const method DoCheckLink(const AParent: int64; const AChild: int64);
+    begin
+      self.DoCheck(AParent);
+      self.DoCheck(AChild);
+      if self.FParents[AChild] <> ADAM_AST_NO_NODE then
+        raise(ADAM_AST_FAULT_ATTACHED + IntToStr(AChild));
+      end;
+      if (AChild = ADAM_AST_PROGRAM) or (AChild = AParent) or self.IsAncestor(AChild, AParent) then
+        raise(ADAM_AST_FAULT_CYCLE + IntToStr(AChild));
+      end;
+    end;
+
+    // Puts the detached AChild last among AParent's children, playing ARole.
+    // Raises (and changes nothing) when it may not go there, or ARole is None
+    method Attach(const AParent: int64; const ARole: NodeRole; const AChild: int64);
+    begin
+      self.DoCheckLink(AParent, AChild);
+      if ARole = NodeRole.None then
+        raise(ADAM_AST_FAULT_NO_ROLE + IntToStr(AChild));
+      end;
+      self.FParents[AChild] := AParent;
+      self.FRoles[AChild] := ARole;
+      self.FChildren[AParent].Add(AChild);
+    end;
+
+    // A new node put last among AParent's children, playing ARole; its id
+    method AddChild(const AParent: int64; const ARole: NodeRole; const AKind: NodeKind;
+      const APlace: SourcePlace; const AStart: int64; const AEnd: int64): int64;
+    var
+      LId: int64;
+    begin
+      LId := self.Add(AKind, APlace, AStart, AEnd);
+      self.Attach(AParent, ARole, LId);
+      return LId;
+    end;
+
+    // Puts the detached ANew where AOld is (its parent, its place among the
+    // children, its role); AOld is left detached, its own children kept, so
+    // it can go under ANew (how a phase wraps a node). Raises, changing
+    // nothing, when AOld has no parent or ANew may not go there
+    method ReplaceChild(const AOld: int64; const ANew: int64);
+    var
+      LParent: int64;
+      LList: ref NodeList;
+    begin
+      self.DoCheck(AOld);
+      LParent := self.FParents[AOld];
+      if LParent = ADAM_AST_NO_NODE then
+        raise(ADAM_AST_FAULT_DETACHED + IntToStr(AOld));
+      end;
+      self.DoCheckLink(LParent, ANew);
+      LList := self.FChildren[LParent];
+      LList.Put(LList.IndexOf(AOld), ANew);
+      self.FParents[ANew] := LParent;
+      self.FRoles[ANew] := self.FRoles[AOld];
+      self.FParents[AOld] := ADAM_AST_NO_NODE;
+      self.FRoles[AOld] := NodeRole.None;
+    end;
+
+    // What ANode's Resolved* fields hold, for Describe: only those set
+    hidden const method DoResolvedText(const ANode: ref Node): string;
+    var
+      LText: string;
+    begin
+      LText := "";
+      if ANode.ResolvedDecl <> 0 then
+        LText := LText + " decl=#" + IntToStr(ANode.ResolvedDecl);
+      end;
+      if ANode.ResolvedUnit <> 0 then
+        LText := LText + " unit=#" + IntToStr(ANode.ResolvedUnit);
+      end;
+      if ANode.ResolvedJump <> 0 then
+        LText := LText + " jump=#" + IntToStr(ANode.ResolvedJump);
+      end;
+      if ANode.ResolvedType <> 0 then
+        LText := LText + " type=#" + IntToStr(ANode.ResolvedType);
+      end;
+      if ANode.ResolvedConvert <> 0 then
+        LText := LText + " convert=#" + IntToStr(ANode.ResolvedConvert);
+      end;
+      if ANode.ResolvedEmbed <> 0 then
+        LText := LText + " embed=#" + IntToStr(ANode.ResolvedEmbed);
+      end;
+      if ANode.ResolvedCallee <> 0 then
+        LText := LText + " callee=#" + IntToStr(ANode.ResolvedCallee);
+      end;
+      if ANode.ResolvedConst.Kind <> ConstKind.Unknown then
+        LText := LText + " const=" + ConstValueText(ANode.ResolvedConst);
+      end;
+      if ANode.ResolvedLinkage <> Linkage.Unset then
+        LText := LText + " linkage=" + LinkageText(ANode.ResolvedLinkage);
+      end;
+      if ANode.ResolvedSymbol <> "" then
+        LText := LText + " symbol=" + ANode.ResolvedSymbol;
+      end;
+      if ANode.ResolvedSize >= 0 then
+        LText := LText + " size=" + IntToStr(ANode.ResolvedSize);
+      end;
+      if ANode.ResolvedAlign >= 0 then
+        LText := LText + " align=" + IntToStr(ANode.ResolvedAlign);
+      end;
+      if ANode.ResolvedOffset >= 0 then
+        LText := LText + " offset=" + IntToStr(ANode.ResolvedOffset);
+      end;
+      if ANode.ResolvedBitOffset >= 0 then
+        LText := LText + " bitoffset=" + IntToStr(int64(ANode.ResolvedBitOffset));
+      end;
+      if ANode.ResolvedBitWidth >= 0 then
+        LText := LText + " bitwidth=" + IntToStr(int64(ANode.ResolvedBitWidth));
+      end;
+      if ANode.ResolvedSlot >= 0 then
+        LText := LText + " slot=" + IntToStr(int64(ANode.ResolvedSlot));
+      end;
+      if ANode.ResolvedInstance <> 0 then
+        LText := LText + " instance=#" + IntToStr(ANode.ResolvedInstance);
+      end;
+      return LText;
+    end;
+
+    // True when AId is an operator written with its spelling (assignment, binary, unary,
+    // postfix): a message names it by that spelling, "the + operator"
+    const method IsSpelledOperator(const AId: int64): bool;
+    var
+      LKind: NodeKind;
+    begin
+      if self.Items[AId].Text = "" then
+        return false;
+      end;
+      LKind := self.Items[AId].Kind;
+      return (LKind = NodeKind.AssignExpression) or (LKind = NodeKind.BinaryExpression) or
+        (LKind = NodeKind.UnaryExpression) or (LKind = NodeKind.PostfixExpression);
+    end;
+
+    // How a message to a user names the construct AId with no article, for a phrase that
+    // leads in with its own ("a local variable 'x'"): its Adam words (NodeKindWords), then
+    // the name it declares or the spelling it was written with, when it has one; an
+    // operator is "+ operator"; a construct whose spelling is its words ('nil', 'self')
+    // is that spelling quoted; a char or string literal's spelling carries its own quotes,
+    // so it is shown as written ("char literal 'q'")
+    const method ConstructText(const AId: int64): string;
+    var
+      LWords: string;
+      LText: string;
+      LKind: NodeKind;
+    begin
+      LKind := self.Items[AId].Kind;
+      LWords := NodeKindWords(LKind);
+      LText := self.Items[AId].Text;
+      if LText = "" then
+        return LWords;
+      end;
+      if self.IsSpelledOperator(AId) then
+        return LText + " operator";
+      end;
+      if (LKind = NodeKind.CharLiteral) or (LKind = NodeKind.StringLiteral) then
+        return LWords + " " + LText;
+      end;
+      if LText = LWords then
+        return "'" + LText + "'";
+      end;
+      return LWords + " '" + LText + "'";
+    end;
+
+    // How a message to a user names the construct AId on its own: ConstructText with its
+    // article: "the" before one that has a name or spelling ("the routine 'f'", "the +
+    // operator"), else "a" / "an" ("a while statement", "an if statement"); a quoted
+    // spelling alone ('nil') takes none
+    const method ConstructPhrase(const AId: int64): string;
+    var
+      LPhrase: string;
+      LFirst: string;
+    begin
+      LPhrase := self.ConstructText(AId);
+      if StartsStr("'", LPhrase) then
+        return LPhrase;
+      end;
+      if self.Items[AId].Text <> "" then
+        return "the " + LPhrase;
+      end;
+      // "an" before a vowel sound: every word NodeKindWords starts with a, e, i or o
+      // sounds one ("unary" starts with u and sounds "you", so u is not in the set)
+      LFirst := Substring(LPhrase, 0, 1);
+      if (LFirst = "a") or (LFirst = "e") or (LFirst = "i") or (LFirst = "o") then
+        return "an " + LPhrase;
+      end;
+      return "a " + LPhrase;
+    end;
+
+    // One line for AId: #id, its role, its kind, then what it holds (a
+    // module's kind, [text], the decoded bytes (control bytes as \xNN), the
+    // wide units when they are not the decoded text widened, each encoding's
+    // fault, the operator, an integer's or a char's value, a suffix, {flags})
+    // and its Resolved* fields that are set (a resolved path is not shown:
+    // it is the machine's)
+    const method Describe(const AId: int64): string;
+    var
+      LNode: ref Node;
+      LText: string;
+      LFlags: string;
+    begin
+      self.DoCheck(AId);
+      LNode := self.FNodes[AId];
+      LText := "#" + IntToStr(AId) + " " + NodeRoleText(self.FRoles[AId]) + ": " +
+        NodeKindText(LNode.Kind);
+      if LNode.Module <> ModuleKind.None then
+        LText := LText + " " + ModuleKindText(LNode.Module);
+      end;
+      if LNode.Text <> "" then
+        LText := LText + " [" + LNode.Text + "]";
+      end;
+      if LNode.Decoded <> "" then
+        LText := LText + " decoded[" + DoVisible(LNode.Decoded) + "]";
+      end;
+      if (len(LNode.DecodedWide) > 0) and (not DoWideIsNarrow(LNode.Decoded, LNode.DecodedWide)) then
+        LText := LText + " wide[" + DoUnitsText(LNode.DecodedWide) + "]";
+      end;
+      LText := LText + DoFaultText("n", LNode.NarrowFault) + DoFaultText("w", LNode.WideFault);
+      if LNode.Op <> OperatorKind.None then
+        LText := LText + " op=" + OperatorKindText(LNode.Op);
+      end;
+      if (LNode.Kind = NodeKind.IntLiteral) or (LNode.Kind = NodeKind.CharLiteral) then
+        LText := LText + " value=" + UIntToStr(LNode.IntValue);
+      end;
+      if LNode.Suffix <> "" then
+        LText := LText + " suffix=" + LNode.Suffix;
+      end;
+      LFlags := NodeFlagsText(LNode.Flags);
+      if LFlags <> "" then
+        LText := LText + " {" + LFlags + "}";
+      end;
+      return LText + self.DoResolvedText(LNode);
+    end;
+
+    // AId and everything under it, one Describe line per node, indented two
+    // spaces a level, in source order; the lines joined by newlines
+    const method DumpTree(const AId: int64): string;
+    var
+      LStack: NodeList;
+      LDepths: NodeList;
+      LText: string;
+      LAt: int64;
+      LDepth: int64;
+      LI: int64;
+    begin
+      self.DoCheck(AId);
+      LStack.Add(AId);
+      LDepths.Add(0);
+      LText := "";
+      while LStack.Count > 0 do
+        LAt := LStack.RemoveLast();
+        LDepth := LDepths.RemoveLast();
+        if LText <> "" then
+          LText := LText + "\n";
+        end;
+        LText := LText + StringOfChar(' ', LDepth * 2) + self.Describe(LAt);
+
+        // The children go on the stack last first, so they come off in
+        // source order
+        for LI := self.FChildren[LAt].Count - 1 downto 0 do
+          LStack.Add(self.FChildren[LAt].Items[LI]);
+          LDepths.Add(LDepth + 1);
+        end;
+      end;
+      return LText;
+    end;
+
+    // A declaration of the system scope named AName
+    hidden method DoAddSystem(const AKind: NodeKind; const AName: string);
+    var
+      LId: int64;
+    begin
+      LId := self.AddChild(ADAM_AST_SYSTEM, NodeRole.SystemDecl, AKind, NoPlace(), 0, 0);
+      self.FNodes[LId].Text := AName;
+    end;
+
+    // The builtin types (BNF sec 4 builtin type), in the grammar's order
+    hidden method DoAddBuiltinTypes();
+    begin
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "int8");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "int16");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "int32");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "int64");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "uint8");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "uint16");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "uint32");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "uint64");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "float32");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "float64");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "bool");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "char");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "wchar");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "string");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "wstring");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "ptr");
+      self.DoAddSystem(NodeKind.BuiltinTypeDecl, "varargs");
+    end;
+
+    // The intrinsics (BNF sec 7 and the asserts of sec 8): predeclared names,
+    // not keywords (BNF decision 7), in the grammar's order
+    hidden method DoAddIntrinsics();
+    begin
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "len");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "size");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "utf8");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "paramcount");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "paramstr");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "getmem");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "resizemem");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "exccode");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "excmsg");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "alive");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "lock");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "ProjectPassword");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "create");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "destroy");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "freemem");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "setlength");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "raise");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "raisecode");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "print");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "println");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "testAssert");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "testAssertTrue");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "testAssertFalse");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "testAssertNil");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "testAssertNotNil");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "testFail");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "testAssertEqualInt");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "testAssertEqualUInt");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "testAssertEqualFloat");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "testAssertEqualStr");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "testAssertEqualBool");
+      self.DoAddSystem(NodeKind.IntrinsicDecl, "testAssertEqualPtr");
+    end;
+
+    // Raises unless a fixed node got the id it must have
+    hidden const method DoExpectId(const AId: int64; const AExpected: int64);
+    begin
+      if AId <> AExpected then
+        raise(ADAM_AST_FAULT_FIXED_ID + IntToStr(AExpected));
+      end;
+    end;
+
+    // An empty program: no node (0), the program (1), the system scope (2)
+    // with the builtin types and the intrinsics, the derived types (3)
+    init();
+    begin
+      self.FCount := 0;
+      self.FTriple := "";
+      self.FRuntime := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.StrRelease] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.StrAssign] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.StrWrite] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.StrTake] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.StrConcat] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.StrFromChar] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.StrLength] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.StrCompare] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.StrUnique] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.StrSetLength] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.WStrConcat] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.WStrFromChar] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.WStrCompare] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.WStrUnique] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.WStrSetLength] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.WStrToUtf8] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.StrAddRef] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.ManagedRelease] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.ManagedAssign] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.ArrRelease] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.ArrAssign] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.ArrUnique] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.ArrSetLength] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.RefNew] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.RefRelease] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.RefAssign] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.AbstractCall] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.FrameHandler] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.Unhandled] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.Catch] := 0;
+      self.FRuntimeRoutines[RuntimeRoutine.SetRange] := 0;
+      self.DoExpectId(self.Add(NodeKind.None, NoPlace(), 0, 0), ADAM_AST_NO_NODE);
+      self.DoExpectId(self.Add(NodeKind.Program, NoPlace(), 0, 0), ADAM_AST_PROGRAM);
+      self.DoExpectId(self.AddChild(ADAM_AST_PROGRAM, NodeRole.System, NodeKind.SystemScope,
+        NoPlace(), 0, 0), ADAM_AST_SYSTEM);
+      self.DoExpectId(self.AddChild(ADAM_AST_PROGRAM, NodeRole.Derived, NodeKind.DerivedTypes,
+        NoPlace(), 0, 0), ADAM_AST_DERIVED);
+      self.DoAddBuiltinTypes();
+      self.DoAddIntrinsics();
+    end;
+
+    // The arena frees its nodes as it ends; declared so the tree is never
+    // copied (one owner of every node)
+    done;
+    begin
+    end;
+  end;
+
+end.

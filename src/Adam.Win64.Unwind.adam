@@ -1,0 +1,531 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Win64.Unwind.adam - Windows x64 unwind data (DESIGN sec 6)
+
+  Table-based unwinding on Windows x64 (Microsoft, "x64 exception handling")
+  needs, for every function that reserves stack or calls, a RUNTIME_FUNCTION
+  in .pdata naming an UNWIND_INFO in .xdata. This unit writes both for one
+  generated function from its FunctionCode (Adam.Backend.Parts) alone: its
+  frame and its prologue steps, as the arch part describes them:
+
+  UNWIND_INFO       DWORD aligned in .xdata: byte 0 the version (1, bits
+                    0-2) and the flags (0, bits 3-7), then the prologue's
+                    size, the count of code slots, the frame register and its
+                    scaled offset (0: no frame register); then the code
+                    slots, padded to an even count with a zero slot
+  a code slot       a USHORT: its low byte the offset of the end of the
+                    prologue instruction it describes, its high byte the
+                    operation (bits 0-3) and the operation's info (bits 4-7)
+  save R            a push of a callee-saved general register, before the
+                    allocation: UWOP_PUSH_NONVOL (0), info R's number (0 rax
+                    .. 15 r15)
+  allocate N        the step after the saves when the frame reserves bytes
+                    (x64: sub rsp, N); its operation by N:
+                    8..128 UWOP_ALLOC_SMALL (2), info N / 8 - 1; 136..512K-8
+                    UWOP_ALLOC_LARGE (1) info 0, the next slot N / 8;
+                    512K..4G-8 UWOP_ALLOC_LARGE info 1, the next two slots N
+                    (its low half first)
+  frame R           a realigned frame's last step (x64: mov R, rsp after the
+                    allocation; R one of the saves): UWOP_SET_FPREG (3),
+                    info 0, and UNWIND_INFO's frame register R with offset
+                    0. The rounding of the stack pointer after it is no
+                    step: past the prologue the unwinder reaches the frame
+                    through R
+  RUNTIME_FUNCTION  DWORD aligned in .pdata: the function's start, its end
+                    and its UNWIND_INFO, each an Rva32 relocation: start and
+                    end against the function's symbol (addends 0 and its byte
+                    count), the third against the UNWIND_INFO's own symbol
+                    ($unwind$<function>, defined where it starts)
+
+  The code slots run in the reverse of the prologue (the unwinder undoes the
+  last step first): a frame register's, the allocation's, then each save's,
+  last pushed first.
+
+  A function that saves nothing, reserves nothing and calls nothing (a bare
+  leaf: no frame) gets neither: the unwinder takes [rsp] as its return
+  address. One with scopes (its guards' bodies, FunctionCode) gets both
+  even so (no codes, prologue 0).
+
+  handler data      a function with scopes (C's __try / __finally form,
+                    Microsoft's "x64 exception handling"): UNWIND_INFO's
+                    flags UNW_FLAG_UHANDLER (2: the handler runs as an
+                    unwind leaves the frame), then after the code slots the
+                    handler's RVA (the frame handler, FunctionCode's
+                    FrameHandler) and its data, the scope table: a DWORD
+                    count, then per scope, innermost first, its begin and
+                    end (Rva32 against the function's symbol, addends the
+                    range's bytes), its handler (Rva32 against the
+                    funclet's symbol) and its jump target (0: a finally,
+                    called as the termination handler (abnormal, frame)).
+                    A catching scope (FunctionCode.ScopeTarget) adds
+                    UNW_FLAG_EHANDLER (1: the handler runs as the exception
+                    is dispatched); its handler is its filter's RVA, called
+                    as (exception pointers, frame), and its jump target the
+                    Rva32 of the byte a caught exception resumes at once the
+                    frames inside are unwound
+
+  UnwindEntry       what was written for one function
+  UnwindFunction    writes it. What it cannot describe raises (a compiler
+                    bug; the message names the function): no frame (not
+                    laid out), no symbol, a save of a register with no
+                    unwind number, a call with no frame, a prologue other
+                    than the frame's saves then one allocation of its bytes
+                    (then, realigned, the frame register's step: one of the
+                    saves, never rsp), steps not ending in rising
+                    order, a prologue over 255 bytes or past the code, a
+                    size that is no positive multiple of 8 up to 4G-8
+*******************************************************************************/
+
+module unit Adam.Win64.Unwind;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Sections, Adam.Backend.Parts;
+
+exported const
+  // The two sections (Microsoft's names) and their alignment (DWORD)
+  ADAM_WIN64_UNWIND_XDATA: string = ".xdata";
+  ADAM_WIN64_UNWIND_PDATA: string = ".pdata";
+  ADAM_WIN64_UNWIND_ALIGN: int64 = 4;
+  // An UNWIND_INFO's symbol: this prefix and its function's symbol (MSVC's spelling)
+  ADAM_WIN64_UNWIND_SYMBOL: string = "$unwind$";
+  // UNWIND_INFO's version, and the largest prologue it describes
+  ADAM_WIN64_UNWIND_VERSION: int64 = 1;
+  ADAM_WIN64_UNWIND_PROLOGUE_MAX: int64 = 255;
+  // The unwind operations Adam writes
+  ADAM_WIN64_UWOP_PUSH_NONVOL: int64 = 0;
+  ADAM_WIN64_UWOP_ALLOC_LARGE: int64 = 1;
+  ADAM_WIN64_UWOP_ALLOC_SMALL: int64 = 2;
+  ADAM_WIN64_UWOP_SET_FPREG: int64 = 3;
+  // UNWIND_INFO's flags of a frame whose handler runs as an exception is dispatched (looking
+  // for a scope that catches it) and as an unwind leaves it, and the scale that puts the
+  // flags in bits 3-7 of the first byte (flags * 8)
+  ADAM_WIN64_UNW_FLAG_EHANDLER: int64 = 1;
+  ADAM_WIN64_UNW_FLAG_UHANDLER: int64 = 2;
+  ADAM_WIN64_UNWIND_FLAGS_SCALE: int64 = 8;
+  // The general registers in the order an unwind code numbers them (its info field: 0 rax
+  // .. 15 r15, Microsoft's "x64 exception handling")
+  ADAM_WIN64_UNWIND_REGISTERS: string =
+    "rax rcx rdx rbx rsp rbp rsi rdi r8 r9 r10 r11 r12 r13 r14 r15";
+  // The stack pointer among them (never a frame register)
+  ADAM_WIN64_UNWIND_STACK: string = "rsp";
+  // A stack size is a multiple of this; the largest size of UWOP_ALLOC_SMALL, of
+  // UWOP_ALLOC_LARGE info 0 (512K - 8) and of info 1 (4G - 8)
+  ADAM_WIN64_UNWIND_SLOT: int64 = 8;
+  ADAM_WIN64_UNWIND_SMALL_MAX: int64 = 128;
+  ADAM_WIN64_UNWIND_SCALED_MAX: int64 = 524280;
+  ADAM_WIN64_UNWIND_LARGE_MAX: int64 = 4294967288;
+  // Raised (an invariant broken) by what unwind data cannot describe (see the header)
+  ADAM_WIN64_UNWIND_FAULT_UNALLOCATED: string = "Win64 unwind: not allocated: ";
+  ADAM_WIN64_UNWIND_FAULT_SYMBOL: string = "Win64 unwind: no symbol: ";
+  ADAM_WIN64_UNWIND_FAULT_SAVED: string =
+    "Win64 unwind: a save no unwind code describes, or not the frame's saves: ";
+  ADAM_WIN64_UNWIND_FAULT_LEAF: string = "Win64 unwind: a call with no frame: ";
+  ADAM_WIN64_UNWIND_FAULT_PROLOGUE: string =
+    "Win64 unwind: a prologue other than the frame's saves then one allocation of its bytes: ";
+  ADAM_WIN64_UNWIND_FAULT_FRAME: string =
+    "Win64 unwind: a realigned frame whose last step is not its saved frame register: ";
+  ADAM_WIN64_UNWIND_FAULT_LONG: string = "Win64 unwind: a prologue over 255 bytes or past the code: ";
+  ADAM_WIN64_UNWIND_FAULT_SIZE: string = "Win64 unwind: a stack size no unwind code takes: ";
+  ADAM_WIN64_UNWIND_FAULT_SCOPE: string =
+    "Win64 unwind: scopes with no frame handler, or a range outside the code: ";
+
+exported type
+  // What UnwindFunction wrote for one function (Written false: a bare leaf, nothing)
+  UnwindEntry = object
+    Written: bool;
+    // Where its UNWIND_INFO starts in .xdata and its RUNTIME_FUNCTION in .pdata, and the
+    // UNWIND_INFO's symbol
+    XdataOffset: int64;
+    PdataOffset: int64;
+    SymbolId: int64;
+    // The prologue's size and the count of code slots (the padding slot not counted)
+    PrologueSize: int64;
+    CodeCount: int64;
+
+    init();
+    begin
+      self.Written := false;
+      self.XdataOffset := 0;
+      self.PdataOffset := 0;
+      self.SymbolId := 0;
+      self.PrologueSize := 0;
+      self.CodeCount := 0;
+    end;
+  end;
+
+type
+  // Writes one function's unwind data (UnwindFunction makes one per function)
+  Win64Unwinder = object
+    hidden FCode: ref FunctionCode;
+    hidden FSections: ref SectionSet;
+    hidden FResult: ref UnwindEntry;
+    // The code slots, each a USHORT's value, in array order
+    hidden FCodes: ref Int64List;
+    // The general registers by their unwind numbers (ADAM_WIN64_UNWIND_REGISTERS)
+    hidden FRegisters: StringArray;
+
+    init(const ACode: ref FunctionCode; const ASections: ref SectionSet);
+    begin
+      self.FCode := ACode;
+      self.FSections := ASections;
+      self.FResult := ref UnwindEntry();
+      self.FCodes := ref Int64List();
+      self.FRegisters := SplitString(ADAM_WIN64_UNWIND_REGISTERS, " ");
+    end;
+
+    // Checks the function, then (it has a frame: saves or an allocation) writes its
+    // UNWIND_INFO and its RUNTIME_FUNCTION; returns what was written. The codes go in the
+    // reverse of the prologue's order (the unwinder undoes the last step first): a realigned
+    // frame's frame register, the allocation, then each save from the last pushed to the
+    // first
+    method Run(): ref UnwindEntry;
+    var
+      LFrame: ref FrameLayout;
+      LStep: ref PrologueStep;
+      LI: int64;
+    begin
+      self.DoCheck();
+      LFrame := self.FCode.Frame;
+      if (LFrame.AllocBytes = 0) and (LFrame.SavedCount = 0) and (self.FCode.ScopeCount() = 0) then
+        return self.FResult;
+      end;
+      self.FResult.PrologueSize := 0;
+      if self.FCode.StepCount > 0 then
+        self.FResult.PrologueSize := self.FCode.StepAt(self.FCode.StepCount - 1).EndsAt;
+      end;
+      if LFrame.Realign > 0 then
+        // The frame register's step is the prologue's last (DoCheckPrologue)
+        self.DoCode(self.FResult.PrologueSize, ADAM_WIN64_UWOP_SET_FPREG, 0);
+      end;
+      if LFrame.AllocBytes > 0 then
+        self.DoAllocCodes(self.FCode.StepAt(LFrame.SavedCount).EndsAt, LFrame.AllocBytes);
+      end;
+      for LI := LFrame.SavedCount - 1 downto 0 do
+        LStep := self.FCode.StepAt(LI);
+        self.DoCode(LStep.EndsAt, ADAM_WIN64_UWOP_PUSH_NONVOL,
+          IndexStr(LStep.RegisterName, self.FRegisters));
+      end;
+      self.FResult.CodeCount := self.FCodes.Count;
+      self.DoWriteXdata();
+      self.DoWritePdata();
+      self.FResult.Written := true;
+      return self.FResult;
+    end;
+
+    // Raises AFault naming the function, and AWhat after it when not empty
+    hidden method DoFault(const AFault: string; const AWhat: string);
+    begin
+      if AWhat = "" then
+        raise(AFault + self.FCode.Symbol);
+      end;
+      raise(AFault + self.FCode.Symbol + ": " + AWhat);
+    end;
+
+    // What unwind data cannot describe raises (see the header)
+    hidden method DoCheck();
+    var
+      LFrame: ref FrameLayout;
+    begin
+      LFrame := self.FCode.Frame;
+      if LFrame = nil then
+        self.DoFault(ADAM_WIN64_UNWIND_FAULT_UNALLOCATED, "");
+      end;
+      if self.FCode.SymbolId = 0 then
+        self.DoFault(ADAM_WIN64_UNWIND_FAULT_SYMBOL, "");
+      end;
+      self.DoCheckScopes();
+      if LFrame.SavedCount < 0 then
+        self.DoFault(ADAM_WIN64_UNWIND_FAULT_SAVED, IntToStr(LFrame.SavedCount));
+      end;
+      if (LFrame.AllocBytes = 0) and (LFrame.SavedCount = 0) then
+        if self.FCode.MakesCalls then
+          self.DoFault(ADAM_WIN64_UNWIND_FAULT_LEAF, "");
+        end;
+        if self.FCode.StepCount <> 0 then
+          self.DoFault(ADAM_WIN64_UNWIND_FAULT_PROLOGUE, "a prologue with no frame");
+        end;
+        return;
+      end;
+      if (LFrame.AllocBytes < 0) or ((LFrame.AllocBytes mod ADAM_WIN64_UNWIND_SLOT) <> 0) or
+        (LFrame.AllocBytes > ADAM_WIN64_UNWIND_LARGE_MAX) then
+        self.DoFault(ADAM_WIN64_UNWIND_FAULT_SIZE, IntToStr(LFrame.AllocBytes));
+      end;
+      self.DoCheckPrologue(LFrame);
+    end;
+
+    // Scopes need the frame handler's symbol and each range inside the code: begin before
+    // end, end not past the function's bytes, a funclet (or filter) symbol named, a catching
+    // scope's target inside the code
+    hidden method DoCheckScopes();
+    var
+      LI: int64;
+    begin
+      if self.FCode.ScopeCount() = 0 then
+        return;
+      end;
+      if self.FCode.FrameHandler = "" then
+        self.DoFault(ADAM_WIN64_UNWIND_FAULT_SCOPE, "no frame handler");
+      end;
+      for LI := 0 to self.FCode.ScopeCount() - 1 do
+        if (self.FCode.ScopeBegin(LI) < 0) or (self.FCode.ScopeBegin(LI) >= self.FCode.ScopeEnd(LI)) or
+          (self.FCode.ScopeEnd(LI) > self.FCode.ByteCount) or (self.FCode.ScopeHandler(LI) = "") or
+          (self.FCode.ScopeTarget(LI) >= self.FCode.ByteCount) then
+          self.DoFault(ADAM_WIN64_UNWIND_FAULT_SCOPE, IntToStr(self.FCode.ScopeBegin(LI)) + ".." +
+            IntToStr(self.FCode.ScopeEnd(LI)));
+        end;
+      end;
+    end;
+
+    // The prologue is the frame's saves (one save of a general register per saved register)
+    // then, when the frame reserves bytes, one allocation of exactly those bytes; its steps
+    // end in rising order, the last no more than 255 bytes from the function's start and
+    // inside its code
+    hidden method DoCheckPrologue(const AFrame: ref FrameLayout);
+    var
+      LStep: ref PrologueStep;
+      LAllocSteps: int64;
+      LFrameSteps: int64;
+      LEnd: int64;
+      LI: int64;
+    begin
+      LAllocSteps := 0;
+      if AFrame.AllocBytes > 0 then
+        LAllocSteps := 1;
+      end;
+      LFrameSteps := 0;
+      if AFrame.Realign > 0 then
+        LFrameSteps := 1;
+      end;
+      if self.FCode.StepCount <> AFrame.SavedCount + LAllocSteps + LFrameSteps then
+        self.DoFault(ADAM_WIN64_UNWIND_FAULT_PROLOGUE, IntToStr(self.FCode.StepCount) +
+          " steps, " + IntToStr(AFrame.SavedCount) + " saved");
+      end;
+      for LI := 0 to AFrame.SavedCount - 1 do
+        LStep := self.FCode.StepAt(LI);
+        if (LStep.Action <> PrologueAction.SaveRegister) or
+          (IndexStr(LStep.RegisterName, self.FRegisters) < 0) then
+          self.DoFault(ADAM_WIN64_UNWIND_FAULT_SAVED, LStep.Text());
+        end;
+      end;
+      if LAllocSteps = 1 then
+        LStep := self.FCode.StepAt(AFrame.SavedCount);
+        if (LStep.Action <> PrologueAction.Allocate) or (LStep.Bytes <> AFrame.AllocBytes) then
+          self.DoFault(ADAM_WIN64_UNWIND_FAULT_PROLOGUE, LStep.Text() + ", the frame " +
+            IntToStr(AFrame.AllocBytes));
+        end;
+      end;
+      if LFrameSteps = 1 then
+        self.DoCheckFrameStep(AFrame);
+      end;
+      // Each step ends past the one before it; the last bounds the prologue
+      LEnd := 0;
+      for LI := 0 to self.FCode.StepCount - 1 do
+        LStep := self.FCode.StepAt(LI);
+        if LStep.EndsAt <= LEnd then
+          self.DoFault(ADAM_WIN64_UNWIND_FAULT_LONG, IntToStr(LStep.EndsAt));
+        end;
+        LEnd := LStep.EndsAt;
+      end;
+      if (LEnd > ADAM_WIN64_UNWIND_PROLOGUE_MAX) or (LEnd > self.FCode.ByteCount) then
+        self.DoFault(ADAM_WIN64_UNWIND_FAULT_LONG, IntToStr(LEnd));
+      end;
+    end;
+
+    // A realigned frame's last step sets its frame register: the frame's FrameRegister, a
+    // general register with an unwind number other than the stack pointer, one the
+    // prologue saved (the unwinder restores it from its save)
+    hidden method DoCheckFrameStep(const AFrame: ref FrameLayout);
+    var
+      LStep: ref PrologueStep;
+      LNumber: int64;
+      LSaved: bool;
+      LI: int64;
+    begin
+      LStep := self.FCode.StepAt(self.FCode.StepCount - 1);
+      LNumber := self.DoFrameNumber(AFrame);
+      if (LStep.Action <> PrologueAction.SetFrame) or
+        (LStep.RegisterName <> AFrame.FrameRegister) or (LNumber < 0) or
+        (AFrame.FrameRegister = ADAM_WIN64_UNWIND_STACK) then
+        self.DoFault(ADAM_WIN64_UNWIND_FAULT_FRAME, LStep.Text());
+      end;
+      LSaved := false;
+      for LI := 0 to AFrame.SavedCount - 1 do
+        if self.FCode.StepAt(LI).RegisterName = AFrame.FrameRegister then
+          LSaved := true;
+        end;
+      end;
+      if not LSaved then
+        self.DoFault(ADAM_WIN64_UNWIND_FAULT_FRAME, LStep.Text() + ", not saved");
+      end;
+    end;
+
+    // The unwind number of AFrame's frame register (-1: none has that name)
+    hidden const method DoFrameNumber(const AFrame: ref FrameLayout): int64;
+    begin
+      return IndexStr(AFrame.FrameRegister, self.FRegisters);
+    end;
+
+    // A code slot: AOffset in the low byte, the operation and its info in the high byte
+    hidden method DoCode(const AOffset: int64; const AOp: int64; const AInfo: int64);
+    begin
+      self.FCodes.Add(AOffset + ((AOp + (AInfo * 16)) * 256));
+    end;
+
+    // The slots of a stack allocation of ABytes ending at AOffset, by the shortest form
+    // (see the header)
+    hidden method DoAllocCodes(const AOffset: int64; const ABytes: int64);
+    begin
+      if ABytes <= ADAM_WIN64_UNWIND_SMALL_MAX then
+        self.DoCode(AOffset, ADAM_WIN64_UWOP_ALLOC_SMALL, (ABytes div ADAM_WIN64_UNWIND_SLOT) - 1);
+        return;
+      end;
+      if ABytes <= ADAM_WIN64_UNWIND_SCALED_MAX then
+        self.DoCode(AOffset, ADAM_WIN64_UWOP_ALLOC_LARGE, 0);
+        self.FCodes.Add(ABytes div ADAM_WIN64_UNWIND_SLOT);
+        return;
+      end;
+      // The unscaled size in two slots, its low half first
+      self.DoCode(AOffset, ADAM_WIN64_UWOP_ALLOC_LARGE, 1);
+      self.FCodes.Add(ABytes mod 65536);
+      self.FCodes.Add(ABytes div 65536);
+    end;
+
+    // The section named AName (read-only, DWORD aligned), made when there is none yet
+    hidden method DoSection(const AName: string): int64;
+    var
+      LId: int64;
+    begin
+      LId := self.FSections.FindSection(AName);
+      if LId = 0 then
+        LId := self.FSections.AddSection(AName, SectionKind.ReadOnly, ADAM_WIN64_UNWIND_ALIGN);
+      end;
+      return LId;
+    end;
+
+    // The UNWIND_INFO at the end of .xdata, its symbol defined where it starts; a function
+    // with scopes adds its handler data (DoWriteScopes)
+    hidden method DoWriteXdata();
+    var
+      LId: int64;
+      LSection: ref Section;
+      LFrameByte: int64;
+      LFlags: int64;
+      LI: int64;
+    begin
+      LId := self.DoSection(ADAM_WIN64_UNWIND_XDATA);
+      LSection := self.FSections.SectionAt(LId);
+      LSection.AlignTo(ADAM_WIN64_UNWIND_ALIGN, uint8(0));
+      self.FResult.XdataOffset := LSection.Size();
+      self.FResult.SymbolId := self.FSections.DefineSymbol(ADAM_WIN64_UNWIND_SYMBOL +
+        self.FCode.Symbol, LId, self.FResult.XdataOffset, self.FCode.Node);
+      // Version 1 in bits 0-2, the flags in bits 3-7 (UHANDLER with scopes, EHANDLER too when
+      // one catches, else none); the
+      // frame register in bits 0-3 of the fourth byte
+      // and its scaled offset (always 0: it takes the stack pointer as it is) in bits 4-7,
+      // all 0 with no frame register
+      LFrameByte := 0;
+      if self.FCode.Frame.Realign > 0 then
+        LFrameByte := self.DoFrameNumber(self.FCode.Frame);
+      end;
+      LFlags := 0;
+      if self.FCode.ScopeCount() > 0 then
+        LFlags := ADAM_WIN64_UNW_FLAG_UHANDLER;
+        if self.FCode.Catches() then
+          LFlags := LFlags + ADAM_WIN64_UNW_FLAG_EHANDLER;
+        end;
+      end;
+      LSection.Put8(uint64(ADAM_WIN64_UNWIND_VERSION + (LFlags * ADAM_WIN64_UNWIND_FLAGS_SCALE)));
+      LSection.Put8(uint64(self.FResult.PrologueSize));
+      LSection.Put8(uint64(self.FCodes.Count));
+      LSection.Put8(uint64(LFrameByte));
+      for LI := 0 to self.FCodes.Count - 1 do
+        LSection.Put16(uint64(self.FCodes.Items[LI]));
+      end;
+      if (self.FCodes.Count mod 2) <> 0 then
+        LSection.Put16(uint64(0));
+      end;
+      if self.FCode.ScopeCount() > 0 then
+        self.DoWriteScopes(LId, LSection);
+      end;
+    end;
+
+    // After the code slots: the frame handler's RVA, then its data, the scope table (see
+    // the header), each RVA an Rva32 relocation
+    hidden method DoWriteScopes(const AId: int64; const ASection: ref Section);
+    var
+      LHandler: int64;
+      LAt: int64;
+      LI: int64;
+    begin
+      LHandler := self.FSections.ReferSymbol(self.FCode.FrameHandler, self.FCode.Node);
+      LAt := ASection.Size();
+      ASection.Put32(uint64(0));
+      self.FSections.AddReloc(AId, LAt, RelocKind.Rva32, LHandler, 0);
+      ASection.Put32(uint64(self.FCode.ScopeCount()));
+      for LI := 0 to self.FCode.ScopeCount() - 1 do
+        LAt := ASection.Size();
+        ASection.Put32(uint64(0));
+        ASection.Put32(uint64(0));
+        ASection.Put32(uint64(0));
+        ASection.Put32(uint64(0));
+        self.FSections.AddReloc(AId, LAt, RelocKind.Rva32, self.FCode.SymbolId,
+          self.FCode.ScopeBegin(LI));
+        self.FSections.AddReloc(AId, LAt + 4, RelocKind.Rva32, self.FCode.SymbolId,
+          self.FCode.ScopeEnd(LI));
+        self.FSections.AddReloc(AId, LAt + 8, RelocKind.Rva32,
+          self.FSections.ReferSymbol(self.FCode.ScopeHandler(LI), self.FCode.Node), 0);
+        // a catching scope's jump target: its byte in the function's code (0 for a finally)
+        if self.FCode.ScopeTarget(LI) >= 0 then
+          self.FSections.AddReloc(AId, LAt + 12, RelocKind.Rva32, self.FCode.SymbolId,
+            self.FCode.ScopeTarget(LI));
+        end;
+      end;
+    end;
+
+    // The RUNTIME_FUNCTION at the end of .pdata: start, end, UNWIND_INFO, each an Rva32
+    hidden method DoWritePdata();
+    var
+      LId: int64;
+      LSection: ref Section;
+      LAt: int64;
+    begin
+      LId := self.DoSection(ADAM_WIN64_UNWIND_PDATA);
+      LSection := self.FSections.SectionAt(LId);
+      LSection.AlignTo(ADAM_WIN64_UNWIND_ALIGN, uint8(0));
+      LAt := LSection.Size();
+      self.FResult.PdataOffset := LAt;
+      LSection.Put32(uint64(0));
+      LSection.Put32(uint64(0));
+      LSection.Put32(uint64(0));
+      self.FSections.AddReloc(LId, LAt, RelocKind.Rva32, self.FCode.SymbolId, 0);
+      self.FSections.AddReloc(LId, LAt + 4, RelocKind.Rva32, self.FCode.SymbolId,
+        self.FCode.ByteCount);
+      self.FSections.AddReloc(LId, LAt + 8, RelocKind.Rva32, self.FResult.SymbolId, 0);
+    end;
+  end;
+
+// ACode's unwind data written into ASections' .xdata and .pdata (made when there are none
+// yet); returns what was written (nothing for a bare leaf). What unwind data cannot
+// describe raises (see the header)
+exported routine UnwindFunction(const ACode: ref FunctionCode; const ASections: ref SectionSet):
+  ref UnwindEntry;
+var
+  LUnwinder: ref Win64Unwinder;
+begin
+  LUnwinder := ref Win64Unwinder(ACode, ASections);
+  return LUnwinder.Run();
+end;
+
+end.

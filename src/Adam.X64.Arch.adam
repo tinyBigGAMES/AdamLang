@@ -1,0 +1,276 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.X64.Arch.adam - the x86_64 arch part (DESIGN sec 6)
+
+  X64Arch         the ArchPart (Adam.Backend.Parts) of x86_64: its register
+                  facts (Adam.X64.Registers), and one IR function generated
+                  into a SectionSet's code section: selected
+                  (Adam.X64.Select), allocated at debug (Adam.X64.Allocate),
+                  encoded (Adam.X64.Encode), handed on as a FunctionCode;
+                  and the stack probe (Adam.X64.Probe) encoded the same way
+  FunctionCodeOf  an allocated, encoded function as its FunctionCode: its
+                  prologue instructions, in code order, each as a step
+                  ending where the encoder says it ends (push r: save r;
+                  sub rsp, N: allocate N; mov r, rsp: set the frame
+                  register r). What the steps cannot say
+                  raises (a compiler bug; the message names the
+                  function): not allocated,
+                  encoded as another function, a prologue instruction
+                  outside the entry block or with no step, prologue
+                  instructions and encoded ends that differ in number;
+                  each SSA slot's frame offset (what a funclet reaches its
+                  parent's slots by), and the IR function's scopes as byte
+                  ranges of the code (DoScopesOf)
+*******************************************************************************/
+
+module unit Adam.X64.Arch;
+
+import System.SysUtils, Adam.Backend.Ssa, Adam.Backend.Sections, Adam.Backend.Parts,
+  Adam.X64.Registers, Adam.X64.Machine, Adam.X64.Select, Adam.X64.Allocate, Adam.X64.Encode,
+  Adam.X64.Probe;
+
+exported const
+  // The arch's name, as a triple spells it
+  ADAM_X64_ARCH_NAME: string = "x86_64";
+  // Raised (an invariant broken) by what a FunctionCode cannot say (see the header)
+  ADAM_X64_ARCH_FAULT_UNALLOCATED: string = "X64 arch: not allocated: ";
+  ADAM_X64_ARCH_FAULT_OTHER: string = "X64 arch: encoded as another function: ";
+  ADAM_X64_ARCH_FAULT_PLACE: string = "X64 arch: a prologue instruction outside the entry block: ";
+  ADAM_X64_ARCH_FAULT_STEP: string = "X64 arch: a prologue instruction no step describes: ";
+  ADAM_X64_ARCH_FAULT_ENDS: string = "X64 arch: prologue instructions and encoded ends differ: ";
+  ADAM_X64_ARCH_FAULT_SCOPE: string = "X64 arch: a scope's block made no machine block: ";
+
+// The step of AInstr, a prologue instruction ending at AEndsAt; nil when no step describes
+// it (push reg: save reg, by ARegisters' name; sub rsp, imm: allocate imm; mov reg, rsp:
+// set the frame register reg)
+routine DoStepOf(const AInstr: ref MachineInstr; const AEndsAt: int64; const AStack: int64;
+  const ARegisters: ref X64Registers): ref PrologueStep;
+var
+  LStep: ref PrologueStep;
+begin
+  if (AInstr.Op = X64Op.Push) and (AInstr.OperandCount = 1) and
+    (AInstr.OperandAt(0).Kind = OperandKind.PhysicalReg) then
+    LStep := ref PrologueStep(PrologueAction.SaveRegister);
+    LStep.RegisterName := ARegisters.Text(AInstr.OperandAt(0).Reg);
+    LStep.EndsAt := AEndsAt;
+    return LStep;
+  end;
+  if (AInstr.Op = X64Op.Mov) and (AInstr.OperandCount = 2) and
+    (AInstr.OperandAt(0).Kind = OperandKind.PhysicalReg) and
+    (AInstr.OperandAt(0).Reg <> AStack) and
+    (AInstr.OperandAt(1).Kind = OperandKind.PhysicalReg) and
+    (AInstr.OperandAt(1).Reg = AStack) then
+    // A realigned frame's frame register taking the stack pointer
+    LStep := ref PrologueStep(PrologueAction.SetFrame);
+    LStep.RegisterName := ARegisters.Text(AInstr.OperandAt(0).Reg);
+    LStep.EndsAt := AEndsAt;
+    return LStep;
+  end;
+  if (AInstr.Op <> X64Op.Sub) or (AInstr.OperandCount <> 2) then
+    return nil;
+  end;
+  if (AInstr.OperandAt(0).Kind <> OperandKind.PhysicalReg) or
+    (AInstr.OperandAt(0).Reg <> AStack) or
+    (AInstr.OperandAt(1).Kind <> OperandKind.Immediate) then
+    return nil;
+  end;
+  LStep := ref PrologueStep(PrologueAction.Allocate);
+  LStep.Bytes := AInstr.OperandAt(1).Imm;
+  LStep.EndsAt := AEndsAt;
+  return LStep;
+end;
+
+// AMachine (allocated, encoded as AEncoded) as its FunctionCode (see the header)
+exported routine FunctionCodeOf(const AMachine: ref MachineFunction;
+  const AEncoded: ref EncodedFunction): ref FunctionCode;
+var
+  LCode: ref FunctionCode;
+  LBlock: ref MachineBlock;
+  LInstr: ref MachineInstr;
+  LStep: ref PrologueStep;
+  LRegisters: ref X64Registers;
+  LStack: int64;
+  LCount: int64;
+  LB: int64;
+  LI: int64;
+begin
+  if AMachine.Frame = nil then
+    raise(ADAM_X64_ARCH_FAULT_UNALLOCATED + AMachine.Symbol);
+  end;
+  if AEncoded.Symbol <> AMachine.Symbol then
+    raise(ADAM_X64_ARCH_FAULT_OTHER + AMachine.Symbol + ": " + AEncoded.Symbol);
+  end;
+  LCode := ref FunctionCode(AMachine.Symbol);
+  LCode.SymbolId := AEncoded.SymbolId;
+  LCode.Node := AMachine.Node;
+  LCode.ByteCount := AEncoded.ByteCount;
+  LCode.Frame := AMachine.Frame;
+  LCode.MakesCalls := AMachine.MakesCalls;
+  LRegisters := ref X64Registers();
+  LStack := LRegisters.NumberOf(ADAM_X64_STACK_POINTER);
+  // Prologue instructions pair with the encoder's ends in code order
+  LCount := 0;
+  for LB := 0 to AMachine.BlockCount - 1 do
+    LBlock := AMachine.BlockAt(LB);
+    for LI := 0 to LBlock.InstrCount - 1 do
+      LInstr := LBlock.InstrAt(LI);
+      if LInstr.Prologue then
+        if LB <> 0 then
+          raise(ADAM_X64_ARCH_FAULT_PLACE + AMachine.Symbol + ": " + AMachine.InstrText(LInstr));
+        end;
+        if LCount >= AEncoded.PrologueEnds.Count then
+          raise(ADAM_X64_ARCH_FAULT_ENDS + AMachine.Symbol + ": more instructions than " +
+            IntToStr(AEncoded.PrologueEnds.Count) + " ends");
+        end;
+        LStep := DoStepOf(LInstr, AEncoded.PrologueEnds.Items[LCount], LStack, LRegisters);
+        if LStep = nil then
+          raise(ADAM_X64_ARCH_FAULT_STEP + AMachine.Symbol + ": " + AMachine.InstrText(LInstr));
+        end;
+        LCode.AddStep(LStep);
+        LCount := LCount + 1;
+      end;
+    end;
+  end;
+  if LCount <> AEncoded.PrologueEnds.Count then
+    raise(ADAM_X64_ARCH_FAULT_ENDS + AMachine.Symbol + ": " + IntToStr(LCount) +
+      " instructions, " + IntToStr(AEncoded.PrologueEnds.Count) + " ends");
+  end;
+  // Each SSA slot's frame offset, what a funclet of the function reaches it by
+  for LI := 0 to AMachine.SlotCount - 1 do
+    if AMachine.SlotSource(LI) <> 0 then
+      LCode.AddSlot(AMachine.SlotSource(LI), AMachine.SlotOffset(LI));
+    end;
+  end;
+  return LCode;
+end;
+
+// The machine block AMachine made from SSA block ASource; raises when it made none
+routine DoMachineBlockOf(const AMachine: ref MachineFunction; const ASource: int64): int64;
+var
+  LB: int64;
+begin
+  for LB := 0 to AMachine.BlockCount - 1 do
+    if AMachine.BlockAt(LB).Source = ASource then
+      return LB;
+    end;
+  end;
+  raise(ADAM_X64_ARCH_FAULT_SCOPE + AMachine.Symbol + ": b" + IntToStr(ASource));
+  return -1;
+end;
+
+// The scopes of SSA function AFunction of AModule (selected as AMachine, encoded as
+// AEncoded) added to ACode as byte ranges, innermost first, with the module's frame handler:
+// a scope starts where the machine block of its first SSA block starts and ends one byte
+// past the end of the machine block of its last (the blocks made from SSA blocks come first,
+// in SSA order, so the ones between are the scope's), so a call ending the range returns
+// into it; never past the function's code. A catching scope's target is where the machine
+// block of its target SSA block starts
+routine DoScopesOf(const AModule: ref IrModule; const AFunction: int64;
+  const AMachine: ref MachineFunction; const AEncoded: ref EncodedFunction;
+  const ACode: ref FunctionCode);
+var
+  LFunction: ref IrFunction;
+  LFirst: int64;
+  LLast: int64;
+  LEnd: int64;
+  LTarget: int64;
+  LI: int64;
+begin
+  LFunction := AModule.FunctionAt(AFunction);
+  if LFunction.ScopeCount() = 0 then
+    return;
+  end;
+  ACode.FrameHandler := AModule.FunctionAt(AModule.FrameHandler).Symbol;
+  for LI := 0 to LFunction.ScopeCount() - 1 do
+    LFirst := DoMachineBlockOf(AMachine, LFunction.Blocks[LFunction.ScopeFirst(LI)]);
+    LLast := DoMachineBlockOf(AMachine, LFunction.Blocks[LFunction.ScopeLast(LI)]);
+    if LLast + 1 < AMachine.BlockCount then
+      LEnd := AEncoded.BlockStarts.Items[LLast + 1];
+    else
+      LEnd := AEncoded.ByteCount;
+    end;
+    LEnd := LEnd + 1;
+    if LEnd > AEncoded.ByteCount then
+      LEnd := AEncoded.ByteCount;
+    end;
+    LTarget := -1;
+    if LFunction.ScopeTarget(LI) >= 0 then
+      LTarget := AEncoded.BlockStarts.Items[DoMachineBlockOf(AMachine,
+        LFunction.Blocks[LFunction.ScopeTarget(LI)])];
+    end;
+    ACode.AddScope(AEncoded.BlockStarts.Items[LFirst], LEnd,
+      AModule.FunctionAt(LFunction.ScopeHandler(LI)).Symbol, LTarget);
+  end;
+end;
+
+exported type
+  // x86_64 (see the header)
+  X64Arch = object(ArchPart)
+    hidden FRegisters: ref X64Registers;
+
+    init();
+    begin
+      self.FRegisters := ref X64Registers();
+    end;
+
+    override method ArchName(): string;
+    begin
+      return ADAM_X64_ARCH_NAME;
+    end;
+
+    override method RegisterCount(): int64;
+    begin
+      return self.FRegisters.Count();
+    end;
+
+    override method RegisterText(const ANumber: int64): string;
+    begin
+      return self.FRegisters.Text(ANumber);
+    end;
+
+    override method RegisterOf(const AName: string): int64;
+    begin
+      return self.FRegisters.NumberOf(AName);
+    end;
+
+    override method GenerateFunction(const AModule: ref IrModule; const AFunction: int64;
+      const AAbi: ref AbiPart; const ASections: ref SectionSet; const ACode: int64;
+      const AParent: ref FunctionCode): ref FunctionCode;
+    var
+      LMachine: ref MachineFunction;
+      LEncoded: ref EncodedFunction;
+      LCode: ref FunctionCode;
+    begin
+      LMachine := SelectFunction(AModule, AFunction, AAbi, AParent);
+      AllocateFunction(LMachine, AAbi);
+      LEncoded := EncodeFunction(LMachine, ASections, ACode);
+      LCode := FunctionCodeOf(LMachine, LEncoded);
+      DoScopesOf(AModule, AFunction, LMachine, LEncoded, LCode);
+      return LCode;
+    end;
+
+    override method GenerateProbe(const AAbi: ref AbiPart; const ASections: ref SectionSet;
+      const ACode: int64): ref FunctionCode;
+    var
+      LMachine: ref MachineFunction;
+    begin
+      // Built allocated (Adam.X64.Probe): encoded as it stands
+      LMachine := ProbeFunction(AAbi);
+      return FunctionCodeOf(LMachine, EncodeFunction(LMachine, ASections, ACode));
+    end;
+  end;
+
+end.

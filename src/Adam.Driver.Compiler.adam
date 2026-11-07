@@ -1,0 +1,385 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Driver.Compiler.adam - The orchestrator
+
+  Compiler      one compile: the one Diagnostics owner (every phase reports
+                into it), the build's SourceFiles and the whole-program AST.
+                Made, it adds the compiler's module path (the standard
+                library's folder, $P:res/libs/std, BNF sec 1); Check runs
+                the front end on one program; Build checks it, then (no
+                error) lowers it, picks its backend and generates its exe
+                into the output folder; PrintReports and ExitCode close the
+                compile out
+
+  Build's output folder (BNF sec 2, @outputpath): the one the command line
+  gives, else the main module's @outputpath (resolved at its directive),
+  else output under the working folder; made when it is not there. The exe
+  is the main module's name with the format's exe ending. Its libraries are
+  searched in every module's @addlibrarypath folders, in module and
+  directive order, then where the target's OS keeps its own. A dll or lib
+  main module is DR0009 at its header (their output is M8's; Lowering itself
+  lowers their routines). A malformed IR out of Lowering raises: a compiler
+  bug, never a report.
+
+  The front end has no phase gate (PROJECT.md, Frontend contracts): once
+  the main module has a header, names, types, layouts and symbols all run,
+  each within the error budget, so one compile reports every phase's
+  errors. A Compiler checks one program: a second Check is a defect in the
+  caller (DR0003).
+
+  PickTarget picks the program's Target from the triple its main module
+  settled; every phase that needs a target fact is handed it. A triple
+  with no target is DR0004 and no target: layouts and symbols are left
+  undone rather than guessed (M1.12). PickBackend picks the code generator
+  (Adam.Backend.Targets) the same way: a triple with a target but no
+  backend is DR0006, and no code is generated.
+*******************************************************************************/
+
+module unit Adam.Driver.Compiler;
+
+import System.SysUtils, System.Windows, Adam.Core.Common, Adam.Core.Messages, Adam.Target,
+  Adam.Target.Registry,
+  Adam.Compiler.SourceText, Adam.Compiler.Diagnostics, Adam.Compiler.SourceFiles,
+  Adam.Compiler.AST, Adam.Compiler.Parser, Adam.Compiler.Semantics, Adam.Compiler.Layout,
+  Adam.Compiler.Symbols, Adam.Backend.Ssa, Adam.Backend.Lowering, Adam.Backend.Targets,
+  Adam.Backend.Generate;
+
+exported const
+  ADAM_ERR_DRIVER_001: string = "DR0001";
+  ADAM_ERR_DRIVER_002: string = "DR0002";
+  ADAM_ERR_DRIVER_003: string = "DR0003";
+  ADAM_ERR_DRIVER_004: string = "DR0004";   // the program's triple names no target Adam has
+  ADAM_ERR_DRIVER_005: string = "DR0005";   // the runtime's folder cannot be told
+  ADAM_ERR_DRIVER_006: string = "DR0006";   // the program's triple has no backend
+  ADAM_ERR_DRIVER_007: string = "DR0007";   // the output folder cannot be made
+  ADAM_ERR_DRIVER_008: string = "DR0008";   // the exe cannot be written
+  ADAM_ERR_DRIVER_009: string = "DR0009";   // a main module build cannot output yet (dll / lib: M8)
+
+  // Build's output folder when neither the command line nor @outputpath names one: under
+  // the working folder (BNF sec 2)
+  ADAM_DRIVER_OUTPUT_DIR: string = "output";
+
+  // The directives Build reads from the AST (their arguments resolved at the directive)
+  ADAM_DRIVER_DIRECTIVE_OUTPUT: string = "@outputpath";
+  ADAM_DRIVER_DIRECTIVE_LIBRARY: string = "@addlibrarypath";
+
+  // Raised (an invariant broken) by a malformed IR out of Lowering
+  ADAM_DRIVER_FAULT_IR: string = "Driver: Lowering made a malformed IR: ";
+
+  // How many errors one compile keeps; the first one past it leaves one DG0001
+  ADAM_DRIVER_ERROR_BUDGET: int64 = 100;
+
+  // The compiler's module path: the standard library's folder beside adam.exe (BNF sec 1)
+  ADAM_DRIVER_STD_MODULE_PATH: string = "$P:res/libs/std";
+
+  // The runtime unit every program carries as an implicit import, and its folder beside
+  // adam.exe (DESIGN sec 8)
+  ADAM_DRIVER_RUNTIME_UNIT: string = "System.Runtime";
+  ADAM_DRIVER_RUNTIME_MODULE_PATH: string = "$P:res/runtime";
+
+  // The file whose folder is a project's root ($R:, BNF sec 1)
+  ADAM_DRIVER_PROJECT_FILE: string = "project.toml";
+
+  // The exit codes of a compile: clean (hints and warnings allowed), or an error reported
+  ADAM_DRIVER_EXIT_OK: int32 = 0;
+  ADAM_DRIVER_EXIT_ERRORS: int32 = 1;
+
+// The project root of the main module at AMainPath (a resolved path): the folder of the
+// nearest project.toml at or above the main module's folder ($R:, BNF sec 1); "" when there
+// is none (a build with no project). Only the file's place is used: what it holds is not read
+exported routine ProjectRootOf(const AMainPath: string): string;
+var
+  LDir: string;
+  LUp: string;
+begin
+  LDir := ExtractFileDir(AMainPath);
+  while LDir <> "" do
+    if FileExists(ResolvePath(ADAM_DRIVER_PROJECT_FILE, LDir)) then
+      return LDir;
+    end;
+    // a root's folder is the root itself: nothing above it
+    LUp := ExtractFileDir(LDir);
+    if LUp = LDir then
+      return "";
+    end;
+    LDir := LUp;
+  end;
+  return "";
+end;
+
+// The Target of the program in ATree, picked once from the triple its main module AMain
+// settled (ATree.Triple): the registry's (Adam.Target.Registry). None (a triple Adam has no
+// target for) is DR0004 at the main module, reported into AReports, and nil: nothing is
+// laid out or named, never a guessed target
+exported routine PickTarget(const ATree: ref SyntaxTree; const AMain: int64;
+  const AReports: ref Diagnostics): ref Target;
+var
+  LTarget: ref Target;
+begin
+  LTarget := FindTarget(ATree.Triple);
+  if LTarget = nil then
+    AReports.Add(Severity.Error, ADAM_ERR_DRIVER_004, ATree[AMain].Place,
+      ADAM_MSG_DRIVER_NO_TARGET, NoArgs().Str(ATree.Triple).Str(KnownTriples()));
+  end;
+  return LTarget;
+end;
+
+// The Backend (Adam.Backend.Targets) that generates code for ATriple, the triple of a
+// program whose front end found a target. None is DR0006 at APlace (the main module),
+// reported into AReports, and nil: no code is generated
+exported routine PickBackend(const ATriple: string; const APlace: SourcePlace;
+  const AReports: ref Diagnostics): ref Backend;
+var
+  LBackend: ref Backend;
+begin
+  LBackend := BackendFor(ATriple);
+  if LBackend = nil then
+    AReports.Add(Severity.Error, ADAM_ERR_DRIVER_006, APlace, ADAM_MSG_DRIVER_NO_BACKEND,
+      NoArgs().Str(ATriple).Str(KnownBackends()));
+  end;
+  return LBackend;
+end;
+
+exported type
+  // One compile (see the header)
+  Compiler = object
+    hidden FReports: ref Diagnostics;
+    hidden FSources: ref SourceFiles;
+    hidden FTree: ref SyntaxTree;
+    hidden FTarget: ref Target;
+    hidden FMain: int64;
+    hidden FChecked: bool;
+
+    // Adds the folder APath ($P: adam.exe's folder) as the next module path. When the
+    // folder of adam.exe cannot be told, ACode warns with ATemplate and imports are looked
+    // for without it
+    hidden method DoAddModulePath(const APath: string; const ACode: string; const ATemplate: string);
+    var
+      LDir: string;
+    begin
+      LDir := ResolvePath(APath);
+      if LDir = "" then
+        self.FReports.Add(Severity.Warning, ACode, NoPlace(), ATemplate, NoArgs().Str(APath));
+        return;
+      end;
+      self.FSources.AddModulePath(LDir);
+    end;
+
+    // The standard library's folder as the first module path (DR0001), the runtime's next
+    // (DR0005: where the implicit runtime unit is found)
+    hidden method DoAddStdPath();
+    begin
+      self.DoAddModulePath(ADAM_DRIVER_STD_MODULE_PATH, ADAM_ERR_DRIVER_001, ADAM_MSG_DRIVER_NO_STD);
+      self.DoAddModulePath(ADAM_DRIVER_RUNTIME_MODULE_PATH, ADAM_ERR_DRIVER_005,
+        ADAM_MSG_DRIVER_NO_RUNTIME);
+    end;
+
+    init();
+    begin
+      self.FReports := ref Diagnostics(ADAM_DRIVER_ERROR_BUDGET);
+      self.FSources := ref SourceFiles();
+      self.FTree := ref SyntaxTree();
+      self.FTarget := nil;
+      self.FMain := 0;
+      self.FChecked := false;
+      self.DoAddStdPath();
+    end;
+
+    // Adds the folder ADir (a resolved path) after the module paths already there: for a
+    // caller that runs the compiler in its own process, whose $P: is not adam.exe's folder
+    // (a probe, later the language server). Before Check
+    method AddModulePath(const ADir: string);
+    begin
+      self.FSources.AddModulePath(ADir);
+    end;
+
+    // The compile's reports: every phase's, and the caller's own (a command line's)
+    property Reports: ref Diagnostics read FReports;
+
+    // The whole-program AST, filled by Check
+    property Tree: ref SyntaxTree read FTree;
+
+    // The main module's id in Tree; 0 before Check, or when the main file cannot be read
+    // or has no module header
+    property MainModule: int64 read FMain;
+
+    // The program's Target, picked by Check; nil before Check, when the main module has no
+    // header, or when its triple names no target (DR0004)
+    property PickedTarget: ref Target read FTarget;
+
+    // Runs the front end on the program whose main module is the file AMainPath (resolved
+    // against the current folder, so the main module's folder is a full path imports and
+    // $S: paths start from): parse (imports recurse into the one AST), names, types,
+    // layouts, symbols. Everything goes to Reports; nothing is printed
+    method Check(const AMainPath: string);
+    var
+      LPath: string;
+    begin
+      if self.FChecked then
+        self.FReports.Add(Severity.Fatal, ADAM_ERR_DRIVER_003, NoPlace(),
+          ADAM_MSG_DRIVER_CHECK_TWICE, NoArgs().Str(AMainPath));
+        return;
+      end;
+      self.FChecked := true;
+      LPath := ResolvePath(AMainPath);
+      if LPath = "" then
+        self.FReports.Add(Severity.Error, ADAM_ERR_DRIVER_002, NoPlace(),
+          ADAM_MSG_DRIVER_BAD_PATH, NoArgs().Str(AMainPath));
+        return;
+      end;
+      // $R: in every file of the build: the main module's project, if it has one
+      self.FSources.SetProjectRoot(ProjectRootOf(LPath));
+      self.FMain := ParseProgramWith(self.FTree, self.FReports, self.FSources, LPath,
+        ADAM_DRIVER_RUNTIME_UNIT);
+      if self.FMain = 0 then
+        return;
+      end;
+      self.FTarget := PickTarget(self.FTree, self.FMain, self.FReports);
+      ResolveNames(self.FTree, self.FReports);
+      CheckTypes(self.FTree, self.FTarget, self.FReports);
+      CheckLayouts(self.FTree, self.FTarget, self.FReports);
+      NameSymbols(self.FTree, self.FTarget, self.FReports);
+    end;
+
+    // The resolved path of the first argument of every directive spelled ASpelling in the
+    // module AModule, in their order (a directive whose path did not resolve was reported
+    // there and adds nothing), appended to AList
+    hidden const method DoDirectivePaths(const AModule: int64; const ASpelling: string;
+      var AList: StringArray);
+    var
+      LDirective: int64;
+      LArg: int64;
+      LI: int64;
+    begin
+      for LI := 0 to self.FTree.CountOf(AModule, NodeRole.Directive) - 1 do
+        LDirective := self.FTree.NthOf(AModule, NodeRole.Directive, LI);
+        if (self.FTree[LDirective].Text = ASpelling) and
+          (self.FTree.CountOf(LDirective, NodeRole.Argument) > 0) then
+          LArg := self.FTree.NthOf(LDirective, NodeRole.Argument, 0);
+          if self.FTree[LArg].ResolvedPath <> "" then
+            setlength(AList, len(AList) + 1);
+            AList[len(AList) - 1] := self.FTree[LArg].ResolvedPath;
+          end;
+        end;
+      end;
+    end;
+
+    // Every module's @addlibrarypath folders, in module order, each module's in its order
+    hidden const method DoLibraryPaths(): StringArray;
+    var
+      LList: StringArray;
+      LI: int64;
+    begin
+      setlength(LList, 0);
+      for LI := 0 to self.FTree.CountOf(ADAM_AST_PROGRAM, NodeRole.Module) - 1 do
+        self.DoDirectivePaths(self.FTree.NthOf(ADAM_AST_PROGRAM, NodeRole.Module, LI),
+          ADAM_DRIVER_DIRECTIVE_LIBRARY, LList);
+      end;
+      return LList;
+    end;
+
+    // The output folder (see the header): AOutputDir when not empty, resolved against the
+    // working folder; "" when it cannot be resolved
+    hidden const method DoOutputDir(const AOutputDir: string): string;
+    var
+      LList: StringArray;
+    begin
+      if AOutputDir <> "" then
+        return ResolvePath(AOutputDir);
+      end;
+      setlength(LList, 0);
+      self.DoDirectivePaths(self.FMain, ADAM_DRIVER_DIRECTIVE_OUTPUT, LList);
+      if len(LList) > 0 then
+        return LList[0];
+      end;
+      return ResolvePath(ADAM_DRIVER_OUTPUT_DIR);
+    end;
+
+    // Check on the program whose main module is AMainPath, then, when nothing stops it, its
+    // exe generated into the output folder AOutputDir ("" for the default; see the header).
+    // Everything goes to Reports; nothing is printed
+    method Build(const AMainPath: string; const AOutputDir: string);
+    var
+      LModule: ref IrModule;
+      LProblems: StringArray;
+      LBackend: ref Backend;
+      LBytes: ByteArray;
+      LDir: string;
+      LExe: string;
+    begin
+      self.Check(AMainPath);
+      if (self.FMain = 0) or self.FReports.HasErrors() then
+        return;
+      end;
+      // A dll or lib main module: its output is not made yet (a unit is PR0004 already)
+      if self.FTree[self.FMain].Module <> ModuleKind.Exe then
+        self.FReports.Add(Severity.Error, ADAM_ERR_DRIVER_009, self.FTree[self.FMain].Place,
+          ADAM_MSG_DRIVER_NOT_EXE, NoArgs().Str(self.FTree[self.FMain].Text)
+          .Str(LowerCase(ModuleKindText(self.FTree[self.FMain].Module))));
+        return;
+      end;
+      LModule := LowerProgram(self.FTree, self.FTarget, self.FReports);
+      if self.FReports.HasErrors() then
+        return;
+      end;
+      LProblems := LModule.Verify();
+      if len(LProblems) > 0 then
+        raise(ADAM_DRIVER_FAULT_IR + JoinStrings(LProblems, "; "));
+      end;
+      LBackend := PickBackend(self.FTree.Triple, self.FTree[self.FMain].Place, self.FReports);
+      if LBackend = nil then
+        return;
+      end;
+      LBytes := GenerateExe(LModule, LBackend, self.DoLibraryPaths(), self.FTree, self.FReports);
+      if self.FReports.HasErrors() then
+        return;
+      end;
+      LDir := self.DoOutputDir(AOutputDir);
+      if LDir = "" then
+        self.FReports.Add(Severity.Error, ADAM_ERR_DRIVER_007, NoPlace(),
+          ADAM_MSG_DRIVER_OUTPUT_DIR, NoArgs().Str(AOutputDir));
+        return;
+      end;
+      if not ForceDirectories(LDir) then
+        self.FReports.Add(Severity.Error, ADAM_ERR_DRIVER_007, NoPlace(),
+          ADAM_MSG_DRIVER_OUTPUT_DIR, NoArgs().Str(LDir));
+        return;
+      end;
+      LExe := ResolvePath(self.FTree[self.FMain].Text + LBackend.Format.ExeExtension(), LDir);
+      if (LExe = "") or not WriteAllBytes(LExe, LBytes) then
+        self.FReports.Add(Severity.Error, ADAM_ERR_DRIVER_008, NoPlace(),
+          ADAM_MSG_DRIVER_WRITE_EXE, NoArgs().Str(LExe));
+      end;
+    end;
+
+    // Prints every report, one line each, in the order made
+    const method PrintReports();
+    begin
+      self.FReports.PrintAll();
+    end;
+
+    // ADAM_DRIVER_EXIT_ERRORS when a report stops the build (an Error or a Fatal), else
+    // ADAM_DRIVER_EXIT_OK
+    const method ExitCode(): int32;
+    begin
+      if self.FReports.HasErrors() then
+        return ADAM_DRIVER_EXIT_ERRORS;
+      end;
+      return ADAM_DRIVER_EXIT_OK;
+    end;
+  end;
+
+end.

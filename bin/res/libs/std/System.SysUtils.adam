@@ -1,0 +1,1942 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.SysUtils.adam - Adam's OS-free utilities: the UTF-8 codec, string
+  helpers, string lists, path names as text, numbers as text
+
+  Nothing here calls the OS, so every other std unit may import it and it
+  imports none of them (System.Windows sits above it, never below). Text is
+  UTF-8 in a string; a malformed sequence decodes to U+FFFD.
+
+  The routines PaskalCPP's SysUtils has keep its names and its rules
+  (ExtractFileName, ChangeFileExt, Kilobyte / Megabyte / Gigabyte), written
+  in Adam: no C or C++. FormatStr comes with Adam's compiler: it is a
+  variadic routine, and the type of each argument comes from Adam's AST at
+  the call.
+
+  Numbers become text the way PaskalCPP's println prints them (C++'s
+  std::format "{}"): an integer in decimal, a bool as true / false, a float
+  as the shortest text that reads back as the same float (Ryu, Ulf Adams
+  2018), fixed or scientific, whichever is shorter (fixed on a tie), the
+  exponent signed and at least two digits: 1e+20, 0.1, 5e-324, inf, -nan.
+
+  Written in the shared subset (DESIGN sec 10): the same file builds under
+  pcpp (stage 0) and Adam.
+*******************************************************************************/
+
+module unit System.SysUtils;
+
+exported const
+  // The code point a malformed UTF-8 sequence or a lone UTF-16 surrogate becomes
+  ADAM_SYSUTILS_REPLACEMENT: uint32 = 0xFFFD;
+  // The bytes in a kilobyte (1024, binary): 4 * Kilobyte is 4096
+  Kilobyte: int64 = 1024;
+  // The bytes in a megabyte (1024 x 1024, binary)
+  Megabyte: int64 = 1024 * 1024;
+  // The bytes in a gigabyte (1024 x 1024 x 1024, binary)
+  Gigabyte: int64 = 1024 * 1024 * 1024;
+
+exported type
+  // A list of names or arguments
+  StringArray = array of string;
+  // A list of bytes (a file's contents, an object's image)
+  ByteArray = array of uint8;
+  // A list of 64-bit integers (ids, offsets, per-id maps)
+  Int64Array = array of int64;
+  // A list of flags (a set over ids)
+  BoolArray = array of bool;
+
+type
+  // A float64 and its bits
+  FloatBits = overlay
+    Value: float64;
+    Bits: uint64;
+  end;
+
+  // A float32 and its bits
+  Float32Bits = overlay
+    Value: float32;
+    Bits: uint32;
+  end;
+
+  // A 128-bit value as two halves
+  RyuPair = record
+    Lo: uint64;
+    Hi: uint64;
+  end;
+
+  // A big unsigned number for building the Ryu tables: 32-bit limbs, the lowest first
+  RyuBig = array[0..31] of uint32;
+
+  // The decimal digits of a uint64, the last one first
+  DigitBuffer = array[0..19] of char;
+
+const
+  // Ryu's double tables: 5^i's inverse for i 0 .. 341, 5^i for i 0 .. 325, 125 bits each
+  ADAM_SYSUTILS_RYU_INV_COUNT: int32 = 342;
+  ADAM_SYSUTILS_RYU_SPLIT_COUNT: int32 = 326;
+  ADAM_SYSUTILS_RYU_BITCOUNT: int32 = 125;
+  ADAM_SYSUTILS_RYU_MANTISSA_BITS: int32 = 52;
+  ADAM_SYSUTILS_RYU_BIAS: int32 = 1023;
+
+var
+  // Ryu's tables, built on the first FloatToStr (GRyuReady set once they are whole)
+  GRyuReady: bool = false;
+  GRyuInv: array[0..341] of RyuPair;
+  GRyuSplit: array[0..325] of RyuPair;
+
+// Decodes the UTF-8 sequence at AIndex of AText and returns its code point, AIndex past it. A
+// malformed sequence (a stray continuation byte, a cut sequence, an overlong form, a surrogate,
+// a value past U+10FFFF) gives ADAM_SYSUTILS_REPLACEMENT and consumes one byte, so decoding
+// always moves on. AIndex must be inside AText
+exported routine DecodeUtf8Char(const AText: string; var AIndex: int64): uint32;
+var
+  LLead: uint32;
+  LNeed: int64;
+  LMin: uint32;
+  LCode: uint32;
+  LNext: uint32;
+  LI: int64;
+begin
+  LLead := uint32(uint8(AText[AIndex]));
+  AIndex := AIndex + 1;
+  if LLead < 0x80 then
+    return LLead;
+  end;
+  LNeed := 0;
+  LCode := 0;
+  LMin := 0;
+  if (LLead & 0xE0) = 0xC0 then
+    LNeed := 1;
+    LCode := LLead & 0x1F;
+    LMin := 0x80;
+  end;
+  if (LLead & 0xF0) = 0xE0 then
+    LNeed := 2;
+    LCode := LLead & 0x0F;
+    LMin := 0x800;
+  end;
+  if (LLead & 0xF8) = 0xF0 then
+    LNeed := 3;
+    LCode := LLead & 0x07;
+    LMin := 0x10000;
+  end;
+  if LNeed = 0 then
+    return ADAM_SYSUTILS_REPLACEMENT;
+  end;
+  if AIndex + LNeed > len(AText) then
+    return ADAM_SYSUTILS_REPLACEMENT;
+  end;
+  for LI := 0 to LNeed - 1 do
+    LNext := uint32(uint8(AText[AIndex + LI]));
+    if (LNext & 0xC0) <> 0x80 then
+      return ADAM_SYSUTILS_REPLACEMENT;
+    end;
+    LCode := (LCode shl 6) | (LNext & 0x3F);
+  end;
+  if (LCode < LMin) or (LCode > 0x10FFFF) then
+    return ADAM_SYSUTILS_REPLACEMENT;
+  end;
+  if (LCode >= 0xD800) and (LCode <= 0xDFFF) then
+    return ADAM_SYSUTILS_REPLACEMENT;
+  end;
+  AIndex := AIndex + LNeed;
+  return LCode;
+end;
+
+// Writes ACode as UTF-8 into AText at AAt, AAt past it. The caller makes the room: up to 4
+// bytes from AAt on (1 below U+80, 2 below U+800, 3 below U+10000, else 4)
+exported routine EncodeUtf8Char(var AText: string; var AAt: int64; const ACode: uint32);
+begin
+  if ACode < 0x80 then
+    AText[AAt] := char(uint8(ACode));
+    AAt := AAt + 1;
+    return;
+  end;
+  if ACode < 0x800 then
+    AText[AAt] := char(uint8(0xC0 | (ACode shr 6)));
+    AText[AAt + 1] := char(uint8(0x80 | (ACode & 0x3F)));
+    AAt := AAt + 2;
+    return;
+  end;
+  if ACode < 0x10000 then
+    AText[AAt] := char(uint8(0xE0 | (ACode shr 12)));
+    AText[AAt + 1] := char(uint8(0x80 | ((ACode shr 6) & 0x3F)));
+    AText[AAt + 2] := char(uint8(0x80 | (ACode & 0x3F)));
+    AAt := AAt + 3;
+    return;
+  end;
+  AText[AAt] := char(uint8(0xF0 | (ACode shr 18)));
+  AText[AAt + 1] := char(uint8(0x80 | ((ACode shr 12) & 0x3F)));
+  AText[AAt + 2] := char(uint8(0x80 | ((ACode shr 6) & 0x3F)));
+  AText[AAt + 3] := char(uint8(0x80 | (ACode & 0x3F)));
+  AAt := AAt + 4;
+end;
+
+// True when AText is strict UTF-8 (RFC 3629): no overlong form, no surrogate, nothing past
+// U+10FFFF, no cut sequence or stray continuation byte. Unlike DecodeUtf8Char it tells a
+// malformed sequence from a written U+FFFD
+exported routine IsUtf8(const AText: string): bool;
+var
+  LAt: int64;
+  LLead: uint32;
+  LNeed: int64;
+  LMin: uint32;
+  LCode: uint32;
+  LNext: uint32;
+  LI: int64;
+begin
+  LAt := 0;
+  while LAt < len(AText) do
+    LLead := uint32(uint8(AText[LAt]));
+    LNeed := -1;
+    LCode := 0;
+    LMin := 0;
+    if LLead < 0x80 then
+      LNeed := 0;
+      LCode := LLead;
+    end;
+    if (LLead & 0xE0) = 0xC0 then
+      LNeed := 1;
+      LCode := LLead & 0x1F;
+      LMin := 0x80;
+    end;
+    if (LLead & 0xF0) = 0xE0 then
+      LNeed := 2;
+      LCode := LLead & 0x0F;
+      LMin := 0x800;
+    end;
+    if (LLead & 0xF8) = 0xF0 then
+      LNeed := 3;
+      LCode := LLead & 0x07;
+      LMin := 0x10000;
+    end;
+    if LNeed < 0 then
+      return false;
+    end;
+    // A cut sequence: its last continuation byte would lie past the end
+    if LAt + LNeed >= len(AText) then
+      return false;
+    end;
+    for LI := 1 to LNeed do
+      LNext := uint32(uint8(AText[LAt + LI]));
+      if (LNext & 0xC0) <> 0x80 then
+        return false;
+      end;
+      LCode := (LCode shl 6) | (LNext & 0x3F);
+    end;
+    if (LCode < LMin) or (LCode > 0x10FFFF) then
+      return false;
+    end;
+    if (LCode >= 0xD800) and (LCode <= 0xDFFF) then
+      return false;
+    end;
+    LAt := LAt + LNeed + 1;
+  end;
+  return true;
+end;
+
+// Writes ACode as UTF-16 into AText at AAt, AAt past it: one unit below U+10000, else a
+// surrogate pair. The caller makes the room (up to 2 units from AAt on). ACode is a code
+// point (at most U+10FFFF); a lone surrogate value is written as the one unit it is
+exported routine EncodeUtf16Char(var AText: wstring; var AAt: int64; const ACode: uint32);
+var
+  LRest: uint32;
+begin
+  if ACode < 0x10000 then
+    AText[AAt] := wchar(uint16(ACode));
+    AAt := AAt + 1;
+    return;
+  end;
+  LRest := ACode - 0x10000;
+  AText[AAt] := wchar(uint16(0xD800 + (LRest shr 10)));
+  AText[AAt + 1] := wchar(uint16(0xDC00 + (LRest & 0x3FF)));
+  AAt := AAt + 2;
+end;
+
+// ACount copies of AChar ("" when ACount is 0 or less)
+exported routine StringOfChar(const AChar: char; const ACount: int64): string;
+var
+  LText: string;
+  LI: int64;
+begin
+  LText := "";
+  if ACount <= 0 then
+    return LText;
+  end;
+  setlength(LText, ACount);
+  for LI := 0 to ACount - 1 do
+    LText[LI] := AChar;
+  end;
+  return LText;
+end;
+
+// The ACount bytes of AText from AFrom on (0-based, as Delphi's string Substring), cut to the
+// text's end; "" when nothing is left or AFrom is negative
+exported routine Substring(const AText: string; const AFrom: int64; const ACount: int64): string;
+var
+  LText: string;
+  LCount: int64;
+  LI: int64;
+begin
+  LText := "";
+  LCount := ACount;
+  if AFrom + LCount > len(AText) then
+    LCount := len(AText) - AFrom;
+  end;
+  if (AFrom < 0) or (LCount <= 0) then
+    return LText;
+  end;
+  setlength(LText, LCount);
+  for LI := 0 to LCount - 1 do
+    LText[LI] := AText[AFrom + LI];
+  end;
+  return LText;
+end;
+
+// AText without the bytes at or below a space at both ends, as Delphi's Trim (a UTF-8 lead or
+// continuation byte is never one, so text is never cut inside a character)
+exported routine Trim(const AText: string): string;
+var
+  LFirst: int64;
+  LLast: int64;
+begin
+  LFirst := 0;
+  LLast := len(AText);
+  while (LFirst < LLast) and (uint8(AText[LFirst]) <= 0x20) do
+    LFirst := LFirst + 1;
+  end;
+  while (LLast > LFirst) and (uint8(AText[LLast - 1]) <= 0x20) do
+    LLast := LLast - 1;
+  end;
+  return Substring(AText, LFirst, LLast - LFirst);
+end;
+
+// AText without the bytes at or below a space at its end, as Delphi's TrimRight (never cut
+// inside a UTF-8 character, as Trim)
+exported routine TrimRight(const AText: string): string;
+var
+  LLast: int64;
+begin
+  LLast := len(AText);
+  while (LLast > 0) and (uint8(AText[LLast - 1]) <= 0x20) do
+    LLast := LLast - 1;
+  end;
+  return Substring(AText, 0, LLast);
+end;
+
+// AText cut at each byte that is one of ADelimiters, as Delphi's SplitString: the parts in
+// order, empty ones kept ("a..b" on '.' is a, "", b); "" gives one empty part
+exported routine SplitString(const AText: string; const ADelimiters: string): StringArray;
+var
+  LParts: StringArray;
+  LStart: int64;
+  LI: int64;
+  LJ: int64;
+  LCut: bool;
+  LCount: int64;
+begin
+  setlength(LParts, 0);
+  LStart := 0;
+  for LI := 0 to len(AText) do
+    LCut := (LI = len(AText));
+    if not LCut then
+      for LJ := 0 to len(ADelimiters) - 1 do
+        if AText[LI] = ADelimiters[LJ] then
+          LCut := true;
+          leave;
+        end;
+      end;
+    end;
+    if LCut then
+      LCount := len(LParts);
+      setlength(LParts, LCount + 1);
+      LParts[LCount] := Substring(AText, LStart, LI - LStart);
+      LStart := LI + 1;
+    end;
+  end;
+  return LParts;
+end;
+
+// True when AText starts with ASubText, byte for byte (Delphi's StartsStr; "" starts every text)
+exported routine StartsStr(const ASubText: string; const AText: string): bool;
+var
+  LI: int64;
+begin
+  if len(ASubText) > len(AText) then
+    return false;
+  end;
+  for LI := 0 to len(ASubText) - 1 do
+    if AText[LI] <> ASubText[LI] then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// True when AText ends with ASubText, byte for byte (Delphi's EndsStr; "" ends every text)
+exported routine EndsStr(const ASubText: string; const AText: string): bool;
+var
+  LI: int64;
+  LFrom: int64;
+begin
+  if len(ASubText) > len(AText) then
+    return false;
+  end;
+  LFrom := len(AText) - len(ASubText);
+  for LI := 0 to len(ASubText) - 1 do
+    if AText[LFrom + LI] <> ASubText[LI] then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// AText with A..Z made a..z; every other byte as it is (Delphi's LowerCase: ASCII only, so a
+// UTF-8 sequence is never touched)
+exported routine LowerCase(const AText: string): string;
+var
+  LText: string;
+  LI: int64;
+begin
+  LText := AText;
+  for LI := 0 to len(LText) - 1 do
+    if (uint8(LText[LI]) >= 0x41) and (uint8(LText[LI]) <= 0x5A) then
+      LText[LI] := char(uint8(uint8(LText[LI]) + 0x20));
+    end;
+  end;
+  return LText;
+end;
+
+// The ACount strings of AList from AFirst on, ASeparator between each two (Delphi's
+// String.Join(Separator, Values, StartIndex, Count)); "" for ACount 0. The caller keeps
+// AFirst .. AFirst + ACount - 1 inside AList
+exported routine JoinStrings(const AList: StringArray; const ASeparator: string;
+  const AFirst: int64; const ACount: int64): string;
+var
+  LText: string;
+  LI: int64;
+begin
+  LText := "";
+  for LI := AFirst to AFirst + ACount - 1 do
+    if LI > AFirst then
+      LText := LText + ASeparator;
+    end;
+    LText := LText + AList[LI];
+  end;
+  return LText;
+end;
+
+// Every string of AList, ASeparator between each two; "" for an empty list
+exported routine JoinStrings(const AList: StringArray; const ASeparator: string): string;
+begin
+  return JoinStrings(AList, ASeparator, 0, len(AList));
+end;
+
+// The index of the first string of AValues equal to AText (case-sensitive), -1 for none
+// (Delphi's StrUtils.IndexStr)
+exported routine IndexStr(const AText: string; const AValues: StringArray): int64;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(AValues) - 1 do
+    if AValues[LI] = AText then
+      return LI;
+    end;
+  end;
+  return -1;
+end;
+
+// AText with a..z made A..Z; every other byte as it is (Delphi's UpperCase: ASCII only)
+exported routine UpperCase(const AText: string): string;
+var
+  LText: string;
+  LI: int64;
+begin
+  LText := AText;
+  for LI := 0 to len(LText) - 1 do
+    if (uint8(LText[LI]) >= 0x61) and (uint8(LText[LI]) <= 0x7A) then
+      LText[LI] := char(uint8(uint8(LText[LI]) - 0x20));
+    end;
+  end;
+  return LText;
+end;
+
+// True when ASubText occurs in AText at byte AAt, byte for byte (AAt past the end: false)
+routine DoOccursAt(const ASubText: string; const AText: string; const AAt: int64): bool;
+var
+  LI: int64;
+begin
+  if AAt + len(ASubText) > len(AText) then
+    return false;
+  end;
+  for LI := 0 to len(ASubText) - 1 do
+    if AText[AAt + LI] <> ASubText[LI] then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// The byte offset of the first occurrence of ASubText in AText at or after AFrom, byte for byte;
+// -1 when there is none (Delphi's TStringHelper.IndexOf: 0-based, case-sensitive). An empty
+// ASubText is found at AFrom; AFrom below 0 counts from 0, past the end finds nothing
+exported routine IndexOf(const ASubText: string; const AText: string; const AFrom: int64): int64;
+var
+  LAt: int64;
+begin
+  LAt := AFrom;
+  if LAt < 0 then
+    LAt := 0;
+  end;
+  while LAt + len(ASubText) <= len(AText) do
+    if DoOccursAt(ASubText, AText, LAt) then
+      return LAt;
+    end;
+    LAt := LAt + 1;
+  end;
+  return -1;
+end;
+
+// Reads AText as a decimal whole number, a '-' allowed first, into AValue; false (AValue
+// unchanged) when AText is not one or does not fit an int64. Unlike Delphi's TryStrToInt, no
+// blank, '+' or '$' hex form is taken: the text is exactly the number
+exported routine TryStrToInt(const AText: string; var AValue: int64): bool;
+var
+  LAt: int64;
+  LNegative: bool;
+  LMagnitude: uint64;
+  LDigit: uint64;
+  LLimit: uint64;
+begin
+  LAt := 0;
+  LNegative := false;
+  if (len(AText) > 0) and (AText[0] = '-') then
+    LNegative := true;
+    LAt := 1;
+  end;
+  if LAt >= len(AText) then
+    return false;
+  end;
+  // The magnitude may reach 2^63 only for a negative number (int64's low end)
+  LLimit := 9223372036854775807;
+  if LNegative then
+    LLimit := LLimit + 1;
+  end;
+  LMagnitude := 0;
+  while LAt < len(AText) do
+    if (uint8(AText[LAt]) < 0x30) or (uint8(AText[LAt]) > 0x39) then
+      return false;
+    end;
+    LDigit := uint64(uint8(AText[LAt])) - 0x30;
+    if LMagnitude > (LLimit - LDigit) div 10 then
+      return false;
+    end;
+    LMagnitude := LMagnitude * 10 + LDigit;
+    LAt := LAt + 1;
+  end;
+  if LNegative and (LMagnitude > 0) then
+    // -(m - 1) - 1 never overflows, 2^63 (int64's low end) included
+    AValue := -int64(LMagnitude - 1) - 1;
+  else
+    AValue := int64(LMagnitude);
+  end;
+  return true;
+end;
+
+// True when AText matches AMask byte for byte, case-sensitive, where '*' in AMask matches any
+// run of bytes (none included) and '?' any one byte. No other character is special
+exported routine MatchesGlob(const AText: string; const AMask: string): bool;
+var
+  LMaskAt: int64;
+  LTextAt: int64;
+  LStar: int64;
+  LMark: int64;
+begin
+  LMaskAt := 0;
+  LTextAt := 0;
+  LStar := -1;
+  LMark := 0;
+  while LTextAt < len(AText) do
+    if (LMaskAt < len(AMask)) and ((AMask[LMaskAt] = '?') or (AMask[LMaskAt] = AText[LTextAt])) then
+      LMaskAt := LMaskAt + 1;
+      LTextAt := LTextAt + 1;
+    else
+      if (LMaskAt < len(AMask)) and (AMask[LMaskAt] = '*') then
+        // Remember the star; it first matches nothing
+        LStar := LMaskAt;
+        LMark := LTextAt;
+        LMaskAt := LMaskAt + 1;
+      else
+        if LStar < 0 then
+          return false;
+        end;
+        // Backtrack: the last star takes one more byte
+        LMaskAt := LStar + 1;
+        LMark := LMark + 1;
+        LTextAt := LMark;
+      end;
+    end;
+  end;
+  while (LMaskAt < len(AMask)) and (AMask[LMaskAt] = '*') do
+    LMaskAt := LMaskAt + 1;
+  end;
+  return LMaskAt = len(AMask);
+end;
+
+// AText with every occurrence of AFromText replaced by AToText, scanning left to right with no
+// overlap, byte for byte (Delphi's ReplaceStr: case-sensitive). An empty AFromText replaces
+// nothing: AText comes back unchanged
+exported routine ReplaceStr(const AText: string; const AFromText: string;
+  const AToText: string): string;
+var
+  LResult: string;
+  LStart: int64;
+  LAt: int64;
+begin
+  if len(AFromText) = 0 then
+    return AText;
+  end;
+  LResult := "";
+  LStart := 0;
+  LAt := 0;
+  while LAt < len(AText) do
+    if DoOccursAt(AFromText, AText, LAt) then
+      // Copy what lies before the match, then the replacement; resume after the match
+      LResult := LResult + Substring(AText, LStart, LAt - LStart) + AToText;
+      LAt := LAt + len(AFromText);
+      LStart := LAt;
+    else
+      LAt := LAt + 1;
+    end;
+  end;
+  return LResult + Substring(AText, LStart, len(AText) - LStart);
+end;
+
+// True when AA sorts before AB: by their UTF-8 bytes as unsigned values, a prefix first. The
+// order is the bytes', never the locale's or the file system's, so it is the same everywhere
+routine DoBefore(const AA: string; const AB: string): bool;
+var
+  LI: int64;
+  LA: uint8;
+  LB: uint8;
+begin
+  LI := 0;
+  while (LI < len(AA)) and (LI < len(AB)) do
+    LA := uint8(AA[LI]);
+    LB := uint8(AB[LI]);
+    if LA <> LB then
+      return LA < LB;
+    end;
+    LI := LI + 1;
+  end;
+  return len(AA) < len(AB);
+end;
+
+// Sorts AList by its UTF-8 bytes as unsigned values, a prefix first: the same order on every
+// machine. Stable (insertion sort: the lists it is for are short)
+exported routine SortStrings(var AList: StringArray);
+var
+  LI: int64;
+  LJ: int64;
+  LItem: string;
+begin
+  for LI := 1 to len(AList) - 1 do
+    LItem := AList[LI];
+    LJ := LI - 1;
+    while LJ >= 0 do
+      if not DoBefore(LItem, AList[LJ]) then
+        leave;
+      end;
+      AList[LJ + 1] := AList[LJ];
+      LJ := LJ - 1;
+    end;
+    AList[LJ + 1] := LItem;
+  end;
+end;
+
+// Where the name part of APath starts: after its last separator ('/', '\' or a drive's ':')
+routine DoNameStart(const APath: string): int64;
+var
+  LIndex: int64;
+  LChar: char;
+begin
+  LIndex := len(APath);
+  while LIndex > 0 do
+    LChar := APath[LIndex - 1];
+    if (LChar = '/') or (LChar = '\\') or (LChar = ':') then
+      leave;
+    end;
+    LIndex := LIndex - 1;
+  end;
+  return LIndex;
+end;
+
+// The name part of a path, as Delphi's ExtractFileName: the text after its last separator ('/',
+// '\' or a drive's ':'), "" when the path ends in one. The path is taken as text (the disk is
+// never touched)
+exported routine ExtractFileName(const APath: string): string;
+var
+  LStart: int64;
+begin
+  LStart := DoNameStart(APath);
+  return Substring(APath, LStart, len(APath) - LStart);
+end;
+
+// The folder part of a path, as Delphi's ExtractFileDir: the text before its name part, without
+// the last separator unless that separator is the root's ("/x" -> "/", "c:\x" -> "c:\", "c:x"
+// -> "c:"); "" when the path has no separator. The disk is never touched
+exported routine ExtractFileDir(const APath: string): string;
+var
+  LStart: int64;
+  LChar: char;
+begin
+  LStart := DoNameStart(APath);
+  if LStart = 0 then
+    return "";
+  end;
+  LChar := APath[LStart - 1];
+  if (LChar = ':') or (LStart = 1) then
+    return Substring(APath, 0, LStart);
+  end;
+  if APath[LStart - 2] = ':' then
+    return Substring(APath, 0, LStart);
+  end;
+  return Substring(APath, 0, LStart - 1);
+end;
+
+// A path with its extension changed, as Delphi's ChangeFileExt: the name part's text from its
+// last '.' on is replaced by AExt (".bak", or "" to drop it); a name with no '.' gets AExt
+// added. Separators as ExtractFileName reads them
+exported routine ChangeFileExt(const APath: string; const AExt: string): string;
+var
+  LStart: int64;
+  LDot: int64;
+  LI: int64;
+begin
+  LStart := DoNameStart(APath);
+  LDot := -1;
+  for LI := LStart to len(APath) - 1 do
+    if APath[LI] = '.' then
+      LDot := LI;
+    end;
+  end;
+  if LDot < 0 then
+    return APath + AExt;
+  end;
+  return Substring(APath, 0, LDot) + AExt;
+end;
+
+// AValue in decimal
+exported routine UIntToStr(const AValue: uint64): string;
+var
+  LDigits: DigitBuffer;
+  LCount: int32;
+  LValue: uint64;
+  LText: string;
+  LI: int32;
+begin
+  LValue := AValue;
+  LCount := 0;
+  repeat
+    LDigits[LCount] := char(uint8(0x30 + (LValue mod 10)));
+    LValue := LValue div 10;
+    LCount := LCount + 1;
+  until LValue = 0;
+  LText := "";
+  setlength(LText, int64(LCount));
+  for LI := 0 to LCount - 1 do
+    LText[int64(LI)] := LDigits[LCount - 1 - LI];
+  end;
+  return LText;
+end;
+
+// AValue in uppercase hex, padded with '0' to at least AMinDigits digits
+// (at most 16: a uint64 has no more)
+exported routine IntToHex(const AValue: uint64; const AMinDigits: int32): string;
+var
+  LDigits: DigitBuffer;
+  LCount: int32;
+  LValue: uint64;
+  LNibble: uint64;
+  LText: string;
+  LI: int32;
+begin
+  LValue := AValue;
+  LCount := 0;
+  repeat
+    LNibble := LValue & 15;
+    if LNibble < 10 then
+      LDigits[LCount] := char(uint8(0x30 + LNibble));
+    else
+      LDigits[LCount] := char(uint8(0x37 + LNibble));
+    end;
+    LValue := LValue shr 4;
+    LCount := LCount + 1;
+  until (LValue = 0) and ((LCount >= AMinDigits) or (LCount >= 16));
+  LText := "";
+  setlength(LText, int64(LCount));
+  for LI := 0 to LCount - 1 do
+    LText[int64(LI)] := LDigits[LCount - 1 - LI];
+  end;
+  return LText;
+end;
+
+// AValue in decimal, a '-' before a negative one (the lowest int64 included)
+exported routine IntToStr(const AValue: int64): string;
+begin
+  if AValue >= 0 then
+    return UIntToStr(uint64(AValue));
+  end;
+  // -(AValue + 1) + 1 is the magnitude without overflowing at the lowest int64
+  return "-" + UIntToStr(uint64(-(AValue + 1)) + 1);
+end;
+
+// "true" or "false", as println prints a bool
+exported routine BoolToStr(const AValue: bool): string;
+begin
+  if AValue then
+    return "true";
+  end;
+  return "false";
+end;
+
+// Sets every limb of ABig to 0
+routine DoBigClear(var ABig: RyuBig);
+var
+  LI: int32;
+begin
+  for LI := 0 to 31 do
+    ABig[LI] := 0;
+  end;
+end;
+
+// The number of bits ABig needs (0 for zero)
+routine DoBigBitLength(var ABig: RyuBig): int32;
+var
+  LLimb: int32;
+  LBits: int32;
+  LValue: uint32;
+begin
+  LLimb := 31;
+  while (LLimb >= 0) and (ABig[LLimb] = 0) do
+    LLimb := LLimb - 1;
+  end;
+  if LLimb < 0 then
+    return 0;
+  end;
+  LBits := 0;
+  LValue := ABig[LLimb];
+  while LValue <> 0 do
+    LBits := LBits + 1;
+    LValue := LValue shr 1;
+  end;
+  return LLimb * 32 + LBits;
+end;
+
+// Bit ABit of ABig, 0 or 1 (0 outside the 1024 bits ABig holds, a negative ABit included)
+routine DoBigBit(var ABig: RyuBig; const ABit: int32): uint64;
+begin
+  if (ABit < 0) or (ABit >= 1024) then
+    return 0;
+  end;
+  return uint64((ABig[ABit div 32] shr uint32(ABit mod 32)) & 1);
+end;
+
+// ABig := ABig * AFactor (the product fits: the tables need at most 917 bits)
+routine DoBigMulSmall(var ABig: RyuBig; const AFactor: uint32);
+var
+  LI: int32;
+  LCarry: uint64;
+  LProduct: uint64;
+begin
+  LCarry := 0;
+  for LI := 0 to 31 do
+    LProduct := uint64(ABig[LI]) * uint64(AFactor) + LCarry;
+    ABig[LI] := uint32(LProduct & 0xFFFFFFFF);
+    LCarry := LProduct shr 32;
+  end;
+end;
+
+// ABig := ABig div ADivisor (rounded down)
+routine DoBigDivSmall(var ABig: RyuBig; const ADivisor: uint32);
+var
+  LI: int32;
+  LRest: uint64;
+  LValue: uint64;
+begin
+  LRest := 0;
+  for LI := 31 downto 0 do
+    LValue := (LRest shl 32) | uint64(ABig[LI]);
+    ABig[LI] := uint32(LValue div uint64(ADivisor));
+    LRest := LValue mod uint64(ADivisor);
+  end;
+end;
+
+// The 128 bits of ABig from bit AFrom up (a bit below 0 reads as 0)
+routine DoBigBits(var ABig: RyuBig; const AFrom: int32): RyuPair;
+var
+  LPair: RyuPair;
+  LK: int32;
+begin
+  LPair.Lo := 0;
+  LPair.Hi := 0;
+  for LK := 0 to 127 do
+    if DoBigBit(ABig, AFrom + LK) <> 0 then
+      if LK < 64 then
+        LPair.Lo := LPair.Lo | (uint64(1) shl uint64(LK));
+      else
+        LPair.Hi := LPair.Hi | (uint64(1) shl uint64(LK - 64));
+      end;
+    end;
+  end;
+  return LPair;
+end;
+
+// Builds Ryu's tables from their definition (Ryu's own table generator): GRyuSplit[i] is the
+// top 125 bits of 5^i, GRyuInv[i] is 2^(bits(5^i) - 1 + 125) div 5^i, plus 1. Computed here
+// rather than written out, so no constant can be mistyped
+routine DoRyuInit();
+var
+  LPow: RyuBig;
+  LInv: RyuBig;
+  LI: int32;
+  LK: int32;
+  LBits: int32;
+  LShift: int32;
+  LPair: RyuPair;
+begin
+  DoBigClear(LPow);
+  LPow[0] := 1;
+  for LI := 0 to ADAM_SYSUTILS_RYU_INV_COUNT - 1 do
+    LBits := DoBigBitLength(LPow);
+    if LI < ADAM_SYSUTILS_RYU_SPLIT_COUNT then
+      GRyuSplit[LI] := DoBigBits(LPow, LBits - ADAM_SYSUTILS_RYU_BITCOUNT);
+    end;
+
+    // 2^LShift div 5^LI: dividing by 5 LI times rounds down as one division does
+    LShift := LBits - 1 + ADAM_SYSUTILS_RYU_BITCOUNT;
+    DoBigClear(LInv);
+    LInv[LShift div 32] := uint32(1) shl uint32(LShift mod 32);
+    for LK := 1 to LI do
+      DoBigDivSmall(LInv, 5);
+    end;
+    LPair := DoBigBits(LInv, 0);
+    if LPair.Lo = 0xFFFFFFFFFFFFFFFF then
+      LPair.Lo := 0;
+      LPair.Hi := LPair.Hi + 1;
+    else
+      LPair.Lo := LPair.Lo + 1;
+    end;
+    GRyuInv[LI] := LPair;
+
+    DoBigMulSmall(LPow, 5);
+  end;
+  GRyuReady := true;
+end;
+
+// The 128-bit product of AA and AB, from 32-bit halves (no part overflows)
+routine DoMul128(const AA: uint64; const AB: uint64): RyuPair;
+var
+  LALo: uint64;
+  LAHi: uint64;
+  LBLo: uint64;
+  LBHi: uint64;
+  L00: uint64;
+  L01: uint64;
+  L10: uint64;
+  L11: uint64;
+  LMid1: uint64;
+  LMid2: uint64;
+  LPair: RyuPair;
+begin
+  LALo := AA & 0xFFFFFFFF;
+  LAHi := AA shr 32;
+  LBLo := AB & 0xFFFFFFFF;
+  LBHi := AB shr 32;
+  L00 := LALo * LBLo;
+  L01 := LALo * LBHi;
+  L10 := LAHi * LBLo;
+  L11 := LAHi * LBHi;
+  LMid1 := L10 + (L00 shr 32);
+  LMid2 := L01 + (LMid1 & 0xFFFFFFFF);
+  LPair.Hi := L11 + (LMid1 shr 32) + (LMid2 shr 32);
+  LPair.Lo := ((LMid2 & 0xFFFFFFFF) shl 32) | (L00 & 0xFFFFFFFF);
+  return LPair;
+end;
+
+// (AM * AMul) shr AShift, AMul a 128-bit table entry, AShift in 64 .. 127 (Ryu's mulShift64)
+routine DoMulShift64(const AM: uint64; const AMul: RyuPair; const AShift: int32): uint64;
+var
+  LLow: RyuPair;
+  LHigh: RyuPair;
+  LSum: uint64;
+  LTop: uint64;
+  LDistance: uint64;
+begin
+  LLow := DoMul128(AM, AMul.Lo);
+  LHigh := DoMul128(AM, AMul.Hi);
+  // The middle 64 bits and their carry, added without wrapping
+  LTop := LHigh.Hi;
+  if LLow.Hi > 0xFFFFFFFFFFFFFFFF - LHigh.Lo then
+    LSum := LLow.Hi - (0xFFFFFFFFFFFFFFFF - LHigh.Lo) - 1;
+    LTop := LTop + 1;
+  else
+    LSum := LLow.Hi + LHigh.Lo;
+  end;
+  LDistance := uint64(AShift - 64);
+  if LDistance = 0 then
+    return LSum;
+  end;
+  return (LTop shl (64 - LDistance)) | (LSum shr LDistance);
+end;
+
+// The bits of 5^AE, plus 1: ((AE * 1217359) shr 19) + 1 (exact for AE 0 .. 3528)
+routine DoPow5Bits(const AE: int32): int32;
+begin
+  return int32((uint64(AE) * 1217359) shr 19) + 1;
+end;
+
+// floor(log10(2^AE)) for AE 0 .. 1650
+routine DoLog10Pow2(const AE: int32): int32;
+begin
+  return int32((uint64(AE) * 78913) shr 18);
+end;
+
+// floor(log10(5^AE)) for AE 0 .. 2620
+routine DoLog10Pow5(const AE: int32): int32;
+begin
+  return int32((uint64(AE) * 732923) shr 20);
+end;
+
+// True when AValue is a multiple of 5^APower (AValue is not 0)
+routine DoMultipleOfPowerOf5(const AValue: uint64; const APower: int32): bool;
+var
+  LValue: uint64;
+  LCount: int32;
+begin
+  LValue := AValue;
+  LCount := 0;
+  while (LValue mod 5) = 0 do
+    LValue := LValue div 5;
+    LCount := LCount + 1;
+  end;
+  return LCount >= APower;
+end;
+
+// True when AValue is a multiple of 2^APower (APower 0 .. 63)
+routine DoMultipleOfPowerOf2(const AValue: uint64; const APower: int32): bool;
+begin
+  return (AValue & ((uint64(1) shl uint64(APower)) - 1)) = 0;
+end;
+
+// 1 when ACondition holds, else 0: Ryu adds and subtracts its comparisons
+routine DoOne(const ACondition: bool): uint64;
+begin
+  if ACondition then
+    return 1;
+  end;
+  return 0;
+end;
+
+type
+  // Ryu's working state for one float: the scaled value and its bounds as decimals
+  RyuState = record
+    Vr: uint64;
+    Vp: uint64;
+    Vm: uint64;
+    E10: int32;
+    AcceptBounds: bool;
+    VmTrailingZeros: bool;
+    VrTrailingZeros: bool;
+  end;
+
+// Ryu's step 2 and 3: the float m2 * 2^e2 and the halfway points to its neighbours, scaled to
+// decimals Vr / Vp / Vm with exponent E10, and whether the dropped parts are all zeros
+routine DoRyuBounds(const AM2: uint64; const AE2: int32; const AMmShift: uint64;
+  var AState: RyuState);
+var
+  LMv: uint64;
+  LQ: int32;
+  LK: int32;
+  LI: int32;
+  LJ: int32;
+  LMul: RyuPair;
+begin
+  LMv := 4 * AM2;
+  AState.VmTrailingZeros := false;
+  AState.VrTrailingZeros := false;
+  if AE2 >= 0 then
+    LQ := DoLog10Pow2(AE2) - int32(DoOne(AE2 > 3));
+    AState.E10 := LQ;
+    LK := ADAM_SYSUTILS_RYU_BITCOUNT + DoPow5Bits(LQ) - 1;
+    LI := -AE2 + LQ + LK;
+    LMul := GRyuInv[LQ];
+    AState.Vr := DoMulShift64(4 * AM2, LMul, LI);
+    AState.Vp := DoMulShift64(4 * AM2 + 2, LMul, LI);
+    AState.Vm := DoMulShift64(4 * AM2 - 1 - AMmShift, LMul, LI);
+    if LQ <= 21 then
+      // Only one of mp, mv and mm can be a multiple of 5, if any
+      if (LMv mod 5) = 0 then
+        AState.VrTrailingZeros := DoMultipleOfPowerOf5(LMv, LQ);
+      else
+        if AState.AcceptBounds then
+          AState.VmTrailingZeros := DoMultipleOfPowerOf5(LMv - 1 - AMmShift, LQ);
+        else
+          AState.Vp := AState.Vp - DoOne(DoMultipleOfPowerOf5(LMv + 2, LQ));
+        end;
+      end;
+    end;
+  else
+    LQ := DoLog10Pow5(-AE2) - int32(DoOne(-AE2 > 1));
+    AState.E10 := LQ + AE2;
+    LI := -AE2 - LQ;
+    LK := DoPow5Bits(LI) - ADAM_SYSUTILS_RYU_BITCOUNT;
+    LJ := LQ - LK;
+    LMul := GRyuSplit[LI];
+    AState.Vr := DoMulShift64(4 * AM2, LMul, LJ);
+    AState.Vp := DoMulShift64(4 * AM2 + 2, LMul, LJ);
+    AState.Vm := DoMulShift64(4 * AM2 - 1 - AMmShift, LMul, LJ);
+    if LQ <= 1 then
+      // mv has at least LQ trailing zero bits: Vr is exact
+      AState.VrTrailingZeros := true;
+      if AState.AcceptBounds then
+        AState.VmTrailingZeros := AMmShift = 1;
+      else
+        AState.Vp := AState.Vp - 1;
+      end;
+    else
+      if LQ < 63 then
+        AState.VrTrailingZeros := DoMultipleOfPowerOf2(LMv, LQ);
+      end;
+    end;
+  end;
+end;
+
+// Ryu's step 4: drops digits while Vp and Vm still differ, then rounds Vr (half to even when
+// the dropped digits are exactly 5000...). AOutput gets the digits, AExp10 their exponent
+routine DoRyuShortest(var AState: RyuState; var AOutput: uint64; var AExp10: int32);
+var
+  LRemoved: int32;
+  LLast: uint64;
+  LRoundUp: bool;
+begin
+  LRemoved := 0;
+  LLast := 0;
+  if AState.VmTrailingZeros or AState.VrTrailingZeros then
+    // The general case: the trailing zeros decide the rounding
+    while (AState.Vp div 10) > (AState.Vm div 10) do
+      AState.VmTrailingZeros := AState.VmTrailingZeros and ((AState.Vm mod 10) = 0);
+      AState.VrTrailingZeros := AState.VrTrailingZeros and (LLast = 0);
+      LLast := AState.Vr mod 10;
+      AState.Vr := AState.Vr div 10;
+      AState.Vp := AState.Vp div 10;
+      AState.Vm := AState.Vm div 10;
+      LRemoved := LRemoved + 1;
+    end;
+    if AState.VmTrailingZeros then
+      while (AState.Vm mod 10) = 0 do
+        AState.VrTrailingZeros := AState.VrTrailingZeros and (LLast = 0);
+        LLast := AState.Vr mod 10;
+        AState.Vr := AState.Vr div 10;
+        AState.Vp := AState.Vp div 10;
+        AState.Vm := AState.Vm div 10;
+        LRemoved := LRemoved + 1;
+      end;
+    end;
+    if AState.VrTrailingZeros and (LLast = 5) and ((AState.Vr mod 2) = 0) then
+      // Exactly halfway: round to even
+      LLast := 4;
+    end;
+    AOutput := AState.Vr + DoOne(((AState.Vr = AState.Vm) and ((not AState.AcceptBounds) or
+      (not AState.VmTrailingZeros))) or (LLast >= 5));
+  else
+    // The common case: no trailing zeros to track
+    LRoundUp := false;
+    while (AState.Vp div 10) > (AState.Vm div 10) do
+      LRoundUp := (AState.Vr mod 10) >= 5;
+      AState.Vr := AState.Vr div 10;
+      AState.Vp := AState.Vp div 10;
+      AState.Vm := AState.Vm div 10;
+      LRemoved := LRemoved + 1;
+    end;
+    AOutput := AState.Vr + DoOne((AState.Vr = AState.Vm) or LRoundUp);
+  end;
+  AExp10 := AState.E10 + LRemoved;
+end;
+
+// The shortest decimal of a finite non-zero float from its IEEE fields: AOutput * 10^AExp10
+// reads back as the same float (Ryu's d2d)
+routine DoRyu(const AMantissa: uint64; const AExponent: uint32; var AOutput: uint64;
+  var AExp10: int32);
+var
+  LE2: int32;
+  LM2: uint64;
+  LMmShift: uint64;
+  LState: RyuState;
+begin
+  if not GRyuReady then
+    DoRyuInit();
+  end;
+  // The value is m2 * 2^e2, e2 lowered by 2 so the bounds below are integers
+  if AExponent = 0 then
+    LE2 := 1 - ADAM_SYSUTILS_RYU_BIAS - ADAM_SYSUTILS_RYU_MANTISSA_BITS - 2;
+    LM2 := AMantissa;
+  else
+    LE2 := int32(AExponent) - ADAM_SYSUTILS_RYU_BIAS - ADAM_SYSUTILS_RYU_MANTISSA_BITS - 2;
+    LM2 := (uint64(1) shl 52) | AMantissa;
+  end;
+  // An even mantissa owns its halfway points (round half to even reads them back to it)
+  LState.AcceptBounds := (LM2 & 1) = 0;
+  // The lower neighbour is half as far when the float is a power of 2 (not a subnormal)
+  LMmShift := DoOne((AMantissa <> 0) or (AExponent <= 1));
+  DoRyuBounds(LM2, LE2, LMmShift, LState);
+  DoRyuShortest(LState, AOutput, AExp10);
+end;
+
+// ADigits (no leading zero) times 10^AExp as text, fixed or scientific, whichever is shorter
+// (fixed on a tie), as C++'s to_chars writes its shortest form: 100, 0.25, 1e+20, 1.5e-07
+routine DoFloatText(const ADigits: string; const AExp: int64): string;
+var
+  LCount: int64;
+  LSciExp: int64;
+  LExpText: string;
+  LFixedLength: int64;
+  LSciLength: int64;
+  LText: string;
+begin
+  LCount := len(ADigits);
+  LSciExp := AExp + LCount - 1;
+  if LSciExp < 0 then
+    LExpText := UIntToStr(uint64(-LSciExp));
+  else
+    LExpText := UIntToStr(uint64(LSciExp));
+  end;
+  if len(LExpText) < 2 then
+    LExpText := "0" + LExpText;
+  end;
+  if AExp >= 0 then
+    LFixedLength := LCount + AExp;
+  else
+    if -AExp < LCount then
+      LFixedLength := LCount + 1;
+    else
+      LFixedLength := 2 - AExp;
+    end;
+  end;
+  LSciLength := LCount + 2 + len(LExpText);
+  if LCount > 1 then
+    LSciLength := LSciLength + 1;
+  end;
+
+  if LFixedLength <= LSciLength then
+    if AExp >= 0 then
+      return ADigits + StringOfChar('0', AExp);
+    end;
+    if -AExp < LCount then
+      return Substring(ADigits, 0, LCount + AExp) + "." + Substring(ADigits, LCount + AExp, -AExp);
+    end;
+    return "0." + StringOfChar('0', -AExp - LCount) + ADigits;
+  end;
+
+  LText := Substring(ADigits, 0, 1);
+  if LCount > 1 then
+    LText := LText + "." + Substring(ADigits, 1, LCount - 1);
+  end;
+  if LSciExp < 0 then
+    return LText + "e-" + LExpText;
+  end;
+  return LText + "e+" + LExpText;
+end;
+
+// The IEEE 754 binary64 bits of AValue, as it sits in memory (sign, 11 exponent bits, 52
+// mantissa bits)
+exported routine Float64ToBits(const AValue: float64): uint64;
+var
+  LBits: FloatBits;
+begin
+  LBits.Value := AValue;
+  return LBits.Bits;
+end;
+
+// The IEEE 754 binary32 bits of AValue, as it sits in memory (sign, 8 exponent bits, 23
+// mantissa bits); the caller converts to float32 first, once (C's rounding: to nearest)
+exported routine Float32ToBits(const AValue: float32): uint32;
+var
+  LBits: Float32Bits;
+begin
+  LBits.Value := AValue;
+  return LBits.Bits;
+end;
+
+// AValue as the shortest text that reads back as the same float64, as println prints it
+// (C++'s std::format "{}"): fixed or scientific, whichever is shorter (fixed on a tie): 1, 0.1,
+// 100, 1e+20, 1.5e-07, 5e-324. Zero keeps its sign (-0); inf, -inf, nan, -nan
+exported routine FloatToStr(const AValue: float64): string;
+var
+  LBits: FloatBits;
+  LSign: string;
+  LExponent: uint32;
+  LMantissa: uint64;
+  LOutput: uint64;
+  LExp10: int32;
+begin
+  LBits.Value := AValue;
+  LSign := "";
+  if (LBits.Bits shr 63) <> 0 then
+    LSign := "-";
+  end;
+  LExponent := uint32((LBits.Bits shr 52) & 0x7FF);
+  LMantissa := LBits.Bits & 0xFFFFFFFFFFFFF;
+  if LExponent = 0x7FF then
+    if LMantissa <> 0 then
+      return LSign + "nan";
+    end;
+    return LSign + "inf";
+  end;
+  if (LExponent = 0) and (LMantissa = 0) then
+    return LSign + "0";
+  end;
+  LOutput := 0;
+  LExp10 := 0;
+  DoRyu(LMantissa, LExponent, LOutput, LExp10);
+  return LSign + DoFloatText(UIntToStr(LOutput), int64(LExp10));
+end;
+
+type
+  // A big unsigned number for the exact float parse: 32-bit limbs, the lowest first, no high
+  // zero limb (zero has no limbs)
+  NatNum = array of uint32;
+
+// ANum without its high zero limbs
+routine DoNatTrim(var ANum: NatNum);
+var
+  LCount: int64;
+begin
+  LCount := len(ANum);
+  while (LCount > 0) and (ANum[LCount - 1] = 0) do
+    LCount := LCount - 1;
+  end;
+  setlength(ANum, LCount);
+end;
+
+// AValue as a NatNum
+routine DoNatOf(const AValue: uint64): NatNum;
+var
+  LResult: NatNum;
+begin
+  setlength(LResult, 2);
+  LResult[0] := uint32(AValue & 0xFFFFFFFF);
+  LResult[1] := uint32(AValue shr uint64(32));
+  DoNatTrim(LResult);
+  return LResult;
+end;
+
+// ANum := ANum * AFactor + AAdd (a limb's product plus its carry fits 64 bits)
+routine DoNatMulAdd(var ANum: NatNum; const AFactor: uint32; const AAdd: uint32);
+var
+  LCarry: uint64;
+  LProduct: uint64;
+  LI: int64;
+  LCount: int64;
+begin
+  LCarry := uint64(AAdd);
+  for LI := 0 to len(ANum) - 1 do
+    LProduct := uint64(ANum[LI]) * uint64(AFactor) + LCarry;
+    ANum[LI] := uint32(LProduct & 0xFFFFFFFF);
+    LCarry := LProduct shr uint64(32);
+  end;
+  if LCarry <> 0 then
+    LCount := len(ANum);
+    setlength(ANum, LCount + 1);
+    ANum[LCount] := uint32(LCarry);
+  end;
+end;
+
+// ANum := ANum * 10^APower (APower >= 0), nine digits per step
+routine DoNatMulPow10(var ANum: NatNum; const APower: int64);
+var
+  LLeft: int64;
+  LFactor: uint32;
+  LI: int64;
+begin
+  LLeft := APower;
+  while LLeft >= 9 do
+    DoNatMulAdd(ANum, 1000000000, 0);
+    LLeft := LLeft - 9;
+  end;
+  LFactor := 1;
+  for LI := 1 to LLeft do
+    LFactor := LFactor * 10;
+  end;
+  if LFactor > 1 then
+    DoNatMulAdd(ANum, LFactor, 0);
+  end;
+end;
+
+// The number of bits ANum needs (0 for zero)
+routine DoNatBits(const ANum: NatNum): int64;
+var
+  LTop: uint32;
+  LBits: int64;
+begin
+  if len(ANum) = 0 then
+    return 0;
+  end;
+  LTop := ANum[len(ANum) - 1];
+  LBits := (len(ANum) - 1) * 32;
+  while LTop <> 0 do
+    LBits := LBits + 1;
+    LTop := LTop shr uint32(1);
+  end;
+  return LBits;
+end;
+
+// ANum shifted left by AShift bits (AShift >= 0)
+routine DoNatShl(const ANum: NatNum; const AShift: int64): NatNum;
+var
+  LResult: NatNum;
+  LLimbs: int64;
+  LBits: int64;
+  LI: int64;
+  LValue: uint64;
+begin
+  setlength(LResult, 0);
+  if len(ANum) = 0 then
+    return LResult;
+  end;
+  LLimbs := AShift div 32;
+  LBits := AShift mod 32;
+  setlength(LResult, len(ANum) + LLimbs + 1);
+  for LI := 0 to len(LResult) - 1 do
+    LResult[LI] := 0;
+  end;
+  for LI := 0 to len(ANum) - 1 do
+    LValue := uint64(ANum[LI]) shl uint64(LBits);
+    LResult[LI + LLimbs] := LResult[LI + LLimbs] | uint32(LValue & 0xFFFFFFFF);
+    LResult[LI + LLimbs + 1] := uint32(LValue shr uint64(32));
+  end;
+  DoNatTrim(LResult);
+  return LResult;
+end;
+
+// -1, 0 or 1 as AFirst is below, equal to or above ASecond (both trimmed)
+routine DoNatCompare(const AFirst: NatNum; const ASecond: NatNum): int32;
+var
+  LI: int64;
+begin
+  if len(AFirst) <> len(ASecond) then
+    if len(AFirst) < len(ASecond) then
+      return -1;
+    end;
+    return 1;
+  end;
+  for LI := len(AFirst) - 1 downto 0 do
+    if AFirst[LI] <> ASecond[LI] then
+      if AFirst[LI] < ASecond[LI] then
+        return -1;
+      end;
+      return 1;
+    end;
+  end;
+  return 0;
+end;
+
+// AFirst := AFirst - ASecond (AFirst is not below ASecond)
+routine DoNatSub(var AFirst: NatNum; const ASecond: NatNum);
+var
+  LBorrow: int64;
+  LDiff: int64;
+  LI: int64;
+begin
+  LBorrow := 0;
+  for LI := 0 to len(AFirst) - 1 do
+    LDiff := int64(AFirst[LI]) - LBorrow;
+    if LI < len(ASecond) then
+      LDiff := LDiff - int64(ASecond[LI]);
+    end;
+    if LDiff < 0 then
+      LDiff := LDiff + 0x100000000;
+      LBorrow := 1;
+    else
+      LBorrow := 0;
+    end;
+    AFirst[LI] := uint32(LDiff);
+  end;
+  DoNatTrim(AFirst);
+end;
+
+// AQuotient := floor(ANum / (ADen * 2^AExponent)), the quotient below 2^(APrecision + 1);
+// ARemainder and AScaledDen are what is left and the divisor it is left of (a negative
+// AExponent scales ANum up instead), so the caller rounds by comparing them
+routine DoNatDivide(const ANum: NatNum; const ADen: NatNum; const AExponent: int64;
+  const APrecision: int64; var AQuotient: uint64; var ARemainder: NatNum;
+  var AScaledDen: NatNum);
+var
+  LNum: NatNum;
+  LBit: int64;
+  LShifted: NatNum;
+begin
+  if AExponent >= 0 then
+    LNum := ANum;
+    AScaledDen := DoNatShl(ADen, AExponent);
+  else
+    LNum := DoNatShl(ANum, -AExponent);
+    AScaledDen := ADen;
+  end;
+  AQuotient := 0;
+  // One quotient bit per step, the highest first: subtract the divisor shifted to that bit
+  // when it fits
+  for LBit := APrecision downto 0 do
+    LShifted := DoNatShl(AScaledDen, LBit);
+    if DoNatCompare(LNum, LShifted) >= 0 then
+      DoNatSub(LNum, LShifted);
+      AQuotient := AQuotient | (uint64(1) shl uint64(LBit));
+    end;
+  end;
+  ARemainder := LNum;
+end;
+
+// The float nearest ANum / ADen (neither zero), rounded once, half to even, to APrecision
+// mantissa bits (53: float64, 24: float32), as AMantissa * 2^AExponent: AMantissa has
+// APrecision bits for a normal value and fewer for a subnormal one (AExponent is then
+// AMinExponent - APrecision + 1). AMinExponent / AMaxExponent are the format's lowest and
+// highest normal exponents. False when the value rounds past the largest finite one
+routine DoNatRound(const ANum: NatNum; const ADen: NatNum; const APrecision: int64;
+  const AMinExponent: int64; const AMaxExponent: int64; var AMantissa: uint64;
+  var AExponent: int64): bool;
+var
+  LExponent: int64;
+  LQuotient: uint64;
+  LRemainder: NatNum;
+  LScaledDen: NatNum;
+  LPass: int64;
+  LOrder: int32;
+  LTop: uint64;
+begin
+  LTop := uint64(1) shl uint64(APrecision);
+  // ANum / ADen lies in [2^(b-1), 2^(b+1)) for b = bits(ANum) - bits(ADen), so the quotient
+  // at this exponent has APrecision or APrecision + 1 bits; one more step when it has the
+  // extra bit. Below the normal range the exponent stays at the subnormal one
+  LExponent := DoNatBits(ANum) - DoNatBits(ADen) - APrecision;
+  if LExponent < AMinExponent - APrecision + 1 then
+    LExponent := AMinExponent - APrecision + 1;
+  end;
+  LQuotient := 0;
+  for LPass := 0 to 1 do
+    DoNatDivide(ANum, ADen, LExponent, APrecision, LQuotient, LRemainder, LScaledDen);
+    if LQuotient < LTop then
+      leave;
+    end;
+    LExponent := LExponent + 1;
+  end;
+  // Half to even: up when the remainder is above half the divisor, or exactly half with an
+  // odd quotient
+  LOrder := DoNatCompare(DoNatShl(LRemainder, 1), LScaledDen);
+  if (LOrder > 0) or ((LOrder = 0) and ((LQuotient & 1) = 1)) then
+    LQuotient := LQuotient + 1;
+    if LQuotient = LTop then
+      LQuotient := LQuotient shr uint64(1);
+      LExponent := LExponent + 1;
+    end;
+  end;
+  if LExponent + APrecision - 1 > AMaxExponent then
+    return false;
+  end;
+  AMantissa := LQuotient;
+  AExponent := LExponent;
+  return true;
+end;
+
+// The float64 AMantissa * 2^AExponent, exact: AMantissa has at most 53 bits, and a value
+// below the smallest normal one is a subnormal with AExponent -1074
+routine DoFloatOf(const AMantissa: uint64; const AExponent: int64): float64;
+var
+  LBits: FloatBits;
+  LMantissa: uint64;
+  LExponent: int64;
+  LHidden: uint64;
+begin
+  LBits.Bits := 0;
+  if AMantissa = 0 then
+    return LBits.Value;
+  end;
+  LHidden := uint64(1) shl uint64(52);
+  LMantissa := AMantissa;
+  LExponent := AExponent;
+  while (LMantissa < LHidden) and (LExponent > -1074) do
+    LMantissa := LMantissa shl uint64(1);
+    LExponent := LExponent - 1;
+  end;
+  if LMantissa >= LHidden then
+    LBits.Bits := (uint64(LExponent + 52 + 1023) shl uint64(52)) | (LMantissa & (LHidden - 1));
+  else
+    LBits.Bits := LMantissa;
+  end;
+  return LBits.Value;
+end;
+
+// The value of digit AChar in base ABase (16 or 10), or -1 when it is no such digit
+routine DoDigitValue(const AChar: char; const ABase: int64): int64;
+begin
+  if (AChar >= '0') and (AChar <= '9') then
+    return int64(uint8(AChar)) - 0x30;
+  end;
+  if ABase = 16 then
+    if (AChar >= 'a') and (AChar <= 'f') then
+      return int64(uint8(AChar)) - 0x61 + 10;
+    end;
+    if (AChar >= 'A') and (AChar <= 'F') then
+      return int64(uint8(AChar)) - 0x41 + 10;
+    end;
+  end;
+  return -1;
+end;
+
+// The value of a C++ float literal's text without its suffix: decimal digits with an
+// optional '.' and e / E exponent, or 0x / 0X hex digits with an optional '.' and the
+// p / P exponent it needs; a digit separator (') between digits is skipped. Rounded once,
+// half to even, to APrecision bits with the format's normal exponent range AMinExponent ..
+// AMaxExponent. False when the text is no such literal; a value past the format's largest
+// is inf
+routine DoParseFloat(const AText: string; const APrecision: int64; const AMinExponent: int64;
+  const AMaxExponent: int64; var AValue: float64): bool;
+var
+  LAt: int64;
+  LBase: int64;
+  LDigits: NatNum;
+  LDigit: int64;
+  LSawDigit: bool;
+  LSawPoint: bool;
+  LFraction: int64;
+  LSignificant: int64;
+  LExpNegative: bool;
+  LExpValue: int64;
+  LSawExpDigit: bool;
+  LScale: int64;
+  LNum: NatNum;
+  LDen: NatNum;
+  LMantissa: uint64;
+  LExponent: int64;
+  LBits: FloatBits;
+  LQuote: char;
+begin
+  LQuote := char(uint8(0x27));
+  AValue := 0.0;
+  LAt := 0;
+  LBase := 10;
+  if StartsStr("0x", AText) or StartsStr("0X", AText) then
+    LAt := 2;
+    LBase := 16;
+  end;
+  setlength(LDigits, 0);
+  LSawDigit := false;
+  LSawPoint := false;
+  LFraction := 0;
+  LSignificant := 0;
+  while LAt < len(AText) do
+    LDigit := DoDigitValue(AText[LAt], LBase);
+    if LDigit >= 0 then
+      DoNatMulAdd(LDigits, uint32(LBase), uint32(LDigit));
+      LSawDigit := true;
+      if LSawPoint then
+        LFraction := LFraction + 1;
+      end;
+      if (LDigit <> 0) or (LSignificant > 0) then
+        LSignificant := LSignificant + 1;
+      end;
+    else
+      if (AText[LAt] = '.') and (not LSawPoint) then
+        LSawPoint := true;
+      else
+        if (AText[LAt] <> LQuote) or (not LSawDigit) then
+          leave;
+        end;
+      end;
+    end;
+    LAt := LAt + 1;
+  end;
+  if not LSawDigit then
+    return false;
+  end;
+  // The exponent: needed by a hex float, optional for a decimal one
+  LExpNegative := false;
+  LExpValue := 0;
+  if LAt < len(AText) then
+    if LBase = 16 then
+      if (AText[LAt] <> 'p') and (AText[LAt] <> 'P') then
+        return false;
+      end;
+    else
+      if (AText[LAt] <> 'e') and (AText[LAt] <> 'E') then
+        return false;
+      end;
+    end;
+    LAt := LAt + 1;
+    if (LAt < len(AText)) and ((AText[LAt] = '+') or (AText[LAt] = '-')) then
+      LExpNegative := (AText[LAt] = '-');
+      LAt := LAt + 1;
+    end;
+    LSawExpDigit := false;
+    while LAt < len(AText) do
+      LDigit := DoDigitValue(AText[LAt], 10);
+      if LDigit >= 0 then
+        // Past a million the value is zero or inf either way: the count stops growing
+        if LExpValue < 1000000 then
+          LExpValue := LExpValue * 10 + LDigit;
+        end;
+        LSawExpDigit := true;
+      else
+        if (AText[LAt] <> LQuote) or (not LSawExpDigit) then
+          return false;
+        end;
+      end;
+      LAt := LAt + 1;
+    end;
+    if not LSawExpDigit then
+      return false;
+    end;
+  else
+    if LBase = 16 then
+      return false;
+    end;
+  end;
+  if LExpNegative then
+    LExpValue := -LExpValue;
+  end;
+  DoNatTrim(LDigits);
+  if len(LDigits) = 0 then
+    return true;
+  end;
+  LNum := LDigits;
+  LDen := DoNatOf(1);
+  if LBase = 16 then
+    // H * 2^(p - 4 * fraction digits), which lies below 2^(scale + bits(H)) and at or above
+    // half of it: past the format's top it is inf, below half its smallest subnormal zero
+    LScale := LExpValue - 4 * LFraction;
+    if LScale + DoNatBits(LDigits) > AMaxExponent + 2 then
+      LBits.Bits := 0x7FF0000000000000;
+      AValue := LBits.Value;
+      return true;
+    end;
+    if LScale + DoNatBits(LDigits) < AMinExponent - APrecision then
+      return true;
+    end;
+    if LScale >= 0 then
+      LNum := DoNatShl(LDigits, LScale);
+    else
+      LDen := DoNatShl(LDen, -LScale);
+    end;
+  else
+    // D * 10^(e - fraction digits); far outside the format it is inf or zero at once
+    LScale := LExpValue - LFraction;
+    if LScale + LSignificant > 400 then
+      LBits.Bits := 0x7FF0000000000000;
+      AValue := LBits.Value;
+      return true;
+    end;
+    if LScale + LSignificant < -400 then
+      return true;
+    end;
+    if LScale >= 0 then
+      DoNatMulPow10(LNum, LScale);
+    else
+      DoNatMulPow10(LDen, -LScale);
+    end;
+  end;
+  LMantissa := 0;
+  LExponent := 0;
+  if not DoNatRound(LNum, LDen, APrecision, AMinExponent, AMaxExponent, LMantissa, LExponent) then
+    LBits.Bits := 0x7FF0000000000000;
+    AValue := LBits.Value;
+    return true;
+  end;
+  AValue := DoFloatOf(LMantissa, LExponent);
+  return true;
+end;
+
+// The float64 a C++ float literal's text (without its suffix) means, as clang reads it:
+// decimal (1.5, 2e10, 1'000.5) or hex (0x1.8p3), rounded once, half to even. False when
+// AText is no such literal (AValue 0); a value past the largest float64 is inf
+exported routine TryStrToFloat(const AText: string; var AValue: float64): bool;
+begin
+  return DoParseFloat(AText, 53, -1022, 1023, AValue);
+end;
+
+// As TryStrToFloat, rounded once to float32 (a literal with the f suffix): AValue holds the
+// float32 value exactly; a value past the largest float32 is inf
+exported routine TryStrToFloat32(const AText: string; var AValue: float64): bool;
+begin
+  return DoParseFloat(AText, 24, -126, 127, AValue);
+end;
+
+// Writes the low ACount bytes of AValue into ABytes at AAt, the lowest byte first (the
+// little-endian order COFF and PE use). The caller keeps AAt .. AAt + ACount - 1 inside
+// ABytes and ACount in 1..8
+exported routine PutLe(var ABytes: ByteArray; const AAt: int64; const AValue: uint64;
+  const ACount: int64);
+var
+  LI: int64;
+begin
+  for LI := 0 to ACount - 1 do
+    ABytes[AAt + LI] := uint8((AValue shr uint64(LI * 8)) & uint64(255));
+  end;
+end;
+
+// The ACount bytes of ABytes at AAt read as an unsigned number, the lowest byte first (PutLe's
+// reverse). The caller keeps AAt .. AAt + ACount - 1 inside ABytes and ACount in 1..8
+exported routine GetLe(const ABytes: ByteArray; const AAt: int64; const ACount: int64): uint64;
+var
+  LValue: uint64;
+  LI: int64;
+begin
+  LValue := 0;
+  for LI := 0 to ACount - 1 do
+    LValue := LValue | (uint64(ABytes[AAt + LI]) shl uint64(LI * 8));
+  end;
+  return LValue;
+end;
+
+// The integer the low AWidth bits of AValue are: read as two's complement when ASigned (the
+// top bit of the AWidth copied up), else as an unsigned number (the bits above cleared). The
+// caller keeps AWidth in 1..64; at 64 AValue comes back as it is
+exported routine ReadLowBits(const AValue: int64; const AWidth: int64; const ASigned: bool): int64;
+var
+  LMask: uint64;
+  LBits: uint64;
+  LTop: uint64;
+begin
+  if AWidth >= 64 then
+    return AValue;
+  end;
+  LMask := (uint64(1) shl uint64(AWidth)) - 1;
+  LBits := uint64(AValue) & LMask;
+  LTop := uint64(1) shl uint64(AWidth - 1);
+  // A set top bit makes the value negative: fill every bit above the width
+  if ASigned and ((LBits & LTop) <> 0) then
+    LBits := LBits | (~LMask);
+  end;
+  return int64(LBits);
+end;
+
+// The mask of AWidth set bits starting at bit AAt (bit 0 the lowest), as the int64 those 64
+// bits are: BitMask(3, 4) = 0x70. The caller keeps AWidth in 1..64 and AAt + AWidth at most
+// 64; at 64 every bit is set
+exported routine BitMask(const AWidth: int64; const AAt: int64): int64;
+var
+  LOnes: uint64;
+begin
+  if AWidth >= 64 then
+    return -1;
+  end;
+  LOnes := (uint64(1) shl uint64(AWidth)) - 1;
+  return int64(LOnes shl uint64(AAt));
+end;
+
+// AValue rounded up to the next multiple of AAlign, a power of two the caller keeps above 0
+// (sections, tables and file offsets laid out at their alignment)
+exported routine AlignUp(const AValue: int64; const AAlign: int64): int64;
+begin
+  return (AValue + AAlign - 1) & (0 - AAlign);
+end;
+
+// True when AValue is a power of two (1, 2, 4, ...); false for 0 and below (an alignment
+// checked before AlignUp or a mask relies on it)
+exported routine IsPowerOfTwo(const AValue: int64): bool;
+begin
+  if AValue <= 0 then
+    return false;
+  end;
+  return (AValue & (AValue - 1)) = 0;
+end;
+
+// Merges the sorted runs ASource[AFrom .. AMiddle - 1] and ASource[AMiddle .. ATo - 1] into
+// ATarget[AFrom .. ATo - 1]; on equal values the left run's comes first (stable)
+routine DoMergeRuns(const ASource: Int64Array; var ATarget: Int64Array; const AFrom: int64;
+  const AMiddle: int64; const ATo: int64);
+var
+  LLeft: int64;
+  LRight: int64;
+  LAt: int64;
+  LTakeLeft: bool;
+begin
+  LLeft := AFrom;
+  LRight := AMiddle;
+  for LAt := AFrom to ATo - 1 do
+    // The left run's next value while it has one and the right run's is not smaller (each
+    // index read only inside its run)
+    LTakeLeft := LLeft < AMiddle;
+    if LTakeLeft then
+      if LRight < ATo then
+        LTakeLeft := ASource[LLeft] <= ASource[LRight];
+      end;
+    end;
+    if LTakeLeft then
+      ATarget[LAt] := ASource[LLeft];
+      LLeft := LLeft + 1;
+    else
+      ATarget[LAt] := ASource[LRight];
+      LRight := LRight + 1;
+    end;
+  end;
+end;
+
+// Sorts AList ascending. Stable; a bottom-up merge sort (runs of 1, 2, 4, ... merged into a
+// second array, the two arrays trading places each pass), so long lists sort in n log n
+exported routine SortInt64s(var AList: Int64Array);
+var
+  LOther: Int64Array;
+  LWidth: int64;
+  LFrom: int64;
+  LMiddle: int64;
+  LTo: int64;
+  LCount: int64;
+  LOtherHolds: bool;
+begin
+  LCount := len(AList);
+  setlength(LOther, LCount);
+  LWidth := 1;
+  // False while AList holds the latest pass, true while LOther does
+  LOtherHolds := false;
+  while LWidth < LCount do
+    LFrom := 0;
+    while LFrom < LCount do
+      LMiddle := LFrom + LWidth;
+      if LMiddle > LCount then
+        LMiddle := LCount;
+      end;
+      LTo := LFrom + 2 * LWidth;
+      if LTo > LCount then
+        LTo := LCount;
+      end;
+      if LOtherHolds then
+        DoMergeRuns(LOther, AList, LFrom, LMiddle, LTo);
+      else
+        DoMergeRuns(AList, LOther, LFrom, LMiddle, LTo);
+      end;
+      LFrom := LTo;
+    end;
+    LOtherHolds := not LOtherHolds;
+    LWidth := LWidth * 2;
+  end;
+  if LOtherHolds then
+    AList := LOther;
+  end;
+end;
+
+end.

@@ -1,0 +1,891 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.X64.Machine.adam - the x86_64 machine IR (DESIGN sec 6)
+
+  What selection (Adam.X64.Select) makes from the SSA IR and allocation and
+  encoding read: x86_64 instructions over virtual registers (numbered per
+  function, each of a class) and physical ones (numbered as
+  Adam.X64.Registers numbers them). Like the SSA IR it is an OUTPUT: each
+  instruction keeps the AST node it came from, nothing flows back.
+
+  MachineOperand  one operand: a virtual or physical register, an
+                  immediate, a memory place, a symbol (a call's target) or
+                  a block (a jump's target). A memory place is a base plus
+                  a displacement; the base is a register, a stack slot of
+                  the function, the incoming argument area (offsets from
+                  the stack pointer at the function's first instruction),
+                  the outgoing argument area (offsets from the stack
+                  pointer at a call) or a symbol, rip-relative. Slots and
+                  the two areas get their places in the frame at
+                  allocation (M2.6).
+  MachineInstr    an operation, its operation size in bytes (for the ops
+                  whose size varies), a condition (Jcc, SetCC), its operands
+                  (the destination first) and the physical registers it
+                  reads or writes beyond them (a call's argument registers
+                  and its volatile set, ret's result register), and whether
+                  it belongs to the prologue (allocation's mark for unwind)
+  MachineBlock    instructions in order; the SSA block it came from, or the
+                  SSA edge it sits on (a block selection adds on an edge
+                  into a block with phis)
+  MachineFunction blocks (the first is the entry), virtual registers with
+                  their classes, slots (size, alignment, and once allocated
+                  their offsets), the largest outgoing area of its calls, and
+                  once allocated its frame (Adam.X64.Allocate); Dump writes it
+                  as text
+*******************************************************************************/
+
+module unit Adam.X64.Machine;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Parts, Adam.X64.Registers;
+
+exported const
+  // Raised (an invariant broken) by an index that names nothing
+  ADAM_X64_MACHINE_FAULT_NO_BLOCK: string = "X64 machine: no block ";
+  ADAM_X64_MACHINE_FAULT_NO_INSTR: string = "X64 machine: no instruction ";
+  ADAM_X64_MACHINE_FAULT_NO_OPERAND: string = "X64 machine: no operand ";
+  ADAM_X64_MACHINE_FAULT_NO_VREG: string = "X64 machine: no virtual register ";
+  ADAM_X64_MACHINE_FAULT_NO_SLOT: string = "X64 machine: no slot ";
+  // A slot the frame cannot hold: a size or an alignment that is no power of two
+  ADAM_X64_MACHINE_FAULT_SLOT: string = "X64 machine: a bad slot: ";
+
+exported type
+  // A virtual register's class: the physical registers it may be given
+  RegClass = choices(General, Vector);
+
+  // What one machine instruction does (see the header). Mov moves 1, 2, 4 or 8 bytes between
+  // general registers, memory and immediates; MovD / MovQ move 4 / 8 bytes between a general
+  // and a vector register; MovSS / MovSD move a float32 / float64 between vector registers
+  // and memory; AddSS .. DivSD combine a float32 (SS) / float64 (SD) in a vector register
+  // with a vector register or memory, in place; XorPS xors two vector registers' bits (a
+  // float's negation: its sign bit flipped); UComiSS / UComiSD compare a float32 / float64
+  // in a vector register with a vector register or memory, writing only the flags (an
+  // unordered pair, a NaN in it, sets ZF, PF and CF); CvtSI2SS / CvtSI2SD convert the
+  // signed 4 or 8-byte integer (the width) in a general register or memory into a float in a
+  // vector register, rounded to nearest; CvtTSS2SI / CvtTSD2SI a float in a vector register
+  // or memory into a signed 4 or 8-byte integer (the width) in a general register,
+  // truncated toward zero; CvtSS2SD / CvtSD2SS a float32 into a float64 and back (rounded
+  // to nearest), vector register from vector register or memory; MovSX8 / MovSX16 / MovSXD
+  // sign-extend and MovZX8 / MovZX16 zero-extend a 1, 2 or 4-byte source into a register of
+  // the instruction's width. IMul multiplies a register by a register or memory (2, 4 or 8
+  // bytes); BitAnd / BitOr / BitXor combine like Add; Neg / BitNot negate / complement
+  // their one operand in place; Shl / Shr / Sar shift their first operand by the count in
+  // the second, which is rcx (the hardware's cl).
+  // Cqo sign-extends rax into rdx (no operands; cdq at width 4, cqo at 8); IDiv / UDiv
+  // divide rdx:rax by their one operand (signed / unsigned, 4 or 8 bytes), the quotient in
+  // rax and the remainder in rdx (rax and rdx are the instructions' ImplicitUses / Defs).
+  // Cmp compares its two operands (it writes only the flags, like Test); SetCC writes 1
+  // when its condition holds, else 0, into its one 1-byte operand. Push / Pop save and
+  // restore their one 8-byte general register on the stack (the prologue's saves and the
+  // epilogue's restores). RepMovsb copies rcx bytes from [rsi] to [rdi], RepStosb stores al
+  // into rcx bytes at [rdi] (no operands: rdi / rsi / rcx / rax are their ImplicitUses /
+  // Defs; the direction flag is clear, as the ABI keeps it)
+  X64Op = choices(Mov, MovD, MovQ, MovSS, MovSD, Lea, Add, Sub, AddSS, AddSD, SubSS, SubSD,
+    MulSS, MulSD, DivSS, DivSD, XorPS, UComiSS, UComiSD, CvtSI2SS, CvtSI2SD, CvtTSS2SI,
+    CvtTSD2SI, CvtSS2SD, CvtSD2SS, Test, Jcc, Jmp, Call, Ret, MovSX8, MovSX16, MovSXD, MovZX8,
+    MovZX16, IMul, BitAnd, BitOr, BitXor, Neg, BitNot, Shl, Shr, Sar, Cqo, IDiv, UDiv, Cmp,
+    SetCC, Push, Pop, RepMovsb, RepStosb);
+
+  // A condition Jcc and SetCC test, in the encoding's order (the low nibble of 0F 80..8F and
+  // of 0F 90..9F)
+  X64Cond = choices(Overflow, NoOverflow, Below, AboveOrEqual, Equal, NotEqual, BelowOrEqual,
+    Above, Sign, NoSign, Parity, NoParity, Less, GreaterOrEqual, LessOrEqual, Greater);
+
+  // What an operand is (see the header)
+  OperandKind = choices(VirtualReg, PhysicalReg, Immediate, Memory, SymbolRef, BlockRef);
+
+  // What a memory operand's displacement is added to (see the header)
+  MemoryBase = choices(Register, Slot, Incoming, Outgoing, RipSymbol);
+
+  // What a symbol names: code (a function), data (a blob) or an import (a library's routine,
+  // reached through its import address)
+  SymbolClass = choices(Code, Data, Import);
+
+// The mnemonic of AOp (Jcc's and SetCC's are their condition's: X64CondText, X64SetText)
+exported routine X64OpText(const AOp: X64Op): string;
+begin
+  match AOp of
+    X64Op.Mov: return "mov";
+    X64Op.MovD: return "movd";
+    X64Op.MovQ: return "movq";
+    X64Op.MovSS: return "movss";
+    X64Op.MovSD: return "movsd";
+    X64Op.Lea: return "lea";
+    X64Op.Add: return "add";
+    X64Op.Sub: return "sub";
+    X64Op.AddSS: return "addss";
+    X64Op.AddSD: return "addsd";
+    X64Op.SubSS: return "subss";
+    X64Op.SubSD: return "subsd";
+    X64Op.MulSS: return "mulss";
+    X64Op.MulSD: return "mulsd";
+    X64Op.DivSS: return "divss";
+    X64Op.DivSD: return "divsd";
+    X64Op.XorPS: return "xorps";
+    X64Op.UComiSS: return "ucomiss";
+    X64Op.UComiSD: return "ucomisd";
+    X64Op.CvtSI2SS: return "cvtsi2ss";
+    X64Op.CvtSI2SD: return "cvtsi2sd";
+    X64Op.CvtTSS2SI: return "cvttss2si";
+    X64Op.CvtTSD2SI: return "cvttsd2si";
+    X64Op.CvtSS2SD: return "cvtss2sd";
+    X64Op.CvtSD2SS: return "cvtsd2ss";
+    X64Op.Test: return "test";
+    X64Op.Jcc: return "jcc";
+    X64Op.Jmp: return "jmp";
+    X64Op.Call: return "call";
+    X64Op.Ret: return "ret";
+    X64Op.MovSX8: return "movsx8";
+    X64Op.MovSX16: return "movsx16";
+    X64Op.MovSXD: return "movsxd";
+    X64Op.MovZX8: return "movzx8";
+    X64Op.MovZX16: return "movzx16";
+    X64Op.IMul: return "imul";
+    X64Op.BitAnd: return "and";
+    X64Op.BitOr: return "or";
+    X64Op.BitXor: return "xor";
+    X64Op.Neg: return "neg";
+    X64Op.BitNot: return "not";
+    X64Op.Shl: return "shl";
+    X64Op.Shr: return "shr";
+    X64Op.Sar: return "sar";
+    X64Op.Cqo: return "cqo";
+    X64Op.IDiv: return "idiv";
+    X64Op.UDiv: return "div";
+    X64Op.Cmp: return "cmp";
+    X64Op.SetCC: return "setcc";
+    X64Op.Push: return "push";
+    X64Op.Pop: return "pop";
+    X64Op.RepMovsb: return "rep movsb";
+    X64Op.RepStosb: return "rep stosb";
+  end;
+  return "";
+end;
+
+// True for the extending moves (the source's width is the op's, the destination's the
+// instruction's)
+exported routine X64OpIsExtend(const AOp: X64Op): bool;
+begin
+  return (AOp = X64Op.MovSX8) or (AOp = X64Op.MovSX16) or (AOp = X64Op.MovSXD) or
+    (AOp = X64Op.MovZX8) or (AOp = X64Op.MovZX16);
+end;
+
+// The name of ACond as the mnemonics spell it after j / set ("ne")
+exported routine X64CondName(const ACond: X64Cond): string;
+begin
+  match ACond of
+    X64Cond.Overflow: return "o";
+    X64Cond.NoOverflow: return "no";
+    X64Cond.Below: return "b";
+    X64Cond.AboveOrEqual: return "ae";
+    X64Cond.Equal: return "e";
+    X64Cond.NotEqual: return "ne";
+    X64Cond.BelowOrEqual: return "be";
+    X64Cond.Above: return "a";
+    X64Cond.Sign: return "s";
+    X64Cond.NoSign: return "ns";
+    X64Cond.Parity: return "p";
+    X64Cond.NoParity: return "np";
+    X64Cond.Less: return "l";
+    X64Cond.GreaterOrEqual: return "ge";
+    X64Cond.LessOrEqual: return "le";
+    X64Cond.Greater: return "g";
+  end;
+  return "";
+end;
+
+// The jump mnemonic of ACond ("jne")
+exported routine X64CondText(const ACond: X64Cond): string;
+begin
+  return "j" + X64CondName(ACond);
+end;
+
+// The set mnemonic of ACond ("setne")
+exported routine X64SetText(const ACond: X64Cond): string;
+begin
+  return "set" + X64CondName(ACond);
+end;
+
+// True for the shifts: shl, shr, sar
+exported routine X64OpIsShift(const AOp: X64Op): bool;
+begin
+  return (AOp = X64Op.Shl) or (AOp = X64Op.Shr) or (AOp = X64Op.Sar);
+end;
+
+// True for the integer ops that combine their first operand with their second in place:
+// add, sub, imul, and, or, xor, and the shifts (by the count in the second)
+exported routine X64OpIsCombine(const AOp: X64Op): bool;
+begin
+  return (AOp = X64Op.Add) or (AOp = X64Op.Sub) or (AOp = X64Op.IMul) or (AOp = X64Op.BitAnd) or
+    (AOp = X64Op.BitOr) or (AOp = X64Op.BitXor) or X64OpIsShift(AOp);
+end;
+
+// True for the integer ops that change their one operand in place: neg, not
+exported routine X64OpIsUnary(const AOp: X64Op): bool;
+begin
+  return (AOp = X64Op.Neg) or (AOp = X64Op.BitNot);
+end;
+
+// True for the vector ops that combine their first operand (a vector register) with their
+// second in place: addss / addsd, subss / subsd, mulss / mulsd, divss / divsd, xorps
+exported routine X64OpIsScalarArith(const AOp: X64Op): bool;
+begin
+  return (AOp = X64Op.AddSS) or (AOp = X64Op.AddSD) or (AOp = X64Op.SubSS) or
+    (AOp = X64Op.SubSD) or (AOp = X64Op.MulSS) or (AOp = X64Op.MulSD) or (AOp = X64Op.DivSS) or
+    (AOp = X64Op.DivSD) or (AOp = X64Op.XorPS);
+end;
+
+// True for the float compares: ucomiss, ucomisd (they read both operands and write only
+// the flags, like cmp)
+exported routine X64OpIsFloatCompare(const AOp: X64Op): bool;
+begin
+  return (AOp = X64Op.UComiSS) or (AOp = X64Op.UComiSD);
+end;
+
+// True for the conversions with a general side, whose width is that side's 4 or 8 bytes:
+// cvtsi2ss / cvtsi2sd (from it), cvttss2si / cvttsd2si (to it)
+exported routine X64OpIsIntConvert(const AOp: X64Op): bool;
+begin
+  return (AOp = X64Op.CvtSI2SS) or (AOp = X64Op.CvtSI2SD) or (AOp = X64Op.CvtTSS2SI) or
+    (AOp = X64Op.CvtTSD2SI);
+end;
+
+// True for every float conversion: X64OpIsIntConvert's and cvtss2sd / cvtsd2ss (they write
+// their first operand and read only their second)
+exported routine X64OpIsFloatConvert(const AOp: X64Op): bool;
+begin
+  return X64OpIsIntConvert(AOp) or (AOp = X64Op.CvtSS2SD) or (AOp = X64Op.CvtSD2SS);
+end;
+
+// True for the divisions: idiv, div (rdx:rax by their one operand, which they only read)
+exported routine X64OpIsDivide(const AOp: X64Op): bool;
+begin
+  return (AOp = X64Op.IDiv) or (AOp = X64Op.UDiv);
+end;
+
+// True for the ops whose operation size varies (Dump prints it after the mnemonic; SetCC
+// always writes 1 byte)
+exported routine X64OpHasWidth(const AOp: X64Op): bool;
+begin
+  return (AOp = X64Op.Mov) or (AOp = X64Op.Lea) or (AOp = X64Op.Test) or X64OpIsExtend(AOp) or
+    X64OpIsCombine(AOp) or X64OpIsUnary(AOp) or (AOp = X64Op.Cqo) or X64OpIsDivide(AOp) or
+    (AOp = X64Op.Cmp) or X64OpIsIntConvert(AOp);
+end;
+
+exported type
+  // One operand (see the header); the fields its kind does not use stay zero / empty
+  MachineOperand = object
+    Kind: OperandKind;
+    // VirtualReg / PhysicalReg: the register's number; Memory with a Register base: the base's
+    Reg: int64;
+    // Memory with a Register base: true when Reg is a virtual register
+    BaseVirtual: bool;
+    // Memory: what the displacement is added to, and the displacement
+    Base: MemoryBase;
+    Disp: int64;
+    // Memory with a Slot base: the slot's index in its function
+    SlotIndex: int64;
+    // Immediate: the value
+    Imm: int64;
+    // SymbolRef, Memory with a RipSymbol base: the symbol, what it names, and for an import
+    // the library it is in
+    SymbolName: string;
+    Symbol: SymbolClass;
+    Library: string;
+    // An import's `external` declaration (its AST node, 0 for none): the node the linker's
+    // reports name (Adam.Backend.Sections.ImportSymbol)
+    Declaration: int64;
+    // BlockRef: the block's index in its function
+    Block: int64;
+
+    init(const AKind: OperandKind);
+    begin
+      self.Kind := AKind;
+      self.Reg := 0;
+      self.BaseVirtual := false;
+      self.Base := MemoryBase.Register;
+      self.Disp := 0;
+      self.SlotIndex := 0;
+      self.Imm := 0;
+      self.SymbolName := "";
+      self.Symbol := SymbolClass.Code;
+      self.Library := "";
+      self.Declaration := 0;
+      self.Block := 0;
+    end;
+  end;
+
+// Virtual register ANumber
+exported routine VirtualOperand(const ANumber: int64): ref MachineOperand;
+var
+  LOperand: ref MachineOperand;
+begin
+  LOperand := ref MachineOperand(OperandKind.VirtualReg);
+  LOperand.Reg := ANumber;
+  return LOperand;
+end;
+
+// Physical register ANumber (the arch's numbering)
+exported routine PhysicalOperand(const ANumber: int64): ref MachineOperand;
+var
+  LOperand: ref MachineOperand;
+begin
+  LOperand := ref MachineOperand(OperandKind.PhysicalReg);
+  LOperand.Reg := ANumber;
+  return LOperand;
+end;
+
+// The immediate AValue
+exported routine ImmediateOperand(const AValue: int64): ref MachineOperand;
+var
+  LOperand: ref MachineOperand;
+begin
+  LOperand := ref MachineOperand(OperandKind.Immediate);
+  LOperand.Imm := AValue;
+  return LOperand;
+end;
+
+// A memory place of ABase at ADisp (the fields of other bases set by the routines below)
+routine DoMemory(const ABase: MemoryBase; const ADisp: int64): ref MachineOperand;
+var
+  LOperand: ref MachineOperand;
+begin
+  LOperand := ref MachineOperand(OperandKind.Memory);
+  LOperand.Base := ABase;
+  LOperand.Disp := ADisp;
+  return LOperand;
+end;
+
+// The memory at ADisp from register AReg (virtual when AVirtual)
+exported routine RegisterMemory(const AReg: int64; const AVirtual: bool;
+  const ADisp: int64): ref MachineOperand;
+var
+  LOperand: ref MachineOperand;
+begin
+  LOperand := DoMemory(MemoryBase.Register, ADisp);
+  LOperand.Reg := AReg;
+  LOperand.BaseVirtual := AVirtual;
+  return LOperand;
+end;
+
+// The memory at ADisp in slot ASlot
+exported routine SlotMemory(const ASlot: int64; const ADisp: int64): ref MachineOperand;
+var
+  LOperand: ref MachineOperand;
+begin
+  LOperand := DoMemory(MemoryBase.Slot, ADisp);
+  LOperand.SlotIndex := ASlot;
+  return LOperand;
+end;
+
+// The memory at ADisp from the stack pointer at the function's first instruction
+exported routine IncomingMemory(const ADisp: int64): ref MachineOperand;
+begin
+  return DoMemory(MemoryBase.Incoming, ADisp);
+end;
+
+// The memory at ADisp from the stack pointer at a call
+exported routine OutgoingMemory(const ADisp: int64): ref MachineOperand;
+begin
+  return DoMemory(MemoryBase.Outgoing, ADisp);
+end;
+
+// The memory at symbol AName (of AKind; ALibrary for an import), rip-relative
+exported routine RipMemory(const AKind: SymbolClass; const AName: string;
+  const ALibrary: string): ref MachineOperand;
+var
+  LOperand: ref MachineOperand;
+begin
+  LOperand := DoMemory(MemoryBase.RipSymbol, 0);
+  LOperand.Symbol := AKind;
+  LOperand.SymbolName := AName;
+  LOperand.Library := ALibrary;
+  return LOperand;
+end;
+
+// The IAT slot of the import AName from ALibrary, rip-relative, declared by the `external`
+// declaration ADeclaration (its AST node)
+exported routine ImportMemory(const AName: string; const ALibrary: string;
+  const ADeclaration: int64): ref MachineOperand;
+var
+  LOperand: ref MachineOperand;
+begin
+  LOperand := RipMemory(SymbolClass.Import, AName, ALibrary);
+  LOperand.Declaration := ADeclaration;
+  return LOperand;
+end;
+
+// The symbol AName of AKind, as a call's target
+exported routine SymbolOperand(const AKind: SymbolClass; const AName: string): ref MachineOperand;
+var
+  LOperand: ref MachineOperand;
+begin
+  LOperand := ref MachineOperand(OperandKind.SymbolRef);
+  LOperand.Symbol := AKind;
+  LOperand.SymbolName := AName;
+  return LOperand;
+end;
+
+// Block ABlock of the function, as a jump's target
+exported routine BlockOperand(const ABlock: int64): ref MachineOperand;
+var
+  LOperand: ref MachineOperand;
+begin
+  LOperand := ref MachineOperand(OperandKind.BlockRef);
+  LOperand.Block := ABlock;
+  return LOperand;
+end;
+
+exported type
+  // One instruction (see the header)
+  MachineInstr = object
+    Op: X64Op;
+    // The operation size in bytes (the ops X64OpHasWidth names; 0 for the others)
+    Width: int64;
+    // Jcc / SetCC: the condition it jumps on / sets from
+    Cond: X64Cond;
+    hidden FOperands: array of ref MachineOperand;
+    hidden FCount: int64;
+    // Physical registers read and written beyond the operands
+    ImplicitUses: ref Int64List;
+    ImplicitDefs: ref Int64List;
+    // True for an instruction of the prologue (allocation makes them; unwind data describes
+    // each)
+    Prologue: bool;
+    Node: int64;
+
+    init(const AOp: X64Op; const AWidth: int64; const ANode: int64);
+    begin
+      self.Op := AOp;
+      self.Width := AWidth;
+      self.Cond := X64Cond.Overflow;
+      self.FCount := 0;
+      self.ImplicitUses := ref Int64List();
+      self.ImplicitDefs := ref Int64List();
+      self.Prologue := false;
+      self.Node := ANode;
+    end;
+
+    property OperandCount: int64 read FCount;
+
+    // Operand AIndex (0-based, the destination first); raises outside the operands
+    const method OperandAt(const AIndex: int64): ref MachineOperand;
+    begin
+      if (AIndex < 0) or (AIndex >= self.FCount) then
+        raise(ADAM_X64_MACHINE_FAULT_NO_OPERAND + IntToStr(AIndex));
+      end;
+      return self.FOperands[AIndex];
+    end;
+
+    // Adds AOperand after the others
+    method AddOperand(const AOperand: ref MachineOperand);
+    begin
+      if self.FCount = len(self.FOperands) then
+        setlength(self.FOperands, self.FCount * 2 + 2);
+      end;
+      self.FOperands[self.FCount] := AOperand;
+      self.FCount := self.FCount + 1;
+    end;
+  end;
+
+  // Instructions in order (see the header)
+  MachineBlock = object
+    // The SSA block it came from (0 for an edge block)
+    Source: int64;
+    // An edge block: the SSA edge it sits on, from and to (0 otherwise)
+    EdgeFrom: int64;
+    EdgeTo: int64;
+    hidden FInstrs: array of ref MachineInstr;
+    hidden FCount: int64;
+
+    init(const ASource: int64);
+    begin
+      self.Source := ASource;
+      self.EdgeFrom := 0;
+      self.EdgeTo := 0;
+      self.FCount := 0;
+    end;
+
+    property InstrCount: int64 read FCount;
+
+    // Instruction AIndex (0-based); raises outside the block
+    const method InstrAt(const AIndex: int64): ref MachineInstr;
+    begin
+      if (AIndex < 0) or (AIndex >= self.FCount) then
+        raise(ADAM_X64_MACHINE_FAULT_NO_INSTR + IntToStr(AIndex));
+      end;
+      return self.FInstrs[AIndex];
+    end;
+
+    // Adds AInstr at the end
+    method AddInstr(const AInstr: ref MachineInstr);
+    begin
+      if self.FCount = len(self.FInstrs) then
+        setlength(self.FInstrs, self.FCount * 2 + 8);
+      end;
+      self.FInstrs[self.FCount] := AInstr;
+      self.FCount := self.FCount + 1;
+    end;
+
+    // Empties the block (allocation rewrites it from a copy of its instructions)
+    method Clear();
+    begin
+      setlength(self.FInstrs, 0);
+      self.FCount := 0;
+    end;
+  end;
+
+  // One function's machine code (see the header)
+  MachineFunction = object
+    Symbol: string;
+    Node: int64;
+    // Its symbol is its object's alone (its IrFunction's Internal)
+    Internal: bool;
+    // The largest outgoing area of the function's calls, and whether it makes any
+    OutgoingBytes: int64;
+    MakesCalls: bool;
+    // The frame allocation gave it (nil until allocated): unwind data reads it with the
+    // prologue's instructions
+    Frame: ref FrameLayout;
+    hidden FBlocks: array of ref MachineBlock;
+    hidden FBlockCount: int64;
+    hidden FClasses: array of RegClass;
+    hidden FVRegCount: int64;
+    hidden FSlotSizes: array of int64;
+    hidden FSlotAligns: array of int64;
+    // Each slot's offset from the stack pointer after the prologue (-1 until placed)
+    hidden FSlotOffsets: array of int64;
+    // Each slot's IR slot (0: none, a spill slot of allocation's)
+    hidden FSlotSources: array of int64;
+    hidden FSlotCount: int64;
+
+    init(const ASymbol: string; const ANode: int64);
+    begin
+      self.Symbol := ASymbol;
+      self.Node := ANode;
+      self.Internal := false;
+      self.OutgoingBytes := 0;
+      self.MakesCalls := false;
+      self.Frame := nil;
+      self.FBlockCount := 0;
+      self.FVRegCount := 0;
+      self.FSlotCount := 0;
+    end;
+
+    property BlockCount: int64 read FBlockCount;
+    property VRegCount: int64 read FVRegCount;
+    property SlotCount: int64 read FSlotCount;
+
+    // A new empty block at the end (from SSA block ASource, 0 for an edge block); returns its
+    // index
+    method AddBlock(const ASource: int64): int64;
+    begin
+      if self.FBlockCount = len(self.FBlocks) then
+        setlength(self.FBlocks, self.FBlockCount * 2 + 4);
+      end;
+      self.FBlocks[self.FBlockCount] := ref MachineBlock(ASource);
+      self.FBlockCount := self.FBlockCount + 1;
+      return self.FBlockCount - 1;
+    end;
+
+    // Block AIndex; raises outside the function
+    const method BlockAt(const AIndex: int64): ref MachineBlock;
+    begin
+      if (AIndex < 0) or (AIndex >= self.FBlockCount) then
+        raise(ADAM_X64_MACHINE_FAULT_NO_BLOCK + IntToStr(AIndex));
+      end;
+      return self.FBlocks[AIndex];
+    end;
+
+    // A new virtual register of AClass; returns its number
+    method NewVReg(const AClass: RegClass): int64;
+    begin
+      if self.FVRegCount = len(self.FClasses) then
+        setlength(self.FClasses, self.FVRegCount * 2 + 8);
+      end;
+      self.FClasses[self.FVRegCount] := AClass;
+      self.FVRegCount := self.FVRegCount + 1;
+      return self.FVRegCount - 1;
+    end;
+
+    // The class of virtual register ANumber; raises for a number that is none
+    const method VRegClass(const ANumber: int64): RegClass;
+    begin
+      if (ANumber < 0) or (ANumber >= self.FVRegCount) then
+        raise(ADAM_X64_MACHINE_FAULT_NO_VREG + IntToStr(ANumber));
+      end;
+      return self.FClasses[ANumber];
+    end;
+
+    // A new slot of ASize bytes aligned to AAlign (both positive, AAlign a power of two);
+    // returns its index
+    method AddSlot(const ASize: int64; const AAlign: int64): int64;
+    begin
+      if (ASize <= 0) or (AAlign <= 0) or ((AAlign & (AAlign - 1)) <> 0) then
+        raise(ADAM_X64_MACHINE_FAULT_SLOT + IntToStr(ASize) + " " + IntToStr(AAlign));
+      end;
+      if self.FSlotCount = len(self.FSlotSizes) then
+        setlength(self.FSlotSizes, self.FSlotCount * 2 + 4);
+        setlength(self.FSlotAligns, self.FSlotCount * 2 + 4);
+        setlength(self.FSlotOffsets, self.FSlotCount * 2 + 4);
+        setlength(self.FSlotSources, self.FSlotCount * 2 + 4);
+      end;
+      self.FSlotSizes[self.FSlotCount] := ASize;
+      self.FSlotAligns[self.FSlotCount] := AAlign;
+      self.FSlotOffsets[self.FSlotCount] := -1;
+      self.FSlotSources[self.FSlotCount] := 0;
+      self.FSlotCount := self.FSlotCount + 1;
+      return self.FSlotCount - 1;
+    end;
+
+    // Records that slot AIndex holds the IR slot ASource; raises outside the slots
+    method SetSlotSource(const AIndex: int64; const ASource: int64);
+    begin
+      if (AIndex < 0) or (AIndex >= self.FSlotCount) then
+        raise(ADAM_X64_MACHINE_FAULT_NO_SLOT + IntToStr(AIndex));
+      end;
+      self.FSlotSources[AIndex] := ASource;
+    end;
+
+    // The IR slot slot AIndex holds (0: none); raises outside the slots
+    const method SlotSource(const AIndex: int64): int64;
+    begin
+      if (AIndex < 0) or (AIndex >= self.FSlotCount) then
+        raise(ADAM_X64_MACHINE_FAULT_NO_SLOT + IntToStr(AIndex));
+      end;
+      return self.FSlotSources[AIndex];
+    end;
+
+    // Places slot AIndex at AOffset from the stack pointer after the prologue; raises
+    // outside the slots or for a negative offset
+    method PlaceSlot(const AIndex: int64; const AOffset: int64);
+    begin
+      if (AIndex < 0) or (AIndex >= self.FSlotCount) then
+        raise(ADAM_X64_MACHINE_FAULT_NO_SLOT + IntToStr(AIndex));
+      end;
+      if AOffset < 0 then
+        raise(ADAM_X64_MACHINE_FAULT_SLOT + "offset " + IntToStr(AOffset));
+      end;
+      self.FSlotOffsets[AIndex] := AOffset;
+    end;
+
+    // Slot AIndex's offset (-1 until placed); raises outside the slots
+    const method SlotOffset(const AIndex: int64): int64;
+    begin
+      if (AIndex < 0) or (AIndex >= self.FSlotCount) then
+        raise(ADAM_X64_MACHINE_FAULT_NO_SLOT + IntToStr(AIndex));
+      end;
+      return self.FSlotOffsets[AIndex];
+    end;
+
+    // Slot AIndex's size and alignment; each raises outside the slots
+    const method SlotSize(const AIndex: int64): int64;
+    begin
+      if (AIndex < 0) or (AIndex >= self.FSlotCount) then
+        raise(ADAM_X64_MACHINE_FAULT_NO_SLOT + IntToStr(AIndex));
+      end;
+      return self.FSlotSizes[AIndex];
+    end;
+
+    const method SlotAlign(const AIndex: int64): int64;
+    begin
+      if (AIndex < 0) or (AIndex >= self.FSlotCount) then
+        raise(ADAM_X64_MACHINE_FAULT_NO_SLOT + IntToStr(AIndex));
+      end;
+      return self.FSlotAligns[AIndex];
+    end;
+
+    // "v3" for a general virtual register, "x3" for a vector one
+    hidden const method DoVRegText(const ANumber: int64): string;
+    begin
+      if self.VRegClass(ANumber) = RegClass.Vector then
+        return "x" + IntToStr(ANumber);
+      end;
+      return "v" + IntToStr(ANumber);
+    end;
+
+    // "+8", "-8" or "" for ADisp
+    hidden const method DoDispText(const ADisp: int64): string;
+    begin
+      if ADisp > 0 then
+        return "+" + IntToStr(ADisp);
+      end;
+      if ADisp < 0 then
+        return IntToStr(ADisp);
+      end;
+      return "";
+    end;
+
+    // A memory operand as Dump writes it: "[slot0+8]", "[v2]", "[rip+import fwrite]"
+    hidden const method DoMemoryText(const ARegisters: ref X64Registers;
+      const AOperand: ref MachineOperand): string;
+    var
+      LBase: string;
+    begin
+      LBase := "";
+      match AOperand.Base of
+        MemoryBase.Register:
+          if AOperand.BaseVirtual then
+            LBase := self.DoVRegText(AOperand.Reg);
+          else
+            LBase := ARegisters.Text(AOperand.Reg);
+          end;
+        MemoryBase.Slot: LBase := "slot" + IntToStr(AOperand.SlotIndex);
+        MemoryBase.Incoming: LBase := "incoming";
+        MemoryBase.Outgoing: LBase := "outgoing";
+        MemoryBase.RipSymbol:
+          if AOperand.Symbol = SymbolClass.Import then
+            LBase := "rip+import " + AOperand.Library + "!" + AOperand.SymbolName;
+          else
+            LBase := "rip+" + AOperand.SymbolName;
+          end;
+      end;
+      return "[" + LBase + self.DoDispText(AOperand.Disp) + "]";
+    end;
+
+    // One operand as Dump writes it, registers named by ARegisters
+    hidden const method DoOperandText(const ARegisters: ref X64Registers;
+      const AOperand: ref MachineOperand): string;
+    begin
+      match AOperand.Kind of
+        OperandKind.VirtualReg: return self.DoVRegText(AOperand.Reg);
+        OperandKind.PhysicalReg: return ARegisters.Text(AOperand.Reg);
+        OperandKind.Immediate: return IntToStr(AOperand.Imm);
+        OperandKind.Memory: return self.DoMemoryText(ARegisters, AOperand);
+        OperandKind.SymbolRef: return AOperand.SymbolName;
+        OperandKind.BlockRef: return "m" + IntToStr(AOperand.Block);
+      end;
+      return "";
+    end;
+
+    // One operand as Dump writes it
+    const method OperandText(const AOperand: ref MachineOperand): string;
+    begin
+      return self.DoOperandText(ref X64Registers(), AOperand);
+    end;
+
+    // " APrefix rcx rdx" for the physical registers in AList ("" for none)
+    hidden const method DoRegListText(const ARegisters: ref X64Registers; const APrefix: string;
+      const AList: ref Int64List): string;
+    var
+      LText: string;
+      LI: int64;
+    begin
+      if AList.Count = 0 then
+        return "";
+      end;
+      LText := " " + APrefix;
+      for LI := 0 to AList.Count - 1 do
+        LText := LText + " " + ARegisters.Text(AList[LI]);
+      end;
+      return LText;
+    end;
+
+    // One instruction as Dump writes it: "add.4 v3, v1", "jne m2", "call f uses rcx defs rax"
+    const method InstrText(const AInstr: ref MachineInstr): string;
+    begin
+      return self.DoInstrText(ref X64Registers(), AInstr);
+    end;
+
+    // One instruction as Dump writes it, registers named by ARegisters
+    hidden const method DoInstrText(const ARegisters: ref X64Registers;
+      const AInstr: ref MachineInstr): string;
+    var
+      LText: string;
+      LI: int64;
+    begin
+      if AInstr.Op = X64Op.Jcc then
+        LText := X64CondText(AInstr.Cond);
+      else
+        if AInstr.Op = X64Op.SetCC then
+          LText := X64SetText(AInstr.Cond);
+        else
+          LText := X64OpText(AInstr.Op);
+        end;
+      end;
+      if X64OpHasWidth(AInstr.Op) then
+        LText := LText + "." + IntToStr(AInstr.Width);
+      end;
+      for LI := 0 to AInstr.OperandCount - 1 do
+        if LI = 0 then
+          LText := LText + " ";
+        else
+          LText := LText + ", ";
+        end;
+        LText := LText + self.DoOperandText(ARegisters, AInstr.OperandAt(LI));
+      end;
+      LText := LText + self.DoRegListText(ARegisters, "uses", AInstr.ImplicitUses) +
+        self.DoRegListText(ARegisters, "defs", AInstr.ImplicitDefs);
+      if AInstr.Prologue then
+        LText := LText + " ; prologue";
+      end;
+      return LText;
+    end;
+
+    // The block heading: "m0 from b1:" or "m4 edge b2 -> b5:"
+    hidden const method DoBlockHeading(const AIndex: int64): string;
+    var
+      LBlock: ref MachineBlock;
+    begin
+      LBlock := self.FBlocks[AIndex];
+      if LBlock.Source = 0 then
+        return "m" + IntToStr(AIndex) + " edge b" + IntToStr(LBlock.EdgeFrom) + " -> b" +
+          IntToStr(LBlock.EdgeTo) + ":";
+      end;
+      return "m" + IntToStr(AIndex) + " from b" + IntToStr(LBlock.Source) + ":";
+    end;
+
+    // The function as text: its name, slots, outgoing area and virtual registers, then
+    // each block and its instructions (registers named by Adam.X64.Registers)
+    const method Dump(): string;
+    var
+      LText: string;
+      LCalls: string;
+      LI: int64;
+      LJ: int64;
+      LBlock: ref MachineBlock;
+      LRegisters: ref X64Registers;
+    begin
+      LRegisters := ref X64Registers();
+      LText := "mfunction " + self.Symbol + "\n";
+      for LI := 0 to self.FSlotCount - 1 do
+        LText := LText + "  slot" + IntToStr(LI) + " size " + IntToStr(self.FSlotSizes[LI]) +
+          " align " + IntToStr(self.FSlotAligns[LI]);
+        if self.FSlotOffsets[LI] >= 0 then
+          LText := LText + " at +" + IntToStr(self.FSlotOffsets[LI]);
+        end;
+        LText := LText + "\n";
+      end;
+      LCalls := "no";
+      if self.MakesCalls then
+        LCalls := "yes";
+      end;
+      LText := LText + "  outgoing " + IntToStr(self.OutgoingBytes) + " calls " + LCalls +
+        " vregs " + IntToStr(self.FVRegCount) + "\n";
+      if self.Frame <> nil then
+        LText := LText + "  frame " + self.Frame.Text() + "\n";
+      end;
+      for LI := 0 to self.FBlockCount - 1 do
+        LBlock := self.FBlocks[LI];
+        LText := LText + "  " + self.DoBlockHeading(LI) + "\n";
+        for LJ := 0 to LBlock.InstrCount - 1 do
+          LText := LText + "    " + self.DoInstrText(LRegisters, LBlock.InstrAt(LJ)) + "\n";
+        end;
+      end;
+      return LText;
+    end;
+  end;
+
+end.

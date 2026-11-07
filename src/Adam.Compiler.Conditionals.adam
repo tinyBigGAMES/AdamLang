@@ -1,0 +1,645 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Compiler.Conditionals.adam - The conditional-directive filter
+
+  ConditionalFilter  sits between the lexer and the parser (BNF sec 2, as
+                     PaskalCPP's Conditionals): it reads one file's tokens
+                     once and passes the active ones on, unchanged. It
+                     consumes @define @undef @ifdef @ifndef @elseif @else
+                     @endif, keeps the file's define set (ADAM, BUILD_<kind>,
+                     TARGET_<ARCH>, TARGET_<OS>, TARGET_<ABI>, the whole
+                     triple TARGET_<ARCH>_<OS>_<ABI>, TARGET_64BIT, then
+                     @define), and checks @target's place and value: in the
+                     prologue, outside any branch, before the first
+                     conditional directive, once; a supported triple; an
+                     import's equal to the main module's.
+
+  The target defines are fixed at the first conditional directive (or the
+  end): the triple handed down to an import, else the command line's
+  override, else the module's own @target, else the command line's default,
+  else x86_64-windows-gnu. The @target directive itself passes on to the
+  parser (its argument is a Directive's like any other).
+*******************************************************************************/
+
+module unit Adam.Compiler.Conditionals;
+
+import System.SysUtils, Adam.Core.Messages, Adam.Target, Adam.Target.Registry,
+  Adam.Compiler.SourceText, Adam.Compiler.Diagnostics, Adam.Compiler.Lexer;
+
+exported const
+  ADAM_ERR_CONDITIONALS_001: string = "CD0001";   // a conditional directive needs a symbol
+  ADAM_ERR_CONDITIONALS_002: string = "CD0002";   // @elseif / @else / @endif with no opener
+  ADAM_ERR_CONDITIONALS_003: string = "CD0003";   // @elseif or @else after @else
+  ADAM_ERR_CONDITIONALS_004: string = "CD0004";   // @ifdef / @ifndef not closed at the end
+  ADAM_ERR_CONDITIONALS_005: string = "CD0005";   // @target outside the directive prologue
+  ADAM_ERR_CONDITIONALS_006: string = "CD0006";   // @target inside a conditional branch
+  ADAM_ERR_CONDITIONALS_007: string = "CD0007";   // @target after a conditional directive
+  ADAM_ERR_CONDITIONALS_008: string = "CD0008";   // @target given twice
+  ADAM_ERR_CONDITIONALS_009: string = "CD0009";   // @target needs a plain string literal
+  ADAM_ERR_CONDITIONALS_010: string = "CD0010";   // not a triple's shape
+  ADAM_ERR_CONDITIONALS_011: string = "CD0011";   // not a supported target
+  ADAM_ERR_CONDITIONALS_012: string = "CD0012";   // an import's @target differs from the main module's
+
+  // The target a build has when nothing names one (BNF sec 2), in the three-part form every
+  // comparison uses; which targets are supported is Adam.Target.Registry's to say
+  ADAM_CONDITIONALS_DEFAULT_TARGET: string = "x86_64-windows-gnu";
+
+type
+  // One open @ifdef / @ifndef: ParentActive = the enclosing region passes tokens on;
+  // HadTrue = a branch was taken, or the parent is inactive (no later branch opens). An
+  // object, not a record: it holds a ref to its opener (a record is plain data)
+  CondFrame = object
+    Opener: ref Token;
+    ParentActive: bool;
+    Active: bool;
+    HadTrue: bool;
+    HadElse: bool;
+  end;
+
+// True when APart is a triple part: not empty, only a..z, 0..9, '_' and '.'
+routine DoIsTriplePart(const APart: string): bool;
+var
+  LI: int64;
+  LByte: uint32;
+begin
+  if APart = "" then
+    return false;
+  end;
+  for LI := 0 to len(APart) - 1 do
+    LByte := uint32(uint8(APart[LI]));
+    if not (((LByte >= 0x61) and (LByte <= 0x7A)) or ((LByte >= 0x30) and (LByte <= 0x39)) or
+      (LByte = 0x5F) or (LByte = 0x2E)) then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// ATriple ("arch-os-abi" or "arch-vendor-os-abi", as LLVM normalizes it) in its
+// three-part form into AThree; false when it has no triple's shape
+routine DoNormalizeTriple(const ATriple: string; var AThree: string): bool;
+var
+  LParts: StringArray;
+  LI: int64;
+begin
+  AThree := "";
+  LParts := SplitString(ATriple, "-");
+  if (len(LParts) < 3) or (len(LParts) > 4) then
+    return false;
+  end;
+  for LI := 0 to len(LParts) - 1 do
+    if not DoIsTriplePart(LParts[LI]) then
+      return false;
+    end;
+  end;
+  if len(LParts) = 4 then
+    AThree := LParts[0] + "-" + LParts[2] + "-" + LParts[3];
+  else
+    AThree := ATriple;
+  end;
+  return true;
+end;
+
+// True when the target ATriple names has 64-bit pointers (TARGET_64BIT); false for a
+// triple Adam has no target for (nothing is guessed from the arch's name)
+routine DoIs64Bit(const ATriple: string): bool;
+var
+  LTarget: ref Target;
+begin
+  LTarget := FindTarget(ATriple);
+  return (LTarget <> nil) and (LTarget.PointerSize() * 8 = 64);
+end;
+
+// True when AKind is a keyword (TokenKind's KwModule .. KwDefault range)
+routine DoIsKeyword(const AKind: TokenKind): bool;
+begin
+  return (AKind >= TokenKind.KwModule) and (AKind <= TokenKind.KwDefault);
+end;
+
+exported type
+  // The filter of one file (see the header). Filter gives the active tokens, EndOfFile
+  // last; Target the triple it settled; IsDefined the define set at the end
+  ConditionalFilter = object
+    hidden FDiagnostics: ref Diagnostics;
+    hidden FDefines: StringArray;
+    hidden FFrames: array of CondFrame;
+    hidden FInput: TokenList;
+    hidden FIndex: int64;
+    hidden FPrologueStart: int64;
+    hidden FInPrologue: bool;
+    hidden FInBuildDirective: bool;
+    hidden FEvaluated: bool;
+    hidden FSawTarget: bool;
+    hidden FParsedTarget: string;
+    hidden FMainTarget: string;
+    hidden FOverrideTarget: string;
+    hidden FDefaultTarget: string;
+    hidden FTarget: string;
+    hidden FCommitted: bool;
+
+    init(const ADiagnostics: ref Diagnostics);
+    begin
+      self.FDiagnostics := ADiagnostics;
+      self.FIndex := 0;
+      self.FPrologueStart := -1;
+      self.FTarget := "";
+    end;
+
+    // The input token at AIndex; past the end the last one (EndOfFile)
+    hidden const method DoTokenAt(const AIndex: int64): ref Token;
+    begin
+      if AIndex >= self.FInput.Count then
+        return self.FInput[self.FInput.Count - 1];
+      end;
+      return self.FInput[AIndex];
+    end;
+
+    // The index of ASymbol in the define set; -1 when it is not defined
+    hidden const method DoDefineIndex(const ASymbol: string): int64;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FDefines) - 1 do
+        if self.FDefines[LI] = ASymbol then
+          return LI;
+        end;
+      end;
+      return -1;
+    end;
+
+    // ASymbol defined (once)
+    hidden method DoDefine(const ASymbol: string);
+    var
+      LCount: int64;
+    begin
+      if self.DoDefineIndex(ASymbol) >= 0 then
+        return;
+      end;
+      LCount := len(self.FDefines);
+      setlength(self.FDefines, LCount + 1);
+      self.FDefines[LCount] := ASymbol;
+    end;
+
+    // ASymbol no longer defined (nothing when it is not)
+    hidden method DoUndefine(const ASymbol: string);
+    var
+      LAt: int64;
+      LI: int64;
+    begin
+      LAt := self.DoDefineIndex(ASymbol);
+      if LAt < 0 then
+        return;
+      end;
+      for LI := LAt to len(self.FDefines) - 2 do
+        self.FDefines[LI] := self.FDefines[LI + 1];
+      end;
+      setlength(self.FDefines, len(self.FDefines) - 1);
+    end;
+
+    // True when the innermost region passes tokens on (outside any frame: always)
+    hidden const method DoIsActive(): bool;
+    begin
+      if len(self.FFrames) = 0 then
+        return true;
+      end;
+      return self.FFrames[len(self.FFrames) - 1].Active;
+    end;
+
+    // True for the seven conditional directives' spellings
+    hidden const method DoIsConditional(const ASpelling: string): bool;
+    begin
+      return (ASpelling = "@define") or (ASpelling = "@undef") or (ASpelling = "@ifdef") or
+        (ASpelling = "@ifndef") or (ASpelling = "@elseif") or (ASpelling = "@else") or
+        (ASpelling = "@endif");
+    end;
+
+    // Error ACode at AToken's place
+    hidden method DoError(const AToken: ref Token; const ACode: string; const ATemplate: string;
+      const AArgs: MessageArgs);
+    begin
+      self.FDiagnostics.Add(Severity.Error, ACode, AToken.Place, ATemplate, AArgs);
+    end;
+
+    // The module header 'module <kind> <dotted name> ;' read by position: BUILD_<kind>
+    // defined and the prologue's first token found. A malformed header is the parser's
+    hidden method DoReadHeader();
+    var
+      LAt: int64;
+      LKind: TokenKind;
+    begin
+      if self.DoTokenAt(0).Kind <> TokenKind.KwModule then
+        return;
+      end;
+      LAt := 2;
+      if self.DoTokenAt(LAt).Kind <> TokenKind.Identifier then
+        return;
+      end;
+      while (self.DoTokenAt(LAt + 1).Kind = TokenKind.Dot) and
+        (self.DoTokenAt(LAt + 2).Kind = TokenKind.Identifier) do
+        LAt := LAt + 2;
+      end;
+      if self.DoTokenAt(LAt + 1).Kind <> TokenKind.Semicolon then
+        return;
+      end;
+      LKind := self.DoTokenAt(1).Kind;
+      if LKind = TokenKind.KwExe then
+        self.DoDefine("BUILD_EXE");
+      else
+        if LKind = TokenKind.KwDll then
+          self.DoDefine("BUILD_DLL");
+        else
+          if LKind = TokenKind.KwLib then
+            self.DoDefine("BUILD_LIB");
+          else
+            if LKind = TokenKind.KwUnit then
+              self.DoDefine("BUILD_UNIT");
+            else
+              return;
+            end;
+          end;
+        end;
+      end;
+      self.FPrologueStart := LAt + 2;
+    end;
+
+    // The prologue runs from just after the header while the tokens are directives; a
+    // build directive runs to its ';', a conditional one takes none. It is structural:
+    // an inactive branch does not change it
+    hidden method DoTrackPrologue(const AToken: ref Token);
+    begin
+      if self.FIndex = self.FPrologueStart then
+        self.FInPrologue := true;
+      end;
+      if not self.FInPrologue then
+        return;
+      end;
+      if AToken.Kind = TokenKind.Directive then
+        if not self.DoIsConditional(AToken.Text) then
+          self.FInBuildDirective := true;
+        end;
+        return;
+      end;
+      if self.FInBuildDirective then
+        if AToken.Kind = TokenKind.Semicolon then
+          self.FInBuildDirective := false;
+        end;
+        return;
+      end;
+      self.FInPrologue := false;
+    end;
+
+    // Once per file: the target settled (see the header) and its defines made
+    hidden method DoCommitTarget();
+    var
+      LParts: StringArray;
+      LThree: string;
+    begin
+      if self.FCommitted then
+        return;
+      end;
+      self.FCommitted := true;
+      if self.FMainTarget <> "" then
+        self.FTarget := self.FMainTarget;
+      else
+        if self.FOverrideTarget <> "" then
+          self.FTarget := self.FOverrideTarget;
+        else
+          if self.FParsedTarget <> "" then
+            self.FTarget := self.FParsedTarget;
+          else
+            if self.FDefaultTarget <> "" then
+              self.FTarget := self.FDefaultTarget;
+            else
+              self.FTarget := ADAM_CONDITIONALS_DEFAULT_TARGET;
+            end;
+          end;
+        end;
+      end;
+      // A command line triple may be four-part: the three-part form names the defines
+      LThree := "";
+      if DoNormalizeTriple(self.FTarget, LThree) then
+        self.FTarget := LThree;
+      else
+        self.FTarget := ADAM_CONDITIONALS_DEFAULT_TARGET;
+      end;
+
+      // The arch, the OS, the ABI alone, then the whole triple ('-' -> '_'), so an
+      // @ifdef can name exactly one target; TARGET_64BIT when the target's pointer is 64
+      // bits (asked of the target: a triple Adam has no target for defines none)
+      LParts := SplitString(self.FTarget, "-");
+      self.DoDefine("TARGET_" + UpperCase(LParts[0]));
+      self.DoDefine("TARGET_" + UpperCase(LParts[1]));
+      self.DoDefine("TARGET_" + UpperCase(LParts[2]));
+      self.DoDefine("TARGET_" + UpperCase(LParts[0]) + "_" + UpperCase(LParts[1]) + "_" +
+        UpperCase(LParts[2]));
+      if DoIs64Bit(self.FTarget) then
+        self.DoDefine("TARGET_64BIT");
+      end;
+    end;
+
+    // The symbol after ADirective (the next token when it is an identifier, the cursor
+    // past it) into ASymbol. None: CD0001; a literal or symbol in its place is the symbol
+    // written wrong and goes with the directive (one mistake, one report); a word, a
+    // directive or the end stays (the symbol is missing)
+    hidden method DoReadSymbol(const ADirective: ref Token; var ASymbol: string): bool;
+    var
+      LToken: ref Token;
+    begin
+      LToken := self.DoTokenAt(self.FIndex);
+      if LToken.Kind = TokenKind.Identifier then
+        ASymbol := LToken.Text;
+        self.FIndex := self.FIndex + 1;
+        return true;
+      end;
+      ASymbol := "";
+      self.DoError(ADirective, ADAM_ERR_CONDITIONALS_001, ADAM_MSG_CONDITIONALS_NEED_SYMBOL,
+        NoArgs().Str(ADirective.Text));
+      if (LToken.Kind <> TokenKind.Directive) and (LToken.Kind <> TokenKind.EndOfFile) and
+        (LToken.Kind <> TokenKind.Invalid) and (not DoIsKeyword(LToken.Kind)) then
+        self.FIndex := self.FIndex + 1;
+      end;
+      return false;
+    end;
+
+    // A new frame for @ifdef / @ifndef ADirective whose condition is ACondition
+    hidden method DoOpen(const ADirective: ref Token; const ACondition: bool);
+    var
+      LCount: int64;
+      LParent: bool;
+    begin
+      LParent := self.DoIsActive();
+      LCount := len(self.FFrames);
+      setlength(self.FFrames, LCount + 1);
+      self.FFrames[LCount].Opener := ADirective;
+      self.FFrames[LCount].ParentActive := LParent;
+      self.FFrames[LCount].Active := LParent and ACondition;
+      // An inactive parent counts as a taken branch, so no later branch opens
+      self.FFrames[LCount].HadTrue := self.FFrames[LCount].Active or (not LParent);
+      self.FFrames[LCount].HadElse := false;
+    end;
+
+    // The innermost frame's index for @elseif / @else / @endif ADirective; -1 when it has
+    // none (CD0002) or, with AAfterElseFaults, its frame had its @else (CD0003)
+    hidden method DoTopFrame(const ADirective: ref Token; const AAfterElseFaults: bool): int64;
+    var
+      LTop: int64;
+    begin
+      LTop := len(self.FFrames) - 1;
+      if LTop < 0 then
+        self.DoError(ADirective, ADAM_ERR_CONDITIONALS_002, ADAM_MSG_CONDITIONALS_NO_OPENER,
+          NoArgs().Str(ADirective.Text));
+        return -1;
+      end;
+      if AAfterElseFaults and self.FFrames[LTop].HadElse then
+        self.DoError(ADirective, ADAM_ERR_CONDITIONALS_003, ADAM_MSG_CONDITIONALS_AFTER_ELSE,
+          NoArgs().Str(ADirective.Text));
+        return -1;
+      end;
+      return LTop;
+    end;
+
+    // @elseif: the branch opens when no earlier one was taken and ACondition holds
+    hidden method DoElseIf(const ADirective: ref Token; const ACondition: bool);
+    var
+      LTop: int64;
+    begin
+      LTop := self.DoTopFrame(ADirective, true);
+      if LTop < 0 then
+        return;
+      end;
+      self.FFrames[LTop].Active := self.FFrames[LTop].ParentActive and
+        (not self.FFrames[LTop].HadTrue) and ACondition;
+      self.FFrames[LTop].HadTrue := self.FFrames[LTop].HadTrue or self.FFrames[LTop].Active;
+    end;
+
+    // @else: the branch opens when no earlier one was taken
+    hidden method DoElse(const ADirective: ref Token);
+    var
+      LTop: int64;
+    begin
+      LTop := self.DoTopFrame(ADirective, true);
+      if LTop < 0 then
+        return;
+      end;
+      self.FFrames[LTop].Active := self.FFrames[LTop].ParentActive and
+        (not self.FFrames[LTop].HadTrue);
+      self.FFrames[LTop].HadTrue := true;
+      self.FFrames[LTop].HadElse := true;
+    end;
+
+    // @endif: the innermost frame closes
+    hidden method DoEndIf(const ADirective: ref Token);
+    var
+      LTop: int64;
+    begin
+      LTop := self.DoTopFrame(ADirective, false);
+      if LTop < 0 then
+        return;
+      end;
+      setlength(self.FFrames, LTop);
+    end;
+
+    // A conditional directive at the cursor: consumed with its symbol, never passed on.
+    // The first one fixes the target defines (@target comes before it)
+    hidden method DoConditional(const ADirective: ref Token);
+    var
+      LName: string;
+      LSymbol: string;
+      LHasSymbol: bool;
+      LDefined: bool;
+    begin
+      LName := ADirective.Text;
+      self.FIndex := self.FIndex + 1;
+      self.DoCommitTarget();
+      self.FEvaluated := true;
+      if LName = "@else" then
+        self.DoElse(ADirective);
+        return;
+      end;
+      if LName = "@endif" then
+        self.DoEndIf(ADirective);
+        return;
+      end;
+
+      // The other five take a symbol; a missing one makes the condition false
+      LSymbol := "";
+      LHasSymbol := self.DoReadSymbol(ADirective, LSymbol);
+      LDefined := LHasSymbol and (self.DoDefineIndex(LSymbol) >= 0);
+      if LName = "@define" then
+        if LHasSymbol and self.DoIsActive() then
+          self.DoDefine(LSymbol);
+        end;
+        return;
+      end;
+      if LName = "@undef" then
+        if LHasSymbol and self.DoIsActive() then
+          self.DoUndefine(LSymbol);
+        end;
+        return;
+      end;
+      if LName = "@ifdef" then
+        self.DoOpen(ADirective, LDefined);
+        return;
+      end;
+      if LName = "@ifndef" then
+        self.DoOpen(ADirective, LHasSymbol and (not LDefined));
+        return;
+      end;
+      // @elseif: DoIsConditional admits only the seven names
+      self.DoElseIf(ADirective, LDefined);
+    end;
+
+    // @target at the cursor: checks only (its tokens still pass on to the parser). The
+    // place first (prologue, no branch, before any conditional, once), then its string,
+    // then its value (a triple's shape, a supported target, an import's equal to the main
+    // module's unless the command line's override rules)
+    hidden method DoTarget(const ADirective: ref Token);
+    var
+      LArg: ref Token;
+      LText: string;
+      LThree: string;
+    begin
+      if not self.FInPrologue then
+        self.DoError(ADirective, ADAM_ERR_CONDITIONALS_005, ADAM_MSG_CONDITIONALS_TARGET_PLACE,
+          NoArgs());
+        return;
+      end;
+      if len(self.FFrames) > 0 then
+        self.DoError(ADirective, ADAM_ERR_CONDITIONALS_006, ADAM_MSG_CONDITIONALS_TARGET_IN_BRANCH,
+          NoArgs());
+        return;
+      end;
+      if self.FEvaluated then
+        self.DoError(ADirective, ADAM_ERR_CONDITIONALS_007, ADAM_MSG_CONDITIONALS_TARGET_LATE,
+          NoArgs());
+        return;
+      end;
+      if self.FSawTarget then
+        self.DoError(ADirective, ADAM_ERR_CONDITIONALS_008, ADAM_MSG_CONDITIONALS_TARGET_TWICE,
+          NoArgs());
+        return;
+      end;
+      self.FSawTarget := true;
+
+      LArg := self.DoTokenAt(self.FIndex + 1);
+      if (LArg.Kind <> TokenKind.StringLiteral) or (len(LArg.Text) < 2) or
+        (LArg.Text[0] <> '"') then
+        self.DoError(ADirective, ADAM_ERR_CONDITIONALS_009, ADAM_MSG_CONDITIONALS_TARGET_STRING,
+          NoArgs());
+        return;
+      end;
+
+      // A triple has no escapes: its text is the spelling inside the quotes
+      LText := Substring(LArg.Text, 1, len(LArg.Text) - 2);
+      LThree := "";
+      if not DoNormalizeTriple(LText, LThree) then
+        self.DoError(LArg, ADAM_ERR_CONDITIONALS_010, ADAM_MSG_CONDITIONALS_TARGET_SHAPE,
+          NoArgs().Str(LText));
+        return;
+      end;
+      if FindTarget(LThree) = nil then
+        self.DoError(LArg, ADAM_ERR_CONDITIONALS_011, ADAM_MSG_CONDITIONALS_TARGET_UNSUPPORTED,
+          NoArgs().Str(LText).Str(KnownTriples()));
+        return;
+      end;
+      if (self.FOverrideTarget = "") and (self.FMainTarget <> "") and
+        (LThree <> self.FMainTarget) then
+        self.DoError(LArg, ADAM_ERR_CONDITIONALS_012, ADAM_MSG_CONDITIONALS_TARGET_MISMATCH,
+          NoArgs().Str(LThree).Str(self.FMainTarget));
+        return;
+      end;
+      self.FParsedTarget := LThree;
+    end;
+
+    // The end: every frame still open is CD0004 at its opener, outermost first; the
+    // target is settled if no conditional did it
+    hidden method DoFinish();
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FFrames) - 1 do
+        self.DoError(self.FFrames[LI].Opener, ADAM_ERR_CONDITIONALS_004,
+          ADAM_MSG_CONDITIONALS_UNTERMINATED, NoArgs().Str(self.FFrames[LI].Opener.Text));
+      end;
+      setlength(self.FFrames, 0);
+      self.DoCommitTarget();
+    end;
+
+    // AInput's active tokens, EndOfFile last (see the header). AMainTarget "" = this is
+    // the main module, else the main module's settled triple; AOverrideTarget /
+    // ADefaultTarget the command line's ("" = none)
+    method Filter(const AInput: TokenList; const AMainTarget: string;
+      const AOverrideTarget: string; const ADefaultTarget: string): TokenList;
+    var
+      LOutput: TokenList;
+      LToken: ref Token;
+    begin
+      setlength(self.FDefines, 0);
+      setlength(self.FFrames, 0);
+      self.FInput := AInput;
+      self.FIndex := 0;
+      self.FPrologueStart := -1;
+      self.FInPrologue := false;
+      self.FInBuildDirective := false;
+      self.FEvaluated := false;
+      self.FSawTarget := false;
+      self.FParsedTarget := "";
+      self.FMainTarget := AMainTarget;
+      self.FOverrideTarget := AOverrideTarget;
+      self.FDefaultTarget := ADefaultTarget;
+      self.FTarget := "";
+      self.FCommitted := false;
+      self.DoDefine("ADAM");
+      self.DoReadHeader();
+
+      // The lexer's list ends with EndOfFile, so the loop always ends
+      while true do
+        LToken := self.DoTokenAt(self.FIndex);
+        if LToken.Kind = TokenKind.EndOfFile then
+          self.DoFinish();
+          LOutput.AddShared(LToken);
+          return LOutput;
+        end;
+        self.DoTrackPrologue(LToken);
+        if (LToken.Kind = TokenKind.Directive) and self.DoIsConditional(LToken.Text) then
+          self.DoConditional(LToken);
+        else
+          if (LToken.Kind = TokenKind.Directive) and (LToken.Text = "@target") then
+            self.DoTarget(LToken);
+          end;
+          if self.DoIsActive() then
+            LOutput.AddShared(LToken);
+          end;
+          self.FIndex := self.FIndex + 1;
+        end;
+      end;
+      return LOutput;
+    end;
+
+    // The triple the last Filter settled (three-part form)
+    const method Target(): string;
+    begin
+      return self.FTarget;
+    end;
+
+    // True when ASymbol was defined at the end of the last Filter
+    const method IsDefined(const ASymbol: string): bool;
+    begin
+      return self.DoDefineIndex(ASymbol) >= 0;
+    end;
+  end;
+
+end.

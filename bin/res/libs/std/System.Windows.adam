@@ -1,0 +1,1287 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.Windows.adam - Adam's Windows layer: paths, files, folders,
+  processes and the program's own end over the Win32 API
+
+  The API is declared here with `external` (DESIGN sec 2): no C or C++ in
+  Adam's dependency path, the same file under pcpp and Adam (shared subset,
+  DESIGN sec 10). Handles are uint64 (a HANDLE is pointer-sized); a buffer
+  Win32 reads or writes is a static array passed `var`, which C linkage
+  passes by reference, so no `addr of`. It imports System.SysUtils (the
+  UTF-8 codec, string lists), never the other way round.
+
+  The routines PaskalCPP's SysUtils has keep its names and its rules
+  (ResolvePath, ExeDir, FileExists, DeleteFile, CreateDir, RemoveDir,
+  ReadAllText, WriteAllText, WriteAllBytes, ForceDirectories, RenameFile, FileSize,
+  TempDir, Halt, Delay), written in Adam over Win32. Adam's own beside them:
+  ReadAllBytes (WriteAllBytes' twin) and SystemDir (Windows' system folder,
+  where the linker finds the system DLLs).
+
+  Text is UTF-8 in a string. Win32 takes UTF-16: the marshaling into its
+  buffers is here (no length limit of its own, malformed input becomes
+  U+FFFD). Every routine that takes a path resolves it first (ResolvePath:
+  $P: $D: $S: work as written), then hands it to the file API full and with
+  the long-path prefix (\\?\, \\?\UNC\), so no MAX_PATH limit applies. File
+  text is read and written as its bytes, as is: no BOM, no line-end change.
+
+  RunProcess follows StdApp.Utils' CaptureConsoleOutput: stdout and stderr
+  share one pipe (the output in written order), stdin is NUL, and once this
+  process closes its copy of the write end the read loop ends at EOF: no
+  deadlock, no thread, no polling.
+*******************************************************************************/
+
+module unit System.Windows;
+
+import System.SysUtils;
+
+exported const
+  // The UTF-16 units a Win32 path or command line holds, its NUL not counted
+  ADAM_WINDOWS_WIDE_MAX: int32 = 32767;
+  // The UTF-16 units up to which ResolvePath writes a path with '/' (the plain Win32 limit);
+  // past it, the long-path spelling
+  ADAM_WINDOWS_SHORT_PATH_MAX: int64 = 247;
+
+exported type
+  // A NUL-terminated UTF-16 text as Win32 reads and writes it
+  WideBuffer = array[0..32767] of uint16;
+
+const
+  ADAM_WINDOWS_INVALID_HANDLE: uint64 = 0xFFFFFFFFFFFFFFFF;
+  ADAM_WINDOWS_INVALID_ATTRIBUTES: uint32 = 0xFFFFFFFF;
+  ADAM_WINDOWS_ATTRIBUTE_DIRECTORY: uint32 = 0x10;
+  ADAM_WINDOWS_ATTRIBUTE_NORMAL: uint32 = 0x80;
+  ADAM_WINDOWS_HANDLE_FLAG_INHERIT: uint32 = 0x1;
+  ADAM_WINDOWS_STARTF_USESHOWWINDOW: uint32 = 0x1;
+  ADAM_WINDOWS_STARTF_USESTDHANDLES: uint32 = 0x100;
+  ADAM_WINDOWS_SW_HIDE: uint16 = 0;
+  ADAM_WINDOWS_NORMAL_PRIORITY_CLASS: uint32 = 0x20;
+  ADAM_WINDOWS_GENERIC_READ: uint32 = 0x80000000;
+  ADAM_WINDOWS_GENERIC_WRITE: uint32 = 0x40000000;
+  ADAM_WINDOWS_FILE_SHARE_READ: uint32 = 0x1;
+  ADAM_WINDOWS_FILE_SHARE_READ_WRITE: uint32 = 0x3;
+  ADAM_WINDOWS_CREATE_ALWAYS: uint32 = 2;
+  ADAM_WINDOWS_OPEN_EXISTING: uint32 = 3;
+  ADAM_WINDOWS_INFINITE: uint32 = 0xFFFFFFFF;
+  ADAM_WINDOWS_ERROR_FILE_NOT_FOUND: uint32 = 2;
+  ADAM_WINDOWS_ERROR_NO_MORE_FILES: uint32 = 18;
+  ADAM_WINDOWS_IO_SIZE: uint32 = 4096;
+  // GET_FILEEX_INFO_LEVELS' GetFileExInfoStandard
+  ADAM_WINDOWS_FILE_EX_INFO_STANDARD: int32 = 0;
+
+type
+  // FILETIME
+  FileTime = record
+    LowDateTime: uint32;
+    HighDateTime: uint32;
+  end;
+
+  // WIN32_FIND_DATAW
+  Win32FindData = record
+    FileAttributes: uint32;
+    CreationTime: FileTime;
+    LastAccessTime: FileTime;
+    LastWriteTime: FileTime;
+    FileSizeHigh: uint32;
+    FileSizeLow: uint32;
+    Reserved0: uint32;
+    Reserved1: uint32;
+    FileName: array[0..259] of uint16;
+    AlternateFileName: array[0..13] of uint16;
+  end;
+
+  // WIN32_FILE_ATTRIBUTE_DATA
+  FileAttributeData = record
+    FileAttributes: uint32;
+    CreationTime: FileTime;
+    LastAccessTime: FileTime;
+    LastWriteTime: FileTime;
+    FileSizeHigh: uint32;
+    FileSizeLow: uint32;
+  end;
+
+  // SECURITY_ATTRIBUTES
+  SecurityAttributes = record
+    StructSize: uint32;
+    SecurityDescriptor: ptr;
+    InheritHandle: int32;
+  end;
+
+  // STARTUPINFOW
+  StartupInfo = record
+    Cb: uint32;
+    Reserved: ptr;
+    Desktop: ptr;
+    Title: ptr;
+    X: uint32;
+    Y: uint32;
+    XSize: uint32;
+    YSize: uint32;
+    XCountChars: uint32;
+    YCountChars: uint32;
+    FillAttribute: uint32;
+    Flags: uint32;
+    ShowWindow: uint16;
+    CbReserved2: uint16;
+    Reserved2: ptr;
+    StdInput: uint64;
+    StdOutput: uint64;
+    StdError: uint64;
+  end;
+
+  // PROCESS_INFORMATION
+  ProcessInformation = record
+    Process: uint64;
+    Thread: uint64;
+    ProcessId: uint32;
+    ThreadId: uint32;
+  end;
+
+  // One ReadFile's or WriteFile's worth of bytes
+  ByteBuffer = array[0..4095] of uint8;
+
+routine clink GetLastError(): uint32; external "kernel32";
+routine clink GetFullPathNameW(var AFileName: WideBuffer; ABufferLength: uint32;
+  var ABuffer: WideBuffer; AFilePart: ptr): uint32; external "kernel32";
+routine clink GetModuleFileNameW(AModule: uint64; var AFileName: WideBuffer; ASize: uint32): uint32;
+  external "kernel32";
+routine clink GetCurrentDirectoryW(ABufferLength: uint32; var ABuffer: WideBuffer): uint32;
+  external "kernel32";
+routine clink GetTempPathW(ABufferLength: uint32; var ABuffer: WideBuffer): uint32;
+  external "kernel32";
+routine clink GetSystemDirectoryW(var ABuffer: WideBuffer; ASize: uint32): uint32;
+  external "kernel32";
+routine clink GetFileAttributesW(var AFileName: WideBuffer): uint32; external "kernel32";
+routine clink GetFileAttributesExW(var AFileName: WideBuffer; AInfoLevel: int32;
+  var AData: FileAttributeData): int32; external "kernel32";
+routine clink CreateDirectoryW(var APathName: WideBuffer; AAttributes: ptr): int32;
+  external "kernel32";
+routine clink RemoveDirectoryW(var APathName: WideBuffer): int32; external "kernel32";
+routine clink DeleteFileW(var AFileName: WideBuffer): int32; external "kernel32";
+routine clink MoveFileExW(var AExisting: WideBuffer; var ANew: WideBuffer; AFlags: uint32): int32;
+  external "kernel32";
+routine clink FindFirstFileW(var AFileName: WideBuffer; var AData: Win32FindData): uint64;
+  external "kernel32";
+routine clink FindNextFileW(AFind: uint64; var AData: Win32FindData): int32; external "kernel32";
+routine clink FindClose(AFind: uint64): int32; external "kernel32";
+routine clink CreatePipe(var ARead: uint64; var AWrite: uint64; var AAttributes: SecurityAttributes;
+  ASize: uint32): int32; external "kernel32";
+routine clink SetHandleInformation(AHandle: uint64; AMask: uint32; AFlags: uint32): int32;
+  external "kernel32";
+routine clink CreateFileW(var AFileName: WideBuffer; AAccess: uint32; AShare: uint32;
+  var AAttributes: SecurityAttributes; ADisposition: uint32; AFlags: uint32;
+  ATemplate: uint64): uint64; external "kernel32";
+routine clink CreateProcessW(var AApplication: WideBuffer; var ACommandLine: WideBuffer;
+  AProcessAttributes: ptr; AThreadAttributes: ptr; AInheritHandles: int32; AFlags: uint32;
+  AEnvironment: ptr; var ACurrentDirectory: WideBuffer; var AStartup: StartupInfo;
+  var AInfo: ProcessInformation): int32; external "kernel32";
+routine clink ReadFile(AFile: uint64; var ABuffer: ByteBuffer; AToRead: uint32; var ARead: uint32;
+  AOverlapped: ptr): int32; external "kernel32";
+routine clink WriteFile(AFile: uint64; var ABuffer: ByteBuffer; AToWrite: uint32;
+  var AWritten: uint32; AOverlapped: ptr): int32; external "kernel32";
+routine clink WaitForSingleObject(AHandle: uint64; AMilliseconds: uint32): uint32;
+  external "kernel32";
+routine clink GetExitCodeProcess(AProcess: uint64; var AExitCode: uint32): int32;
+  external "kernel32";
+routine clink CloseHandle(AHandle: uint64): int32; external "kernel32";
+routine clink Sleep(AMilliseconds: uint32); external "kernel32";
+// The C runtime's exit: it flushes what the program printed and runs its exit work
+// (ExitProcess would drop output still in the C runtime's buffers)
+routine clink exit(ACode: int32); external "ucrtbase";
+
+// Writes AText (UTF-8) into ABuffer as UTF-16 from AStart on and ends it with a NUL; ALength
+// gets the units written, the NUL not counted. False when it does not fit (ADAM_WINDOWS_WIDE_MAX
+// units in all, AStart included)
+routine DoUtf8ToWideAt(const AText: string; var ABuffer: WideBuffer; const AStart: int32;
+  var ALength: int32): bool;
+var
+  LIndex: int64;
+  LCode: uint32;
+  LAt: int32;
+begin
+  ALength := 0;
+  ABuffer[AStart] := 0;
+  LIndex := 0;
+  LAt := AStart;
+  while LIndex < len(AText) do
+    LCode := DecodeUtf8Char(AText, LIndex);
+    if LCode >= 0x10000 then
+      // A surrogate pair
+      if LAt + 2 > ADAM_WINDOWS_WIDE_MAX then
+        return false;
+      end;
+      LCode := LCode - 0x10000;
+      ABuffer[LAt] := uint16(0xD800 | (LCode shr 10));
+      ABuffer[LAt + 1] := uint16(0xDC00 | (LCode & 0x3FF));
+      LAt := LAt + 2;
+    else
+      if LAt + 1 > ADAM_WINDOWS_WIDE_MAX then
+        return false;
+      end;
+      ABuffer[LAt] := uint16(LCode);
+      LAt := LAt + 1;
+    end;
+  end;
+  ABuffer[LAt] := 0;
+  ALength := LAt - AStart;
+  return true;
+end;
+
+// AText (UTF-8) into ABuffer as NUL-terminated UTF-16; malformed input becomes U+FFFD. False
+// when it needs more than ADAM_WINDOWS_WIDE_MAX units
+exported routine Utf8ToWide(const AText: string; var ABuffer: WideBuffer): bool;
+var
+  LLength: int32;
+begin
+  return DoUtf8ToWideAt(AText, ABuffer, 0, LLength);
+end;
+
+// The UTF-8 text of ABuffer's first ALength units, or up to its NUL when that comes first; a
+// lone surrogate becomes U+FFFD
+exported routine WideToUtf8(var ABuffer: WideBuffer; const ALength: int32): string;
+var
+  LText: string;
+  LAt: int64;
+  LI: int32;
+  LUnit: uint32;
+  LNext: uint32;
+  LCode: uint32;
+begin
+  LText := "";
+  // At most 3 bytes per unit: a pair (2 units) takes 4
+  setlength(LText, int64(ALength) * 3);
+  LAt := 0;
+  LI := 0;
+  while (LI < ALength) and (ABuffer[LI] <> 0) do
+    LUnit := uint32(ABuffer[LI]);
+    LI := LI + 1;
+    LCode := LUnit;
+    if (LUnit >= 0xD800) and (LUnit <= 0xDBFF) then
+      // A high surrogate: a pair with the low one that follows, else alone
+      LCode := ADAM_SYSUTILS_REPLACEMENT;
+      if LI < ALength then
+        LNext := uint32(ABuffer[LI]);
+        if (LNext >= 0xDC00) and (LNext <= 0xDFFF) then
+          LCode := 0x10000 + ((LUnit - 0xD800) shl 10) + (LNext - 0xDC00);
+          LI := LI + 1;
+        end;
+      end;
+    end;
+    if (LUnit >= 0xDC00) and (LUnit <= 0xDFFF) then
+      // A low surrogate with no high one before it
+      LCode := ADAM_SYSUTILS_REPLACEMENT;
+    end;
+    EncodeUtf8Char(LText, LAt, LCode);
+  end;
+  setlength(LText, LAt);
+  return LText;
+end;
+
+// AArg as one argument of a Windows command line, by the rules CommandLineToArgvW reads back
+// (StdApp.Utils' QuoteCommandArg): as is when nothing in it splits or quotes (an empty one
+// still needs ""), else quoted, each backslash run before a quote or the closing quote doubled
+// and the quote itself escaped
+exported routine QuoteArg(const AArg: string): string;
+var
+  LNeeds: bool;
+  LI: int64;
+  LChar: char;
+  LSlashes: int64;
+  LText: string;
+begin
+  LNeeds := len(AArg) = 0;
+  for LI := 0 to len(AArg) - 1 do
+    LChar := AArg[LI];
+    if (LChar = ' ') or (LChar = '\t') or (LChar = '\n') or (LChar = '\v') or (LChar = '"') then
+      LNeeds := true;
+    end;
+  end;
+  if not LNeeds then
+    return AArg;
+  end;
+  LText := "\"";
+  LSlashes := 0;
+  for LI := 0 to len(AArg) - 1 do
+    LChar := AArg[LI];
+    if LChar = '\\' then
+      // A run of backslashes counts only before a quote
+      LSlashes := LSlashes + 1;
+    else
+      if LChar = '"' then
+        LText := LText + StringOfChar('\\', LSlashes * 2 + 1) + "\"";
+      else
+        LText := LText + StringOfChar('\\', LSlashes) + LChar;
+      end;
+      LSlashes := 0;
+    end;
+  end;
+  // The backslashes before the closing quote doubled, so it stays a quote
+  LText := LText + StringOfChar('\\', LSlashes * 2) + "\"";
+  return LText;
+end;
+
+// True for a path separator ('/' or '\')
+routine DoIsSeparator(const AChar: char): bool;
+begin
+  return (AChar = '/') or (AChar = '\\');
+end;
+
+// AText with every AFrom byte replaced by ATo (the separators are ASCII: UTF-8 text is never cut)
+routine DoReplaceChar(const AText: string; const AFrom: char; const ATo: char): string;
+var
+  LText: string;
+  LI: int64;
+begin
+  LText := AText;
+  for LI := 0 to len(LText) - 1 do
+    if LText[LI] = AFrom then
+      LText[LI] := ATo;
+    end;
+  end;
+  return LText;
+end;
+
+// True when AText starts with the prefix "$<ALetter>:", the letter (upper case) in either case
+routine DoHasPrefix(const AText: string; const ALetter: char): bool;
+var
+  LLetter: uint8;
+begin
+  if len(AText) < 3 then
+    return false;
+  end;
+  LLetter := uint8(AText[1]);
+  if (LLetter >= 0x61) and (LLetter <= 0x7A) then
+    LLetter := uint8(LLetter - 0x20);
+  end;
+  return (AText[0] = '$') and (LLetter = uint8(ALetter)) and (AText[2] = ':');
+end;
+
+// The long-path spelling in either slash (\\?\..., //?/..., or a mix)
+routine DoIsLongForm(const APath: string): bool;
+begin
+  if len(APath) < 4 then
+    return false;
+  end;
+  return DoIsSeparator(APath[0]) and DoIsSeparator(APath[1]) and (APath[2] = '?') and
+    DoIsSeparator(APath[3]);
+end;
+
+// True when APath is rooted: a separator first, or a drive letter and ':'
+routine DoIsRooted(const APath: string): bool;
+begin
+  if (len(APath) > 0) and DoIsSeparator(APath[0]) then
+    return true;
+  end;
+  return (len(APath) >= 2) and (APath[1] = ':');
+end;
+
+// The UTF-16 units AText (UTF-8) takes: 2 for a code point past U+FFFF, else 1
+routine DoWideLength(const AText: string): int64;
+var
+  LIndex: int64;
+  LCount: int64;
+begin
+  LIndex := 0;
+  LCount := 0;
+  while LIndex < len(AText) do
+    if DecodeUtf8Char(AText, LIndex) >= 0x10000 then
+      LCount := LCount + 2;
+    else
+      LCount := LCount + 1;
+    end;
+  end;
+  return LCount;
+end;
+
+// Win32's own full-path rule (GetFullPathNameW: '.' and '..' folded, repeated separators
+// joined, no disk access, symlinks not followed); APath as it is when Win32 cannot make it full
+routine DoFullPath(const APath: string): string;
+var
+  LInput: WideBuffer;
+  LFull: WideBuffer;
+  LLength: int32;
+  LResult: uint32;
+begin
+  if not DoUtf8ToWideAt(APath, LInput, 0, LLength) then
+    return APath;
+  end;
+  LResult := GetFullPathNameW(LInput, uint32(ADAM_WINDOWS_WIDE_MAX + 1), LFull, nil);
+  // 0 = it failed; more than the buffer holds = the size it would need
+  if (LResult = 0) or (LResult > uint32(ADAM_WINDOWS_WIDE_MAX)) then
+    return APath;
+  end;
+  return WideToUtf8(LFull, int32(LResult));
+end;
+
+// The one output form of a full path: up to ADAM_WINDOWS_SHORT_PATH_MAX UTF-16 units the
+// forward-slash spelling, past it the long-path spelling (backslashes, \\?\UNC\ for a share, a
+// device path \\.\ as is). A path already in long form keeps it. Idempotent on both
+routine DoFinish(const AFull: string): string;
+var
+  LPath: string;
+begin
+  if DoIsLongForm(AFull) then
+    return DoReplaceChar(AFull, '/', '\\');
+  end;
+  if DoWideLength(AFull) <= ADAM_WINDOWS_SHORT_PATH_MAX then
+    return DoReplaceChar(AFull, '\\', '/');
+  end;
+  LPath := DoReplaceChar(AFull, '/', '\\');
+  if StartsStr("\\\\.\\", LPath) then
+    return LPath;
+  end;
+  if StartsStr("\\\\", LPath) then
+    return "\\\\?\\UNC\\" + Substring(LPath, 2, len(LPath) - 2);
+  end;
+  return "\\\\?\\" + LPath;
+end;
+
+// APath under ABase, one separator between them
+routine DoCombine(const ABase: string; const APath: string): string;
+begin
+  if (len(ABase) > 0) and DoIsSeparator(ABase[len(ABase) - 1]) then
+    return ABase + APath;
+  end;
+  return ABase + "\\" + APath;
+end;
+
+// The current working directory as Win32 spells it; "" when it cannot be read
+routine DoCurrentDir(): string;
+var
+  LBuffer: WideBuffer;
+  LLength: uint32;
+begin
+  LLength := GetCurrentDirectoryW(uint32(ADAM_WINDOWS_WIDE_MAX + 1), LBuffer);
+  // 0 = it failed; more than the buffer holds = the size it would need
+  if (LLength = 0) or (LLength > uint32(ADAM_WINDOWS_WIDE_MAX)) then
+    return "";
+  end;
+  return WideToUtf8(LBuffer, int32(LLength));
+end;
+
+// The folder of this process's exe file as Win32 spells it, asked of the OS (never argv[0]),
+// with no trailing separator except at a root (C:\); "" when it cannot be read
+routine DoExeFolder(): string;
+var
+  LBuffer: WideBuffer;
+  LSize: uint32;
+  LLength: uint32;
+  LFile: string;
+  LSep: int64;
+  LI: int64;
+begin
+  LSize := uint32(ADAM_WINDOWS_WIDE_MAX + 1);
+  LLength := GetModuleFileNameW(0, LBuffer, LSize);
+  // 0 = it failed; the whole buffer = the path was cut short
+  if (LLength = 0) or (LLength >= LSize) then
+    return "";
+  end;
+  LFile := WideToUtf8(LBuffer, int32(LLength));
+  LSep := -1;
+  for LI := 0 to len(LFile) - 1 do
+    if DoIsSeparator(LFile[LI]) then
+      LSep := LI;
+    end;
+  end;
+  if LSep < 0 then
+    return "";
+  end;
+  if (LSep = 2) and (LFile[1] = ':') then
+    return Substring(LFile, 0, 3);
+  end;
+  return Substring(LFile, 0, LSep);
+end;
+
+// Resolves APath to one full, normalized path against ABaseDir (PaskalCPP's ResolvePath rule).
+// A prefix at the very start, in either case, names the base: $P: the folder of this program's
+// exe (asked of the OS), $D: the current working directory, $S: ABaseDir (the same as none).
+// $R: (the project root) is a build-time prefix of the compiler only: it gives "". A rooted path
+// is only normalized; any other is resolved against its base (ABaseDir "" = the current working
+// directory). '.' and '..' are folded and repeated separators joined, as text: the disk is never
+// touched. Leading and trailing blanks are trimmed. The result uses '/' up to
+// ADAM_WINDOWS_SHORT_PATH_MAX UTF-16 units and the long-path spelling past it (\\?\C:\...,
+// \\?\UNC\server\share\...), so every file routine takes it at any length; resolving a result
+// again gives it back unchanged. "" for an empty path, only a prefix, or a $R: path
+exported routine ResolvePath(const APath: string; const ABaseDir: string): string;
+var
+  LPath: string;
+  LBase: string;
+  LExeBase: bool;
+  LCurrentBase: bool;
+begin
+  LPath := Trim(APath);
+  if LPath = "" then
+    return "";
+  end;
+  if DoHasPrefix(LPath, 'R') then
+    return "";
+  end;
+
+  // An explicit prefix, at the very start only, overrides the caller's base
+  LExeBase := DoHasPrefix(LPath, 'P');
+  LCurrentBase := DoHasPrefix(LPath, 'D');
+  if LExeBase or LCurrentBase or DoHasPrefix(LPath, 'S') then
+    LPath := Trim(Substring(LPath, 3, len(LPath) - 3));
+  end;
+  if LPath = "" then
+    return "";
+  end;
+  LBase := ABaseDir;
+  if LExeBase then
+    LBase := DoExeFolder();
+  end;
+  if LCurrentBase then
+    LBase := DoCurrentDir();
+  end;
+
+  // The long-path spelling takes backslashes only: one typed with '/' is the same path
+  if DoIsLongForm(LPath) then
+    LPath := DoReplaceChar(LPath, '/', '\\');
+  end;
+  if DoIsLongForm(LBase) then
+    LBase := DoReplaceChar(LBase, '/', '\\');
+  end;
+  if not DoIsRooted(LPath) then
+    if LBase = "" then
+      LBase := DoCurrentDir();
+    end;
+    LPath := DoCombine(LBase, LPath);
+  end;
+  return DoFinish(DoFullPath(LPath));
+end;
+
+// Resolves APath against the current working directory; see ResolvePath(APath, ABaseDir) for
+// the prefixes and the result's form
+exported routine ResolvePath(const APath: string): string;
+begin
+  return ResolvePath(APath, "");
+end;
+
+// Puts the long-path prefix into ABuffer at AAt: "\\?\" or, for a UNC path, "\\?\UNC\"
+routine DoPutLongPrefix(var ABuffer: WideBuffer; var AAt: int32; const AUnc: bool);
+begin
+  ABuffer[0] := 0x5C;
+  ABuffer[1] := 0x5C;
+  ABuffer[2] := 0x3F;
+  ABuffer[3] := 0x5C;
+  AAt := 4;
+  if AUnc then
+    ABuffer[4] := 0x55;
+    ABuffer[5] := 0x4E;
+    ABuffer[6] := 0x43;
+    ABuffer[7] := 0x5C;
+    AAt := 8;
+  end;
+end;
+
+// APath as the file API takes it in ABuffer: resolved (ResolvePath), backslashes, with the
+// long-path prefix (X:\... -> \\?\X:\..., \\server\share -> \\?\UNC\server\share; a path
+// already \\?\ or \\.\ stays as it is). False when it resolves to "" or does not fit
+routine DoFilePath(const APath: string; var ABuffer: WideBuffer): bool;
+var
+  LPath: string;
+  LAt: int32;
+  LLength: int32;
+begin
+  ABuffer[0] := 0;
+  LPath := DoReplaceChar(ResolvePath(APath), '/', '\\');
+  if LPath = "" then
+    return false;
+  end;
+  if StartsStr("\\\\?\\", LPath) or StartsStr("\\\\.\\", LPath) then
+    return DoUtf8ToWideAt(LPath, ABuffer, 0, LLength);
+  end;
+  if StartsStr("\\\\", LPath) then
+    // A UNC path: its leading "\\" is replaced by "\\?\UNC\"
+    DoPutLongPrefix(ABuffer, LAt, true);
+    return DoUtf8ToWideAt(Substring(LPath, 2, len(LPath) - 2), ABuffer, LAt, LLength);
+  end;
+  DoPutLongPrefix(ABuffer, LAt, false);
+  return DoUtf8ToWideAt(LPath, ABuffer, LAt, LLength);
+end;
+
+// The folder that holds this program's exe file, in the form ResolvePath returns, with no
+// trailing separator (except at a root). Asked of the OS, so it is right however the program
+// was started; "" when the OS cannot tell
+exported routine ExeDir(): string;
+var
+  LDir: string;
+begin
+  LDir := DoExeFolder();
+  if LDir = "" then
+    return "";
+  end;
+  return DoFinish(LDir);
+end;
+
+// The system's folder for temporary files (GetTempPathW: TMP, TEMP, USERPROFILE or the Windows
+// folder), in the form ResolvePath returns, with no trailing separator (except at a root); ""
+// when the system names none
+exported routine TempDir(): string;
+var
+  LBuffer: WideBuffer;
+  LLength: uint32;
+  LDir: string;
+  LCount: int64;
+begin
+  LLength := GetTempPathW(uint32(ADAM_WINDOWS_WIDE_MAX + 1), LBuffer);
+  if (LLength = 0) or (LLength > uint32(ADAM_WINDOWS_WIDE_MAX)) then
+    return "";
+  end;
+  LDir := WideToUtf8(LBuffer, int32(LLength));
+  // GetTempPathW ends in a separator; a root (C:\) keeps its own
+  LCount := len(LDir);
+  while (LCount > 1) and DoIsSeparator(LDir[LCount - 1]) do
+    if (LCount = 3) and (LDir[1] = ':') then
+      leave;
+    end;
+    LCount := LCount - 1;
+  end;
+  LDir := Substring(LDir, 0, LCount);
+  if LDir = "" then
+    return "";
+  end;
+  return ResolvePath(LDir);
+end;
+
+// The system folder (GetSystemDirectoryW: where Windows keeps its DLLs, C:\Windows\System32 on
+// most systems), in the form ResolvePath returns, with no trailing separator (except at a
+// root); "" when the system names none
+exported routine SystemDir(): string;
+var
+  LBuffer: WideBuffer;
+  LLength: uint32;
+begin
+  LLength := GetSystemDirectoryW(LBuffer, uint32(ADAM_WINDOWS_WIDE_MAX + 1));
+  // 0 is a failure; a length past the buffer is the size it would need
+  if (LLength = 0) or (LLength > uint32(ADAM_WINDOWS_WIDE_MAX)) then
+    return "";
+  end;
+  return ResolvePath(WideToUtf8(LBuffer, int32(LLength)));
+end;
+
+// APath's file attributes, or ADAM_WINDOWS_INVALID_ATTRIBUTES when it does not exist or cannot
+// be read
+routine DoAttributes(const APath: string): uint32;
+var
+  LBuffer: WideBuffer;
+begin
+  if not DoFilePath(APath, LBuffer) then
+    return ADAM_WINDOWS_INVALID_ATTRIBUTES;
+  end;
+  return GetFileAttributesW(LBuffer);
+end;
+
+// True when APath names an existing file (not a folder); false for a folder, a missing path, ""
+// or a path the OS cannot read. The path goes through ResolvePath first
+exported routine FileExists(const APath: string): bool;
+var
+  LAttributes: uint32;
+begin
+  LAttributes := DoAttributes(APath);
+  if LAttributes = ADAM_WINDOWS_INVALID_ATTRIBUTES then
+    return false;
+  end;
+  return (LAttributes & ADAM_WINDOWS_ATTRIBUTE_DIRECTORY) = 0;
+end;
+
+// True when APath names an existing folder. The path goes through ResolvePath first
+exported routine DirectoryExists(const APath: string): bool;
+var
+  LAttributes: uint32;
+begin
+  LAttributes := DoAttributes(APath);
+  if LAttributes = ADAM_WINDOWS_INVALID_ATTRIBUTES then
+    return false;
+  end;
+  return (LAttributes & ADAM_WINDOWS_ATTRIBUTE_DIRECTORY) <> 0;
+end;
+
+// Deletes a file, as Delphi's DeleteFile: a folder is never removed by it. True when the file
+// was deleted; false for a folder, a missing path or one the OS refuses (a file open elsewhere)
+exported routine DeleteFile(const APath: string): bool;
+var
+  LBuffer: WideBuffer;
+begin
+  if not FileExists(APath) then
+    return false;
+  end;
+  if not DoFilePath(APath, LBuffer) then
+    return false;
+  end;
+  return DeleteFileW(LBuffer) <> 0;
+end;
+
+// Creates one folder, as Delphi's CreateDir: its parent must exist already (nothing above it is
+// made). True when the folder was made; false when something of that name exists already (a
+// folder or a file), its parent is missing, or the OS refuses it
+exported routine CreateDir(const APath: string): bool;
+var
+  LBuffer: WideBuffer;
+begin
+  if not DoFilePath(APath, LBuffer) then
+    return false;
+  end;
+  return CreateDirectoryW(LBuffer, nil) <> 0;
+end;
+
+// Removes an empty folder, as Delphi's RemoveDir: a folder that holds anything is left as it
+// is. True when it was removed; false when it is not empty, is a file, is missing, or the OS
+// refuses it
+exported routine RemoveDir(const APath: string): bool;
+var
+  LBuffer: WideBuffer;
+begin
+  if not DirectoryExists(APath) then
+    return false;
+  end;
+  if not DoFilePath(APath, LBuffer) then
+    return false;
+  end;
+  return RemoveDirectoryW(LBuffer) <> 0;
+end;
+
+// The folder above APath (a resolved path): the text before its last separator, a drive root
+// keeping its separator (C:/a -> C:/); "" when there is none
+routine DoParentDir(const APath: string): string;
+var
+  LCount: int64;
+  LSep: int64;
+  LI: int64;
+  LParent: string;
+begin
+  LCount := len(APath);
+  while (LCount > 0) and DoIsSeparator(APath[LCount - 1]) do
+    LCount := LCount - 1;
+  end;
+  LSep := -1;
+  for LI := 0 to LCount - 1 do
+    if DoIsSeparator(APath[LI]) then
+      LSep := LI;
+    end;
+  end;
+  if LSep <= 0 then
+    return "";
+  end;
+  LParent := Substring(APath, 0, LSep);
+  if (len(LParent) > 0) and (LParent[len(LParent) - 1] = ':') then
+    LParent := LParent + APath[LSep];
+  end;
+  return LParent;
+end;
+
+// Creates a folder and every missing folder above it, as Delphi's ForceDirectories. A folder
+// already there is a success. True when the path is a folder afterwards; false when a file is in
+// the way, the path is "" or the OS refuses it
+exported routine ForceDirectories(const APath: string): bool;
+var
+  LPath: string;
+  LParent: string;
+  LBuffer: WideBuffer;
+begin
+  LPath := ResolvePath(APath);
+  if LPath = "" then
+    return false;
+  end;
+  if DirectoryExists(LPath) then
+    return true;
+  end;
+  if FileExists(LPath) then
+    return false;
+  end;
+  // Each step is shorter than the one before: the walk up ends at the root
+  LParent := DoParentDir(LPath);
+  if (LParent <> "") and (len(LParent) < len(LPath)) and (not DirectoryExists(LParent)) then
+    if not ForceDirectories(LParent) then
+      return false;
+    end;
+  end;
+  if DoFilePath(LPath, LBuffer) then
+    // A folder another program made meanwhile is still a success: the check below decides
+    CreateDirectoryW(LBuffer, nil);
+  end;
+  return DirectoryExists(LPath);
+end;
+
+// Gives a file a new name or moves it, as Delphi's RenameFile: something at the new name is
+// never replaced (delete it first). True when the file was renamed; false when AOldPath is not
+// a file, ANewPath exists already, its folder is missing or the OS refuses it (a move to another
+// drive is refused)
+exported routine RenameFile(const AOldPath: string; const ANewPath: string): bool;
+var
+  LOld: WideBuffer;
+  LNew: WideBuffer;
+begin
+  if not FileExists(AOldPath) then
+    return false;
+  end;
+  if FileExists(ANewPath) or DirectoryExists(ANewPath) then
+    return false;
+  end;
+  if not DoFilePath(AOldPath, LOld) then
+    return false;
+  end;
+  if not DoFilePath(ANewPath, LNew) then
+    return false;
+  end;
+  // No flags: an existing target is refused, never replaced
+  return MoveFileExW(LOld, LNew, 0) <> 0;
+end;
+
+// The size of a file in bytes, read from the file system without opening it; -1 when it is a
+// folder, is missing or the OS refuses it
+exported routine FileSize(const APath: string): int64;
+var
+  LBuffer: WideBuffer;
+  LData: FileAttributeData;
+begin
+  if not DoFilePath(APath, LBuffer) then
+    return -1;
+  end;
+  if GetFileAttributesExW(LBuffer, ADAM_WINDOWS_FILE_EX_INFO_STANDARD, LData) = 0 then
+    return -1;
+  end;
+  if (LData.FileAttributes & ADAM_WINDOWS_ATTRIBUTE_DIRECTORY) <> 0 then
+    return -1;
+  end;
+  return int64((uint64(LData.FileSizeHigh) shl 32) | uint64(LData.FileSizeLow));
+end;
+
+// Opens APath with AAccess / AShare / ADisposition; ADAM_WINDOWS_INVALID_HANDLE when it cannot.
+// The handle is never inherited by a child process
+routine DoOpenFile(const APath: string; const AAccess: uint32; const AShare: uint32;
+  const ADisposition: uint32): uint64;
+var
+  LBuffer: WideBuffer;
+  LAttributes: SecurityAttributes;
+begin
+  if not DoFilePath(APath, LBuffer) then
+    return ADAM_WINDOWS_INVALID_HANDLE;
+  end;
+  LAttributes.StructSize := uint32(size(SecurityAttributes));
+  LAttributes.SecurityDescriptor := nil;
+  LAttributes.InheritHandle := 0;
+  return CreateFileW(LBuffer, AAccess, AShare, LAttributes, ADisposition,
+    ADAM_WINDOWS_ATTRIBUTE_NORMAL, 0);
+end;
+
+// Reads a whole file into AText, its bytes as they are (no newline or code page conversion).
+// False when it is a folder, is missing, or cannot be opened or read (AText then "")
+exported routine ReadAllText(const APath: string; var AText: string): bool;
+var
+  LFile: uint64;
+  LBuffer: ByteBuffer;
+  LCount: uint32;
+  LOld: int64;
+  LI: int64;
+  LOk: bool;
+begin
+  AText := "";
+  LFile := DoOpenFile(APath, ADAM_WINDOWS_GENERIC_READ, ADAM_WINDOWS_FILE_SHARE_READ_WRITE,
+    ADAM_WINDOWS_OPEN_EXISTING);
+  if LFile = ADAM_WINDOWS_INVALID_HANDLE then
+    return false;
+  end;
+  LOk := true;
+  guard
+    while true do
+      LCount := 0;
+      if ReadFile(LFile, LBuffer, ADAM_WINDOWS_IO_SIZE, LCount, nil) = 0 then
+        LOk := false;
+        leave;
+      end;
+      // A file's end is a read that succeeds with no bytes
+      if LCount = 0 then
+        leave;
+      end;
+      LOld := len(AText);
+      setlength(AText, LOld + int64(LCount));
+      for LI := 0 to int64(LCount) - 1 do
+        AText[LOld + LI] := char(LBuffer[LI]);
+      end;
+    end;
+  finally
+    CloseHandle(LFile);
+  end;
+  if not LOk then
+    AText := "";
+  end;
+  return LOk;
+end;
+
+// Reads a whole file into ABytes, its bytes as they are. False when it is a folder, is missing,
+// or cannot be opened or read (ABytes then empty)
+exported routine ReadAllBytes(const APath: string; var ABytes: ByteArray): bool;
+var
+  LFile: uint64;
+  LBuffer: ByteBuffer;
+  LRead: uint32;
+  LCount: int64;
+  LCapacity: int64;
+  LI: int64;
+  LOk: bool;
+begin
+  setlength(ABytes, 0);
+  LFile := DoOpenFile(APath, ADAM_WINDOWS_GENERIC_READ, ADAM_WINDOWS_FILE_SHARE_READ_WRITE,
+    ADAM_WINDOWS_OPEN_EXISTING);
+  if LFile = ADAM_WINDOWS_INVALID_HANDLE then
+    return false;
+  end;
+  LOk := true;
+  LCount := 0;
+  LCapacity := 0;
+  guard
+    while true do
+      LRead := 0;
+      if ReadFile(LFile, LBuffer, ADAM_WINDOWS_IO_SIZE, LRead, nil) = 0 then
+        LOk := false;
+        leave;
+      end;
+      // A file's end is a read that succeeds with no bytes
+      if LRead = 0 then
+        leave;
+      end;
+      // The array doubles when a chunk does not fit, so a big file is not copied per chunk
+      if LCount + int64(LRead) > LCapacity then
+        LCapacity := LCapacity * 2;
+        if LCapacity < LCount + int64(LRead) then
+          LCapacity := LCount + int64(ADAM_WINDOWS_IO_SIZE);
+        end;
+        setlength(ABytes, LCapacity);
+      end;
+      for LI := 0 to int64(LRead) - 1 do
+        ABytes[LCount + LI] := LBuffer[LI];
+      end;
+      LCount := LCount + int64(LRead);
+    end;
+  finally
+    CloseHandle(LFile);
+  end;
+  if not LOk then
+    setlength(ABytes, 0);
+    return false;
+  end;
+  setlength(ABytes, LCount);
+  return true;
+end;
+
+// Writes the bytes of ABytes as the whole file: a file there is replaced, a missing one is made
+// in a folder that exists. False when the path is a folder, its folder is missing, or it cannot
+// be fully written
+exported routine WriteAllBytes(const APath: string; const ABytes: ByteArray): bool;
+var
+  LFile: uint64;
+  LBuffer: ByteBuffer;
+  LFrom: int64;
+  LCount: int64;
+  LWritten: uint32;
+  LI: int64;
+  LOk: bool;
+begin
+  LFile := DoOpenFile(APath, ADAM_WINDOWS_GENERIC_WRITE, ADAM_WINDOWS_FILE_SHARE_READ,
+    ADAM_WINDOWS_CREATE_ALWAYS);
+  if LFile = ADAM_WINDOWS_INVALID_HANDLE then
+    return false;
+  end;
+  LOk := true;
+  guard
+    LFrom := 0;
+    while LFrom < len(ABytes) do
+      // The next chunk, at most one buffer
+      LCount := len(ABytes) - LFrom;
+      if LCount > int64(ADAM_WINDOWS_IO_SIZE) then
+        LCount := int64(ADAM_WINDOWS_IO_SIZE);
+      end;
+      for LI := 0 to LCount - 1 do
+        LBuffer[LI] := ABytes[LFrom + LI];
+      end;
+      LWritten := 0;
+      if WriteFile(LFile, LBuffer, uint32(LCount), LWritten, nil) = 0 then
+        LOk := false;
+        leave;
+      end;
+      if int64(LWritten) <> LCount then
+        LOk := false;
+        leave;
+      end;
+      LFrom := LFrom + LCount;
+    end;
+  finally
+    CloseHandle(LFile);
+  end;
+  return LOk;
+end;
+
+// Writes AText as the whole file, its bytes as they are (no BOM; line ends as the caller wrote
+// them), through WriteAllBytes: the same replacing, the same failures
+exported routine WriteAllText(const APath: string; const AText: string): bool;
+var
+  LBytes: ByteArray;
+  LI: int64;
+begin
+  setlength(LBytes, len(AText));
+  for LI := 0 to len(AText) - 1 do
+    LBytes[LI] := uint8(AText[LI]);
+  end;
+  return WriteAllBytes(APath, LBytes);
+end;
+
+// The file name AData holds, as UTF-8
+routine DoFindName(var AData: Win32FindData): string;
+var
+  LWide: WideBuffer;
+  LI: int32;
+begin
+  LI := 0;
+  while (LI < 260) and (AData.FileName[LI] <> 0) do
+    LWide[LI] := AData.FileName[LI];
+    LI := LI + 1;
+  end;
+  return WideToUtf8(LWide, LI);
+end;
+
+// ADir without its trailing separators (a drive root keeps none either: "C:" + "\*" is "C:\*")
+routine DoTrimSeparators(const ADir: string): string;
+var
+  LLength: int64;
+begin
+  LLength := len(ADir);
+  while (LLength > 0) and DoIsSeparator(ADir[LLength - 1]) do
+    LLength := LLength - 1;
+  end;
+  return Substring(ADir, 0, LLength);
+end;
+
+// The names of ADir's entries that are folders (AWantDirectories) or files (not), sorted by
+// SortStrings, "." and ".." left out. False when the folder cannot be read; an empty folder is
+// true with an empty list
+routine DoList(const ADir: string; const AWantDirectories: bool; var AList: StringArray): bool;
+var
+  LBuffer: WideBuffer;
+  LData: Win32FindData;
+  LFind: uint64;
+  LName: string;
+  LIsDirectory: bool;
+  LCount: int64;
+  LOk: bool;
+begin
+  setlength(AList, 0);
+  if not DoFilePath(DoTrimSeparators(ADir) + "\\*", LBuffer) then
+    return false;
+  end;
+  LFind := FindFirstFileW(LBuffer, LData);
+  if LFind = ADAM_WINDOWS_INVALID_HANDLE then
+    // A drive root has no "." entry: nothing matched is an empty folder there
+    return GetLastError() = ADAM_WINDOWS_ERROR_FILE_NOT_FOUND;
+  end;
+  LCount := 0;
+  LOk := true;
+  guard
+    repeat
+      LName := DoFindName(LData);
+      LIsDirectory := (LData.FileAttributes & ADAM_WINDOWS_ATTRIBUTE_DIRECTORY) <> 0;
+      if (LName <> ".") and (LName <> "..") and (LIsDirectory = AWantDirectories) then
+        setlength(AList, LCount + 1);
+        AList[LCount] := LName;
+        LCount := LCount + 1;
+      end;
+    until FindNextFileW(LFind, LData) = 0;
+    // The listing ends at "no more files"; any other failure cut it short
+    LOk := GetLastError() = ADAM_WINDOWS_ERROR_NO_MORE_FILES;
+  finally
+    FindClose(LFind);
+  end;
+  if not LOk then
+    setlength(AList, 0);
+    return false;
+  end;
+  SortStrings(AList);
+  return true;
+end;
+
+// The names of the files in ADir (no folders), sorted by their bytes. False when the folder
+// cannot be read. The path goes through ResolvePath first
+exported routine GetFiles(const ADir: string; var AList: StringArray): bool;
+begin
+  return DoList(ADir, false, AList);
+end;
+
+// The names of the folders in ADir ("." and ".." left out), sorted by their bytes. False when
+// the folder cannot be read. The path goes through ResolvePath first
+exported routine GetDirectories(const ADir: string; var AList: StringArray): bool;
+begin
+  return DoList(ADir, true, AList);
+end;
+
+// Reads ARead to EOF (the pipe breaks when every writer has closed it), appending the bytes to
+// AOutput as they came
+routine DoReadAll(const ARead: uint64; var AOutput: string);
+var
+  LBuffer: ByteBuffer;
+  LCount: uint32;
+  LOld: int64;
+  LI: int64;
+begin
+  while true do
+    LCount := 0;
+    if ReadFile(ARead, LBuffer, ADAM_WINDOWS_IO_SIZE, LCount, nil) = 0 then
+      leave;
+    end;
+    LOld := len(AOutput);
+    setlength(AOutput, LOld + int64(LCount));
+    for LI := 0 to int64(LCount) - 1 do
+      AOutput[LOld + LI] := char(LBuffer[LI]);
+    end;
+  end;
+end;
+
+// Starts the process (stdin ANul, stdout and stderr AWrite), reads its output to EOF, waits for
+// it and takes its exit code; closes the write end once the child holds it, and the process and
+// thread handles on every path. False when it does not start or its exit code cannot be read
+routine DoStartAndRead(var AApplication: WideBuffer; var ACommandLine: WideBuffer;
+  var ADirectory: WideBuffer; const ANul: uint64; var AWrite: uint64; const ARead: uint64;
+  var AOutput: string; var AExitCode: uint32): bool;
+var
+  LStartup: StartupInfo;
+  LInfo: ProcessInformation;
+  LStarted: bool;
+  LOk: bool;
+begin
+  LStartup.Cb := uint32(size(StartupInfo));
+  LStartup.Flags := ADAM_WINDOWS_STARTF_USESTDHANDLES | ADAM_WINDOWS_STARTF_USESHOWWINDOW;
+  LStartup.ShowWindow := ADAM_WINDOWS_SW_HIDE;
+  LStartup.StdInput := ANul;
+  LStartup.StdOutput := AWrite;
+  LStartup.StdError := AWrite;
+  LStarted := CreateProcessW(AApplication, ACommandLine, nil, nil, 1,
+    ADAM_WINDOWS_NORMAL_PRIORITY_CLASS, nil, ADirectory, LStartup, LInfo) <> 0;
+  // Only the child holds the write end now: the pipe breaks when it exits, so the read below
+  // ends on EOF
+  CloseHandle(AWrite);
+  AWrite := 0;
+  if not LStarted then
+    return false;
+  end;
+  LOk := false;
+  guard
+    DoReadAll(ARead, AOutput);
+    WaitForSingleObject(LInfo.Process, ADAM_WINDOWS_INFINITE);
+    LOk := GetExitCodeProcess(LInfo.Process, AExitCode) <> 0;
+  finally
+    CloseHandle(LInfo.Process);
+    CloseHandle(LInfo.Thread);
+  end;
+  return LOk;
+end;
+
+// Runs AExe (the path of the exe file itself, its extension included: no PATH search; it goes
+// through ResolvePath) with AArgs, in AWorkDir ("" = this process's folder). stdin is NUL;
+// stdout and stderr go to one pipe, so AOutput holds the bytes in the order written; AExitCode
+// gets the exit code. False when it cannot start or its exit code cannot be read (AOutput then
+// holds what was read, if anything). Every handle it opens is closed on every path
+exported routine RunProcess(const AExe: string; const AArgs: StringArray; const AWorkDir: string;
+  var AOutput: string; var AExitCode: uint32): bool;
+var
+  LCommand: string;
+  LI: int64;
+  LApplication: WideBuffer;
+  LCommandLine: WideBuffer;
+  LDirectory: WideBuffer;
+  LNulName: WideBuffer;
+  LWorkDir: string;
+  LAttributes: SecurityAttributes;
+  LRead: uint64;
+  LWrite: uint64;
+  LNul: uint64;
+  LOk: bool;
+begin
+  AOutput := "";
+  AExitCode := 0;
+  // The program is named twice: as the application (full, long-path form: no MAX_PATH limit,
+  // no search) and quoted as the command line's first argument (argv[0] for the child)
+  LCommand := QuoteArg(AExe);
+  for LI := 0 to len(AArgs) - 1 do
+    LCommand := LCommand + " " + QuoteArg(AArgs[LI]);
+  end;
+  LWorkDir := AWorkDir;
+  if LWorkDir = "" then
+    LWorkDir := ".";
+  end;
+  if not DoFilePath(AExe, LApplication) then
+    return false;
+  end;
+  if not Utf8ToWide(LCommand, LCommandLine) then
+    return false;
+  end;
+  if not Utf8ToWide(LWorkDir, LDirectory) then
+    return false;
+  end;
+  if not Utf8ToWide("NUL", LNulName) then
+    return false;
+  end;
+
+  // Both pipe ends inheritable; the read end is made private below, so a child never holds it
+  LAttributes.StructSize := uint32(size(SecurityAttributes));
+  LAttributes.SecurityDescriptor := nil;
+  LAttributes.InheritHandle := 1;
+  LRead := 0;
+  LWrite := 0;
+  if CreatePipe(LRead, LWrite, LAttributes, 0) = 0 then
+    return false;
+  end;
+  LNul := ADAM_WINDOWS_INVALID_HANDLE;
+  LOk := false;
+  guard
+    if SetHandleInformation(LRead, ADAM_WINDOWS_HANDLE_FLAG_INHERIT, 0) <> 0 then
+      LNul := CreateFileW(LNulName, ADAM_WINDOWS_GENERIC_READ, ADAM_WINDOWS_FILE_SHARE_READ_WRITE,
+        LAttributes, ADAM_WINDOWS_OPEN_EXISTING, 0, 0);
+    end;
+    if LNul <> ADAM_WINDOWS_INVALID_HANDLE then
+      LOk := DoStartAndRead(LApplication, LCommandLine, LDirectory, LNul, LWrite, LRead, AOutput,
+        AExitCode);
+    end;
+  finally
+    CloseHandle(LRead);
+    if LWrite <> 0 then
+      CloseHandle(LWrite);
+    end;
+    if LNul <> ADAM_WINDOWS_INVALID_HANDLE then
+      CloseHandle(LNul);
+    end;
+  end;
+  return LOk;
+end;
+
+// Ends the program at once with AExitCode (0 is success), as Delphi's Halt: through the C
+// runtime's exit, so what the program printed is flushed and its exit work runs; the caller's
+// locals are not ended
+exported routine Halt(const AExitCode: int32);
+begin
+  exit(AExitCode);
+end;
+
+// Waits AMilliseconds, then returns: at least that long (Sleep; the OS may wake the program a
+// little later). A wait of 0 or less returns at once
+exported routine Delay(const AMilliseconds: int32);
+begin
+  if AMilliseconds > 0 then
+    Sleep(uint32(AMilliseconds));
+  end;
+end;
+
+end.

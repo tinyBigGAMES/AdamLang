@@ -1,0 +1,293 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Win64.Abi.adam - the Windows x64 convention (DESIGN sec 6)
+
+  Win64Abi      the AbiPart (Adam.Backend.Parts) of x86_64-windows-gnu, the
+                one convention of every routine on Windows x64 (clink and
+                cpplink alike):
+                - Arguments by position, each in one 8-byte place: the first
+                  four in rcx, rdx, r8, r9 (a float in xmm0..xmm3 at the same
+                  position), the rest on the stack from 32 bytes above the
+                  stack pointer at the call, in order. The caller always
+                  reserves the 32-byte home (shadow) area for the first four,
+                  used or not.
+                - The result in rax (a float in xmm0); none for void.
+                - The stack pointer is 16-byte aligned at every call; the
+                  call pushes the 8-byte return address, so at a callee's
+                  first instruction an argument's offset is 8 more.
+                - Callee-saved: rbx, rbp, rdi, rsi, r12..r15, xmm6..xmm15;
+                  the rest is volatile.
+                - The frame rule (no frame pointer unless realigned, below:
+                  unwind data describes the frame, M2.8): the prologue
+                  pushes the saved registers, then reserves AllocBytes =
+                  the outgoing area (rounded to 16) and the locals
+                  (rounded to their alignment), padded so the
+                  stack pointer is 16-byte aligned after the prologue. A
+                  function with no locals, no calls and no saved registers
+                  gets no frame (AllocBytes 0).
+                - Locals aligned above 16 bytes (a power of two) realign
+                  the frame: rbp is saved with the others, rbp takes the
+                  stack pointer after the reservation (UWOP_SET_FPREG,
+                  frame offset 0), then the stack pointer is rounded down
+                  to the alignment (only ever lower: no padding). The
+                  locals and the outgoing area are off the rounded stack
+                  pointer (the locals' start rounded to the alignment); the
+                  saved registers, the return address and the incoming
+                  area are off rbp; an epilogue releases with
+                  lea rsp, [rbp + AllocBytes] before the pops.
+                - Windows commits a thread's stack a 4096-byte page at a
+                  time through a guard page: a frame reaching more than a
+                  page below its saves (AllocBytes, plus Realign - 16 for
+                  a realigned one) is probed (FrameLayout.ProbeBytes): the
+                  prologue, after the saves and before the reservation,
+                  calls the arch's probe with the bytes in rax; the probe
+                  changes only rax, r10, r11 (free at a function's start:
+                  no argument, no result) and moves no stack pointer, so
+                  no unwind code describes it.
+*******************************************************************************/
+
+module unit Adam.Win64.Abi;
+
+import System.SysUtils, Adam.Backend.Ssa, Adam.Backend.Sections, Adam.Backend.Parts,
+  Adam.Win64.Unwind;
+
+exported const
+  // The ABI's name
+  ADAM_WIN64_ABI_NAME: string = "win64";
+  // The stack pointer's alignment at a call, and one argument place
+  ADAM_WIN64_STACK_ALIGN: int64 = 16;
+  ADAM_WIN64_SLOT_BYTES: int64 = 8;
+  // How many arguments travel in registers, and the home area the caller reserves for them
+  ADAM_WIN64_REGISTER_ARGS: int64 = 4;
+  ADAM_WIN64_HOME_BYTES: int64 = 32;
+  // The return address the call pushes
+  ADAM_WIN64_RETURN_BYTES: int64 = 8;
+  // The registers, as the x86_64 arch part names them
+  ADAM_WIN64_INT_ARGS: string = "rcx rdx r8 r9";
+  ADAM_WIN64_FLOAT_ARGS: string = "xmm0 xmm1 xmm2 xmm3";
+  ADAM_WIN64_INT_RESULT: string = "rax";
+  ADAM_WIN64_FLOAT_RESULT: string = "xmm0";
+  ADAM_WIN64_CALLEE_SAVED: string =
+    "rbx rbp rdi rsi r12 r13 r14 r15 xmm6 xmm7 xmm8 xmm9 xmm10 xmm11 xmm12 xmm13 xmm14 xmm15";
+  ADAM_WIN64_VOLATILE: string = "rax rcx rdx r8 r9 r10 r11 xmm0 xmm1 xmm2 xmm3 xmm4 xmm5";
+  // The register a realigned frame keeps its frame in (callee-saved, above)
+  ADAM_WIN64_FRAME_REGISTER: string = "rbp";
+  // The stack page Windows commits a thread's stack by (through its guard page), and the
+  // registers free at a function's first instruction (volatile, no argument, no result)
+  ADAM_WIN64_PAGE_BYTES: int64 = 4096;
+  ADAM_WIN64_PROBE_SCRATCH: string = "rax r10 r11";
+  // Raised (an IR or Lowering fault) by a void parameter, or a frame this rule cannot make
+  ADAM_WIN64_FAULT_VOID_PARAM: string = "Win64Abi: a void parameter at ";
+  ADAM_WIN64_FAULT_LOCAL_ALIGN: string = "Win64Abi: a local alignment that is not a power of two: ";
+  ADAM_WIN64_FAULT_NEGATIVE: string = "Win64Abi: a negative frame request: ";
+
+// AValue (0 or more) rounded up to a multiple of AAlign (1 or more)
+routine DoRoundUp(const AValue: int64; const AAlign: int64): int64;
+begin
+  return ((AValue + AAlign - 1) div AAlign) * AAlign;
+end;
+
+exported type
+  // The Windows x64 convention (see the header)
+  Win64Abi = object(AbiPart)
+    hidden FIntArgs: StringArray;
+    hidden FFloatArgs: StringArray;
+
+    init();
+    begin
+      self.FIntArgs := SplitString(ADAM_WIN64_INT_ARGS, " ");
+      self.FFloatArgs := SplitString(ADAM_WIN64_FLOAT_ARGS, " ");
+    end;
+
+    override method AbiName(): string;
+    begin
+      return ADAM_WIN64_ABI_NAME;
+    end;
+
+    override method StackAlign(): int64;
+    begin
+      return ADAM_WIN64_STACK_ALIGN;
+    end;
+
+    override method FrameRegister(): string;
+    begin
+      return ADAM_WIN64_FRAME_REGISTER;
+    end;
+
+    override method PageBytes(): int64;
+    begin
+      return ADAM_WIN64_PAGE_BYTES;
+    end;
+
+    override method ProbeScratch(): StringArray;
+    begin
+      return SplitString(ADAM_WIN64_PROBE_SCRATCH, " ");
+    end;
+
+    // The location of argument AIndex of AType: its register by position, else its place
+    // above the home area
+    hidden const method DoArgLocation(const AIndex: int64; const AType: IrType): ref Location;
+    var
+      LOffset: int64;
+    begin
+      if AIndex < ADAM_WIN64_REGISTER_ARGS then
+        if IsFloatType(AType) then
+          return RegisterLocation(self.FFloatArgs[AIndex]);
+        end;
+        return RegisterLocation(self.FIntArgs[AIndex]);
+      end;
+      LOffset := ADAM_WIN64_HOME_BYTES + (AIndex - ADAM_WIN64_REGISTER_ARGS) * ADAM_WIN64_SLOT_BYTES;
+      return StackLocation(LOffset, LOffset + ADAM_WIN64_RETURN_BYTES);
+    end;
+
+    // A variadic call (ASignature.Variadic: its call-site signature, every argument listed)
+    // copies each float in a register slot into the slot's integer register too, as the
+    // convention asks of a varargs or unprototyped call: the callee spills the integer
+    // registers to its home area and reads its variadic arguments from there
+    override method LayoutCall(const ASignature: ref IrSignature): ref CallLayout;
+    var
+      LLayout: ref CallLayout;
+      LPlace: ref Location;
+      LI: int64;
+      LType: IrType;
+      LStackArgs: int64;
+    begin
+      LLayout := ref CallLayout();
+      for LI := 0 to ASignature.ParamCount - 1 do
+        LType := ASignature.ParamTypes[LI];
+        if LType = IrType.Void then
+          raise(ADAM_WIN64_FAULT_VOID_PARAM + IntToStr(LI));
+        end;
+        LPlace := self.DoArgLocation(LI, LType);
+        if ASignature.Variadic and IsFloatType(LType) and (LPlace.Kind = LocationKind.Register) then
+          LPlace.ShadowName := self.FIntArgs[LI];
+        end;
+        LLayout.AddArg(LPlace);
+      end;
+      if IsFloatType(ASignature.ResultType) then
+        LLayout.ResultAt := RegisterLocation(ADAM_WIN64_FLOAT_RESULT);
+      end;
+      if (ASignature.ResultType <> IrType.Void) and not IsFloatType(ASignature.ResultType) then
+        LLayout.ResultAt := RegisterLocation(ADAM_WIN64_INT_RESULT);
+      end;
+      // The home area always, then one place per argument past the fourth
+      LStackArgs := ASignature.ParamCount - ADAM_WIN64_REGISTER_ARGS;
+      if LStackArgs < 0 then
+        LStackArgs := 0;
+      end;
+      LLayout.OutgoingBytes := ADAM_WIN64_HOME_BYTES + LStackArgs * ADAM_WIN64_SLOT_BYTES;
+      return LLayout;
+    end;
+
+    // Every argument has an 8-byte place above the return address (the four register ones
+    // in the home area the caller reserved): the function stores each integer register
+    // past its fixed parameters in its home (a variadic caller copied a float there too),
+    // so its variadic arguments run one place apart from the one past the fixed parameters
+    override method LayoutVarargs(const ASignature: ref IrSignature): ref VarargsLayout;
+    var
+      LLayout: ref VarargsLayout;
+      LI: int64;
+    begin
+      LLayout := ref VarargsLayout();
+      for LI := ASignature.ParamCount to ADAM_WIN64_REGISTER_ARGS - 1 do
+        LLayout.AddHome(self.FIntArgs[LI], ADAM_WIN64_RETURN_BYTES + LI * ADAM_WIN64_SLOT_BYTES);
+      end;
+      LLayout.FirstAt := ADAM_WIN64_RETURN_BYTES + ASignature.ParamCount * ADAM_WIN64_SLOT_BYTES;
+      return LLayout;
+    end;
+
+    override method LayoutFrame(const ALocalBytes: int64; const ALocalAlign: int64;
+      const AOutgoingBytes: int64; const ASavedCount: int64): ref FrameLayout;
+    var
+      LFrame: ref FrameLayout;
+      LAlign: int64;
+      LFrameAlign: int64;
+      LBelow: int64;
+      LReach: int64;
+    begin
+      if (ALocalBytes < 0) or (ALocalAlign < 0) or (AOutgoingBytes < 0) or (ASavedCount < 0) then
+        raise(ADAM_WIN64_FAULT_NEGATIVE + IntToStr(ALocalBytes) + " " + IntToStr(ALocalAlign) +
+          " " + IntToStr(AOutgoingBytes) + " " + IntToStr(ASavedCount));
+      end;
+      if (ALocalAlign > 0) and not IsPowerOfTwo(ALocalAlign) then
+        raise(ADAM_WIN64_FAULT_LOCAL_ALIGN + IntToStr(ALocalAlign));
+      end;
+      LAlign := ALocalAlign;
+      if LAlign < 1 then
+        LAlign := 1;
+      end;
+      LFrame := ref FrameLayout();
+      LFrame.SavedCount := ASavedCount;
+      LFrame.SavedBytes := ASavedCount * ADAM_WIN64_SLOT_BYTES;
+      // Locals aligned above the stack's alignment realign the frame (see the header)
+      LFrameAlign := ADAM_WIN64_STACK_ALIGN;
+      if LAlign > ADAM_WIN64_STACK_ALIGN then
+        LFrameAlign := LAlign;
+        LFrame.Realign := LAlign;
+        LFrame.FrameRegister := ADAM_WIN64_FRAME_REGISTER;
+      end;
+      // The outgoing area at the bottom, rounded to 16; the locals above it start at the
+      // frame's alignment
+      LFrame.OutgoingBytes := DoRoundUp(AOutgoingBytes, ADAM_WIN64_STACK_ALIGN);
+      LFrame.LocalBase := DoRoundUp(LFrame.OutgoingBytes, LFrameAlign);
+      LFrame.LocalBytes := DoRoundUp(ALocalBytes, LAlign);
+      LBelow := LFrame.LocalBase + LFrame.LocalBytes;
+      if (LBelow = 0) and (ASavedCount = 0) then
+        // A leaf with nothing to keep: no frame
+        LFrame.AllocBytes := 0;
+      else
+        // At entry the stack pointer is 8 past a 16 boundary (the return address); the
+        // saved registers and the reserved bytes (whole 8-byte places, so the loop below
+        // ends) bring it back to one
+        LFrame.AllocBytes := DoRoundUp(LBelow, ADAM_WIN64_SLOT_BYTES);
+        while ((ADAM_WIN64_RETURN_BYTES + LFrame.SavedBytes + LFrame.AllocBytes) mod
+          ADAM_WIN64_STACK_ALIGN) <> 0 do
+          LFrame.AllocBytes := LFrame.AllocBytes + ADAM_WIN64_SLOT_BYTES;
+        end;
+      end;
+      LFrame.SavedBase := LFrame.AllocBytes;
+      LFrame.ReturnOffset := LFrame.SavedBase + LFrame.SavedBytes;
+      LFrame.EntryBase := LFrame.ReturnOffset;
+      // How far below the saves the frame reaches: the reservation, then a realigned frame's
+      // rounding (the stack pointer is 16-aligned after the reservation, so the rounding
+      // drops it by Realign - 16 at most); past a page it is probed (see the header)
+      LReach := LFrame.AllocBytes;
+      if LFrame.Realign > 0 then
+        LReach := LReach + LFrame.Realign - ADAM_WIN64_STACK_ALIGN;
+      end;
+      if LReach > ADAM_WIN64_PAGE_BYTES then
+        LFrame.ProbeBytes := LReach;
+      end;
+      return LFrame;
+    end;
+
+    override method CalleeSaved(): StringArray;
+    begin
+      return SplitString(ADAM_WIN64_CALLEE_SAVED, " ");
+    end;
+
+    override method Volatile(): StringArray;
+    begin
+      return SplitString(ADAM_WIN64_VOLATILE, " ");
+    end;
+
+    override method WriteUnwind(const ACode: ref FunctionCode; const ASections: ref SectionSet);
+    begin
+      UnwindFunction(ACode, ASections);
+    end;
+  end;
+
+end.

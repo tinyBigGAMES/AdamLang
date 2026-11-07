@@ -1,0 +1,1883 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Backend.Ssa.adam - the SSA IR (DESIGN sec 3, sec 4)
+
+  The IR Lowering makes from the finished AST and the target parts read. It
+  is an OUTPUT: it holds no fact the AST lacks (each instruction keeps the
+  AST node it came from, for lines) and nothing flows back from it.
+
+  IrModule      the arenas: instructions, blocks, functions, data blobs,
+                externals, each by id (0 is none, ids never reused), and
+                the entry function. An instruction is its own value: an
+                operand is the id of the instruction that defines it.
+  IrSignature   a result type and parameter types (functions, externals)
+  IrInstr       one operation: kind, value type, operands, block targets,
+                and per kind: Imm (a constant's value, a parameter's index,
+                a slot's size), Align (a slot's), Link (the function, data
+                blob or external it names), Predicate (a compare's test)
+  IrBlock       an ordered list of instructions ending in one terminator
+  IrFunction    a symbol (internal: its object's alone), a signature,
+                blocks (the first is the entry); its scopes (a guard's
+                body: a run of its blocks and the funclet an unwind leaving
+                them runs); a funclet names its parent, in whose frame it
+                runs, and uses no value of the parent's but its slots
+  IrData        a symbol (internal: its object's alone), a kind (read-only,
+                variable, zeroed), an alignment and bytes (a zeroed blob: a
+                size)
+  IrExternal    a symbol, the library it is in, a signature
+
+  Predecessors are never stored: they follow from the terminators, so
+  Verify and every consumer derive them (PredsOf) and they cannot go stale.
+  Verify returns the problems of a malformed IR (a compiler bug: the driver
+  raises on any); Dump writes the IR as text for rows and debugging.
+*******************************************************************************/
+
+module unit Adam.Backend.Ssa;
+
+import System.SysUtils, Adam.Core.Containers;
+
+exported const
+  // Raised (an invariant broken) by an id that names nothing
+  ADAM_SSA_FAULT_NO_INSTR: string = "SSA: no instruction ";
+  ADAM_SSA_FAULT_NO_BLOCK: string = "SSA: no block ";
+  ADAM_SSA_FAULT_NO_FUNCTION: string = "SSA: no function ";
+  ADAM_SSA_FAULT_NO_DATA: string = "SSA: no data ";
+  ADAM_SSA_FAULT_NO_EXTERNAL: string = "SSA: no external ";
+  ADAM_SSA_FAULT_NO_SIGNATURE: string = "SSA: no signature ";
+  ADAM_SSA_FAULT_NO_PARAM: string = "SSA: no parameter ";
+  ADAM_SSA_FAULT_NO_BYTE: string = "SSA: no byte ";
+  // Raised by a blob written against its kind (bytes into a Zeroed one, a size into
+  // another)
+  ADAM_SSA_FAULT_ZEROED_BYTE: string = "SSA: a byte added to the zeroed data ";
+  ADAM_SSA_FAULT_NOT_ZEROED: string = "SSA: a size reserved in data that is not zeroed ";
+  // An arena's first storage, doubled each time it is full
+  ADAM_SSA_FIRST_CAPACITY: int64 = 16;
+
+exported type
+  // A value's machine-independent type
+  IrType = choices(Void, Bool, Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64,
+    Float32, Float64, Pointer);
+
+  // What an instruction does (see IrInstr for each kind's fields)
+  IrOp = choices(Constant, Parameter, Slot, Load, Store, Add, Sub, Address, Call,
+    CallExternal, Ret, Jump, Branch, Phi, Convert, Mul, BitAnd, BitOr, BitXor, Neg, BitNot,
+    Shl, Shr, Sar, SDiv, UDiv, SRem, URem, Compare, Offset, Copy, Fill, FDiv, CodeAddress,
+    ImportAddress, CallIndirect, VarargsStart);
+
+  // What a compare tests (its IrInstr.Predicate): equality, or an order that is signed or
+  // unsigned as the machine compares; on floats C's rules: FEqual and the orders are false
+  // when either operand is a NaN (ordered), FNotEqual true (unordered), so a NaN is unequal
+  // to itself (the operands' type and the predicate never disagree: Verify)
+  IrPredicate = choices(Equal, NotEqual, SLess, SLessEqual, SGreater, SGreaterEqual, ULess,
+    ULessEqual, UGreater, UGreaterEqual, FEqual, FNotEqual, FLess, FLessEqual, FGreater,
+    FGreaterEqual);
+
+  // Where a data blob lives: constant bytes the program only reads (a string literal's
+  // text), a module variable's starting bytes, or a module variable that starts zeroed (a
+  // size, no bytes)
+  IrDataKind = choices(ReadOnly, Variable, Zeroed);
+
+// The name of AKind, as Dump prints it
+exported routine IrDataKindText(const AKind: IrDataKind): string;
+begin
+  match AKind of
+    IrDataKind.ReadOnly: return "readonly";
+    IrDataKind.Variable: return "variable";
+    IrDataKind.Zeroed: return "zeroed";
+  end;
+  return "";
+end;
+
+// The name of AType, as Dump prints it (Adam's builtin spelling)
+exported routine IrTypeText(const AType: IrType): string;
+begin
+  match AType of
+    IrType.Void: return "void";
+    IrType.Bool: return "bool";
+    IrType.Int8: return "int8";
+    IrType.Int16: return "int16";
+    IrType.Int32: return "int32";
+    IrType.Int64: return "int64";
+    IrType.UInt8: return "uint8";
+    IrType.UInt16: return "uint16";
+    IrType.UInt32: return "uint32";
+    IrType.UInt64: return "uint64";
+    IrType.Float32: return "float32";
+    IrType.Float64: return "float64";
+    IrType.Pointer: return "ptr";
+  end;
+  return "";
+end;
+
+// The name of AOp, as Dump prints it
+exported routine IrOpText(const AOp: IrOp): string;
+begin
+  match AOp of
+    IrOp.Constant: return "const";
+    IrOp.Parameter: return "param";
+    IrOp.Slot: return "slot";
+    IrOp.Load: return "load";
+    IrOp.Store: return "store";
+    IrOp.Add: return "add";
+    IrOp.Sub: return "sub";
+    IrOp.Address: return "address";
+    IrOp.Call: return "call";
+    IrOp.CallExternal: return "callx";
+    IrOp.Ret: return "ret";
+    IrOp.Jump: return "jump";
+    IrOp.Branch: return "branch";
+    IrOp.Phi: return "phi";
+    IrOp.Convert: return "convert";
+    IrOp.Mul: return "mul";
+    IrOp.BitAnd: return "and";
+    IrOp.BitOr: return "or";
+    IrOp.BitXor: return "xor";
+    IrOp.Neg: return "neg";
+    IrOp.BitNot: return "not";
+    IrOp.Shl: return "shl";
+    IrOp.Shr: return "shr";
+    IrOp.Sar: return "sar";
+    IrOp.SDiv: return "sdiv";
+    IrOp.UDiv: return "udiv";
+    IrOp.SRem: return "srem";
+    IrOp.URem: return "urem";
+    IrOp.Compare: return "cmp";
+    IrOp.Offset: return "offset";
+    IrOp.Copy: return "copy";
+    IrOp.Fill: return "fill";
+    IrOp.FDiv: return "fdiv";
+    IrOp.CodeAddress: return "codeaddr";
+    IrOp.ImportAddress: return "importaddr";
+    IrOp.CallIndirect: return "calli";
+    IrOp.VarargsStart: return "varargsstart";
+  end;
+  return "";
+end;
+
+// The name of APredicate, as Dump prints it after "cmp"
+exported routine IrPredicateText(const APredicate: IrPredicate): string;
+begin
+  match APredicate of
+    IrPredicate.Equal: return "eq";
+    IrPredicate.NotEqual: return "ne";
+    IrPredicate.SLess: return "slt";
+    IrPredicate.SLessEqual: return "sle";
+    IrPredicate.SGreater: return "sgt";
+    IrPredicate.SGreaterEqual: return "sge";
+    IrPredicate.ULess: return "ult";
+    IrPredicate.ULessEqual: return "ule";
+    IrPredicate.UGreater: return "ugt";
+    IrPredicate.UGreaterEqual: return "uge";
+    IrPredicate.FEqual: return "oeq";
+    IrPredicate.FNotEqual: return "une";
+    IrPredicate.FLess: return "olt";
+    IrPredicate.FLessEqual: return "ole";
+    IrPredicate.FGreater: return "ogt";
+    IrPredicate.FGreaterEqual: return "oge";
+  end;
+  return "";
+end;
+
+// True for the predicates that compare floats: oeq, une, olt, ole, ogt, oge
+exported routine IsFloatPredicate(const APredicate: IrPredicate): bool;
+begin
+  return (APredicate = IrPredicate.FEqual) or (APredicate = IrPredicate.FNotEqual) or
+    (APredicate = IrPredicate.FLess) or (APredicate = IrPredicate.FLessEqual) or
+    (APredicate = IrPredicate.FGreater) or (APredicate = IrPredicate.FGreaterEqual);
+end;
+
+// True for the predicates that order signed integers: slt, sle, sgt, sge
+exported routine IsSignedPredicate(const APredicate: IrPredicate): bool;
+begin
+  return (APredicate = IrPredicate.SLess) or (APredicate = IrPredicate.SLessEqual) or
+    (APredicate = IrPredicate.SGreater) or (APredicate = IrPredicate.SGreaterEqual);
+end;
+
+// True for the predicates that order unsigned values: ult, ule, ugt, uge
+exported routine IsUnsignedPredicate(const APredicate: IrPredicate): bool;
+begin
+  return (APredicate = IrPredicate.ULess) or (APredicate = IrPredicate.ULessEqual) or
+    (APredicate = IrPredicate.UGreater) or (APredicate = IrPredicate.UGreaterEqual);
+end;
+
+// True for the kinds that end a block
+exported routine IsTerminator(const AOp: IrOp): bool;
+begin
+  return (AOp = IrOp.Ret) or (AOp = IrOp.Jump) or (AOp = IrOp.Branch);
+end;
+
+// True for the types add and sub work on: the integers and the floats
+exported routine IsArithmeticType(const AType: IrType): bool;
+begin
+  return (AType <> IrType.Void) and (AType <> IrType.Bool) and (AType <> IrType.Pointer);
+end;
+
+// True for the float types: float32 and float64 (fdiv's only types; mul and neg take them
+// beside the integers)
+exported routine IsFloatType(const AType: IrType): bool;
+begin
+  return (AType = IrType.Float32) or (AType = IrType.Float64);
+end;
+
+// True for the integer types: the ones and, or, xor and not work on (mul and neg take the
+// floats too)
+exported routine IsIntegerType(const AType: IrType): bool;
+begin
+  return IsArithmeticType(AType) and (not IsFloatType(AType));
+end;
+
+// True for the signed integer types (a right shift of one is arithmetic: sar)
+exported routine IsSignedType(const AType: IrType): bool;
+begin
+  return (AType = IrType.Int8) or (AType = IrType.Int16) or (AType = IrType.Int32) or
+    (AType = IrType.Int64);
+end;
+
+// True for the types a variadic argument travels as after C's default promotions: int32,
+// int64, uint32, uint64, float64, ptr (bool, the narrower integers and float32 never)
+exported routine IsVariadicArgType(const AType: IrType): bool;
+begin
+  return (AType = IrType.Int32) or (AType = IrType.Int64) or (AType = IrType.UInt32) or
+    (AType = IrType.UInt64) or (AType = IrType.Float64) or (AType = IrType.Pointer);
+end;
+
+// True for the types convert takes and gives: the integers, the floats, bool (taken only:
+// a value converted to bool is a compare) and ptr (never to or from a float)
+exported routine IsConvertType(const AType: IrType): bool;
+begin
+  return AType <> IrType.Void;
+end;
+
+exported type
+  // A result type and the parameters' types, in order. Variadic: a routine's or a routine
+  // type's lists its fixed parameters, and a call of it passes more operands after them,
+  // each of a type C's default promotions give (IsVariadicArgType); a call site's (Select
+  // builds it for the ABI part's LayoutCall) lists every argument
+  IrSignature = object
+    ResultType: IrType;
+    Variadic: bool;
+    hidden FParams: array of IrType;
+    hidden FCount: int64;
+
+    init(const AResultType: IrType);
+    begin
+      self.ResultType := AResultType;
+      self.Variadic := false;
+      self.FCount := 0;
+    end;
+
+    property ParamCount: int64 read FCount;
+
+    // The type of parameter AIndex (0-based); raises outside the list
+    property ParamTypes[AIndex: int64]: IrType
+      read
+      begin
+        if (AIndex < 0) or (AIndex >= self.FCount) then
+          raise(ADAM_SSA_FAULT_NO_PARAM + IntToStr(AIndex));
+        end;
+        return self.FParams[AIndex];
+      end;
+
+    // Adds a parameter of AType after the others
+    method AddParam(const AType: IrType);
+    begin
+      if self.FCount = len(self.FParams) then
+        setlength(self.FParams, self.FCount * 2 + 4);
+      end;
+      self.FParams[self.FCount] := AType;
+      self.FCount := self.FCount + 1;
+    end;
+
+    // "(int32, ptr): int64" ("(ptr, ...): int32" when variadic), as Dump prints a signature
+    const method Text(): string;
+    var
+      LText: string;
+      LI: int64;
+    begin
+      LText := "(";
+      for LI := 0 to self.FCount - 1 do
+        if LI > 0 then
+          LText := LText + ", ";
+        end;
+        LText := LText + IrTypeText(self.FParams[LI]);
+      end;
+      if self.Variadic then
+        if self.FCount > 0 then
+          LText := LText + ", ";
+        end;
+        LText := LText + "...";
+      end;
+      return LText + "): " + IrTypeText(self.ResultType);
+    end;
+  end;
+
+  // One operation. Per kind:
+  //   Constant      Imm = the value (a bool is 0 / 1, a float its IEEE-754 bits)
+  //   Parameter     Imm = the parameter's index; in the entry block
+  //   Slot          a stack slot's address: Imm = size, Align = alignment
+  //   Load          Operands[0] = the address
+  //   Store         Operands[0] = the address, Operands[1] = the value
+  //   Add, Sub      Operands[0], Operands[1], both of the value type
+  //   Address       a data blob's address: Link = the data id
+  //   Call          Link = the function id, Operands = the arguments
+  //   CallExternal  Link = the external id, Operands = the arguments
+  //   CodeAddress   a ptr: the address of the function Link (a routine value)
+  //   ImportAddress a ptr: the address of the external Link (its import entry's value)
+  //   CallIndirect  Link = the signature id (IrModule.SignatureAt), Operands[0] = the ptr
+  //                 called, Operands[1..] = the arguments (a call through a routine value)
+  //   VarargsStart  a ptr: the address of the first variadic argument of the variadic
+  //                 function it is in (where its clink varargs.next reads from; the ABI
+  //                 places the arguments one slot apart, Target.VariadicSlotBytes)
+  //   Ret           Operands = the value (none for a void function)
+  //   Jump          Targets[0]
+  //   Branch        Operands[0] = the bool, Targets = then, else
+  //   Phi           Operands[k] arrives from Targets[k] (the predecessors)
+  //   Compare       a bool: Operands[0] Predicate Operands[1], both of one integer, bool or
+  //                 ptr type
+  //   Offset        a ptr: Operands[0] (a ptr) moved by Operands[1] (an int64 byte count,
+  //                 negative moves back); every address step (a field, an element, ptr + n)
+  //   Copy          void: Imm bytes from Operands[1] (a ptr, the source) to Operands[0] (a
+  //                 ptr, the destination); the two never overlap in part (an aggregate copy)
+  //   Fill          void: Imm bytes at Operands[0] (a ptr) set to zero (an aggregate zeroed)
+  IrInstr = object
+    Kind: IrOp;
+    ValueType: IrType;
+    Operands: ref Int64List;
+    Targets: ref Int64List;
+    Imm: int64;
+    Align: int64;
+    Link: int64;
+    Block: int64;
+    Node: int64;
+    Predicate: IrPredicate;
+
+    init(const AKind: IrOp; const AValueType: IrType; const ABlock: int64; const ANode: int64);
+    begin
+      self.Kind := AKind;
+      self.ValueType := AValueType;
+      self.Operands := ref Int64List();
+      self.Targets := ref Int64List();
+      self.Imm := 0;
+      self.Align := 0;
+      self.Link := 0;
+      self.Block := ABlock;
+      self.Node := ANode;
+      self.Predicate := IrPredicate.Equal;
+    end;
+  end;
+
+  // Instructions in order; the last one is the block's terminator
+  IrBlock = object
+    Owner: int64;
+    Instrs: ref Int64List;
+
+    init(const AOwner: int64);
+    begin
+      self.Owner := AOwner;
+      self.Instrs := ref Int64List();
+    end;
+  end;
+
+  // A routine's code: its blocks, the first one the entry. A funclet (Parent not 0) is a
+  // guard's finally run while its parent's frame unwinds: it runs in that frame, so its
+  // operands may be its parent's slots (nothing else of the parent's); its signature is
+  // (uint8, ptr): void, parameter 1 (FrameValue, a Parameter of its entry block) the frame
+  // the parent's slots are reached from, as the target's parts define it. A function's
+  // scopes are its guards' bodies and its own managed slots' cleanup: each a run of its
+  // blocks, by their positions in Blocks (first to last, the innermost scope before the ones
+  // around it), and the funclet run when an unwind leaves it. A scope with a target (a
+  // block position, -1: none) catches instead: its handler is a filter function (no
+  // funclet) that says whether the exception is caught, and a caught one resumes at the
+  // target's block once the frames inside it are unwound
+  IrFunction = object
+    Symbol: string;
+    Signature: ref IrSignature;
+    Blocks: ref Int64List;
+    Node: int64;
+    // Its symbol is its object's alone (a module's private routine: Symbols.HasInternalSymbol)
+    Internal: bool;
+    // The function a funclet runs in the frame of (0: no funclet), and its frame parameter
+    Parent: int64;
+    FrameValue: int64;
+    hidden FScopeFirst: ref Int64List;
+    hidden FScopeLast: ref Int64List;
+    hidden FScopeHandler: ref Int64List;
+    hidden FScopeTarget: ref Int64List;
+
+    init(const ASymbol: string; const AResultType: IrType; const ANode: int64);
+    begin
+      self.Symbol := ASymbol;
+      self.Signature := ref IrSignature(AResultType);
+      self.Blocks := ref Int64List();
+      self.Node := ANode;
+      self.Internal := false;
+      self.Parent := 0;
+      self.FrameValue := 0;
+      self.FScopeFirst := ref Int64List();
+      self.FScopeLast := ref Int64List();
+      self.FScopeHandler := ref Int64List();
+      self.FScopeTarget := ref Int64List();
+    end;
+
+    // How many scopes the function has
+    const method ScopeCount(): int64;
+    begin
+      return self.FScopeFirst.Count;
+    end;
+
+    // Scope AIndex's first and last block positions (in Blocks), its handler (a funclet, or
+    // a catching scope's filter) and its target (-1: none)
+    const method ScopeFirst(const AIndex: int64): int64;
+    begin
+      return self.FScopeFirst[AIndex];
+    end;
+
+    const method ScopeLast(const AIndex: int64): int64;
+    begin
+      return self.FScopeLast[AIndex];
+    end;
+
+    const method ScopeHandler(const AIndex: int64): int64;
+    begin
+      return self.FScopeHandler[AIndex];
+    end;
+
+    const method ScopeTarget(const AIndex: int64): int64;
+    begin
+      return self.FScopeTarget[AIndex];
+    end;
+
+    // Adds a scope: the blocks at positions AFirst .. ALast, AHandler the funclet an unwind
+    // leaving them runs, ATarget -1; or, catching, AHandler the filter and ATarget the
+    // position of the block a caught exception resumes at (added innermost first)
+    method AddScope(const AFirst: int64; const ALast: int64; const AHandler: int64;
+      const ATarget: int64);
+    begin
+      self.FScopeFirst.Add(AFirst);
+      self.FScopeLast.Add(ALast);
+      self.FScopeHandler.Add(AHandler);
+      self.FScopeTarget.Add(ATarget);
+    end;
+  end;
+
+  // Bytes the program addresses: a string literal's text (ReadOnly), or a module
+  // variable's storage (Variable with its starting bytes, Zeroed with a size alone)
+  IrData = object
+    Symbol: string;
+    Kind: IrDataKind;
+    Align: int64;
+    Node: int64;
+    // Its symbol is its object's alone (a module's private variable:
+    // Symbols.HasInternalSymbol)
+    Internal: bool;
+    hidden FBytes: array of uint8;
+    hidden FCount: int64;
+    hidden FZeroSize: int64;
+    // Its address words, in the order added: each at its byte offset in the blob, the
+    // symbol whose address (plus the addend) fills its 8 bytes when the blob is placed
+    // (Generate: an Abs64 relocation; the linker adds the base relocation)
+    hidden FAddressAt: array of int64;
+    hidden FAddressSymbol: array of string;
+    hidden FAddressAddend: array of int64;
+    hidden FAddressCount: int64;
+
+    init(const ASymbol: string; const AKind: IrDataKind; const AAlign: int64; const ANode: int64);
+    begin
+      self.Symbol := ASymbol;
+      self.Kind := AKind;
+      self.Align := AAlign;
+      self.Node := ANode;
+      self.Internal := false;
+      self.FCount := 0;
+      self.FZeroSize := 0;
+      self.FAddressCount := 0;
+    end;
+
+    // The address words it holds (AddAddress)
+    property AddressCount: int64 read FAddressCount;
+
+    // The byte offset in the blob of address word AIndex; raises outside them
+    const method AddressOffset(const AIndex: int64): int64;
+    begin
+      self.DoCheckAddress(AIndex);
+      return self.FAddressAt[AIndex];
+    end;
+
+    // The symbol address word AIndex holds the address of; raises outside them
+    const method AddressSymbol(const AIndex: int64): string;
+    begin
+      self.DoCheckAddress(AIndex);
+      return self.FAddressSymbol[AIndex];
+    end;
+
+    // The addend address word AIndex adds to its symbol's address; raises outside them
+    const method AddressAddend(const AIndex: int64): int64;
+    begin
+      self.DoCheckAddress(AIndex);
+      return self.FAddressAddend[AIndex];
+    end;
+
+    // Raises unless AIndex names an address word
+    hidden const method DoCheckAddress(const AIndex: int64);
+    begin
+      if (AIndex < 0) or (AIndex >= self.FAddressCount) then
+        raise(ADAM_SSA_FAULT_NO_BYTE + IntToStr(AIndex));
+      end;
+    end;
+
+    // An address word added at the end: 8 zero bytes the symbol ASymbol's address plus
+    // AAddend fills when the blob is placed; raises for a Zeroed blob (it holds no bytes)
+    method AddAddress(const ASymbol: string; const AAddend: int64);
+    var
+      LI: int64;
+    begin
+      if self.Kind = IrDataKind.Zeroed then
+        raise(ADAM_SSA_FAULT_ZEROED_BYTE + self.Symbol);
+      end;
+      if self.FAddressCount = len(self.FAddressAt) then
+        setlength(self.FAddressAt, self.FAddressCount * 2 + 4);
+        setlength(self.FAddressSymbol, self.FAddressCount * 2 + 4);
+        setlength(self.FAddressAddend, self.FAddressCount * 2 + 4);
+      end;
+      self.FAddressAt[self.FAddressCount] := self.FCount;
+      self.FAddressSymbol[self.FAddressCount] := ASymbol;
+      self.FAddressAddend[self.FAddressCount] := AAddend;
+      self.FAddressCount := self.FAddressCount + 1;
+      for LI := 0 to 7 do
+        self.AddByte(0);
+      end;
+    end;
+
+    // The bytes it holds (a Zeroed blob holds none)
+    property ByteCount: int64 read FCount;
+
+    // Its size in bytes: its bytes, or a Zeroed blob's reserved size
+    const method Size(): int64;
+    begin
+      if self.Kind = IrDataKind.Zeroed then
+        return self.FZeroSize;
+      end;
+      return self.FCount;
+    end;
+
+    // Grows a Zeroed blob by ACount bytes; raises for any other kind
+    method Reserve(const ACount: int64);
+    begin
+      if self.Kind <> IrDataKind.Zeroed then
+        raise(ADAM_SSA_FAULT_NOT_ZEROED + self.Symbol);
+      end;
+      self.FZeroSize := self.FZeroSize + ACount;
+    end;
+
+    // The byte at AIndex (0-based); raises outside the blob
+    property Bytes[AIndex: int64]: uint8
+      read
+      begin
+        if (AIndex < 0) or (AIndex >= self.FCount) then
+          raise(ADAM_SSA_FAULT_NO_BYTE + IntToStr(AIndex));
+        end;
+        return self.FBytes[AIndex];
+      end;
+
+    // Adds AByte at the end; raises for a Zeroed blob (it holds no bytes)
+    method AddByte(const AByte: uint8);
+    begin
+      if self.Kind = IrDataKind.Zeroed then
+        raise(ADAM_SSA_FAULT_ZEROED_BYTE + self.Symbol);
+      end;
+      if self.FCount = len(self.FBytes) then
+        setlength(self.FBytes, self.FCount * 2 + 16);
+      end;
+      self.FBytes[self.FCount] := AByte;
+      self.FCount := self.FCount + 1;
+    end;
+  end;
+
+  // A routine outside the program, in a library (its `external` declaration)
+  IrExternal = object
+    Symbol: string;
+    Library: string;
+    Signature: ref IrSignature;
+    Node: int64;
+
+    init(const ASymbol: string; const ALibrary: string; const AResultType: IrType;
+      const ANode: int64);
+    begin
+      self.Symbol := ASymbol;
+      self.Library := ALibrary;
+      self.Signature := ref IrSignature(AResultType);
+      self.Node := ANode;
+    end;
+  end;
+
+// Appends AText to AProblems
+routine DoProblem(var AProblems: StringArray; const AText: string);
+begin
+  setlength(AProblems, len(AProblems) + 1);
+  AProblems[len(AProblems) - 1] := AText;
+end;
+
+// "" when AInstr has AOperands operands and ATargets targets, else the fault
+routine DoCounts(const AInstr: ref IrInstr; const AOperands: int64; const ATargets: int64): string;
+begin
+  if AInstr.Operands.Count <> AOperands then
+    return "takes " + IntToStr(AOperands) + " operands, has " + IntToStr(AInstr.Operands.Count);
+  end;
+  if AInstr.Targets.Count <> ATargets then
+    return "takes " + IntToStr(ATargets) + " targets, has " + IntToStr(AInstr.Targets.Count);
+  end;
+  return "";
+end;
+
+// The new length of an arena holding ACount ids in ALength places: ALength
+// while there is room for one more, else doubled (at least the first capacity)
+routine DoCapacity(const ACount: int64; const ALength: int64): int64;
+begin
+  if ACount < ALength then
+    return ALength;
+  end;
+  if ALength * 2 < ADAM_SSA_FIRST_CAPACITY then
+    return ADAM_SSA_FIRST_CAPACITY;
+  end;
+  return ALength * 2;
+end;
+
+exported type
+  // The whole IR of one program (see the header)
+  IrModule = object
+    hidden FInstrs: array of ref IrInstr;
+    hidden FInstrCount: int64;
+    hidden FBlocks: array of ref IrBlock;
+    hidden FBlockCount: int64;
+    hidden FFunctions: array of ref IrFunction;
+    hidden FFunctionCount: int64;
+    hidden FData: array of ref IrData;
+    hidden FDataCount: int64;
+    hidden FExternals: array of ref IrExternal;
+    hidden FExternalCount: int64;
+    // The signatures calls through routine values carry (CallIndirect's Link)
+    hidden FSignatures: array of ref IrSignature;
+    hidden FSignatureCount: int64;
+    // The program's entry function (0: none yet)
+    Entry: int64;
+    // The function the OS calls for a frame of a function with scopes (the platform unit's
+    // frame handler; 0: no function has scopes)
+    FrameHandler: int64;
+
+    init();
+    begin
+      self.FInstrCount := 1;
+      self.FBlockCount := 1;
+      self.FFunctionCount := 1;
+      self.FDataCount := 1;
+      self.FExternalCount := 1;
+      self.FSignatureCount := 1;
+      self.Entry := 0;
+      self.FrameHandler := 0;
+    end;
+
+    // How many ids each arena has handed out, id 0 included
+    property InstrCount: int64 read FInstrCount;
+    property BlockCount: int64 read FBlockCount;
+    property FunctionCount: int64 read FFunctionCount;
+    property DataCount: int64 read FDataCount;
+    property ExternalCount: int64 read FExternalCount;
+    property SignatureCount: int64 read FSignatureCount;
+
+    const method IsInstr(const AId: int64): bool;
+    begin
+      return (AId >= 1) and (AId < self.FInstrCount);
+    end;
+
+    const method IsBlock(const AId: int64): bool;
+    begin
+      return (AId >= 1) and (AId < self.FBlockCount);
+    end;
+
+    const method IsFunction(const AId: int64): bool;
+    begin
+      return (AId >= 1) and (AId < self.FFunctionCount);
+    end;
+
+    const method IsData(const AId: int64): bool;
+    begin
+      return (AId >= 1) and (AId < self.FDataCount);
+    end;
+
+    const method IsExternal(const AId: int64): bool;
+    begin
+      return (AId >= 1) and (AId < self.FExternalCount);
+    end;
+
+    const method IsSignature(const AId: int64): bool;
+    begin
+      return (AId >= 1) and (AId < self.FSignatureCount);
+    end;
+
+    // The entity an id names; each raises when the id names nothing
+    const method InstrAt(const AId: int64): ref IrInstr;
+    begin
+      if not self.IsInstr(AId) then
+        raise(ADAM_SSA_FAULT_NO_INSTR + IntToStr(AId));
+      end;
+      return self.FInstrs[AId];
+    end;
+
+    const method BlockAt(const AId: int64): ref IrBlock;
+    begin
+      if not self.IsBlock(AId) then
+        raise(ADAM_SSA_FAULT_NO_BLOCK + IntToStr(AId));
+      end;
+      return self.FBlocks[AId];
+    end;
+
+    const method FunctionAt(const AId: int64): ref IrFunction;
+    begin
+      if not self.IsFunction(AId) then
+        raise(ADAM_SSA_FAULT_NO_FUNCTION + IntToStr(AId));
+      end;
+      return self.FFunctions[AId];
+    end;
+
+    const method DataAt(const AId: int64): ref IrData;
+    begin
+      if not self.IsData(AId) then
+        raise(ADAM_SSA_FAULT_NO_DATA + IntToStr(AId));
+      end;
+      return self.FData[AId];
+    end;
+
+    const method ExternalAt(const AId: int64): ref IrExternal;
+    begin
+      if not self.IsExternal(AId) then
+        raise(ADAM_SSA_FAULT_NO_EXTERNAL + IntToStr(AId));
+      end;
+      return self.FExternals[AId];
+    end;
+
+    const method SignatureAt(const AId: int64): ref IrSignature;
+    begin
+      if not self.IsSignature(AId) then
+        raise(ADAM_SSA_FAULT_NO_SIGNATURE + IntToStr(AId));
+      end;
+      return self.FSignatures[AId];
+    end;
+
+    // A new function with no parameters and no blocks; returns its id
+    method AddFunction(const ASymbol: string; const AResultType: IrType; const ANode: int64): int64;
+    var
+      LId: int64;
+    begin
+      setlength(self.FFunctions, DoCapacity(self.FFunctionCount, len(self.FFunctions)));
+      LId := self.FFunctionCount;
+      self.FFunctions[LId] := ref IrFunction(ASymbol, AResultType, ANode);
+      self.FFunctionCount := LId + 1;
+      return LId;
+    end;
+
+    // A new empty block at the end of AFunction's blocks; returns its id
+    method AddBlock(const AFunction: int64): int64;
+    var
+      LId: int64;
+    begin
+      if not self.IsFunction(AFunction) then
+        raise(ADAM_SSA_FAULT_NO_FUNCTION + IntToStr(AFunction));
+      end;
+      setlength(self.FBlocks, DoCapacity(self.FBlockCount, len(self.FBlocks)));
+      LId := self.FBlockCount;
+      self.FBlocks[LId] := ref IrBlock(AFunction);
+      self.FBlockCount := LId + 1;
+      self.FFunctions[AFunction].Blocks.Add(LId);
+      return LId;
+    end;
+
+    // A new empty data blob of kind AKind; returns its id
+    method AddDataOfKind(const ASymbol: string; const AKind: IrDataKind; const AAlign: int64;
+      const ANode: int64): int64;
+    var
+      LId: int64;
+    begin
+      setlength(self.FData, DoCapacity(self.FDataCount, len(self.FData)));
+      LId := self.FDataCount;
+      self.FData[LId] := ref IrData(ASymbol, AKind, AAlign, ANode);
+      self.FDataCount := LId + 1;
+      return LId;
+    end;
+
+    // A new empty read-only data blob (constant bytes); returns its id
+    method AddData(const ASymbol: string; const AAlign: int64; const ANode: int64): int64;
+    begin
+      return self.AddDataOfKind(ASymbol, IrDataKind.ReadOnly, AAlign, ANode);
+    end;
+
+    // A new external with no parameters; returns its id
+    method AddExternal(const ASymbol: string; const ALibrary: string; const AResultType: IrType;
+      const ANode: int64): int64;
+    var
+      LId: int64;
+    begin
+      setlength(self.FExternals, DoCapacity(self.FExternalCount, len(self.FExternals)));
+      LId := self.FExternalCount;
+      self.FExternals[LId] := ref IrExternal(ASymbol, ALibrary, AResultType, ANode);
+      self.FExternalCount := LId + 1;
+      return LId;
+    end;
+
+    // A new signature with no parameters (a call through a routine value carries it);
+    // returns its id
+    method AddSignature(const AResultType: IrType): int64;
+    var
+      LId: int64;
+    begin
+      setlength(self.FSignatures, DoCapacity(self.FSignatureCount, len(self.FSignatures)));
+      LId := self.FSignatureCount;
+      self.FSignatures[LId] := ref IrSignature(AResultType);
+      self.FSignatureCount := LId + 1;
+      return LId;
+    end;
+
+    // A new instruction at the end of ABlock; returns its id (its value)
+    method Emit(const ABlock: int64; const AKind: IrOp; const AValueType: IrType;
+      const ANode: int64): int64;
+    var
+      LId: int64;
+    begin
+      if not self.IsBlock(ABlock) then
+        raise(ADAM_SSA_FAULT_NO_BLOCK + IntToStr(ABlock));
+      end;
+      setlength(self.FInstrs, DoCapacity(self.FInstrCount, len(self.FInstrs)));
+      LId := self.FInstrCount;
+      self.FInstrs[LId] := ref IrInstr(AKind, AValueType, ABlock, ANode);
+      self.FInstrCount := LId + 1;
+      self.FBlocks[ABlock].Instrs.Add(LId);
+      return LId;
+    end;
+
+    // The blocks of ABlock's function whose terminator targets it, in block
+    // order, each once
+    const method PredsOf(const ABlock: int64): ref Int64List;
+    var
+      LResultList: ref Int64List;
+      LBlocks: ref Int64List;
+      LLast: ref IrInstr;
+      LI: int64;
+      LB: int64;
+    begin
+      LResultList := ref Int64List();
+      LBlocks := self.FunctionAt(self.BlockAt(ABlock).Owner).Blocks;
+      for LI := 0 to LBlocks.Count - 1 do
+        LB := LBlocks[LI];
+        if self.FBlocks[LB].Instrs.Count > 0 then
+          LLast := self.FInstrs[self.FBlocks[LB].Instrs[self.FBlocks[LB].Instrs.Count - 1]];
+          if IsTerminator(LLast.Kind) and (LLast.Targets.IndexOf(ABlock) >= 0) then
+            LResultList.Add(LB);
+          end;
+        end;
+      end;
+      return LResultList;
+    end;
+
+    // "fname b3 i7: " (AInstr 0: "fname b3: ")
+    hidden const method DoWhere(const AFunction: int64; const ABlock: int64;
+      const AInstr: int64): string;
+    var
+      LText: string;
+    begin
+      LText := self.FFunctions[AFunction].Symbol;
+      if ABlock <> 0 then
+        LText := LText + " b" + IntToStr(ABlock);
+      end;
+      if AInstr <> 0 then
+        LText := LText + " i" + IntToStr(AInstr);
+      end;
+      return LText + ": ";
+    end;
+
+    // "" when operand AIndex of AInstr has AType, else the fault
+    hidden const method DoOperandIs(const AInstr: ref IrInstr; const AIndex: int64;
+      const AType: IrType): string;
+    var
+      LType: IrType;
+    begin
+      LType := self.FInstrs[AInstr.Operands[AIndex]].ValueType;
+      if LType <> AType then
+        return "operand " + IntToStr(AIndex) + " is " + IrTypeText(LType) + ", wants " +
+          IrTypeText(AType);
+      end;
+      return "";
+    end;
+
+    // "" when AInstr's operands from AFirst on fit ASignature's parameters (the ones before
+    // it are the call's own: a calli's target) and its value type is ASignature's result,
+    // else the fault. A variadic signature takes at least its parameters, each operand
+    // after them of a promoted type (IsVariadicArgType)
+    hidden const method DoFitsSignature(const AInstr: ref IrInstr;
+      const ASignature: ref IrSignature; const AFirst: int64): string;
+    var
+      LText: string;
+      LType: IrType;
+      LI: int64;
+    begin
+      if ASignature.Variadic then
+        if AInstr.Operands.Count < AFirst + ASignature.ParamCount then
+          return "takes at least " + IntToStr(AFirst + ASignature.ParamCount) + " operands, has " +
+            IntToStr(AInstr.Operands.Count);
+        end;
+        if AInstr.Targets.Count <> 0 then
+          return DoCounts(AInstr, AInstr.Operands.Count, 0);
+        end;
+      else
+        LText := DoCounts(AInstr, AFirst + ASignature.ParamCount, 0);
+        if LText <> "" then
+          return LText;
+        end;
+      end;
+      for LI := 0 to ASignature.ParamCount - 1 do
+        LText := self.DoOperandIs(AInstr, AFirst + LI, ASignature.ParamTypes[LI]);
+        if LText <> "" then
+          return LText;
+        end;
+      end;
+      for LI := AFirst + ASignature.ParamCount to AInstr.Operands.Count - 1 do
+        LType := self.FInstrs[AInstr.Operands[LI]].ValueType;
+        if not IsVariadicArgType(LType) then
+          return "operand " + IntToStr(LI) + " is " + IrTypeText(LType) + ", a variadic one is promoted";
+        end;
+      end;
+      if AInstr.ValueType <> ASignature.ResultType then
+        return "is " + IrTypeText(AInstr.ValueType) + ", the callee returns " +
+          IrTypeText(ASignature.ResultType);
+      end;
+      return "";
+    end;
+
+    // "" when instruction AInstr of AFunction has its kind's shape (counts,
+    // types, links), else the fault. Its operands and targets are valid ids.
+    hidden const method DoShape(const AFunction: int64; const AInstr: int64): string;
+    var
+      LInstr: ref IrInstr;
+      LSig: ref IrSignature;
+      LText: string;
+    begin
+      LInstr := self.FInstrs[AInstr];
+      LSig := self.FFunctions[AFunction].Signature;
+      if LInstr.Kind = IrOp.Constant then
+        if LInstr.ValueType = IrType.Void then
+          return "a constant needs a type";
+        end;
+        return DoCounts(LInstr, 0, 0);
+      end;
+      if LInstr.Kind = IrOp.Parameter then
+        if LInstr.Block <> self.FFunctions[AFunction].Blocks[0] then
+          return "a parameter outside the entry block";
+        end;
+        if (LInstr.Imm < 0) or (LInstr.Imm >= LSig.ParamCount) then
+          return "no parameter " + IntToStr(LInstr.Imm);
+        end;
+        if LInstr.ValueType <> LSig.ParamTypes[LInstr.Imm] then
+          return "is " + IrTypeText(LInstr.ValueType) + ", parameter " + IntToStr(LInstr.Imm) +
+            " is " + IrTypeText(LSig.ParamTypes[LInstr.Imm]);
+        end;
+        return DoCounts(LInstr, 0, 0);
+      end;
+      if LInstr.Kind = IrOp.VarargsStart then
+        if not LSig.Variadic then
+          return "varargsstart in a function that is not variadic";
+        end;
+        if LInstr.ValueType <> IrType.Pointer then
+          return "varargsstart is a ptr";
+        end;
+        return DoCounts(LInstr, 0, 0);
+      end;
+      if LInstr.Kind = IrOp.Slot then
+        if LInstr.ValueType <> IrType.Pointer then
+          return "a slot is a ptr";
+        end;
+        if LInstr.Imm <= 0 then
+          return "a slot's size must be positive";
+        end;
+        if (LInstr.Align <= 0) or ((LInstr.Align & (LInstr.Align - 1)) <> 0) then
+          return "a slot's alignment must be a power of two";
+        end;
+        return DoCounts(LInstr, 0, 0);
+      end;
+      if LInstr.Kind = IrOp.Load then
+        LText := DoCounts(LInstr, 1, 0);
+        if LText = "" then
+          LText := self.DoOperandIs(LInstr, 0, IrType.Pointer);
+        end;
+        if (LText = "") and (LInstr.ValueType = IrType.Void) then
+          LText := "a load needs a type";
+        end;
+        return LText;
+      end;
+      if LInstr.Kind = IrOp.Store then
+        LText := DoCounts(LInstr, 2, 0);
+        if LText = "" then
+          LText := self.DoOperandIs(LInstr, 0, IrType.Pointer);
+        end;
+        if (LText = "") and (LInstr.ValueType <> IrType.Void) then
+          LText := "a store has no value";
+        end;
+        return LText;
+      end;
+      if (LInstr.Kind = IrOp.Add) or (LInstr.Kind = IrOp.Sub) or (LInstr.Kind = IrOp.Mul) then
+        return self.DoOperatorShape(LInstr, 2, IsArithmeticType(LInstr.ValueType));
+      end;
+      if (LInstr.Kind = IrOp.BitAnd) or (LInstr.Kind = IrOp.BitOr) or
+        (LInstr.Kind = IrOp.BitXor) then
+        return self.DoOperatorShape(LInstr, 2, IsIntegerType(LInstr.ValueType));
+      end;
+      if LInstr.Kind = IrOp.Neg then
+        return self.DoOperatorShape(LInstr, 1, IsArithmeticType(LInstr.ValueType));
+      end;
+      if LInstr.Kind = IrOp.BitNot then
+        return self.DoOperatorShape(LInstr, 1, IsIntegerType(LInstr.ValueType));
+      end;
+      // fdiv is a float's real division (IEEE: a zero divisor gives inf or NaN, no trap), so
+      // it is its own op beside the integer divisions
+      if LInstr.Kind = IrOp.FDiv then
+        return self.DoOperatorShape(LInstr, 2, IsFloatType(LInstr.ValueType));
+      end;
+      if (LInstr.Kind = IrOp.Shl) or (LInstr.Kind = IrOp.Shr) or (LInstr.Kind = IrOp.Sar) then
+        return self.DoShiftShape(LInstr);
+      end;
+      // sdiv / srem divide int32 / int64, udiv / urem uint32 / uint64: the op names the
+      // division the machine does (the type and the op never disagree), and the language
+      // promotes every narrower operand first (BNF sec 6), so no division is narrower
+      if (LInstr.Kind = IrOp.SDiv) or (LInstr.Kind = IrOp.SRem) then
+        return self.DoOperatorShape(LInstr, 2, (LInstr.ValueType = IrType.Int32) or
+          (LInstr.ValueType = IrType.Int64));
+      end;
+      if (LInstr.Kind = IrOp.UDiv) or (LInstr.Kind = IrOp.URem) then
+        return self.DoOperatorShape(LInstr, 2, (LInstr.ValueType = IrType.UInt32) or
+          (LInstr.ValueType = IrType.UInt64));
+      end;
+      if LInstr.Kind = IrOp.Address then
+        if not self.IsData(LInstr.Link) then
+          return "d" + IntToStr(LInstr.Link) + " is no data";
+        end;
+        if LInstr.ValueType <> IrType.Pointer then
+          return "an address is a ptr";
+        end;
+        return DoCounts(LInstr, 0, 0);
+      end;
+      if LInstr.Kind = IrOp.Offset then
+        if LInstr.ValueType <> IrType.Pointer then
+          return "an offset is a ptr";
+        end;
+        LText := DoCounts(LInstr, 2, 0);
+        if LText = "" then
+          LText := self.DoOperandIs(LInstr, 0, IrType.Pointer);
+        end;
+        if LText = "" then
+          LText := self.DoOperandIs(LInstr, 1, IrType.Int64);
+        end;
+        return LText;
+      end;
+      if (LInstr.Kind = IrOp.Copy) or (LInstr.Kind = IrOp.Fill) then
+        return self.DoBytesShape(LInstr);
+      end;
+      if LInstr.Kind = IrOp.Call then
+        if not self.IsFunction(LInstr.Link) then
+          return "f" + IntToStr(LInstr.Link) + " is no function";
+        end;
+        return self.DoFitsSignature(LInstr, self.FFunctions[LInstr.Link].Signature, 0);
+      end;
+      if LInstr.Kind = IrOp.CallExternal then
+        if not self.IsExternal(LInstr.Link) then
+          return "x" + IntToStr(LInstr.Link) + " is no external";
+        end;
+        return self.DoFitsSignature(LInstr, self.FExternals[LInstr.Link].Signature, 0);
+      end;
+      if (LInstr.Kind = IrOp.CodeAddress) or (LInstr.Kind = IrOp.ImportAddress) then
+        return self.DoCodeAddressShape(LInstr);
+      end;
+      if LInstr.Kind = IrOp.CallIndirect then
+        if not self.IsSignature(LInstr.Link) then
+          return "s" + IntToStr(LInstr.Link) + " is no signature";
+        end;
+        // The target first (its count alone when there is none), then the arguments
+        if LInstr.Operands.Count = 0 then
+          return DoCounts(LInstr, 1 + self.FSignatures[LInstr.Link].ParamCount, 0);
+        end;
+        LText := self.DoOperandIs(LInstr, 0, IrType.Pointer);
+        if LText = "" then
+          LText := self.DoFitsSignature(LInstr, self.FSignatures[LInstr.Link], 1);
+        end;
+        return LText;
+      end;
+      if LInstr.Kind = IrOp.Ret then
+        if LInstr.ValueType <> IrType.Void then
+          return "a ret has no value";
+        end;
+        if LSig.ResultType = IrType.Void then
+          return DoCounts(LInstr, 0, 0);
+        end;
+        LText := DoCounts(LInstr, 1, 0);
+        if LText = "" then
+          LText := self.DoOperandIs(LInstr, 0, LSig.ResultType);
+        end;
+        return LText;
+      end;
+      if LInstr.Kind = IrOp.Jump then
+        if LInstr.ValueType <> IrType.Void then
+          return "a jump has no value";
+        end;
+        return DoCounts(LInstr, 0, 1);
+      end;
+      if LInstr.Kind = IrOp.Branch then
+        if LInstr.ValueType <> IrType.Void then
+          return "a branch has no value";
+        end;
+        LText := DoCounts(LInstr, 1, 2);
+        if LText = "" then
+          LText := self.DoOperandIs(LInstr, 0, IrType.Bool);
+        end;
+        return LText;
+      end;
+      if LInstr.Kind = IrOp.Convert then
+        return self.DoConvertShape(LInstr);
+      end;
+      if LInstr.Kind = IrOp.Compare then
+        return self.DoCompareShape(LInstr);
+      end;
+      // Phi: one operand per predecessor, each of the phi's type
+      return self.DoPhiShape(LInstr);
+    end;
+
+    // "" when the codeaddr / importaddr AInstr names a function / an external, is a ptr and
+    // has no operands, else the fault
+    hidden const method DoCodeAddressShape(const AInstr: ref IrInstr): string;
+    begin
+      if (AInstr.Kind = IrOp.CodeAddress) and (not self.IsFunction(AInstr.Link)) then
+        return "f" + IntToStr(AInstr.Link) + " is no function";
+      end;
+      if (AInstr.Kind = IrOp.ImportAddress) and (not self.IsExternal(AInstr.Link)) then
+        return "x" + IntToStr(AInstr.Link) + " is no external";
+      end;
+      if AInstr.ValueType <> IrType.Pointer then
+        return "a code address is a ptr";
+      end;
+      return DoCounts(AInstr, 0, 0);
+    end;
+
+    // "" when the operator AInstr (add, sub, mul, and, or, xor, sdiv, udiv, srem, urem:
+    // ACount 2; neg, not: 1) works on its type (AFits: the kind's type test) and has ACount
+    // operands of that type
+    hidden const method DoOperatorShape(const AInstr: ref IrInstr; const ACount: int64;
+      const AFits: bool): string;
+    var
+      LText: string;
+      LI: int64;
+    begin
+      if not AFits then
+        return "works on " + IrTypeText(AInstr.ValueType);
+      end;
+      LText := DoCounts(AInstr, ACount, 0);
+      LI := 0;
+      while (LText = "") and (LI < ACount) do
+        LText := self.DoOperandIs(AInstr, LI, AInstr.ValueType);
+        LI := LI + 1;
+      end;
+      return LText;
+    end;
+
+    // "" when the shift AInstr (shl, shr, sar) shifts a value of its integer type by a count
+    // of any integer type (a count is never converted: BNF sec 6)
+    hidden const method DoShiftShape(const AInstr: ref IrInstr): string;
+    var
+      LText: string;
+      LCount: IrType;
+    begin
+      if not IsIntegerType(AInstr.ValueType) then
+        return "works on " + IrTypeText(AInstr.ValueType);
+      end;
+      LText := DoCounts(AInstr, 2, 0);
+      if LText = "" then
+        LText := self.DoOperandIs(AInstr, 0, AInstr.ValueType);
+      end;
+      if LText <> "" then
+        return LText;
+      end;
+      LCount := self.FInstrs[AInstr.Operands[1]].ValueType;
+      if not IsIntegerType(LCount) then
+        return "shifts by " + IrTypeText(LCount);
+      end;
+      return "";
+    end;
+
+    // "" when the copy or fill AInstr is void and moves a positive byte count (Imm): a copy
+    // from a ptr (Operands[1]) to a ptr (Operands[0]), a fill at a ptr (Operands[0])
+    hidden const method DoBytesShape(const AInstr: ref IrInstr): string;
+    var
+      LText: string;
+      LCount: int64;
+    begin
+      if AInstr.ValueType <> IrType.Void then
+        return "a " + IrOpText(AInstr.Kind) + " has no value";
+      end;
+      if AInstr.Imm <= 0 then
+        return "moves " + IntToStr(AInstr.Imm) + " bytes";
+      end;
+      LCount := 1;
+      if AInstr.Kind = IrOp.Copy then
+        LCount := 2;
+      end;
+      LText := DoCounts(AInstr, LCount, 0);
+      if LText = "" then
+        LText := self.DoOperandIs(AInstr, 0, IrType.Pointer);
+      end;
+      if (LText = "") and (LCount = 2) then
+        LText := self.DoOperandIs(AInstr, 1, IrType.Pointer);
+      end;
+      return LText;
+    end;
+
+    // "" when the convert AInstr takes one value to another type: each an integer, a float
+    // or a ptr (bool only taken: a value converted to bool is a compare), a ptr never to or
+    // from a float, never one type to itself. Between an integer and a float it is C's
+    // conversion (to nearest one way, toward zero the other), between floats a rounding
+    hidden const method DoConvertShape(const AInstr: ref IrInstr): string;
+    var
+      LText: string;
+      LFrom: IrType;
+    begin
+      if (not IsConvertType(AInstr.ValueType)) or (AInstr.ValueType = IrType.Bool) then
+        return "converts to " + IrTypeText(AInstr.ValueType);
+      end;
+      LText := DoCounts(AInstr, 1, 0);
+      if LText <> "" then
+        return LText;
+      end;
+      LFrom := self.FInstrs[AInstr.Operands[0]].ValueType;
+      if not IsConvertType(LFrom) then
+        return "converts from " + IrTypeText(LFrom);
+      end;
+      if LFrom = AInstr.ValueType then
+        return "converts " + IrTypeText(LFrom) + " to itself";
+      end;
+      if ((LFrom = IrType.Pointer) and IsFloatType(AInstr.ValueType)) or
+        (IsFloatType(LFrom) and (AInstr.ValueType = IrType.Pointer)) then
+        return "converts " + IrTypeText(LFrom) + " to " + IrTypeText(AInstr.ValueType);
+      end;
+      return "";
+    end;
+
+    // "" when the compare AInstr is a bool of two operands of one integer, bool, ptr or float
+    // type, its predicate fitting that type: a float predicate on a float and only there, a
+    // signed order only on a signed integer, an unsigned order on an unsigned integer, a
+    // bool or a ptr, equality on any of those
+    hidden const method DoCompareShape(const AInstr: ref IrInstr): string;
+    var
+      LText: string;
+      LType: IrType;
+    begin
+      if AInstr.ValueType <> IrType.Bool then
+        return "a compare is a bool";
+      end;
+      LText := DoCounts(AInstr, 2, 0);
+      if LText <> "" then
+        return LText;
+      end;
+      LType := self.FInstrs[AInstr.Operands[0]].ValueType;
+      if (not IsArithmeticType(LType)) and (LType <> IrType.Bool) and
+        (LType <> IrType.Pointer) then
+        return "compares " + IrTypeText(LType);
+      end;
+      LText := self.DoOperandIs(AInstr, 1, LType);
+      if LText <> "" then
+        return LText;
+      end;
+      if IsFloatPredicate(AInstr.Predicate) <> IsFloatType(LType) then
+        return IrPredicateText(AInstr.Predicate) + " on " + IrTypeText(LType);
+      end;
+      if IsSignedPredicate(AInstr.Predicate) and (not IsSignedType(LType)) then
+        return IrPredicateText(AInstr.Predicate) + " on " + IrTypeText(LType);
+      end;
+      if IsUnsignedPredicate(AInstr.Predicate) and IsSignedType(LType) then
+        return IrPredicateText(AInstr.Predicate) + " on " + IrTypeText(LType);
+      end;
+      return "";
+    end;
+
+    // "" when the phi AInstr has one operand of its type per predecessor
+    // of its block, its targets being exactly those predecessors
+    hidden const method DoPhiShape(const AInstr: ref IrInstr): string;
+    var
+      LPreds: ref Int64List;
+      LText: string;
+      LI: int64;
+    begin
+      if AInstr.ValueType = IrType.Void then
+        return "a phi needs a type";
+      end;
+      LPreds := self.PredsOf(AInstr.Block);
+      LText := DoCounts(AInstr, LPreds.Count, LPreds.Count);
+      if LText <> "" then
+        return LText;
+      end;
+      for LI := 0 to AInstr.Targets.Count - 1 do
+        if LPreds.IndexOf(AInstr.Targets[LI]) < 0 then
+          return "b" + IntToStr(AInstr.Targets[LI]) + " is no predecessor";
+        end;
+        LText := self.DoOperandIs(AInstr, LI, AInstr.ValueType);
+        if LText <> "" then
+          return LText;
+        end;
+      end;
+      return "";
+    end;
+
+    // True when AFunction is a funclet and AOperand a slot of its parent (the one thing of
+    // another function a funclet may use: IrFunction)
+    hidden const method DoIsParentSlot(const AFunction: int64; const AOperand: int64): bool;
+    var
+      LParent: int64;
+      LInstr: ref IrInstr;
+    begin
+      LParent := self.FFunctions[AFunction].Parent;
+      if not self.IsFunction(LParent) then
+        return false;
+      end;
+      LInstr := self.FInstrs[AOperand];
+      if (LInstr.Kind <> IrOp.Slot) or (not self.IsBlock(LInstr.Block)) then
+        return false;
+      end;
+      return self.FBlocks[LInstr.Block].Owner = LParent;
+    end;
+
+    // A funclet's shape appended to AProblems: its parent a function before it (generated
+    // first: its frame is laid out when the funclet is), the signature (uint8, ptr): void,
+    // its FrameValue parameter 1 of its entry block
+    hidden const method DoVerifyFunclet(const AFunction: int64; var AProblems: StringArray);
+    var
+      LFunction: ref IrFunction;
+      LWhere: string;
+      LFrame: ref IrInstr;
+    begin
+      LFunction := self.FFunctions[AFunction];
+      LWhere := self.DoWhere(AFunction, 0, 0);
+      if (not self.IsFunction(LFunction.Parent)) or (LFunction.Parent >= AFunction) then
+        DoProblem(AProblems, LWhere + "the funclet's parent f" + IntToStr(LFunction.Parent) +
+          " is no function before it");
+      end;
+      if (LFunction.Signature.ParamCount <> 2) or (LFunction.Signature.Variadic) or
+        (LFunction.Signature.ResultType <> IrType.Void) or
+        (LFunction.Signature.ParamTypes[0] <> IrType.UInt8) or
+        (LFunction.Signature.ParamTypes[1] <> IrType.Pointer) then
+        DoProblem(AProblems, LWhere + "a funclet's signature is not (uint8, ptr): void");
+        return;
+      end;
+      if (not self.IsInstr(LFunction.FrameValue)) or (LFunction.Blocks.Count = 0) then
+        DoProblem(AProblems, LWhere + "the funclet has no frame parameter");
+        return;
+      end;
+      LFrame := self.FInstrs[LFunction.FrameValue];
+      if (LFrame.Kind <> IrOp.Parameter) or (LFrame.Imm <> 1) or
+        (LFrame.Block <> LFunction.Blocks[0]) then
+        DoProblem(AProblems, LWhere + "the funclet's frame value i" +
+          IntToStr(LFunction.FrameValue) + " is not parameter 1 of its entry block");
+      end;
+    end;
+
+    // AFunction's scopes appended to AProblems: each a run of its block positions, first
+    // to last, its handler a funclet of AFunction (a catching scope's: a function that is
+    // no funclet, its target a block position outside the run), and the module's
+    // FrameHandler a function
+    hidden const method DoVerifyScopes(const AFunction: int64; var AProblems: StringArray);
+    var
+      LFunction: ref IrFunction;
+      LWhere: string;
+      LHandler: int64;
+      LTarget: int64;
+      LI: int64;
+    begin
+      LFunction := self.FFunctions[AFunction];
+      LWhere := self.DoWhere(AFunction, 0, 0);
+      if (LFunction.ScopeCount() > 0) and (not self.IsFunction(self.FrameHandler)) then
+        DoProblem(AProblems, LWhere + "a function with scopes and no frame handler");
+      end;
+      for LI := 0 to LFunction.ScopeCount() - 1 do
+        if (LFunction.ScopeFirst(LI) < 0) or (LFunction.ScopeFirst(LI) > LFunction.ScopeLast(LI)) or
+          (LFunction.ScopeLast(LI) >= LFunction.Blocks.Count) then
+          DoProblem(AProblems, LWhere + "scope " + IntToStr(LI) + " is no run of its blocks");
+        end;
+        LHandler := LFunction.ScopeHandler(LI);
+        LTarget := LFunction.ScopeTarget(LI);
+        if LTarget < 0 then
+          if (not self.IsFunction(LHandler)) or (self.FFunctions[LHandler].Parent <> AFunction) then
+            DoProblem(AProblems, LWhere + "scope " + IntToStr(LI) + "'s handler f" +
+              IntToStr(LHandler) + " is no funclet of this function");
+          end;
+        else
+          if (not self.IsFunction(LHandler)) or (self.FFunctions[LHandler].Parent <> 0) then
+            DoProblem(AProblems, LWhere + "scope " + IntToStr(LI) + "'s filter f" +
+              IntToStr(LHandler) + " is no function of its own");
+          end;
+          if (LTarget >= LFunction.Blocks.Count) or
+            ((LTarget >= LFunction.ScopeFirst(LI)) and (LTarget <= LFunction.ScopeLast(LI))) then
+            DoProblem(AProblems, LWhere + "scope " + IntToStr(LI) + "'s target " +
+              IntToStr(LTarget) + " is no block outside its run");
+          end;
+        end;
+      end;
+    end;
+
+    // Every problem of AFunction appended to AProblems: terminators,
+    // operands, targets, dominance (a value defined before every use), shape
+    hidden const method DoVerifyFunction(const AFunction: int64; var AProblems: StringArray);
+    var
+      LBlocks: ref Int64List;
+      LCount: int64;
+      LDom: BoolArray;
+      LDefIndex: Int64Array;
+      LDefPos: Int64Array;
+      LBI: int64;
+      LPos: int64;
+      LInstrs: ref Int64List;
+      LId: int64;
+      LValid: bool;
+      LText: string;
+    begin
+      LBlocks := self.FFunctions[AFunction].Blocks;
+      LCount := LBlocks.Count;
+      if LCount = 0 then
+        DoProblem(AProblems, self.DoWhere(AFunction, 0, 0) + "the function has no blocks");
+        return;
+      end;
+      if self.FFunctions[AFunction].Parent <> 0 then
+        self.DoVerifyFunclet(AFunction, AProblems);
+      end;
+      self.DoVerifyScopes(AFunction, AProblems);
+      // Where each instruction of this function is defined: block index, position
+      setlength(LDefIndex, self.FInstrCount);
+      setlength(LDefPos, self.FInstrCount);
+      for LId := 0 to self.FInstrCount - 1 do
+        LDefIndex[LId] := -1;
+      end;
+      for LBI := 0 to LCount - 1 do
+        LInstrs := self.FBlocks[LBlocks[LBI]].Instrs;
+        for LPos := 0 to LInstrs.Count - 1 do
+          LDefIndex[LInstrs[LPos]] := LBI;
+          LDefPos[LInstrs[LPos]] := LPos;
+        end;
+      end;
+      LDom := self.DoDominators(AFunction);
+      for LBI := 0 to LCount - 1 do
+        LInstrs := self.FBlocks[LBlocks[LBI]].Instrs;
+        if LInstrs.Count = 0 then
+          DoProblem(AProblems, self.DoWhere(AFunction, LBlocks[LBI], 0) + "the block is empty");
+        end;
+        for LPos := 0 to LInstrs.Count - 1 do
+          LId := LInstrs[LPos];
+          LValid := self.DoCheckPlace(AFunction, LBlocks[LBI], LId, LPos = LInstrs.Count - 1,
+            AProblems);
+          if self.DoCheckOperands(AFunction, LId, LBI, LPos, LDom, LDefIndex, LDefPos,
+            AProblems) and LValid then
+            LText := self.DoShape(AFunction, LId);
+            if LText <> "" then
+              DoProblem(AProblems, self.DoWhere(AFunction, LBlocks[LBI], LId) + LText);
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // Checks AId's place in its block (a terminator last and only last) and
+    // that its targets are blocks of AFunction; false when a target is not
+    // (DoShape then skips it)
+    hidden const method DoCheckPlace(const AFunction: int64; const ABlock: int64;
+      const AId: int64; const AIsLast: bool; var AProblems: StringArray): bool;
+    var
+      LInstr: ref IrInstr;
+      LWhere: string;
+      LValid: bool;
+      LK: int64;
+      LTarget: int64;
+    begin
+      LInstr := self.FInstrs[AId];
+      LWhere := self.DoWhere(AFunction, ABlock, AId);
+      if IsTerminator(LInstr.Kind) and not AIsLast then
+        DoProblem(AProblems, LWhere + "a terminator before the block's end");
+      end;
+      if AIsLast and not IsTerminator(LInstr.Kind) then
+        DoProblem(AProblems, LWhere + "the block does not end in a terminator");
+      end;
+      LValid := true;
+      for LK := 0 to LInstr.Targets.Count - 1 do
+        LTarget := LInstr.Targets[LK];
+        if not self.IsBlock(LTarget) then
+          DoProblem(AProblems, LWhere + "target b" + IntToStr(LTarget) + " is no block");
+          LValid := false;
+        else
+          if self.FBlocks[LTarget].Owner <> AFunction then
+            DoProblem(AProblems, LWhere + "target b" + IntToStr(LTarget) +
+              " is a block of another function");
+            LValid := false;
+          end;
+        end;
+      end;
+      return LValid;
+    end;
+
+    // Checks AId's operands: each an instruction of AFunction that has a
+    // value and is defined before every use (a phi's operand before the end
+    // of the block it arrives from). False when an operand is no value of
+    // this function (DoShape then skips it); a dominance fault is reported
+    // and does not stop the shape check.
+    hidden const method DoCheckOperands(const AFunction: int64; const AId: int64;
+      const ABlockIndex: int64; const APos: int64; const ADom: BoolArray;
+      const ADefIndex: Int64Array; const ADefPos: Int64Array;
+      var AProblems: StringArray): bool;
+    var
+      LInstr: ref IrInstr;
+      LBlocks: ref Int64List;
+      LCount: int64;
+      LWhere: string;
+      LValid: bool;
+      LK: int64;
+      LOperand: int64;
+      LDef: int64;
+      LUse: int64;
+      LName: string;
+    begin
+      LInstr := self.FInstrs[AId];
+      LBlocks := self.FFunctions[AFunction].Blocks;
+      LCount := LBlocks.Count;
+      LWhere := self.DoWhere(AFunction, LBlocks[ABlockIndex], AId);
+      LValid := true;
+      for LK := 0 to LInstr.Operands.Count - 1 do
+        LOperand := LInstr.Operands[LK];
+        LName := "operand i" + IntToStr(LOperand);
+        if not self.IsInstr(LOperand) then
+          DoProblem(AProblems, LWhere + LName + " is no instruction");
+          LValid := false;
+        else
+          LDef := ADefIndex[LOperand];
+          if (LDef < 0) and self.DoIsParentSlot(AFunction, LOperand) then
+            // A funclet's operand in its parent's frame: defined before the funclet runs
+            skip;
+          end;
+          if LDef < 0 then
+            DoProblem(AProblems, LWhere + LName + " is not in this function");
+            LValid := false;
+          else
+            if self.FInstrs[LOperand].ValueType = IrType.Void then
+              DoProblem(AProblems, LWhere + LName + " has no value");
+              LValid := false;
+            end;
+            if LInstr.Kind = IrOp.Phi then
+              // A phi's operand must reach the end of the block it comes from
+              LUse := -1;
+              if LK < LInstr.Targets.Count then
+                LUse := LBlocks.IndexOf(LInstr.Targets[LK]);
+              end;
+              if (LUse >= 0) and not ADom[LUse * LCount + LDef] then
+                DoProblem(AProblems, LWhere + LName + " does not dominate its use");
+              end;
+            else
+              if LDef = ABlockIndex then
+                if ADefPos[LOperand] >= APos then
+                  DoProblem(AProblems, LWhere + LName + " is used before its definition");
+                end;
+              else
+                if not ADom[ABlockIndex * LCount + LDef] then
+                  DoProblem(AProblems, LWhere + LName + " does not dominate its use");
+                end;
+              end;
+            end;
+          end;
+        end;
+      end;
+      return LValid;
+    end;
+
+    // The dominator relation of AFunction's blocks, by block index: element
+    // I * Count + J is true when block J dominates block I. The iterative
+    // dataflow form: the entry is dominated by itself only; every other
+    // block by itself and by what dominates all its predecessors. A block
+    // with no predecessors (unreachable) keeps "every block", as the
+    // empty intersection.
+    hidden const method DoDominators(const AFunction: int64): BoolArray;
+    var
+      LBlocks: ref Int64List;
+      LCount: int64;
+      LDom: BoolArray;
+      LPreds: ref Int64List;
+      LChanged: bool;
+      LValue: bool;
+      LI: int64;
+      LJ: int64;
+      LK: int64;
+      LP: int64;
+    begin
+      LBlocks := self.FFunctions[AFunction].Blocks;
+      LCount := LBlocks.Count;
+      setlength(LDom, LCount * LCount);
+      for LI := 0 to LCount - 1 do
+        for LJ := 0 to LCount - 1 do
+          LDom[LI * LCount + LJ] := (LI > 0) or (LJ = 0);
+        end;
+      end;
+      LChanged := true;
+      while LChanged do
+        LChanged := false;
+        for LI := 1 to LCount - 1 do
+          LPreds := self.PredsOf(LBlocks[LI]);
+          for LJ := 0 to LCount - 1 do
+            LValue := true;
+            if LJ <> LI then
+              for LK := 0 to LPreds.Count - 1 do
+                LP := LBlocks.IndexOf(LPreds[LK]);
+                if not LDom[LP * LCount + LJ] then
+                  LValue := false;
+                end;
+              end;
+            end;
+            if LDom[LI * LCount + LJ] <> LValue then
+              LDom[LI * LCount + LJ] := LValue;
+              LChanged := true;
+            end;
+          end;
+        end;
+      end;
+      return LDom;
+    end;
+
+    // Every problem of the IR, one line each ("fname b3 i7: what"); empty
+    // when the IR is well formed
+    const method Verify(): StringArray;
+    var
+      LProblems: StringArray;
+      LF: int64;
+    begin
+      setlength(LProblems, 0);
+      for LF := 1 to self.FFunctionCount - 1 do
+        self.DoVerifyFunction(LF, LProblems);
+      end;
+      if (self.Entry <> 0) and not self.IsFunction(self.Entry) then
+        DoProblem(LProblems, "entry f" + IntToStr(self.Entry) + " is no function");
+      end;
+      return LProblems;
+    end;
+
+    // "i1, i2" (APrefix "i") for the ids in AList
+    hidden const method DoIdList(const APrefix: string; const AList: ref Int64List): string;
+    var
+      LText: string;
+      LK: int64;
+    begin
+      LText := "";
+      for LK := 0 to AList.Count - 1 do
+        if LK > 0 then
+          LText := LText + ", ";
+        end;
+        LText := LText + APrefix + IntToStr(AList[LK]);
+      end;
+      return LText;
+    end;
+
+    // "i4(i5, i6)": a calli's target, then its arguments in brackets
+    hidden const method DoCalliText(const AInstr: ref IrInstr): string;
+    var
+      LText: string;
+      LK: int64;
+    begin
+      if AInstr.Operands.Count = 0 then
+        return "()";
+      end;
+      LText := "i" + IntToStr(AInstr.Operands[0]) + "(";
+      for LK := 1 to AInstr.Operands.Count - 1 do
+        if LK > 1 then
+          LText := LText + ", ";
+        end;
+        LText := LText + "i" + IntToStr(AInstr.Operands[LK]);
+      end;
+      return LText + ")";
+    end;
+
+    // One instruction's line, as Dump writes it
+    hidden const method DoDumpInstr(const AId: int64): string;
+    var
+      LInstr: ref IrInstr;
+      LText: string;
+      LRest: string;
+      LK: int64;
+    begin
+      LInstr := self.FInstrs[AId];
+      LText := "    ";
+      if LInstr.ValueType <> IrType.Void then
+        LText := LText + "i" + IntToStr(AId) + " = ";
+      end;
+      LText := LText + IrOpText(LInstr.Kind);
+      if LInstr.ValueType <> IrType.Void then
+        LText := LText + " " + IrTypeText(LInstr.ValueType);
+      end;
+      if LInstr.Kind = IrOp.Constant then
+        return LText + " " + IntToStr(LInstr.Imm) + "\n";
+      end;
+      if LInstr.Kind = IrOp.Compare then
+        LText := LText + " " + IrPredicateText(LInstr.Predicate);
+      end;
+      if LInstr.Kind = IrOp.Parameter then
+        return LText + " #" + IntToStr(LInstr.Imm) + "\n";
+      end;
+      if LInstr.Kind = IrOp.Slot then
+        return LText + " " + IntToStr(LInstr.Imm) + " align " + IntToStr(LInstr.Align) + "\n";
+      end;
+      if LInstr.Kind = IrOp.Address then
+        return LText + " d" + IntToStr(LInstr.Link) + "\n";
+      end;
+      // "copy 12 i3, i5" / "fill 12 i3": the byte count, then the pointers
+      if (LInstr.Kind = IrOp.Copy) or (LInstr.Kind = IrOp.Fill) then
+        return LText + " " + IntToStr(LInstr.Imm) + " " + self.DoIdList("i", LInstr.Operands) +
+          "\n";
+      end;
+      if LInstr.Kind = IrOp.Call then
+        return LText + " f" + IntToStr(LInstr.Link) + "(" +
+          self.DoIdList("i", LInstr.Operands) + ")\n";
+      end;
+      if LInstr.Kind = IrOp.CallExternal then
+        return LText + " x" + IntToStr(LInstr.Link) + "(" +
+          self.DoIdList("i", LInstr.Operands) + ")\n";
+      end;
+      if LInstr.Kind = IrOp.CodeAddress then
+        return LText + " f" + IntToStr(LInstr.Link) + "\n";
+      end;
+      if LInstr.Kind = IrOp.ImportAddress then
+        return LText + " x" + IntToStr(LInstr.Link) + "\n";
+      end;
+      // "calli s1 i4(i5, i6)": the signature, the ptr called, the arguments
+      if LInstr.Kind = IrOp.CallIndirect then
+        return LText + " s" + IntToStr(LInstr.Link) + " " + self.DoCalliText(LInstr) + "\n";
+      end;
+      if LInstr.Kind = IrOp.Phi then
+        for LK := 0 to LInstr.Operands.Count - 1 do
+          if LK > 0 then
+            LText := LText + ",";
+          end;
+          LText := LText + " [i" + IntToStr(LInstr.Operands[LK]) + ", b";
+          if LK < LInstr.Targets.Count then
+            LText := LText + IntToStr(LInstr.Targets[LK]);
+          end;
+          LText := LText + "]";
+        end;
+        return LText + "\n";
+      end;
+      // The rest: operands, then targets
+      LRest := self.DoIdList("i", LInstr.Operands);
+      if (LRest <> "") and (LInstr.Targets.Count > 0) then
+        LRest := LRest + ", ";
+      end;
+      LRest := LRest + self.DoIdList("b", LInstr.Targets);
+      if LRest <> "" then
+        LText := LText + " " + LRest;
+      end;
+      return LText + "\n";
+    end;
+
+    // One data blob's line: "data d1 msg align 1: 48 69 0A" (read-only), "data d2 G
+    // internal variable align 4: 07 00 00 00", "data d3 H zeroed align 8 size 8"
+    hidden const method DoDumpData(const AId: int64): string;
+    var
+      LData: ref IrData;
+      LText: string;
+      LK: int64;
+    begin
+      LData := self.FData[AId];
+      LText := "data d" + IntToStr(AId) + " " + LData.Symbol;
+      if LData.Internal then
+        LText := LText + " internal";
+      end;
+      if LData.Kind <> IrDataKind.ReadOnly then
+        LText := LText + " " + IrDataKindText(LData.Kind);
+      end;
+      LText := LText + " align " + IntToStr(LData.Align);
+      if LData.Kind = IrDataKind.Zeroed then
+        return LText + " size " + IntToStr(LData.Size()) + "\n";
+      end;
+      LText := LText + ":";
+      for LK := 0 to LData.ByteCount - 1 do
+        LText := LText + " " + IntToHex(uint64(LData.Bytes[LK]), 2);
+      end;
+      return LText + "\n";
+    end;
+
+    // The whole IR as text: data blobs, externals, then each function with
+    // its blocks and instructions
+    const method Dump(): string;
+    var
+      LText: string;
+      LFunction: ref IrFunction;
+      LExternal: ref IrExternal;
+      LBlock: ref IrBlock;
+      LI: int64;
+      LB: int64;
+      LK: int64;
+    begin
+      LText := "";
+      for LI := 1 to self.FDataCount - 1 do
+        LText := LText + self.DoDumpData(LI);
+      end;
+      for LI := 1 to self.FExternalCount - 1 do
+        LExternal := self.FExternals[LI];
+        LText := LText + "external x" + IntToStr(LI) + " " + LExternal.Symbol +
+          LExternal.Signature.Text() + " from " + LExternal.Library + "\n";
+      end;
+      for LI := 1 to self.FSignatureCount - 1 do
+        LText := LText + "signature s" + IntToStr(LI) + " " + self.FSignatures[LI].Text() + "\n";
+      end;
+      for LI := 1 to self.FFunctionCount - 1 do
+        LFunction := self.FFunctions[LI];
+        LText := LText + "function f" + IntToStr(LI) + " " + LFunction.Symbol +
+          LFunction.Signature.Text();
+        if self.Entry = LI then
+          LText := LText + " entry";
+        end;
+        if LFunction.Internal then
+          LText := LText + " internal";
+        end;
+        // A funclet's parent and frame value; each scope: its blocks and its funclet (a
+        // catching one: its filter and its target block)
+        if LFunction.Parent <> 0 then
+          LText := LText + " funclet of f" + IntToStr(LFunction.Parent) + " frame i" +
+            IntToStr(LFunction.FrameValue);
+        end;
+        LText := LText + "\n";
+        for LK := 0 to LFunction.ScopeCount() - 1 do
+          LText := LText + "  scope b" + IntToStr(LFunction.Blocks[LFunction.ScopeFirst(LK)]) +
+            " .. b" + IntToStr(LFunction.Blocks[LFunction.ScopeLast(LK)]);
+          if LFunction.ScopeTarget(LK) < 0 then
+            LText := LText + " finally f" + IntToStr(LFunction.ScopeHandler(LK)) + "\n";
+          else
+            LText := LText + " catch f" + IntToStr(LFunction.ScopeHandler(LK)) + " at b" +
+              IntToStr(LFunction.Blocks[LFunction.ScopeTarget(LK)]) + "\n";
+          end;
+        end;
+        for LB := 0 to LFunction.Blocks.Count - 1 do
+          LBlock := self.FBlocks[LFunction.Blocks[LB]];
+          LText := LText + "  b" + IntToStr(LFunction.Blocks[LB]) + ":\n";
+          for LK := 0 to LBlock.Instrs.Count - 1 do
+            LText := LText + self.DoDumpInstr(LBlock.Instrs[LK]);
+          end;
+        end;
+      end;
+      return LText;
+    end;
+  end;
+
+end.

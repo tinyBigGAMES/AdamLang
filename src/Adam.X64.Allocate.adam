@@ -1,0 +1,785 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.X64.Allocate.adam - x86_64 register allocation at debug (DESIGN sec 5)
+
+  AllocateFunction  rewrites a selected MachineFunction (Adam.X64.Select)
+                    in place: no virtual register is left, every slot and
+                    argument area is a place off the stack pointer, the
+                    prologue and the epilogues are in, and the function
+                    holds its frame (MachineFunction.Frame) for unwind data.
+
+  The debug rule (DESIGN sec 5: every value in its stack place, live within
+  one instruction): every virtual register gets a spill slot of its own (8
+  bytes, after the function's own slots). Each instruction loads the
+  virtual registers it reads into scratch registers, runs on them, and
+  stores the ones it writes back. Scratch registers come from the ABI's
+  volatile set (so no scratch needs a save), in its order, of the virtual
+  register's class, and never one that is live across the instruction: a
+  physical register is live from where it is written to where it is read
+  (an argument register up to its call, a call's result up to its copy, a
+  parameter's register up to the entry copy, the result register up to
+  ret), found by a backward scan of each block. No physical register is
+  live into a block other than the entry (selection keeps those
+  lifetimes inside a block); one that is raises.
+
+  A callee-saved register selection writes (rdi / rsi of a rep movsb, as
+  an operand or an implicit register) is saved: the prologue pushes
+  each, in the ABI's order, before it reserves the frame, and each ret pops
+  them in reverse after the release (a callee-saved vector register written
+  raises: push saves general registers only).
+
+  The frame comes from the ABI part's frame rule (LayoutFrame): the locals
+  are the slots in order, each at its alignment; the outgoing area is the
+  largest call's; the saved registers are counted. The prologue reserves
+  AllocBytes (sub rsp, after the pushes, all marked as prologue), each ret
+  is preceded by its release (add rsp) and the pops. The bases
+  resolve to the stack pointer after the prologue: a slot at its place, the
+  incoming area at the frame's EntryBase, the outgoing area at 0.
+
+  A slot aligned above the ABI's StackAlign realigns the frame (the ABI's
+  FrameLayout.Realign): the ABI's FrameRegister is saved with the others
+  (never a scratch: it is callee-saved), the prologue ends mov frame, rsp
+  (its step) then and rsp, -Realign; the incoming area is off the frame
+  register, and each ret's release is lea rsp, [frame + AllocBytes]. The
+  ABI realigning without a slot asking for it (or the reverse) raises.
+
+  A probed frame (the ABI's FrameLayout.ProbeBytes) calls the stack probe
+  (Adam.X64.Probe) after the pushes and before the reservation: mov size,
+  ProbeBytes; call the probe (its registers its implicit writes). Neither
+  is a prologue step (they move no stack pointer and save nothing). A probe
+  register live into the function (an argument in it) raises.
+*******************************************************************************/
+
+module unit Adam.X64.Allocate;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Parts, Adam.X64.Registers,
+  Adam.X64.Machine, Adam.X64.Probe;
+
+exported const
+  // A spill slot's size and alignment: one general register, or a float64 in a vector one
+  ADAM_X64_ALLOC_SPILL_BYTES: int64 = 8;
+  // Raised (an invariant broken) by a function allocation cannot take
+  ADAM_X64_ALLOC_FAULT_TWICE: string = "X64 allocate: already allocated: ";
+  ADAM_X64_ALLOC_FAULT_NO_REGISTER: string = "X64 allocate: the arch has no register '";
+  ADAM_X64_ALLOC_FAULT_NO_SCRATCH: string = "X64 allocate: no free register for ";
+  ADAM_X64_ALLOC_FAULT_LIVE_IN: string = "X64 allocate: a register live into m";
+  ADAM_X64_ALLOC_FAULT_SAVED_VECTOR: string =
+    "X64 allocate: a callee-saved vector register written (push saves general ones only): ";
+  ADAM_X64_ALLOC_FAULT_FRAME_REGISTER: string =
+    "X64 allocate: the ABI's frame register is not a callee-saved general register: ";
+  ADAM_X64_ALLOC_FAULT_REALIGN: string =
+    "X64 allocate: the ABI's frame and the locals' alignment disagree on realigning ";
+  ADAM_X64_ALLOC_FAULT_PROBE_LIVE: string =
+    "X64 allocate: a stack probe register live into the function: ";
+
+// True for the ops that read their first operand (the others only write it, or have none;
+// a division's one operand is its divisor, read only: rax / rdx are its implicit registers;
+// test, cmp and ucomiss / ucomisd read both operands and write only the flags; push reads
+// its one operand; call reads its target: a register through a routine value)
+routine DoReadsDest(const AOp: X64Op): bool;
+begin
+  return X64OpIsCombine(AOp) or X64OpIsUnary(AOp) or X64OpIsScalarArith(AOp) or
+    (AOp = X64Op.Test) or X64OpIsDivide(AOp) or (AOp = X64Op.Cmp) or (AOp = X64Op.Push) or
+    X64OpIsFloatCompare(AOp) or (AOp = X64Op.Call);
+end;
+
+// True for the ops that write their first operand (setcc and pop write their one operand,
+// never reading it)
+routine DoWritesDest(const AOp: X64Op): bool;
+begin
+  return (AOp = X64Op.Mov) or (AOp = X64Op.MovD) or (AOp = X64Op.MovQ) or (AOp = X64Op.MovSS) or
+    (AOp = X64Op.MovSD) or (AOp = X64Op.Lea) or X64OpIsCombine(AOp) or X64OpIsUnary(AOp) or
+    X64OpIsScalarArith(AOp) or X64OpIsExtend(AOp) or (AOp = X64Op.SetCC) or (AOp = X64Op.Pop) or
+    X64OpIsFloatConvert(AOp);
+end;
+
+// AValue (0 or more) rounded up to a multiple of AAlign (1 or more)
+routine DoRoundUp(const AValue: int64; const AAlign: int64): int64;
+begin
+  return ((AValue + AAlign - 1) div AAlign) * AAlign;
+end;
+
+// The virtual register AOperand names (itself, or its memory base); -1 for none
+routine DoVRegOf(const AOperand: ref MachineOperand): int64;
+begin
+  if AOperand.Kind = OperandKind.VirtualReg then
+    return AOperand.Reg;
+  end;
+  if (AOperand.Kind = OperandKind.Memory) and (AOperand.Base = MemoryBase.Register) and
+    AOperand.BaseVirtual then
+    return AOperand.Reg;
+  end;
+  return -1;
+end;
+
+type
+  // A block's old instructions (per-register sets and spill slots are System.SysUtils'
+  // BoolArray / Int64Array)
+  InstrArray = array of ref MachineInstr;
+
+  // One function's allocation (see the header)
+  Allocator = object
+    hidden FFunction: ref MachineFunction;
+    hidden FRegisterTable: ref X64Registers;
+    hidden FAbi: ref AbiPart;
+    hidden FFrame: ref FrameLayout;
+    // The stack pointer's number, and how many registers the arch has
+    hidden FStack: int64;
+    hidden FRegisters: int64;
+    // The scratch candidates: the ABI's volatile registers by class, in its order
+    hidden FGeneral: ref Int64List;
+    hidden FVector: ref Int64List;
+    // Virtual register -> its spill slot
+    hidden FSpillOf: Int64Array;
+    // The callee-saved registers the function writes, in the ABI's order: the prologue
+    // pushes them in this order, each ret pops them in the reverse
+    hidden FSaved: ref Int64List;
+    // A realigned frame's frame register (the ABI's FrameRegister), -1 when the frame is
+    // not realigned
+    hidden FFrameReg: int64;
+
+    init(const AFunction: ref MachineFunction; const AAbi: ref AbiPart);
+    begin
+      self.FFunction := AFunction;
+      self.FRegisterTable := ref X64Registers();
+      self.FAbi := AAbi;
+      self.FFrame := nil;
+      self.FFrameReg := -1;
+      self.FStack := -1;
+      self.FRegisters := 0;
+      self.FGeneral := ref Int64List();
+      self.FVector := ref Int64List();
+      self.FSaved := ref Int64List();
+    end;
+
+    // The arch's number of the register named AName; raises for a name it lacks
+    hidden method DoPhysical(const AName: string): int64;
+    var
+      LNumber: int64;
+    begin
+      LNumber := self.FRegisterTable.NumberOf(AName);
+      if LNumber < 0 then
+        raise(ADAM_X64_ALLOC_FAULT_NO_REGISTER + AName + "'");
+      end;
+      return LNumber;
+    end;
+
+    // The stack pointer and the scratch candidates
+    hidden method DoRegisters();
+    var
+      LVolatile: StringArray;
+      LNumber: int64;
+      LI: int64;
+    begin
+      self.FStack := self.DoPhysical(ADAM_X64_STACK_POINTER);
+      self.FRegisters := self.FRegisterTable.Count();
+      LVolatile := self.FAbi.Volatile();
+      for LI := 0 to len(LVolatile) - 1 do
+        LNumber := self.DoPhysical(LVolatile[LI]);
+        if LNumber >= ADAM_X64_FIRST_XMM then
+          self.FVector.Add(LNumber);
+        else
+          self.FGeneral.Add(LNumber);
+        end;
+      end;
+    end;
+
+    // The largest alignment of the function's own slots (selection's: the spill slots come
+    // later, at 8)
+    hidden method DoSlotAlign(): int64;
+    var
+      LAlign: int64;
+      LI: int64;
+    begin
+      LAlign := 1;
+      for LI := 0 to self.FFunction.SlotCount - 1 do
+        if self.FFunction.SlotAlign(LI) > LAlign then
+          LAlign := self.FFunction.SlotAlign(LI);
+        end;
+      end;
+      return LAlign;
+    end;
+
+    // FFrameReg: the ABI's frame register when a slot is aligned above the ABI's stack
+    // alignment (the frame is realigned), else -1
+    hidden method DoFrameRegister();
+    begin
+      if self.DoSlotAlign() > self.FAbi.StackAlign() then
+        self.FFrameReg := self.DoPhysical(self.FAbi.FrameRegister());
+      end;
+    end;
+
+    // The callee-saved registers some instruction writes (an operand or an implicit
+    // register: scratch registers are volatile, so only selection's fixed registers count),
+    // and a realigned frame's frame register, into FSaved in the ABI's order; raises for a
+    // vector one (no push saves it) and for a frame register the ABI does not call saved
+    hidden method DoSavedRegisters();
+    var
+      LWritten: BoolArray;
+      LReads: BoolArray;
+      LWrites: BoolArray;
+      LCalleeSaved: StringArray;
+      LBlock: ref MachineBlock;
+      LNumber: int64;
+      LB: int64;
+      LI: int64;
+      LR: int64;
+    begin
+      setlength(LWritten, self.FRegisters);
+      for LR := 0 to self.FRegisters - 1 do
+        LWritten[LR] := false;
+      end;
+      for LB := 0 to self.FFunction.BlockCount - 1 do
+        LBlock := self.FFunction.BlockAt(LB);
+        for LI := 0 to LBlock.InstrCount - 1 do
+          self.DoAccess(LBlock.InstrAt(LI), LReads, LWrites);
+          for LR := 0 to self.FRegisters - 1 do
+            LWritten[LR] := LWritten[LR] or LWrites[LR];
+          end;
+        end;
+      end;
+      // A realigned frame writes its frame register in the prologue
+      if self.FFrameReg >= 0 then
+        if (self.FFrameReg = self.FStack) or (self.FFrameReg >= ADAM_X64_FIRST_XMM) then
+          raise(ADAM_X64_ALLOC_FAULT_FRAME_REGISTER + self.FRegisterTable.Text(self.FFrameReg));
+        end;
+        LWritten[self.FFrameReg] := true;
+      end;
+      LCalleeSaved := self.FAbi.CalleeSaved();
+      for LI := 0 to len(LCalleeSaved) - 1 do
+        LNumber := self.DoPhysical(LCalleeSaved[LI]);
+        if (LNumber <> self.FStack) and LWritten[LNumber] then
+          if LNumber >= ADAM_X64_FIRST_XMM then
+            raise(ADAM_X64_ALLOC_FAULT_SAVED_VECTOR + LCalleeSaved[LI] + " in " +
+              self.FFunction.Symbol);
+          end;
+          self.FSaved.Add(LNumber);
+        end;
+      end;
+      if (self.FFrameReg >= 0) and (self.FSaved.IndexOf(self.FFrameReg) < 0) then
+        raise(ADAM_X64_ALLOC_FAULT_FRAME_REGISTER + self.FRegisterTable.Text(self.FFrameReg));
+      end;
+    end;
+
+    // A spill slot per virtual register, every slot placed, the frame from the ABI's rule
+    hidden method DoFrame();
+    var
+      LOffsets: Int64Array;
+      LPos: int64;
+      LAlign: int64;
+      LOutgoing: int64;
+      LI: int64;
+    begin
+      setlength(self.FSpillOf, self.FFunction.VRegCount);
+      for LI := 0 to self.FFunction.VRegCount - 1 do
+        self.FSpillOf[LI] := self.FFunction.AddSlot(ADAM_X64_ALLOC_SPILL_BYTES,
+          ADAM_X64_ALLOC_SPILL_BYTES);
+      end;
+      // The locals: each slot at its alignment, in order, from 0
+      setlength(LOffsets, self.FFunction.SlotCount);
+      LPos := 0;
+      LAlign := 1;
+      for LI := 0 to self.FFunction.SlotCount - 1 do
+        LPos := DoRoundUp(LPos, self.FFunction.SlotAlign(LI));
+        LOffsets[LI] := LPos;
+        LPos := LPos + self.FFunction.SlotSize(LI);
+        if self.FFunction.SlotAlign(LI) > LAlign then
+          LAlign := self.FFunction.SlotAlign(LI);
+        end;
+      end;
+      LOutgoing := 0;
+      if self.FFunction.MakesCalls then
+        LOutgoing := self.FFunction.OutgoingBytes;
+      end;
+      self.FFrame := self.FAbi.LayoutFrame(LPos, LAlign, LOutgoing, self.FSaved.Count);
+      // The ABI realigns exactly when DoFrameRegister reserved its frame register
+      if (self.FFrame.Realign > 0) <> (self.FFrameReg >= 0) then
+        raise(ADAM_X64_ALLOC_FAULT_REALIGN + self.FFunction.Symbol);
+      end;
+      if (self.FFrameReg >= 0) and
+        (self.DoPhysical(self.FFrame.FrameRegister) <> self.FFrameReg) then
+        raise(ADAM_X64_ALLOC_FAULT_REALIGN + self.FFunction.Symbol + ": " +
+          self.FFrame.FrameRegister);
+      end;
+      for LI := 0 to self.FFunction.SlotCount - 1 do
+        self.FFunction.PlaceSlot(LI, self.FFrame.LocalBase + LOffsets[LI]);
+      end;
+    end;
+
+    // The physical registers AInstr reads into AReads and writes into AWrites (both sized to
+    // the arch's registers, cleared first)
+    hidden method DoAccess(const AInstr: ref MachineInstr; var AReads: BoolArray;
+      var AWrites: BoolArray);
+    var
+      LOperand: ref MachineOperand;
+      LI: int64;
+    begin
+      setlength(AReads, self.FRegisters);
+      setlength(AWrites, self.FRegisters);
+      for LI := 0 to self.FRegisters - 1 do
+        AReads[LI] := false;
+        AWrites[LI] := false;
+      end;
+      for LI := 0 to AInstr.OperandCount - 1 do
+        LOperand := AInstr.OperandAt(LI);
+        if LOperand.Kind = OperandKind.PhysicalReg then
+          if (LI > 0) or DoReadsDest(AInstr.Op) then
+            AReads[LOperand.Reg] := true;
+          end;
+          if (LI = 0) and DoWritesDest(AInstr.Op) then
+            AWrites[LOperand.Reg] := true;
+          end;
+        end;
+        if (LOperand.Kind = OperandKind.Memory) and (LOperand.Base = MemoryBase.Register) and
+          not LOperand.BaseVirtual then
+          AReads[LOperand.Reg] := true;
+        end;
+      end;
+      for LI := 0 to AInstr.ImplicitUses.Count - 1 do
+        AReads[AInstr.ImplicitUses[LI]] := true;
+      end;
+      for LI := 0 to AInstr.ImplicitDefs.Count - 1 do
+        AWrites[AInstr.ImplicitDefs[LI]] := true;
+      end;
+    end;
+
+    // The physical registers live into and out of each of the ACount instructions in
+    // AInstrs (element I * registers + R), by a backward scan from an empty set
+    hidden method DoLiveness(const AInstrs: InstrArray; const ACount: int64;
+      var ALiveIn: BoolArray; var ALiveOut: BoolArray);
+    var
+      LLive: BoolArray;
+      LReads: BoolArray;
+      LWrites: BoolArray;
+      LI: int64;
+      LR: int64;
+    begin
+      setlength(ALiveIn, ACount * self.FRegisters);
+      setlength(ALiveOut, ACount * self.FRegisters);
+      setlength(LLive, self.FRegisters);
+      for LR := 0 to self.FRegisters - 1 do
+        LLive[LR] := false;
+      end;
+      for LI := ACount - 1 downto 0 do
+        self.DoAccess(AInstrs[LI], LReads, LWrites);
+        for LR := 0 to self.FRegisters - 1 do
+          ALiveOut[LI * self.FRegisters + LR] := LLive[LR];
+          LLive[LR] := (LLive[LR] and not LWrites[LR]) or LReads[LR];
+          ALiveIn[LI * self.FRegisters + LR] := LLive[LR];
+        end;
+      end;
+    end;
+
+    // "v3" / "x3": virtual register AVReg as Dump names it
+    hidden method DoVRegText(const AVReg: int64): string;
+    begin
+      if self.FFunction.VRegClass(AVReg) = RegClass.Vector then
+        return "x" + IntToStr(AVReg);
+      end;
+      return "v" + IntToStr(AVReg);
+    end;
+
+    // A free scratch register of AVReg's class, marked busy in ABusy; raises when none is
+    // free (ABlock, AIndex: where, for the fault)
+    hidden method DoPickScratch(const AVReg: int64; var ABusy: BoolArray; const ABlock: int64;
+      const AIndex: int64): int64;
+    var
+      LCandidates: ref Int64List;
+      LI: int64;
+    begin
+      LCandidates := self.FGeneral;
+      if self.FFunction.VRegClass(AVReg) = RegClass.Vector then
+        LCandidates := self.FVector;
+      end;
+      for LI := 0 to LCandidates.Count - 1 do
+        if not ABusy[LCandidates[LI]] then
+          ABusy[LCandidates[LI]] := true;
+          return LCandidates[LI];
+        end;
+      end;
+      raise(ADAM_X64_ALLOC_FAULT_NO_SCRATCH + self.DoVRegText(AVReg) + " at m" + IntToStr(ABlock) +
+        " #" + IntToStr(AIndex));
+      return -1;
+    end;
+
+    // AVReg's spill slot loaded into AScratch (AStore false) or AScratch stored into it, at
+    // the end of ABlock: 8 bytes (a general register whole, a vector one's float64)
+    hidden method DoSpillMove(const ABlock: ref MachineBlock; const AStore: bool;
+      const AVReg: int64; const AScratch: int64; const ANode: int64);
+    var
+      LInstr: ref MachineInstr;
+      LSpill: ref MachineOperand;
+    begin
+      LSpill := RegisterMemory(self.FStack, false, self.FFunction.SlotOffset(self.FSpillOf[AVReg]));
+      if self.FFunction.VRegClass(AVReg) = RegClass.Vector then
+        LInstr := ref MachineInstr(X64Op.MovSD, 0, ANode);
+      else
+        LInstr := ref MachineInstr(X64Op.Mov, ADAM_X64_ALLOC_SPILL_BYTES, ANode);
+      end;
+      if AStore then
+        LInstr.AddOperand(LSpill);
+        LInstr.AddOperand(PhysicalOperand(AScratch));
+      else
+        LInstr.AddOperand(PhysicalOperand(AScratch));
+        LInstr.AddOperand(LSpill);
+      end;
+      ABlock.AddInstr(LInstr);
+    end;
+
+    // The registers a scratch carrying only a read vreg of AInstr (instruction AIndex) may
+    // not be: live into or out of it, read by it (AReads, its implicit uses included), its
+    // explicit physical destination, the stack pointer; never its implicit defs alone (they
+    // are written after its operands are read)
+    hidden method DoReadBusy(const AInstr: ref MachineInstr; const AIndex: int64;
+      const AReads: BoolArray; const ALiveIn: BoolArray; const ALiveOut: BoolArray): BoolArray;
+    var
+      LBusy: BoolArray;
+      LOperand: ref MachineOperand;
+      LI: int64;
+    begin
+      setlength(LBusy, self.FRegisters);
+      for LI := 0 to self.FRegisters - 1 do
+        LBusy[LI] := ALiveIn[AIndex * self.FRegisters + LI] or
+          ALiveOut[AIndex * self.FRegisters + LI] or AReads[LI];
+      end;
+      if (AInstr.OperandCount > 0) and DoWritesDest(AInstr.Op) then
+        LOperand := AInstr.OperandAt(0);
+        if LOperand.Kind = OperandKind.PhysicalReg then
+          LBusy[LOperand.Reg] := true;
+        end;
+      end;
+      LBusy[self.FStack] := true;
+      return LBusy;
+    end;
+
+    // True when AInstr reads virtual register AVReg (an operand it reads, or a memory base)
+    hidden method DoIsRead(const AInstr: ref MachineInstr; const AVReg: int64): bool;
+    var
+      LOperand: ref MachineOperand;
+      LI: int64;
+    begin
+      for LI := 0 to AInstr.OperandCount - 1 do
+        LOperand := AInstr.OperandAt(LI);
+        if (LOperand.Kind = OperandKind.VirtualReg) and (LOperand.Reg = AVReg) then
+          if (LI > 0) or DoReadsDest(AInstr.Op) then
+            return true;
+          end;
+        end;
+        if (LOperand.Kind = OperandKind.Memory) and (DoVRegOf(LOperand) = AVReg) then
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // True when AInstr writes virtual register AVReg (its first operand)
+    hidden method DoIsWritten(const AInstr: ref MachineInstr; const AVReg: int64): bool;
+    var
+      LOperand: ref MachineOperand;
+    begin
+      if (AInstr.OperandCount = 0) or not DoWritesDest(AInstr.Op) then
+        return false;
+      end;
+      LOperand := AInstr.OperandAt(0);
+      return (LOperand.Kind = OperandKind.VirtualReg) and (LOperand.Reg = AVReg);
+    end;
+
+    // AOperand over physical registers and the stack pointer: a virtual register (or base)
+    // is its scratch (AVRegs[i] -> AScratch[i]); a slot, the incoming and the outgoing area
+    // are places off the stack pointer after the prologue
+    hidden method DoResolve(const AOperand: ref MachineOperand; const AVRegs: ref Int64List;
+      const AScratch: ref Int64List): ref MachineOperand;
+    begin
+      if AOperand.Kind = OperandKind.VirtualReg then
+        return PhysicalOperand(AScratch[AVRegs.IndexOf(AOperand.Reg)]);
+      end;
+      if AOperand.Kind <> OperandKind.Memory then
+        return AOperand;
+      end;
+      match AOperand.Base of
+        MemoryBase.Slot:
+          return RegisterMemory(self.FStack, false,
+            self.FFunction.SlotOffset(AOperand.SlotIndex) + AOperand.Disp);
+        MemoryBase.Incoming:
+          // A realigned frame's incoming area is off its frame register (the stack pointer
+          // moved by an amount known only at run time)
+          if self.FFrameReg >= 0 then
+            return RegisterMemory(self.FFrameReg, false, self.FFrame.EntryBase + AOperand.Disp);
+          end;
+          return RegisterMemory(self.FStack, false, self.FFrame.EntryBase + AOperand.Disp);
+        MemoryBase.Outgoing:
+          return RegisterMemory(self.FStack, false, AOperand.Disp);
+        MemoryBase.Register:
+          if AOperand.BaseVirtual then
+            return RegisterMemory(AScratch[AVRegs.IndexOf(AOperand.Reg)], false, AOperand.Disp);
+          end;
+        MemoryBase.RipSymbol:
+          return AOperand;
+      end;
+      return AOperand;
+    end;
+
+    // AOp (sub in the prologue, add before a ret) of the frame's reserved bytes on the stack
+    // pointer, at the end of ABlock
+    hidden method DoStackAdjust(const ABlock: ref MachineBlock; const AOp: X64Op;
+      const APrologue: bool; const ANode: int64);
+    var
+      LInstr: ref MachineInstr;
+    begin
+      LInstr := ref MachineInstr(AOp, ADAM_X64_ALLOC_SPILL_BYTES, ANode);
+      LInstr.AddOperand(PhysicalOperand(self.FStack));
+      LInstr.AddOperand(ImmediateOperand(self.FFrame.AllocBytes));
+      LInstr.Prologue := APrologue;
+      ABlock.AddInstr(LInstr);
+    end;
+
+    // Instruction AIndex of block ABlockIndex (AInstr) at the end of ABlock over scratch
+    // registers: its reads loaded, the instruction, its writes stored. ALiveIn / ALiveOut:
+    // the block's physical liveness (see DoLiveness)
+    hidden method DoRewrite(const ABlock: ref MachineBlock; const ABlockIndex: int64;
+      const AIndex: int64; const AInstr: ref MachineInstr; const ALiveIn: BoolArray;
+      const ALiveOut: BoolArray);
+    var
+      LBusy: BoolArray;
+      LReadBusy: BoolArray;
+      LReads: BoolArray;
+      LWrites: BoolArray;
+      LVRegs: ref Int64List;
+      LScratch: ref Int64List;
+      LNew: ref MachineInstr;
+      LVReg: int64;
+      LPick: int64;
+      LI: int64;
+    begin
+      // Busy: whatever is live across it, its own physical registers, the stack pointer.
+      // Its implicit defs are written after it has read its operands (a call's volatile
+      // registers), so a scratch that only carries a read vreg may be one of them (LReadBusy:
+      // a call through a routine value reads its target from r10 / r11); a written vreg's
+      // scratch avoids them
+      self.DoAccess(AInstr, LReads, LWrites);
+      setlength(LBusy, self.FRegisters);
+      for LI := 0 to self.FRegisters - 1 do
+        LBusy[LI] := ALiveIn[AIndex * self.FRegisters + LI] or
+          ALiveOut[AIndex * self.FRegisters + LI] or LReads[LI] or LWrites[LI];
+      end;
+      LBusy[self.FStack] := true;
+      LReadBusy := self.DoReadBusy(AInstr, AIndex, LReads, ALiveIn, ALiveOut);
+      LVRegs := ref Int64List();
+      LScratch := ref Int64List();
+      for LI := 0 to AInstr.OperandCount - 1 do
+        LVReg := DoVRegOf(AInstr.OperandAt(LI));
+        if (LVReg >= 0) and (LVRegs.IndexOf(LVReg) < 0) then
+          LVRegs.Add(LVReg);
+          if self.DoIsWritten(AInstr, LVReg) then
+            LPick := self.DoPickScratch(LVReg, LBusy, ABlockIndex, AIndex);
+          else
+            LPick := self.DoPickScratch(LVReg, LReadBusy, ABlockIndex, AIndex);
+          end;
+          LBusy[LPick] := true;
+          LReadBusy[LPick] := true;
+          LScratch.Add(LPick);
+        end;
+      end;
+      for LI := 0 to LVRegs.Count - 1 do
+        if self.DoIsRead(AInstr, LVRegs[LI]) then
+          self.DoSpillMove(ABlock, false, LVRegs[LI], LScratch[LI], AInstr.Node);
+        end;
+      end;
+      LNew := ref MachineInstr(AInstr.Op, AInstr.Width, AInstr.Node);
+      LNew.Cond := AInstr.Cond;
+      LNew.ImplicitUses := AInstr.ImplicitUses;
+      LNew.ImplicitDefs := AInstr.ImplicitDefs;
+      LNew.Prologue := AInstr.Prologue;
+      for LI := 0 to AInstr.OperandCount - 1 do
+        LNew.AddOperand(self.DoResolve(AInstr.OperandAt(LI), LVRegs, LScratch));
+      end;
+      ABlock.AddInstr(LNew);
+      for LI := 0 to LVRegs.Count - 1 do
+        if self.DoIsWritten(AInstr, LVRegs[LI]) then
+          self.DoSpillMove(ABlock, true, LVRegs[LI], LScratch[LI], AInstr.Node);
+        end;
+      end;
+    end;
+
+    // Block AIndex rewritten (see the header): the prologue at the entry's start, each
+    // instruction over scratch registers, each ret after its release of the frame
+    hidden method DoBlock(const AIndex: int64);
+    var
+      LBlock: ref MachineBlock;
+      LOld: InstrArray;
+      LLiveIn: BoolArray;
+      LLiveOut: BoolArray;
+      LCount: int64;
+      LI: int64;
+      LR: int64;
+    begin
+      LBlock := self.FFunction.BlockAt(AIndex);
+      LCount := LBlock.InstrCount;
+      setlength(LOld, LCount);
+      for LI := 0 to LCount - 1 do
+        LOld[LI] := LBlock.InstrAt(LI);
+      end;
+      self.DoLiveness(LOld, LCount, LLiveIn, LLiveOut);
+      if (AIndex <> 0) and (LCount > 0) then
+        for LR := 0 to self.FRegisters - 1 do
+          if LLiveIn[LR] then
+            raise(ADAM_X64_ALLOC_FAULT_LIVE_IN + IntToStr(AIndex) + ": " + self.FRegisterTable.Text(LR));
+          end;
+        end;
+      end;
+      LBlock.Clear();
+      if AIndex = 0 then
+        // The prologue: the saves first (the frame rule's order), then a probed frame's
+        // probe, then the reservation, then a realigned frame's frame register and the
+        // rounding
+        for LR := 0 to self.FSaved.Count - 1 do
+          self.DoSaveMove(LBlock, X64Op.Push, self.FSaved[LR], true, self.FFunction.Node);
+        end;
+        if self.FFrame.ProbeBytes > 0 then
+          self.DoProbe(LBlock, LLiveIn, self.FFunction.Node);
+        end;
+        if self.FFrame.AllocBytes > 0 then
+          self.DoStackAdjust(LBlock, X64Op.Sub, true, self.FFunction.Node);
+        end;
+        if self.FFrameReg >= 0 then
+          self.DoRealign(LBlock, self.FFunction.Node);
+        end;
+      end;
+      for LI := 0 to LCount - 1 do
+        if LOld[LI].Op = X64Op.Ret then
+          // The epilogue: the prologue undone in reverse (a realigned frame releases off its
+          // frame register, the one release form unwind data allows with one)
+          if self.FFrameReg >= 0 then
+            self.DoRelease(LBlock, LOld[LI].Node);
+          end;
+          if (self.FFrameReg < 0) and (self.FFrame.AllocBytes > 0) then
+            self.DoStackAdjust(LBlock, X64Op.Add, false, LOld[LI].Node);
+          end;
+          for LR := self.FSaved.Count - 1 downto 0 do
+            self.DoSaveMove(LBlock, X64Op.Pop, self.FSaved[LR], false, LOld[LI].Node);
+          end;
+        end;
+        self.DoRewrite(LBlock, AIndex, LI, LOld[LI], LLiveIn, LLiveOut);
+      end;
+    end;
+
+    // A push (in the prologue) or a pop (before a ret) of callee-saved register AReg, at the
+    // end of ABlock
+    hidden method DoSaveMove(const ABlock: ref MachineBlock; const AOp: X64Op; const AReg: int64;
+      const APrologue: bool; const ANode: int64);
+    var
+      LInstr: ref MachineInstr;
+    begin
+      LInstr := ref MachineInstr(AOp, 0, ANode);
+      LInstr.AddOperand(PhysicalOperand(AReg));
+      LInstr.Prologue := APrologue;
+      ABlock.AddInstr(LInstr);
+    end;
+
+    // A realigned frame's end of prologue, at the end of ABlock: mov frame, rsp (a prologue
+    // instruction: the frame register's step), then and rsp, -Realign (after the prologue:
+    // unwind data reaches the frame through the frame register from here on)
+    hidden method DoRealign(const ABlock: ref MachineBlock; const ANode: int64);
+    var
+      LInstr: ref MachineInstr;
+    begin
+      LInstr := ref MachineInstr(X64Op.Mov, ADAM_X64_ALLOC_SPILL_BYTES, ANode);
+      LInstr.AddOperand(PhysicalOperand(self.FFrameReg));
+      LInstr.AddOperand(PhysicalOperand(self.FStack));
+      LInstr.Prologue := true;
+      ABlock.AddInstr(LInstr);
+      LInstr := ref MachineInstr(X64Op.BitAnd, ADAM_X64_ALLOC_SPILL_BYTES, ANode);
+      LInstr.AddOperand(PhysicalOperand(self.FStack));
+      LInstr.AddOperand(ImmediateOperand(0 - self.FFrame.Realign));
+      ABlock.AddInstr(LInstr);
+    end;
+
+    // A probed frame's probe, at the end of ABlock (after the pushes): mov size, ProbeBytes;
+    // call the probe (see the header). ALiveIn: the entry block's physical liveness (see
+    // DoLiveness); a probe register live at its first instruction raises
+    hidden method DoProbe(const ABlock: ref MachineBlock; const ALiveIn: BoolArray;
+      const ANode: int64);
+    var
+      LScratch: ref Int64List;
+      LInstr: ref MachineInstr;
+      LI: int64;
+    begin
+      LScratch := ProbeRegisters(self.FAbi, self.FRegisterTable);
+      for LI := 0 to LScratch.Count - 1 do
+        if ALiveIn[LScratch[LI]] then
+          raise(ADAM_X64_ALLOC_FAULT_PROBE_LIVE + self.FFunction.Symbol + ": " +
+            self.FRegisterTable.Text(LScratch[LI]));
+        end;
+      end;
+      LInstr := ref MachineInstr(X64Op.Mov, ADAM_X64_ALLOC_SPILL_BYTES, ANode);
+      LInstr.AddOperand(PhysicalOperand(LScratch[0]));
+      LInstr.AddOperand(ImmediateOperand(self.FFrame.ProbeBytes));
+      ABlock.AddInstr(LInstr);
+      LInstr := ref MachineInstr(X64Op.Call, 0, ANode);
+      LInstr.AddOperand(SymbolOperand(SymbolClass.Code, ADAM_X64_PROBE_SYMBOL));
+      LInstr.ImplicitUses.Add(LScratch[0]);
+      for LI := 0 to LScratch.Count - 1 do
+        LInstr.ImplicitDefs.Add(LScratch[LI]);
+      end;
+      ABlock.AddInstr(LInstr);
+      // The function calls (the probe needs no outgoing area: the frame stands as laid out)
+      self.FFunction.MakesCalls := true;
+    end;
+
+    // A realigned frame's release before a ret's pops, at the end of ABlock:
+    // lea rsp, [frame + AllocBytes] (the stack pointer as it was before the reservation)
+    hidden method DoRelease(const ABlock: ref MachineBlock; const ANode: int64);
+    var
+      LInstr: ref MachineInstr;
+    begin
+      LInstr := ref MachineInstr(X64Op.Lea, ADAM_X64_ALLOC_SPILL_BYTES, ANode);
+      LInstr.AddOperand(PhysicalOperand(self.FStack));
+      LInstr.AddOperand(RegisterMemory(self.FFrameReg, false, self.FFrame.AllocBytes));
+      ABlock.AddInstr(LInstr);
+    end;
+
+    // The function allocated (see the header)
+    method Run();
+    var
+      LI: int64;
+    begin
+      if self.FFunction.Frame <> nil then
+        raise(ADAM_X64_ALLOC_FAULT_TWICE + self.FFunction.Symbol);
+      end;
+      self.DoRegisters();
+      self.DoFrameRegister();
+      self.DoSavedRegisters();
+      self.DoFrame();
+      for LI := 0 to self.FFunction.BlockCount - 1 do
+        self.DoBlock(LI);
+      end;
+      self.FFunction.Frame := self.FFrame;
+    end;
+  end;
+
+// AFunction (selected, not yet allocated) allocated in place at debug: scratch registers
+// from AAbi's volatile set, numbered by Adam.X64.Registers, the frame by AAbi's rule (see the
+// header); raises for a function it cannot allocate and for a register AAbi names that x86_64
+// lacks
+exported routine AllocateFunction(const AFunction: ref MachineFunction; const AAbi: ref AbiPart);
+var
+  LAllocator: ref Allocator;
+begin
+  LAllocator := ref Allocator(AFunction, AAbi);
+  LAllocator.Run();
+end;
+
+end.

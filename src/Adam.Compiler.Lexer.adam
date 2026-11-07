@@ -1,0 +1,1397 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Compiler.Lexer.adam - Source bytes -> tokens (BNF sec 9)
+
+  TokenKind     what a token is: a category (identifier, directive,
+                literal, end of file, invalid) or the exact keyword or
+                symbol. KindText names each one.
+  NumberParts   what a number literal's text holds, read by ReadNumber:
+                integer or float, base, body, suffix, value, the problem
+  Token         one token: its kind, its place (embedded SourcePlace), its
+                physical byte range, its spelling (splices removed, a raw
+                string's body kept physical), an integer's value and a
+                literal's suffix
+  TokenList     the tokens of one file, EndOfFile last
+  Lexer         reads a SourceText token by token, reporting through
+                Diagnostics. Every lexical error leaves an Invalid token
+                over the bytes it covers: nothing is dropped silently.
+
+  The keywords are PaskalCPP's own, without its C++ surface (cpp, cppstart,
+  cppend), plus virtual, operator and default (BNF sec 4), and public (BNF
+  row 20: it replaces exported, which is kept until M5). The object
+  words (init, own, ref, is, as, ...) are context words: identifiers here.
+  Literals follow C++'s forms: a number is read as one pp-number (digits,
+  letters, separators, a sign after an exponent mark) and then checked,
+  so `10q` is one bad literal, never a number and a name. Escapes are not
+  decoded here (the parser's); there is no octal. A newline or a line
+  splice follows SourceText's one rule.
+*******************************************************************************/
+
+module unit Adam.Compiler.Lexer;
+
+import System.SysUtils, Adam.Core.Messages, Adam.Compiler.SourceText, Adam.Compiler.Diagnostics;
+
+exported const
+  ADAM_ERR_LEXER_001: string = "LX0001";   // a string or character literal not closed on its line
+  ADAM_ERR_LEXER_002: string = "LX0002";   // a raw string not closed
+  ADAM_ERR_LEXER_003: string = "LX0003";   // a block comment not closed
+  ADAM_ERR_LEXER_004: string = "LX0004";   // a character that starts no token
+  ADAM_ERR_LEXER_005: string = "LX0005";   // a malformed number
+  ADAM_ERR_LEXER_006: string = "LX0006";   // an integer no integer type holds
+  ADAM_ERR_LEXER_007: string = "LX0007";   // a leading 0: no octal literals
+  ADAM_ERR_LEXER_009: string = "LX0009";   // '@' with no directive name
+  ADAM_ERR_LEXER_010: string = "LX0010";   // a raw string delimiter that is invalid or too long
+  ADAM_ERR_LEXER_011: string = "LX0011";   // invalid UTF-8
+  ADAM_ERR_LEXER_201: string = "LX0201";   // warning: blanks between '\' and its newline
+  ADAM_ERR_LEXER_202: string = "LX0202";   // warning: '*' and '/' split by a splice
+  ADAM_ERR_LEXER_203: string = "LX0203";   // warning: '/*' inside a block comment
+
+  // The longest raw string delimiter, as C++
+  ADAM_LEXER_MAX_DELIMITER: int64 = 16;
+  ADAM_LEXER_INT64_MAX: uint64 = 9223372036854775807u;
+  ADAM_LEXER_UINT64_MAX: uint64 = 18446744073709551615u;
+
+// The byte value of an ASCII character
+routine DoCode(const AChar: char): int32;
+begin
+  return int32(uint8(AChar));
+end;
+
+// True for '0'..'9'
+routine DoIsDigit(const AByte: int32): bool;
+begin
+  return (AByte >= DoCode('0')) and (AByte <= DoCode('9'));
+end;
+
+// True for a byte that starts an identifier: 'A'..'Z', 'a'..'z', '_'
+routine DoIsLetter(const AByte: int32): bool;
+begin
+  if (AByte >= DoCode('a')) and (AByte <= DoCode('z')) then
+    return true;
+  end;
+  if (AByte >= DoCode('A')) and (AByte <= DoCode('Z')) then
+    return true;
+  end;
+  return AByte = DoCode('_');
+end;
+
+// True for a byte an identifier may go on with
+routine DoIsWordByte(const AByte: int32): bool;
+begin
+  return DoIsLetter(AByte) or DoIsDigit(AByte);
+end;
+
+// True for a blank: space, tab (9), LF (10), VT (11), FF (12), CR (13)
+routine DoIsBlank(const AByte: int32): bool;
+begin
+  return (AByte = DoCode(' ')) or ((AByte >= 9) and (AByte <= 13));
+end;
+
+// True for LF or CR: the bytes a newline starts with
+routine DoIsNewline(const AByte: int32): bool;
+begin
+  return (AByte = 10) or (AByte = 13);
+end;
+
+// True for 'u' or 'U'
+routine DoIsUnsignedMark(const AByte: int32): bool;
+begin
+  return (AByte = DoCode('u')) or (AByte = DoCode('U'));
+end;
+
+// The byte at AIndex of AText as 0..255; -1 past either end
+routine DoTextByte(const AText: string; const AIndex: int64): int32;
+begin
+  if (AIndex < 0) or (AIndex >= len(AText)) then
+    return -1;
+  end;
+  return int32(uint8(AText[AIndex]));
+end;
+
+// The value of AByte as a digit of ABase (2, 10 or 16); -1 when it is none
+routine DoDigitValue(const AByte: int32; const ABase: int32): int32;
+var
+  LValue: int32;
+begin
+  LValue := -1;
+  if DoIsDigit(AByte) then
+    LValue := AByte - DoCode('0');
+  else
+    if (AByte >= DoCode('a')) and (AByte <= DoCode('f')) then
+      LValue := AByte - DoCode('a') + 10;
+    else
+      if (AByte >= DoCode('A')) and (AByte <= DoCode('F')) then
+        LValue := AByte - DoCode('A') + 10;
+      end;
+    end;
+  end;
+  if LValue >= ABase then
+    return -1;
+  end;
+  return LValue;
+end;
+
+// The digits of ABase from AAt, a separator ' allowed only between two of
+// them. Returns the offset after them; ACount gets how many digits there
+// were, ABadSeparator is set when a ' stands anywhere else
+routine DoScanDigits(const AText: string; const AAt: int64; const ABase: int32;
+  var ACount: int64; var ABadSeparator: bool): int64;
+var
+  LAt: int64;
+begin
+  LAt := AAt;
+  ACount := 0;
+  while true do
+    if DoDigitValue(DoTextByte(AText, LAt), ABase) >= 0 then
+      ACount := ACount + 1;
+      LAt := LAt + 1;
+    else
+      if DoTextByte(AText, LAt) <> DoCode('\'') then
+        leave;
+      end;
+      if (ACount = 0) or (DoDigitValue(DoTextByte(AText, LAt + 1), ABase) < 0) then
+        ABadSeparator := true;
+      end;
+      LAt := LAt + 1;
+    end;
+  end;
+  return LAt;
+end;
+
+// True when AText[AFrom, ATo) holds a digit separator
+routine DoHasSeparator(const AText: string; const AFrom: int64; const ATo: int64): bool;
+var
+  LI: int64;
+begin
+  for LI := AFrom to ATo - 1 do
+    if DoTextByte(AText, LI) = DoCode('\'') then
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+// True for an integer size suffix: l L ll LL z Z
+routine DoIsSizeSuffix(const AText: string): bool;
+begin
+  return (AText = "l") or (AText = "L") or (AText = "ll") or (AText = "LL") or
+    (AText = "z") or (AText = "Z");
+end;
+
+// True for an integer suffix (BNF int suffix): none; u or U with an optional
+// size after it; a size with an optional u or U after it
+routine DoIsIntSuffix(const AText: string): bool;
+var
+  LLength: int64;
+begin
+  LLength := len(AText);
+  if LLength = 0 then
+    return true;
+  end;
+  if DoIsUnsignedMark(DoTextByte(AText, 0)) then
+    return (LLength = 1) or DoIsSizeSuffix(Substring(AText, 1, LLength - 1));
+  end;
+  if DoIsUnsignedMark(DoTextByte(AText, LLength - 1)) then
+    return DoIsSizeSuffix(Substring(AText, 0, LLength - 1));
+  end;
+  return DoIsSizeSuffix(AText);
+end;
+
+// True when an integer suffix holds u or U (the literal may be unsigned)
+routine DoHasUnsignedMark(const ASuffix: string): bool;
+begin
+  return DoIsUnsignedMark(DoTextByte(ASuffix, 0)) or
+    DoIsUnsignedMark(DoTextByte(ASuffix, len(ASuffix) - 1));
+end;
+
+// True for a float suffix Adam takes: none (float64) or f / F (float32). Adam has no
+// long double and no float16 (user 2026-11-03): l, L, f16 and F16 are refused by name
+routine DoIsFloatSuffix(const AText: string): bool;
+begin
+  return (AText = "") or (AText = "f") or (AText = "F");
+end;
+
+// True for C++23's other float suffixes: refused by name (F63), the message naming the
+// two spellings Adam has
+routine DoIsRefusedFloatSuffix(const AText: string): bool;
+begin
+  return (AText = "l") or (AText = "L") or (AText = "f16") or (AText = "F16") or
+    (AText = "f32") or (AText = "F32") or (AText = "f64") or (AText = "F64") or
+    (AText = "f128") or (AText = "F128") or (AText = "bf16") or (AText = "BF16");
+end;
+
+// AText without its leading zeros and separators: the decimal a leading-0
+// literal meant ("0" when nothing else is left)
+routine DoDropLeadingZeros(const AText: string): string;
+var
+  LAt: int64;
+begin
+  LAt := 0;
+  while (DoTextByte(AText, LAt) = DoCode('0')) or (DoTextByte(AText, LAt) = DoCode('\'')) do
+    LAt := LAt + 1;
+  end;
+  if LAt >= len(AText) then
+    return "0";
+  end;
+  return Substring(AText, LAt, len(AText) - LAt);
+end;
+
+exported type
+  // What a token is. The categories first, then the symbols, then the
+  // keywords from KwModule to KwDefault (KeywordKind walks that range)
+  TokenKind = choices(
+    EndOfFile, Invalid, Identifier, Directive,
+    IntLiteral, FloatLiteral, StringLiteral, CharLiteral,
+    LParen, RParen, LBracket, RBracket, Comma, Semicolon, Colon, Assign,
+    Dot, DotDot, Ellipsis, Caret, Question, Tilde, Bang, Arrow,
+    Plus, PlusPlus, PlusAssign, Minus, MinusMinus, MinusAssign,
+    Star, StarAssign, Slash, SlashAssign, Percent, PercentAssign,
+    Amp, AmpAmp, AmpAssign, Pipe, PipePipe, PipeAssign,
+    Equal, NotEqual, Less, LessEqual, Compare, ShiftLeft, ShiftLeftAssign,
+    Greater, GreaterEqual, ShiftRight, ShiftRightAssign,
+    KwModule, KwExe, KwDll, KwLib, KwUnit, KwImport, KwInitialize, KwFinalize,
+    KwBegin, KwEnd, KwVar, KwConst, KwType, KwRoutine, KwForward, KwMethod,
+    KwExported, KwPublic, KwClink, KwCpplink, KwExternal, KwRecord, KwObject, KwOverlay,
+    KwChoices, KwArray, KwOf, KwPtr, KwTo, KwSet, KwPacked, KwAlign,
+    KwIf, KwThen, KwElse, KwWhile, KwDo, KwFor, KwDownto, KwRepeat, KwUntil,
+    KwMatch, KwGuard, KwExcept, KwFinally, KwReturn, KwLeave, KwSkip,
+    KwOr, KwAnd, KwXor, KwNot, KwIn, KwShl, KwShr, KwDiv, KwMod, KwAddr,
+    KwTrue, KwFalse, KwNil, KwSelf, KwParent, KwVarargs, KwTest,
+    KwInt8, KwInt16, KwInt32, KwInt64, KwUint8, KwUint16, KwUint32, KwUint64,
+    KwFloat32, KwFloat64, KwBool, KwChar, KwWchar, KwString, KwWstring,
+    KwVirtual, KwOperator, KwDefault);
+
+  // What is wrong with a number literal (None: nothing)
+  NumberProblem = choices(None, NoDigits, BadDigit, BadSeparator, HexFloatSeparator,
+    NoHexExponent, NoExponentDigits, BadSuffix, RefusedSuffix, Octal, TooBigSigned,
+    TooBig);
+
+  // A number literal's text, read: integer or float, its base (2, 10, 16),
+  // its body (the text before the suffix), its suffix, an integer's value,
+  // the first problem found and, for an octal-looking one, the decimal it meant
+  NumberParts = record
+    IsFloat: bool;
+    Base: int32;
+    Body: string;
+    Suffix: string;
+    Value: uint64;
+    Problem: NumberProblem;
+    Meant: string;
+  end;
+
+// How a message or a row names AKind: a category in words, a symbol or a
+// keyword as it is written
+exported routine KindText(const AKind: TokenKind): string;
+begin
+  match AKind of
+    TokenKind.EndOfFile: return "end of file";
+    TokenKind.Invalid: return "invalid token";
+    TokenKind.Identifier: return "identifier";
+    TokenKind.Directive: return "directive";
+    TokenKind.IntLiteral: return "integer literal";
+    TokenKind.FloatLiteral: return "float literal";
+    TokenKind.StringLiteral: return "string literal";
+    TokenKind.CharLiteral: return "character literal";
+    TokenKind.LParen: return "(";
+    TokenKind.RParen: return ")";
+    TokenKind.LBracket: return "[";
+    TokenKind.RBracket: return "]";
+    TokenKind.Comma: return ",";
+    TokenKind.Semicolon: return ";";
+    TokenKind.Colon: return ":";
+    TokenKind.Assign: return ":=";
+    TokenKind.Dot: return ".";
+    TokenKind.DotDot: return "..";
+    TokenKind.Ellipsis: return "...";
+    TokenKind.Caret: return "^";
+    TokenKind.Question: return "?";
+    TokenKind.Tilde: return "~";
+    TokenKind.Bang: return "!";
+    TokenKind.Arrow: return "->";
+    TokenKind.Plus: return "+";
+    TokenKind.PlusPlus: return "++";
+    TokenKind.PlusAssign: return "+=";
+    TokenKind.Minus: return "-";
+    TokenKind.MinusMinus: return "--";
+    TokenKind.MinusAssign: return "-=";
+    TokenKind.Star: return "*";
+    TokenKind.StarAssign: return "*=";
+    TokenKind.Slash: return "/";
+    TokenKind.SlashAssign: return "/=";
+    TokenKind.Percent: return "%";
+    TokenKind.PercentAssign: return "%=";
+    TokenKind.Amp: return "&";
+    TokenKind.AmpAmp: return "&&";
+    TokenKind.AmpAssign: return "&=";
+    TokenKind.Pipe: return "|";
+    TokenKind.PipePipe: return "||";
+    TokenKind.PipeAssign: return "|=";
+    TokenKind.Equal: return "=";
+    TokenKind.NotEqual: return "<>";
+    TokenKind.Less: return "<";
+    TokenKind.LessEqual: return "<=";
+    TokenKind.Compare: return "<=>";
+    TokenKind.ShiftLeft: return "<<";
+    TokenKind.ShiftLeftAssign: return "<<=";
+    TokenKind.Greater: return ">";
+    TokenKind.GreaterEqual: return ">=";
+    TokenKind.ShiftRight: return ">>";
+    TokenKind.ShiftRightAssign: return ">>=";
+    TokenKind.KwModule: return "module";
+    TokenKind.KwExe: return "exe";
+    TokenKind.KwDll: return "dll";
+    TokenKind.KwLib: return "lib";
+    TokenKind.KwUnit: return "unit";
+    TokenKind.KwImport: return "import";
+    TokenKind.KwInitialize: return "initialize";
+    TokenKind.KwFinalize: return "finalize";
+    TokenKind.KwBegin: return "begin";
+    TokenKind.KwEnd: return "end";
+    TokenKind.KwVar: return "var";
+    TokenKind.KwConst: return "const";
+    TokenKind.KwType: return "type";
+    TokenKind.KwRoutine: return "routine";
+    TokenKind.KwForward: return "forward";
+    TokenKind.KwMethod: return "method";
+    TokenKind.KwExported: return "exported";
+    TokenKind.KwPublic: return "public";
+    TokenKind.KwClink: return "clink";
+    TokenKind.KwCpplink: return "cpplink";
+    TokenKind.KwExternal: return "external";
+    TokenKind.KwRecord: return "record";
+    TokenKind.KwObject: return "object";
+    TokenKind.KwOverlay: return "overlay";
+    TokenKind.KwChoices: return "choices";
+    TokenKind.KwArray: return "array";
+    TokenKind.KwOf: return "of";
+    TokenKind.KwPtr: return "ptr";
+    TokenKind.KwTo: return "to";
+    TokenKind.KwSet: return "set";
+    TokenKind.KwPacked: return "packed";
+    TokenKind.KwAlign: return "align";
+    TokenKind.KwIf: return "if";
+    TokenKind.KwThen: return "then";
+    TokenKind.KwElse: return "else";
+    TokenKind.KwWhile: return "while";
+    TokenKind.KwDo: return "do";
+    TokenKind.KwFor: return "for";
+    TokenKind.KwDownto: return "downto";
+    TokenKind.KwRepeat: return "repeat";
+    TokenKind.KwUntil: return "until";
+    TokenKind.KwMatch: return "match";
+    TokenKind.KwGuard: return "guard";
+    TokenKind.KwExcept: return "except";
+    TokenKind.KwFinally: return "finally";
+    TokenKind.KwReturn: return "return";
+    TokenKind.KwLeave: return "leave";
+    TokenKind.KwSkip: return "skip";
+    TokenKind.KwOr: return "or";
+    TokenKind.KwAnd: return "and";
+    TokenKind.KwXor: return "xor";
+    TokenKind.KwNot: return "not";
+    TokenKind.KwIn: return "in";
+    TokenKind.KwShl: return "shl";
+    TokenKind.KwShr: return "shr";
+    TokenKind.KwDiv: return "div";
+    TokenKind.KwMod: return "mod";
+    TokenKind.KwAddr: return "addr";
+    TokenKind.KwTrue: return "true";
+    TokenKind.KwFalse: return "false";
+    TokenKind.KwNil: return "nil";
+    TokenKind.KwSelf: return "self";
+    TokenKind.KwParent: return "parent";
+    TokenKind.KwVarargs: return "varargs";
+    TokenKind.KwTest: return "test";
+    TokenKind.KwInt8: return "int8";
+    TokenKind.KwInt16: return "int16";
+    TokenKind.KwInt32: return "int32";
+    TokenKind.KwInt64: return "int64";
+    TokenKind.KwUint8: return "uint8";
+    TokenKind.KwUint16: return "uint16";
+    TokenKind.KwUint32: return "uint32";
+    TokenKind.KwUint64: return "uint64";
+    TokenKind.KwFloat32: return "float32";
+    TokenKind.KwFloat64: return "float64";
+    TokenKind.KwBool: return "bool";
+    TokenKind.KwChar: return "char";
+    TokenKind.KwWchar: return "wchar";
+    TokenKind.KwString: return "string";
+    TokenKind.KwWstring: return "wstring";
+    TokenKind.KwVirtual: return "virtual";
+    TokenKind.KwOperator: return "operator";
+    TokenKind.KwDefault: return "default";
+  end;
+  return "";
+end;
+
+// The keyword AText spells, or Identifier. Every keyword is lowercase
+// letters and digits, so a word starting otherwise is no keyword
+exported routine KeywordKind(const AText: string): TokenKind;
+var
+  LFirst: int32;
+  LKind: TokenKind;
+begin
+  LFirst := DoTextByte(AText, 0);
+  if (LFirst < DoCode('a')) or (LFirst > DoCode('z')) then
+    return TokenKind.Identifier;
+  end;
+  for LKind := TokenKind.KwModule to TokenKind.KwDefault do
+    if KindText(LKind) = AText then
+      return LKind;
+    end;
+  end;
+  return TokenKind.Identifier;
+end;
+
+// True for the word that makes a declaration public (BNF row 20): public, and exported
+// while the compiler's own sources are also built by pcpp, which knows only exported
+// (until PLAN-SELFHOST S6z retires the pcpp copy)
+exported routine IsPublicWord(const AKind: TokenKind): bool;
+begin
+  return (AKind = TokenKind.KwPublic) or (AKind = TokenKind.KwExported);
+end;
+
+// Keeps AProblem as AParts' problem unless an earlier one is there
+routine DoNote(var AParts: NumberParts; const AProblem: NumberProblem);
+begin
+  if AParts.Problem = NumberProblem.None then
+    AParts.Problem := AProblem;
+  end;
+end;
+
+// The exponent at AAt of AText ('e' / 'p' already seen there): an optional
+// sign, then decimal digits. Returns the offset after it
+routine DoReadExponent(const AText: string; const AAt: int64; var AParts: NumberParts): int64;
+var
+  LAt: int64;
+  LCount: int64;
+  LBadSeparator: bool;
+begin
+  LAt := AAt + 1;
+  if (DoTextByte(AText, LAt) = DoCode('+')) or (DoTextByte(AText, LAt) = DoCode('-')) then
+    LAt := LAt + 1;
+  end;
+  LBadSeparator := false;
+  LAt := DoScanDigits(AText, LAt, 10, LCount, LBadSeparator);
+  if LCount = 0 then
+    DoNote(AParts, NumberProblem.NoExponentDigits);
+  end;
+  if LBadSeparator then
+    DoNote(AParts, NumberProblem.BadSeparator);
+  end;
+  return LAt;
+end;
+
+// A decimal literal from AText[0]: digits, an optional '.' and fraction,
+// an optional exponent. Returns the offset after its body
+routine DoReadDecimal(const AText: string; var AParts: NumberParts): int64;
+var
+  LAt: int64;
+  LWhole: int64;
+  LFraction: int64;
+  LBadSeparator: bool;
+begin
+  LBadSeparator := false;
+  LFraction := 0;
+  LAt := DoScanDigits(AText, 0, 10, LWhole, LBadSeparator);
+  if DoTextByte(AText, LAt) = DoCode('.') then
+    AParts.IsFloat := true;
+    LAt := DoScanDigits(AText, LAt + 1, 10, LFraction, LBadSeparator);
+  end;
+  if LWhole + LFraction = 0 then
+    DoNote(AParts, NumberProblem.NoDigits);
+  end;
+  if LBadSeparator then
+    DoNote(AParts, NumberProblem.BadSeparator);
+  end;
+  if (DoTextByte(AText, LAt) = DoCode('e')) or (DoTextByte(AText, LAt) = DoCode('E')) then
+    AParts.IsFloat := true;
+    LAt := DoReadExponent(AText, LAt, AParts);
+  end;
+  return LAt;
+end;
+
+// A hex literal after its 0x: digits, then for a hex float an optional '.'
+// and fraction and the 'p' exponent it needs. Returns the offset after its body
+routine DoReadHex(const AText: string; var AParts: NumberParts): int64;
+var
+  LAt: int64;
+  LWhole: int64;
+  LFraction: int64;
+  LBadSeparator: bool;
+  LByte: int32;
+begin
+  LBadSeparator := false;
+  LFraction := 0;
+  LAt := DoScanDigits(AText, 2, 16, LWhole, LBadSeparator);
+  LByte := DoTextByte(AText, LAt);
+  if (LByte = DoCode('.')) or (LByte = DoCode('p')) or (LByte = DoCode('P')) then
+    AParts.IsFloat := true;
+    if LByte = DoCode('.') then
+      LAt := DoScanDigits(AText, LAt + 1, 16, LFraction, LBadSeparator);
+    end;
+  end;
+  if LWhole + LFraction = 0 then
+    DoNote(AParts, NumberProblem.NoDigits);
+  end;
+  if LBadSeparator then
+    DoNote(AParts, NumberProblem.BadSeparator);
+  end;
+  if not AParts.IsFloat then
+    return LAt;
+  end;
+  // BNF hex float: hex digits with no separators, then the 'p' exponent
+  if DoHasSeparator(AText, 0, LAt) then
+    DoNote(AParts, NumberProblem.HexFloatSeparator);
+  end;
+  LByte := DoTextByte(AText, LAt);
+  if (LByte <> DoCode('p')) and (LByte <> DoCode('P')) then
+    DoNote(AParts, NumberProblem.NoHexExponent);
+    return LAt;
+  end;
+  return DoReadExponent(AText, LAt, AParts);
+end;
+
+// A binary literal after its 0b. Returns the offset after its body
+routine DoReadBinary(const AText: string; var AParts: NumberParts): int64;
+var
+  LAt: int64;
+  LCount: int64;
+  LBadSeparator: bool;
+begin
+  LBadSeparator := false;
+  LAt := DoScanDigits(AText, 2, 2, LCount, LBadSeparator);
+  if LCount = 0 then
+    DoNote(AParts, NumberProblem.NoDigits);
+  end;
+  // A decimal digit right after the binary ones (0b102) is in the wrong base
+  if DoIsDigit(DoTextByte(AText, LAt)) then
+    DoNote(AParts, NumberProblem.BadDigit);
+  end;
+  if LBadSeparator then
+    DoNote(AParts, NumberProblem.BadSeparator);
+  end;
+  return LAt;
+end;
+
+// The value of an integer's body in AParts.Base, separators skipped; TooBig
+// noted when no uint64 holds it, TooBigSigned when a decimal without u / U
+// is past int64 (C++23 [lex.icon], F19)
+routine DoReadValue(var AParts: NumberParts);
+var
+  LAt: int64;
+  LDigit: int32;
+  LBase: uint64;
+  LValue: uint64;
+begin
+  LAt := 0;
+  if AParts.Base <> 10 then
+    LAt := 2;
+  end;
+  LBase := uint64(AParts.Base);
+  LValue := 0;
+  while LAt < len(AParts.Body) do
+    LDigit := DoDigitValue(DoTextByte(AParts.Body, LAt), AParts.Base);
+    LAt := LAt + 1;
+    if LDigit < 0 then
+      skip;
+    end;
+    // LValue * LBase + LDigit past uint64 is caught before it wraps
+    if LValue > (ADAM_LEXER_UINT64_MAX - uint64(LDigit)) div LBase then
+      DoNote(AParts, NumberProblem.TooBig);
+      return;
+    end;
+    LValue := LValue * LBase + uint64(LDigit);
+  end;
+  AParts.Value := LValue;
+  if (AParts.Base = 10) and (LValue > ADAM_LEXER_INT64_MAX) and not DoHasUnsignedMark(AParts.Suffix) then
+    DoNote(AParts, NumberProblem.TooBigSigned);
+  end;
+end;
+
+// Reads a number literal's text (its splices removed) by BNF sec 9: the
+// base, the body, the suffix, an integer's value and the first problem
+exported routine ReadNumber(const AText: string): NumberParts;
+var
+  LParts: NumberParts;
+  LAt: int64;
+  LSecond: int32;
+begin
+  LParts.IsFloat := false;
+  LParts.Base := 10;
+  LParts.Body := "";
+  LParts.Suffix := "";
+  LParts.Value := 0;
+  LParts.Problem := NumberProblem.None;
+  LParts.Meant := "";
+  LSecond := DoTextByte(AText, 1);
+  if (DoTextByte(AText, 0) = DoCode('0')) and ((LSecond = DoCode('x')) or (LSecond = DoCode('X'))) then
+    LParts.Base := 16;
+    LAt := DoReadHex(AText, LParts);
+  else
+    if (DoTextByte(AText, 0) = DoCode('0')) and ((LSecond = DoCode('b')) or (LSecond = DoCode('B'))) then
+      LParts.Base := 2;
+      LAt := DoReadBinary(AText, LParts);
+    else
+      LAt := DoReadDecimal(AText, LParts);
+    end;
+  end;
+  LParts.Body := Substring(AText, 0, LAt);
+  LParts.Suffix := Substring(AText, LAt, len(AText) - LAt);
+  if LParts.IsFloat then
+    if DoIsRefusedFloatSuffix(LParts.Suffix) then
+      DoNote(LParts, NumberProblem.RefusedSuffix);
+    end;
+    if not DoIsFloatSuffix(LParts.Suffix) then
+      DoNote(LParts, NumberProblem.BadSuffix);
+    end;
+    return LParts;
+  end;
+  if not DoIsIntSuffix(LParts.Suffix) then
+    DoNote(LParts, NumberProblem.BadSuffix);
+  end;
+  // A decimal integer may not start with 0 unless it is 0 (no octal)
+  if (LParts.Base = 10) and (DoTextByte(LParts.Body, 0) = DoCode('0')) and (len(LParts.Body) > 1) then
+    LParts.Meant := DoDropLeadingZeros(LParts.Body) + LParts.Suffix;
+    DoNote(LParts, NumberProblem.Octal);
+  end;
+  if LParts.Problem = NumberProblem.None then
+    DoReadValue(LParts);
+  end;
+  return LParts;
+end;
+
+exported type
+  // One token. Its place is embedded (FileName, Line, Column read through
+  // it); [StartOffset, EndOffset) is its physical byte range in the file
+  Token = object
+    embed Place: SourcePlace;
+    hidden FKind: TokenKind;
+    hidden FStart: int64;
+    hidden FEnd: int64;
+    hidden FText: string;
+    hidden FValue: uint64;
+    hidden FSuffix: string;
+
+    // An end-of-file token with no place
+    init();
+    begin
+      self.FKind := TokenKind.EndOfFile;
+      self.FStart := 0;
+      self.FEnd := 0;
+      self.FText := "";
+      self.FValue := 0;
+      self.FSuffix := "";
+    end;
+
+    init(const AKind: TokenKind; const APlace: SourcePlace; const AStart: int64;
+      const AEnd: int64; const AText: string; const AValue: uint64; const ASuffix: string);
+    begin
+      self.Place := APlace;
+      self.FKind := AKind;
+      self.FStart := AStart;
+      self.FEnd := AEnd;
+      self.FText := AText;
+      self.FValue := AValue;
+      self.FSuffix := ASuffix;
+    end;
+
+    property Kind: TokenKind read FKind;
+    property StartOffset: int64 read FStart;
+    property EndOffset: int64 read FEnd;
+
+    // The spelling: splices removed, a raw string's body as written
+    property Text: string read FText;
+
+    // An integer literal's value (0 for any other token)
+    property IntValue: uint64 read FValue;
+
+    // A number literal's suffix as written ("" when it has none)
+    property Suffix: string read FSuffix;
+  end;
+
+  // The tokens of one file, in order, EndOfFile last
+  TokenList = object
+    hidden FItems: array of ref Token;
+
+    property Count: int64
+      read
+      begin
+        return len(self.FItems);
+      end;
+
+    // The token at AIndex (0-based)
+    property Items[AIndex: int64]: ref Token
+      read
+      begin
+        return self.FItems[AIndex];
+      end;
+      default;
+
+    // Adds a copy of AToken at the end
+    method Add(const AToken: Token);
+    var
+      LCount: int64;
+    begin
+      LCount := len(self.FItems);
+      setlength(self.FItems, LCount + 1);
+      self.FItems[LCount] := ref Token(AToken.Kind, AToken.Place, AToken.StartOffset,
+        AToken.EndOffset, AToken.Text, AToken.IntValue, AToken.Suffix);
+    end;
+
+    // Adds AToken itself at the end (shared, not copied: a filter passing a token on)
+    method AddShared(const AToken: ref Token);
+    var
+      LCount: int64;
+    begin
+      LCount := len(self.FItems);
+      setlength(self.FItems, LCount + 1);
+      self.FItems[LCount] := AToken;
+    end;
+  end;
+
+  // Reads ASource token by token from its first line (after a BOM),
+  // reporting into ADiagnostics. Next gives one token, ReadAll all of them
+  Lexer = object
+    hidden FSource: ref SourceText;
+    hidden FDiagnostics: ref Diagnostics;
+    hidden FAt: int64;
+    hidden FSpliceChecked: int64;
+
+    init(const ASource: ref SourceText; const ADiagnostics: ref Diagnostics);
+    begin
+      self.FSource := ASource;
+      self.FDiagnostics := ADiagnostics;
+      self.FAt := ASource.FirstLineStart;
+      self.FSpliceChecked := -1;
+    end;
+
+    // Reports ATemplate filled with AArgs at the place of AAt
+    hidden method DoReport(const ASeverity: Severity; const ACode: string; const AAt: int64;
+      const ATemplate: string; const AArgs: MessageArgs);
+    begin
+      self.FDiagnostics.Add(ASeverity, ACode, self.FSource.PlaceOf(AAt), ATemplate, AArgs);
+    end;
+
+    // The byte at AAt as 0..255; -1 past either end
+    hidden const method DoByte(const AAt: int64): int32;
+    begin
+      return self.FSource.ByteAt(AAt);
+    end;
+
+    // The first byte at or after AAt that begins no splice (SourceText's
+    // Logical). A splice with blanks before its newline is LX0201, once:
+    // the lexer only moves forward, so a splice already looked at is behind
+    // FSpliceChecked
+    hidden method DoLogical(const AAt: int64): int64;
+    var
+      LAt: int64;
+      LLength: int64;
+    begin
+      LAt := AAt;
+      LLength := self.FSource.SpliceLength(LAt);
+      while LLength > 0 do
+        if LAt > self.FSpliceChecked then
+          self.FSpliceChecked := LAt;
+          if self.FSource.SpliceNewlineOffset(LAt) <> LAt + 1 then
+            self.DoReport(Severity.Warning, ADAM_ERR_LEXER_201, LAt, ADAM_MSG_LEXER_SPACE_SPLICE,
+              NoArgs());
+          end;
+        end;
+        LAt := LAt + LLength;
+        LLength := self.FSource.SpliceLength(LAt);
+      end;
+      return LAt;
+    end;
+
+    // The logical byte after the one-byte character at AAt
+    hidden method DoNext(const AAt: int64): int64;
+    begin
+      return self.DoLogical(AAt + 1);
+    end;
+
+    // The length of the well-formed UTF-8 character at AAt: 1 for ASCII,
+    // 2..4 for a sequence; 0 when its bytes are not UTF-8 (a lead with no
+    // sequence, an overlong form, a surrogate, past U+10FFFF, cut short)
+    hidden const method DoUtf8Length(const AAt: int64): int64;
+    var
+      LLead: int32;
+      LLength: int64;
+      LLow: int32;
+      LHigh: int32;
+      LI: int64;
+      LByte: int32;
+    begin
+      LLead := self.DoByte(AAt);
+      if LLead < 0x80 then
+        return 1;
+      end;
+      if (LLead < 0xC2) or (LLead > 0xF4) then
+        return 0;
+      end;
+      LLength := 2;
+      if LLead >= 0xE0 then
+        LLength := 3;
+      end;
+      if LLead >= 0xF0 then
+        LLength := 4;
+      end;
+      // The second byte's range is narrower after E0, ED, F0 and F4
+      LLow := 0x80;
+      LHigh := 0xBF;
+      if LLead = 0xE0 then
+        LLow := 0xA0;
+      end;
+      if LLead = 0xED then
+        LHigh := 0x9F;
+      end;
+      if LLead = 0xF0 then
+        LLow := 0x90;
+      end;
+      if LLead = 0xF4 then
+        LHigh := 0x8F;
+      end;
+      for LI := 1 to LLength - 1 do
+        LByte := self.DoByte(AAt + LI);
+        if (LByte < LLow) or (LByte > LHigh) then
+          return 0;
+        end;
+        LLow := 0x80;
+        LHigh := 0xBF;
+      end;
+      return LLength;
+    end;
+
+    // The bytes of the character at AAt; a byte that starts no well-formed
+    // UTF-8 character is LX0011 and counts alone
+    hidden method DoCharLength(const AAt: int64): int64;
+    var
+      LLength: int64;
+    begin
+      LLength := self.DoUtf8Length(AAt);
+      if LLength = 0 then
+        self.DoReport(Severity.Error, ADAM_ERR_LEXER_011, AAt, ADAM_MSG_LEXER_BAD_UTF8,
+          NoArgs().Str(IntToHex(uint64(self.DoByte(AAt)), 2)));
+        LLength := 1;
+      end;
+      return LLength;
+    end;
+
+    // The logical offset after the character at AAt (one byte or a whole
+    // UTF-8 sequence: a splice never cuts one, '\' is ASCII)
+    hidden method DoStepChar(const AAt: int64): int64;
+    begin
+      return self.DoLogical(AAt + self.DoCharLength(AAt));
+    end;
+
+    // How a message names the character at AAt (ALength bytes): 'x' for
+    // printable ASCII, U+0007 for a control, 'é' (U+00E9) past ASCII
+    hidden const method DoCharName(const AAt: int64; const ALength: int64): string;
+    var
+      LByte: int32;
+      LText: string;
+      LIndex: int64;
+      LCode: uint32;
+    begin
+      LByte := self.DoByte(AAt);
+      if (LByte > DoCode(' ')) and (LByte < 127) then
+        return "'" + self.FSource.Slice(AAt, AAt + 1) + "'";
+      end;
+      if LByte < 0x80 then
+        return "U+" + IntToHex(uint64(LByte), 4);
+      end;
+      LText := self.FSource.Slice(AAt, AAt + ALength);
+      LIndex := 0;
+      LCode := DecodeUtf8Char(LText, LIndex);
+      return "'" + LText + "' (U+" + IntToHex(uint64(LCode), 4) + ")";
+    end;
+
+    // The token of AKind over [AStart, AEnd): its spelling taken from the
+    // source (ARawQuoteAt: a raw string's quote, -1 for none). The next
+    // token is searched from AEnd
+    hidden method DoMake(const AKind: TokenKind; const AStart: int64; const AEnd: int64;
+      const ARawQuoteAt: int64; const AValue: uint64; const ASuffix: string): Token;
+    var
+      LToken: Token(AKind, self.FSource.PlaceOf(AStart), AStart, AEnd,
+        self.FSource.Spelling(AStart, AEnd, ARawQuoteAt), AValue, ASuffix);
+    begin
+      self.FAt := AEnd;
+      return LToken;
+    end;
+
+    // Skips a line comment whose second '/' is at ASecondSlash; returns the
+    // newline that ends it (a splice continues it, as clang)
+    hidden method DoLineComment(const ASecondSlash: int64): int64;
+    var
+      LAt: int64;
+      LByte: int32;
+    begin
+      LAt := self.DoNext(ASecondSlash);
+      LByte := self.DoByte(LAt);
+      while (LByte >= 0) and not DoIsNewline(LByte) do
+        LAt := self.DoStepChar(LAt);
+        LByte := self.DoByte(LAt);
+      end;
+      return LAt;
+    end;
+
+    // Skips a block comment opened at ASlash (its '*' at AStar); returns the
+    // offset after its closing '/'. Comments do not nest: an inner opener is
+    // LX0203; a closer split by a splice still closes (LX0202); no closer
+    // is LX0003
+    hidden method DoBlockComment(const ASlash: int64; const AStar: int64): int64;
+    var
+      LAt: int64;
+      LByte: int32;
+      LNext: int64;
+    begin
+      LAt := self.DoNext(AStar);
+      while true do
+        LByte := self.DoByte(LAt);
+        if LByte < 0 then
+          self.DoReport(Severity.Error, ADAM_ERR_LEXER_003, ASlash, ADAM_MSG_LEXER_UNTERMINATED_COMMENT,
+            NoArgs());
+          return LAt;
+        end;
+        if LByte = DoCode('*') then
+          LNext := self.DoNext(LAt);
+          if self.DoByte(LNext) = DoCode('/') then
+            if LNext <> LAt + 1 then
+              self.DoReport(Severity.Warning, ADAM_ERR_LEXER_202, LAt, ADAM_MSG_LEXER_SPLIT_COMMENT_END,
+                NoArgs());
+            end;
+            return self.DoNext(LNext);
+          end;
+        end;
+        if LByte = DoCode('/') then
+          LNext := self.DoNext(LAt);
+          if self.DoByte(LNext) = DoCode('*') then
+            self.DoReport(Severity.Warning, ADAM_ERR_LEXER_203, LAt, ADAM_MSG_LEXER_NESTED_COMMENT,
+              NoArgs());
+            // Go on from the '*': it may start the closer ("/*/")
+            LAt := LNext;
+            skip;
+          end;
+        end;
+        LAt := self.DoStepChar(LAt);
+      end;
+      return LAt;
+    end;
+
+    // Skips blanks and comments from FAt; returns where the next token starts
+    hidden method DoSkipBlank(): int64;
+    var
+      LAt: int64;
+      LByte: int32;
+      LNext: int64;
+    begin
+      LAt := self.DoLogical(self.FAt);
+      while true do
+        LByte := self.DoByte(LAt);
+        if DoIsBlank(LByte) then
+          LAt := self.DoNext(LAt);
+          skip;
+        end;
+        if LByte <> DoCode('/') then
+          return LAt;
+        end;
+        LNext := self.DoNext(LAt);
+        if self.DoByte(LNext) = DoCode('/') then
+          LAt := self.DoLineComment(LNext);
+          skip;
+        end;
+        if self.DoByte(LNext) <> DoCode('*') then
+          return LAt;
+        end;
+        LAt := self.DoBlockComment(LAt, LNext);
+      end;
+      return LAt;
+    end;
+
+    // The offset of the last word byte of the word whose first byte is at AFirst
+    hidden method DoWordLast(const AFirst: int64): int64;
+    var
+      LLast: int64;
+      LNext: int64;
+    begin
+      LLast := AFirst;
+      LNext := self.DoNext(LLast);
+      while DoIsWordByte(self.DoByte(LNext)) do
+        LLast := LNext;
+        LNext := self.DoNext(LLast);
+      end;
+      return LLast;
+    end;
+
+    // A raw string R"delimiter( ... )delimiter": its 'R' at AStart, its quote
+    // at AQuote. The delimiter and body are physical (never spliced)
+    hidden method DoRawString(const AStart: int64; const AQuote: int64): Token;
+    var
+      LAt: int64;
+      LByte: int32;
+      LDelimiter: string;
+      LClose: string;
+      LLength: int64;
+    begin
+      LAt := AQuote + 1;
+      LByte := self.DoByte(LAt);
+      while LByte <> DoCode('(') do
+        if (LByte <= DoCode(' ')) or (LByte >= 127) or (LByte = DoCode(')')) or
+          (LByte = DoCode('\\')) or (LAt - AQuote - 1 >= ADAM_LEXER_MAX_DELIMITER) then
+          self.DoReport(Severity.Error, ADAM_ERR_LEXER_010, AQuote, ADAM_MSG_LEXER_BAD_DELIMITER,
+            NoArgs().Str(self.FSource.Slice(AQuote + 1, LAt)));
+          // The rest of the line goes with it: the body cannot be found
+          while (self.DoByte(LAt) >= 0) and not DoIsNewline(self.DoByte(LAt)) do
+            LAt := LAt + 1;
+          end;
+          return self.DoMake(TokenKind.Invalid, AStart, LAt, AQuote, 0, "");
+        end;
+        LAt := LAt + 1;
+        LByte := self.DoByte(LAt);
+      end;
+      LDelimiter := self.FSource.Slice(AQuote + 1, LAt);
+      LClose := ")" + LDelimiter + "\"";
+      LLength := len(LClose);
+      LAt := LAt + 1;
+      while true do
+        LByte := self.DoByte(LAt);
+        if LByte < 0 then
+          self.DoReport(Severity.Error, ADAM_ERR_LEXER_002, AStart, ADAM_MSG_LEXER_UNTERMINATED_RAW,
+            NoArgs().Str(LDelimiter));
+          return self.DoMake(TokenKind.Invalid, AStart, LAt, AQuote, 0, "");
+        end;
+        if (LByte = DoCode(')')) and (self.FSource.Slice(LAt, LAt + LLength) = LClose) then
+          return self.DoMake(TokenKind.StringLiteral, AStart, LAt + LLength, AQuote, 0, "");
+        end;
+        LAt := LAt + self.DoCharLength(LAt);
+      end;
+      return self.DoMake(TokenKind.Invalid, AStart, LAt, AQuote, 0, "");
+    end;
+
+    // An identifier or keyword from AStart; R right before '"' opens a raw
+    // string (Adam has no other string prefix)
+    hidden method DoWord(const AStart: int64): Token;
+    var
+      LLast: int64;
+      LNext: int64;
+      LText: string;
+    begin
+      LLast := self.DoWordLast(AStart);
+      LNext := self.DoNext(LLast);
+      LText := self.FSource.Spelling(AStart, LLast + 1, -1);
+      if (LText = "R") and (self.DoByte(LNext) = DoCode('"')) then
+        return self.DoRawString(AStart, LNext);
+      end;
+      return self.DoMake(KeywordKind(LText), AStart, LLast + 1, -1, 0, "");
+    end;
+
+    // A directive: '@' and a name right after it (LX0009 without one)
+    hidden method DoDirective(const AStart: int64): Token;
+    var
+      LNext: int64;
+    begin
+      LNext := self.DoNext(AStart);
+      if not DoIsLetter(self.DoByte(LNext)) then
+        self.DoReport(Severity.Error, ADAM_ERR_LEXER_009, AStart, ADAM_MSG_LEXER_NO_DIRECTIVE, NoArgs());
+        return self.DoMake(TokenKind.Invalid, AStart, AStart + 1, -1, 0, "");
+      end;
+      return self.DoMake(TokenKind.Directive, AStart, self.DoWordLast(LNext) + 1, -1, 0, "");
+    end;
+
+    // A quoted literal of AKind from its opening AQuote at AStart: escapes
+    // are skipped whole (the parser decodes them); a newline or the end of
+    // the file before the closing quote is LX0001 (ATemplate)
+    hidden method DoQuoted(const AStart: int64; const AQuote: int32; const AKind: TokenKind;
+      const ATemplate: string): Token;
+    var
+      LAt: int64;
+      LByte: int32;
+    begin
+      LAt := self.DoNext(AStart);
+      while true do
+        LByte := self.DoByte(LAt);
+        if (LByte < 0) or DoIsNewline(LByte) then
+          self.DoReport(Severity.Error, ADAM_ERR_LEXER_001, AStart, ATemplate, NoArgs());
+          return self.DoMake(TokenKind.Invalid, AStart, LAt, -1, 0, "");
+        end;
+        if LByte = AQuote then
+          return self.DoMake(AKind, AStart, LAt + 1, -1, 0, "");
+        end;
+        if LByte = DoCode('\\') then
+          LAt := self.DoNext(LAt);
+          LByte := self.DoByte(LAt);
+          if (LByte < 0) or DoIsNewline(LByte) then
+            skip;
+          end;
+        end;
+        LAt := self.DoStepChar(LAt);
+      end;
+      return self.DoMake(TokenKind.Invalid, AStart, LAt, -1, 0, "");
+    end;
+
+    // Reports what is wrong with the number ANumber (its text) by AParts
+    hidden method DoNumberProblem(const AStart: int64; const ANumber: string;
+      const AParts: NumberParts);
+    var
+      LArgs: MessageArgs;
+    begin
+      LArgs := NoArgs().Str(ANumber);
+      match AParts.Problem of
+        NumberProblem.None:
+          return;
+        NumberProblem.NoDigits:
+          self.DoReport(Severity.Error, ADAM_ERR_LEXER_005, AStart, ADAM_MSG_LEXER_NO_DIGITS, LArgs);
+        NumberProblem.BadDigit:
+          self.DoReport(Severity.Error, ADAM_ERR_LEXER_005, AStart, ADAM_MSG_LEXER_BAD_DIGIT, LArgs);
+        NumberProblem.BadSeparator:
+          self.DoReport(Severity.Error, ADAM_ERR_LEXER_005, AStart, ADAM_MSG_LEXER_BAD_SEPARATOR, LArgs);
+        NumberProblem.HexFloatSeparator:
+          self.DoReport(Severity.Error, ADAM_ERR_LEXER_005, AStart, ADAM_MSG_LEXER_HEX_FLOAT_SEPARATOR,
+            LArgs);
+        NumberProblem.NoHexExponent:
+          self.DoReport(Severity.Error, ADAM_ERR_LEXER_005, AStart, ADAM_MSG_LEXER_NO_HEX_EXPONENT, LArgs);
+        NumberProblem.NoExponentDigits:
+          self.DoReport(Severity.Error, ADAM_ERR_LEXER_005, AStart, ADAM_MSG_LEXER_NO_EXPONENT_DIGITS,
+            LArgs);
+        NumberProblem.BadSuffix:
+          self.DoReport(Severity.Error, ADAM_ERR_LEXER_005, AStart, ADAM_MSG_LEXER_BAD_SUFFIX,
+            NoArgs().Str(AParts.Suffix).Str(AParts.Body));
+        NumberProblem.RefusedSuffix:
+          self.DoReport(Severity.Error, ADAM_ERR_LEXER_005, AStart, ADAM_MSG_LEXER_REFUSED_SUFFIX,
+            NoArgs().Str(AParts.Suffix).Str(AParts.Body).Str(AParts.Body));
+        NumberProblem.Octal:
+          self.DoReport(Severity.Error, ADAM_ERR_LEXER_007, AStart, ADAM_MSG_LEXER_OCTAL,
+            LArgs.Str(AParts.Meant));
+        NumberProblem.TooBigSigned:
+          self.DoReport(Severity.Error, ADAM_ERR_LEXER_006, AStart, ADAM_MSG_LEXER_TOO_BIG_SIGNED,
+            LArgs.Str(AParts.Body + AParts.Suffix + "u"));
+        NumberProblem.TooBig:
+          self.DoReport(Severity.Error, ADAM_ERR_LEXER_006, AStart, ADAM_MSG_LEXER_TOO_BIG, LArgs);
+      end;
+    end;
+
+    // A number from AStart, read as one pp-number (C++ [lex.ppnumber]):
+    // digits, letters, '_', a '.' that does not start '..', a separator '
+    // before a word byte, a sign after e E p P. Then ReadNumber checks it
+    hidden method DoNumber(const AStart: int64): Token;
+    var
+      LLast: int64;
+      LNext: int64;
+      LByte: int32;
+      LPrev: int32;
+      LTake: bool;
+      LText: string;
+      LParts: NumberParts;
+    begin
+      LLast := AStart;
+      LNext := self.DoNext(LLast);
+      while true do
+        LPrev := self.DoByte(LLast);
+        LByte := self.DoByte(LNext);
+        LTake := DoIsWordByte(LByte);
+        if LByte = DoCode('.') then
+          LTake := self.DoByte(self.DoNext(LNext)) <> DoCode('.');
+        end;
+        if LByte = DoCode('\'') then
+          LTake := DoIsWordByte(self.DoByte(self.DoNext(LNext)));
+        end;
+        if (LByte = DoCode('+')) or (LByte = DoCode('-')) then
+          LTake := (LPrev = DoCode('e')) or (LPrev = DoCode('E')) or (LPrev = DoCode('p')) or
+            (LPrev = DoCode('P'));
+        end;
+        if not LTake then
+          leave;
+        end;
+        LLast := LNext;
+        LNext := self.DoNext(LLast);
+      end;
+      LText := self.FSource.Spelling(AStart, LLast + 1, -1);
+      LParts := ReadNumber(LText);
+      if LParts.Problem <> NumberProblem.None then
+        self.DoNumberProblem(AStart, LText, LParts);
+        return self.DoMake(TokenKind.Invalid, AStart, LLast + 1, -1, 0, "");
+      end;
+      if LParts.IsFloat then
+        return self.DoMake(TokenKind.FloatLiteral, AStart, LLast + 1, -1, 0, LParts.Suffix);
+      end;
+      return self.DoMake(TokenKind.IntLiteral, AStart, LLast + 1, -1, LParts.Value, LParts.Suffix);
+    end;
+
+    // A byte past ASCII outside a literal or comment: no token starts with
+    // one (LX0004), or it is not UTF-8 (LX0011)
+    hidden method DoStray(const AStart: int64): Token;
+    var
+      LLength: int64;
+    begin
+      LLength := self.DoUtf8Length(AStart);
+      if LLength = 0 then
+        self.DoReport(Severity.Error, ADAM_ERR_LEXER_011, AStart, ADAM_MSG_LEXER_BAD_UTF8,
+          NoArgs().Str(IntToHex(uint64(self.DoByte(AStart)), 2)));
+        LLength := 1;
+      else
+        self.DoReport(Severity.Error, ADAM_ERR_LEXER_004, AStart, ADAM_MSG_LEXER_BAD_CHARACTER,
+          NoArgs().Str(self.DoCharName(AStart, LLength)));
+      end;
+      return self.DoMake(TokenKind.Invalid, AStart, AStart + LLength, -1, 0, "");
+    end;
+
+    // ALong when the logical byte after ALast is AWanted (ALast then moves
+    // onto it), else AShort
+    hidden method DoPair(var ALast: int64; const AWanted: char; const ALong: TokenKind;
+      const AShort: TokenKind): TokenKind;
+    var
+      LNext: int64;
+    begin
+      LNext := self.DoNext(ALast);
+      if self.DoByte(LNext) <> DoCode(AWanted) then
+        return AShort;
+      end;
+      ALast := LNext;
+      return ALong;
+    end;
+
+    // A symbol from AStart, the longest that matches; a byte no token starts
+    // with is LX0004
+    hidden method DoSymbol(const AStart: int64): Token;
+    var
+      LLast: int64;
+      LKind: TokenKind;
+    begin
+      LLast := AStart;
+      LKind := TokenKind.Invalid;
+      match char(uint8(self.DoByte(AStart))) of
+        '(': LKind := TokenKind.LParen;
+        ')': LKind := TokenKind.RParen;
+        '[': LKind := TokenKind.LBracket;
+        ']': LKind := TokenKind.RBracket;
+        ',': LKind := TokenKind.Comma;
+        ';': LKind := TokenKind.Semicolon;
+        '^': LKind := TokenKind.Caret;
+        '?': LKind := TokenKind.Question;
+        '~': LKind := TokenKind.Tilde;
+        '!': LKind := TokenKind.Bang;
+        '=': LKind := TokenKind.Equal;
+        ':': LKind := self.DoPair(LLast, '=', TokenKind.Assign, TokenKind.Colon);
+        '*': LKind := self.DoPair(LLast, '=', TokenKind.StarAssign, TokenKind.Star);
+        '/': LKind := self.DoPair(LLast, '=', TokenKind.SlashAssign, TokenKind.Slash);
+        '%': LKind := self.DoPair(LLast, '=', TokenKind.PercentAssign, TokenKind.Percent);
+        '.':
+          LKind := self.DoPair(LLast, '.', TokenKind.DotDot, TokenKind.Dot);
+          if LKind = TokenKind.DotDot then
+            LKind := self.DoPair(LLast, '.', TokenKind.Ellipsis, TokenKind.DotDot);
+          end;
+        '+':
+          LKind := self.DoPair(LLast, '+', TokenKind.PlusPlus, TokenKind.Plus);
+          if LKind = TokenKind.Plus then
+            LKind := self.DoPair(LLast, '=', TokenKind.PlusAssign, TokenKind.Plus);
+          end;
+        '-':
+          LKind := self.DoPair(LLast, '-', TokenKind.MinusMinus, TokenKind.Minus);
+          if LKind = TokenKind.Minus then
+            LKind := self.DoPair(LLast, '=', TokenKind.MinusAssign, TokenKind.Minus);
+          end;
+          if LKind = TokenKind.Minus then
+            LKind := self.DoPair(LLast, '>', TokenKind.Arrow, TokenKind.Minus);
+          end;
+        '&':
+          LKind := self.DoPair(LLast, '&', TokenKind.AmpAmp, TokenKind.Amp);
+          if LKind = TokenKind.Amp then
+            LKind := self.DoPair(LLast, '=', TokenKind.AmpAssign, TokenKind.Amp);
+          end;
+        '|':
+          LKind := self.DoPair(LLast, '|', TokenKind.PipePipe, TokenKind.Pipe);
+          if LKind = TokenKind.Pipe then
+            LKind := self.DoPair(LLast, '=', TokenKind.PipeAssign, TokenKind.Pipe);
+          end;
+        '<':
+          LKind := self.DoPair(LLast, '<', TokenKind.ShiftLeft, TokenKind.Less);
+          if LKind = TokenKind.ShiftLeft then
+            LKind := self.DoPair(LLast, '=', TokenKind.ShiftLeftAssign, TokenKind.ShiftLeft);
+          end;
+          if LKind = TokenKind.Less then
+            LKind := self.DoPair(LLast, '>', TokenKind.NotEqual, TokenKind.Less);
+          end;
+          if LKind = TokenKind.Less then
+            LKind := self.DoPair(LLast, '=', TokenKind.LessEqual, TokenKind.Less);
+          end;
+          if LKind = TokenKind.LessEqual then
+            LKind := self.DoPair(LLast, '>', TokenKind.Compare, TokenKind.LessEqual);
+          end;
+        '>':
+          LKind := self.DoPair(LLast, '>', TokenKind.ShiftRight, TokenKind.Greater);
+          if LKind = TokenKind.ShiftRight then
+            LKind := self.DoPair(LLast, '=', TokenKind.ShiftRightAssign, TokenKind.ShiftRight);
+          end;
+          if LKind = TokenKind.Greater then
+            LKind := self.DoPair(LLast, '=', TokenKind.GreaterEqual, TokenKind.Greater);
+          end;
+      else
+        self.DoReport(Severity.Error, ADAM_ERR_LEXER_004, AStart, ADAM_MSG_LEXER_BAD_CHARACTER,
+          NoArgs().Str(self.DoCharName(AStart, 1)));
+      end;
+      return self.DoMake(LKind, AStart, LLast + 1, -1, 0, "");
+    end;
+
+    // The next token; EndOfFile at the end, and again on every later call
+    method Next(): Token;
+    var
+      LStart: int64;
+      LByte: int32;
+    begin
+      LStart := self.DoSkipBlank();
+      LByte := self.DoByte(LStart);
+      if LByte < 0 then
+        return self.DoMake(TokenKind.EndOfFile, LStart, LStart, -1, 0, "");
+      end;
+      if DoIsLetter(LByte) then
+        return self.DoWord(LStart);
+      end;
+      if DoIsDigit(LByte) then
+        return self.DoNumber(LStart);
+      end;
+      if (LByte = DoCode('.')) and DoIsDigit(self.DoByte(self.DoNext(LStart))) then
+        return self.DoNumber(LStart);
+      end;
+      if LByte = DoCode('"') then
+        return self.DoQuoted(LStart, LByte, TokenKind.StringLiteral, ADAM_MSG_LEXER_UNTERMINATED_STRING);
+      end;
+      if LByte = DoCode('\'') then
+        return self.DoQuoted(LStart, LByte, TokenKind.CharLiteral, ADAM_MSG_LEXER_UNTERMINATED_CHAR);
+      end;
+      if LByte = DoCode('@') then
+        return self.DoDirective(LStart);
+      end;
+      if LByte >= 0x80 then
+        return self.DoStray(LStart);
+      end;
+      return self.DoSymbol(LStart);
+    end;
+
+    // Every token to the end of the file, EndOfFile last
+    method ReadAll(): TokenList;
+    var
+      LList: TokenList;
+      LToken: Token;
+    begin
+      repeat
+        LToken := self.Next();
+        LList.Add(LToken);
+      until LToken.Kind = TokenKind.EndOfFile;
+      return LList;
+    end;
+  end;
+
+end.

@@ -1,0 +1,1266 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Compiler.Folding.adam - the value of every constant expression, written
+  into its ResolvedConst (used by Semantics as it types the tree)
+
+  ConstantFolder.Fold folds one expression whose type is known and whose
+  operands are folded already (the typing walk calls it bottom-up, so every
+  fit check above it reads the value): literals (a float literal read once, as
+  clang reads it, to float32 for the f suffix), a const's or a choice value's
+  name, unary and binary operators, comparisons, casts (T(x) and a cast call),
+  size(T) (Adam.Compiler.Layout), a conditional with a constant condition.
+  FoldDeclaration gives a const its value in its declared type; NumberChoices
+  numbers a choices type's values (an explicit value, else one past the one
+  before, the first 0).
+
+  The arithmetic is C++23's on this target: an operand converts to the
+  operator's type first; unsigned results wrap; a signed result that does not
+  fit is SM0256, as is a finite float that overflows to inf; div / mod / '/'
+  by zero SM0257; the lowest value div / mod -1 SM0258; a shift count outside
+  0..bits-1 SM0259; << wraps and >> of a negative value is arithmetic. A float
+  operation is done in float64 and rounded once to float32 when that is its
+  type (exact: 53 >= 2 * 24 + 2). PaskalCPP's numbers and words.
+*******************************************************************************/
+
+module unit Adam.Compiler.Folding;
+
+import System.SysUtils, Adam.Core.Messages, Adam.Target, Adam.Compiler.SourceText,
+  Adam.Compiler.Diagnostics, Adam.Compiler.AST, Adam.Compiler.Types, Adam.Compiler.Layout;
+
+exported const
+  ADAM_ERR_FOLDING_202: string = "SM0202";   // a choice value that is no constant
+  ADAM_ERR_FOLDING_256: string = "SM0256";   // a constant that overflows its type
+  ADAM_ERR_FOLDING_257: string = "SM0257";   // div / mod / '/' by zero
+  ADAM_ERR_FOLDING_258: string = "SM0258";   // the lowest value div / mod -1
+  ADAM_ERR_FOLDING_259: string = "SM0259";   // a shift count outside 0..bits-1
+
+  // The largest float32, the point halfway above it (a value there or past rounds to inf)
+  // and the largest float64
+  ADAM_FOLDING_FLOAT32_MAX: float64 = 3.4028234663852886e38;
+  ADAM_FOLDING_FLOAT32_HALF: float64 = 3.4028235677973366e38;
+  ADAM_FOLDING_FLOAT64_MAX: float64 = 1.7976931348623157e308;
+
+type
+  // An integer constant as a sign and a magnitude (the lowest int64 too): the fold
+  // computes in this form, so no step overflows
+  FoldedInt = record
+    Negative: bool;
+    Magnitude: uint64;
+  end;
+
+  // A float64 and its bits
+  FoldBits = overlay
+    Value: float64;
+    Bits: uint64;
+  end;
+
+// True when an integer of magnitude AMagnitude is exact in a float with an ABits-bit
+// mantissa (24 / 53): its significant bits, after its trailing zero bits, fit
+exported routine FitsMantissa(const AMagnitude: uint64; const ABits: int64): bool;
+var
+  LValue: uint64;
+begin
+  LValue := AMagnitude;
+  while (LValue <> 0) and ((LValue & 1) = 0) do
+    LValue := LValue shr uint64(1);
+  end;
+  return LValue < (uint64(1) shl uint64(ABits));
+end;
+
+// True when AValue is a NaN
+routine DoIsNan(const AValue: float64): bool;
+begin
+  return AValue <> AValue;
+end;
+
+// The magnitude of AValue
+routine DoAbs(const AValue: float64): float64;
+begin
+  if AValue < 0.0 then
+    return -AValue;
+  end;
+  return AValue;
+end;
+
+// inf, or -inf when ANegative
+routine DoInfinity(const ANegative: bool): float64;
+var
+  LBits: FoldBits;
+begin
+  LBits.Bits := 0x7FF0000000000000;
+  if ANegative then
+    LBits.Bits := 0xFFF0000000000000;
+  end;
+  return LBits.Value;
+end;
+
+// True when float32 holds the float64 AValue exactly (an infinity is exact, a NaN never; a
+// finite value past float32's range is not, checked before any conversion)
+exported routine FloatFitsSingle(const AValue: float64): bool;
+var
+  LAbs: float64;
+begin
+  if DoIsNan(AValue) then
+    return false;
+  end;
+  LAbs := DoAbs(AValue);
+  if LAbs > ADAM_FOLDING_FLOAT64_MAX then
+    return true;
+  end;
+  if LAbs > ADAM_FOLDING_FLOAT32_MAX then
+    return false;
+  end;
+  return float64(float32(AValue)) = AValue;
+end;
+
+// AValue rounded to float32, held in a float64: past the largest float32 it is that
+// largest value below the halfway point and inf from there on (no conversion out of range)
+exported routine RoundToSingle(const AValue: float64): float64;
+var
+  LAbs: float64;
+begin
+  if DoIsNan(AValue) then
+    return AValue;
+  end;
+  LAbs := DoAbs(AValue);
+  if LAbs >= ADAM_FOLDING_FLOAT32_HALF then
+    return DoInfinity(AValue < 0.0);
+  end;
+  if LAbs > ADAM_FOLDING_FLOAT32_MAX then
+    if AValue < 0.0 then
+      return -ADAM_FOLDING_FLOAT32_MAX;
+    end;
+    return ADAM_FOLDING_FLOAT32_MAX;
+  end;
+  return float64(float32(AValue));
+end;
+
+// The integer ANegative / AMagnitude (zero is never negative)
+routine DoInt(const ANegative: bool; const AMagnitude: uint64): FoldedInt;
+var
+  LValue: FoldedInt;
+begin
+  LValue.Negative := ANegative and (AMagnitude <> 0);
+  LValue.Magnitude := AMagnitude;
+  return LValue;
+end;
+
+// AValue's 64-bit two's complement bits
+routine DoBitsOf(const AValue: FoldedInt): uint64;
+begin
+  if AValue.Negative then
+    return (~AValue.Magnitude) + 1;
+  end;
+  return AValue.Magnitude;
+end;
+
+// The low AWidth bits set (all 64 for 64)
+routine DoMask(const AWidth: int64): uint64;
+begin
+  if AWidth >= 64 then
+    return 0xFFFFFFFFFFFFFFFFu;
+  end;
+  return (uint64(1) shl uint64(AWidth)) - 1;
+end;
+
+// The integer the low AWidth bits of ABits are, read signed (two's complement) when ASigned
+routine DoFromBits(const ABits: uint64; const AWidth: int64; const ASigned: bool): FoldedInt;
+var
+  LBits: uint64;
+begin
+  LBits := ABits & DoMask(AWidth);
+  if ASigned and (((LBits shr uint64(AWidth - 1)) & 1) = 1) then
+    return DoInt(true, ((~LBits) + 1) & DoMask(AWidth));
+  end;
+  return DoInt(false, LBits);
+end;
+
+// AFirst + ASecond into AResult; false when the magnitude passes 64 bits
+routine DoAddInt(const AFirst: FoldedInt; const ASecond: FoldedInt; var AResult: FoldedInt): bool;
+begin
+  if AFirst.Negative = ASecond.Negative then
+    if AFirst.Magnitude > 0xFFFFFFFFFFFFFFFFu - ASecond.Magnitude then
+      return false;
+    end;
+    AResult := DoInt(AFirst.Negative, AFirst.Magnitude + ASecond.Magnitude);
+    return true;
+  end;
+  if AFirst.Magnitude >= ASecond.Magnitude then
+    AResult := DoInt(AFirst.Negative, AFirst.Magnitude - ASecond.Magnitude);
+  else
+    AResult := DoInt(ASecond.Negative, ASecond.Magnitude - AFirst.Magnitude);
+  end;
+  return true;
+end;
+
+// -AValue
+routine DoNegateInt(const AValue: FoldedInt): FoldedInt;
+begin
+  return DoInt(not AValue.Negative, AValue.Magnitude);
+end;
+
+// AFirst * ASecond into AResult; false when the magnitude passes 64 bits
+routine DoMulInt(const AFirst: FoldedInt; const ASecond: FoldedInt; var AResult: FoldedInt): bool;
+begin
+  if (AFirst.Magnitude <> 0) and (ASecond.Magnitude > 0xFFFFFFFFFFFFFFFFu div AFirst.Magnitude) then
+    return false;
+  end;
+  AResult := DoInt(AFirst.Negative <> ASecond.Negative, AFirst.Magnitude * ASecond.Magnitude);
+  return true;
+end;
+
+// -1, 0 or 1 as AFirst is below, equal to or above ASecond
+routine DoOrderInt(const AFirst: FoldedInt; const ASecond: FoldedInt): int32;
+begin
+  if AFirst.Negative <> ASecond.Negative then
+    if AFirst.Negative then
+      return -1;
+    end;
+    return 1;
+  end;
+  if AFirst.Magnitude = ASecond.Magnitude then
+    return 0;
+  end;
+  if (AFirst.Magnitude < ASecond.Magnitude) <> AFirst.Negative then
+    return -1;
+  end;
+  return 1;
+end;
+
+// -1, 0 or 1 as AFirst is below, equal to or above ASecond (no NaN)
+routine DoOrderFloat(const AFirst: float64; const ASecond: float64): int32;
+begin
+  if AFirst < ASecond then
+    return -1;
+  end;
+  if AFirst > ASecond then
+    return 1;
+  end;
+  return 0;
+end;
+
+// AValue as a float64, rounded once to float32 when ASingle (C++'s integer conversion)
+routine DoIntToFloat(const AValue: FoldedInt; const ASingle: bool): float64;
+var
+  LValue: float64;
+begin
+  if ASingle then
+    LValue := float64(float32(AValue.Magnitude));
+  else
+    LValue := float64(AValue.Magnitude);
+  end;
+  if AValue.Negative then
+    return -LValue;
+  end;
+  return LValue;
+end;
+
+// The truth of the float AValue as C converts a float to bool (`x != 0`): 1 unless it is
+// +0.0 or -0.0, so 0.5 and a NaN are 1
+routine DoFloatTruth(const AValue: float64): uint64;
+begin
+  if AValue <> 0.0 then
+    return 1;
+  end;
+  return 0;
+end;
+
+// The float AValue truncated toward zero into AResult; false for a NaN or a magnitude
+// at or past 2^64
+routine DoFloatToInt(const AValue: float64; var AResult: FoldedInt): bool;
+var
+  LAbs: float64;
+begin
+  if DoIsNan(AValue) then
+    return false;
+  end;
+  LAbs := DoAbs(AValue);
+  if LAbs >= 18446744073709551616.0 then
+    return false;
+  end;
+  AResult := DoInt(AValue < 0.0, uint64(LAbs));
+  return true;
+end;
+
+exported type
+  // The folds of one tree (see the unit header): every result into the node's
+  // ResolvedConst, every fault reported once at the node it is about
+  ConstantFolder = object
+    hidden FTree: ref SyntaxTree;
+    hidden FTarget: ref Target;
+    hidden FDiagnostics: ref Diagnostics;
+
+    // ATarget answers size(T); nil (no target picked) leaves size(T) unfolded
+    init(const ATree: ref SyntaxTree; const ATarget: ref Target;
+      const ADiagnostics: ref Diagnostics);
+    begin
+      self.FTree := ATree;
+      self.FTarget := ATarget;
+      self.FDiagnostics := ADiagnostics;
+    end;
+
+    // Error ACode at AId's place
+    hidden method DoError(const AId: int64; const ACode: string; const ATemplate: string;
+      const AArgs: MessageArgs);
+    begin
+      self.FDiagnostics.Add(Severity.Error, ACode, self.FTree[AId].Place, ATemplate, AArgs);
+    end;
+
+    // AType as a message writes it
+    hidden const method DoText(const AType: int64): string;
+    begin
+      return TypeText(self.FTree, AType);
+    end;
+
+    // The class of AType
+    hidden const method DoClass(const AType: int64): TypeClass;
+    begin
+      return ClassOf(self.FTree, AType);
+    end;
+
+    // The bits an integer-like value of AType has (an integer's width, a char's and a wchar's
+    // as the target lays them out (CharTypeBits), bool 8, a choices value 64)
+    hidden const method DoWidth(const AType: int64): int64;
+    var
+      LClass: TypeClass;
+    begin
+      LClass := self.DoClass(AType);
+      if IsIntegerClass(LClass) then
+        return IntBits(self.FTree, AType);
+      end;
+      if (LClass = TypeClass.Char) or (LClass = TypeClass.WideChar) then
+        return CharTypeBits(self.FTree, self.FTarget, AType);
+      end;
+      if LClass = TypeClass.Boolean then
+        return 8;
+      end;
+      return 64;
+    end;
+
+    // True when values of the integer-like AType are signed (a signed integer, a choices
+    // value, a char or wchar where the target says so: IsCharTypeSigned)
+    hidden const method DoSigned(const AType: int64): bool;
+    var
+      LClass: TypeClass;
+    begin
+      LClass := self.DoClass(AType);
+      if (LClass = TypeClass.Char) or (LClass = TypeClass.WideChar) then
+        return IsCharTypeSigned(self.FTree, self.FTarget, AType);
+      end;
+      return (LClass = TypeClass.SignedInt) or (LClass = TypeClass.ChoicesType);
+    end;
+
+    // AValue converted to the integer-like AType as C++ converts: its low bits, read as the
+    // type reads them
+    hidden const method DoWrapInto(const AType: int64; const AValue: FoldedInt): FoldedInt;
+    begin
+      return DoFromBits(DoBitsOf(AValue), self.DoWidth(AType), self.DoSigned(AType));
+    end;
+
+    // The constant the integer-like AValue of AType is (Boolean, Char, Unsigned or Signed
+    // by the type's class)
+    hidden const method DoIntConst(const AType: int64; const AValue: FoldedInt): ConstValue;
+    var
+      LConst: ConstValue;
+      LClass: TypeClass;
+    begin
+      LConst.Kind := ConstKind.Signed;
+      LConst.Bits := DoBitsOf(AValue);
+      LConst.Float := 0.0;
+      LConst.Text := "";
+      LClass := self.DoClass(AType);
+      if LClass = TypeClass.Boolean then
+        LConst.Kind := ConstKind.Boolean;
+        LConst.Bits := 0;
+        if AValue.Magnitude <> 0 then
+          LConst.Bits := 1;
+        end;
+      end;
+      if (LClass = TypeClass.Char) or (LClass = TypeClass.WideChar) then
+        LConst.Kind := ConstKind.Char;
+        LConst.Bits := LConst.Bits & DoMask(self.DoWidth(AType));
+      end;
+      if LClass = TypeClass.UnsignedInt then
+        LConst.Kind := ConstKind.Unsigned;
+        LConst.Bits := LConst.Bits & DoMask(self.DoWidth(AType));
+      end;
+      return LConst;
+    end;
+
+    // The float constant AValue
+    hidden const method DoFloatConst(const AValue: float64): ConstValue;
+    var
+      LConst: ConstValue;
+    begin
+      LConst.Kind := ConstKind.Float;
+      LConst.Bits := 0;
+      LConst.Float := AValue;
+      LConst.Text := "";
+      return LConst;
+    end;
+
+    // The folded constant of AId (Unknown for 0)
+    hidden const method DoConstOf(const AId: int64): ConstValue;
+    var
+      LConst: ConstValue;
+    begin
+      if AId = 0 then
+        LConst.Kind := ConstKind.Unknown;
+        LConst.Bits := 0;
+        LConst.Float := 0.0;
+        LConst.Text := "";
+        return LConst;
+      end;
+      return self.FTree[AId].ResolvedConst;
+    end;
+
+    // The integer the constant AConst of type AType is (a char read as its type reads it);
+    // false when it is no integer-like constant
+    hidden const method DoIntValue(const AConst: ConstValue; const AType: int64; var AValue: FoldedInt): bool;
+    begin
+      match AConst.Kind of
+        ConstKind.Signed:
+          AValue := DoFromBits(AConst.Bits, 64, true);
+          return true;
+        ConstKind.Unsigned, ConstKind.Boolean:
+          AValue := DoInt(false, AConst.Bits);
+          return true;
+        ConstKind.Char:
+          AValue := DoFromBits(AConst.Bits, self.DoWidth(AType), self.DoSigned(AType));
+          return true;
+      else
+        // no other constant is an integer
+      end;
+      return false;
+    end;
+
+    // The integer the folded AId is (see DoIntValue)
+    hidden const method DoIntOf(const AId: int64; var AValue: FoldedInt): bool;
+    begin
+      return self.DoIntValue(self.DoConstOf(AId), self.FTree[AId].ResolvedType, AValue);
+    end;
+
+    // The float the folded AId is: a float constant, or an integer one converted (to
+    // float32 when ASingle); false for any other
+    hidden const method DoFloatOf(const AId: int64; const ASingle: bool; var AValue: float64): bool;
+    var
+      LConst: ConstValue;
+      LInt: FoldedInt;
+    begin
+      LConst := self.DoConstOf(AId);
+      if LConst.Kind = ConstKind.Float then
+        AValue := LConst.Float;
+        return true;
+      end;
+      if self.DoIntValue(LConst, self.FTree[AId].ResolvedType, LInt) then
+        AValue := DoIntToFloat(LInt, ASingle);
+        return true;
+      end;
+      return false;
+    end;
+
+    // The constant AConst converted to AType where its value lands (a float into float32,
+    // an integer into a float, an integer into another integer-like type); else as it is
+    hidden const method DoConvertConst(const AConst: ConstValue; const AFrom: int64;
+      const AType: int64): ConstValue;
+    var
+      LClass: TypeClass;
+      LInt: FoldedInt;
+      LSingle: bool;
+    begin
+      LClass := self.DoClass(AType);
+      if LClass = TypeClass.Float then
+        LSingle := FloatBits(self.FTree, AType) = 32;
+        if AConst.Kind = ConstKind.Float then
+          if LSingle then
+            return self.DoFloatConst(RoundToSingle(AConst.Float));
+          end;
+          return AConst;
+        end;
+        if self.DoIntValue(AConst, AFrom, LInt) then
+          return self.DoFloatConst(DoIntToFloat(LInt, LSingle));
+        end;
+        return AConst;
+      end;
+      if (IsIntegerClass(LClass) or (LClass = TypeClass.Char) or (LClass = TypeClass.WideChar) or
+        (LClass = TypeClass.Boolean) or (LClass = TypeClass.ChoicesType)) and
+        self.DoIntValue(AConst, AFrom, LInt) then
+        return self.DoIntConst(AType, self.DoWrapInto(AType, LInt));
+      end;
+      return AConst;
+    end;
+
+    // AConst written as AId's constant
+    hidden method DoSet(const AId: int64; const AConst: ConstValue);
+    begin
+      self.FTree[AId].ResolvedConst := AConst;
+    end;
+
+    // The bool constant AValue written as AId's
+    hidden method DoSetBool(const AId: int64; const AValue: bool);
+    var
+      LConst: ConstValue;
+    begin
+      LConst.Kind := ConstKind.Boolean;
+      LConst.Bits := 0;
+      if AValue then
+        LConst.Bits := 1;
+      end;
+      LConst.Float := 0.0;
+      LConst.Text := "";
+      self.DoSet(AId, LConst);
+    end;
+
+    // SM0256 at AId: its constant overflows AType
+    hidden method DoOverflow(const AId: int64; const AType: int64);
+    begin
+      self.DoError(AId, ADAM_ERR_FOLDING_256, ADAM_MSG_FOLDING_OVERFLOW, NoArgs().Str(self.DoText(AType)));
+    end;
+
+    // The signed result AValue of AId's operation in AType: written when the type holds it,
+    // else SM0256
+    hidden method DoSignedResult(const AId: int64; const AType: int64; const AValue: FoldedInt);
+    begin
+      if not IntFits(self.FTree, AType, AValue.Negative, AValue.Magnitude) then
+        self.DoOverflow(AId, AType);
+        return;
+      end;
+      self.DoSet(AId, self.DoIntConst(AType, AValue));
+    end;
+
+    // The float result AValue of AId's operation in AType (rounded to float32 when that is
+    // its type): a finite operation that overflows to inf is SM0256
+    hidden method DoFloatResult(const AId: int64; const AType: int64; const AValue: float64);
+    var
+      LValue: float64;
+    begin
+      LValue := AValue;
+      if FloatBits(self.FTree, AType) = 32 then
+        LValue := RoundToSingle(AValue);
+      end;
+      if (not DoIsNan(LValue)) and (DoAbs(LValue) > ADAM_FOLDING_FLOAT64_MAX) then
+        self.DoOverflow(AId, AType);
+        return;
+      end;
+      self.DoSet(AId, self.DoFloatConst(LValue));
+    end;
+
+    // A float literal AId: its text read once, as clang reads it, to float32 for the f
+    // suffix; a finite literal past its type's range is SM0256 (a malformed one was the
+    // lexer's)
+    hidden method DoFloatLiteral(const AId: int64; const AType: int64);
+    var
+      LText: string;
+      LSuffix: string;
+      LValue: float64;
+      LOk: bool;
+    begin
+      LText := self.FTree[AId].Text;
+      LSuffix := self.FTree[AId].Suffix;
+      if (LSuffix <> "") and EndsStr(LSuffix, LText) then
+        LText := Substring(LText, 0, len(LText) - len(LSuffix));
+      end;
+      LValue := 0.0;
+      if FloatBits(self.FTree, AType) = 32 then
+        LOk := TryStrToFloat32(LText, LValue);
+      else
+        LOk := TryStrToFloat(LText, LValue);
+      end;
+      if not LOk then
+        return;
+      end;
+      if DoAbs(LValue) > ADAM_FOLDING_FLOAT64_MAX then
+        self.DoOverflow(AId, AType);
+        return;
+      end;
+      self.DoSet(AId, self.DoFloatConst(LValue));
+    end;
+
+    // A literal AId of type AType: its value
+    hidden method DoLiteral(const AId: int64; const AType: int64);
+    var
+      LConst: ConstValue;
+    begin
+      LConst.Kind := ConstKind.Unknown;
+      LConst.Bits := 0;
+      LConst.Float := 0.0;
+      LConst.Text := "";
+      match self.FTree[AId].Kind of
+        NodeKind.IntLiteral:
+          self.DoSet(AId, self.DoIntConst(AType, DoInt(false, self.FTree[AId].IntValue)));
+          return;
+        NodeKind.FloatLiteral:
+          self.DoFloatLiteral(AId, AType);
+          return;
+        NodeKind.BoolLiteral:
+          self.DoSetBool(AId, self.FTree[AId].Text = "true");
+          return;
+        NodeKind.CharLiteral:
+          LConst.Kind := ConstKind.Char;
+          LConst.Bits := self.FTree[AId].IntValue;
+        NodeKind.StringLiteral:
+          LConst.Kind := ConstKind.String;
+          LConst.Text := self.FTree[AId].Decoded;
+        NodeKind.NilLiteral:
+          LConst.Kind := ConstKind.Nil;
+      else
+        // no other kind is a literal
+      end;
+      self.DoSet(AId, LConst);
+    end;
+
+    // A name or member AId naming a const or a choice value: that declaration's value
+    hidden method DoName(const AId: int64);
+    var
+      LDecl: int64;
+      LKind: NodeKind;
+    begin
+      LDecl := self.FTree[AId].ResolvedDecl;
+      if LDecl = 0 then
+        return;
+      end;
+      LKind := self.FTree[LDecl].Kind;
+      if (LKind = NodeKind.ConstDecl) or (LKind = NodeKind.ChoiceValue) then
+        self.DoSet(AId, self.FTree[LDecl].ResolvedConst);
+      end;
+    end;
+
+    // A unary operator AId of type AType over a folded operand
+    hidden method DoUnary(const AId: int64; const AType: int64);
+    var
+      LOperand: int64;
+      LOp: OperatorKind;
+      LConst: ConstValue;
+      LInt: FoldedInt;
+      LWidth: int64;
+    begin
+      LOperand := self.FTree.FirstOf(AId, NodeRole.Operand);
+      LOp := self.FTree[AId].Op;
+      LConst := self.DoConstOf(LOperand);
+      if LConst.Kind = ConstKind.Unknown then
+        return;
+      end;
+      if LOp = OperatorKind.LogicalNot then
+        if LConst.Kind = ConstKind.Boolean then
+          self.DoSetBool(AId, LConst.Bits = 0);
+        end;
+        return;
+      end;
+      if LConst.Kind = ConstKind.Float then
+        if LOp = OperatorKind.Negate then
+          self.DoSet(AId, self.DoFloatConst(-LConst.Float));
+        end;
+        if LOp = OperatorKind.Plus then
+          self.DoSet(AId, LConst);
+        end;
+        return;
+      end;
+      if not self.DoIntOf(LOperand, LInt) then
+        return;
+      end;
+      LInt := self.DoWrapInto(AType, LInt);
+      LWidth := self.DoWidth(AType);
+      if LOp = OperatorKind.Plus then
+        self.DoSet(AId, self.DoIntConst(AType, LInt));
+      end;
+      if LOp = OperatorKind.BitNot then
+        self.DoSet(AId, self.DoIntConst(AType, DoFromBits(~DoBitsOf(LInt), LWidth, self.DoSigned(AType))));
+      end;
+      if LOp = OperatorKind.Negate then
+        if self.DoSigned(AType) then
+          self.DoSignedResult(AId, AType, DoNegateInt(LInt));
+        else
+          self.DoSet(AId, self.DoIntConst(AType, DoFromBits(uint64(0) - DoBitsOf(LInt), LWidth, false)));
+        end;
+      end;
+    end;
+
+    // The order of the folded ALeft and ARight compared as C++ compares them (in their
+    // common arithmetic type; bools, chars, choice values and strings by value) into
+    // AOrder; false when they are no constants it orders (a NaN is unordered: AUnordered)
+    hidden method DoOrder(const ALeft: int64; const ARight: int64; var AOrder: int32;
+      var AUnordered: bool): bool;
+    var
+      LLeftType: int64;
+      LRightType: int64;
+      LCommon: int64;
+      LLeftConst: ConstValue;
+      LRightConst: ConstValue;
+      LFirst: float64;
+      LSecond: float64;
+      LA: FoldedInt;
+      LB: FoldedInt;
+    begin
+      AUnordered := false;
+      LLeftType := self.FTree[ALeft].ResolvedType;
+      LRightType := self.FTree[ARight].ResolvedType;
+      LLeftConst := self.DoConstOf(ALeft);
+      LRightConst := self.DoConstOf(ARight);
+      if (LLeftConst.Kind = ConstKind.Unknown) or (LRightConst.Kind = ConstKind.Unknown) then
+        return false;
+      end;
+      if (LLeftConst.Kind = ConstKind.String) and (LRightConst.Kind = ConstKind.String) then
+        AOrder := 0;
+        if LLeftConst.Text <> LRightConst.Text then
+          AOrder := 1;
+          AUnordered := true;
+        end;
+        return true;
+      end;
+      if IsNumericClass(self.DoClass(LLeftType)) and IsNumericClass(self.DoClass(LRightType)) then
+        LCommon := CommonArithmetic(self.FTree, LLeftType, LRightType);
+        if self.DoClass(LCommon) = TypeClass.Float then
+          if (not self.DoFloatOf(ALeft, false, LFirst)) or (not self.DoFloatOf(ARight, false, LSecond)) then
+            return false;
+          end;
+          if DoIsNan(LFirst) or DoIsNan(LSecond) then
+            AUnordered := true;
+            AOrder := 1;
+            return true;
+          end;
+          AOrder := DoOrderFloat(LFirst, LSecond);
+          return true;
+        end;
+        if (LCommon = 0) or (not self.DoIntOf(ALeft, LA)) or (not self.DoIntOf(ARight, LB)) then
+          return false;
+        end;
+        AOrder := DoOrderInt(self.DoWrapInto(LCommon, LA), self.DoWrapInto(LCommon, LB));
+        return true;
+      end;
+      if (not self.DoIntOf(ALeft, LA)) or (not self.DoIntOf(ARight, LB)) then
+        return false;
+      end;
+      AOrder := DoOrderInt(LA, LB);
+      return true;
+    end;
+
+    // A comparison AId (operator AOp, type AType) over folded operands: a bool, or <=>'s
+    // -1 / 0 / 1. Two different strings are only unequal; a NaN is unordered (only <>
+    // holds, <=> is not folded)
+    hidden method DoCompare(const AId: int64; const AOp: OperatorKind; const AType: int64;
+      const ALeft: int64; const ARight: int64);
+    var
+      LOrder: int32;
+      LUnordered: bool;
+      LResult: bool;
+    begin
+      LOrder := 0;
+      LUnordered := false;
+      if not self.DoOrder(ALeft, ARight, LOrder, LUnordered) then
+        return;
+      end;
+      if AOp = OperatorKind.Compare then
+        if not LUnordered then
+          self.DoSet(AId, self.DoIntConst(AType, DoInt(LOrder < 0, uint64(LOrder * LOrder))));
+        end;
+        return;
+      end;
+      if AOp = OperatorKind.Equal then
+        LResult := (not LUnordered) and (LOrder = 0);
+      else
+        if AOp = OperatorKind.NotEqual then
+          LResult := LUnordered or (LOrder <> 0);
+        else
+          // An ordering of two different strings is not folded
+          if LUnordered and (self.DoConstOf(ALeft).Kind = ConstKind.String) then
+            return;
+          end;
+          LResult := not LUnordered;
+          if AOp = OperatorKind.Less then
+            LResult := LResult and (LOrder < 0);
+          end;
+          if AOp = OperatorKind.LessEqual then
+            LResult := LResult and (LOrder <= 0);
+          end;
+          if AOp = OperatorKind.Greater then
+            LResult := LResult and (LOrder > 0);
+          end;
+          if AOp = OperatorKind.GreaterEqual then
+            LResult := LResult and (LOrder >= 0);
+          end;
+        end;
+      end;
+      self.DoSetBool(AId, LResult);
+    end;
+
+    // An integer operation AId (+ - * div mod & | xor, operator AOp) in AType over the
+    // folded ALeft and ARight, each converted to AType first
+    hidden method DoIntBinary(const AId: int64; const AOp: OperatorKind; const ALeft: int64;
+      const ARight: int64; const AType: int64);
+    var
+      LA: FoldedInt;
+      LB: FoldedInt;
+      LResult: FoldedInt;
+      LWidth: int64;
+      LSigned: bool;
+      LBits: uint64;
+      LOk: bool;
+    begin
+      if (not self.DoIntOf(ALeft, LA)) or (not self.DoIntOf(ARight, LB)) then
+        return;
+      end;
+      LA := self.DoWrapInto(AType, LA);
+      LB := self.DoWrapInto(AType, LB);
+      LWidth := self.DoWidth(AType);
+      LSigned := self.DoSigned(AType);
+      if (AOp = OperatorKind.BitAnd) or (AOp = OperatorKind.BitOr) or (AOp = OperatorKind.Xor) then
+        LBits := DoBitsOf(LA) & DoBitsOf(LB);
+        if AOp = OperatorKind.BitOr then
+          LBits := DoBitsOf(LA) | DoBitsOf(LB);
+        end;
+        if AOp = OperatorKind.Xor then
+          LBits := DoBitsOf(LA) xor DoBitsOf(LB);
+        end;
+        self.DoSet(AId, self.DoIntConst(AType, DoFromBits(LBits, LWidth, LSigned)));
+        return;
+      end;
+      if (AOp = OperatorKind.IntDivide) or (AOp = OperatorKind.Modulo) then
+        if LB.Magnitude = 0 then
+          self.DoError(AId, ADAM_ERR_FOLDING_257, ADAM_MSG_FOLDING_BY_ZERO, NoArgs().Str(self.FTree[AId].Text));
+          return;
+        end;
+        if LSigned and LA.Negative and (LA.Magnitude = IntLimit(self.FTree, AType, true)) and
+          LB.Negative and (LB.Magnitude = 1) then
+          self.DoError(AId, ADAM_ERR_FOLDING_258, ADAM_MSG_FOLDING_MIN_DIV,
+            NoArgs().Str(ConstIntText(true, LA.Magnitude)).Str(self.FTree[AId].Text).Str(self.DoText(AType)));
+          return;
+        end;
+        // C++ truncates: the quotient's sign is the operands' product's, the remainder's
+        // the dividend's
+        if AOp = OperatorKind.IntDivide then
+          LResult := DoInt(LA.Negative <> LB.Negative, LA.Magnitude div LB.Magnitude);
+        else
+          LResult := DoInt(LA.Negative, LA.Magnitude mod LB.Magnitude);
+        end;
+        self.DoSignedResult(AId, AType, LResult);
+        return;
+      end;
+      if (AOp <> OperatorKind.Add) and (AOp <> OperatorKind.Subtract) and (AOp <> OperatorKind.Multiply) then
+        return;
+      end;
+      if not LSigned then
+        // Unsigned arithmetic wraps
+        LBits := DoBitsOf(LA) + DoBitsOf(LB);
+        if AOp = OperatorKind.Subtract then
+          LBits := DoBitsOf(LA) - DoBitsOf(LB);
+        end;
+        if AOp = OperatorKind.Multiply then
+          LBits := DoBitsOf(LA) * DoBitsOf(LB);
+        end;
+        self.DoSet(AId, self.DoIntConst(AType, DoFromBits(LBits, LWidth, false)));
+        return;
+      end;
+      LResult := DoInt(false, 0);
+      if AOp = OperatorKind.Add then
+        LOk := DoAddInt(LA, LB, LResult);
+      else
+        if AOp = OperatorKind.Subtract then
+          LOk := DoAddInt(LA, DoNegateInt(LB), LResult);
+        else
+          LOk := DoMulInt(LA, LB, LResult);
+        end;
+      end;
+      if not LOk then
+        self.DoOverflow(AId, AType);
+        return;
+      end;
+      self.DoSignedResult(AId, AType, LResult);
+    end;
+
+    // A shift AId (operator AOp) in AType: the count 0 .. bits - 1 (SM0259 at it); << keeps
+    // the low bits, >> of a negative value is arithmetic
+    hidden method DoShift(const AId: int64; const AOp: OperatorKind; const ALeft: int64;
+      const ARight: int64; const AType: int64);
+    var
+      LCount: FoldedInt;
+      LA: FoldedInt;
+      LWidth: int64;
+      LSigned: bool;
+      LBits: uint64;
+    begin
+      if (not self.DoIntOf(ARight, LCount)) or (not self.DoIntOf(ALeft, LA)) then
+        return;
+      end;
+      LWidth := self.DoWidth(AType);
+      if LCount.Negative or (LCount.Magnitude >= uint64(LWidth)) then
+        self.DoError(ARight, ADAM_ERR_FOLDING_259, ADAM_MSG_FOLDING_SHIFT_COUNT,
+          NoArgs().Str(ConstIntText(LCount.Negative, LCount.Magnitude)).Int(LWidth - 1));
+        return;
+      end;
+      LSigned := self.DoSigned(AType);
+      LA := self.DoWrapInto(AType, LA);
+      LBits := DoBitsOf(LA);
+      if AOp = OperatorKind.ShiftLeft then
+        LBits := LBits shl LCount.Magnitude;
+      else
+        if LSigned and LA.Negative then
+          LBits := ~((~LBits) shr LCount.Magnitude);
+        else
+          LBits := LBits shr LCount.Magnitude;
+        end;
+      end;
+      self.DoSet(AId, self.DoIntConst(AType, DoFromBits(LBits, LWidth, LSigned)));
+    end;
+
+    // A float operation AId (+ - * /, operator AOp) in AType: in float64, rounded once to
+    // float32 when that is its type; '/' by zero is SM0257
+    hidden method DoFloatBinary(const AId: int64; const AOp: OperatorKind; const ALeft: int64;
+      const ARight: int64; const AType: int64);
+    var
+      LSingle: bool;
+      LA: float64;
+      LB: float64;
+      LResult: float64;
+    begin
+      LSingle := FloatBits(self.FTree, AType) = 32;
+      if (not self.DoFloatOf(ALeft, LSingle, LA)) or (not self.DoFloatOf(ARight, LSingle, LB)) then
+        return;
+      end;
+      match AOp of
+        OperatorKind.Add: LResult := LA + LB;
+        OperatorKind.Subtract: LResult := LA - LB;
+        OperatorKind.Multiply: LResult := LA * LB;
+        OperatorKind.Divide:
+          if LB = 0.0 then
+            self.DoError(AId, ADAM_ERR_FOLDING_257, ADAM_MSG_FOLDING_BY_ZERO, NoArgs().Str(self.FTree[AId].Text));
+            return;
+          end;
+          LResult := LA / LB;
+      else
+        // no other operator takes floats
+        return;
+      end;
+      self.DoFloatResult(AId, AType, LResult);
+    end;
+
+    // A binary operator AId of type AType over folded operands
+    hidden method DoBinary(const AId: int64; const AType: int64);
+    var
+      LLeft: int64;
+      LRight: int64;
+      LOp: OperatorKind;
+      LLeftConst: ConstValue;
+      LRightConst: ConstValue;
+      LClass: TypeClass;
+      LConst: ConstValue;
+    begin
+      LLeft := self.FTree.FirstOf(AId, NodeRole.Left);
+      LRight := self.FTree.FirstOf(AId, NodeRole.Right);
+      LOp := self.FTree[AId].Op;
+      LLeftConst := self.DoConstOf(LLeft);
+      LRightConst := self.DoConstOf(LRight);
+      if (LLeftConst.Kind = ConstKind.Unknown) or (LRightConst.Kind = ConstKind.Unknown) then
+        return;
+      end;
+      if (LOp = OperatorKind.LogicalAnd) or (LOp = OperatorKind.LogicalOr) then
+        if (LLeftConst.Kind = ConstKind.Boolean) and (LRightConst.Kind = ConstKind.Boolean) then
+          if LOp = OperatorKind.LogicalAnd then
+            self.DoSetBool(AId, (LLeftConst.Bits <> 0) and (LRightConst.Bits <> 0));
+          else
+            self.DoSetBool(AId, (LLeftConst.Bits <> 0) or (LRightConst.Bits <> 0));
+          end;
+        end;
+        return;
+      end;
+      if (LOp = OperatorKind.Equal) or (LOp = OperatorKind.NotEqual) or (LOp = OperatorKind.Less) or
+        (LOp = OperatorKind.LessEqual) or (LOp = OperatorKind.Greater) or
+        (LOp = OperatorKind.GreaterEqual) or (LOp = OperatorKind.Compare) then
+        self.DoCompare(AId, LOp, AType, LLeft, LRight);
+        return;
+      end;
+      LClass := self.DoClass(AType);
+      if (LClass = TypeClass.Text) and (LOp = OperatorKind.Add) then
+        if (LLeftConst.Kind = ConstKind.String) and (LRightConst.Kind = ConstKind.String) then
+          LConst := LLeftConst;
+          LConst.Text := LLeftConst.Text + LRightConst.Text;
+          self.DoSet(AId, LConst);
+        end;
+        return;
+      end;
+      if LClass = TypeClass.Float then
+        self.DoFloatBinary(AId, LOp, LLeft, LRight, AType);
+        return;
+      end;
+      if not IsIntegerClass(LClass) then
+        return;
+      end;
+      if (LOp = OperatorKind.ShiftLeft) or (LOp = OperatorKind.ShiftRight) then
+        self.DoShift(AId, LOp, LLeft, LRight, AType);
+        return;
+      end;
+      self.DoIntBinary(AId, LOp, LLeft, LRight, AType);
+    end;
+
+    // A cast of the folded AOperand to AType written on AId: an integer-like value wraps
+    // into an integer-like type (a choices type takes the number as it is), a float
+    // truncates into one (SM0256 when it does not fit) except into bool, where it is C's
+    // `x != 0` (bool(0.5) is true, a NaN true), anything numeric converts to a float
+    // (rounded once to float32)
+    hidden method DoCast(const AId: int64; const AOperand: int64; const AType: int64);
+    var
+      LConst: ConstValue;
+      LClass: TypeClass;
+      LInt: FoldedInt;
+    begin
+      LConst := self.DoConstOf(AOperand);
+      if LConst.Kind = ConstKind.Unknown then
+        return;
+      end;
+      LClass := self.DoClass(AType);
+      if LClass = TypeClass.Float then
+        if LConst.Kind = ConstKind.Float then
+          self.DoFloatResult(AId, AType, LConst.Float);
+          return;
+        end;
+        if self.DoIntOf(AOperand, LInt) then
+          self.DoSet(AId, self.DoFloatConst(DoIntToFloat(LInt, FloatBits(self.FTree, AType) = 32)));
+        end;
+        return;
+      end;
+      if not (IsIntegerClass(LClass) or (LClass = TypeClass.Char) or (LClass = TypeClass.WideChar) or
+        (LClass = TypeClass.Boolean) or (LClass = TypeClass.ChoicesType)) then
+        return;
+      end;
+      if (LConst.Kind = ConstKind.Float) and (LClass = TypeClass.Boolean) then
+        self.DoSet(AId, self.DoIntConst(AType, DoInt(false, DoFloatTruth(LConst.Float))));
+        return;
+      end;
+      if LConst.Kind = ConstKind.Float then
+        if (not DoFloatToInt(LConst.Float, LInt)) or
+          (IsIntegerClass(LClass) and (not IntFits(self.FTree, AType, LInt.Negative, LInt.Magnitude))) then
+          self.DoOverflow(AId, AType);
+          return;
+        end;
+        self.DoSet(AId, self.DoIntConst(AType, self.DoWrapInto(AType, LInt)));
+        return;
+      end;
+      if not self.DoIntOf(AOperand, LInt) then
+        return;
+      end;
+      if LClass = TypeClass.ChoicesType then
+        self.DoSet(AId, self.DoIntConst(AType, LInt));
+        return;
+      end;
+      self.DoSet(AId, self.DoIntConst(AType, self.DoWrapInto(AType, LInt)));
+    end;
+
+    // The type the argument AArg of size(...) names: a type expression's, or a name's or
+    // member's that names a type; 0 for any other argument
+    hidden const method DoSizeArgument(const AArg: int64): int64;
+    var
+      LKind: NodeKind;
+      LDecl: int64;
+    begin
+      LKind := self.FTree[AArg].Kind;
+      if (LKind = NodeKind.BuiltinTypeName) or (LKind = NodeKind.NamedType) or
+        (LKind = NodeKind.PointerType) or (LKind = NodeKind.ArrayType) or (LKind = NodeKind.RoutineType) or
+        (LKind = NodeKind.OwnType) or (LKind = NodeKind.RefType) or (LKind = NodeKind.WeakType) then
+        return CanonicalOf(self.FTree, AArg);
+      end;
+      if (LKind <> NodeKind.NameExpression) and (LKind <> NodeKind.MemberExpression) then
+        return 0;
+      end;
+      LDecl := self.FTree[AArg].ResolvedDecl;
+      if (LDecl = 0) or ((self.FTree[LDecl].Kind <> NodeKind.TypeDecl) and
+        (self.FTree[LDecl].Kind <> NodeKind.BuiltinTypeDecl)) then
+        return 0;
+      end;
+      return DeclaredTypeOf(self.FTree, LDecl);
+    end;
+
+    // A call AId of type AType: a cast through a type's name (one argument), or size(T)
+    // (the type's layout)
+    hidden method DoCall(const AId: int64; const AType: int64);
+    var
+      LCallee: int64;
+      LDecl: int64;
+      LKind: NodeKind;
+      LSize: int64;
+    begin
+      LCallee := self.FTree.FirstOf(AId, NodeRole.Callee);
+      while (LCallee <> 0) and (self.FTree[LCallee].Kind = NodeKind.ParenExpression) do
+        LCallee := self.FTree.FirstOf(LCallee, NodeRole.Operand);
+      end;
+      if (LCallee = 0) or ((self.FTree[LCallee].Kind <> NodeKind.NameExpression) and
+        (self.FTree[LCallee].Kind <> NodeKind.MemberExpression)) then
+        return;
+      end;
+      LDecl := self.FTree[LCallee].ResolvedDecl;
+      if (LDecl = 0) or (self.FTree.CountOf(AId, NodeRole.Argument) <> 1) then
+        return;
+      end;
+      LKind := self.FTree[LDecl].Kind;
+      if (LKind = NodeKind.TypeDecl) or (LKind = NodeKind.BuiltinTypeDecl) then
+        self.DoCast(AId, self.FTree.FirstOf(AId, NodeRole.Argument), AType);
+        return;
+      end;
+      if (LKind = NodeKind.IntrinsicDecl) and (self.FTree[LDecl].Text = "size") then
+        LSize := TypeSize(self.FTree, self.FTarget,
+          self.DoSizeArgument(self.FTree.FirstOf(AId, NodeRole.Argument)));
+        if LSize >= 0 then
+          self.DoSet(AId, self.DoIntConst(AType, DoInt(false, uint64(LSize))));
+        end;
+      end;
+    end;
+
+    // A conditional AId of type AType with a folded bool condition: the chosen branch's
+    // constant, converted to AType
+    hidden method DoConditional(const AId: int64; const AType: int64);
+    var
+      LCondition: ConstValue;
+      LChosen: int64;
+      LConst: ConstValue;
+    begin
+      LCondition := self.DoConstOf(self.FTree.FirstOf(AId, NodeRole.Condition));
+      if LCondition.Kind <> ConstKind.Boolean then
+        return;
+      end;
+      LChosen := self.FTree.FirstOf(AId, NodeRole.Else);
+      if LCondition.Bits <> 0 then
+        LChosen := self.FTree.FirstOf(AId, NodeRole.Then);
+      end;
+      LConst := self.DoConstOf(LChosen);
+      if (LChosen = 0) or (LConst.Kind = ConstKind.Unknown) then
+        return;
+      end;
+      self.DoSet(AId, self.DoConvertConst(LConst, self.FTree[LChosen].ResolvedType, AType));
+    end;
+
+    // The expression AId folded, once it is typed and its operands are folded (see the
+    // unit header); an expression of unknown type is left alone
+    method Fold(const AId: int64);
+    var
+      LType: int64;
+    begin
+      if AId = 0 then
+        return;
+      end;
+      LType := self.FTree[AId].ResolvedType;
+      if LType = 0 then
+        return;
+      end;
+      match self.FTree[AId].Kind of
+        NodeKind.IntLiteral, NodeKind.FloatLiteral, NodeKind.BoolLiteral, NodeKind.CharLiteral,
+        NodeKind.StringLiteral, NodeKind.NilLiteral:
+          self.DoLiteral(AId, LType);
+        NodeKind.ParenExpression:
+          self.DoSet(AId, self.DoConstOf(self.FTree.FirstOf(AId, NodeRole.Operand)));
+        NodeKind.NameExpression, NodeKind.MemberExpression:
+          self.DoName(AId);
+        NodeKind.UnaryExpression:
+          self.DoUnary(AId, LType);
+        NodeKind.BinaryExpression:
+          self.DoBinary(AId, LType);
+        NodeKind.TypeCast:
+          self.DoCast(AId, self.FTree.FirstOf(AId, NodeRole.Operand), LType);
+        NodeKind.CallExpression:
+          self.DoCall(AId, LType);
+        NodeKind.ConditionalExpression:
+          self.DoConditional(AId, LType);
+      else
+        // no other expression has a constant value
+      end;
+    end;
+
+    // The const declaration ADecl's value in its declared type (its initializer's
+    // constant converted; a char literal into a wchar takes its wide value)
+    method FoldDeclaration(const ADecl: int64);
+    var
+      LInit: int64;
+      LRoot: int64;
+      LType: int64;
+      LConst: ConstValue;
+      LWide: wstring;
+    begin
+      LInit := self.FTree.FirstOf(ADecl, NodeRole.Initializer);
+      LType := self.FTree[ADecl].ResolvedType;
+      if (LInit = 0) or (LType = 0) then
+        return;
+      end;
+      LConst := self.DoConstOf(LInit);
+      if LConst.Kind = ConstKind.Unknown then
+        return;
+      end;
+      LRoot := LInit;
+      while self.FTree[LRoot].Kind = NodeKind.ParenExpression do
+        LRoot := self.FTree.FirstOf(LRoot, NodeRole.Operand);
+      end;
+      LWide := self.FTree[LRoot].DecodedWide;
+      if (self.DoClass(LType) = TypeClass.WideChar) and (self.FTree[LRoot].Kind = NodeKind.CharLiteral) and
+        (len(LWide) > 0) then
+        LConst.Kind := ConstKind.Char;
+        LConst.Bits := uint64(uint16(LWide[0]));
+        self.DoSet(ADecl, LConst);
+        return;
+      end;
+      self.DoSet(ADecl, self.DoConvertConst(LConst, self.FTree[LInit].ResolvedType, LType));
+    end;
+
+    // The number of the choice value AMember (its explicit value folded already) into its
+    // ResolvedConst: its explicit value (a constant: SM0202; an int64: SM0256), else one
+    // past the value before it in the body ABody (the first 0; past the largest int64:
+    // SM0256). Called value by value as the list is typed, so a value may name one before
+    // it (fB = fA + 1); an implicit value after one with no number has none either
+    method NumberChoice(const ABody: int64; const AMember: int64);
+    var
+      LI: int64;
+      LPrevious: int64;
+      LExpr: int64;
+      LInt64: int64;
+      LCurrent: FoldedInt;
+      LBefore: FoldedInt;
+    begin
+      LInt64 := BuiltinType(self.FTree, "int64");
+      LExpr := self.FTree.FirstOf(AMember, NodeRole.Value);
+      LCurrent := DoInt(false, 0);
+      if LExpr <> 0 then
+        if not self.DoIntOf(LExpr, LCurrent) then
+          if self.FTree[LExpr].ResolvedType <> 0 then
+            self.DoError(LExpr, ADAM_ERR_FOLDING_202, ADAM_MSG_SEMANTICS_NOT_CONSTANT,
+              NoArgs().Str(ADAM_MSG_SEMANTICS_POS_CHOICE));
+          end;
+          return;
+        end;
+        if not IntFits(self.FTree, LInt64, LCurrent.Negative, LCurrent.Magnitude) then
+          self.DoOverflow(LExpr, LInt64);
+          return;
+        end;
+        self.DoSet(AMember, self.DoIntConst(LInt64, LCurrent));
+        return;
+      end;
+      // The value before it in the list (none: this is the first, 0)
+      LPrevious := 0;
+      for LI := 0 to self.FTree.CountOf(ABody, NodeRole.Member) - 1 do
+        if self.FTree.NthOf(ABody, NodeRole.Member, LI) = AMember then
+          leave;
+        end;
+        LPrevious := self.FTree.NthOf(ABody, NodeRole.Member, LI);
+      end;
+      if LPrevious <> 0 then
+        if not self.DoIntOf(LPrevious, LBefore) then
+          return;
+        end;
+        if (not DoAddInt(LBefore, DoInt(false, 1), LCurrent)) or
+          (not IntFits(self.FTree, LInt64, LCurrent.Negative, LCurrent.Magnitude)) then
+          self.DoOverflow(AMember, LInt64);
+          return;
+        end;
+      end;
+      self.DoSet(AMember, self.DoIntConst(LInt64, LCurrent));
+    end;
+  end;
+
+end.

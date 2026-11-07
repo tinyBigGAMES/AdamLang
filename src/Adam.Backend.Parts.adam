@@ -1,0 +1,647 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Backend.Parts.adam - the three target parts (DESIGN sec 6)
+
+  A target is three independent parts, each an abstract object here, each
+  target's part one implementation of it:
+  ArchPart      the instruction set: its registers (by number and name),
+                and one IR function generated into a SectionSet's code
+                section (x86_64: Adam.X64.Select, Allocate, Encode over the
+                arch's own machine IR), answered as a FunctionCode; and the
+                stack probe a probed frame calls, by the ABI's facts
+  AbiPart       the OS / ABI: the calling convention, the frame rule and
+                its stack facts (the page a probed frame touches by, the
+                registers free at a function's start),
+                answered as data (CallLayout, FrameLayout) that names
+                registers by their arch name, so the ABI part never holds
+                an arch part and the arch part never holds an ABI part;
+                and a generated function's unwind data, written from its
+                FunctionCode alone
+  FormatPart    the object format: what a section of each kind is called,
+                a SectionSet written as one object file's bytes, and a
+                SectionSet linked into an exe
+
+  Parts never reference each other: Adam.Backend.Targets composes one of
+  each per triple, and the phases above ask the composed parts. A fact no
+  method answers is a new method here and in every implementation, never a
+  constant above the parts.
+
+  Location      where one value is at a call: none (a void result), an
+                arch register by name, or a stack place given as offsets
+                from the stack pointer at the call instruction (where the
+                caller writes it) and at the callee's first instruction
+                (where the callee reads it)
+  CallLayout    a call's argument locations in order, its result's, and
+                the bytes the caller reserves under the call for them
+  VarargsLayout how a variadic function reaches its variadic arguments: the
+                argument registers it stores at entry (each a home: the
+                register and its place, from the stack pointer at entry)
+                and where the first variadic argument is
+  FrameLayout   one function's frame: the bytes the prologue reserves and
+                where each area starts, as offsets from the stack pointer
+                after the prologue (a realigned frame, a probed frame: see
+                FrameLayout)
+  PrologueStep  one prologue instruction as data: what it does (allocate
+                bytes, save a register, set the frame register; registers
+                by their arch name) and where it ends, in bytes from the
+                function's start
+  FunctionCode  one generated function as the arch part hands it on: its
+                symbol (and its id in the SectionSet), AST node, byte
+                count, frame, whether it calls, its prologue steps in order,
+                its IR slots' frame offsets (a funclet's parent's, which the
+                funclet reaches them by), its scopes as byte ranges with
+                their funclets' symbols and the frame handler's symbol
+*******************************************************************************/
+
+module unit Adam.Backend.Parts;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Compiler.Diagnostics, Adam.Compiler.AST,
+  Adam.Backend.Ssa, Adam.Backend.Sections;
+
+exported const
+  // Raised (an invariant broken) by an argument index outside a call, a step index outside
+  // a prologue
+  ADAM_PARTS_FAULT_NO_ARG: string = "Parts: no argument ";
+  ADAM_PARTS_FAULT_NO_STEP: string = "Parts: no prologue step ";
+  ADAM_PARTS_FAULT_NO_HOME: string = "Parts: no varargs home ";
+
+exported type
+  // Where a value is (see the header)
+  LocationKind = choices(None, Register, Stack);
+
+// The name of AKind, as a row prints it
+exported routine LocationKindText(const AKind: LocationKind): string;
+begin
+  match AKind of
+    LocationKind.None: return "none";
+    LocationKind.Register: return "register";
+    LocationKind.Stack: return "stack";
+  end;
+  return "";
+end;
+
+exported type
+  // Where one value is at a call (see the header)
+  Location = object
+    Kind: LocationKind;
+    // Register: the arch part's name for it ("rcx", "xmm0")
+    RegisterName: string;
+    // Register: a second register the value is copied into too ("" for none): a float of a
+    // variadic call goes in its float register and its integer one (Win64)
+    ShadowName: string;
+    // Stack: the offset from the stack pointer at the call instruction
+    CallOffset: int64;
+    // Stack: the offset from the stack pointer at the callee's first instruction; a home
+    // (VarargsLayout.HomeAt, a register): the place, from there, the function stores it at
+    EntryOffset: int64;
+
+    init(const AKind: LocationKind);
+    begin
+      self.Kind := AKind;
+      self.RegisterName := "";
+      self.ShadowName := "";
+      self.CallOffset := 0;
+      self.EntryOffset := 0;
+    end;
+
+    // "rcx", "xmm1+rdx" (with its shadow), "stack call +32 entry +40" or "none", as a row
+    // prints it
+    const method Text(): string;
+    begin
+      match self.Kind of
+        LocationKind.None: return "none";
+        LocationKind.Register:
+          if self.ShadowName <> "" then
+            return self.RegisterName + "+" + self.ShadowName;
+          end;
+          return self.RegisterName;
+        LocationKind.Stack:
+          return "stack call +" + IntToStr(self.CallOffset) + " entry +" +
+            IntToStr(self.EntryOffset);
+      end;
+      return "none";
+    end;
+  end;
+
+// A location in the register named AName
+exported routine RegisterLocation(const AName: string): ref Location;
+var
+  LLocation: ref Location;
+begin
+  LLocation := ref Location(LocationKind.Register);
+  LLocation.RegisterName := AName;
+  return LLocation;
+end;
+
+// A stack location at ACallOffset from the stack pointer at the call, AEntryOffset at the
+// callee's first instruction
+exported routine StackLocation(const ACallOffset: int64; const AEntryOffset: int64): ref Location;
+var
+  LLocation: ref Location;
+begin
+  LLocation := ref Location(LocationKind.Stack);
+  LLocation.CallOffset := ACallOffset;
+  LLocation.EntryOffset := AEntryOffset;
+  return LLocation;
+end;
+
+exported type
+  // A call's argument and result locations (see the header)
+  CallLayout = object
+    hidden FArgs: array of ref Location;
+    hidden FCount: int64;
+    // Where the result is (Kind None for a void call)
+    ResultAt: ref Location;
+    // The bytes the caller reserves under the call for the arguments (any home area the
+    // convention asks for included)
+    OutgoingBytes: int64;
+
+    init();
+    begin
+      self.FCount := 0;
+      self.ResultAt := ref Location(LocationKind.None);
+      self.OutgoingBytes := 0;
+    end;
+
+    property ArgCount: int64 read FCount;
+
+    // Where argument AIndex (0-based) is; raises outside the arguments
+    const method ArgAt(const AIndex: int64): ref Location;
+    begin
+      if (AIndex < 0) or (AIndex >= self.FCount) then
+        raise(ADAM_PARTS_FAULT_NO_ARG + IntToStr(AIndex));
+      end;
+      return self.FArgs[AIndex];
+    end;
+
+    // Adds ALocation as the next argument's
+    method AddArg(const ALocation: ref Location);
+    begin
+      if self.FCount = len(self.FArgs) then
+        setlength(self.FArgs, self.FCount * 2 + 4);
+      end;
+      self.FArgs[self.FCount] := ALocation;
+      self.FCount := self.FCount + 1;
+    end;
+
+    // The layout as text, one line per argument then the result and the outgoing bytes
+    const method Text(): string;
+    var
+      LText: string;
+      LI: int64;
+    begin
+      LText := "";
+      for LI := 0 to self.FCount - 1 do
+        LText := LText + "arg " + IntToStr(LI) + " " + self.FArgs[LI].Text() + "\n";
+      end;
+      return LText + "result " + self.ResultAt.Text() + "\n" + "outgoing " +
+        IntToStr(self.OutgoingBytes) + "\n";
+    end;
+  end;
+
+  // How a variadic function reaches its variadic arguments (see the header)
+  VarargsLayout = object
+    hidden FHomes: array of ref Location;
+    hidden FCount: int64;
+    // The offset from the stack pointer at the function's first instruction of its first
+    // variadic argument (the next ones follow, Target.VariadicSlotBytes apart)
+    FirstAt: int64;
+
+    init();
+    begin
+      self.FCount := 0;
+      self.FirstAt := 0;
+    end;
+
+    property HomeCount: int64 read FCount;
+
+    // Home AIndex (0-based): a register location whose EntryOffset is the place the function
+    // stores it at entry, so the variadic arguments it carried sit beside the stacked ones;
+    // raises outside the homes
+    const method HomeAt(const AIndex: int64): ref Location;
+    begin
+      if (AIndex < 0) or (AIndex >= self.FCount) then
+        raise(ADAM_PARTS_FAULT_NO_HOME + IntToStr(AIndex));
+      end;
+      return self.FHomes[AIndex];
+    end;
+
+    // Adds the register named AName, stored at AEntryOffset, as the next home
+    method AddHome(const AName: string; const AEntryOffset: int64);
+    var
+      LHome: ref Location;
+    begin
+      LHome := RegisterLocation(AName);
+      LHome.EntryOffset := AEntryOffset;
+      if self.FCount = len(self.FHomes) then
+        setlength(self.FHomes, self.FCount * 2 + 4);
+      end;
+      self.FHomes[self.FCount] := LHome;
+      self.FCount := self.FCount + 1;
+    end;
+
+    // The layout as text: one line per home ("home rdx entry +16"), then "first entry +16"
+    const method Text(): string;
+    var
+      LText: string;
+      LI: int64;
+    begin
+      LText := "";
+      for LI := 0 to self.FCount - 1 do
+        LText := LText + "home " + self.FHomes[LI].RegisterName + " entry +" +
+          IntToStr(self.FHomes[LI].EntryOffset) + "\n";
+      end;
+      return LText + "first entry +" + IntToStr(self.FirstAt) + "\n";
+    end;
+  end;
+
+  // One function's frame (see the header). Every offset is from the stack pointer after
+  // the prologue, which reserves AllocBytes under the registers it saved
+  FrameLayout = object
+    // The callee-saved registers the prologue saves, and the bytes they take
+    SavedCount: int64;
+    SavedBytes: int64;
+    // The locals' area: its start and its bytes (locals are placed from LocalBase up)
+    LocalBase: int64;
+    LocalBytes: int64;
+    // The area for the arguments of the calls the function makes (from offset 0)
+    OutgoingBytes: int64;
+    // The bytes the prologue reserves under the saved registers (0: no frame)
+    AllocBytes: int64;
+    // Where the saved registers start, and the return address
+    SavedBase: int64;
+    ReturnOffset: int64;
+    // The stack pointer at the function's first instruction: a Location's EntryOffset is
+    // from here
+    EntryBase: int64;
+    // A realigned frame (locals aligned above the ABI's StackAlign): Realign is the
+    // alignment the stack pointer is rounded down to after the prologue, and FrameRegister
+    // (by the arch part's name) holds the stack pointer as it was after the reservation.
+    // Then LocalBase and OutgoingBytes are from the rounded stack pointer, SavedBase,
+    // ReturnOffset and EntryBase from FrameRegister. 0 and "": not realigned, every offset
+    // from the stack pointer after the prologue
+    Realign: int64;
+    FrameRegister: string;
+    // A probed frame: the bytes below the stack pointer after the saves that the frame
+    // reaches (the reservation, and a realigned frame's rounding at its most), touched page
+    // by page (AbiPart.PageBytes) before the reservation, so the OS's guard page is never
+    // skipped. 0: not probed, the frame stays within a page of what the saves touched
+    ProbeBytes: int64;
+
+    init();
+    begin
+      self.SavedCount := 0;
+      self.SavedBytes := 0;
+      self.LocalBase := 0;
+      self.LocalBytes := 0;
+      self.OutgoingBytes := 0;
+      self.AllocBytes := 0;
+      self.SavedBase := 0;
+      self.ReturnOffset := 0;
+      self.EntryBase := 0;
+      self.Realign := 0;
+      self.FrameRegister := "";
+      self.ProbeBytes := 0;
+    end;
+
+    // The frame as one line, as a row prints it (a realigned frame adds its alignment and
+    // its frame register, a probed one its probe)
+    const method Text(): string;
+    var
+      LText: string;
+    begin
+      LText := "alloc " + IntToStr(self.AllocBytes) + " outgoing " + IntToStr(self.OutgoingBytes) +
+        " locals +" + IntToStr(self.LocalBase) + " " + IntToStr(self.LocalBytes) + " saved +" +
+        IntToStr(self.SavedBase) + " " + IntToStr(self.SavedCount) + " return +" +
+        IntToStr(self.ReturnOffset) + " entry +" + IntToStr(self.EntryBase);
+      if self.Realign > 0 then
+        LText := LText + " realign " + IntToStr(self.Realign) + " over " + self.FrameRegister;
+      end;
+      if self.ProbeBytes > 0 then
+        LText := LText + " probe " + IntToStr(self.ProbeBytes);
+      end;
+      return LText;
+    end;
+  end;
+
+  // What one prologue step does (see the header)
+  PrologueAction = choices(Allocate, SaveRegister, SetFrame);
+
+// The name of AAction, as a row prints it
+exported routine PrologueActionText(const AAction: PrologueAction): string;
+begin
+  match AAction of
+    PrologueAction.Allocate: return "allocate";
+    PrologueAction.SaveRegister: return "save";
+    PrologueAction.SetFrame: return "frame";
+  end;
+  return "";
+end;
+
+exported type
+  // One prologue instruction as data (see the header)
+  PrologueStep = object
+    Action: PrologueAction;
+    // Allocate: the bytes reserved (0 otherwise)
+    Bytes: int64;
+    // SaveRegister / SetFrame: the register, by the arch part's name ("" otherwise)
+    RegisterName: string;
+    // Where the step's instruction ends, in bytes from the function's start
+    EndsAt: int64;
+
+    init(const AAction: PrologueAction);
+    begin
+      self.Action := AAction;
+      self.Bytes := 0;
+      self.RegisterName := "";
+      self.EndsAt := 0;
+    end;
+
+    // "allocate 40 ends 4", "save rbx ends 1", as a row prints it
+    const method Text(): string;
+    begin
+      if self.Action = PrologueAction.Allocate then
+        return "allocate " + IntToStr(self.Bytes) + " ends " + IntToStr(self.EndsAt);
+      end;
+      return PrologueActionText(self.Action) + " " + self.RegisterName + " ends " +
+        IntToStr(self.EndsAt);
+    end;
+  end;
+
+  // One generated function (see the header). Its slots: each IR slot's offset in its frame
+  // (from the stack pointer after the prologue, a realigned frame's rounded one), what a
+  // funclet of it reaches them by. Its scopes: each a byte range of its code (from its
+  // symbol on, the end past the range: a call ending at the range's last byte returns into
+  // it) and the symbol of the funclet an unwind leaving it runs, innermost first (a catching
+  // scope's: its filter's symbol and its target, the byte its caught exceptions resume at;
+  // -1 for any other); with any, FrameHandler is the symbol of the function the OS calls for
+  // its frame
+  FunctionCode = object
+    hidden FSteps: array of ref PrologueStep;
+    hidden FCount: int64;
+    hidden FSlotIds: ref Int64List;
+    hidden FSlotOffsets: ref Int64List;
+    hidden FScopeBegins: ref Int64List;
+    hidden FScopeEnds: ref Int64List;
+    hidden FScopeHandlers: StringArray;
+    hidden FScopeTargets: ref Int64List;
+    // The function's symbol, its id in the SectionSet it was generated into, its AST node
+    // (0: none)
+    Symbol: string;
+    SymbolId: int64;
+    Node: int64;
+    // Its code's bytes, from its symbol on
+    ByteCount: int64;
+    // Its frame (nil: none laid out), and whether it makes calls
+    Frame: ref FrameLayout;
+    MakesCalls: bool;
+    // The frame handler's symbol ("": no scopes)
+    FrameHandler: string;
+
+    init(const ASymbol: string);
+    begin
+      self.FCount := 0;
+      self.FSlotIds := ref Int64List();
+      self.FSlotOffsets := ref Int64List();
+      self.FScopeBegins := ref Int64List();
+      self.FScopeEnds := ref Int64List();
+      setlength(self.FScopeHandlers, 0);
+      self.FScopeTargets := ref Int64List();
+      self.Symbol := ASymbol;
+      self.SymbolId := 0;
+      self.Node := 0;
+      self.ByteCount := 0;
+      self.Frame := nil;
+      self.MakesCalls := false;
+      self.FrameHandler := "";
+    end;
+
+    property StepCount: int64 read FCount;
+
+    // Records IR slot AIrSlot at AOffset in the frame
+    method AddSlot(const AIrSlot: int64; const AOffset: int64);
+    begin
+      self.FSlotIds.Add(AIrSlot);
+      self.FSlotOffsets.Add(AOffset);
+    end;
+
+    // The frame offset of IR slot AIrSlot (-1: not one of the function's slots)
+    const method SlotOffsetOf(const AIrSlot: int64): int64;
+    var
+      LI: int64;
+    begin
+      LI := self.FSlotIds.IndexOf(AIrSlot);
+      if LI < 0 then
+        return -1;
+      end;
+      return self.FSlotOffsets[LI];
+    end;
+
+    // Adds a scope: the bytes ABegin up to AEnd (past the last), the funclet AHandler and
+    // ATarget -1; or, catching, the filter AHandler and the byte ATarget
+    method AddScope(const ABegin: int64; const AEnd: int64; const AHandler: string;
+      const ATarget: int64);
+    begin
+      self.FScopeBegins.Add(ABegin);
+      self.FScopeEnds.Add(AEnd);
+      setlength(self.FScopeHandlers, len(self.FScopeHandlers) + 1);
+      self.FScopeHandlers[len(self.FScopeHandlers) - 1] := AHandler;
+      self.FScopeTargets.Add(ATarget);
+    end;
+
+    // Scope AIndex's target byte (-1: no catching scope)
+    const method ScopeTarget(const AIndex: int64): int64;
+    begin
+      return self.FScopeTargets[AIndex];
+    end;
+
+    // True when a scope catches (one has a target)
+    const method Catches(): bool;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to self.FScopeTargets.Count - 1 do
+        if self.FScopeTargets[LI] >= 0 then
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // How many scopes; scope AIndex's begin, end and funclet symbol
+    const method ScopeCount(): int64;
+    begin
+      return self.FScopeBegins.Count;
+    end;
+
+    const method ScopeBegin(const AIndex: int64): int64;
+    begin
+      return self.FScopeBegins[AIndex];
+    end;
+
+    const method ScopeEnd(const AIndex: int64): int64;
+    begin
+      return self.FScopeEnds[AIndex];
+    end;
+
+    const method ScopeHandler(const AIndex: int64): string;
+    begin
+      return self.FScopeHandlers[AIndex];
+    end;
+
+    // Prologue step AIndex (0-based, in code order); raises outside the prologue
+    const method StepAt(const AIndex: int64): ref PrologueStep;
+    begin
+      if (AIndex < 0) or (AIndex >= self.FCount) then
+        raise(ADAM_PARTS_FAULT_NO_STEP + IntToStr(AIndex) + " in " + self.Symbol);
+      end;
+      return self.FSteps[AIndex];
+    end;
+
+    // Adds AStep as the prologue's next step
+    method AddStep(const AStep: ref PrologueStep);
+    begin
+      if self.FCount = len(self.FSteps) then
+        setlength(self.FSteps, self.FCount * 2 + 4);
+      end;
+      self.FSteps[self.FCount] := AStep;
+      self.FCount := self.FCount + 1;
+    end;
+
+    // The function as text: one line of its shape, then one per step
+    const method Text(): string;
+    var
+      LText: string;
+      LFrame: string;
+      LI: int64;
+    begin
+      LFrame := "none";
+      if self.Frame <> nil then
+        LFrame := self.Frame.Text();
+      end;
+      LText := "code " + self.Symbol + " bytes " + IntToStr(self.ByteCount) + " calls " +
+        BoolToStr(self.MakesCalls) + " frame " + LFrame + "\n";
+      for LI := 0 to self.FCount - 1 do
+        LText := LText + "step " + IntToStr(LI) + " " + self.FSteps[LI].Text() + "\n";
+      end;
+      return LText;
+    end;
+  end;
+
+  // The OS / ABI (see the header); registers are named as the arch part names them
+  AbiPart = object
+    // The ABI's name ("win64")
+    virtual method AbiName(): string; abstract;
+
+    // The stack pointer's alignment at every call, in bytes
+    virtual method StackAlign(): int64; abstract;
+
+    // The callee-saved register a realigned frame keeps its frame in (FrameLayout.Realign),
+    // by the arch part's name; the arch part saves it and never allocates it in such a frame
+    virtual method FrameRegister(): string; abstract;
+
+    // The OS's stack page in bytes: the stride a probed frame touches its pages at
+    // (FrameLayout.ProbeBytes)
+    virtual method PageBytes(): int64; abstract;
+
+    // The registers free at a function's first instruction (volatile, no argument and no
+    // result in them), by the arch part's name: the arch's stack probe takes its size in the
+    // first and may change only these
+    virtual method ProbeScratch(): StringArray; abstract;
+
+    // Where the arguments and the result of a call to a routine of ASignature are, and the
+    // bytes the caller reserves for them; raises for a void parameter (an IR fault)
+    virtual method LayoutCall(const ASignature: ref IrSignature): ref CallLayout; abstract;
+
+    // How a variadic function of ASignature (its own: the fixed parameters, marked
+    // Variadic) reaches its variadic arguments: the argument registers it stores at entry,
+    // and where the first variadic argument is
+    virtual method LayoutVarargs(const ASignature: ref IrSignature): ref VarargsLayout; abstract;
+
+    // The frame of a function whose locals take ALocalBytes aligned to ALocalAlign, whose
+    // calls need AOutgoingBytes (the largest CallLayout.OutgoingBytes; 0 for no call), and
+    // whose prologue saves ASavedCount callee-saved registers
+    virtual method LayoutFrame(const ALocalBytes: int64; const ALocalAlign: int64;
+      const AOutgoingBytes: int64; const ASavedCount: int64): ref FrameLayout; abstract;
+
+    // The registers a callee must give back unchanged
+    virtual method CalleeSaved(): StringArray; abstract;
+
+    // The registers a call may change
+    virtual method Volatile(): StringArray; abstract;
+
+    // ACode's unwind data written into ASections (the ABI's sections, made on first use);
+    // nothing for a function the ABI needs none for; raises (a compiler bug) for what the
+    // ABI's unwind data cannot describe
+    virtual method WriteUnwind(const ACode: ref FunctionCode; const ASections: ref SectionSet);
+      abstract;
+  end;
+
+  // The instruction set (see the header)
+  ArchPart = object
+    // The arch's name as a triple spells it ("x86_64")
+    virtual method ArchName(): string; abstract;
+
+    // How many registers the arch has, numbered 0 .. RegisterCount() - 1
+    virtual method RegisterCount(): int64; abstract;
+
+    // The name of register ANumber; "" for a number that is no register
+    virtual method RegisterText(const ANumber: int64): string; abstract;
+
+    // The number of the register named AName; -1 for a name that is no register
+    virtual method RegisterOf(const AName: string): int64; abstract;
+
+    // Function AFunction of AModule generated, by AAbi's convention, into ASections' code
+    // section ACode (its symbol defined there, its calls' relocations and imports added);
+    // AParent the generated parent of a funclet (nil for any other function), whose frame
+    // the funclet reaches the parent's slots in; the FunctionCode carries its slots' offsets
+    // and its scopes. Raises (a compiler bug) for what the arch cannot generate
+    virtual method GenerateFunction(const AModule: ref IrModule; const AFunction: int64;
+      const AAbi: ref AbiPart; const ASections: ref SectionSet; const ACode: int64;
+      const AParent: ref FunctionCode): ref FunctionCode; abstract;
+
+    // The stack probe a probed frame's prologue calls (FrameLayout.ProbeBytes), generated by
+    // AAbi's facts (PageBytes, ProbeScratch) into ASections' code section ACode, its symbol
+    // internal; once per SectionSet, when a generated function's frame is probed
+    virtual method GenerateProbe(const AAbi: ref AbiPart; const ASections: ref SectionSet;
+      const ACode: int64): ref FunctionCode; abstract;
+  end;
+
+  // The object format (see the header)
+  FormatPart = object
+    // The format's name ("coff")
+    virtual method FormatName(): string; abstract;
+
+    // The name of the section that holds what AKind holds
+    virtual method SectionNameOf(const AKind: SectionKind): string; abstract;
+
+    // What an exe's file name ends with (".exe"; "" for a format whose exes have none)
+    virtual method ExeExtension(): string; abstract;
+
+    // ASections as one object file's bytes, deterministic; raises (a compiler bug) for what
+    // the format cannot hold
+    virtual method WriteObject(const ASections: ref SectionSet): ByteArray; abstract;
+
+    // ASections linked into an exe entered at the symbol AEntry, its imports' libraries
+    // searched in the build's AAddedPaths and then wherever the format's OS keeps its own;
+    // what the program got wrong (an undefined symbol, a name its library lacks) reported
+    // at ATree's nodes into ADiagnostics. Empty after a report
+    virtual method LinkExe(const ASections: ref SectionSet; const AEntry: string;
+      const AAddedPaths: StringArray; const ATree: ref SyntaxTree;
+      const ADiagnostics: ref Diagnostics): ByteArray; abstract;
+  end;
+
+end.

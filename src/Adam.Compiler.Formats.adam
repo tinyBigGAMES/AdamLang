@@ -1,0 +1,717 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Compiler.Formats.adam - a print / println format read once (used by
+  Semantics: SM0502; the plan it gives is the AST's, Lowering only reads it)
+
+  PaskalCPP's print is std::format: clang checks the format against the
+  argument types when the program is built, so Adam reads it the way libc++
+  22's compile-time check does (repo\bin\res\zig\lib\libcxx\include\__format:
+  format_functions.h __vformat_to / __handle_replacement_field,
+  format_string.h __parse_arg_id / __parse_number, parser_std_format_spec.h
+  __parser::__parse / __validate / __process_parsed_*, range_formatter.h
+  parse). Each argument's spec rules come from its print form (Types'
+  PrintFormOf, PaskalCPP's PrintForm): the integral formatter's for an
+  integer, a bool and a char, the floating point one's for a float, the
+  string one's for every text form and a choices value (PaskalCPP's formatter
+  of a choices type is formatter<string_view>'s), the pointer one's for an
+  address, the range one's for an array or a set. A width or a precision
+  taken from an argument must name a standard integer (an int8 .. uint64:
+  never a bool or a char) where libc++ checks it at compile time, the top
+  level of a form std::format holds as itself; a choices value and a range
+  are handles, whose argument types std::format checks only when it runs.
+*******************************************************************************/
+
+module unit Adam.Compiler.Formats;
+
+import System.SysUtils, Adam.Compiler.AST, Adam.Compiler.Types;
+
+exported const
+  // The largest number a format writes: an argument id, a width, a precision (libc++'s
+  // __number_max, INT32_MAX)
+  ADAM_FORMATS_NUMBER_MAX: int64 = 2147483647;
+
+  // The most digits such a number is written with (libc++'s __parse_number)
+  ADAM_FORMATS_NUMBER_DIGITS: int64 = 10;
+
+type
+  // The fields a form's spec may write (libc++'s __fields): one it does not take is SM0502.
+  // RangeFill: a `:` first ends the range's own spec (its element's follows); ConsumeAll:
+  // the spec must end at the `}` (a range's element spec may follow its own)
+  SpecFields = record
+    Sign: bool;
+    Alternate: bool;
+    ZeroPad: bool;
+    Precision: bool;
+    Localized: bool;
+    TypeLetter: bool;
+    RangeFill: bool;
+    ClearBrackets: bool;
+    ConsumeAll: bool;
+  end;
+
+  // Where a format is read: its text, the canonical types of the arguments after it, the
+  // position, the next automatic argument id, and which numbering was used (automatic
+  // `{}`, manual `{0}`: never both)
+  ReaderState = record
+    Text: string;
+    Types: array of int64;
+    At: int64;
+    Next: int64;
+    Automatic: bool;
+    Manual: bool;
+  end;
+
+// The fields of no form: everything off (each form's routine turns its own on)
+routine DoNoFields(): SpecFields;
+var
+  LFields: SpecFields;
+begin
+  LFields.Sign := false;
+  LFields.Alternate := false;
+  LFields.ZeroPad := false;
+  LFields.Precision := false;
+  LFields.Localized := false;
+  LFields.TypeLetter := false;
+  LFields.RangeFill := false;
+  LFields.ClearBrackets := false;
+  LFields.ConsumeAll := false;
+  return LFields;
+end;
+
+// The fields the print form AForm's formatter parses (libc++'s __fields_integral for an
+// integer, a bool and a char, __fields_floating_point, __fields_string for the text forms
+// and a choices value, __fields_pointer, __fields_range)
+routine DoFieldsOf(const AForm: PrintForm): SpecFields;
+var
+  LFields: SpecFields;
+begin
+  LFields := DoNoFields();
+  if AForm = PrintForm.Range then
+    LFields.RangeFill := true;
+    LFields.ClearBrackets := true;
+    return LFields;
+  end;
+  LFields.TypeLetter := true;
+  LFields.ConsumeAll := true;
+  if (AForm = PrintForm.Integer) or (AForm = PrintForm.Boolean) or (AForm = PrintForm.Char) or
+    (AForm = PrintForm.Float) then
+    LFields.Sign := true;
+    LFields.Alternate := true;
+    LFields.ZeroPad := true;
+    LFields.Localized := true;
+    LFields.Precision := AForm = PrintForm.Float;
+    return LFields;
+  end;
+  if AForm = PrintForm.Address then
+    LFields.ZeroPad := true;
+    return LFields;
+  end;
+  // A text form or a choices value: the string formatter's
+  LFields.Precision := true;
+  return LFields;
+end;
+
+// True when AForm is one std::format holds as a handle (a formatter of its own: a choices
+// value, a range), whose width and precision argument types are checked when it runs
+routine DoIsHandle(const AForm: PrintForm): bool;
+begin
+  return (AForm = PrintForm.Choice) or (AForm = PrintForm.Range);
+end;
+
+// True when the form AForm takes a precision from an argument checked at compile time (the
+// float and string formatters: libc++'s _HasPrecision)
+routine DoHasPrecision(const AForm: PrintForm): bool;
+begin
+  return (AForm = PrintForm.Float) or (AForm = PrintForm.Text) or (AForm = PrintForm.WideText) or
+    (AForm = PrintForm.WideChar) or (AForm = PrintForm.CText) or (AForm = PrintForm.WideCText);
+end;
+
+// The type an element of the range type AType has (an array's element, a set's member)
+routine DoElementType(const ATree: ref SyntaxTree; const AType: int64): int64;
+begin
+  if ClassOf(ATree, AType) = TypeClass.SetType then
+    return SetElementOf(ATree, AType);
+  end;
+  return TargetOf(ATree, AType);
+end;
+
+// True when AState's text has a byte at its position and it is AChar
+routine DoIs(const AState: ReaderState; const AChar: char): bool;
+begin
+  return (AState.At < len(AState.Text)) and (AState.Text[AState.At] = AChar);
+end;
+
+// True when AState's text has a decimal digit at its position
+routine DoIsDigit(const AState: ReaderState): bool;
+begin
+  return (AState.At < len(AState.Text)) and (AState.Text[AState.At] >= '0') and
+    (AState.Text[AState.At] <= '9');
+end;
+
+// The number at the position (libc++'s __parse_number) into AValue, the position past
+// it; false when it is too large (past ADAM_FORMATS_NUMBER_MAX or its digits)
+routine DoNumber(var AState: ReaderState; var AValue: int64): bool;
+var
+  LDigits: int64;
+begin
+  AValue := 0;
+  LDigits := 0;
+  while DoIsDigit(AState) do
+    AValue := AValue * 10 + (int64(AState.Text[AState.At]) - int64('0'));
+    LDigits := LDigits + 1;
+    AState.At := AState.At + 1;
+    if (LDigits > ADAM_FORMATS_NUMBER_DIGITS) or (AValue > ADAM_FORMATS_NUMBER_MAX) then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// The next automatic argument id into AId (libc++'s next_arg_id): false once an id was
+// written (manual numbering) or when no argument is left
+routine DoAutomatic(var AState: ReaderState; var AId: int64): bool;
+begin
+  if AState.Manual then
+    return false;
+  end;
+  AState.Automatic := true;
+  if AState.Next >= len(AState.Types) then
+    return false;
+  end;
+  AId := AState.Next;
+  AState.Next := AState.Next + 1;
+  return true;
+end;
+
+// The written argument id AId checked (libc++'s check_arg_id): false after an automatic
+// one, or past the arguments
+routine DoManual(var AState: ReaderState; const AId: int64): bool;
+begin
+  if AState.Automatic then
+    return false;
+  end;
+  AState.Manual := true;
+  return AId < len(AState.Types);
+end;
+
+// The argument id at the position into AId (libc++'s __parse_arg_id): `0`, a number, or
+// none before a `:` or a `}` (the next automatic one)
+routine DoArgId(var AState: ReaderState; var AId: int64): bool;
+begin
+  if AState.At >= len(AState.Text) then
+    return false;
+  end;
+  if DoIs(AState, '0') then
+    AState.At := AState.At + 1;
+    AId := 0;
+    return DoManual(AState, 0);
+  end;
+  if DoIs(AState, ':') or DoIs(AState, '}') then
+    return DoAutomatic(AState, AId);
+  end;
+  if not DoIsDigit(AState) then
+    return false;
+  end;
+  if not DoNumber(AState, AId) then
+    return false;
+  end;
+  return DoManual(AState, AId);
+end;
+
+// The argument id of a width or a precision (its `{` passed: libc++'s
+// __format_spec::__parse_arg_id) into AId, then its `}`
+routine DoNestedId(var AState: ReaderState; var AId: int64): bool;
+begin
+  if not DoArgId(AState, AId) then
+    return false;
+  end;
+  if not DoIs(AState, '}') then
+    return false;
+  end;
+  AState.At := AState.At + 1;
+  return true;
+end;
+
+// The align the character AChar writes into AAlign (`<` `^` `>`); false for any other
+routine DoAlignOf(const AChar: char; var AAlign: FormatAlign): bool;
+begin
+  if AChar = '<' then
+    AAlign := FormatAlign.Left;
+    return true;
+  end;
+  if AChar = '^' then
+    AAlign := FormatAlign.Center;
+    return true;
+  end;
+  if AChar = '>' then
+    AAlign := FormatAlign.Right;
+    return true;
+  end;
+  return false;
+end;
+
+// The bytes of the UTF-8 sequence its lead byte AByte starts (the format is a literal the
+// lexer read as valid UTF-8)
+routine DoUtf8Length(const AByte: char): int64;
+var
+  LByte: int64;
+begin
+  LByte := int64(uint8(AByte));
+  if LByte >= 240 then
+    return 4;
+  end;
+  if LByte >= 224 then
+    return 3;
+  end;
+  if LByte >= 192 then
+    return 2;
+  end;
+  return 1;
+end;
+
+// Fill and align at the position into ASpec (libc++'s __parse_fill_align): one code point
+// then an align character sets both, an align character alone the align; false for a `{`
+// fill
+routine DoFillAlign(var AState: ReaderState; var ASpec: FormatSpec): bool;
+var
+  LLength: int64;
+  LAlign: FormatAlign;
+  LI: int64;
+begin
+  if AState.At >= len(AState.Text) then
+    return true;
+  end;
+  LLength := DoUtf8Length(AState.Text[AState.At]);
+  if (AState.At + LLength < len(AState.Text)) and
+    DoAlignOf(AState.Text[AState.At + LLength], LAlign) then
+    if (LLength = 1) and (AState.Text[AState.At] = '{') then
+      return false;
+    end;
+    ASpec.Fill := "";
+    for LI := 0 to LLength - 1 do
+      ASpec.Fill := ASpec.Fill + AState.Text[AState.At + LI];
+    end;
+    ASpec.Align := LAlign;
+    AState.At := AState.At + LLength + 1;
+    return true;
+  end;
+  if DoAlignOf(AState.Text[AState.At], LAlign) then
+    ASpec.Align := LAlign;
+    AState.At := AState.At + 1;
+  end;
+  return true;
+end;
+
+// The sign at the position into ASpec; false when the form does not take one (AAllowed)
+routine DoSign(var AState: ReaderState; const AAllowed: bool; var ASpec: FormatSpec): bool;
+begin
+  if DoIs(AState, '+') then
+    ASpec.Sign := FormatSign.Plus;
+  else
+    if DoIs(AState, '-') then
+      ASpec.Sign := FormatSign.Minus;
+    else
+      if DoIs(AState, ' ') then
+        ASpec.Sign := FormatSign.Space;
+      else
+        return true;
+      end;
+    end;
+  end;
+  AState.At := AState.At + 1;
+  return AAllowed;
+end;
+
+// `#` and `0` at the position into ASpec; false for one the form does not take (AFields).
+// A `0` pads with zeros only when no align was written (libc++'s __zero_padding)
+routine DoAlternateZero(var AState: ReaderState; const AFields: SpecFields;
+  var ASpec: FormatSpec): bool;
+begin
+  if DoIs(AState, '#') then
+    if not AFields.Alternate then
+      return false;
+    end;
+    ASpec.Alternate := true;
+    AState.At := AState.At + 1;
+  end;
+  if DoIs(AState, '0') then
+    if not AFields.ZeroPad then
+      return false;
+    end;
+    if ASpec.Align = FormatAlign.None then
+      ASpec.ZeroPad := true;
+    end;
+    AState.At := AState.At + 1;
+  end;
+  return true;
+end;
+
+// The width at the position into ASpec: a number (never with a leading zero) or `{id}`
+routine DoWidth(var AState: ReaderState; var ASpec: FormatSpec): bool;
+var
+  LValue: int64;
+begin
+  if DoIs(AState, '0') then
+    return false;
+  end;
+  if DoIs(AState, '{') then
+    AState.At := AState.At + 1;
+    if not DoNestedId(AState, LValue) then
+      return false;
+    end;
+    ASpec.WidthArgument := int32(LValue);
+    return true;
+  end;
+  if DoIsDigit(AState) then
+    if not DoNumber(AState, LValue) then
+      return false;
+    end;
+    ASpec.Width := int32(LValue);
+  end;
+  return true;
+end;
+
+// The precision at the position into ASpec: `.` then a number or `{id}`; false when the
+// form does not take one (AAllowed) or nothing follows the `.`
+routine DoPrecision(var AState: ReaderState; const AAllowed: bool; var ASpec: FormatSpec): bool;
+var
+  LValue: int64;
+begin
+  if not DoIs(AState, '.') then
+    return true;
+  end;
+  if not AAllowed then
+    return false;
+  end;
+  AState.At := AState.At + 1;
+  if DoIs(AState, '{') then
+    AState.At := AState.At + 1;
+    if not DoNestedId(AState, LValue) then
+      return false;
+    end;
+    ASpec.PrecisionArgument := int32(LValue);
+    return true;
+  end;
+  if not DoIsDigit(AState) then
+    return false;
+  end;
+  if not DoNumber(AState, LValue) then
+    return false;
+  end;
+  ASpec.Precision := int32(LValue);
+  return true;
+end;
+
+// True when AChar is a type letter std::format reads (libc++'s __parse_type)
+routine DoIsTypeLetter(const AChar: char): bool;
+begin
+  return (AChar = 'A') or (AChar = 'B') or (AChar = 'E') or (AChar = 'F') or (AChar = 'G') or
+    (AChar = 'X') or (AChar = 'a') or (AChar = 'b') or (AChar = 'c') or (AChar = 'd') or
+    (AChar = 'e') or (AChar = 'f') or (AChar = 'g') or (AChar = 'o') or (AChar = 'p') or
+    (AChar = 'P') or (AChar = 's') or (AChar = 'x') or (AChar = '?');
+end;
+
+// `L`, `n` and the type letter at the position into ASpec; false for `L` or `n` the form
+// does not take (AFields)
+routine DoTail(var AState: ReaderState; const AFields: SpecFields; var ASpec: FormatSpec): bool;
+begin
+  if DoIs(AState, 'L') then
+    if not AFields.Localized then
+      return false;
+    end;
+    ASpec.Localized := true;
+    AState.At := AState.At + 1;
+  end;
+  if DoIs(AState, 'n') then
+    if not AFields.ClearBrackets then
+      return false;
+    end;
+    ASpec.ClearBrackets := true;
+    AState.At := AState.At + 1;
+  end;
+  if AFields.TypeLetter and (AState.At < len(AState.Text)) and
+    DoIsTypeLetter(AState.Text[AState.At]) then
+    ASpec.Presentation := "" + AState.Text[AState.At];
+    AState.At := AState.At + 1;
+  end;
+  return true;
+end;
+
+// The std-format-spec at the position into ASpec (libc++'s __parser::__parse), AFields the
+// fields its form takes; the position past it, at its `}` when AFields.ConsumeAll
+routine DoStdSpec(var AState: ReaderState; const AFields: SpecFields; var ASpec: FormatSpec): bool;
+begin
+  if (AState.At >= len(AState.Text)) or DoIs(AState, '}') or (AFields.RangeFill and DoIs(AState, ':')) then
+    return true;
+  end;
+  if not DoFillAlign(AState, ASpec) then
+    return false;
+  end;
+  if not DoSign(AState, AFields.Sign, ASpec) then
+    return false;
+  end;
+  if not DoAlternateZero(AState, AFields, ASpec) then
+    return false;
+  end;
+  if not DoWidth(AState, ASpec) then
+    return false;
+  end;
+  if not DoPrecision(AState, AFields.Precision, ASpec) then
+    return false;
+  end;
+  if not DoTail(AState, AFields, ASpec) then
+    return false;
+  end;
+  return (not AFields.ConsumeAll) or (AState.At >= len(AState.Text)) or DoIs(AState, '}');
+end;
+
+// True when ASpec writes nothing a bool or a char shown as text takes (libc++'s
+// __fields_bool: no sign, no `#`, no zero padding)
+routine DoTextFieldsOnly(const ASpec: FormatSpec): bool;
+begin
+  return (ASpec.Sign = FormatSign.None) and (not ASpec.Alternate) and (not ASpec.ZeroPad);
+end;
+
+// True when APresentation is a letter that writes an integer's digits (b B o d x X)
+routine DoIsIntegerLetter(const APresentation: string): bool;
+begin
+  return (APresentation = "b") or (APresentation = "B") or (APresentation = "o") or
+    (APresentation = "d") or (APresentation = "x") or (APresentation = "X");
+end;
+
+// True when the spec ASpec read for the form AForm is one its formatter takes (libc++'s
+// __process_parsed_integer / _bool / _char / _floating_point, __process_display_type_string
+// and _pointer)
+routine DoSpecFits(const AForm: PrintForm; const ASpec: FormatSpec): bool;
+var
+  LType: string;
+begin
+  LType := ASpec.Presentation;
+  if AForm = PrintForm.Integer then
+    if LType = "c" then
+      return DoTextFieldsOnly(ASpec);
+    end;
+    return (LType = "") or DoIsIntegerLetter(LType);
+  end;
+  if AForm = PrintForm.Boolean then
+    if (LType = "") or (LType = "s") then
+      return DoTextFieldsOnly(ASpec);
+    end;
+    return DoIsIntegerLetter(LType);
+  end;
+  if AForm = PrintForm.Char then
+    if (LType = "") or (LType = "c") or (LType = "?") then
+      return DoTextFieldsOnly(ASpec);
+    end;
+    return DoIsIntegerLetter(LType);
+  end;
+  if AForm = PrintForm.Float then
+    return (LType = "") or (LType = "a") or (LType = "A") or (LType = "e") or (LType = "E") or
+      (LType = "f") or (LType = "F") or (LType = "g") or (LType = "G");
+  end;
+  if AForm = PrintForm.Address then
+    return (LType = "") or (LType = "p") or (LType = "P");
+  end;
+  // A text form or a choices value: the string formatter's
+  return (LType = "") or (LType = "s") or (LType = "?");
+end;
+
+// True when the argument AId a width or a precision takes is a standard integer (libc++'s
+// __compile_time_validate_argument: never a bool or a char)
+routine DoIsCount(const ATree: ref SyntaxTree; const AState: ReaderState; const AId: int32): bool;
+begin
+  return (AId < 0) or (PrintFormOf(ATree, AState.Types[AId]) = PrintForm.Integer);
+end;
+
+// The spec of an argument's type (DoSpecOf below: a range's element spec is one too)
+forward routine DoSpecOf(const ATree: ref SyntaxTree; var AState: ReaderState; const AType: int64;
+  const ATopLevel: bool; var ASpecs: array of FormatSpec): bool;
+
+// The spec of a range type AType at the position (libc++'s range_formatter::parse) into
+// ASpecs: its own spec, then its element's when one is written after a `:`
+routine DoRangeSpec(const ATree: ref SyntaxTree; var AState: ReaderState; const AType: int64;
+  var ASpecs: array of FormatSpec): bool;
+var
+  LSpec: FormatSpec;
+  LElement: int64;
+  LCount: int64;
+  LUnder: bool;
+begin
+  LSpec := DefaultFormatSpec();
+  if not DoStdSpec(AState, DoFieldsOf(PrintForm.Range), LSpec) then
+    return false;
+  end;
+  // The range's own type: s or ?s for a range of chars only (no PaskalCPP element is a
+  // pair, so never m)
+  LElement := DoElementType(ATree, AType);
+  if DoIs(AState, 's') or DoIs(AState, '?') then
+    if PrintFormOf(ATree, LElement) <> PrintForm.Char then
+      return false;
+    end;
+    if DoIs(AState, '?') then
+      AState.At := AState.At + 1;
+      if not DoIs(AState, 's') then
+        return false;
+      end;
+      LSpec.Presentation := "?s";
+    else
+      LSpec.Presentation := "s";
+    end;
+    AState.At := AState.At + 1;
+  end;
+  if DoIs(AState, 'm') then
+    return false;
+  end;
+  LCount := len(ASpecs);
+  setlength(ASpecs, LCount + 1);
+  ASpecs[LCount] := LSpec;
+  LUnder := DoIs(AState, ':');
+  if LUnder then
+    AState.At := AState.At + 1;
+    if not DoSpecOf(ATree, AState, LElement, false, ASpecs) then
+      return false;
+    end;
+  else
+    if (AState.At < len(AState.Text)) and (not DoIs(AState, '}')) then
+      return false;
+    end;
+  end;
+  // s / ?s take no n and no element spec
+  return (LSpec.Presentation = "") or ((not LSpec.ClearBrackets) and (not LUnder));
+end;
+
+// The spec of an argument of type AType at the position into ASpecs (appended: its own,
+// then its element's for a range); ATopLevel: the argument itself (its width and precision
+// argument types are checked unless its form is a handle), not a range's element
+routine DoSpecOf(const ATree: ref SyntaxTree; var AState: ReaderState; const AType: int64;
+  const ATopLevel: bool; var ASpecs: array of FormatSpec): bool;
+var
+  LForm: PrintForm;
+  LSpec: FormatSpec;
+  LCount: int64;
+begin
+  LForm := PrintFormOf(ATree, AType);
+  if LForm = PrintForm.Range then
+    return DoRangeSpec(ATree, AState, AType, ASpecs);
+  end;
+  LSpec := DefaultFormatSpec();
+  if not DoStdSpec(AState, DoFieldsOf(LForm), LSpec) then
+    return false;
+  end;
+  if not DoSpecFits(LForm, LSpec) then
+    return false;
+  end;
+  if ATopLevel and (not DoIsHandle(LForm)) then
+    if not DoIsCount(ATree, AState, LSpec.WidthArgument) then
+      return false;
+    end;
+    if DoHasPrecision(LForm) and (not DoIsCount(ATree, AState, LSpec.PrecisionArgument)) then
+      return false;
+    end;
+  end;
+  LCount := len(ASpecs);
+  setlength(ASpecs, LCount + 1);
+  ASpecs[LCount] := LSpec;
+  return true;
+end;
+
+// One replacement field (its `{` passed: libc++'s __handle_replacement_field) into AItem:
+// its argument id, a `:` and its spec or none (the form's defaults), its `}`
+routine DoField(const ATree: ref SyntaxTree; var AState: ReaderState; var AItem: FormatItem): bool;
+var
+  LId: int64;
+begin
+  if not DoArgId(AState, LId) then
+    return false;
+  end;
+  AItem.Argument := int32(LId);
+  setlength(AItem.Specs, 0);
+  if DoIs(AState, ':') then
+    AState.At := AState.At + 1;
+    if not DoSpecOf(ATree, AState, AState.Types[LId], true, AItem.Specs) then
+      return false;
+    end;
+  else
+    if not DoIs(AState, '}') then
+      return false;
+    end;
+    setlength(AItem.Specs, 1);
+    AItem.Specs[0] := DefaultFormatSpec();
+  end;
+  if not DoIs(AState, '}') then
+    return false;
+  end;
+  AState.At := AState.At + 1;
+  return true;
+end;
+
+// The print / println format AText (its decoded UTF-8) read against the arguments after
+// it, ATypes their canonical types in order, as libc++'s compile-time check reads it
+// (__vformat_to: `{{` and `}}` are one brace each, any other brace opens or closes a
+// replacement field): true with APlan filled when std::format takes it, false when it
+// would refuse it (SM0502). Arguments no placeholder names are allowed
+exported routine ReadFormat(const ATree: ref SyntaxTree; const AText: string;
+  const ATypes: array of int64; var APlan: FormatPlan): bool;
+var
+  LState: ReaderState;
+  LPart: string;
+  LItem: FormatItem;
+  LCount: int64;
+begin
+  setlength(APlan.Items, 0);
+  APlan.Tail := "";
+  LState.Text := AText;
+  LState.Types := ATypes;
+  LState.At := 0;
+  LState.Next := 0;
+  LState.Automatic := false;
+  LState.Manual := false;
+  LPart := "";
+  while LState.At < len(AText) do
+    if AText[LState.At] = '{' then
+      LState.At := LState.At + 1;
+      if LState.At >= len(AText) then
+        return false;
+      end;
+      if AText[LState.At] = '{' then
+        LPart := LPart + '{';
+        LState.At := LState.At + 1;
+      else
+        LItem.Text := LPart;
+        if not DoField(ATree, LState, LItem) then
+          return false;
+        end;
+        LCount := len(APlan.Items);
+        setlength(APlan.Items, LCount + 1);
+        APlan.Items[LCount] := LItem;
+        LPart := "";
+      end;
+    else
+      if AText[LState.At] = '}' then
+        LState.At := LState.At + 1;
+        if (LState.At >= len(AText)) or (AText[LState.At] <> '}') then
+          return false;
+        end;
+      end;
+      LPart := LPart + AText[LState.At];
+      LState.At := LState.At + 1;
+    end;
+  end;
+  APlan.Tail := LPart;
+  return true;
+end;
+
+end.

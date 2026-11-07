@@ -1,0 +1,1291 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.X64.Encode.adam - x86_64 machine code bytes (DESIGN sec 6)
+
+  The last step of the x86_64 chain for one function: an allocated
+  MachineFunction (Adam.X64.Allocate: physical registers only, every memory
+  place a register plus a displacement, or a symbol rip-relative) becomes
+  bytes at the end of a code section of a SectionSet, with the relocations
+  its symbols need. The forms are the Intel SDM's (Vol. 2):
+
+  prefixes  66 (a 2-byte operation; also movd / movq's), F3 / F2 (movss /
+            movsd and their arithmetic), then REX: W a 64-bit operation, R /
+            B the high bit of the ModRM reg / rm (or base) register, and a
+            bare 40 when a 1-byte operation names spl, bpl, sil or dil (which
+            without REX would be ah, ch, dh or bh)
+  ModRM     mod 11 a register; [base] mod 00, [base+disp8] mod 01,
+            [base+disp32] mod 10; rsp / r12 as a base need the SIB byte 24
+            (no index); rbp / r13 with no displacement take a zero disp8 (mod
+            00 there means rip); [rip+symbol] is mod 00 rm 101 and a disp32
+            the relocation fills
+  jumps     jcc 0F 80+cc rel32 and jmp E9 rel32 to a block of the function
+            (always rel32: debug code is not relaxed), patched once every
+            block is placed
+  calls     E8 rel32 to a code symbol; FF /2 through a register or memory (an
+            import: call [rip+import])
+
+  Every relocation is Rel32 against its symbol (Sections: S + Addend - (P +
+  4)); its addend is minus the bytes after the field (an immediate after a
+  rip-relative displacement). A function starts at a 16-byte boundary (int3
+  bytes fill up to it) and its symbol is defined there.
+
+  EncodedFunction  where a function landed: its symbol, section, start and
+                   size, and as offsets from its start where each block
+                   starts, where each instruction ends (blocks in order) and
+                   where each prologue instruction ends (unwind data reads
+                   them, Adam.Win64.Unwind)
+  EncodeFunction   encodes one function. What encoding cannot take raises:
+                   selection and allocation made it, so it is a compiler bug
+                   (not allocated, not a code section, a virtual register, an
+                   unplaced memory base, a register number or class that does
+                   not fit, a bad operation size, an immediate or displacement
+                   out of range, a form with no encoding, a jump outside the
+                   function); the message names the instruction ("add2 m0 i3")
+*******************************************************************************/
+
+module unit Adam.X64.Encode;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Sections, Adam.X64.Registers,
+  Adam.X64.Machine;
+
+exported const
+  // Raised (an invariant broken) by what encoding cannot take (see the header)
+  ADAM_X64_ENCODE_FAULT_UNALLOCATED: string = "X64 encode: not allocated: ";
+  ADAM_X64_ENCODE_FAULT_SECTION: string = "X64 encode: not a code section: ";
+  ADAM_X64_ENCODE_FAULT_VIRTUAL: string = "X64 encode: a virtual register: ";
+  ADAM_X64_ENCODE_FAULT_BASE: string = "X64 encode: an unplaced memory base: ";
+  ADAM_X64_ENCODE_FAULT_REGISTER: string = "X64 encode: no register ";
+  ADAM_X64_ENCODE_FAULT_CLASS: string = "X64 encode: a register of the wrong class: ";
+  ADAM_X64_ENCODE_FAULT_WIDTH: string = "X64 encode: a bad operation size: ";
+  ADAM_X64_ENCODE_FAULT_RANGE: string = "X64 encode: out of range: ";
+  ADAM_X64_ENCODE_FAULT_FORM: string = "X64 encode: no encoding for ";
+  ADAM_X64_ENCODE_FAULT_BLOCK: string = "X64 encode: no block ";
+  // A function's alignment in its section, and the byte that fills up to it (int3)
+  ADAM_X64_ENCODE_ALIGN: int64 = 16;
+  ADAM_X64_ENCODE_FILL: int64 = 0xCC;
+  // The range of a 32-bit field: sign-extended, and the largest a 32-bit operation takes
+  ADAM_X64_ENCODE_INT32_MIN: int64 = -2147483648;
+  ADAM_X64_ENCODE_INT32_MAX: int64 = 2147483647;
+  ADAM_X64_ENCODE_UINT32_MAX: int64 = 4294967295;
+
+exported type
+  // Where one function landed (see the header); the lists' offsets are from StartOffset
+  EncodedFunction = object
+    Symbol: string;
+    // The function's symbol in the SectionSet, its section, where it starts there and the
+    // bytes it took
+    SymbolId: int64;
+    SectionId: int64;
+    StartOffset: int64;
+    ByteCount: int64;
+    // Where each block starts, where each instruction ends (blocks in order), where each
+    // prologue instruction ends
+    BlockStarts: ref Int64List;
+    InstrEnds: ref Int64List;
+    PrologueEnds: ref Int64List;
+
+    init(const ASymbol: string; const ASectionId: int64);
+    begin
+      self.Symbol := ASymbol;
+      self.SymbolId := 0;
+      self.SectionId := ASectionId;
+      self.StartOffset := 0;
+      self.ByteCount := 0;
+      self.BlockStarts := ref Int64List();
+      self.InstrEnds := ref Int64List();
+      self.PrologueEnds := ref Int64List();
+    end;
+  end;
+
+type
+  // Encodes one function (EncodeFunction makes one per function)
+  X64Encoder = object
+    hidden FMachine: ref MachineFunction;
+    hidden FSections: ref SectionSet;
+    hidden FSection: ref Section;
+    hidden FResult: ref EncodedFunction;
+    hidden FRegisters: ref X64Registers;
+    // The instruction being encoded: where it is and its text (for faults), its AST node
+    // (a symbol's first reference)
+    hidden FWhere: string;
+    hidden FOpText: string;
+    hidden FNode: int64;
+    // The jumps to patch: each rel32 field's offset in the section, and its target block
+    hidden FFixFields: ref Int64List;
+    hidden FFixBlocks: ref Int64List;
+
+    init(const AMachine: ref MachineFunction; const ASections: ref SectionSet;
+      const ASectionId: int64);
+    begin
+      self.FMachine := AMachine;
+      self.FSections := ASections;
+      self.FSection := ASections.SectionAt(ASectionId);
+      self.FResult := ref EncodedFunction(AMachine.Symbol, ASectionId);
+      self.FRegisters := ref X64Registers();
+      self.FWhere := "";
+      self.FOpText := "";
+      self.FNode := 0;
+      self.FFixFields := ref Int64List();
+      self.FFixBlocks := ref Int64List();
+    end;
+
+    // Encodes the function at the end of the section (at a 16-byte boundary) and defines
+    // its symbol there; returns where it landed
+    method Run(): ref EncodedFunction;
+    var
+      LBlock: int64;
+    begin
+      if self.FMachine.Frame = nil then
+        raise(ADAM_X64_ENCODE_FAULT_UNALLOCATED + self.FMachine.Symbol);
+      end;
+      if self.FSection.Kind <> SectionKind.Code then
+        raise(ADAM_X64_ENCODE_FAULT_SECTION + self.FSection.SectionName);
+      end;
+      self.FSection.AlignTo(ADAM_X64_ENCODE_ALIGN, uint8(ADAM_X64_ENCODE_FILL));
+      self.FResult.StartOffset := self.FSection.Size();
+      self.FResult.SymbolId := self.FSections.DefineSymbol(self.FMachine.Symbol,
+        self.FResult.SectionId, self.FResult.StartOffset, self.FMachine.Node);
+      if self.FMachine.Internal then
+        self.FSections.MakeInternal(self.FResult.SymbolId);
+      end;
+      for LBlock := 0 to self.FMachine.BlockCount - 1 do
+        self.FResult.BlockStarts.Add(self.DoHere());
+        self.DoBlock(LBlock);
+      end;
+      self.DoPatchJumps();
+      self.FResult.ByteCount := self.DoHere();
+      return self.FResult;
+    end;
+
+    // The section's end as an offset from the function's start
+    hidden const method DoHere(): int64;
+    begin
+      return self.FSection.Size() - self.FResult.StartOffset;
+    end;
+
+    // Block ABlock's instructions, each one's end (and a prologue one's) recorded
+    hidden method DoBlock(const ABlock: int64);
+    var
+      LBlock: ref MachineBlock;
+      LInstr: ref MachineInstr;
+      LI: int64;
+    begin
+      LBlock := self.FMachine.BlockAt(ABlock);
+      for LI := 0 to LBlock.InstrCount - 1 do
+        LInstr := LBlock.InstrAt(LI);
+        self.FWhere := self.FMachine.Symbol + " m" + IntToStr(ABlock) + " i" + IntToStr(LI);
+        self.FOpText := self.DoOpText(LInstr);
+        self.FNode := LInstr.Node;
+        self.DoCheckOperands(LInstr);
+        self.DoInstr(LInstr);
+        self.FResult.InstrEnds.Add(self.DoHere());
+        if LInstr.Prologue then
+          self.FResult.PrologueEnds.Add(self.DoHere());
+        end;
+      end;
+    end;
+
+    // AInstr's mnemonic, with its operation size for the ops that have one ("mov.8")
+    hidden const method DoOpText(const AInstr: ref MachineInstr): string;
+    begin
+      if X64OpHasWidth(AInstr.Op) then
+        return X64OpText(AInstr.Op) + "." + IntToStr(AInstr.Width);
+      end;
+      return X64OpText(AInstr.Op);
+    end;
+
+    // Raises AFault naming AWhat and the instruction being encoded
+    hidden method DoFault(const AFault: string; const AWhat: string);
+    begin
+      raise(AFault + AWhat + " at " + self.FWhere);
+    end;
+
+    // Every operand of AInstr is something encoding takes: no virtual register, a register
+    // number the arch has, a memory place over a physical register or a symbol
+    hidden method DoCheckOperands(const AInstr: ref MachineInstr);
+    var
+      LOperand: ref MachineOperand;
+      LI: int64;
+    begin
+      for LI := 0 to AInstr.OperandCount - 1 do
+        LOperand := AInstr.OperandAt(LI);
+        if LOperand.Kind = OperandKind.VirtualReg then
+          self.DoFault(ADAM_X64_ENCODE_FAULT_VIRTUAL, "v" + IntToStr(LOperand.Reg));
+        end;
+        if LOperand.Kind = OperandKind.PhysicalReg then
+          self.DoCheckRegister(LOperand.Reg);
+        end;
+        if LOperand.Kind = OperandKind.Memory then
+          self.DoCheckMemory(LOperand);
+        end;
+      end;
+    end;
+
+    // Register number AReg is one the arch has
+    hidden method DoCheckRegister(const AReg: int64);
+    begin
+      if (AReg < 0) or (AReg >= self.FRegisters.Count()) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_REGISTER, IntToStr(AReg));
+      end;
+    end;
+
+    // Memory AOperand is over a physical register or a symbol (allocation resolved slots and
+    // the argument areas off rsp), its displacement a 32-bit field's
+    hidden method DoCheckMemory(const AOperand: ref MachineOperand);
+    begin
+      if (AOperand.Disp < ADAM_X64_ENCODE_INT32_MIN) or (AOperand.Disp > ADAM_X64_ENCODE_INT32_MAX) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_RANGE, IntToStr(AOperand.Disp));
+      end;
+      if AOperand.Base = MemoryBase.Slot then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_BASE, "slot" + IntToStr(AOperand.SlotIndex));
+      end;
+      if AOperand.Base = MemoryBase.Incoming then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_BASE, "incoming");
+      end;
+      if AOperand.Base = MemoryBase.Outgoing then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_BASE, "outgoing");
+      end;
+      if AOperand.Base = MemoryBase.Register then
+        if AOperand.BaseVirtual then
+          self.DoFault(ADAM_X64_ENCODE_FAULT_VIRTUAL, "v" + IntToStr(AOperand.Reg));
+        end;
+        self.DoCheckRegister(AOperand.Reg);
+      end;
+    end;
+
+    // General register AReg's encoding number (0..15); a vector register is the class fault
+    hidden method DoGeneral(const AReg: int64): int64;
+    begin
+      if AReg >= ADAM_X64_FIRST_XMM then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_CLASS, self.FRegisters.Text(AReg));
+      end;
+      return AReg;
+    end;
+
+    // Vector register AReg's encoding number (xmm0..xmm15 as 0..15); a general register is
+    // the class fault
+    hidden method DoVector(const AReg: int64): int64;
+    begin
+      if AReg < ADAM_X64_FIRST_XMM then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_CLASS, self.FRegisters.Text(AReg));
+      end;
+      return AReg - ADAM_X64_FIRST_XMM;
+    end;
+
+    // What AOperand is (its registers were checked by DoCheckOperands)
+    hidden const method DoIsRegister(const AOperand: ref MachineOperand): bool;
+    begin
+      return AOperand.Kind = OperandKind.PhysicalReg;
+    end;
+
+    hidden const method DoIsVector(const AOperand: ref MachineOperand): bool;
+    begin
+      return (AOperand.Kind = OperandKind.PhysicalReg) and (AOperand.Reg >= ADAM_X64_FIRST_XMM);
+    end;
+
+    hidden const method DoIsMemory(const AOperand: ref MachineOperand): bool;
+    begin
+      return AOperand.Kind = OperandKind.Memory;
+    end;
+
+    hidden const method DoIsImmediate(const AOperand: ref MachineOperand): bool;
+    begin
+      return AOperand.Kind = OperandKind.Immediate;
+    end;
+
+    // AIfTrue when ACondition holds, else AIfFalse
+    hidden const method DoPick(const ACondition: bool; const AIfTrue: int64;
+      const AIfFalse: int64): int64;
+    begin
+      if ACondition then
+        return AIfTrue;
+      end;
+      return AIfFalse;
+    end;
+
+    // The operand-size prefix of an AWidth-byte operation: 66 for 2 bytes, else none (0)
+    hidden const method DoSizePrefix(const AWidth: int64): int64;
+    begin
+      if AWidth = 2 then
+        return 0x66;
+      end;
+      return 0;
+    end;
+
+    // The bytes of an AWidth-byte operation's immediate (an 8-byte one takes 4,
+    // sign-extended)
+    hidden const method DoImmBytes(const AWidth: int64): int64;
+    begin
+      if AWidth = 8 then
+        return 4;
+      end;
+      return AWidth;
+    end;
+
+    // AInstr has ACount operands, else the form fault
+    hidden method DoNeed(const AInstr: ref MachineInstr; const ACount: int64);
+    begin
+      if AInstr.OperandCount <> ACount then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+      end;
+    end;
+
+    // AInstr's operation size is 1, 2, 4 or 8 bytes, else the size fault
+    hidden method DoCheckWidth(const AInstr: ref MachineInstr);
+    begin
+      if (AInstr.Width <> 1) and (AInstr.Width <> 2) and (AInstr.Width <> 4) and
+        (AInstr.Width <> 8) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_WIDTH, self.FOpText);
+      end;
+    end;
+
+    // AValue fits the immediate of an AWidth-byte operation: 1 and 2 bytes signed or
+    // unsigned, 4 bytes int32 or uint32, 8 bytes int32 (sign-extended); else the range fault
+    hidden method DoCheckImmediate(const AValue: int64; const AWidth: int64);
+    var
+      LLow: int64;
+      LHigh: int64;
+    begin
+      LLow := ADAM_X64_ENCODE_INT32_MIN;
+      LHigh := ADAM_X64_ENCODE_INT32_MAX;
+      if AWidth = 1 then
+        LLow := -128;
+        LHigh := 255;
+      end;
+      if AWidth = 2 then
+        LLow := -32768;
+        LHigh := 65535;
+      end;
+      if AWidth = 4 then
+        LHigh := ADAM_X64_ENCODE_UINT32_MAX;
+      end;
+      if (AValue < LLow) or (AValue > LHigh) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_RANGE, IntToStr(AValue));
+      end;
+    end;
+
+    // One byte
+    hidden method DoByte(const AValue: int64);
+    begin
+      self.FSection.Put8(uint64(AValue));
+    end;
+
+    // The low ASize (1, 2, 4 or 8) bytes of AValue, little-endian
+    hidden method DoImm(const AValue: int64; const ASize: int64);
+    begin
+      if ASize = 1 then
+        self.FSection.Put8(uint64(AValue));
+      end;
+      if ASize = 2 then
+        self.FSection.Put16(uint64(AValue));
+      end;
+      if ASize = 4 then
+        self.FSection.Put32(uint64(AValue));
+      end;
+      if ASize = 8 then
+        self.FSection.Put64(uint64(AValue));
+      end;
+    end;
+
+    // One instruction's prefix, REX, opcode and ModRM operand (see the header). APrefix: 0
+    // (none) or 66 / F3 / F2; AWide: REX.W; AEscape: 0F before AOpcode; AReg: the ModRM
+    // reg field, a register's encoding number or (ADigit) an opcode digit; ARm: the rm
+    // operand, a general register, a vector one (ARmVector) or memory; AByte: a 1-byte
+    // operation (spl, bpl, sil and dil need a REX); ATail: the bytes the caller puts after
+    // it (a rip-relative field's addend subtracts them)
+    hidden method DoEncode(const APrefix: int64; const AWide: bool; const AEscape: bool;
+      const AOpcode: int64; const AReg: int64; const ADigit: bool;
+      const ARm: ref MachineOperand; const ARmVector: bool; const AByte: bool;
+      const ATail: int64);
+    begin
+      self.DoEncodeBytes(APrefix, AWide, AEscape, AOpcode, AReg, ADigit, ARm, ARmVector, AByte,
+        AByte, ATail);
+    end;
+
+    // DoEncode with the 1-byte register rule per field: AByteReg for the reg field, AByteRm
+    // for a register rm (movzx / movsx read a 1-byte rm into a wider reg)
+    hidden method DoEncodeBytes(const APrefix: int64; const AWide: bool; const AEscape: bool;
+      const AOpcode: int64; const AReg: int64; const ADigit: bool;
+      const ARm: ref MachineOperand; const ARmVector: bool; const AByteReg: bool;
+      const AByteRm: bool; const ATail: int64);
+    var
+      LRm: int64;
+      LRex: int64;
+      LForce: bool;
+    begin
+      LRm := self.DoRmNumber(ARm, ARmVector);
+      LRex := 0;
+      if AWide then
+        LRex := LRex + 8;
+      end;
+      if (not ADigit) and (AReg >= 8) then
+        LRex := LRex + 4;
+      end;
+      if LRm >= 8 then
+        LRex := LRex + 1;
+      end;
+      LForce := false;
+      if AByteReg and (not ADigit) and (AReg >= 4) and (AReg <= 7) then
+        LForce := true;
+      end;
+      if AByteRm and self.DoIsRegister(ARm) and (LRm >= 4) and (LRm <= 7) then
+        LForce := true;
+      end;
+      if APrefix <> 0 then
+        self.DoByte(APrefix);
+      end;
+      if (LRex <> 0) or LForce then
+        self.DoByte(0x40 + LRex);
+      end;
+      if AEscape then
+        self.DoByte(0x0F);
+      end;
+      self.DoByte(AOpcode);
+      self.DoModRM(AReg & 7, ARm, LRm, ATail);
+    end;
+
+    // The encoding number of ARm's register (a vector one when AVector) or memory base
+    // register; -1 for a rip-relative symbol; anything else is the form fault
+    hidden method DoRmNumber(const ARm: ref MachineOperand; const AVector: bool): int64;
+    begin
+      if self.DoIsRegister(ARm) then
+        if AVector then
+          return self.DoVector(ARm.Reg);
+        end;
+        return self.DoGeneral(ARm.Reg);
+      end;
+      if self.DoIsMemory(ARm) and (ARm.Base = MemoryBase.Register) then
+        return self.DoGeneral(ARm.Reg);
+      end;
+      if self.DoIsMemory(ARm) and (ARm.Base = MemoryBase.RipSymbol) then
+        return -1;
+      end;
+      self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+      return -1;
+    end;
+
+    // The ModRM byte (reg field AReg3) for ARm, then its SIB byte, displacement or
+    // rip-relative field (see the header); ARmNumber is DoRmNumber's
+    hidden method DoModRM(const AReg3: int64; const ARm: ref MachineOperand;
+      const ARmNumber: int64; const ATail: int64);
+    var
+      LBase: int64;
+      LMod: int64;
+      LField: int64;
+      LSymbol: int64;
+    begin
+      if self.DoIsRegister(ARm) then
+        self.DoByte(0xC0 + AReg3 * 8 + (ARmNumber & 7));
+        return;
+      end;
+      if ARm.Base = MemoryBase.RipSymbol then
+        LSymbol := self.DoSymbolOf(ARm);
+        self.DoByte(AReg3 * 8 + 5);
+        LField := self.FSection.Size();
+        self.FSection.Put32(0);
+        self.FSections.AddReloc(self.FResult.SectionId, LField, RelocKind.Rel32, LSymbol,
+          ARm.Disp - ATail);
+        return;
+      end;
+      LBase := ARmNumber & 7;
+      LMod := 2;
+      if (ARm.Disp >= -128) and (ARm.Disp <= 127) then
+        LMod := 1;
+      end;
+      if (ARm.Disp = 0) and (LBase <> 5) then
+        LMod := 0;
+      end;
+      self.DoByte(LMod * 64 + AReg3 * 8 + LBase);
+      if LBase = 4 then
+        self.DoByte(0x24);
+      end;
+      if LMod = 1 then
+        self.DoImm(ARm.Disp, 1);
+      end;
+      if LMod = 2 then
+        self.DoImm(ARm.Disp, 4);
+      end;
+    end;
+
+    // The SectionSet symbol AOperand names: an import's (its library and name), else the
+    // symbol of that name (Undefined until something defines it)
+    hidden method DoSymbolOf(const AOperand: ref MachineOperand): int64;
+    begin
+      if AOperand.Symbol = SymbolClass.Import then
+        // An import is needed by its `external` declaration (the linker reports there)
+        return self.FSections.ImportSymbol(AOperand.Library, AOperand.SymbolName,
+          AOperand.Declaration);
+      end;
+      return self.FSections.ReferSymbol(AOperand.SymbolName, self.FNode);
+    end;
+
+    // An opcode with register AReg in its low three bits (B8+r, B0+r): APrefix, the REX it
+    // needs (AWide, the register's high bit, a bare 40 for spl..dil in a 1-byte AByte form),
+    // the opcode
+    hidden method DoOpcodeReg(const APrefix: int64; const AWide: bool; const AByte: bool;
+      const AOpcode: int64; const AReg: int64);
+    var
+      LRex: int64;
+    begin
+      LRex := 0;
+      if AWide then
+        LRex := 8;
+      end;
+      if AReg >= 8 then
+        LRex := LRex + 1;
+      end;
+      if APrefix <> 0 then
+        self.DoByte(APrefix);
+      end;
+      if (LRex <> 0) or (AByte and (AReg >= 4) and (AReg <= 7)) then
+        self.DoByte(0x40 + LRex);
+      end;
+      self.DoByte(AOpcode + (AReg & 7));
+    end;
+
+    // mov: register or memory from a register (89, 88 for 1 byte); a register from memory
+    // (8B, 8A); a register from an immediate (DoMovImmediate); memory from an immediate (C7
+    // /0 iw / id, C6 /0 ib)
+    hidden method DoMov(const AInstr: ref MachineInstr);
+    var
+      LDst: ref MachineOperand;
+      LSrc: ref MachineOperand;
+      LPrefix: int64;
+      LWide: bool;
+      LByte: bool;
+      LReg: int64;
+      LBytes: int64;
+    begin
+      self.DoNeed(AInstr, 2);
+      self.DoCheckWidth(AInstr);
+      LDst := AInstr.OperandAt(0);
+      LSrc := AInstr.OperandAt(1);
+      LPrefix := self.DoSizePrefix(AInstr.Width);
+      LWide := AInstr.Width = 8;
+      LByte := AInstr.Width = 1;
+      if (self.DoIsRegister(LDst) or self.DoIsMemory(LDst)) and self.DoIsRegister(LSrc) then
+        LReg := self.DoGeneral(LSrc.Reg);
+        self.DoEncode(LPrefix, LWide, false, self.DoPick(LByte, 0x88, 0x89), LReg, false, LDst,
+          false, LByte, 0);
+        return;
+      end;
+      if self.DoIsRegister(LDst) and self.DoIsMemory(LSrc) then
+        LReg := self.DoGeneral(LDst.Reg);
+        self.DoEncode(LPrefix, LWide, false, self.DoPick(LByte, 0x8A, 0x8B), LReg, false, LSrc,
+          false, LByte, 0);
+        return;
+      end;
+      if self.DoIsRegister(LDst) and self.DoIsImmediate(LSrc) then
+        self.DoMovImmediate(AInstr, LDst, LSrc.Imm);
+        return;
+      end;
+      if self.DoIsMemory(LDst) and self.DoIsImmediate(LSrc) then
+        self.DoCheckImmediate(LSrc.Imm, AInstr.Width);
+        LBytes := self.DoImmBytes(AInstr.Width);
+        self.DoEncode(LPrefix, LWide, false, self.DoPick(LByte, 0xC6, 0xC7), 0, true, LDst,
+          false, LByte, LBytes);
+        self.DoImm(LSrc.Imm, LBytes);
+        return;
+      end;
+      self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+    end;
+
+    // movsx / movzx / movsxd: a register (the instruction's width, wider than the source)
+    // from a register or memory of the op's source width (SDM: movsx r, r/m8 0F BE /r;
+    // r, r/m16 0F BF /r; movzx r, r/m8 0F B6 /r; r, r/m16 0F B7 /r; movsxd r64, r/m32
+    // REX.W 63 /r; 66 for a 16-bit destination, REX.W for a 64-bit one)
+    hidden method DoExtend(const AInstr: ref MachineInstr);
+    var
+      LDst: ref MachineOperand;
+      LSrc: ref MachineOperand;
+      LSourceWidth: int64;
+      LOpcode: int64;
+      LEscape: bool;
+    begin
+      self.DoNeed(AInstr, 2);
+      self.DoCheckWidth(AInstr);
+      LDst := AInstr.OperandAt(0);
+      LSrc := AInstr.OperandAt(1);
+      LSourceWidth := 2;
+      LOpcode := self.DoPick(AInstr.Op = X64Op.MovSX16, 0xBF, 0xB7);
+      LEscape := true;
+      if (AInstr.Op = X64Op.MovSX8) or (AInstr.Op = X64Op.MovZX8) then
+        LSourceWidth := 1;
+        LOpcode := self.DoPick(AInstr.Op = X64Op.MovSX8, 0xBE, 0xB6);
+      end;
+      if AInstr.Op = X64Op.MovSXD then
+        LSourceWidth := 4;
+        LOpcode := 0x63;
+        LEscape := false;
+      end;
+      if (AInstr.Width <= LSourceWidth) or (not self.DoIsRegister(LDst)) or
+        not (self.DoIsRegister(LSrc) or self.DoIsMemory(LSrc)) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+      end;
+      self.DoEncodeBytes(self.DoSizePrefix(AInstr.Width), AInstr.Width = 8, LEscape, LOpcode,
+        self.DoGeneral(LDst.Reg), false, LSrc, false, false, LSourceWidth = 1, 0);
+    end;
+
+    // mov register ADst, AValue: 8 bytes as C7 /0 id when AValue fits int32 (sign-extended),
+    // else B8+r with all 8 bytes (mov r64, imm64); 4, 2 and 1 bytes as B8+r id, 66 B8+r iw
+    // and B0+r ib
+    hidden method DoMovImmediate(const AInstr: ref MachineInstr; const ADst: ref MachineOperand;
+      const AValue: int64);
+    var
+      LReg: int64;
+    begin
+      LReg := self.DoGeneral(ADst.Reg);
+      if AInstr.Width = 8 then
+        if (AValue >= ADAM_X64_ENCODE_INT32_MIN) and (AValue <= ADAM_X64_ENCODE_INT32_MAX) then
+          self.DoEncode(0, true, false, 0xC7, 0, true, ADst, false, false, 4);
+          self.DoImm(AValue, 4);
+          return;
+        end;
+        self.DoOpcodeReg(0, true, false, 0xB8, LReg);
+        self.DoImm(AValue, 8);
+        return;
+      end;
+      self.DoCheckImmediate(AValue, AInstr.Width);
+      self.DoOpcodeReg(self.DoSizePrefix(AInstr.Width), false, AInstr.Width = 1,
+        self.DoPick(AInstr.Width = 1, 0xB0, 0xB8), LReg);
+      self.DoImm(AValue, AInstr.Width);
+    end;
+
+    // lea: a register from a memory place's address (8D; REX.W for 8 bytes, 66 for 2; no
+    // 1-byte form)
+    hidden method DoLea(const AInstr: ref MachineInstr);
+    var
+      LDst: ref MachineOperand;
+      LSrc: ref MachineOperand;
+      LReg: int64;
+    begin
+      self.DoNeed(AInstr, 2);
+      self.DoCheckWidth(AInstr);
+      LDst := AInstr.OperandAt(0);
+      LSrc := AInstr.OperandAt(1);
+      if (AInstr.Width = 1) or (not self.DoIsRegister(LDst)) or (not self.DoIsMemory(LSrc)) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+        return;
+      end;
+      LReg := self.DoGeneral(LDst.Reg);
+      self.DoEncode(self.DoSizePrefix(AInstr.Width), AInstr.Width = 8, false, 0x8D, LReg, false,
+        LSrc, false, false, 0);
+    end;
+
+    // The ALU group digit of the combining op or cmp AOp (SDM: add /0, or /1, and /4, sub /5,
+    // xor /6, cmp /7): its immediate forms' ModRM digit, and its register forms' opcodes are
+    // digit * 8 + 1 (r/m, r) and + 3 (r, r/m)
+    hidden const method DoAluDigit(const AOp: X64Op): int64;
+    begin
+      if AOp = X64Op.BitOr then
+        return 1;
+      end;
+      if AOp = X64Op.BitAnd then
+        return 4;
+      end;
+      if AOp = X64Op.Sub then
+        return 5;
+      end;
+      if AOp = X64Op.BitXor then
+        return 6;
+      end;
+      if AOp = X64Op.Cmp then
+        return 7;
+      end;
+      return 0;
+    end;
+
+    // add / or / and / sub / xor / cmp: register or memory with a register (01 / 09 / 21 /
+    // 29 / 31 / 39), a register with memory (03 / 0B / 23 / 2B / 33 / 3B), register or memory
+    // with an immediate (DoArithImmediate); a 1-byte operation's opcodes are one less (00,
+    // 02, ...)
+    hidden method DoArith(const AInstr: ref MachineInstr);
+    var
+      LDst: ref MachineOperand;
+      LSrc: ref MachineOperand;
+      LDigit: int64;
+      LPrefix: int64;
+      LWide: bool;
+      LByte: bool;
+      LToRm: int64;
+      LFromRm: int64;
+      LReg: int64;
+    begin
+      self.DoNeed(AInstr, 2);
+      self.DoCheckWidth(AInstr);
+      LDst := AInstr.OperandAt(0);
+      LSrc := AInstr.OperandAt(1);
+      LDigit := self.DoAluDigit(AInstr.Op);
+      LPrefix := self.DoSizePrefix(AInstr.Width);
+      LWide := AInstr.Width = 8;
+      LByte := AInstr.Width = 1;
+      LToRm := LDigit * 8 + 1;
+      LFromRm := LDigit * 8 + 3;
+      if LByte then
+        LToRm := LToRm - 1;
+        LFromRm := LFromRm - 1;
+      end;
+      if (self.DoIsRegister(LDst) or self.DoIsMemory(LDst)) and self.DoIsRegister(LSrc) then
+        LReg := self.DoGeneral(LSrc.Reg);
+        self.DoEncode(LPrefix, LWide, false, LToRm, LReg, false, LDst, false, LByte, 0);
+        return;
+      end;
+      if self.DoIsRegister(LDst) and self.DoIsMemory(LSrc) then
+        LReg := self.DoGeneral(LDst.Reg);
+        self.DoEncode(LPrefix, LWide, false, LFromRm, LReg, false, LSrc, false, LByte, 0);
+        return;
+      end;
+      if (self.DoIsRegister(LDst) or self.DoIsMemory(LDst)) and self.DoIsImmediate(LSrc) then
+        self.DoArithImmediate(AInstr, LDst, LSrc.Imm, LDigit);
+        return;
+      end;
+      self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+    end;
+
+    // add / or / and / sub / xor / cmp (opcode digit ADigit, DoAluDigit) of register or
+    // memory ADst with AValue: 80 /d ib for 1 byte; 83 /d ib when AValue fits a signed byte;
+    // else 81 /d iw / id
+    hidden method DoArithImmediate(const AInstr: ref MachineInstr; const ADst: ref MachineOperand;
+      const AValue: int64; const ADigit: int64);
+    var
+      LBytes: int64;
+    begin
+      self.DoCheckImmediate(AValue, AInstr.Width);
+      if AInstr.Width = 1 then
+        self.DoEncode(0, false, false, 0x80, ADigit, true, ADst, false, true, 1);
+        self.DoImm(AValue, 1);
+        return;
+      end;
+      if (AValue >= -128) and (AValue <= 127) then
+        self.DoEncode(self.DoSizePrefix(AInstr.Width), AInstr.Width = 8, false, 0x83, ADigit, true,
+          ADst, false, false, 1);
+        self.DoImm(AValue, 1);
+        return;
+      end;
+      LBytes := self.DoImmBytes(AInstr.Width);
+      self.DoEncode(self.DoSizePrefix(AInstr.Width), AInstr.Width = 8, false, 0x81, ADigit, true,
+        ADst, false, false, LBytes);
+      self.DoImm(AValue, LBytes);
+    end;
+
+    // imul: a register by a register or memory (0F AF /r), or a register by an immediate
+    // into itself (6B /r ib when it fits a signed byte, else 69 /r iw / id; reg and rm both
+    // the register); 2, 4 or 8 bytes (SDM: no 1-byte form of these)
+    hidden method DoIMul(const AInstr: ref MachineInstr);
+    var
+      LDst: ref MachineOperand;
+      LSrc: ref MachineOperand;
+      LPrefix: int64;
+      LWide: bool;
+      LReg: int64;
+      LBytes: int64;
+    begin
+      self.DoNeed(AInstr, 2);
+      self.DoCheckWidth(AInstr);
+      LDst := AInstr.OperandAt(0);
+      LSrc := AInstr.OperandAt(1);
+      if (AInstr.Width = 1) or (not self.DoIsRegister(LDst)) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+        return;
+      end;
+      LPrefix := self.DoSizePrefix(AInstr.Width);
+      LWide := AInstr.Width = 8;
+      LReg := self.DoGeneral(LDst.Reg);
+      if self.DoIsRegister(LSrc) or self.DoIsMemory(LSrc) then
+        self.DoEncode(LPrefix, LWide, true, 0xAF, LReg, false, LSrc, false, false, 0);
+        return;
+      end;
+      if self.DoIsImmediate(LSrc) then
+        self.DoCheckImmediate(LSrc.Imm, AInstr.Width);
+        if (LSrc.Imm >= -128) and (LSrc.Imm <= 127) then
+          self.DoEncode(LPrefix, LWide, false, 0x6B, LReg, false, LDst, false, false, 1);
+          self.DoImm(LSrc.Imm, 1);
+          return;
+        end;
+        LBytes := self.DoImmBytes(AInstr.Width);
+        self.DoEncode(LPrefix, LWide, false, 0x69, LReg, false, LDst, false, false, LBytes);
+        self.DoImm(LSrc.Imm, LBytes);
+        return;
+      end;
+      self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+    end;
+
+    // shl / shr / sar: register or memory by cl (D3 /4, /5, /7; D2 for 1 byte); the count
+    // operand must be rcx (encoding number 1: the SDM has no other register count)
+    hidden method DoShift(const AInstr: ref MachineInstr);
+    var
+      LDst: ref MachineOperand;
+      LCount: ref MachineOperand;
+      LByte: bool;
+      LDigit: int64;
+    begin
+      self.DoNeed(AInstr, 2);
+      self.DoCheckWidth(AInstr);
+      LDst := AInstr.OperandAt(0);
+      LCount := AInstr.OperandAt(1);
+      if not (self.DoIsRegister(LDst) or self.DoIsMemory(LDst)) or
+        (not self.DoIsRegister(LCount)) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+        return;
+      end;
+      if self.DoGeneral(LCount.Reg) <> 1 then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+        return;
+      end;
+      LDigit := 4;
+      if AInstr.Op = X64Op.Shr then
+        LDigit := 5;
+      end;
+      if AInstr.Op = X64Op.Sar then
+        LDigit := 7;
+      end;
+      LByte := AInstr.Width = 1;
+      self.DoEncode(self.DoSizePrefix(AInstr.Width), AInstr.Width = 8, false,
+        self.DoPick(LByte, 0xD2, 0xD3), LDigit, true, LDst, false, LByte, 0);
+    end;
+
+    // neg / not: register or memory in place (F7 /3, F7 /2; F6 for 1 byte)
+    hidden method DoUnaryOp(const AInstr: ref MachineInstr);
+    var
+      LDst: ref MachineOperand;
+      LByte: bool;
+    begin
+      self.DoNeed(AInstr, 1);
+      self.DoCheckWidth(AInstr);
+      LDst := AInstr.OperandAt(0);
+      if not (self.DoIsRegister(LDst) or self.DoIsMemory(LDst)) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+        return;
+      end;
+      LByte := AInstr.Width = 1;
+      self.DoEncode(self.DoSizePrefix(AInstr.Width), AInstr.Width = 8, false,
+        self.DoPick(LByte, 0xF6, 0xF7), self.DoPick(AInstr.Op = X64Op.Neg, 3, 2), true, LDst,
+        false, LByte, 0);
+    end;
+
+    // AInstr's operation size is 4 or 8 bytes (cdq / cqo and the divisions the selector
+    // makes: every narrower division is promoted first), else the size fault
+    hidden method DoCheckWide(const AInstr: ref MachineInstr);
+    begin
+      if (AInstr.Width <> 4) and (AInstr.Width <> 8) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_WIDTH, self.FOpText);
+      end;
+    end;
+
+    // cdq / cqo: rax sign-extended into rdx, no operands (99; REX.W 99 for cqo)
+    hidden method DoCqo(const AInstr: ref MachineInstr);
+    begin
+      self.DoNeed(AInstr, 0);
+      self.DoCheckWide(AInstr);
+      if AInstr.Width = 8 then
+        self.DoByte(0x48);
+      end;
+      self.DoByte(0x99);
+    end;
+
+    // idiv / div: rdx:rax by a register or memory (F7 /7, F7 /6; REX.W at 8 bytes)
+    hidden method DoDivision(const AInstr: ref MachineInstr);
+    var
+      LDivisor: ref MachineOperand;
+    begin
+      self.DoNeed(AInstr, 1);
+      self.DoCheckWide(AInstr);
+      LDivisor := AInstr.OperandAt(0);
+      if not (self.DoIsRegister(LDivisor) or self.DoIsMemory(LDivisor)) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+        return;
+      end;
+      self.DoEncode(0, AInstr.Width = 8, false, 0xF7, self.DoPick(AInstr.Op = X64Op.IDiv, 7, 6),
+        true, LDivisor, false, false, 0);
+    end;
+
+    // test: register or memory with a register (85, 84 for 1 byte; a register with memory is
+    // the same form, test being symmetric); register or memory with an immediate (F7 /0 iw /
+    // id, F6 /0 ib)
+    hidden method DoTest(const AInstr: ref MachineInstr);
+    var
+      LDst: ref MachineOperand;
+      LSrc: ref MachineOperand;
+      LPrefix: int64;
+      LWide: bool;
+      LByte: bool;
+      LOpcode: int64;
+      LReg: int64;
+      LBytes: int64;
+    begin
+      self.DoNeed(AInstr, 2);
+      self.DoCheckWidth(AInstr);
+      LDst := AInstr.OperandAt(0);
+      LSrc := AInstr.OperandAt(1);
+      LPrefix := self.DoSizePrefix(AInstr.Width);
+      LWide := AInstr.Width = 8;
+      LByte := AInstr.Width = 1;
+      LOpcode := self.DoPick(LByte, 0x84, 0x85);
+      if (self.DoIsRegister(LDst) or self.DoIsMemory(LDst)) and self.DoIsRegister(LSrc) then
+        LReg := self.DoGeneral(LSrc.Reg);
+        self.DoEncode(LPrefix, LWide, false, LOpcode, LReg, false, LDst, false, LByte, 0);
+        return;
+      end;
+      if self.DoIsRegister(LDst) and self.DoIsMemory(LSrc) then
+        LReg := self.DoGeneral(LDst.Reg);
+        self.DoEncode(LPrefix, LWide, false, LOpcode, LReg, false, LSrc, false, LByte, 0);
+        return;
+      end;
+      if (self.DoIsRegister(LDst) or self.DoIsMemory(LDst)) and self.DoIsImmediate(LSrc) then
+        self.DoCheckImmediate(LSrc.Imm, AInstr.Width);
+        LBytes := self.DoImmBytes(AInstr.Width);
+        self.DoEncode(LPrefix, LWide, false, self.DoPick(LByte, 0xF6, 0xF7), 0, true, LDst, false,
+          LByte, LBytes);
+        self.DoImm(LSrc.Imm, LBytes);
+        return;
+      end;
+      self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+    end;
+
+    // setcc: 1 when its condition holds, else 0, into a 1-byte register or memory (0F 90+cc
+    // /0, the condition's code as Jcc's; spl..dil take a bare REX)
+    hidden method DoSetCC(const AInstr: ref MachineInstr);
+    var
+      LDst: ref MachineOperand;
+    begin
+      self.DoNeed(AInstr, 1);
+      LDst := AInstr.OperandAt(0);
+      if not (self.DoIsRegister(LDst) or self.DoIsMemory(LDst)) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+        return;
+      end;
+      self.DoEncode(0, false, true, 0x90 + self.DoCondCode(AInstr.Cond), 0, true, LDst, false,
+        true, 0);
+    end;
+
+    // movd / movq between a vector register and a general register or memory: 66 [REX.W] 0F
+    // 6E /r into the vector register, 66 [REX.W] 0F 7E /r out of it
+    hidden method DoMovCross(const AInstr: ref MachineInstr);
+    var
+      LDst: ref MachineOperand;
+      LSrc: ref MachineOperand;
+      LWide: bool;
+      LReg: int64;
+    begin
+      self.DoNeed(AInstr, 2);
+      LDst := AInstr.OperandAt(0);
+      LSrc := AInstr.OperandAt(1);
+      LWide := AInstr.Op = X64Op.MovQ;
+      if self.DoIsVector(LDst) then
+        LReg := self.DoVector(LDst.Reg);
+        self.DoEncode(0x66, LWide, true, 0x6E, LReg, false, LSrc, false, false, 0);
+        return;
+      end;
+      if self.DoIsVector(LSrc) then
+        LReg := self.DoVector(LSrc.Reg);
+        self.DoEncode(0x66, LWide, true, 0x7E, LReg, false, LDst, false, false, 0);
+        return;
+      end;
+      self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+    end;
+
+    // movss / movsd (F3 / F2): a vector register from a vector register or memory (0F 10 /r),
+    // memory from a vector register (0F 11 /r)
+    hidden method DoMovScalar(const AInstr: ref MachineInstr);
+    var
+      LDst: ref MachineOperand;
+      LSrc: ref MachineOperand;
+      LPrefix: int64;
+      LReg: int64;
+    begin
+      self.DoNeed(AInstr, 2);
+      LDst := AInstr.OperandAt(0);
+      LSrc := AInstr.OperandAt(1);
+      LPrefix := self.DoPick(AInstr.Op = X64Op.MovSS, 0xF3, 0xF2);
+      if self.DoIsVector(LDst) then
+        LReg := self.DoVector(LDst.Reg);
+        self.DoEncode(LPrefix, false, true, 0x10, LReg, false, LSrc, true, false, 0);
+        return;
+      end;
+      if self.DoIsMemory(LDst) and self.DoIsRegister(LSrc) then
+        LReg := self.DoVector(LSrc.Reg);
+        self.DoEncode(LPrefix, false, true, 0x11, LReg, false, LDst, true, false, 0);
+        return;
+      end;
+      self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+    end;
+
+    // The prefix of the scalar op AOp (X64OpIsScalarArith, X64OpIsFloatCompare,
+    // X64OpIsFloatConvert): F3 for a float32's arithmetic (SS) and the conversions from a
+    // float32 or to one from an integer, F2 for a float64's, 66 for ucomisd, none for xorps
+    // and ucomiss
+    hidden const method DoScalarPrefix(const AOp: X64Op): int64;
+    begin
+      if (AOp = X64Op.AddSS) or (AOp = X64Op.SubSS) or (AOp = X64Op.MulSS) or
+        (AOp = X64Op.DivSS) or (AOp = X64Op.CvtSS2SD) or (AOp = X64Op.CvtSI2SS) or
+        (AOp = X64Op.CvtTSS2SI) then
+        return 0xF3;
+      end;
+      if (AOp = X64Op.XorPS) or (AOp = X64Op.UComiSS) then
+        return 0;
+      end;
+      if AOp = X64Op.UComiSD then
+        return 0x66;
+      end;
+      return 0xF2;
+    end;
+
+    // The opcode after 0F of the scalar op AOp: 58 add, 59 mul, 5C sub, 5E div, 57 xorps, 2E
+    // ucomiss / ucomisd, 5A cvtss2sd / cvtsd2ss, 2A cvtsi2ss / sd, 2C cvttss2si / cvttsd2si
+    hidden const method DoScalarOpcode(const AOp: X64Op): int64;
+    begin
+      if X64OpIsFloatCompare(AOp) then
+        return 0x2E;
+      end;
+      if (AOp = X64Op.CvtSS2SD) or (AOp = X64Op.CvtSD2SS) then
+        return 0x5A;
+      end;
+      if (AOp = X64Op.CvtSI2SS) or (AOp = X64Op.CvtSI2SD) then
+        return 0x2A;
+      end;
+      if (AOp = X64Op.CvtTSS2SI) or (AOp = X64Op.CvtTSD2SI) then
+        return 0x2C;
+      end;
+      if (AOp = X64Op.AddSS) or (AOp = X64Op.AddSD) then
+        return 0x58;
+      end;
+      if (AOp = X64Op.MulSS) or (AOp = X64Op.MulSD) then
+        return 0x59;
+      end;
+      if (AOp = X64Op.SubSS) or (AOp = X64Op.SubSD) then
+        return 0x5C;
+      end;
+      if (AOp = X64Op.DivSS) or (AOp = X64Op.DivSD) then
+        return 0x5E;
+      end;
+      return 0x57;
+    end;
+
+    // addss / addsd, subss / subsd, mulss / mulsd, divss / divsd (F3 / F2, then 0F 58 / 5C /
+    // 59 / 5E /r), xorps (0F 57 /r) and ucomiss / ucomisd ([66] 0F 2E /r): a vector register
+    // with a vector register or memory
+    hidden method DoScalarArith(const AInstr: ref MachineInstr);
+    var
+      LDst: ref MachineOperand;
+      LSrc: ref MachineOperand;
+      LReg: int64;
+    begin
+      self.DoNeed(AInstr, 2);
+      LDst := AInstr.OperandAt(0);
+      LSrc := AInstr.OperandAt(1);
+      if not self.DoIsRegister(LDst) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+        return;
+      end;
+      LReg := self.DoVector(LDst.Reg);
+      self.DoEncode(self.DoScalarPrefix(AInstr.Op), false, true, self.DoScalarOpcode(AInstr.Op),
+        LReg, false, LSrc, true, false, 0);
+    end;
+
+    // cvtsi2ss / cvtsi2sd (F3 / F2 [REX.W] 0F 2A /r): a vector register from a general
+    // register or memory of 4 or 8 bytes (the width); cvttss2si / cvttsd2si (F3 / F2 [REX.W]
+    // 0F 2C /r): a general register of 4 or 8 bytes from a vector register or memory
+    hidden method DoIntConvert(const AInstr: ref MachineInstr);
+    var
+      LDst: ref MachineOperand;
+      LSrc: ref MachineOperand;
+      LToInt: bool;
+      LReg: int64;
+    begin
+      self.DoNeed(AInstr, 2);
+      LDst := AInstr.OperandAt(0);
+      LSrc := AInstr.OperandAt(1);
+      if ((AInstr.Width <> 4) and (AInstr.Width <> 8)) or (not self.DoIsRegister(LDst)) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+        return;
+      end;
+      LToInt := (AInstr.Op = X64Op.CvtTSS2SI) or (AInstr.Op = X64Op.CvtTSD2SI);
+      if LToInt then
+        LReg := self.DoGeneral(LDst.Reg);
+      else
+        LReg := self.DoVector(LDst.Reg);
+      end;
+      self.DoEncode(self.DoScalarPrefix(AInstr.Op), AInstr.Width = 8, true,
+        self.DoScalarOpcode(AInstr.Op), LReg, false, LSrc, LToInt, false, 0);
+    end;
+
+    // jcc (0F 80+cc) or jmp (E9) to a block of the function; the rel32 is patched by
+    // DoPatchJumps once every block is placed
+    hidden method DoJump(const AInstr: ref MachineInstr);
+    var
+      LTarget: ref MachineOperand;
+    begin
+      self.DoNeed(AInstr, 1);
+      LTarget := AInstr.OperandAt(0);
+      if LTarget.Kind <> OperandKind.BlockRef then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+        return;
+      end;
+      if (LTarget.Block < 0) or (LTarget.Block >= self.FMachine.BlockCount) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_BLOCK, IntToStr(LTarget.Block));
+        return;
+      end;
+      if AInstr.Op = X64Op.Jcc then
+        self.DoByte(0x0F);
+        self.DoByte(0x80 + self.DoCondCode(AInstr.Cond));
+      else
+        self.DoByte(0xE9);
+      end;
+      self.FFixFields.Add(self.FSection.Size());
+      self.FFixBlocks.Add(LTarget.Block);
+      self.FSection.Put32(0);
+    end;
+
+    // ACond's condition code (the low nibble of Jcc's 0F 80..8F and SETcc's 0F 90..9F)
+    hidden const method DoCondCode(const ACond: X64Cond): int64;
+    begin
+      match ACond of
+        X64Cond.Overflow: return 0;
+        X64Cond.NoOverflow: return 1;
+        X64Cond.Below: return 2;
+        X64Cond.AboveOrEqual: return 3;
+        X64Cond.Equal: return 4;
+        X64Cond.NotEqual: return 5;
+        X64Cond.BelowOrEqual: return 6;
+        X64Cond.Above: return 7;
+        X64Cond.Sign: return 8;
+        X64Cond.NoSign: return 9;
+        X64Cond.Parity: return 10;
+        X64Cond.NoParity: return 11;
+        X64Cond.Less: return 12;
+        X64Cond.GreaterOrEqual: return 13;
+        X64Cond.LessOrEqual: return 14;
+        X64Cond.Greater: return 15;
+      end;
+      return 0;
+    end;
+
+    // call: E8 rel32 to a code symbol; FF /2 through a register or memory (an import's
+    // [rip+import])
+    hidden method DoCall(const AInstr: ref MachineInstr);
+    var
+      LTarget: ref MachineOperand;
+      LSymbol: int64;
+      LField: int64;
+    begin
+      self.DoNeed(AInstr, 1);
+      LTarget := AInstr.OperandAt(0);
+      if (LTarget.Kind = OperandKind.SymbolRef) and (LTarget.Symbol = SymbolClass.Code) then
+        LSymbol := self.DoSymbolOf(LTarget);
+        self.DoByte(0xE8);
+        LField := self.FSection.Size();
+        self.FSection.Put32(0);
+        self.FSections.AddReloc(self.FResult.SectionId, LField, RelocKind.Rel32, LSymbol, 0);
+        return;
+      end;
+      if self.DoIsRegister(LTarget) or self.DoIsMemory(LTarget) then
+        self.DoEncode(0, false, false, 0xFF, 2, true, LTarget, false, false, 0);
+        return;
+      end;
+      self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+    end;
+
+    // ret (C3)
+    hidden method DoRet(const AInstr: ref MachineInstr);
+    begin
+      self.DoNeed(AInstr, 0);
+      self.DoByte(0xC3);
+    end;
+
+    // push / pop of a general register, always 8 bytes in 64-bit mode (50+rd, 58+rd; REX.B
+    // for r8..r15, no REX.W)
+    hidden method DoPushPop(const AInstr: ref MachineInstr);
+    var
+      LReg: ref MachineOperand;
+    begin
+      self.DoNeed(AInstr, 1);
+      LReg := AInstr.OperandAt(0);
+      if not self.DoIsRegister(LReg) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+        return;
+      end;
+      self.DoOpcodeReg(0, false, false, self.DoPick(AInstr.Op = X64Op.Push, 0x50, 0x58),
+        self.DoGeneral(LReg.Reg));
+    end;
+
+    // rep movsb / rep stosb: no operands, the REP prefix then the byte form (F3 A4, F3 AA)
+    hidden method DoRepString(const AInstr: ref MachineInstr);
+    begin
+      self.DoNeed(AInstr, 0);
+      self.DoByte(0xF3);
+      self.DoByte(self.DoPick(AInstr.Op = X64Op.RepMovsb, 0xA4, 0xAA));
+    end;
+
+    // AInstr's bytes, by its op
+    hidden method DoInstr(const AInstr: ref MachineInstr);
+    begin
+      match AInstr.Op of
+        X64Op.Mov: self.DoMov(AInstr);
+        X64Op.MovD, X64Op.MovQ: self.DoMovCross(AInstr);
+        X64Op.MovSS, X64Op.MovSD: self.DoMovScalar(AInstr);
+        X64Op.Lea: self.DoLea(AInstr);
+        X64Op.Add, X64Op.Sub, X64Op.BitAnd, X64Op.BitOr, X64Op.BitXor, X64Op.Cmp:
+          self.DoArith(AInstr);
+        X64Op.SetCC: self.DoSetCC(AInstr);
+        X64Op.IMul: self.DoIMul(AInstr);
+        X64Op.Neg, X64Op.BitNot: self.DoUnaryOp(AInstr);
+        X64Op.Shl, X64Op.Shr, X64Op.Sar: self.DoShift(AInstr);
+        X64Op.Cqo: self.DoCqo(AInstr);
+        X64Op.IDiv, X64Op.UDiv: self.DoDivision(AInstr);
+        X64Op.AddSS, X64Op.AddSD, X64Op.SubSS, X64Op.SubSD, X64Op.MulSS, X64Op.MulSD,
+          X64Op.DivSS, X64Op.DivSD, X64Op.XorPS, X64Op.UComiSS, X64Op.UComiSD, X64Op.CvtSS2SD,
+          X64Op.CvtSD2SS:
+          self.DoScalarArith(AInstr);
+        X64Op.CvtSI2SS, X64Op.CvtSI2SD, X64Op.CvtTSS2SI, X64Op.CvtTSD2SI: self.DoIntConvert(AInstr);
+        X64Op.Test: self.DoTest(AInstr);
+        X64Op.Jcc, X64Op.Jmp: self.DoJump(AInstr);
+        X64Op.Call: self.DoCall(AInstr);
+        X64Op.Ret: self.DoRet(AInstr);
+        X64Op.Push, X64Op.Pop: self.DoPushPop(AInstr);
+        X64Op.RepMovsb, X64Op.RepStosb: self.DoRepString(AInstr);
+        X64Op.MovSX8, X64Op.MovSX16, X64Op.MovSXD, X64Op.MovZX8, X64Op.MovZX16:
+          self.DoExtend(AInstr);
+      end;
+    end;
+
+    // Every jump's rel32: its target block's start minus the end of the field
+    hidden method DoPatchJumps();
+    var
+      LI: int64;
+      LField: int64;
+      LTarget: int64;
+    begin
+      for LI := 0 to self.FFixFields.Count - 1 do
+        LField := self.FFixFields.Items[LI];
+        LTarget := self.FResult.StartOffset + self.FResult.BlockStarts.Items[self.FFixBlocks.Items[LI]];
+        self.FSection.Patch32(LField, uint64(LTarget - (LField + 4)));
+      end;
+    end;
+  end;
+
+// AMachine (allocated) encoded at the end of code section ASectionId of ASections, its
+// symbol defined at its start; returns where it landed. What encoding cannot take raises
+// (see the header)
+exported routine EncodeFunction(const AMachine: ref MachineFunction;
+  const ASections: ref SectionSet; const ASectionId: int64): ref EncodedFunction;
+var
+  LEncoder: ref X64Encoder;
+begin
+  LEncoder := ref X64Encoder(AMachine, ASections, ASectionId);
+  return LEncoder.Run();
+end;
+
+end.

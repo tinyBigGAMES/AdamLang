@@ -1,0 +1,1092 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Compiler.Symbols.adam - the linkage each routine gets and the symbol
+  the linker sees (DESIGN sec 2, BNF sec 3), written into the AST
+
+  NameSymbols settles ResolvedLinkage and writes ResolvedSymbol on every
+  routine, forward routine, method, init, copy, done, operator, inline or
+  abstract property accessor and module variable:
+  - A routine is clink (C linkage: its plain name) unless written cpplink or
+    overloaded (more than one RoutineDecl of its name in its module, forwards
+    out): an overload written clink gets C++ linkage with a warning (SM0323),
+    one with no word silently. Two C linkage definitions of one symbol are an
+    error at the second (SM0024, Adam's own). An external routine binds its
+    own name (the clause names a library, never a symbol).
+  - A module's private routine or variable (not exported, not external: BNF
+    decision row 20) keeps its linkage but binds an internal symbol, as
+    clang writes a static one of its namespace: N <namespaces> L <name> E
+    and, for a routine, its parameters by its linkage. It never meets
+    another module's, so SM0024 is only between public routines and
+    variables; a public clink routine's or variable's symbol is its plain
+    name.
+  - Everything a type declares is C++ linkage: a method, an init (C1), a
+    copy (C1), a done (D1), an operator, an inline or abstract accessor
+    (adam_get_X() const / adam_set_X([index, ]value), as PaskalCPP's
+    pcpp_get_X / pcpp_set_X; an accessor naming a method has that method's).
+    An operator has no self: it is a function of its type's module; div and
+    in, which C++ lacks, are vendor operators (v23div, v22in).
+  - A module variable is clink, as a routine with no word is (a variable has
+    no linkage word: Adam involves no C++ unless asked): a public one's
+    symbol is its plain name (SM0024 against any other C definition), a
+    private one's is internal (above), an external one binds its own name.
+  - Generic routines and what generic types declare are M10's (instances).
+
+  The symbol scheme and the C++ type of each builtin are the target's (the
+  Target passed in, Adam.Target); this unit holds no target fact.
+
+  ItaniumMangler is the Itanium C++ ABI as clang writes it: a module is a
+  namespace (a dotted name nested ones); a record, object, interface,
+  overlay or choices type a class of its module (one declared in a routine
+  a local class of it: Z <routine> E); the builtins the target's C++
+  types; Adam's types with no C++ type classes of the namespace adam:
+  string, wstring, varargs, dynarray<T>, own<T>, ref<T>, weak<T>, set<N> (N
+  its member count) and a static array array<T, Low, High>; a routine type
+  a function pointer. Parameters follow BNF sec 3's passing rule
+  (Types.PassedByReference): var T&, a const non-scalar under C++ linkage
+  const T&; a C++ linkage variadic's typed pack is a last adam::varargs, a
+  C one's an ellipsis.
+
+  Substitution candidates are keyed by the entity's plain mangling (no
+  substitutions): equal keys are one C++ entity, so two Adam types C++ sees
+  as one (two sets of 8 members) share a candidate as clang's do. A
+  namespace is keyed by its dotted name.
+*******************************************************************************/
+
+module unit Adam.Compiler.Symbols;
+
+import System.SysUtils, Adam.Core.Messages, Adam.Target, Adam.Compiler.SourceText,
+  Adam.Compiler.Diagnostics, Adam.Compiler.AST, Adam.Compiler.Scopes, Adam.Compiler.Types,
+  Adam.Compiler.Layout;
+
+exported const
+  ADAM_ERR_SYMBOLS_024: string = "SM0024";   // one C linkage symbol defined twice (Adam's own)
+  ADAM_ERR_SYMBOLS_323: string = "SM0323";   // an overloaded clink routine gets C++ linkage
+
+const
+  // A substitution's sequence id is base 36, upper case (Itanium)
+  ADAM_SYMBOLS_SEQ_DIGITS: string = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  // The namespace of the C++ twins of Adam's own types (DESIGN sec 2)
+  ADAM_SYMBOLS_RUNTIME_NS: string = "adam";
+  // The names of a property's inline accessors, before the property's name
+  ADAM_SYMBOLS_GET_PREFIX: string = "adam_get_";
+  ADAM_SYMBOLS_SET_PREFIX: string = "adam_set_";
+
+// The Itanium code of the C++ fundamental type ACppType (as a Target's BuiltinCppType
+// spells it); empty for one with none here (string, wstring, varargs and ptr have no
+// fundamental type: the mangler writes them)
+routine DoFundamentalCode(const ACppType: string): string;
+begin
+  if ACppType = "signed char" then
+    return "a";
+  end;
+  if ACppType = "unsigned char" then
+    return "h";
+  end;
+  if ACppType = "short" then
+    return "s";
+  end;
+  if ACppType = "unsigned short" then
+    return "t";
+  end;
+  if ACppType = "int" then
+    return "i";
+  end;
+  if ACppType = "unsigned int" then
+    return "j";
+  end;
+  if ACppType = "long" then
+    return "l";
+  end;
+  if ACppType = "unsigned long" then
+    return "m";
+  end;
+  if ACppType = "long long" then
+    return "x";
+  end;
+  if ACppType = "unsigned long long" then
+    return "y";
+  end;
+  if ACppType = "float" then
+    return "f";
+  end;
+  if ACppType = "double" then
+    return "d";
+  end;
+  if ACppType = "bool" then
+    return "b";
+  end;
+  if ACppType = "char" then
+    return "c";
+  end;
+  if ACppType = "wchar_t" then
+    return "w";
+  end;
+  if ACppType = "char16_t" then
+    return "Ds";
+  end;
+  if ACppType = "char32_t" then
+    return "Di";
+  end;
+  return "";
+end;
+
+// The Itanium operator name of an operator declaration of AOp taking AOperands operands; empty
+// for one C++ has no twin of and no vendor name is given
+routine DoOperatorCode(const AOp: OperatorKind; const AOperands: int64): string;
+begin
+  if AOp = OperatorKind.Add then
+    return "pl";
+  end;
+  if (AOp = OperatorKind.Subtract) or (AOp = OperatorKind.Negate) then
+    if AOperands = 1 then
+      return "ng";
+    end;
+    return "mi";
+  end;
+  if AOp = OperatorKind.Multiply then
+    return "ml";
+  end;
+  if AOp = OperatorKind.Divide then
+    return "dv";
+  end;
+  // div and in have no C++ operator: vendor extended operators, v <operands> <name>
+  if AOp = OperatorKind.IntDivide then
+    return "v23div";
+  end;
+  if AOp = OperatorKind.Modulo then
+    return "rm";
+  end;
+  if AOp = OperatorKind.Equal then
+    return "eq";
+  end;
+  if AOp = OperatorKind.NotEqual then
+    return "ne";
+  end;
+  if AOp = OperatorKind.Less then
+    return "lt";
+  end;
+  if AOp = OperatorKind.LessEqual then
+    return "le";
+  end;
+  if AOp = OperatorKind.Greater then
+    return "gt";
+  end;
+  if AOp = OperatorKind.GreaterEqual then
+    return "ge";
+  end;
+  if AOp = OperatorKind.In then
+    return "v22in";
+  end;
+  return "";
+end;
+
+// A template argument holding the integer AValue (its type long long): Lx <value> E, a
+// negative value written n <magnitude>
+routine DoIntegerArgument(const AValue: int64): string;
+begin
+  if AValue < 0 then
+    // -(AValue + 1) + 1 is the magnitude without overflowing at the smallest int64
+    return "Lxn" + UIntToStr(uint64(-(AValue + 1)) + 1) + "E";
+  end;
+  return "Lx" + IntToStr(AValue) + "E";
+end;
+
+// True when the routine, forward routine or module variable AId binds an internal symbol:
+// it is its module's private declaration (Scopes.IsModulePrivate) and no external one (an
+// external binds its own C name, defined elsewhere)
+exported routine HasInternalSymbol(const ATree: ref SyntaxTree; const AId: int64): bool;
+begin
+  if not IsModulePrivate(ATree, AId) then
+    return false;
+  end;
+  return ATree.FirstOf(AId, NodeRole.External) = 0;
+end;
+
+exported type
+  // The Itanium C++ ABI mangler (see the header): one symbol at a time, its substitution
+  // candidates kept by key in the order they are met; a builtin's code comes from the C++
+  // type FTarget says it is. In plain mode nothing is looked up or added: what it writes is
+  // an entity's key
+  ItaniumMangler = object
+    hidden FTree: ref SyntaxTree;
+    hidden FTarget: ref Target;
+    hidden FKeys: array of string;
+    hidden FCount: int64;
+    hidden FFailed: bool;
+    hidden FPlain: bool;
+
+    init(const ATree: ref SyntaxTree; const ATarget: ref Target);
+    begin
+      self.FTree := ATree;
+      self.FTarget := ATarget;
+      self.FCount := 0;
+      self.FFailed := false;
+      self.FPlain := false;
+    end;
+
+    // Starts a new symbol: no candidate yet, nothing failed
+    hidden method DoReset();
+    begin
+      self.FCount := 0;
+      self.FFailed := false;
+      self.FPlain := false;
+    end;
+
+    // The index of the candidate AKey; -1 when it is none (always in plain mode)
+    hidden const method DoFind(const AKey: string): int64;
+    var
+      LI: int64;
+    begin
+      if self.FPlain then
+        return -1;
+      end;
+      for LI := 0 to self.FCount - 1 do
+        if self.FKeys[LI] = AKey then
+          return LI;
+        end;
+      end;
+      return -1;
+    end;
+
+    // AKey added as the next candidate (nothing in plain mode)
+    hidden method DoAdd(const AKey: string);
+    begin
+      if self.FPlain then
+        return;
+      end;
+      if self.FCount >= len(self.FKeys) then
+        setlength(self.FKeys, self.FCount * 2 + 16);
+      end;
+      self.FKeys[self.FCount] := AKey;
+      self.FCount := self.FCount + 1;
+    end;
+
+    // The substitution naming candidate AIndex: S_ for the first, then S <seq-id> _ with the
+    // sequence id AIndex - 1 in base 36
+    hidden const method DoSubstitution(const AIndex: int64): string;
+    var
+      LValue: int64;
+      LText: string;
+    begin
+      if AIndex = 0 then
+        return "S_";
+      end;
+      LValue := AIndex - 1;
+      LText := Substring(ADAM_SYMBOLS_SEQ_DIGITS, LValue mod 36, 1);
+      LValue := LValue div 36;
+      while LValue > 0 do
+        LText := Substring(ADAM_SYMBOLS_SEQ_DIGITS, LValue mod 36, 1) + LText;
+        LValue := LValue div 36;
+      end;
+      return "S" + LText + "_";
+    end;
+
+    // An identifier as Itanium writes it: its length in bytes, then its bytes
+    hidden const method DoSourceName(const AName: string): string;
+    begin
+      return IntToStr(len(AName)) + AName;
+    end;
+
+    // The first ACount parts of AParts joined by dots (a namespace's key)
+    hidden const method DoJoined(const AParts: StringArray; const ACount: int64): string;
+    var
+      LI: int64;
+      LText: string;
+    begin
+      LText := AParts[0];
+      for LI := 1 to ACount - 1 do
+        LText := LText + "." + AParts[LI];
+      end;
+      return LText;
+    end;
+
+    // The <prefix> of the namespaces the dotted name ADotted names (one a part): the longest
+    // leading run already a candidate as its substitution, then each further part as its
+    // source name, each added
+    hidden method DoNamespace(const ADotted: string): string;
+    var
+      LParts: StringArray;
+      LCount: int64;
+      LStart: int64;
+      LI: int64;
+      LAt: int64;
+      LText: string;
+    begin
+      LParts := SplitString(ADotted, ".");
+      LCount := len(LParts);
+      if LCount = 0 then
+        self.FFailed := true;
+        return "";
+      end;
+      LText := "";
+      LStart := 0;
+      for LI := LCount downto 1 do
+        LAt := self.DoFind("ns:" + self.DoJoined(LParts, LI));
+        if LAt >= 0 then
+          LText := self.DoSubstitution(LAt);
+          LStart := LI;
+          leave;
+        end;
+      end;
+      for LI := LStart to LCount - 1 do
+        LText := LText + self.DoSourceName(LParts[LI]);
+        self.DoAdd("ns:" + self.DoJoined(LParts, LI + 1));
+      end;
+      return LText;
+    end;
+
+    // The plain mangling of the type AType: the key of a type candidate
+    hidden method DoPlainOf(const AType: int64): string;
+    var
+      LSaved: bool;
+      LText: string;
+    begin
+      LSaved := self.FPlain;
+      self.FPlain := true;
+      LText := self.DoType(AType);
+      self.FPlain := LSaved;
+      return LText;
+    end;
+
+    // The candidate key of the type AType (empty in plain mode, where nothing is looked up)
+    hidden method DoTypeKey(const AType: int64): string;
+    begin
+      if self.FPlain then
+        return "";
+      end;
+      return "T:" + self.DoPlainOf(AType);
+    end;
+
+    // A class of the namespace adam named AName, the C++ twin of the Adam type AType that has
+    // no C++ type (string, wstring, varargs): its substitution, else N 4adam <name> E, added
+    hidden method DoRuntimeClass(const AType: int64; const AName: string): string;
+    var
+      LKey: string;
+      LAt: int64;
+      LText: string;
+    begin
+      LKey := self.DoTypeKey(AType);
+      LAt := self.DoFind(LKey);
+      if LAt >= 0 then
+        return self.DoSubstitution(LAt);
+      end;
+      LText := "N" + self.DoNamespace(ADAM_SYMBOLS_RUNTIME_NS);
+      LText := LText + self.DoSourceName(AName) + "E";
+      self.DoAdd(LKey);
+      return LText;
+    end;
+
+    // The head of a template class of the namespace adam named AName, up to its arguments:
+    // N, the template's substitution or its prefix (the template added), I
+    hidden method DoTemplateHead(const AName: string): string;
+    var
+      LKey: string;
+      LAt: int64;
+      LText: string;
+    begin
+      LKey := "tn:" + AName;
+      LAt := self.DoFind(LKey);
+      if LAt >= 0 then
+        return "N" + self.DoSubstitution(LAt) + "I";
+      end;
+      LText := "N" + self.DoNamespace(ADAM_SYMBOLS_RUNTIME_NS);
+      LText := LText + self.DoSourceName(AName);
+      self.DoAdd(LKey);
+      return LText + "I";
+    end;
+
+    // const AType: its substitution, else K <type>, added
+    hidden method DoConstType(const AType: int64): string;
+    var
+      LKey: string;
+      LAt: int64;
+      LText: string;
+    begin
+      LKey := "";
+      if not self.FPlain then
+        LKey := "K:" + self.DoPlainOf(AType);
+      end;
+      LAt := self.DoFind(LKey);
+      if LAt >= 0 then
+        return self.DoSubstitution(LAt);
+      end;
+      LText := "K" + self.DoType(AType);
+      self.DoAdd(LKey);
+      return LText;
+    end;
+
+    // A reference to AType (to const AType when AConst): its substitution, else R <type>,
+    // added after what the type adds
+    hidden method DoReference(const AType: int64; const AConst: bool): string;
+    var
+      LKey: string;
+      LAt: int64;
+      LText: string;
+    begin
+      LKey := "";
+      if not self.FPlain then
+        if AConst then
+          LKey := "RK:" + self.DoPlainOf(AType);
+        else
+          LKey := "R:" + self.DoPlainOf(AType);
+        end;
+      end;
+      LAt := self.DoFind(LKey);
+      if LAt >= 0 then
+        return self.DoSubstitution(LAt);
+      end;
+      if AConst then
+        LText := "R" + self.DoConstType(AType);
+      else
+        LText := "R" + self.DoType(AType);
+      end;
+      self.DoAdd(LKey);
+      return LText;
+    end;
+
+    // The type declaration a member AId (a method, init, copy, done, operator or accessor)
+    // belongs to; 0 when it has none
+    hidden const method DoOwnerDecl(const AId: int64): int64;
+    var
+      LBody: int64;
+      LDecl: int64;
+    begin
+      LBody := MethodOwnerOf(self.FTree, AId);
+      if LBody = 0 then
+        return 0;
+      end;
+      LDecl := self.FTree.ParentOf(LBody);
+      if (LDecl = 0) or (self.FTree[LDecl].Kind <> NodeKind.TypeDecl) then
+        return 0;
+      end;
+      return LDecl;
+    end;
+
+    // The local name's head of an entity declared in the routine ARoutine: Z <its encoding> E
+    hidden method DoLocalHead(const ARoutine: int64): string;
+    var
+      LText: string;
+    begin
+      LText := "Z" + self.DoEncoding(ARoutine);
+      return LText + "E";
+    end;
+
+    // The declared type ADecl (a record, object, interface, overlay or choices) as a type:
+    // its substitution, else N <module's namespaces> <name> E (in a routine: Z <routine> E
+    // <name>), added
+    hidden method DoClassType(const ADecl: int64): string;
+    var
+      LKey: string;
+      LAt: int64;
+      LScope: int64;
+      LText: string;
+    begin
+      LKey := self.DoTypeKey(ADecl);
+      LAt := self.DoFind(LKey);
+      if LAt >= 0 then
+        return self.DoSubstitution(LAt);
+      end;
+      LScope := self.FTree.ParentOf(ADecl);
+      if self.FTree[LScope].Kind = NodeKind.Module then
+        LText := "N" + self.DoNamespace(self.FTree[LScope].Text);
+        LText := LText + self.DoSourceName(self.FTree[ADecl].Text) + "E";
+      else
+        if self.FTree[LScope].Kind <> NodeKind.RoutineDecl then
+          self.FFailed := true;
+          return "";
+        end;
+        LText := self.DoLocalHead(LScope);
+        LText := LText + self.DoSourceName(self.FTree[ADecl].Text);
+      end;
+      self.DoAdd(LKey);
+      return LText;
+    end;
+
+    // The <name> of the member AUnqualified (an unqualified name as written) of the type
+    // ADecl: N [K] <the type as a prefix> <member> E, a const method's AConst giving the K;
+    // a type declared in a routine puts that under the routine's local name
+    hidden method DoMemberName(const ADecl: int64; const AUnqualified: string; const AConst: bool): string;
+    var
+      LKey: string;
+      LAt: int64;
+      LScope: int64;
+      LText: string;
+    begin
+      LScope := self.FTree.ParentOf(ADecl);
+      LText := "";
+      if self.FTree[LScope].Kind <> NodeKind.Module then
+        if self.FTree[LScope].Kind <> NodeKind.RoutineDecl then
+          self.FFailed := true;
+          return "";
+        end;
+        LText := self.DoLocalHead(LScope);
+      end;
+      LText := LText + "N";
+      if AConst then
+        LText := LText + "K";
+      end;
+      LKey := self.DoTypeKey(ADecl);
+      LAt := self.DoFind(LKey);
+      if LAt >= 0 then
+        LText := LText + self.DoSubstitution(LAt);
+      else
+        if self.FTree[LScope].Kind = NodeKind.Module then
+          LText := LText + self.DoNamespace(self.FTree[LScope].Text);
+        end;
+        LText := LText + self.DoSourceName(self.FTree[ADecl].Text);
+        self.DoAdd(LKey);
+      end;
+      return LText + AUnqualified + "E";
+    end;
+
+    // The <name> of an operator ACode of the type ADecl: a function of the type's module (an
+    // operator has no self), or of the routine a local type is declared in
+    hidden method DoOperatorName(const ADecl: int64; const ACode: string): string;
+    var
+      LScope: int64;
+      LText: string;
+    begin
+      LScope := self.FTree.ParentOf(ADecl);
+      if self.FTree[LScope].Kind = NodeKind.Module then
+        LText := "N" + self.DoNamespace(self.FTree[LScope].Text);
+        return LText + ACode + "E";
+      end;
+      if self.FTree[LScope].Kind <> NodeKind.RoutineDecl then
+        self.FFailed := true;
+        return "";
+      end;
+      LText := self.DoLocalHead(LScope);
+      return LText + ACode;
+    end;
+
+    // The derived type AType of class AClass as a type, before it is added (DoType adds it):
+    // an untyped pointer Pv, a pointer P [K] <target>, adam's templates, a routine type a
+    // function pointer (its function type added here, before the pointer)
+    hidden method DoDerived(const AType: int64; const AClass: TypeClass): string;
+    var
+      LText: string;
+      LSource: int64;
+      LLow: int64;
+      LHigh: int64;
+      LReturn: int64;
+      LLinkage: Linkage;
+      LFunctionKey: string;
+    begin
+      if AClass = TypeClass.UntypedPointer then
+        return "Pv";
+      end;
+      if AClass = TypeClass.Pointer then
+        if IsConstTarget(self.FTree, AType) then
+          LText := "P" + self.DoConstType(TargetOf(self.FTree, AType));
+        else
+          LText := "P" + self.DoType(TargetOf(self.FTree, AType));
+        end;
+        return LText;
+      end;
+      if AClass = TypeClass.DynamicArray then
+        LText := self.DoTemplateHead("dynarray");
+        LText := LText + self.DoType(TargetOf(self.FTree, AType));
+        return LText + "EE";
+      end;
+      if AClass = TypeClass.StaticArray then
+        // The bounds are read where the type was first written (Types: ResolvedDecl)
+        LSource := self.FTree[AType].ResolvedDecl;
+        if (LSource = 0) or
+          (not BoundValue(self.FTree, self.FTarget, self.FTree.FirstOf(LSource, NodeRole.LowBound), LLow)) or
+          (not BoundValue(self.FTree, self.FTarget, self.FTree.FirstOf(LSource, NodeRole.HighBound), LHigh)) then
+          self.FFailed := true;
+          return "";
+        end;
+        LText := self.DoTemplateHead("array");
+        LText := LText + self.DoType(TargetOf(self.FTree, AType));
+        return LText + DoIntegerArgument(LLow) + DoIntegerArgument(LHigh) + "EE";
+      end;
+      if AClass = TypeClass.SetType then
+        LText := self.DoTemplateHead("set");
+        return LText + DoIntegerArgument(SetCount(self.FTree, self.FTarget, AType)) + "EE";
+      end;
+      if (AClass = TypeClass.OwnType) or (AClass = TypeClass.RefType) or (AClass = TypeClass.WeakType) then
+        if AClass = TypeClass.OwnType then
+          LText := self.DoTemplateHead("own");
+        else
+          if AClass = TypeClass.RefType then
+            LText := self.DoTemplateHead("ref");
+          else
+            LText := self.DoTemplateHead("weak");
+          end;
+        end;
+        LText := LText + self.DoType(TargetOf(self.FTree, AType));
+        return LText + "EE";
+      end;
+      if AClass = TypeClass.RoutineType then
+        // Its parameters and linkage are read where it was first made (a routine type
+        // expression or a routine); its return type is TargetOf (0: none, void)
+        LSource := self.FTree[AType].ResolvedDecl;
+        if LSource = 0 then
+          self.FFailed := true;
+          return "";
+        end;
+        LLinkage := Linkage.C;
+        if IsCppSignature(self.FTree, LSource) then
+          LLinkage := Linkage.Cpp;
+        end;
+        LFunctionKey := "";
+        if not self.FPlain then
+          LFunctionKey := "F:" + self.DoPlainOf(AType);
+        end;
+        LText := "F";
+        LReturn := TargetOf(self.FTree, AType);
+        if LReturn = 0 then
+          LText := LText + "v";
+        else
+          LText := LText + self.DoType(LReturn);
+        end;
+        LText := LText + self.DoParams(LSource, LLinkage) + "E";
+        self.DoAdd(LFunctionKey);
+        return "P" + LText;
+      end;
+      self.FFailed := true;
+      return "";
+    end;
+
+    // The <type> of the canonical type AType (see the header); fails on an unknown type
+    hidden method DoType(const AType: int64): string;
+    var
+      LClass: TypeClass;
+      LKey: string;
+      LAt: int64;
+      LText: string;
+      LCode: string;
+    begin
+      if AType = 0 then
+        self.FFailed := true;
+        return "";
+      end;
+      LClass := ClassOf(self.FTree, AType);
+      if IsNumericClass(LClass) or (LClass = TypeClass.Boolean) or (LClass = TypeClass.Char) or
+        (LClass = TypeClass.WideChar) then
+        LCode := DoFundamentalCode(self.FTarget.BuiltinCppType(self.FTree[AType].Text));
+        if LCode = "" then
+          self.FFailed := true;
+        end;
+        return LCode;
+      end;
+      if LClass = TypeClass.Text then
+        return self.DoRuntimeClass(AType, "string");
+      end;
+      if LClass = TypeClass.WideText then
+        return self.DoRuntimeClass(AType, "wstring");
+      end;
+      if LClass = TypeClass.Varargs then
+        return self.DoRuntimeClass(AType, "varargs");
+      end;
+      if LClass = TypeClass.NilType then
+        return "Dn";
+      end;
+      if (LClass = TypeClass.RecordType) or (LClass = TypeClass.ObjectType) or
+        (LClass = TypeClass.InterfaceType) or (LClass = TypeClass.OverlayType) or
+        (LClass = TypeClass.ChoicesType) then
+        return self.DoClassType(AType);
+      end;
+      if LClass = TypeClass.Unknown then
+        self.FFailed := true;
+        return "";
+      end;
+      LKey := self.DoTypeKey(AType);
+      LAt := self.DoFind(LKey);
+      if LAt >= 0 then
+        return self.DoSubstitution(LAt);
+      end;
+      LText := self.DoDerived(AType, LClass);
+      self.DoAdd(LKey);
+      return LText;
+    end;
+
+    // The <type> of the parameter AParam under ALinkage (BNF sec 3's passing rule)
+    hidden method DoParam(const AParam: int64; const ALinkage: Linkage): string;
+    var
+      LTypeExpr: int64;
+      LType: int64;
+    begin
+      LTypeExpr := self.FTree.FirstOf(AParam, NodeRole.TypeOf);
+      if LTypeExpr = 0 then
+        self.FFailed := true;
+        return "";
+      end;
+      LType := CanonicalOf(self.FTree, LTypeExpr);
+      if not PassedByReference(self.FTree, AParam, ALinkage) then
+        return self.DoType(LType);
+      end;
+      return self.DoReference(LType, not self.FTree[AParam].HasFlag(NodeFlag.VarParam));
+    end;
+
+    // The <bare-function-type> of the signature ASig (a routine, a member or a routine type)
+    // under ALinkage: each parameter's type, then a variadic's pack (C++ linkage: a last
+    // adam::varargs; C: an ellipsis); v when there is none
+    hidden method DoParams(const ASig: int64; const ALinkage: Linkage): string;
+    var
+      LText: string;
+      LI: int64;
+    begin
+      LText := "";
+      for LI := 0 to self.FTree.CountOf(ASig, NodeRole.Param) - 1 do
+        LText := LText + self.DoParam(self.FTree.NthOf(ASig, NodeRole.Param, LI), ALinkage);
+      end;
+      if self.FTree[ASig].HasFlag(NodeFlag.Variadic) then
+        if ALinkage = Linkage.Cpp then
+          LText := LText + self.DoType(BuiltinType(self.FTree, "varargs"));
+        else
+          LText := LText + "z";
+        end;
+      end;
+      if LText = "" then
+        return "v";
+      end;
+      return LText;
+    end;
+
+    // The parameters of an inline or abstract accessor of AProperty: its index (by its
+    // mode), then for a write AWrite the value, of the property's type, by value
+    hidden method DoAccessorParams(const AProperty: int64; const AWrite: bool): string;
+    var
+      LText: string;
+      LIndex: int64;
+      LTypeExpr: int64;
+    begin
+      LText := "";
+      LIndex := self.FTree.FirstOf(AProperty, NodeRole.Param);
+      if LIndex <> 0 then
+        LText := self.DoParam(LIndex, Linkage.Cpp);
+      end;
+      if AWrite then
+        LTypeExpr := self.FTree.FirstOf(AProperty, NodeRole.TypeOf);
+        if LTypeExpr = 0 then
+          self.FFailed := true;
+          return "";
+        end;
+        LText := LText + self.DoType(CanonicalOf(self.FTree, LTypeExpr));
+      end;
+      if LText = "" then
+        return "v";
+      end;
+      return LText;
+    end;
+
+    // The <encoding> of the routine-like AId: its <name>, then its parameters (a routine of
+    // C linkage, met as the routine a local type is declared in, is its plain name alone,
+    // as clang writes main's)
+    hidden method DoEncoding(const AId: int64): string;
+    var
+      LKind: NodeKind;
+      LDecl: int64;
+      LText: string;
+      LCode: string;
+      LProperty: int64;
+    begin
+      LKind := self.FTree[AId].Kind;
+      if (LKind = NodeKind.RoutineDecl) or (LKind = NodeKind.ForwardRoutine) then
+        // A private routine is internal whatever its linkage: N <namespaces> L <name> E and
+        // its parameters by its own linkage's passing rule, as clang writes a static
+        // function of a namespace (unique per module, so two modules' never meet)
+        if HasInternalSymbol(self.FTree, AId) then
+          if self.FTree[AId].ResolvedLinkage = Linkage.Unset then
+            self.FFailed := true;
+            return "";
+          end;
+          LText := "N" + self.DoNamespace(self.FTree[ModuleOf(self.FTree, AId)].Text);
+          LText := LText + "L" + self.DoSourceName(self.FTree[AId].Text) + "E";
+          return LText + self.DoParams(AId, self.FTree[AId].ResolvedLinkage);
+        end;
+        if self.FTree[AId].ResolvedLinkage = Linkage.C then
+          return self.DoSourceName(self.FTree[AId].Text);
+        end;
+        if self.FTree[AId].ResolvedLinkage <> Linkage.Cpp then
+          self.FFailed := true;
+          return "";
+        end;
+        LText := "N" + self.DoNamespace(self.FTree[ModuleOf(self.FTree, AId)].Text);
+        LText := LText + self.DoSourceName(self.FTree[AId].Text) + "E";
+        return LText + self.DoParams(AId, Linkage.Cpp);
+      end;
+      LDecl := self.DoOwnerDecl(AId);
+      if LDecl = 0 then
+        self.FFailed := true;
+        return "";
+      end;
+      if LKind = NodeKind.MethodDecl then
+        LText := self.DoMemberName(LDecl, self.DoSourceName(self.FTree[AId].Text),
+          self.FTree[AId].HasFlag(NodeFlag.ConstMethod));
+        return LText + self.DoParams(AId, Linkage.Cpp);
+      end;
+      if (LKind = NodeKind.InitDecl) or (LKind = NodeKind.CopyDecl) then
+        LText := self.DoMemberName(LDecl, "C1", false);
+        return LText + self.DoParams(AId, Linkage.Cpp);
+      end;
+      if LKind = NodeKind.DoneDecl then
+        LText := self.DoMemberName(LDecl, "D1", false);
+        return LText + "v";
+      end;
+      if LKind = NodeKind.OperatorDecl then
+        LCode := DoOperatorCode(self.FTree[AId].Op, self.FTree.CountOf(AId, NodeRole.Param));
+        if LCode = "" then
+          self.FFailed := true;
+          return "";
+        end;
+        LText := self.DoOperatorName(LDecl, LCode);
+        return LText + self.DoParams(AId, Linkage.Cpp);
+      end;
+      if (LKind = NodeKind.PropertyRead) or (LKind = NodeKind.PropertyWrite) then
+        LProperty := self.FTree.ParentOf(AId);
+        if LKind = NodeKind.PropertyRead then
+          LText := self.DoMemberName(LDecl,
+            self.DoSourceName(ADAM_SYMBOLS_GET_PREFIX + self.FTree[LProperty].Text), true);
+          return LText + self.DoAccessorParams(LProperty, false);
+        end;
+        LText := self.DoMemberName(LDecl,
+          self.DoSourceName(ADAM_SYMBOLS_SET_PREFIX + self.FTree[LProperty].Text), false);
+        return LText + self.DoAccessorParams(LProperty, true);
+      end;
+      self.FFailed := true;
+      return "";
+    end;
+
+    // The C++ linkage symbol of the routine-like AId (a routine of settled linkage, a
+    // member, an accessor): _Z <encoding>; empty when a part of it has no name (a type
+    // that was not resolved: reported where it was lost)
+    method RoutineSymbol(const AId: int64): string;
+    var
+      LText: string;
+    begin
+      self.DoReset();
+      LText := "_Z" + self.DoEncoding(AId);
+      if self.FFailed then
+        return "";
+      end;
+      return LText;
+    end;
+
+    // The namespaced symbol of the module variable AId: _ZN <its module's namespaces>
+    // <name> E, a private one's name internal (L <name>, as clang writes a static variable
+    // of a namespace); the namer gives it to private variables only (DoModuleVariable)
+    method VariableSymbol(const AId: int64): string;
+    var
+      LText: string;
+    begin
+      self.DoReset();
+      LText := "_ZN" + self.DoNamespace(self.FTree[ModuleOf(self.FTree, AId)].Text);
+      if HasInternalSymbol(self.FTree, AId) then
+        LText := LText + "L";
+      end;
+      LText := LText + self.DoSourceName(self.FTree[AId].Text) + "E";
+      if self.FFailed then
+        return "";
+      end;
+      return LText;
+    end;
+  end;
+
+exported type
+  // One naming pass over a tree (see NameSymbols): the C linkage definitions met so far,
+  // by symbol, for SM0024
+  SymbolNamer = object
+    hidden FTree: ref SyntaxTree;
+    hidden FDiagnostics: ref Diagnostics;
+    hidden FMangler: ref ItaniumMangler;
+    hidden FCSymbols: array of string;
+    hidden FCDecls: array of int64;
+    hidden FCCount: int64;
+
+    // The mangler is ATarget's scheme (one scheme today: Itanium)
+    init(const ATree: ref SyntaxTree; const ATarget: ref Target;
+      const ADiagnostics: ref Diagnostics);
+    begin
+      self.FTree := ATree;
+      self.FDiagnostics := ADiagnostics;
+      match ATarget.Mangling() of
+        ManglingScheme.Itanium: self.FMangler := ref ItaniumMangler(ATree, ATarget);
+      end;
+      self.FCCount := 0;
+    end;
+
+    // True when AId is generic or lies in something generic (a generic type's members, a
+    // local type of a generic routine): M10 names its instances
+    hidden const method DoIsGeneric(const AId: int64): bool;
+    var
+      LAt: int64;
+    begin
+      LAt := AId;
+      while LAt <> 0 do
+        if self.FTree.CountOf(LAt, NodeRole.GenericParam) > 0 then
+          return true;
+        end;
+        LAt := self.FTree.ParentOf(LAt);
+      end;
+      return false;
+    end;
+
+    // ADecl's name as a message writes it: its module's name, a dot, its own
+    hidden const method DoQualified(const ADecl: int64): string;
+    begin
+      return self.FTree[ModuleOf(self.FTree, ADecl)].Text + "." + self.FTree[ADecl].Text;
+    end;
+
+    // The C linkage definition ADecl of ASymbol recorded; SM0024 at ADecl when one is already
+    hidden method DoCDefinition(const ADecl: int64; const ASymbol: string);
+    var
+      LI: int64;
+    begin
+      for LI := 0 to self.FCCount - 1 do
+        if self.FCSymbols[LI] = ASymbol then
+          self.FDiagnostics.Add(Severity.Error, ADAM_ERR_SYMBOLS_024, self.FTree[ADecl].Place,
+            ADAM_MSG_SYMBOLS_C_SYMBOL_TWICE, NoArgs().Str(ASymbol).Str(self.DoQualified(self.FCDecls[LI])));
+          return;
+        end;
+      end;
+      if self.FCCount >= len(self.FCSymbols) then
+        setlength(self.FCSymbols, self.FCCount * 2 + 16);
+        setlength(self.FCDecls, self.FCCount * 2 + 16);
+      end;
+      self.FCSymbols[self.FCCount] := ASymbol;
+      self.FCDecls[self.FCCount] := ADecl;
+      self.FCCount := self.FCCount + 1;
+    end;
+
+    // A routine or forward routine AId: its linkage settled (BNF sec 3), then its symbol
+    hidden method DoRoutine(const AId: int64);
+    var
+      LOverloaded: bool;
+      LLinkage: Linkage;
+    begin
+      if self.DoIsGeneric(AId) then
+        return;
+      end;
+      LOverloaded := IsOverloadedRoutine(self.FTree, AId);
+      LLinkage := Linkage.C;
+      if self.FTree[AId].HasFlag(NodeFlag.Cpplink) or LOverloaded then
+        LLinkage := Linkage.Cpp;
+      end;
+      // The warning once per routine: at the definition (or external), not its forward
+      if LOverloaded and self.FTree[AId].HasFlag(NodeFlag.Clink) and
+        (self.FTree[AId].Kind = NodeKind.RoutineDecl) then
+        self.FDiagnostics.Add(Severity.Warning, ADAM_ERR_SYMBOLS_323, self.FTree[AId].Place,
+          ADAM_MSG_SYMBOLS_LINKAGE_DROPPED, NoArgs().Str(self.FTree[AId].Text));
+      end;
+      self.FTree[AId].ResolvedLinkage := LLinkage;
+      // A private routine's symbol is internal (the mangler's), so it never meets another
+      // module's: SM0024 is only between the C linkage definitions of public routines
+      if HasInternalSymbol(self.FTree, AId) then
+        self.FTree[AId].ResolvedSymbol := self.FMangler.RoutineSymbol(AId);
+        return;
+      end;
+      if LLinkage = Linkage.C then
+        self.FTree[AId].ResolvedSymbol := self.FTree[AId].Text;
+        if (self.FTree[AId].Kind = NodeKind.RoutineDecl) and (self.FTree.FirstOf(AId, NodeRole.Body) <> 0) then
+          self.DoCDefinition(AId, self.FTree[AId].Text);
+        end;
+        return;
+      end;
+      self.FTree[AId].ResolvedSymbol := self.FMangler.RoutineSymbol(AId);
+    end;
+
+    // What a type declares (a method, init, copy, done, operator; an accessor with a body
+    // or abstract): C++ linkage and its symbol
+    hidden method DoMember(const AId: int64);
+    begin
+      if self.DoIsGeneric(AId) then
+        return;
+      end;
+      self.FTree[AId].ResolvedLinkage := Linkage.Cpp;
+      self.FTree[AId].ResolvedSymbol := self.FMangler.RoutineSymbol(AId);
+    end;
+
+    // A module variable AId: C linkage always (a variable has no linkage word); a private
+    // one's symbol is internal (the mangler's, so it never meets another module's), an
+    // external one binds its own C name, a public one its plain name, recorded for SM0024
+    hidden method DoModuleVariable(const AId: int64);
+    begin
+      self.FTree[AId].ResolvedLinkage := Linkage.C;
+      if HasInternalSymbol(self.FTree, AId) then
+        self.FTree[AId].ResolvedSymbol := self.FMangler.VariableSymbol(AId);
+        return;
+      end;
+      self.FTree[AId].ResolvedSymbol := self.FTree[AId].Text;
+      if self.FTree.FirstOf(AId, NodeRole.External) = 0 then
+        self.DoCDefinition(AId, self.FTree[AId].Text);
+      end;
+    end;
+
+    // The one declaration AId, by its kind (anything else names nothing)
+    hidden method DoNode(const AId: int64);
+    var
+      LKind: NodeKind;
+    begin
+      LKind := self.FTree[AId].Kind;
+      if (LKind = NodeKind.RoutineDecl) or (LKind = NodeKind.ForwardRoutine) then
+        self.DoRoutine(AId);
+        return;
+      end;
+      if (LKind = NodeKind.MethodDecl) or (LKind = NodeKind.InitDecl) or (LKind = NodeKind.CopyDecl) or
+        (LKind = NodeKind.DoneDecl) or (LKind = NodeKind.OperatorDecl) then
+        self.DoMember(AId);
+        return;
+      end;
+      // An accessor with a body (or abstract) is a member function. One bound to a field (its
+      // Text) is the field itself, no function, unless its property is virtual / override:
+      // its vtable slot then holds a function Lowering makes from the field
+      if ((LKind = NodeKind.PropertyRead) or (LKind = NodeKind.PropertyWrite)) and
+        ((self.FTree[AId].Text = "") or self.FTree[self.FTree.ParentOf(AId)].HasFlag(NodeFlag.Virtual) or
+        self.FTree[self.FTree.ParentOf(AId)].HasFlag(NodeFlag.Override)) then
+        self.DoMember(AId);
+        return;
+      end;
+      if (LKind = NodeKind.VarDecl) and (self.FTree[self.FTree.ParentOf(AId)].Kind = NodeKind.Module) then
+        self.DoModuleVariable(AId);
+      end;
+    end;
+
+    // Every declaration of the tree in arena order (the parse order: deterministic; a
+    // routine comes before the types declared in it, whose local names read its linkage);
+    // recovered nodes name nothing
+    method Run();
+    var
+      LI: int64;
+    begin
+      for LI := 1 to self.FTree.Count - 1 do
+        if not self.FTree[LI].HasFlag(NodeFlag.Recovered) then
+          self.DoNode(LI);
+        end;
+      end;
+    end;
+  end;
+
+// Every routine, member, accessor and module variable of the program in ATree given its
+// linkage and symbol (see SymbolNamer) as ATarget spells them, reporting into ADiagnostics.
+// Runs after CheckLayouts: it reads canonical types, static array bounds and set member
+// counts. With no target (nil) nothing is named: a symbol's spelling is the target's, and
+// the Driver has reported the missing target (DR0004)
+exported routine NameSymbols(const ATree: ref SyntaxTree; const ATarget: ref Target;
+  const ADiagnostics: ref Diagnostics);
+var
+  LNamer: ref SymbolNamer;
+begin
+  if ATarget = nil then
+    return;
+  end;
+  LNamer := ref SymbolNamer(ATree, ATarget, ADiagnostics);
+  LNamer.Run();
+end;
+
+end.

@@ -1,0 +1,169 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.X64.Probe.adam - the x86_64 stack probe (DESIGN sec 6)
+
+  A probed frame (FrameLayout.ProbeBytes, the ABI's rule) touches every page
+  it reaches, in order from the top, before its prologue reserves it, so the
+  OS's guard page is never skipped. The prologue, after its saves, puts the
+  bytes in the first of the ABI's probe registers (AbiPart.ProbeScratch) and
+  calls the probe; the probe changes only those registers and the flags, and
+  moves no stack pointer, so no unwind code describes the call and the
+  probe itself is a leaf with no unwind data.
+
+  ProbeRegisters  the ABI's probe registers by the arch's numbers: the size
+                  first, then the probe's cursor and bottom; raises (a
+                  compiler bug) for fewer than three, or a name the arch
+                  does not have
+  ProbeFunction   the probe as an allocated MachineFunction (internal symbol
+                  ADAM_X64_PROBE_SYMBOL, an empty frame), for the encoder:
+                    lea cursor, [rsp + 8]   the caller's stack pointer
+                    mov bottom, cursor
+                    sub bottom, size        the lowest byte the frame reaches
+                  loop:
+                    sub cursor, page
+                    cmp cursor, bottom
+                    jbe last
+                    mov size, [cursor]      one page touched
+                    jmp loop
+                  last:
+                    mov size, [bottom]      the last (partial) page
+                    ret
+                  raises (a compiler bug) for a page that is not a power
+                  of two
+*******************************************************************************/
+
+module unit Adam.X64.Probe;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Parts, Adam.X64.Registers,
+  Adam.X64.Machine;
+
+exported const
+  // The probe's symbol (internal to the object it is generated into)
+  ADAM_X64_PROBE_SYMBOL: string = "__adam_probe_stack";
+  // The registers the probe needs: the size, its cursor, its bottom
+  ADAM_X64_PROBE_REGISTERS: int64 = 3;
+  // The return address x86_64's call pushes, and the probe's operation size
+  ADAM_X64_PROBE_RETURN_BYTES: int64 = 8;
+  ADAM_X64_PROBE_WIDTH: int64 = 8;
+  // Raised (an invariant broken) by ABI facts the probe cannot take (see the header)
+  ADAM_X64_PROBE_FAULT_SCRATCH: string = "X64 probe: the ABI's probe registers: ";
+  ADAM_X64_PROBE_FAULT_PAGE: string = "X64 probe: a page that is not a power of two: ";
+
+// AAbi's probe registers by ARegisters' numbers (see the header)
+exported routine ProbeRegisters(const AAbi: ref AbiPart; const ARegisters: ref X64Registers):
+  ref Int64List;
+var
+  LNames: StringArray;
+  LList: ref Int64List;
+  LNumber: int64;
+  LI: int64;
+begin
+  LNames := AAbi.ProbeScratch();
+  if len(LNames) < ADAM_X64_PROBE_REGISTERS then
+    raise(ADAM_X64_PROBE_FAULT_SCRATCH + IntToStr(len(LNames)) + ", not " +
+      IntToStr(ADAM_X64_PROBE_REGISTERS));
+  end;
+  LList := ref Int64List();
+  for LI := 0 to len(LNames) - 1 do
+    LNumber := ARegisters.NumberOf(LNames[LI]);
+    if LNumber < 0 then
+      raise(ADAM_X64_PROBE_FAULT_SCRATCH + "no register '" + LNames[LI] + "'");
+    end;
+    LList.Add(LNumber);
+  end;
+  return LList;
+end;
+
+// AOp (of the probe's width) over AFirst and ASecond at the end of ABlock
+routine DoPair(const ABlock: ref MachineBlock; const AOp: X64Op; const AFirst: ref MachineOperand;
+  const ASecond: ref MachineOperand);
+var
+  LInstr: ref MachineInstr;
+begin
+  LInstr := ref MachineInstr(AOp, ADAM_X64_PROBE_WIDTH, 0);
+  LInstr.AddOperand(AFirst);
+  LInstr.AddOperand(ASecond);
+  ABlock.AddInstr(LInstr);
+end;
+
+// A jump (AOp Jmp, or Jcc on ACond) to block ATarget at the end of ABlock
+routine DoJump(const ABlock: ref MachineBlock; const AOp: X64Op; const ACond: X64Cond;
+  const ATarget: int64);
+var
+  LInstr: ref MachineInstr;
+begin
+  LInstr := ref MachineInstr(AOp, 0, 0);
+  LInstr.Cond := ACond;
+  LInstr.AddOperand(BlockOperand(ATarget));
+  ABlock.AddInstr(LInstr);
+end;
+
+// The probe for AAbi (see the header)
+exported routine ProbeFunction(const AAbi: ref AbiPart): ref MachineFunction;
+var
+  LRegisters: ref X64Registers;
+  LScratch: ref Int64List;
+  LMachine: ref MachineFunction;
+  LEntry: ref MachineBlock;
+  LLoop: ref MachineBlock;
+  LLast: ref MachineBlock;
+  LLoopIndex: int64;
+  LLastIndex: int64;
+  LPage: int64;
+  LSize: int64;
+  LCursor: int64;
+  LBottom: int64;
+  LStack: int64;
+begin
+  LPage := AAbi.PageBytes();
+  if not IsPowerOfTwo(LPage) then
+    raise(ADAM_X64_PROBE_FAULT_PAGE + IntToStr(LPage));
+  end;
+  LRegisters := ref X64Registers();
+  LScratch := ProbeRegisters(AAbi, LRegisters);
+  LSize := LScratch[0];
+  LCursor := LScratch[1];
+  LBottom := LScratch[2];
+  LStack := LRegisters.NumberOf(ADAM_X64_STACK_POINTER);
+  LMachine := ref MachineFunction(ADAM_X64_PROBE_SYMBOL, 0);
+  LMachine.Internal := true;
+  // A leaf that saves nothing and moves no stack pointer: an empty frame, no unwind data
+  LMachine.Frame := ref FrameLayout();
+  LEntry := LMachine.BlockAt(LMachine.AddBlock(0));
+  LLoopIndex := LMachine.AddBlock(0);
+  LLoop := LMachine.BlockAt(LLoopIndex);
+  LLastIndex := LMachine.AddBlock(0);
+  LLast := LMachine.BlockAt(LLastIndex);
+  // From the caller's stack pointer (above the return address the call pushed) down to the
+  // lowest byte its frame reaches
+  DoPair(LEntry, X64Op.Lea, PhysicalOperand(LCursor),
+    RegisterMemory(LStack, false, ADAM_X64_PROBE_RETURN_BYTES));
+  DoPair(LEntry, X64Op.Mov, PhysicalOperand(LBottom), PhysicalOperand(LCursor));
+  DoPair(LEntry, X64Op.Sub, PhysicalOperand(LBottom), PhysicalOperand(LSize));
+  DoJump(LEntry, X64Op.Jmp, X64Cond.Overflow, LLoopIndex);
+  // One page down at a time, each touched by a read (unsigned: addresses)
+  DoPair(LLoop, X64Op.Sub, PhysicalOperand(LCursor), ImmediateOperand(LPage));
+  DoPair(LLoop, X64Op.Cmp, PhysicalOperand(LCursor), PhysicalOperand(LBottom));
+  DoJump(LLoop, X64Op.Jcc, X64Cond.BelowOrEqual, LLastIndex);
+  DoPair(LLoop, X64Op.Mov, PhysicalOperand(LSize), RegisterMemory(LCursor, false, 0));
+  DoJump(LLoop, X64Op.Jmp, X64Cond.Overflow, LLoopIndex);
+  // The last page, reached part way
+  DoPair(LLast, X64Op.Mov, PhysicalOperand(LSize), RegisterMemory(LBottom, false, 0));
+  LLast.AddInstr(ref MachineInstr(X64Op.Ret, 0, 0));
+  return LMachine;
+end;
+
+end.

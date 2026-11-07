@@ -1,0 +1,803 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Testbed.Runner.adam - adamtest's command line: collects the tests,
+  runs each through adam.exe, compares, reports
+
+    adamtest <ids / globs> | -all | -failed | -list [glob]
+             [-root <dir>]... [-adam <exe>] | -h
+
+  A test is a .adam file under a root (default: Adam's repo\bin\res\tests;
+  -root, repeatable, replaces it), fixtures\ folders skipped. Its id is
+  <folder>.<stem>, the folders below the root joined by dots; a file
+  directly in a root takes the root folder's name. A glob takes * and ?.
+
+  Each test's spec (Adam.Testbed.Spec) says what runs: check and error run
+  `adam check <file>` and match adam's reports against the markers (an
+  unmarked report fails, a marker nobody reported fails); cli runs adam with
+  the spec's args and compares exit code and output lines; run runs `adam
+  build <file> -o <output root>`, matches its reports as check does, then
+  runs the exe it wrote and compares as cli does. adam runs in the
+  output root (Adam's repo\bin\output), so nothing lands beside a test.
+  Output is compared as lines: LF ends, trailing blanks and trailing empty
+  lines dropped, PaskalCPP's [Heap] report left out (stage 0's own; Adam's
+  runtime prints [Adam Heap], compared as any line); the first difference is
+  shown. <DIR> in args and | lines is the test's folder, <OUT> in | lines the
+  output root, both in '/' form.
+
+  The ids that failed are kept in the output root's adamtest.failed for
+  -failed. Exit codes as PaskalCPP's testbed: 0 every test passed, 1 a test
+  failed, 2 a command line mistake (TR codes, printed with the usage).
+
+  The default folders are the repo's release layout: adamtest.exe and
+  adam.exe side by side in bin\, the tests in bin\res\tests, the builds in
+  bin\output (PLAN-SELFHOST S6a moved them with the sources).
+*******************************************************************************/
+
+module unit Adam.Testbed.Runner;
+
+import System.SysUtils, System.Windows, Adam.Core.Messages, Adam.Compiler.SourceText,
+  Adam.Compiler.Diagnostics, Adam.Testbed.Spec;
+
+exported const
+  ADAM_ERR_TESTBED_101: string = "TR0001";   // the usage (a Hint)
+  ADAM_ERR_TESTBED_102: string = "TR0002";   // an option adamtest does not know
+  ADAM_ERR_TESTBED_103: string = "TR0003";   // an option with no value after it
+  ADAM_ERR_TESTBED_104: string = "TR0004";   // nothing named to run
+  ADAM_ERR_TESTBED_105: string = "TR0005";   // a glob no test matches
+  ADAM_ERR_TESTBED_106: string = "TR0006";   // adam.exe is not there
+  ADAM_ERR_TESTBED_107: string = "TR0007";   // a root that cannot be read
+  ADAM_ERR_TESTBED_108: string = "TR0008";   // -failed with nothing kept
+  ADAM_ERR_TESTBED_109: string = "TR0009";   // a test file that cannot be read
+
+  // adamtest's exit codes
+  ADAM_TESTBED_EXIT_PASSED: int32 = 0;
+  ADAM_TESTBED_EXIT_FAILED: int32 = 1;
+  ADAM_TESTBED_EXIT_USAGE: int32 = 2;
+
+const
+  // The release layout, from adamtest.exe's folder (see the header)
+  ADAM_TESTBED_DEFAULT_ROOT: string = "$P:res/tests";
+  ADAM_TESTBED_DEFAULT_ADAM: string = "$P:adam.exe";
+  ADAM_TESTBED_OUTPUT_ROOT: string = "$P:output";
+
+  ADAM_TESTBED_FAILED_FILE: string = "adamtest.failed";
+  ADAM_TESTBED_TEST_EXT: string = ".adam";
+  ADAM_TESTBED_FIXTURES: string = "fixtures";
+  ADAM_TESTBED_HEAP_PREFIX: string = "[Heap]";
+  ADAM_TESTBED_CHECK: string = "check";
+  // A run test's build: the command, its output option, the exe's ending (win64 only, as
+  // every Adam run; the runner is a tool beside the compiler, not a phase above the parts)
+  ADAM_TESTBED_BUILD: string = "build";
+  ADAM_TESTBED_OUTPUT_OPTION: string = "-o";
+  ADAM_TESTBED_EXE_EXT: string = ".exe";
+  ADAM_TESTBED_DIR_HOLE: string = "<DIR>";
+  ADAM_TESTBED_OUT_HOLE: string = "<OUT>";
+  ADAM_TESTBED_BUDGET: int64 = 100;
+
+  // The exit codes adam check gives a clean and a failing program
+  ADAM_TESTBED_CHECK_CLEAN: int32 = 0;
+  ADAM_TESTBED_CHECK_ERRORS: int32 = 1;
+
+type
+  // One test file: its id and its full path ('/' form)
+  FoundTest = record
+    Id: string;
+    Path: string;
+  end;
+
+  FoundTestArray = array of FoundTest;
+
+  // What the command line asks for
+  RunRequest = record
+    Roots: StringArray;
+    AdamExe: string;
+    Masks: StringArray;
+    RunAll: bool;
+    RunFailed: bool;
+    ListOnly: bool;
+    ShowHelp: bool;
+  end;
+
+// Appends AText to AList
+routine DoAddString(var AList: StringArray; const AText: string);
+var
+  LCount: int64;
+begin
+  LCount := len(AList);
+  setlength(AList, LCount + 1);
+  AList[LCount] := AText;
+end;
+
+// APath with every '\' as '/' (how adam prints a path, and how <DIR> / <OUT> read)
+routine DoSlashes(const APath: string): string;
+begin
+  return ReplaceStr(APath, "\\", "/");
+end;
+
+// Prints one line
+routine DoPrint(const AText: string);
+begin
+  println("{}", AText);
+end;
+
+// Reports the usage into AReports (a Hint with no place)
+routine DoUsage(const AReports: ref Diagnostics);
+begin
+  AReports.Add(Severity.Hint, ADAM_ERR_TESTBED_101, NoPlace(), ADAM_MSG_TESTBED_USAGE, NoArgs());
+end;
+
+// One command line mistake into AReports (an Error with no place), the usage after it, all
+// printed: ADAM_TESTBED_EXIT_USAGE
+routine DoMistake(const AReports: ref Diagnostics; const ACode: string; const ATemplate: string;
+  const AArgs: MessageArgs): int32;
+begin
+  AReports.Add(Severity.Error, ACode, NoPlace(), ATemplate, AArgs);
+  DoUsage(AReports);
+  AReports.PrintAll();
+  return ADAM_TESTBED_EXIT_USAGE;
+end;
+
+// Reads the command line into ARequest; false after a mistake reported into AReports
+routine DoReadArgs(const AReports: ref Diagnostics; var ARequest: RunRequest): bool;
+var
+  LIndex: int32;
+  LArg: string;
+begin
+  setlength(ARequest.Roots, 0);
+  ARequest.AdamExe := ADAM_TESTBED_DEFAULT_ADAM;
+  setlength(ARequest.Masks, 0);
+  ARequest.RunAll := false;
+  ARequest.RunFailed := false;
+  ARequest.ListOnly := false;
+  ARequest.ShowHelp := paramcount() < 1;
+  LIndex := 1;
+  while LIndex <= paramcount() do
+    LArg := paramstr(LIndex);
+    if (LArg = "-h") or (LArg = "--help") then
+      ARequest.ShowHelp := true;
+    else
+      if LArg = "-all" then
+        ARequest.RunAll := true;
+      else
+        if LArg = "-failed" then
+          ARequest.RunFailed := true;
+        else
+          if LArg = "-list" then
+            ARequest.ListOnly := true;
+          else
+            if (LArg = "-root") or (LArg = "-adam") then
+              // Both take the next argument as their value
+              if LIndex + 1 > paramcount() then
+                AReports.Add(Severity.Error, ADAM_ERR_TESTBED_103, NoPlace(),
+                  ADAM_MSG_TESTBED_NEEDS_VALUE, NoArgs().Str(LArg));
+                return false;
+              end;
+              LIndex := LIndex + 1;
+              if LArg = "-root" then
+                DoAddString(ARequest.Roots, paramstr(LIndex));
+              else
+                ARequest.AdamExe := paramstr(LIndex);
+              end;
+            else
+              if StartsStr("-", LArg) then
+                AReports.Add(Severity.Error, ADAM_ERR_TESTBED_102, NoPlace(),
+                  ADAM_MSG_TESTBED_UNKNOWN_OPTION, NoArgs().Str(LArg));
+                return false;
+              end;
+              DoAddString(ARequest.Masks, LArg);
+            end;
+          end;
+        end;
+      end;
+    end;
+    LIndex := LIndex + 1;
+  end;
+  return true;
+end;
+
+// Adds the tests in ADir and below to ATests: a file's id is AFilePrefix.<stem>; a folder's
+// files take ASubPrefix<folder> (fixtures\ folders skipped)
+routine DoCollectFolder(const ADir: string; const AFilePrefix: string; const ASubPrefix: string;
+  var ATests: FoundTestArray);
+var
+  LFiles: StringArray;
+  LDirs: StringArray;
+  LI: int64;
+  LName: string;
+  LCount: int64;
+begin
+  if GetFiles(ADir, LFiles) then
+    for LI := 0 to len(LFiles) - 1 do
+      LName := LFiles[LI];
+      if EndsStr(ADAM_TESTBED_TEST_EXT, LName) then
+        LCount := len(ATests);
+        setlength(ATests, LCount + 1);
+        ATests[LCount].Id := AFilePrefix + "." +
+          Substring(LName, 0, len(LName) - len(ADAM_TESTBED_TEST_EXT));
+        ATests[LCount].Path := ADir + "/" + LName;
+      end;
+    end;
+  end;
+  if GetDirectories(ADir, LDirs) then
+    for LI := 0 to len(LDirs) - 1 do
+      if LDirs[LI] <> ADAM_TESTBED_FIXTURES then
+        DoCollectFolder(ADir + "/" + LDirs[LI], ASubPrefix + LDirs[LI],
+          ASubPrefix + LDirs[LI] + ".", ATests);
+      end;
+    end;
+  end;
+end;
+
+// A process's output AText as lines (see the header): LF ends, trailing blanks and trailing
+// empty lines dropped, PaskalCPP's [Heap] lines left out (stage 0's own report; Adam's
+// runtime prints [Adam Heap], compared as any line, DESIGN sec 8)
+routine DoOutputLines(const AText: string): StringArray;
+var
+  LParts: StringArray;
+  LLines: StringArray;
+  LI: int64;
+  LLine: string;
+begin
+  setlength(LLines, 0);
+  LParts := SplitString(AText, "\n");
+  for LI := 0 to len(LParts) - 1 do
+    LLine := TrimRight(LParts[LI]);
+    if not StartsStr(ADAM_TESTBED_HEAP_PREFIX, LLine) then
+      DoAddString(LLines, LLine);
+    end;
+  end;
+  while (len(LLines) > 0) and (LLines[len(LLines) - 1] = "") do
+    setlength(LLines, len(LLines) - 1);
+  end;
+  return LLines;
+end;
+
+// True when AWord is a report level as adam prints it
+routine DoIsLevel(const AWord: string): bool;
+begin
+  return (AWord = ADAM_MSG_DIAGNOSTICS_HINT) or (AWord = ADAM_MSG_DIAGNOSTICS_WARNING) or
+    IsErrorLevel(AWord);
+end;
+
+// Reads "<Level> <CODE>: <text>" into AReport's level, code and text; false when ARest is not
+routine DoReadReportTail(const ARest: string; var AReport: ReportMarker): bool;
+var
+  LSpace: int64;
+  LColon: int64;
+begin
+  LSpace := IndexOf(" ", ARest, 0);
+  if LSpace < 0 then
+    return false;
+  end;
+  LColon := IndexOf(": ", ARest, LSpace + 1);
+  if LColon < 0 then
+    return false;
+  end;
+  AReport.Level := Substring(ARest, 0, LSpace);
+  if not DoIsLevel(AReport.Level) then
+    return false;
+  end;
+  AReport.Code := Substring(ARest, LSpace + 1, LColon - LSpace - 1);
+  AReport.Message := Substring(ARest, LColon + 2, len(ARest) - LColon - 2);
+  return true;
+end;
+
+// Reads one line adam printed into AReport and APath: "<path>(<line>,<column>): <tail>", or
+// "<tail>" for a report with no place (APath "", line and column 0). False when the line is
+// no report
+routine DoReadReport(const ALine: string; var APath: string; var AReport: ReportMarker): bool;
+var
+  LSpace: int64;
+  LClose: int64;
+  LOpen: int64;
+  LComma: int64;
+  LValue: int64;
+begin
+  APath := "";
+  AReport.Line := 0;
+  AReport.Column := 0;
+
+  // A line that starts with a level word is a report with no place
+  LSpace := IndexOf(" ", ALine, 0);
+  if (LSpace > 0) and DoIsLevel(Substring(ALine, 0, LSpace)) then
+    return DoReadReportTail(ALine, AReport);
+  end;
+
+  LClose := IndexOf("): ", ALine, 0);
+  if LClose < 0 then
+    return false;
+  end;
+  // The place's '(' is the last one before its "): " (a path may hold its own)
+  LOpen := LClose - 1;
+  while (LOpen >= 0) and (ALine[LOpen] <> '(') do
+    LOpen := LOpen - 1;
+  end;
+  if LOpen <= 0 then
+    return false;
+  end;
+  LComma := IndexOf(",", ALine, LOpen);
+  if (LComma < 0) or (LComma > LClose) then
+    return false;
+  end;
+  if not TryStrToInt(Substring(ALine, LOpen + 1, LComma - LOpen - 1), LValue) then
+    return false;
+  end;
+  AReport.Line := int32(LValue);
+  if not TryStrToInt(Substring(ALine, LComma + 1, LClose - LComma - 1), LValue) then
+    return false;
+  end;
+  AReport.Column := int32(LValue);
+  APath := Substring(ALine, 0, LOpen);
+  return DoReadReportTail(Substring(ALine, LClose + 3, len(ALine) - LClose - 3), AReport);
+end;
+
+// AMarker as a spec writes it: LEVEL CODE[@column][: text] with adam's level word
+routine DoMarkerText(const AMarker: ReportMarker): string;
+var
+  LText: string;
+begin
+  LText := AMarker.Level + " " + AMarker.Code;
+  if AMarker.Column > 0 then
+    LText := LText + "@" + IntToStr(int64(AMarker.Column));
+  end;
+  if AMarker.Message <> "" then
+    LText := LText + ": " + AMarker.Message;
+  end;
+  return LText;
+end;
+
+// True when the report AReport (at APath) is what AMarker expects in the file ATestPath
+routine DoMatches(const AReport: ReportMarker; const APath: string; const AMarker: ReportMarker;
+  const ATestPath: string): bool;
+begin
+  if (APath <> ATestPath) or (AReport.Level <> AMarker.Level) or (AReport.Code <> AMarker.Code) or
+    (AReport.Line <> AMarker.Line) then
+    return false;
+  end;
+  if (AMarker.Column <> 0) and (AReport.Column <> AMarker.Column) then
+    return false;
+  end;
+  return (AMarker.Message = "") or (AReport.Message = AMarker.Message);
+end;
+
+// Matches adam's report lines ALines against ASpec's markers for the file ATestPath: every
+// report needs its own marker (an unmarked hint or warning passes under warnings allow) and
+// every marker its report. Each mismatch is one line in ADetails
+routine DoCompareReports(const ALines: StringArray; const ATestPath: string; const ASpec: TestSpec;
+  var ADetails: StringArray);
+var
+  LUsed: array of bool;
+  LI: int64;
+  LJ: int64;
+  LFound: int64;
+  LPath: string;
+  LReport: ReportMarker;
+begin
+  setlength(LUsed, len(ASpec.Markers));
+  for LJ := 0 to len(LUsed) - 1 do
+    LUsed[LJ] := false;
+  end;
+  for LI := 0 to len(ALines) - 1 do
+    if not DoReadReport(ALines[LI], LPath, LReport) then
+      DoAddString(ADetails, NoArgs().Str(ALines[LI]).Fill(ADAM_MSG_TESTBED_STRANGE));
+    else
+      LFound := -1;
+      LJ := 0;
+      while (LFound < 0) and (LJ < len(ASpec.Markers)) do
+        if not LUsed[LJ] and DoMatches(LReport, LPath, ASpec.Markers[LJ], ATestPath) then
+          LFound := LJ;
+        end;
+        LJ := LJ + 1;
+      end;
+      if LFound >= 0 then
+        LUsed[LFound] := true;
+      else
+        if not (ASpec.WarningsAllow and not IsErrorLevel(LReport.Level)) then
+          DoAddString(ADetails, NoArgs().Str(ALines[LI]).Fill(ADAM_MSG_TESTBED_UNEXPECTED));
+        end;
+      end;
+    end;
+  end;
+  for LJ := 0 to len(ASpec.Markers) - 1 do
+    if not LUsed[LJ] then
+      DoAddString(ADetails, NoArgs().Int(int64(ASpec.Markers[LJ].Line))
+        .Str(DoMarkerText(ASpec.Markers[LJ])).Fill(ADAM_MSG_TESTBED_MISSING));
+    end;
+  end;
+end;
+
+// Compares adam's output lines AGot with the spec's AWant (holes already filled): the first
+// difference is one line in ADetails
+routine DoCompareLines(const AGot: StringArray; const AWant: StringArray;
+  var ADetails: StringArray);
+var
+  LI: int64;
+begin
+  LI := 0;
+  while (LI < len(AGot)) and (LI < len(AWant)) do
+    if AGot[LI] <> AWant[LI] then
+      DoAddString(ADetails, NoArgs().Int(LI + 1).Str(AGot[LI]).Str(AWant[LI])
+        .Fill(ADAM_MSG_TESTBED_LINE_DIFF));
+      return;
+    end;
+    LI := LI + 1;
+  end;
+  if LI < len(AGot) then
+    DoAddString(ADetails, NoArgs().Int(LI + 1).Str(AGot[LI]).Fill(ADAM_MSG_TESTBED_LINE_EXTRA));
+    return;
+  end;
+  if LI < len(AWant) then
+    DoAddString(ADetails, NoArgs().Int(LI + 1).Str(AWant[LI]).Fill(ADAM_MSG_TESTBED_LINE_SHORT));
+  end;
+end;
+
+// The spec's expected lines with <DIR> and <OUT> filled, compared as adam's output is
+routine DoWantedLines(const ASpec: TestSpec; const ADir: string; const AOutRoot: string): StringArray;
+var
+  LLines: StringArray;
+  LI: int64;
+begin
+  setlength(LLines, 0);
+  for LI := 0 to len(ASpec.Expect) - 1 do
+    DoAddString(LLines, TrimRight(ReplaceStr(ReplaceStr(ASpec.Expect[LI], ADAM_TESTBED_DIR_HOLE,
+      ADir), ADAM_TESTBED_OUT_HOLE, AOutRoot)));
+  end;
+  while (len(LLines) > 0) and (LLines[len(LLines) - 1] = "") do
+    setlength(LLines, len(LLines) - 1);
+  end;
+  return LLines;
+end;
+
+// Runs the run test ATest (spec ASpec): `adam build <file> -o <AOutRoot>` in AOutRoot, its
+// reports matched as check's (exit 0), then the exe it wrote (<stem>.exe in AOutRoot, any
+// old one deleted first) run in AOutRoot with the spec's args, its exit code and output
+// lines compared. Every way it fails is a line in ADetails
+routine DoRunBuilt(const ATest: FoundTest; const ASpec: TestSpec; const AAdam: string;
+  const AOutRoot: string; var ADetails: StringArray);
+var
+  LDir: string;
+  LExe: string;
+  LArgs: StringArray;
+  LI: int64;
+  LOutput: string;
+  LExit: uint32;
+begin
+  LDir := DoSlashes(ExtractFileDir(ATest.Path));
+  LExe := AOutRoot + "/" + ChangeFileExt(ExtractFileName(ATest.Path), ADAM_TESTBED_EXE_EXT);
+  if FileExists(LExe) then
+    DeleteFile(LExe);
+  end;
+  setlength(LArgs, 0);
+  DoAddString(LArgs, ADAM_TESTBED_BUILD);
+  DoAddString(LArgs, ATest.Path);
+  DoAddString(LArgs, ADAM_TESTBED_OUTPUT_OPTION);
+  DoAddString(LArgs, AOutRoot);
+  LOutput := "";
+  LExit := 0;
+  if not RunProcess(AAdam, LArgs, AOutRoot, LOutput, LExit) then
+    DoAddString(ADetails, NoArgs().Str(AAdam).Fill(ADAM_MSG_TESTBED_CANNOT_RUN));
+    return;
+  end;
+  // adam prints the main module's path as it resolved it, '/' form
+  DoCompareReports(DoOutputLines(LOutput), DoSlashes(ResolvePath(ATest.Path)), ASpec, ADetails);
+  if int32(LExit) <> ADAM_TESTBED_CHECK_CLEAN then
+    DoAddString(ADetails, NoArgs().Int(int64(int32(LExit))).Fill(ADAM_MSG_TESTBED_BUILD_EXIT));
+    return;
+  end;
+  if not FileExists(LExe) then
+    DoAddString(ADetails, NoArgs().Str(LExe).Fill(ADAM_MSG_TESTBED_NO_EXE));
+    return;
+  end;
+
+  setlength(LArgs, 0);
+  for LI := 0 to len(ASpec.Args) - 1 do
+    DoAddString(LArgs, ReplaceStr(ASpec.Args[LI], ADAM_TESTBED_DIR_HOLE, LDir));
+  end;
+  LOutput := "";
+  LExit := 0;
+  if not RunProcess(LExe, LArgs, AOutRoot, LOutput, LExit) then
+    DoAddString(ADetails, NoArgs().Str(LExe).Fill(ADAM_MSG_TESTBED_CANNOT_RUN));
+    return;
+  end;
+  if int32(LExit) <> ASpec.ExitCode then
+    DoAddString(ADetails, NoArgs().Int(int64(int32(LExit))).Int(int64(ASpec.ExitCode))
+      .Fill(ADAM_MSG_TESTBED_EXIT));
+  end;
+  // The exe's own [Adam Heap] report is compared as any other line (DESIGN sec 8)
+  DoCompareLines(DoOutputLines(LOutput), DoWantedLines(ASpec, LDir, AOutRoot), ADetails);
+end;
+
+// Runs the test ATest whose spec is ASpec through AAdam in AOutRoot; every way it fails is a
+// line in ADetails (none: it passed)
+routine DoRunSpec(const ATest: FoundTest; const ASpec: TestSpec; const AAdam: string;
+  const AOutRoot: string; var ADetails: StringArray);
+var
+  LDir: string;
+  LArgs: StringArray;
+  LI: int64;
+  LOutput: string;
+  LExit: uint32;
+  LWantExit: int32;
+  LTestPath: string;
+begin
+  if ASpec.Kind = TestKind.Run then
+    DoRunBuilt(ATest, ASpec, AAdam, AOutRoot, ADetails);
+    return;
+  end;
+  LDir := DoSlashes(ExtractFileDir(ATest.Path));
+  setlength(LArgs, 0);
+  if ASpec.Kind = TestKind.Cli then
+    for LI := 0 to len(ASpec.Args) - 1 do
+      DoAddString(LArgs, ReplaceStr(ASpec.Args[LI], ADAM_TESTBED_DIR_HOLE, LDir));
+    end;
+    LWantExit := ASpec.ExitCode;
+  else
+    DoAddString(LArgs, ADAM_TESTBED_CHECK);
+    DoAddString(LArgs, ATest.Path);
+    LWantExit := ADAM_TESTBED_CHECK_CLEAN;
+    if ASpec.Kind = TestKind.Error then
+      LWantExit := ADAM_TESTBED_CHECK_ERRORS;
+    end;
+  end;
+
+  LOutput := "";
+  LExit := 0;
+  if not RunProcess(AAdam, LArgs, AOutRoot, LOutput, LExit) then
+    DoAddString(ADetails, NoArgs().Str(AAdam).Fill(ADAM_MSG_TESTBED_CANNOT_RUN));
+    return;
+  end;
+  if int32(LExit) <> LWantExit then
+    DoAddString(ADetails, NoArgs().Int(int64(int32(LExit))).Int(int64(LWantExit))
+      .Fill(ADAM_MSG_TESTBED_EXIT));
+  end;
+  if ASpec.Kind = TestKind.Cli then
+    DoCompareLines(DoOutputLines(LOutput), DoWantedLines(ASpec, LDir, DoSlashes(AOutRoot)),
+      ADetails);
+  else
+    // adam prints the main module's path as it resolved it, '/' form
+    LTestPath := DoSlashes(ResolvePath(ATest.Path));
+    DoCompareReports(DoOutputLines(LOutput), LTestPath, ASpec, ADetails);
+  end;
+end;
+
+// Runs one test and prints its result: PASS, or FAIL with every reason under it. True when it
+// passed
+routine DoRunTest(const ATest: FoundTest; const AAdam: string; const AOutRoot: string): bool;
+var
+  LReports: ref Diagnostics;
+  LText: string;
+  LSpec: TestSpec;
+  LDetails: StringArray;
+  LI: int64;
+begin
+  setlength(LDetails, 0);
+  LReports := ref Diagnostics(ADAM_TESTBED_BUDGET);
+  if not ReadAllText(ATest.Path, LText) then
+    LReports.Add(Severity.Error, ADAM_ERR_TESTBED_109, PlaceAt(ATest.Path, 1, 1),
+      ADAM_MSG_TESTBED_CANNOT_READ, NoArgs());
+  else
+    if ReadSpec(ATest.Path, LText, LReports, LSpec) then
+      DoRunSpec(ATest, LSpec, AAdam, AOutRoot, LDetails);
+    end;
+  end;
+  if (LReports.Count = 0) and (len(LDetails) = 0) then
+    DoPrint(NoArgs().Str(ATest.Id).Fill(ADAM_MSG_TESTBED_PASS));
+    return true;
+  end;
+  DoPrint(NoArgs().Str(ATest.Id).Fill(ADAM_MSG_TESTBED_FAIL));
+  LReports.PrintAll();
+  for LI := 0 to len(LDetails) - 1 do
+    DoPrint(NoArgs().Str(LDetails[LI]).Fill(ADAM_MSG_TESTBED_DETAIL));
+  end;
+  return false;
+end;
+
+// The ids -failed runs: the lines of the output root's adamtest.failed
+routine DoFailedIds(const AFailedFile: string): StringArray;
+var
+  LText: string;
+  LParts: StringArray;
+  LIds: StringArray;
+  LI: int64;
+begin
+  setlength(LIds, 0);
+  if ReadAllText(AFailedFile, LText) then
+    LParts := SplitString(LText, "\n");
+    for LI := 0 to len(LParts) - 1 do
+      if Trim(LParts[LI]) <> "" then
+        DoAddString(LIds, Trim(LParts[LI]));
+      end;
+    end;
+  end;
+  return LIds;
+end;
+
+// True when AId is picked by ARequest: -all, or one of its masks
+routine DoPicked(const AId: string; const ARequest: RunRequest): bool;
+var
+  LI: int64;
+begin
+  if ARequest.RunAll then
+    return true;
+  end;
+  for LI := 0 to len(ARequest.Masks) - 1 do
+    if MatchesGlob(AId, ARequest.Masks[LI]) then
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+// The first of ARequest's masks no test in ATests matches; "" when every one matches one
+routine DoUnmatchedMask(const ATests: FoundTestArray; const ARequest: RunRequest): string;
+var
+  LI: int64;
+  LJ: int64;
+  LHit: bool;
+begin
+  for LI := 0 to len(ARequest.Masks) - 1 do
+    LHit := false;
+    LJ := 0;
+    while not LHit and (LJ < len(ATests)) do
+      LHit := MatchesGlob(ATests[LJ].Id, ARequest.Masks[LI]);
+      LJ := LJ + 1;
+    end;
+    if not LHit then
+      return ARequest.Masks[LI];
+    end;
+  end;
+  return "";
+end;
+
+// -list: every picked test (every test when no mask is named) with its kind
+routine DoList(const ATests: FoundTestArray; const ARequest: RunRequest);
+var
+  LI: int64;
+  LText: string;
+  LSpec: TestSpec;
+  LReports: ref Diagnostics;
+  LKind: string;
+begin
+  for LI := 0 to len(ATests) - 1 do
+    if (len(ARequest.Masks) = 0) or DoPicked(ATests[LI].Id, ARequest) then
+      LKind := TestKindText(TestKind.Unset);
+      LReports := ref Diagnostics(ADAM_TESTBED_BUDGET);
+      if ReadAllText(ATests[LI].Path, LText) then
+        ReadSpec(ATests[LI].Path, LText, LReports, LSpec);
+        LKind := TestKindText(LSpec.Kind);
+      end;
+      DoPrint(NoArgs().Str(ATests[LI].Id).Str(LKind).Fill(ADAM_MSG_TESTBED_LIST));
+    end;
+  end;
+end;
+
+// Collects the tests of every root in ARequest into ATests; a root that cannot be read is a
+// mistake: its path ("" when every root reads)
+routine DoCollect(const ARequest: RunRequest; var ATests: FoundTestArray): string;
+var
+  LI: int64;
+  LRoot: string;
+begin
+  setlength(ATests, 0);
+  for LI := 0 to len(ARequest.Roots) - 1 do
+    LRoot := DoSlashes(ResolvePath(ARequest.Roots[LI]));
+    while EndsStr("/", LRoot) do
+      LRoot := Substring(LRoot, 0, len(LRoot) - 1);
+    end;
+    if (LRoot = "") or not DirectoryExists(LRoot) then
+      return ARequest.Roots[LI];
+    end;
+    DoCollectFolder(LRoot, ExtractFileName(LRoot), "", ATests);
+  end;
+  return "";
+end;
+
+// Runs the picked tests of ATests, prints the summary, keeps the failed ids in AFailedFile:
+// ADAM_TESTBED_EXIT_PASSED or ADAM_TESTBED_EXIT_FAILED
+routine DoRunPicked(const ATests: FoundTestArray; const ARequest: RunRequest; const AAdam: string;
+  const AOutRoot: string; const AFailedFile: string): int32;
+var
+  LI: int64;
+  LPassed: int64;
+  LFailed: int64;
+  LFailedIds: string;
+begin
+  LPassed := 0;
+  LFailed := 0;
+  LFailedIds := "";
+  for LI := 0 to len(ATests) - 1 do
+    if DoPicked(ATests[LI].Id, ARequest) then
+      if DoRunTest(ATests[LI], AAdam, AOutRoot) then
+        LPassed := LPassed + 1;
+      else
+        LFailed := LFailed + 1;
+        LFailedIds := LFailedIds + ATests[LI].Id + "\n";
+      end;
+    end;
+  end;
+  WriteAllText(AFailedFile, LFailedIds);
+  DoPrint(NoArgs().Int(LPassed).Int(LFailed).Int(LPassed + LFailed).Fill(ADAM_MSG_TESTBED_SUMMARY));
+  if LFailed > 0 then
+    return ADAM_TESTBED_EXIT_FAILED;
+  end;
+  return ADAM_TESTBED_EXIT_PASSED;
+end;
+
+// Runs adamtest's command line (see the header): the exit code for the process
+exported routine RunTests(): int32;
+var
+  LReports: ref Diagnostics;
+  LRequest: RunRequest;
+  LTests: FoundTestArray;
+  LOutRoot: string;
+  LFailedFile: string;
+  LAdam: string;
+  LBad: string;
+begin
+  LReports := ref Diagnostics(ADAM_TESTBED_BUDGET);
+  if not DoReadArgs(LReports, LRequest) then
+    DoUsage(LReports);
+    LReports.PrintAll();
+    return ADAM_TESTBED_EXIT_USAGE;
+  end;
+  if LRequest.ShowHelp then
+    DoUsage(LReports);
+    LReports.PrintAll();
+    return ADAM_TESTBED_EXIT_PASSED;
+  end;
+
+  if len(LRequest.Roots) = 0 then
+    DoAddString(LRequest.Roots, ADAM_TESTBED_DEFAULT_ROOT);
+  end;
+  LBad := DoCollect(LRequest, LTests);
+  if LBad <> "" then
+    return DoMistake(LReports, ADAM_ERR_TESTBED_107, ADAM_MSG_TESTBED_NO_ROOT, NoArgs().Str(LBad));
+  end;
+  if LRequest.ListOnly then
+    DoList(LTests, LRequest);
+    return ADAM_TESTBED_EXIT_PASSED;
+  end;
+
+  LOutRoot := DoSlashes(ResolvePath(ADAM_TESTBED_OUTPUT_ROOT));
+  ForceDirectories(LOutRoot);
+  LFailedFile := LOutRoot + "/" + ADAM_TESTBED_FAILED_FILE;
+  if LRequest.RunFailed then
+    LRequest.Masks := DoFailedIds(LFailedFile);
+    if len(LRequest.Masks) = 0 then
+      return DoMistake(LReports, ADAM_ERR_TESTBED_108, ADAM_MSG_TESTBED_NO_FAILED,
+        NoArgs().Str(LFailedFile));
+    end;
+  end;
+  if not LRequest.RunAll and (len(LRequest.Masks) = 0) then
+    return DoMistake(LReports, ADAM_ERR_TESTBED_104, ADAM_MSG_TESTBED_NOTHING, NoArgs());
+  end;
+  if not LRequest.RunAll then
+    LBad := DoUnmatchedMask(LTests, LRequest);
+    if LBad <> "" then
+      return DoMistake(LReports, ADAM_ERR_TESTBED_105, ADAM_MSG_TESTBED_NO_MATCH,
+        NoArgs().Str(LBad));
+    end;
+  end;
+
+  LAdam := ResolvePath(LRequest.AdamExe);
+  if (LAdam = "") or not FileExists(LAdam) then
+    return DoMistake(LReports, ADAM_ERR_TESTBED_106, ADAM_MSG_TESTBED_NO_ADAM,
+      NoArgs().Str(LRequest.AdamExe));
+  end;
+  return DoRunPicked(LTests, LRequest, LAdam, LOutRoot, LFailedFile);
+end;
+
+end.

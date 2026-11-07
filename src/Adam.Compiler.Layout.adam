@@ -1,0 +1,1358 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Compiler.Layout.adam - where every value lives in memory, as the
+  compile's target lays it out (DESIGN sec 6), written into the AST
+
+  Every target fact (a scalar's size and alignment, a pointer's, the
+  bitfield rule) is asked of the Target the caller passes (Adam.Target);
+  this unit holds none. With no target (nil) nothing is laid out and every
+  size stays unknown: the Driver reports the missing target (DR0004).
+
+  TypeSize / TypeAlign lay a canonical type out the first time they are asked
+  (its ResolvedSize / ResolvedAlign), and every field of an aggregate with it:
+  a field's ResolvedOffset (from the start of the named type, through anonymous
+  parts too), a bitfield's ResolvedBitOffset / ResolvedBitWidth, an anonymous
+  part's offset, size and alignment, a parent's ResolvedOffset on its Parent
+  node.
+
+  - Builtins: the target's size and alignment. A pointer, a routine value, a
+    string, a wstring, a dynamic array and an own / ref / weak are one target
+    pointer: the runtime (M4) keeps what they point at.
+  - A record is a C struct: its parent its first member, then its fields in
+    order, each at its alignment (1 in a packed record), bitfields by the
+    target's rule (Microsoft: a run of bitfields shares a unit while the
+    unit's type has the same size and its bits hold them; anything else
+    starts a new unit); align(n) raises the alignment. An overlay is a C
+    union. An anonymous part is laid out as a member of its own kind. An empty
+    aggregate is 1 byte (C++, as PaskalCPP emits it).
+  - An object is a C++ class by the Itanium ABI: a vtable pointer at 0 when it
+    is polymorphic and its parent is not, the parent at its alignment (a
+    polymorphic parent at 0, sharing its vtable pointer), the fields after the
+    parent's data size when the parent is no POD (its tail padding is reused),
+    else after its size.
+  - A static array: its count times its element's size. A choices type: an
+    int32, an int64 when a value needs more than int32. A set: one bit per
+    member, 1, 2 or 4 bytes, else whole words (the target's uint64).
+
+  VtableSlots numbers an object's or an interface's virtual members (their
+  ResolvedSlot; a property takes one slot per accessor, read first); an
+  override takes the slot of what it overrides. The count is the type's
+  ResolvedSlot.
+
+  CheckLayouts reports what a layout cannot be: a constant place that is no
+  constant (SM0202), bounds out of order (SM0328) or of mixed families
+  (SM0320 / SM0322), a set past 65536 members (SM0321), a type too large
+  (SM0277), a bad align (SM0310-0312), a bad bitfield (SM0314-0316), a string
+  or dynamic array in an overlay (SM0313) or a packed record (SM0331), an
+  object or owner held by a record or overlay (SM0357). PaskalCPP's numbers.
+*******************************************************************************/
+
+module unit Adam.Compiler.Layout;
+
+import System.SysUtils, Adam.Core.Messages, Adam.Target, Adam.Compiler.SourceText,
+  Adam.Compiler.Diagnostics, Adam.Compiler.AST, Adam.Compiler.Types;
+
+exported const
+  ADAM_ERR_LAYOUT_202: string = "SM0202";   // a constant place holds no constant
+  ADAM_ERR_LAYOUT_277: string = "SM0277";   // a type too large
+  ADAM_ERR_LAYOUT_310: string = "SM0310";   // align n is not a power of two
+  ADAM_ERR_LAYOUT_311: string = "SM0311";   // align n below the natural alignment
+  ADAM_ERR_LAYOUT_312: string = "SM0312";   // align n past 8192
+  ADAM_ERR_LAYOUT_313: string = "SM0313";   // a string / dynamic array in an overlay's storage
+  ADAM_ERR_LAYOUT_314: string = "SM0314";   // a bitfield of a type that takes none
+  ADAM_ERR_LAYOUT_315: string = "SM0315";   // a bitfield width outside 1..bits
+  ADAM_ERR_LAYOUT_316: string = "SM0316";   // a choices bitfield too narrow for its ordinals
+  ADAM_ERR_LAYOUT_320: string = "SM0320";   // set range bounds of different families
+  ADAM_ERR_LAYOUT_321: string = "SM0321";   // a set past 65536 members
+  ADAM_ERR_LAYOUT_322: string = "SM0322";   // array bounds of different families
+  ADAM_ERR_LAYOUT_328: string = "SM0328";   // a low bound above the high bound
+  ADAM_ERR_LAYOUT_331: string = "SM0331";   // a string / dynamic array in a packed record
+  ADAM_ERR_LAYOUT_357: string = "SM0357";   // an object or owner held by a record or overlay
+
+  // No type holds more bytes (BNF sec 4, one limit on every target)
+  ADAM_LAYOUT_MAX_SIZE: int64 = 1152921504606846975;
+  // The largest align(n) and the most members a set has
+  ADAM_LAYOUT_ALIGN_LIMIT: int64 = 8192;
+  ADAM_LAYOUT_SET_LIMIT: int64 = 65536;
+  // ResolvedSize while a type is being laid out (a by-value cycle meets it: unknown), and
+  // for a type past ADAM_LAYOUT_MAX_SIZE
+  ADAM_LAYOUT_IN_PROGRESS: int64 = -2;
+  ADAM_LAYOUT_TOO_LARGE: int64 = -3;
+
+type
+  // Where an aggregate's layout stands: the next free byte (a union: its widest member's
+  // end), the open bitfield run (its unit's offset and size, the bits used), the largest
+  // member alignment; Unknown once a member's layout is
+  LayoutCursor = record
+    Offset: int64;
+    RunOffset: int64;
+    RunSize: int64;
+    RunUsed: int64;
+    MaxAlign: int64;
+    Packed: bool;
+    Union: bool;
+    Unknown: bool;
+    TooLarge: bool;
+  end;
+
+// AValue rounded up to a multiple of AAlign (AAlign >= 1)
+routine DoRoundUp(const AValue: int64; const AAlign: int64): int64;
+var
+  LRest: int64;
+begin
+  LRest := AValue mod AAlign;
+  if LRest = 0 then
+    return AValue;
+  end;
+  return AValue + AAlign - LRest;
+end;
+
+// The larger of AFirst and ASecond
+routine DoMax(const AFirst: int64; const ASecond: int64): int64;
+begin
+  if AFirst > ASecond then
+    return AFirst;
+  end;
+  return ASecond;
+end;
+
+forward routine DoLay(const ATree: ref SyntaxTree; const ATarget: ref Target; const AType: int64;
+  const ADepth: int64);
+
+// The size of AType on ATarget, laid out the first time it is asked for; -1 when it is
+// unknown, too large or has no value (an interface, varargs), and when ATarget is nil (no
+// target picked: nothing is guessed)
+exported routine TypeSize(const ATree: ref SyntaxTree; const ATarget: ref Target;
+  const AType: int64): int64;
+begin
+  if AType = 0 then
+    return -1;
+  end;
+  DoLay(ATree, ATarget, AType, 0);
+  if ATree[AType].ResolvedSize < 0 then
+    return -1;
+  end;
+  return ATree[AType].ResolvedSize;
+end;
+
+// The bits a value of the char or wchar type AType has: the size ATarget lays it out at;
+// with no target (DR0004) 8 for a char and 16 for a wchar, Adam's own widths
+exported routine CharTypeBits(const ATree: ref SyntaxTree; const ATarget: ref Target;
+  const AType: int64): int64;
+var
+  LSize: int64;
+begin
+  LSize := TypeSize(ATree, ATarget, AType);
+  if LSize > 0 then
+    return LSize * 8;
+  end;
+  if ClassOf(ATree, AType) = TypeClass.WideChar then
+    return 16;
+  end;
+  return 8;
+end;
+
+// True when values of the char or wchar type AType are signed on ATarget (Target.CharSigned,
+// Target.WideCharSigned); with no target (DR0004) a char is signed and a wchar unsigned
+exported routine IsCharTypeSigned(const ATree: ref SyntaxTree; const ATarget: ref Target;
+  const AType: int64): bool;
+begin
+  if ClassOf(ATree, AType) = TypeClass.WideChar then
+    return (ATarget <> nil) and ATarget.WideCharSigned();
+  end;
+  return (ATarget = nil) or ATarget.CharSigned();
+end;
+
+// The value of the constant AExpr as a bound (an integer, a char's code, a choice
+// value's number, a bool) into AValue; false when it was not folded to one or does not
+// fit an int64. A bound of a char or wchar type is read at the width and sign ATarget
+// gives that type (a char's stored code is its low bits: char(200) is -56 where char is
+// signed), as SEM's DoFoldedBits reads a label, so bounds order and count as the values
+// of the type do
+exported routine BoundValue(const ATree: ref SyntaxTree; const ATarget: ref Target;
+  const AExpr: int64; var AValue: int64): bool;
+var
+  LConst: ConstValue;
+  LType: int64;
+  LClass: TypeClass;
+begin
+  AValue := 0;
+  if AExpr = 0 then
+    return false;
+  end;
+  LConst := ATree[AExpr].ResolvedConst;
+  match LConst.Kind of
+    ConstKind.Signed, ConstKind.Char, ConstKind.Boolean:
+      AValue := int64(LConst.Bits);
+    ConstKind.Unsigned:
+      if LConst.Bits > 0x7FFFFFFFFFFFFFFFu then
+        return false;
+      end;
+      AValue := int64(LConst.Bits);
+  else
+    // no other constant is a bound
+    return false;
+  end;
+  LType := ATree[AExpr].ResolvedType;
+  LClass := ClassOf(ATree, LType);
+  if (LClass = TypeClass.Char) or (LClass = TypeClass.WideChar) then
+    AValue := ReadLowBits(AValue, CharTypeBits(ATree, ATarget, LType),
+      IsCharTypeSigned(ATree, ATarget, LType));
+  end;
+  return true;
+end;
+
+// AHigh - ALow + 1 when that is an int64, else -1 (ALow <= AHigh); the difference is taken
+// in uint64, where it always fits
+routine DoSpan(const ALow: int64; const AHigh: int64): int64;
+var
+  LSpan: uint64;
+begin
+  LSpan := uint64(AHigh) - uint64(ALow);
+  if LSpan >= 0x7FFFFFFFFFFFFFFFu then
+    return -1;
+  end;
+  return int64(LSpan) + 1;
+end;
+
+// The number of elements of the static array AType; -1 when a bound is unknown, the
+// bounds are out of order or the count passes an int64 (bounds read on ATarget: BoundValue)
+exported routine ArrayCount(const ATree: ref SyntaxTree; const ATarget: ref Target;
+  const AType: int64): int64;
+var
+  LSource: int64;
+  LLow: int64;
+  LHigh: int64;
+begin
+  LSource := ATree[AType].ResolvedDecl;
+  if LSource = 0 then
+    return -1;
+  end;
+  if (not BoundValue(ATree, ATarget, ATree.FirstOf(LSource, NodeRole.LowBound), LLow)) or
+    (not BoundValue(ATree, ATarget, ATree.FirstOf(LSource, NodeRole.HighBound), LHigh)) then
+    return -1;
+  end;
+  if LHigh < LLow then
+    return -1;
+  end;
+  return DoSpan(LLow, LHigh);
+end;
+
+// The lowest and highest numbers of the choices type AType's values into ALow / AHigh;
+// false when a value's number is unknown or it has none
+exported routine ChoicesRange(const ATree: ref SyntaxTree; const AType: int64; var ALow: int64;
+  var AHigh: int64): bool;
+var
+  LBody: int64;
+  LI: int64;
+  LValue: int64;
+  LNumber: int64;
+begin
+  ALow := 0;
+  AHigh := 0;
+  LBody := BodyOf(ATree, AType);
+  if (LBody = 0) or (ATree.CountOf(LBody, NodeRole.Member) = 0) then
+    return false;
+  end;
+  for LI := 0 to ATree.CountOf(LBody, NodeRole.Member) - 1 do
+    LValue := ATree.NthOf(LBody, NodeRole.Member, LI);
+    if ATree[LValue].ResolvedConst.Kind <> ConstKind.Signed then
+      return false;
+    end;
+    LNumber := int64(ATree[LValue].ResolvedConst.Bits);
+    if (LI = 0) or (LNumber < ALow) then
+      ALow := LNumber;
+    end;
+    if (LI = 0) or (LNumber > AHigh) then
+      AHigh := LNumber;
+    end;
+  end;
+  return true;
+end;
+
+// The lowest and highest members of the set type AType into ALow / AHigh (bit i of a set
+// holds member ALow + i): its range's bounds (read on ATarget: BoundValue), a char's codes
+// on ATarget (-128..127 where char is signed, else 0..255), bool 0..1, a choices type's
+// numbers; false when unknown (a bound not folded, bounds reversed, another element)
+exported routine SetRange(const ATree: ref SyntaxTree; const ATarget: ref Target;
+  const AType: int64; var ALow: int64; var AHigh: int64): bool;
+var
+  LBody: int64;
+  LElement: int64;
+  LClass: TypeClass;
+begin
+  ALow := 0;
+  AHigh := 0;
+  LBody := BodyOf(ATree, AType);
+  if LBody = 0 then
+    return false;
+  end;
+  if ATree.FirstOf(LBody, NodeRole.LowBound) <> 0 then
+    return BoundValue(ATree, ATarget, ATree.FirstOf(LBody, NodeRole.LowBound), ALow) and
+      BoundValue(ATree, ATarget, ATree.FirstOf(LBody, NodeRole.HighBound), AHigh) and (AHigh >= ALow);
+  end;
+  LElement := CanonicalOf(ATree, ATree.FirstOf(LBody, NodeRole.Element));
+  LClass := ClassOf(ATree, LElement);
+  if LClass = TypeClass.Char then
+    if IsCharTypeSigned(ATree, ATarget, LElement) then
+      ALow := -128;
+      AHigh := 127;
+    else
+      AHigh := 255;
+    end;
+    return true;
+  end;
+  if LClass = TypeClass.Boolean then
+    AHigh := 1;
+    return true;
+  end;
+  if LClass = TypeClass.ChoicesType then
+    return ChoicesRange(ATree, LElement, ALow, AHigh);
+  end;
+  return false;
+end;
+
+// The members the set type AType has (SetRange's span); -1 when unknown
+exported routine SetCount(const ATree: ref SyntaxTree; const ATarget: ref Target;
+  const AType: int64): int64;
+var
+  LLow: int64;
+  LHigh: int64;
+begin
+  if not SetRange(ATree, ATarget, AType, LLow, LHigh) then
+    return -1;
+  end;
+  return DoSpan(LLow, LHigh);
+end;
+
+// True when AName is a builtin Adam keeps as one pointer (its handle): string, wstring
+routine DoIsHandleBuiltin(const AName: string): bool;
+begin
+  return (AName = "string") or (AName = "wstring");
+end;
+
+// The size of the builtin type named AName on ATarget (-1: varargs, no value of it is
+// laid out)
+routine DoBuiltinSize(const ATarget: ref Target; const AName: string): int64;
+begin
+  if DoIsHandleBuiltin(AName) then
+    return ATarget.PointerSize();
+  end;
+  return ATarget.BuiltinSize(AName);
+end;
+
+// The alignment of the builtin type named AName on ATarget (-1 as DoBuiltinSize)
+routine DoBuiltinAlign(const ATarget: ref Target; const AName: string): int64;
+begin
+  if DoIsHandleBuiltin(AName) then
+    return ATarget.PointerAlign();
+  end;
+  return ATarget.BuiltinAlign(AName);
+end;
+
+// The alignment of AType (see TypeSize); -1 when its size is unknown
+exported routine TypeAlign(const ATree: ref SyntaxTree; const ATarget: ref Target;
+  const AType: int64): int64;
+begin
+  if TypeSize(ATree, ATarget, AType) < 0 then
+    return -1;
+  end;
+  return ATree[AType].ResolvedAlign;
+end;
+
+forward routine DoHolds(const ATree: ref SyntaxTree; const AType: int64; const AOwners: bool;
+  const ADepth: int64): bool;
+
+// True when a member of the aggregate body ABody holds what DoHolds looks for: a field, an
+// embed, an anonymous part's field, the parent
+routine DoHoldsIn(const ATree: ref SyntaxTree; const ABody: int64; const AOwners: bool;
+  const ADepth: int64): bool;
+var
+  LI: int64;
+  LMember: int64;
+  LKind: NodeKind;
+  LParent: int64;
+begin
+  LParent := ATree.FirstOf(ABody, NodeRole.Parent);
+  if (LParent <> 0) and DoHolds(ATree, CanonicalOf(ATree, LParent), AOwners, ADepth + 1) then
+    return true;
+  end;
+  for LI := 0 to ATree.CountOf(ABody, NodeRole.Member) - 1 do
+    LMember := ATree.NthOf(ABody, NodeRole.Member, LI);
+    LKind := ATree[LMember].Kind;
+    if (LKind = NodeKind.FieldDecl) or (LKind = NodeKind.EmbedDecl) then
+      if DoHolds(ATree, CanonicalOf(ATree, ATree.FirstOf(LMember, NodeRole.TypeOf)), AOwners,
+        ADepth + 1) then
+        return true;
+      end;
+    end;
+    if ((LKind = NodeKind.AnonRecord) or (LKind = NodeKind.AnonOverlay)) and
+      DoHoldsIn(ATree, LMember, AOwners, ADepth + 1) then
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+// True when a value of AType holds, at any depth (itself, a field, an array's element, a
+// parent): a string, a wstring or a dynamic array (AOwners false), or an object by value
+// or an own / ref / weak (AOwners true)
+routine DoHolds(const ATree: ref SyntaxTree; const AType: int64; const AOwners: bool;
+  const ADepth: int64): bool;
+var
+  LClass: TypeClass;
+begin
+  if (AType = 0) or (ADepth > ADAM_TYPES_MAX_DEPTH) then
+    return false;
+  end;
+  LClass := ClassOf(ATree, AType);
+  if (LClass = TypeClass.Text) or (LClass = TypeClass.WideText) or (LClass = TypeClass.DynamicArray) then
+    return not AOwners;
+  end;
+  if (LClass = TypeClass.OwnType) or (LClass = TypeClass.RefType) or (LClass = TypeClass.WeakType) then
+    return AOwners;
+  end;
+  if LClass = TypeClass.ObjectType then
+    if AOwners then
+      return true;
+    end;
+    return DoHoldsIn(ATree, BodyOf(ATree, AType), AOwners, ADepth + 1);
+  end;
+  if LClass = TypeClass.StaticArray then
+    return DoHolds(ATree, TargetOf(ATree, AType), AOwners, ADepth + 1);
+  end;
+  if (LClass = TypeClass.RecordType) or (LClass = TypeClass.OverlayType) then
+    return DoHoldsIn(ATree, BodyOf(ATree, AType), AOwners, ADepth + 1);
+  end;
+  return false;
+end;
+
+// True when a value of AType holds a string, a wstring or a dynamic array at any depth
+exported routine HoldsManaged(const ATree: ref SyntaxTree; const AType: int64): bool;
+begin
+  return DoHolds(ATree, AType, false, 0);
+end;
+
+// True when a value of AType holds an object by value or an own / ref / weak at any depth
+exported routine HoldsOwner(const ATree: ref SyntaxTree; const AType: int64): bool;
+begin
+  return DoHolds(ATree, AType, true, 0);
+end;
+
+// True when the object AType is POD for the Itanium layout (its tail padding is not reused
+// by a descendant): not polymorphic, no parent, no init / copy / done, no field that holds
+// a string, a dynamic array, an owner or an object
+routine DoIsLayoutPod(const ATree: ref SyntaxTree; const AType: int64): bool;
+var
+  LBody: int64;
+  LI: int64;
+  LKind: NodeKind;
+begin
+  if IsPolymorphic(ATree, AType) then
+    return false;
+  end;
+  LBody := BodyOf(ATree, AType);
+  if (LBody = 0) or (ATree.FirstOf(LBody, NodeRole.Parent) <> 0) then
+    return false;
+  end;
+  for LI := 0 to ATree.CountOf(LBody, NodeRole.Member) - 1 do
+    LKind := ATree[ATree.NthOf(LBody, NodeRole.Member, LI)].Kind;
+    if (LKind = NodeKind.InitDecl) or (LKind = NodeKind.CopyDecl) or (LKind = NodeKind.DoneDecl) then
+      return false;
+    end;
+  end;
+  return not (DoHoldsIn(ATree, LBody, false, 0) or DoHoldsIn(ATree, LBody, true, 0));
+end;
+
+// True when a field of AType takes a bitfield width: an integer, bool, char, wchar or
+// choices type
+exported routine TakesBitfield(const ATree: ref SyntaxTree; const AType: int64): bool;
+var
+  LClass: TypeClass;
+begin
+  LClass := ClassOf(ATree, AType);
+  return IsIntegerClass(LClass) or (LClass = TypeClass.Boolean) or (LClass = TypeClass.Char) or
+    (LClass = TypeClass.WideChar) or (LClass = TypeClass.ChoicesType);
+end;
+
+// A fresh cursor for a struct (AUnion false) or a union, packed or not
+routine DoCursor(const AUnion: bool; const APacked: bool): LayoutCursor;
+var
+  LCursor: LayoutCursor;
+begin
+  LCursor.Offset := 0;
+  LCursor.RunOffset := 0;
+  LCursor.RunSize := 0;
+  LCursor.RunUsed := 0;
+  LCursor.MaxAlign := 1;
+  LCursor.Packed := APacked;
+  LCursor.Union := AUnion;
+  LCursor.Unknown := false;
+  LCursor.TooLarge := false;
+  return LCursor;
+end;
+
+// ACursor marks a member it could not lay out: unknown, or too large when ASize says so
+routine DoMarkUnknown(var ACursor: LayoutCursor; const ASize: int64);
+begin
+  ACursor.Unknown := true;
+  if ASize = ADAM_LAYOUT_TOO_LARGE then
+    ACursor.TooLarge := true;
+  end;
+end;
+
+// A member of ASize bytes aligned AAlign goes into ACursor: its offset in the aggregate
+// (0 in a union) returned, the cursor past it, the open bitfield run closed
+routine DoPlaceBytes(var ACursor: LayoutCursor; const ASize: int64; const AAlign: int64): int64;
+var
+  LAt: int64;
+begin
+  ACursor.RunSize := 0;
+  ACursor.MaxAlign := DoMax(ACursor.MaxAlign, AAlign);
+  if ACursor.Union then
+    ACursor.Offset := DoMax(ACursor.Offset, ASize);
+    return 0;
+  end;
+  LAt := DoRoundUp(ACursor.Offset, AAlign);
+  if LAt > ADAM_LAYOUT_MAX_SIZE - ASize then
+    ACursor.Unknown := true;
+    ACursor.TooLarge := true;
+    return LAt;
+  end;
+  ACursor.Offset := LAt + ASize;
+  return LAt;
+end;
+
+// BitfieldRule.Microsoft: a bitfield of ALaneSize bytes (aligned AAlign) and AWidth bits
+// joins ACursor's open run while the run's unit has the same size and its bits hold it,
+// else it starts a new unit. Its unit's offset in AAt, its bit offset in ABit
+routine DoPlaceMicrosoftBits(var ACursor: LayoutCursor; const ALaneSize: int64;
+  const AAlign: int64; const AWidth: int64; var AAt: int64; var ABit: int64);
+begin
+  if (ACursor.RunSize = ALaneSize) and (ACursor.RunUsed + AWidth <= ALaneSize * 8) then
+    AAt := ACursor.RunOffset;
+    ABit := ACursor.RunUsed;
+    ACursor.RunUsed := ACursor.RunUsed + AWidth;
+    return;
+  end;
+  AAt := DoPlaceBytes(ACursor, ALaneSize, AAlign);
+  ACursor.RunOffset := AAt;
+  ACursor.RunSize := ALaneSize;
+  ACursor.RunUsed := AWidth;
+  ABit := 0;
+end;
+
+// The field or embed AField placed into ACursor at ABase (the start of the anonymous part
+// it is in, from the named type's start): its offset, a bitfield's bit offset and width
+// (in a union at 0; else by ATarget's bitfield rule)
+routine DoPlaceField(const ATree: ref SyntaxTree; const ATarget: ref Target; const AField: int64;
+  const ABase: int64; var ACursor: LayoutCursor; const ADepth: int64);
+var
+  LType: int64;
+  LSize: int64;
+  LAlign: int64;
+  LWidthExpr: int64;
+  LWidth: int64;
+  LAt: int64;
+  LBit: int64;
+begin
+  LType := CanonicalOf(ATree, ATree.FirstOf(AField, NodeRole.TypeOf));
+  DoLay(ATree, ATarget, LType, ADepth + 1);
+  LSize := -1;
+  if LType <> 0 then
+    LSize := ATree[LType].ResolvedSize;
+  end;
+  if LSize < 0 then
+    DoMarkUnknown(ACursor, LSize);
+    return;
+  end;
+  LAlign := ATree[LType].ResolvedAlign;
+  if ACursor.Packed then
+    LAlign := 1;
+  end;
+  LWidthExpr := ATree.FirstOf(AField, NodeRole.BitWidth);
+  LWidth := 0;
+  if (LWidthExpr = 0) or (not BoundValue(ATree, ATarget, LWidthExpr, LWidth)) or (LWidth < 1) or
+    (LWidth > LSize * 8) or (not TakesBitfield(ATree, LType)) then
+    LAt := DoPlaceBytes(ACursor, LSize, LAlign);
+    ATree[AField].ResolvedOffset := ABase + LAt;
+    return;
+  end;
+  ACursor.MaxAlign := DoMax(ACursor.MaxAlign, LAlign);
+  if ACursor.Union then
+    ACursor.Offset := DoMax(ACursor.Offset, LSize);
+    LAt := 0;
+    LBit := 0;
+  else
+    // Each rule sets both; a rule with no arm here would leave the field at 0
+    LAt := 0;
+    LBit := 0;
+    match ATarget.Bitfields() of
+      BitfieldRule.Microsoft: DoPlaceMicrosoftBits(ACursor, LSize, LAlign, LWidth, LAt, LBit);
+    end;
+  end;
+  ATree[AField].ResolvedOffset := ABase + LAt;
+  ATree[AField].ResolvedBitOffset := int32(LBit);
+  ATree[AField].ResolvedBitWidth := int32(LWidth);
+end;
+
+// The size of what ACursor laid out: its end rounded to its alignment, 1 for an empty
+// aggregate (C++, as PaskalCPP emits it)
+routine DoCursorSize(const ACursor: LayoutCursor): int64;
+var
+  LSize: int64;
+begin
+  LSize := DoRoundUp(ACursor.Offset, ACursor.MaxAlign);
+  if LSize = 0 then
+    return 1;
+  end;
+  return LSize;
+end;
+
+forward routine DoLayMembers(const ATree: ref SyntaxTree; const ATarget: ref Target; const ABody: int64;
+  const ABase: int64; var ACursor: LayoutCursor; const ADepth: int64);
+
+// The anonymous record or overlay AAnon placed into ACursor at ABase: laid out as a member
+// of its own kind (a struct or a union, packed when it or its container is), then its
+// fields once more at their final offsets
+routine DoPlaceAnon(const ATree: ref SyntaxTree; const ATarget: ref Target; const AAnon: int64;
+  const ABase: int64; var ACursor: LayoutCursor; const ADepth: int64);
+var
+  LInner: LayoutCursor;
+  LSize: int64;
+  LAlign: int64;
+  LAt: int64;
+begin
+  LInner := DoCursor(ATree[AAnon].Kind = NodeKind.AnonOverlay,
+    ACursor.Packed or ATree[AAnon].HasFlag(NodeFlag.Packed));
+  DoLayMembers(ATree, ATarget, AAnon, 0, LInner, ADepth + 1);
+  if LInner.Unknown then
+    ACursor.Unknown := true;
+    ACursor.TooLarge := ACursor.TooLarge or LInner.TooLarge;
+    return;
+  end;
+  LSize := DoCursorSize(LInner);
+  LAlign := LInner.MaxAlign;
+  if ACursor.Packed then
+    LAlign := 1;
+  end;
+  LAt := DoPlaceBytes(ACursor, LSize, LAlign);
+  ATree[AAnon].ResolvedOffset := ABase + LAt;
+  ATree[AAnon].ResolvedSize := LSize;
+  ATree[AAnon].ResolvedAlign := LInner.MaxAlign;
+  LInner := DoCursor(ATree[AAnon].Kind = NodeKind.AnonOverlay,
+    ACursor.Packed or ATree[AAnon].HasFlag(NodeFlag.Packed));
+  DoLayMembers(ATree, ATarget, AAnon, ABase + LAt, LInner, ADepth + 1);
+end;
+
+// The fields, embeds and anonymous parts of the body ABody placed into ACursor in order
+routine DoLayMembers(const ATree: ref SyntaxTree; const ATarget: ref Target; const ABody: int64;
+  const ABase: int64; var ACursor: LayoutCursor; const ADepth: int64);
+var
+  LI: int64;
+  LMember: int64;
+  LKind: NodeKind;
+begin
+  for LI := 0 to ATree.CountOf(ABody, NodeRole.Member) - 1 do
+    LMember := ATree.NthOf(ABody, NodeRole.Member, LI);
+    LKind := ATree[LMember].Kind;
+    if (LKind = NodeKind.FieldDecl) or (LKind = NodeKind.EmbedDecl) then
+      DoPlaceField(ATree, ATarget, LMember, ABase, ACursor, ADepth);
+    end;
+    if (LKind = NodeKind.AnonRecord) or (LKind = NodeKind.AnonOverlay) then
+      DoPlaceAnon(ATree, ATarget, LMember, ABase, ACursor, ADepth);
+    end;
+  end;
+end;
+
+// The bytes of a set of ACount members: one bit each, 1, 2 or 4 bytes, else whole words
+// (a word is ATarget's uint64)
+routine DoSetBytes(const ATarget: ref Target; const ACount: int64): int64;
+var
+  LBytes: int64;
+begin
+  LBytes := (ACount + 7) div 8;
+  if LBytes <= 1 then
+    return 1;
+  end;
+  if LBytes <= 2 then
+    return 2;
+  end;
+  if LBytes <= 4 then
+    return 4;
+  end;
+  return DoRoundUp(LBytes, ATarget.BuiltinSize("uint64"));
+end;
+
+// A record's parent placed into ACursor as its first member (BNF sec 4: adam_parent), at
+// offset 0; the Parent node's ResolvedOffset says so
+routine DoRecordParent(const ATree: ref SyntaxTree; const ATarget: ref Target; const ABody: int64;
+  var ACursor: LayoutCursor; const ADepth: int64);
+var
+  LParentNode: int64;
+  LParent: int64;
+  LAlign: int64;
+begin
+  LParentNode := ATree.FirstOf(ABody, NodeRole.Parent);
+  if LParentNode = 0 then
+    return;
+  end;
+  LParent := CanonicalOf(ATree, LParentNode);
+  DoLay(ATree, ATarget, LParent, ADepth + 1);
+  if (LParent = 0) or (ATree[LParent].ResolvedSize < 0) then
+    if LParent <> 0 then
+      DoMarkUnknown(ACursor, ATree[LParent].ResolvedSize);
+    else
+      ACursor.Unknown := true;
+    end;
+    return;
+  end;
+  LAlign := ATree[LParent].ResolvedAlign;
+  if ACursor.Packed then
+    LAlign := 1;
+  end;
+  ATree[LParentNode].ResolvedOffset := DoPlaceBytes(ACursor, ATree[LParent].ResolvedSize, LAlign);
+end;
+
+// An object's base part placed into ACursor by the Itanium ABI: the vtable pointer at 0
+// when the object is polymorphic and its parent is not; the parent at its alignment (a
+// polymorphic one at 0, sharing the pointer); the fields after the parent's data when the
+// parent is no POD (its tail padding is reused) or empty, else after its size
+routine DoObjectBase(const ATree: ref SyntaxTree; const ATarget: ref Target; const AType: int64;
+  const ABody: int64; var ACursor: LayoutCursor; const ADepth: int64);
+var
+  LParentNode: int64;
+  LParent: int64;
+  LParentPoly: bool;
+  LAt: int64;
+  LData: int64;
+begin
+  LParentNode := ATree.FirstOf(ABody, NodeRole.Parent);
+  LParent := 0;
+  if LParentNode <> 0 then
+    LParent := CanonicalOf(ATree, LParentNode);
+  end;
+  LParentPoly := (LParent <> 0) and IsPolymorphic(ATree, LParent);
+  if IsPolymorphic(ATree, AType) and (not LParentPoly) then
+    // The vtable pointer, at 0
+    LAt := DoPlaceBytes(ACursor, ATarget.PointerSize(), ATarget.PointerAlign());
+  end;
+  if LParentNode = 0 then
+    return;
+  end;
+  DoLay(ATree, ATarget, LParent, ADepth + 1);
+  if (LParent = 0) or (ATree[LParent].ResolvedSize < 0) then
+    if LParent <> 0 then
+      DoMarkUnknown(ACursor, ATree[LParent].ResolvedSize);
+    else
+      ACursor.Unknown := true;
+    end;
+    return;
+  end;
+  LAt := DoRoundUp(ACursor.Offset, ATree[LParent].ResolvedAlign);
+  ATree[LParentNode].ResolvedOffset := LAt;
+  ACursor.MaxAlign := DoMax(ACursor.MaxAlign, ATree[LParent].ResolvedAlign);
+  LData := ATree[BodyOf(ATree, LParent)].ResolvedSize;
+  if (LData = 0) or (not DoIsLayoutPod(ATree, LParent)) then
+    ACursor.Offset := LAt + LData;
+  else
+    ACursor.Offset := LAt + ATree[LParent].ResolvedSize;
+  end;
+end;
+
+// The record, overlay or object AType laid out (see the unit header): its size and
+// alignment on AType, its data size (without tail padding) on its body
+routine DoLayAggregate(const ATree: ref SyntaxTree; const ATarget: ref Target; const AType: int64;
+  const ADepth: int64);
+var
+  LBody: int64;
+  LKind: NodeKind;
+  LCursor: LayoutCursor;
+  LSize: int64;
+  LAlign: int64;
+  LValue: int64;
+begin
+  LBody := BodyOf(ATree, AType);
+  if LBody = 0 then
+    ATree[AType].ResolvedSize := -1;
+    return;
+  end;
+  LKind := ATree[LBody].Kind;
+  LCursor := DoCursor(LKind = NodeKind.OverlayType, ATree[LBody].HasFlag(NodeFlag.Packed));
+  if LKind = NodeKind.ObjectType then
+    DoObjectBase(ATree, ATarget, AType, LBody, LCursor, ADepth);
+  else
+    if LKind = NodeKind.RecordType then
+      DoRecordParent(ATree, ATarget, LBody, LCursor, ADepth);
+    end;
+  end;
+  DoLayMembers(ATree, ATarget, LBody, 0, LCursor, ADepth);
+  if LCursor.Unknown then
+    if LCursor.TooLarge then
+      ATree[AType].ResolvedSize := ADAM_LAYOUT_TOO_LARGE;
+    else
+      ATree[AType].ResolvedSize := -1;
+    end;
+    return;
+  end;
+  // align(n): a power of two at or above the natural alignment, at most 8192, raises it
+  // (any other value is CheckLayouts' report)
+  LAlign := LCursor.MaxAlign;
+  LValue := 0;
+  if BoundValue(ATree, ATarget, ATree.FirstOf(LBody, NodeRole.Align), LValue) and IsPowerOfTwo(LValue) and
+    (LValue <= ADAM_LAYOUT_ALIGN_LIMIT) and (LValue >= LAlign) then
+    LAlign := LValue;
+  end;
+  LCursor.MaxAlign := LAlign;
+  ATree[LBody].ResolvedSize := LCursor.Offset;
+  LSize := DoCursorSize(LCursor);
+  if LSize > ADAM_LAYOUT_MAX_SIZE then
+    ATree[AType].ResolvedSize := ADAM_LAYOUT_TOO_LARGE;
+    return;
+  end;
+  ATree[AType].ResolvedSize := LSize;
+  ATree[AType].ResolvedAlign := LAlign;
+end;
+
+// The canonical type AType laid out once (see the unit header): ResolvedSize and
+// ResolvedAlign written on it (-1: unknown or no value; ADAM_LAYOUT_TOO_LARGE)
+routine DoLay(const ATree: ref SyntaxTree; const ATarget: ref Target; const AType: int64;
+  const ADepth: int64);
+var
+  LClass: TypeClass;
+  LSize: int64;
+  LAlign: int64;
+  LElement: int64;
+  LElementSize: int64;
+  LCount: int64;
+  LLow: int64;
+  LHigh: int64;
+begin
+  // No target picked: nothing is laid out (sizes stay unknown), never a guessed target
+  if (ATarget = nil) or (AType = 0) or (ADepth > ADAM_TYPES_MAX_DEPTH) then
+    return;
+  end;
+  if (ATree[AType].ResolvedSize >= 0) or (ATree[AType].ResolvedSize = ADAM_LAYOUT_IN_PROGRESS) or
+    (ATree[AType].ResolvedSize = ADAM_LAYOUT_TOO_LARGE) then
+    return;
+  end;
+  LClass := ClassOf(ATree, AType);
+  LSize := -1;
+  LAlign := -1;
+  match LClass of
+    TypeClass.SignedInt, TypeClass.UnsignedInt, TypeClass.Float, TypeClass.Boolean,
+    TypeClass.Char, TypeClass.WideChar, TypeClass.Text, TypeClass.WideText,
+    TypeClass.UntypedPointer:
+      LSize := DoBuiltinSize(ATarget, ATree[AType].Text);
+      LAlign := DoBuiltinAlign(ATarget, ATree[AType].Text);
+    TypeClass.Pointer, TypeClass.DynamicArray, TypeClass.RoutineType, TypeClass.OwnType,
+    TypeClass.RefType, TypeClass.WeakType, TypeClass.NilType:
+      LSize := ATarget.PointerSize();
+      LAlign := ATarget.PointerAlign();
+    TypeClass.StaticArray:
+      LElement := TargetOf(ATree, AType);
+      DoLay(ATree, ATarget, LElement, ADepth + 1);
+      LCount := ArrayCount(ATree, ATarget, AType);
+      LElementSize := -1;
+      if LElement <> 0 then
+        LElementSize := ATree[LElement].ResolvedSize;
+      end;
+      if LElementSize = ADAM_LAYOUT_TOO_LARGE then
+        LSize := ADAM_LAYOUT_TOO_LARGE;
+      end;
+      if (LCount >= 0) and (LElementSize >= 0) then
+        if (LElementSize > 0) and (LCount > ADAM_LAYOUT_MAX_SIZE div LElementSize) then
+          LSize := ADAM_LAYOUT_TOO_LARGE;
+        else
+          LSize := LCount * LElementSize;
+          LAlign := ATree[LElement].ResolvedAlign;
+        end;
+      end;
+    TypeClass.ChoicesType:
+      // An int32, an int64 when a value needs more
+      LSize := ATarget.BuiltinSize("int32");
+      LAlign := ATarget.BuiltinAlign("int32");
+      LLow := 0;
+      LHigh := 0;
+      if ChoicesRange(ATree, AType, LLow, LHigh) and ((LLow < -2147483648) or (LHigh > 2147483647)) then
+        LSize := ATarget.BuiltinSize("int64");
+        LAlign := ATarget.BuiltinAlign("int64");
+      end;
+    TypeClass.SetType:
+      // Aligned to its size, at most a word's (ATarget's uint64)
+      LCount := SetCount(ATree, ATarget, AType);
+      if (LCount > 0) and (LCount <= ADAM_LAYOUT_SET_LIMIT) then
+        LSize := DoSetBytes(ATarget, LCount);
+        LAlign := LSize;
+        if LAlign > ATarget.BuiltinAlign("uint64") then
+          LAlign := ATarget.BuiltinAlign("uint64");
+        end;
+      end;
+    TypeClass.RecordType, TypeClass.OverlayType, TypeClass.ObjectType:
+      ATree[AType].ResolvedSize := ADAM_LAYOUT_IN_PROGRESS;
+      DoLayAggregate(ATree, ATarget, AType, ADepth);
+      return;
+  else
+    // an interface, varargs or an unknown type has no layout
+  end;
+  ATree[AType].ResolvedSize := LSize;
+  ATree[AType].ResolvedAlign := LAlign;
+end;
+
+// The slots the vtable of the object or interface AType has, numbering its virtual
+// members once (their ResolvedSlot; the count is AType's): the parent's slots first; a
+// new virtual method one slot, a virtual property one per accessor (read first); an
+// override the slot of the member it overrides; an interface's members all in order
+exported routine VtableSlots(const ATree: ref SyntaxTree; const AType: int64): int64;
+var
+  LClass: TypeClass;
+  LBody: int64;
+  LParent: int64;
+  LNext: int64;
+  LI: int64;
+  LMember: int64;
+  LKind: NodeKind;
+  LSpan: int64;
+  LOverridden: int64;
+  LSlot: int64;
+begin
+  if AType = 0 then
+    return 0;
+  end;
+  LClass := ClassOf(ATree, AType);
+  if (LClass <> TypeClass.ObjectType) and (LClass <> TypeClass.InterfaceType) then
+    return 0;
+  end;
+  if ATree[AType].ResolvedSlot >= 0 then
+    return int64(ATree[AType].ResolvedSlot);
+  end;
+  // Written first: a parent cycle meets a count, not a loop
+  ATree[AType].ResolvedSlot := 0;
+  LBody := BodyOf(ATree, AType);
+  LNext := 0;
+  LParent := 0;
+  if ATree.FirstOf(LBody, NodeRole.Parent) <> 0 then
+    LParent := CanonicalOf(ATree, ATree.FirstOf(LBody, NodeRole.Parent));
+    if ClassOf(ATree, LParent) = LClass then
+      LNext := VtableSlots(ATree, LParent);
+    else
+      LParent := 0;
+    end;
+  end;
+  for LI := 0 to ATree.CountOf(LBody, NodeRole.Member) - 1 do
+    LMember := ATree.NthOf(LBody, NodeRole.Member, LI);
+    LKind := ATree[LMember].Kind;
+    if (LKind = NodeKind.MethodDecl) or (LKind = NodeKind.PropertyDecl) then
+      LSpan := 1;
+      if LKind = NodeKind.PropertyDecl then
+        LSpan := ATree.CountOf(LMember, NodeRole.Read) + ATree.CountOf(LMember, NodeRole.Write);
+        if LSpan < 1 then
+          LSpan := 1;
+        end;
+      end;
+      LSlot := -1;
+      if (LClass = TypeClass.ObjectType) and ATree[LMember].HasFlag(NodeFlag.Override) and (LParent <> 0) then
+        LOverridden := MemberOf(ATree, LParent, ATree[LMember].Text);
+        if (LOverridden <> 0) and (ATree[LOverridden].ResolvedSlot >= 0) then
+          LSlot := int64(ATree[LOverridden].ResolvedSlot);
+        end;
+      end;
+      if (LSlot < 0) and ((LClass = TypeClass.InterfaceType) or ATree[LMember].HasFlag(NodeFlag.Virtual) or
+        ATree[LMember].HasFlag(NodeFlag.Override)) then
+        LSlot := LNext;
+        LNext := LNext + LSpan;
+      end;
+      if LSlot >= 0 then
+        ATree[LMember].ResolvedSlot := int32(LSlot);
+      end;
+    end;
+  end;
+  ATree[AType].ResolvedSlot := int32(LNext);
+  return LNext;
+end;
+
+exported type
+  // One layout pass over a tree (see CheckLayouts): every declared aggregate laid out and
+  // its vtable numbered, every constant place and layout rule checked
+  LayoutChecker = object
+    hidden FTree: ref SyntaxTree;
+    hidden FTarget: ref Target;
+    hidden FDiagnostics: ref Diagnostics;
+
+    init(const ATree: ref SyntaxTree; const ATarget: ref Target;
+      const ADiagnostics: ref Diagnostics);
+    begin
+      self.FTree := ATree;
+      self.FTarget := ATarget;
+      self.FDiagnostics := ADiagnostics;
+    end;
+
+    // Error ACode at AId's place
+    hidden method DoError(const AId: int64; const ACode: string; const ATemplate: string;
+      const AArgs: MessageArgs);
+    begin
+      self.FDiagnostics.Add(Severity.Error, ACode, self.FTree[AId].Place, ATemplate, AArgs);
+    end;
+
+    // AType as a message writes it
+    hidden const method DoText(const AType: int64): string;
+    begin
+      return TypeText(self.FTree, AType);
+    end;
+
+    // True when the constant place AExpr (APosition names it) holds a folded constant;
+    // SM0202 when it does not (an expression with no type was reported where it was lost)
+    hidden method DoConstantPlace(const AExpr: int64; const APosition: string): bool;
+    begin
+      if AExpr = 0 then
+        return false;
+      end;
+      if self.FTree[AExpr].ResolvedConst.Kind <> ConstKind.Unknown then
+        return true;
+      end;
+      if self.FTree[AExpr].ResolvedType <> 0 then
+        self.DoError(AExpr, ADAM_ERR_LAYOUT_202, ADAM_MSG_SEMANTICS_NOT_CONSTANT,
+          NoArgs().Str(APosition));
+      end;
+      return false;
+    end;
+
+    // The family of the bound AExpr: -1 integer, -2 char, a choices type itself; 0 for any
+    // other
+    hidden const method DoFamily(const AExpr: int64): int64;
+    var
+      LType: int64;
+      LClass: TypeClass;
+    begin
+      LType := self.FTree[AExpr].ResolvedType;
+      LClass := ClassOf(self.FTree, LType);
+      if IsIntegerClass(LClass) then
+        return -1;
+      end;
+      if LClass = TypeClass.Char then
+        return -2;
+      end;
+      if LClass = TypeClass.ChoicesType then
+        return LType;
+      end;
+      return 0;
+    end;
+
+    // The bound AExpr of value AValue (BoundValue's reading) as a message spells it: an
+    // integer by its value, a char literal or a choice value as written; a bound written
+    // with no text of its own (a cast such as char(130)) by its value, as pcpp spells a
+    // folded bound
+    hidden const method DoBoundText(const AExpr: int64; const AValue: int64): string;
+    begin
+      if (self.DoFamily(AExpr) = -1) or (self.FTree[AExpr].Text = "") then
+        return IntToStr(AValue);
+      end;
+      return self.FTree[AExpr].Text;
+    end;
+
+    // The LowBound / HighBound of AOwner (a static array or a set range, APosition its
+    // place word): constants (SM0202) of one family (ACode, ATemplate), low <= high
+    // (SM0328). Its member count, -1 when it has none
+    hidden method DoBounds(const AOwner: int64; const APosition: string; const ACode: string;
+      const ATemplate: string): int64;
+    var
+      LLowExpr: int64;
+      LHighExpr: int64;
+      LLowOk: bool;
+      LHighOk: bool;
+      LLow: int64;
+      LHigh: int64;
+      LFamily: int64;
+    begin
+      LLowExpr := self.FTree.FirstOf(AOwner, NodeRole.LowBound);
+      LHighExpr := self.FTree.FirstOf(AOwner, NodeRole.HighBound);
+      LLowOk := self.DoConstantPlace(LLowExpr, APosition);
+      LHighOk := self.DoConstantPlace(LHighExpr, APosition);
+      if (not LLowOk) or (not LHighOk) then
+        return -1;
+      end;
+      LFamily := self.DoFamily(LLowExpr);
+      if (LFamily = 0) or (LFamily <> self.DoFamily(LHighExpr)) then
+        self.DoError(LHighExpr, ACode, ATemplate, NoArgs());
+        return -1;
+      end;
+      if (not BoundValue(self.FTree, self.FTarget, LLowExpr, LLow)) or (not BoundValue(self.FTree, self.FTarget, LHighExpr, LHigh)) then
+        return -1;
+      end;
+      if LLow > LHigh then
+        self.DoError(LLowExpr, ADAM_ERR_LAYOUT_328, ADAM_MSG_SEMANTICS_LOW_HIGH,
+          NoArgs().Str(self.DoBoundText(LLowExpr, LLow)).Str(self.DoBoundText(LHighExpr, LHigh)));
+        return -1;
+      end;
+      return DoSpan(LLow, LHigh);
+    end;
+
+    // A static array type expression AId: its bounds, its size (SM0277)
+    hidden method DoArray(const AId: int64);
+    var
+      LType: int64;
+      LCount: int64;
+    begin
+      if self.FTree.FirstOf(AId, NodeRole.LowBound) = 0 then
+        return;
+      end;
+      LCount := self.DoBounds(AId, ADAM_MSG_SEMANTICS_POS_ARRAY_BOUND, ADAM_ERR_LAYOUT_322,
+        ADAM_MSG_SEMANTICS_ARRAY_BOUND_FAMILY);
+      LType := self.FTree[AId].ResolvedType;
+      if (LType = 0) or (LCount < 0) then
+        return;
+      end;
+      DoLay(self.FTree, self.FTarget, LType, 0);
+      if self.FTree[LType].ResolvedSize = ADAM_LAYOUT_TOO_LARGE then
+        self.DoError(AId, ADAM_ERR_LAYOUT_277, ADAM_MSG_LAYOUT_TOO_LARGE,
+          NoArgs().Str(self.DoText(LType)).Str(IntToStr(ADAM_LAYOUT_MAX_SIZE)));
+      end;
+    end;
+
+    // A set type's body ABody: a range's bounds and member count (SM0321)
+    hidden method DoSet(const ABody: int64);
+    var
+      LCount: int64;
+    begin
+      if self.FTree.FirstOf(ABody, NodeRole.LowBound) = 0 then
+        return;
+      end;
+      LCount := self.DoBounds(ABody, ADAM_MSG_SEMANTICS_POS_SET_BOUND, ADAM_ERR_LAYOUT_320,
+        ADAM_MSG_SEMANTICS_SET_BOUND_FAMILY);
+      if LCount > ADAM_LAYOUT_SET_LIMIT then
+        self.DoError(ABody, ADAM_ERR_LAYOUT_321, ADAM_MSG_SEMANTICS_SET_TOO_MANY,
+          NoArgs().Str(IntToStr(LCount)));
+      end;
+    end;
+
+    // The bitfield AField of type AType with width AWidth: a constant (SM0202) on a type
+    // that takes one (SM0314), 1 .. its bits (SM0315); a choices one holds its ordinals as
+    // signed values (SM0316)
+    hidden method DoBitfield(const AField: int64; const AWidth: int64; const AType: int64);
+    var
+      LValue: int64;
+      LBits: int64;
+      LLow: int64;
+      LHigh: int64;
+      LNeed: int64;
+    begin
+      if not self.DoConstantPlace(AWidth, ADAM_MSG_SEMANTICS_POS_BIT_WIDTH) then
+        return;
+      end;
+      if (AType = 0) or (not TakesBitfield(self.FTree, AType)) then
+        if AType <> 0 then
+          self.DoError(AWidth, ADAM_ERR_LAYOUT_314, ADAM_MSG_LAYOUT_BITFIELD_TYPE, NoArgs());
+        end;
+        return;
+      end;
+      LBits := TypeSize(self.FTree, self.FTarget, AType) * 8;
+      LValue := 0;
+      if (not BoundValue(self.FTree, self.FTarget, AWidth, LValue)) or (LValue < 1) or (LValue > LBits) then
+        self.DoError(AWidth, ADAM_ERR_LAYOUT_315, ADAM_MSG_LAYOUT_BITFIELD_WIDTH,
+          NoArgs().Str(self.FTree[AWidth].Text).Int(LBits));
+        return;
+      end;
+      if (ClassOf(self.FTree, AType) <> TypeClass.ChoicesType) or
+        (not ChoicesRange(self.FTree, AType, LLow, LHigh)) then
+        return;
+      end;
+      // The fewest bits whose signed range holds every ordinal
+      LNeed := 1;
+      while (LNeed < 64) and ((LLow < -(int64(1) shl int64(LNeed - 1))) or
+        (LHigh > (int64(1) shl int64(LNeed - 1)) - 1)) do
+        LNeed := LNeed + 1;
+      end;
+      if LValue < LNeed then
+        self.DoError(AWidth, ADAM_ERR_LAYOUT_316, ADAM_MSG_LAYOUT_BITFIELD_ORDINALS,
+          NoArgs().Str(IntToStr(LValue)).Str(self.DoText(AType)));
+      end;
+    end;
+
+    // The fields of the aggregate body ABody of AOwner: bitfields; a string or dynamic
+    // array in an overlay's storage (SM0313) or a packed record (SM0331); an object or an
+    // owner held by a record or an overlay (SM0357, ARecordLike); anonymous parts through
+    hidden method DoFields(const ABody: int64; const AOwner: int64; const AInOverlay: bool;
+      const APacked: bool; const ARecordLike: bool);
+    var
+      LI: int64;
+      LMember: int64;
+      LKind: NodeKind;
+      LType: int64;
+      LWidth: int64;
+    begin
+      for LI := 0 to self.FTree.CountOf(ABody, NodeRole.Member) - 1 do
+        LMember := self.FTree.NthOf(ABody, NodeRole.Member, LI);
+        LKind := self.FTree[LMember].Kind;
+        if LKind = NodeKind.FieldDecl then
+          LType := CanonicalOf(self.FTree, self.FTree.FirstOf(LMember, NodeRole.TypeOf));
+          LWidth := self.FTree.FirstOf(LMember, NodeRole.BitWidth);
+          if LWidth <> 0 then
+            self.DoBitfield(LMember, LWidth, LType);
+          end;
+          if AInOverlay and HoldsManaged(self.FTree, LType) then
+            self.DoError(LMember, ADAM_ERR_LAYOUT_313, ADAM_MSG_LAYOUT_OVERLAY_MANAGED,
+              NoArgs().Str(self.FTree[LMember].Text).Str(self.DoText(AOwner)).Str(self.DoText(LType)));
+          end;
+          if APacked and HoldsManaged(self.FTree, LType) then
+            self.DoError(LMember, ADAM_ERR_LAYOUT_331, ADAM_MSG_LAYOUT_PACKED_MANAGED,
+              NoArgs().Str(self.FTree[LMember].Text).Str(self.DoText(AOwner)).Str(self.DoText(LType)));
+          end;
+          if ARecordLike and HoldsOwner(self.FTree, LType) then
+            self.DoError(LMember, ADAM_ERR_LAYOUT_357, ADAM_MSG_LAYOUT_OWNER_FIELD,
+              NoArgs().Str(self.FTree[LMember].Text).Str(self.DoText(AOwner)));
+          end;
+        end;
+        if LKind = NodeKind.AnonRecord then
+          self.DoFields(LMember, AOwner, AInOverlay, APacked or self.FTree[LMember].HasFlag(NodeFlag.Packed),
+            ARecordLike);
+        end;
+        if LKind = NodeKind.AnonOverlay then
+          self.DoFields(LMember, AOwner, true, APacked, ARecordLike);
+        end;
+      end;
+    end;
+
+    // A record's align(n) in the body ABody of AType: a constant (SM0202), a power of two
+    // (SM0310), at most 8192 (SM0312), not below the natural alignment (SM0311)
+    hidden method DoAlign(const ABody: int64; const AType: int64);
+    var
+      LExpr: int64;
+      LValue: int64;
+      LAlign: int64;
+    begin
+      LExpr := self.FTree.FirstOf(ABody, NodeRole.Align);
+      if (LExpr = 0) or (not self.DoConstantPlace(LExpr, ADAM_MSG_SEMANTICS_POS_ALIGN)) then
+        return;
+      end;
+      LValue := 0;
+      if (not BoundValue(self.FTree, self.FTarget, LExpr, LValue)) or (not IsPowerOfTwo(LValue)) then
+        self.DoError(LExpr, ADAM_ERR_LAYOUT_310, ADAM_MSG_LAYOUT_ALIGN_POWER,
+          NoArgs().Str(self.FTree[LExpr].Text));
+        return;
+      end;
+      if LValue > ADAM_LAYOUT_ALIGN_LIMIT then
+        self.DoError(LExpr, ADAM_ERR_LAYOUT_312, ADAM_MSG_LAYOUT_ALIGN_LIMIT,
+          NoArgs().Str(IntToStr(LValue)));
+        return;
+      end;
+      // A value below the natural alignment raised nothing: the type kept its own
+      LAlign := TypeAlign(self.FTree, self.FTarget, AType);
+      if (LAlign > 0) and (LValue < LAlign) then
+        self.DoError(LExpr, ADAM_ERR_LAYOUT_311, ADAM_MSG_LAYOUT_ALIGN_NATURAL,
+          NoArgs().Str(IntToStr(LValue)).Str(IntToStr(LAlign)).Str(self.DoText(AType)));
+      end;
+    end;
+
+    // True when a field of the body ABody (or of its anonymous parts) has a type too
+    // large itself (its report is there, not at the aggregate)
+    hidden const method DoFieldTooLarge(const ABody: int64): bool;
+    var
+      LI: int64;
+      LMember: int64;
+      LKind: NodeKind;
+      LType: int64;
+    begin
+      for LI := 0 to self.FTree.CountOf(ABody, NodeRole.Member) - 1 do
+        LMember := self.FTree.NthOf(ABody, NodeRole.Member, LI);
+        LKind := self.FTree[LMember].Kind;
+        if (LKind = NodeKind.FieldDecl) or (LKind = NodeKind.EmbedDecl) then
+          LType := CanonicalOf(self.FTree, self.FTree.FirstOf(LMember, NodeRole.TypeOf));
+          if (LType <> 0) and (self.FTree[LType].ResolvedSize = ADAM_LAYOUT_TOO_LARGE) then
+            return true;
+          end;
+        end;
+        if ((LKind = NodeKind.AnonRecord) or (LKind = NodeKind.AnonOverlay)) and
+          self.DoFieldTooLarge(LMember) then
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // A type declaration AId: an aggregate laid out (SM0277 when too large and no field
+    // is), its fields and align checked; a vtable numbered; a set's range checked
+    hidden method DoTypeDecl(const AId: int64);
+    var
+      LType: int64;
+      LBody: int64;
+      LKind: NodeKind;
+      LCount: int64;
+    begin
+      LType := DeclaredTypeOf(self.FTree, AId);
+      LBody := self.FTree.FirstOf(AId, NodeRole.TypeOf);
+      if (LType = 0) or (LBody = 0) or (LType <> AId) then
+        return;
+      end;
+      LKind := self.FTree[LBody].Kind;
+      if (LKind = NodeKind.RecordType) or (LKind = NodeKind.OverlayType) or (LKind = NodeKind.ObjectType) then
+        DoLay(self.FTree, self.FTarget, LType, 0);
+        if (self.FTree[LType].ResolvedSize = ADAM_LAYOUT_TOO_LARGE) and (not self.DoFieldTooLarge(LBody)) then
+          self.DoError(AId, ADAM_ERR_LAYOUT_277, ADAM_MSG_LAYOUT_TOO_LARGE,
+            NoArgs().Str(self.DoText(LType)).Str(IntToStr(ADAM_LAYOUT_MAX_SIZE)));
+        end;
+        if LKind = NodeKind.RecordType then
+          self.DoAlign(LBody, LType);
+        end;
+        self.DoFields(LBody, LType, LKind = NodeKind.OverlayType, self.FTree[LBody].HasFlag(NodeFlag.Packed),
+          LKind <> NodeKind.ObjectType);
+      end;
+      if (LKind = NodeKind.ObjectType) or (LKind = NodeKind.InterfaceType) then
+        // Numbered here so every virtual member has its slot; the count is not needed
+        LCount := VtableSlots(self.FTree, LType);
+      end;
+      if LKind = NodeKind.SetType then
+        self.DoSet(LBody);
+      end;
+    end;
+
+    // Every type declaration and static array type expression of the tree, in arena order
+    // (the parse order: deterministic); recovered nodes are silent
+    method Run();
+    var
+      LI: int64;
+      LKind: NodeKind;
+    begin
+      for LI := 1 to self.FTree.Count - 1 do
+        if not self.FTree[LI].HasFlag(NodeFlag.Recovered) then
+          LKind := self.FTree[LI].Kind;
+          if LKind = NodeKind.TypeDecl then
+            self.DoTypeDecl(LI);
+          end;
+          if (LKind = NodeKind.ArrayType) and (self.FTree.ParentOf(LI) <> ADAM_AST_DERIVED) then
+            self.DoArray(LI);
+          end;
+        end;
+      end;
+    end;
+  end;
+
+// Every declared type of the program in ATree laid out on ATarget and checked (see
+// LayoutChecker), reporting into ADiagnostics. Runs after CheckTypes: it reads folded
+// constants. With no target (nil) nothing is laid out or checked: the Driver has reported
+// the missing target (DR0004), and checks made on unknown sizes would only add noise
+exported routine CheckLayouts(const ATree: ref SyntaxTree; const ATarget: ref Target;
+  const ADiagnostics: ref Diagnostics);
+var
+  LChecker: ref LayoutChecker;
+begin
+  if ATarget = nil then
+    return;
+  end;
+  LChecker := ref LayoutChecker(ATree, ATarget, ADiagnostics);
+  LChecker.Run();
+end;
+
+end.
