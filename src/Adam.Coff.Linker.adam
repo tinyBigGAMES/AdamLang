@@ -29,10 +29,15 @@
               import) gives no DLL: the import is unbound (its symbol
               Undefined) and the library's objects that define what the
               program needs are merged into the set first
-              (Adam.Coff.Foreign, the libraries in first-use order); the
-              code reads such a routine's address from a local import slot
-              (lld's: an 8-byte pointer in .rdata, the routine's address by
-              an Abs64) as it reads a DLL routine's from its IAT slot. Image
+              (Adam.Coff.Foreign, the libraries in first-use order, then
+              the ABI's C runtime archives, CRuntimeFacts); the code reads
+              such a routine's address from a local import slot (lld's: an
+              8-byte pointer in .rdata, the routine's address by an Abs64)
+              as it reads a DLL routine's from its IAT slot. What the
+              objects still need that the C runtime's DLL exports is
+              imported from it: `__imp_` + an export is that import's slot,
+              an export's own name an import thunk (the machine's jump
+              through the slot, CoffMachine.ImportThunk, in .text). Image
               sections by kind, in this order: .text (code), .rdata
               (read-only, then the import tables), .data, .bss (zeroed),
               then .reloc when an Abs64 relocation needs a base relocation;
@@ -81,8 +86,8 @@
 module unit Adam.Coff.Linker;
 
 import System.SysUtils, Adam.Core.Containers, Adam.Core.Messages, Adam.Compiler.SourceText,
-  Adam.Compiler.Diagnostics, Adam.Compiler.AST, Adam.Backend.Sections, Adam.Coff.Writer,
-  Adam.Coff.Exports, Adam.Coff.Foreign;
+  Adam.Compiler.Diagnostics, Adam.Compiler.AST, Adam.Backend.Sections, Adam.Backend.Parts,
+  Adam.Coff.Writer, Adam.Coff.Exports, Adam.Coff.Foreign;
 
 exported const
   // Reported (see the header)
@@ -95,14 +100,18 @@ exported const
   ADAM_LINKER_STATIC: int64 = -2;
   // The set section of the local import slots (in the .rdata group)
   ADAM_LINKER_LOCAL_IMPORTS: string = ".rdata$adam_local_imports";
+  // The set section of the import thunks (in the .text group): the code a static object's
+  // direct call to a C runtime DLL export reaches (DoThunk), aligned as an import slot
+  ADAM_LINKER_IMPORT_THUNKS: string = ".text$adam_import_thunks";
   // A group name's separator: the part before it is the group (".text$mn" is in ".text")
   ADAM_LINKER_GROUP_MARK: string = "$";
   // Raised (see the header)
-  ADAM_LINKER_FAULT_INPUT: string = "Linker: no sections, no machine or no diagnostics";
+  ADAM_LINKER_FAULT_INPUT: string = "Linker: no sections, no machine, no diagnostics or no C runtime";
   ADAM_LINKER_FAULT_ENTRY: string = "Linker: the entry is no symbol defined in code: ";
   ADAM_LINKER_FAULT_ALIGN: string = "Linker: a section aligned past a page: ";
   ADAM_LINKER_FAULT_FIELD: string = "Linker: a value its relocation field does not hold: ";
   ADAM_LINKER_FAULT_UNDEFINED: string = "Linker: a relocation to an undefined symbol: ";
+  ADAM_LINKER_FAULT_THUNK: string = "Linker: an import thunk defined apart from its symbol: ";
   ADAM_LINKER_FAULT_PDATA: string = "Linker: a .pdata that is no whole number of entries: ";
   // MS-DOS Stub and Signature: "MZ", the signature's offset at 0x3C, "PE\0\0" right after
   // a 64-byte MS-DOS header (0x3C's 4 bytes are its last)
@@ -254,6 +263,10 @@ type
     hidden FStaticFiles: ref StringIdMap;
     // The set section of the local import slots (DoLocalImport); 0 until the first
     hidden FLocalImports: int64;
+    // The ABI's C runtime (CRuntimeFacts: its archives and DLL); the set section of the
+    // import thunks (DoThunk), 0 until the first
+    hidden FRuntime: ref CRuntimeFacts;
+    hidden FImportThunks: int64;
     // The slots (one per DLL file and name): its DLL, name, hint, and where its hint / name
     // entry and its IAT entry sit in .rdata; a slot key -> its index + 1; per import id its
     // slot (-1 after a report)
@@ -286,13 +299,16 @@ type
     hidden FBytes: ByteArray;
 
     init(const ASet: ref SectionSet; const AMachine: ref CoffMachine; const AEntry: string;
-      const APaths: StringArray; const ATree: ref SyntaxTree; const ADiagnostics: ref Diagnostics);
+      const APaths: StringArray; const ARuntime: ref CRuntimeFacts; const ATree: ref SyntaxTree;
+      const ADiagnostics: ref Diagnostics);
     begin
       self.FSet := ASet;
       self.FMachine := AMachine;
       self.FEntry := AEntry;
       self.FEntrySymbol := 0;
       self.FPaths := APaths;
+      self.FRuntime := ARuntime;
+      self.FImportThunks := 0;
       self.FTree := ATree;
       self.FDiagnostics := ADiagnostics;
       self.FFailed := false;
@@ -514,20 +530,49 @@ type
       return LSlot;
     end;
 
-    // Every import's slot, in import id order
-    hidden method DoImports();
+    // The slot of every import from id AFirst on, in import id order
+    hidden method DoImportsFrom(const AFirst: int64);
     var
       LId: int64;
     begin
       setlength(self.FImportSlot, self.FSet.ImportCount);
-      for LId := 1 to self.FSet.ImportCount - 1 do
+      for LId := AFirst to self.FSet.ImportCount - 1 do
         self.FImportSlot[LId] := self.DoImportSlot(LId);
       end;
     end;
 
+    // The C runtime's archives (FRuntime) added to AForeign after the program's static
+    // libraries, each found by BNF sec 2's search and reported at the node of the import
+    // that first named a static library; one the program named itself is not added twice.
+    // False after a report
+    hidden method DoRuntimeArchives(const AForeign: ref ForeignLinker): bool;
+    var
+      LI: int64;
+      LFile: string;
+      LNode: int64;
+    begin
+      LNode := self.FArchiveNodes[0];
+      for LI := 0 to len(self.FRuntime.Archives) - 1 do
+        LFile := FindLibrary(self.FRuntime.Archives[LI], self.FPaths, self.FDiagnostics,
+          self.DoPlace(LNode));
+        if LFile = "" then
+          self.FFailed := true;
+          return false;
+        end;
+        if self.FStaticFiles.Find(LowerCase(LFile)) = 0 then
+          if not AForeign.AddArchive(LFile, LNode) then
+            self.FFailed := true;
+            return false;
+          end;
+        end;
+      end;
+      return true;
+    end;
+
     // The static libraries' objects the program needs merged into the set (Adam.Coff.Foreign:
     // the libraries in first-use order, each read at the node of the import that first named
-    // it); nothing when no import named one. False after their report
+    // it, then the C runtime's archives); nothing when no import named one. False after
+    // their report
     hidden method DoForeign(): bool;
     var
       LForeign: ref ForeignLinker;
@@ -543,11 +588,102 @@ type
           return false;
         end;
       end;
+      if not self.DoRuntimeArchives(LForeign) then
+        return false;
+      end;
       if not LForeign.Run() then
         self.FFailed := true;
         return false;
       end;
       return true;
+    end;
+
+    // The Undefined symbol AId (named AName, first needed at ANode) defined as an import
+    // thunk: the machine's indirect jump (CoffMachine.ImportThunk) through the slot of a new
+    // import of AName from the C runtime's DLL, so a static object's direct call reaches the
+    // DLL's export, as lld's thunk does
+    hidden method DoThunk(const AId: int64; const AName: string; const ANode: int64);
+    var
+      LSlot: int64;
+      LSection: ref Section;
+      LAt: int64;
+      LK: int64;
+    begin
+      LSlot := self.FSet.ImportSymbol(self.FRuntime.LibraryName, AName, ANode);
+      if self.FImportThunks = 0 then
+        self.FImportThunks := self.FSet.AddSection(ADAM_LINKER_IMPORT_THUNKS, SectionKind.Code,
+          ADAM_LINKER_THUNK_SIZE);
+      end;
+      LSection := self.FSet.SectionAt(self.FImportThunks);
+      LAt := AlignUp(LSection.Size(), ADAM_LINKER_THUNK_SIZE);
+      LSection.PutZeros(LAt - LSection.Size());
+      for LK := 0 to len(self.FMachine.ImportThunk) - 1 do
+        LSection.Put8(uint64(self.FMachine.ImportThunk[LK]));
+      end;
+      // The definition keeps the Undefined symbol's id: every relocation to it reaches the thunk
+      if self.FSet.DefineSymbol(AName, self.FImportThunks, LAt, ANode) <> AId then
+        raise(ADAM_LINKER_FAULT_THUNK + AName);
+      end;
+      self.FSet.AddReloc(self.FImportThunks, LAt + self.FMachine.ImportThunkField, RelocKind.Rel32,
+        LSlot, 0);
+    end;
+
+    // The Undefined symbol AId bound to the C runtime DLL ALibrary when it exports its name:
+    // `__imp_` + an export becomes that import's slot (SectionSet.BindImport: the object reads
+    // the address there), an export's own name an import thunk (DoThunk); else it stays
+    hidden method DoRuntimeName(const AId: int64; const ALibrary: int64);
+    var
+      LSymbol: ref SectionSymbol;
+      LTable: ref ExportTable;
+      LPrefix: int64;
+      LBase: string;
+    begin
+      LSymbol := self.FSet.SymbolAt(AId);
+      LTable := self.FLibraries[ALibrary].Table;
+      LPrefix := len(ADAM_COFF_IMPORT_PREFIX);
+      if StartsStr(ADAM_COFF_IMPORT_PREFIX, LSymbol.SymbolName) then
+        LBase := Substring(LSymbol.SymbolName, LPrefix, len(LSymbol.SymbolName) - LPrefix);
+        if LTable.IndexOf(LBase) >= 0 then
+          self.FSet.BindImport(AId, self.FRuntime.LibraryName, LBase, LSymbol.Node);
+        end;
+        return;
+      end;
+      if LTable.IndexOf(LSymbol.SymbolName) >= 0 then
+        self.DoThunk(AId, LSymbol.SymbolName, LSymbol.Node);
+      end;
+    end;
+
+    // After the static libraries: every Undefined symbol the C runtime's DLL exports bound to
+    // it (DoRuntimeName), the new imports given their slots; the DLL is found the first time
+    // a name needs it. Nothing when the program named no static library (its own undefined
+    // names stay LK0001)
+    hidden method DoCRuntime();
+    var
+      LFirst: int64;
+      LCount: int64;
+      LId: int64;
+      LSymbol: ref SectionSymbol;
+      LLibrary: int64;
+    begin
+      if len(self.FArchiveFiles) = 0 then
+        return;
+      end;
+      LFirst := self.FSet.ImportCount;
+      LCount := self.FSet.SymbolCount;
+      LLibrary := -1;
+      for LId := 1 to LCount - 1 do
+        LSymbol := self.FSet.SymbolAt(LId);
+        if LSymbol.Kind = SymbolKind.Undefined then
+          if LLibrary = -1 then
+            LLibrary := self.DoLibrary(self.FRuntime.LibraryName, LSymbol.Node);
+            if LLibrary < 0 then
+              return;
+            end;
+          end;
+          self.DoRuntimeName(LId, LLibrary);
+        end;
+      end;
+      self.DoImportsFrom(LFirst);
     end;
 
     // Every Undefined symbol reported at the node that needs it
@@ -1331,9 +1467,10 @@ type
     var
       LNone: ByteArray;
     begin
-      self.DoImports();
+      self.DoImportsFrom(1);
       // After a static library's report its symbols would only repeat it as LK0001
       if self.DoForeign() then
+        self.DoCRuntime();
         self.DoUndefined();
       end;
       if not self.FFailed then
@@ -1353,20 +1490,23 @@ type
   end;
 
 // ASections linked into a PE32+ exe for AMachine, entered at the symbol AEntry, its imports'
-// DLLs searched in ALibraryPaths (Adam.Coff.Exports.LibraryPaths), reports at ATree's nodes
-// into ADiagnostics (see the header); empty after a report. ADllNames: the DLLs the exe
-// imports, in its import directory's order
+// DLLs searched in ALibraryPaths (Adam.Coff.Exports.LibraryPaths), a static library's objects
+// linked against ARuntime (the ABI's C runtime), reports at ATree's nodes into ADiagnostics
+// (see the header); empty after a report. ADllNames: the DLLs the exe imports, in its import
+// directory's order
 exported routine LinkImage(const ASections: ref SectionSet; const AMachine: ref CoffMachine;
-  const AEntry: string; const ALibraryPaths: StringArray; const ATree: ref SyntaxTree;
-  const ADiagnostics: ref Diagnostics; var ADllNames: StringArray): ByteArray;
+  const AEntry: string; const ALibraryPaths: StringArray; const ARuntime: ref CRuntimeFacts;
+  const ATree: ref SyntaxTree; const ADiagnostics: ref Diagnostics;
+  var ADllNames: StringArray): ByteArray;
 var
   LLinker: ref CoffLinker;
   LBytes: ByteArray;
 begin
-  if (ASections = nil) or (AMachine = nil) or (ADiagnostics = nil) then
+  if (ASections = nil) or (AMachine = nil) or (ADiagnostics = nil) or (ARuntime = nil) then
     raise(ADAM_LINKER_FAULT_INPUT);
   end;
-  LLinker := ref CoffLinker(ASections, AMachine, AEntry, ALibraryPaths, ATree, ADiagnostics);
+  LLinker := ref CoffLinker(ASections, AMachine, AEntry, ALibraryPaths, ARuntime, ATree,
+    ADiagnostics);
   LBytes := LLinker.Run();
   ADllNames := LLinker.DllNames();
   return LBytes;
