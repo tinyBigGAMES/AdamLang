@@ -1,0 +1,617 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Coff.Foreign.adam - a static library's COFF objects taken into the
+  link: members pulled in by undefined symbol and merged into the SectionSet
+  (DESIGN sec 7)
+
+  ForeignLinker  one link's static libraries, in search order (AddArchive:
+                 each read whole, its symbol index the first definition of
+                 each name wins, earlier libraries first, as lld's MinGW
+                 search). Run walks the set's symbols in id order; an
+                 Undefined one an index names pulls that member in (once),
+                 and the symbols the member adds are walked in turn. A
+                 member is read by Adam.Coff.Reader, its Machine checked,
+                 then merged:
+                   sections   dropped: IMAGE_SCN_LNK_REMOVE, LNK_INFO and
+                              MEM_DISCARDABLE ones (.llvm_addrsig,
+                              .drectve, .debug$S); a COMDAT section kept
+                              when it is the first copy of its COMDAT
+                              symbol (selection ANY); every kept one a new
+                              set section (code, zeroed, writable data or
+                              read-only, by its flags), its name made
+                              unique, its group name the object's own
+                              (.text$mn: the linker lays out by it), its
+                              bytes copied
+                   symbols    an external defined in a kept section is
+                              defined in the set (a second definition is
+                              FO0003); one in a dropped section, and an
+                              undefined one, is referred to by name; a
+                              static or label in a kept section becomes an
+                              internal set symbol under a unique name
+                   relocs     each kept section's, by the machine's types
+                              (CoffMachine: Rel32, Rva32, Abs64), the addend
+                              read from the field (COFF keeps it there;
+                              the linker writes the whole field)
+                 Every symbol the member adds, and every report about it,
+                 is at the AST node of the reference that pulled the
+                 member in (the external declaration first needing it).
+
+  Reported, the link failed after it: a library that cannot be read
+  (FO0001) or is no archive (AR codes, Adam.Coff.Archive); a member that is
+  damaged (OB0001, Adam.Coff.Reader, or FO0005: a COMDAT section with no
+  COMDAT symbol, a symbol past its section or in a section it does not
+  have, a relocation past its section) or built for another machine
+  (FO0002); a second definition (FO0003); what clang's objects for
+  x86_64-windows-gnu were never seen to hold, so adam does not link it
+  (FO0004): another relocation type, a common, absolute or weak external
+  symbol, a COMDAT selection other than ANY, a section aligned past the
+  page; a relocation to a symbol in no kept section (FO0006). Nothing
+  raises.
+*******************************************************************************/
+
+module unit Adam.Coff.Foreign;
+
+import System.SysUtils, System.Windows, Adam.Core.Containers, Adam.Core.Messages,
+  Adam.Compiler.SourceText, Adam.Compiler.Diagnostics, Adam.Compiler.AST, Adam.Backend.Sections,
+  Adam.Coff.Writer, Adam.Coff.Archive, Adam.Coff.Reader;
+
+exported const
+  // Reported (see the header)
+  ADAM_ERR_FOREIGN_001: string = "FO0001";   // a static library that cannot be read
+  ADAM_ERR_FOREIGN_002: string = "FO0002";   // a member built for another machine
+  ADAM_ERR_FOREIGN_003: string = "FO0003";   // a second definition
+  ADAM_ERR_FOREIGN_004: string = "FO0004";   // something adam does not link
+  ADAM_ERR_FOREIGN_005: string = "FO0005";   // a damaged member
+  ADAM_ERR_FOREIGN_006: string = "FO0006";   // a relocation to a symbol in no kept section
+  // A member's key in the symbol index map: its archive's index times this, plus its own
+  // index, plus 1 (the map's 0 is none)
+  ADAM_FOREIGN_MEMBER_SPAN: int64 = 0x100000000;
+  // A 32-bit field's sign bit and the span it wraps by (a Rel32 or Rva32 addend is signed)
+  ADAM_FOREIGN_SIGN_32: int64 = 0x80000000;
+  ADAM_FOREIGN_SPAN_32: int64 = 0x100000000;
+  // A Rel32 or Rva32 field's bytes, an Abs64 field's
+  ADAM_FOREIGN_FIELD_32: int64 = 4;
+  ADAM_FOREIGN_FIELD_64: int64 = 8;
+
+type
+  // One static library: its file, its bytes, the archive read, and which members are in
+  ForeignArchive = object
+    FilePath: string;
+    Bytes: ByteArray;
+    Data: ArchiveData;
+    Loaded: BoolArray;
+
+    init(const AFilePath: string);
+    begin
+      self.FilePath := AFilePath;
+    end;
+  end;
+
+  // One member being merged: the object read, how reports name it, the node that pulled it
+  // in, its load number (unique set names); per section its set section and per symbol record
+  // its set symbol (0: none), per section whether it is kept
+  ForeignMerge = object
+    Source: CoffObjectData;
+    ObjectLabel: string;
+    Node: int64;
+    Serial: int64;
+    SectionOf: Int64Array;
+    SymbolOf: Int64Array;
+    Kept: BoolArray;
+
+    init(const AObjectLabel: string; const ANode: int64; const ASerial: int64);
+    begin
+      self.ObjectLabel := AObjectLabel;
+      self.Node := ANode;
+      self.Serial := ASerial;
+    end;
+  end;
+
+// True when a section of ACharacteristics is never part of an image (see the header)
+routine DoIsDropped(const ACharacteristics: int64): bool;
+begin
+  return (ACharacteristics & (ADAM_COFF_SCN_LNK_REMOVE | ADAM_COFF_SCN_LNK_INFO |
+    ADAM_COFF_SCN_MEM_DISCARDABLE)) <> 0;
+end;
+
+// The kind of set section a section of ACharacteristics becomes
+routine DoKindOf(const ACharacteristics: int64): SectionKind;
+begin
+  if (ACharacteristics & ADAM_COFF_SCN_CNT_CODE) <> 0 then
+    return SectionKind.Code;
+  end;
+  if (ACharacteristics & ADAM_COFF_SCN_CNT_UNINITIALIZED_DATA) <> 0 then
+    return SectionKind.Zeroed;
+  end;
+  if (ACharacteristics & ADAM_COFF_SCN_MEM_WRITE) <> 0 then
+    return SectionKind.Data;
+  end;
+  return SectionKind.ReadOnly;
+end;
+
+// The index of the COMDAT symbol of AObject's section ANumber: the second symbol record in
+// that section (the first is its section definition); -1 for none
+routine DoComdatSymbol(const AObject: CoffObjectData; const ANumber: int64): int64;
+var
+  LIndex: int64;
+  LSeen: int64;
+begin
+  LSeen := 0;
+  for LIndex := 0 to len(AObject.Symbols) - 1 do
+    if (not AObject.Symbols[LIndex].IsAux) and
+      (AObject.Symbols[LIndex].SectionNumber = ANumber) then
+      LSeen := LSeen + 1;
+      if LSeen = 2 then
+        return LIndex;
+      end;
+    end;
+  end;
+  return -1;
+end;
+
+// The 4-byte field at AAt of ABytes as a signed value
+routine DoSigned32(const ABytes: ByteArray; const AAt: int64): int64;
+var
+  LValue: int64;
+begin
+  LValue := int64(GetLe(ABytes, AAt, ADAM_FOREIGN_FIELD_32));
+  if LValue >= ADAM_FOREIGN_SIGN_32 then
+    LValue := LValue - ADAM_FOREIGN_SPAN_32;
+  end;
+  return LValue;
+end;
+
+exported type
+  // One link's static libraries and the members they give it (see the header)
+  ForeignLinker = object
+    hidden FSet: ref SectionSet;
+    hidden FMachine: ref CoffMachine;
+    hidden FTree: ref SyntaxTree;
+    hidden FDiagnostics: ref Diagnostics;
+    hidden FFailed: bool;
+    hidden FArchives: array of ref ForeignArchive;
+    // A symbol name -> the member key (see ADAM_FOREIGN_MEMBER_SPAN) of its first definition
+    hidden FMemberOf: ref StringIdMap;
+    // A COMDAT symbol name -> 1 once one copy of its section is kept
+    hidden FComdats: ref StringIdMap;
+    hidden FLoads: int64;
+
+    init(const ASet: ref SectionSet; const AMachine: ref CoffMachine; const ATree: ref SyntaxTree;
+      const ADiagnostics: ref Diagnostics);
+    begin
+      self.FSet := ASet;
+      self.FMachine := AMachine;
+      self.FTree := ATree;
+      self.FDiagnostics := ADiagnostics;
+      self.FFailed := false;
+      self.FMemberOf := ref StringIdMap();
+      self.FComdats := ref StringIdMap();
+      self.FLoads := 0;
+    end;
+
+    // Where the AST node ANode is: NoPlace with no tree or no node
+    hidden const method DoPlace(const ANode: int64): SourcePlace;
+    begin
+      if (self.FTree = nil) or (ANode = 0) then
+        return NoPlace();
+      end;
+      return self.FTree[ANode].Place;
+    end;
+
+    // Reports ACode at ANode's place; the link has failed
+    hidden method DoReport(const ACode: string; const ANode: int64; const ATemplate: string;
+      const AArgs: MessageArgs);
+    begin
+      self.FDiagnostics.Add(Severity.Error, ACode, self.DoPlace(ANode), ATemplate, AArgs);
+      self.FFailed := true;
+    end;
+
+    // Reports what AMerge's object holds and adam does not link (FO0004), AWhat the filled
+    // form
+    hidden method DoUnlinked(const AMerge: ref ForeignMerge; const AWhat: string);
+    begin
+      self.DoReport(ADAM_ERR_FOREIGN_004, AMerge.Node, ADAM_MSG_FOREIGN_UNLINKED,
+        NoArgs().Str(AMerge.ObjectLabel).Str(AWhat));
+    end;
+
+    // Reports AMerge's object damaged for AReason (FO0005)
+    hidden method DoDamaged(const AMerge: ref ForeignMerge; const AReason: string);
+    begin
+      self.DoReport(ADAM_ERR_FOREIGN_005, AMerge.Node, ADAM_MSG_FOREIGN_DAMAGED,
+        NoArgs().Str(AMerge.ObjectLabel).Str(AReason));
+    end;
+
+    // The static library AFilePath (found for the declaration ANode) read and its symbol
+    // index added after the libraries before it; false after a report
+    method AddArchive(const AFilePath: string; const ANode: int64): bool;
+    var
+      LArchive: ref ForeignArchive;
+      LIndex: int64;
+      LS: int64;
+      LSymbol: ArchiveSymbol;
+    begin
+      LArchive := ref ForeignArchive(AFilePath);
+      if not ReadAllBytes(AFilePath, LArchive.Bytes) then
+        self.DoReport(ADAM_ERR_FOREIGN_001, ANode, ADAM_MSG_FOREIGN_UNREADABLE,
+          NoArgs().Str(AFilePath));
+        return false;
+      end;
+      if not ReadArchive(LArchive.Bytes, AFilePath, self.DoPlace(ANode), self.FDiagnostics,
+        LArchive.Data) then
+        self.FFailed := true;
+        return false;
+      end;
+      setlength(LArchive.Loaded, len(LArchive.Data.Members));
+      for LS := 0 to len(LArchive.Data.Members) - 1 do
+        LArchive.Loaded[LS] := false;
+      end;
+      LIndex := len(self.FArchives);
+      setlength(self.FArchives, LIndex + 1);
+      self.FArchives[LIndex] := LArchive;
+      for LS := 0 to len(LArchive.Data.Symbols) - 1 do
+        LSymbol := LArchive.Data.Symbols[LS];
+        if (LArchive.Data.Members[LSymbol.Member].Kind = MemberKind.CoffObject) and
+          (self.FMemberOf.Find(LSymbol.SymbolName) = 0) then
+          self.FMemberOf.Put(LSymbol.SymbolName,
+            LIndex * ADAM_FOREIGN_MEMBER_SPAN + LSymbol.Member + 1);
+        end;
+      end;
+      return true;
+    end;
+
+    // Whether AMerge's COMDAT section AIndex (0-based) is kept: the first copy of its COMDAT
+    // symbol (selection ANY); false, after a report, for a selection adam does not link or a
+    // section with no COMDAT symbol
+    hidden method DoKeepComdat(const AMerge: ref ForeignMerge; const AIndex: int64): bool;
+    var
+      LSection: CoffSection;
+      LSymbol: int64;
+      LKey: string;
+    begin
+      LSection := AMerge.Source.Sections[AIndex];
+      LSymbol := DoComdatSymbol(AMerge.Source, AIndex + 1);
+      if (LSection.Selection = 0) or (LSymbol < 0) then
+        self.DoDamaged(AMerge, NoArgs().Str(LSection.SectionName).Fill(
+          ADAM_MSG_FOREIGN_REASON_NO_COMDAT));
+        return false;
+      end;
+      if LSection.Selection <> ADAM_COFF_COMDAT_ANY then
+        self.DoUnlinked(AMerge, NoArgs().Str(LSection.SectionName).Int(LSection.Selection).Fill(
+          ADAM_MSG_FOREIGN_FORM_SELECTION));
+        return false;
+      end;
+      LKey := AMerge.Source.Symbols[LSymbol].SymbolName;
+      if self.FComdats.Find(LKey) <> 0 then
+        return false;
+      end;
+      self.FComdats.Put(LKey, 1);
+      return true;
+    end;
+
+    // Which of AMerge's sections are kept (see the header)
+    hidden method DoKeep(const AMerge: ref ForeignMerge);
+    var
+      LI: int64;
+      LFlags: int64;
+    begin
+      setlength(AMerge.Kept, len(AMerge.Source.Sections));
+      for LI := 0 to len(AMerge.Source.Sections) - 1 do
+        LFlags := AMerge.Source.Sections[LI].Characteristics;
+        AMerge.Kept[LI] := not DoIsDropped(LFlags);
+        if AMerge.Kept[LI] and ((LFlags & ADAM_COFF_SCN_LNK_COMDAT) <> 0) then
+          AMerge.Kept[LI] := self.DoKeepComdat(AMerge, LI);
+        end;
+      end;
+    end;
+
+    // AMerge's kept section AIndex (0-based) as a new set section, its bytes copied from
+    // ABytes; 0 after a report (an alignment past the page)
+    hidden method DoAddSection(const ABytes: ByteArray; const AMerge: ref ForeignMerge;
+      const AIndex: int64): int64;
+    var
+      LSection: CoffSection;
+      LKind: SectionKind;
+      LName: string;
+      LId: int64;
+      LTarget: ref Section;
+      LK: int64;
+    begin
+      LSection := AMerge.Source.Sections[AIndex];
+      if LSection.Align > self.FMachine.PageSize then
+        self.DoUnlinked(AMerge, NoArgs().Str(LSection.SectionName).Int(LSection.Align).Int(
+          self.FMachine.PageSize).Fill(ADAM_MSG_FOREIGN_FORM_ALIGN));
+        return 0;
+      end;
+      LKind := DoKindOf(LSection.Characteristics);
+      // Unique in the set: the object's label and load number and the section's number
+      LName := LSection.SectionName + " (" + AMerge.ObjectLabel + " #" +
+        IntToStr(AMerge.Serial) + "." + IntToStr(AIndex + 1) + ")";
+      LId := self.FSet.AddSection(LName, LKind, LSection.Align);
+      LTarget := self.FSet.SectionAt(LId);
+      LTarget.GroupName := LSection.SectionName;
+      if LKind = SectionKind.Zeroed then
+        LTarget.PutZeros(LSection.DataSize);
+        return LId;
+      end;
+      for LK := 0 to LSection.DataSize - 1 do
+        LTarget.Put8(uint64(ABytes[LSection.DataAt + LK]));
+      end;
+      return LId;
+    end;
+
+    // Every kept section of AMerge as a set section (see the header)
+    hidden method DoSections(const ABytes: ByteArray; const AMerge: ref ForeignMerge);
+    var
+      LI: int64;
+    begin
+      setlength(AMerge.SectionOf, len(AMerge.Source.Sections));
+      for LI := 0 to len(AMerge.Source.Sections) - 1 do
+        AMerge.SectionOf[LI] := 0;
+        if AMerge.Kept[LI] then
+          AMerge.SectionOf[LI] := self.DoAddSection(ABytes, AMerge, LI);
+        end;
+      end;
+    end;
+
+    // True when ASymbol of AMerge lies in a section its object has, at an offset inside it;
+    // false after a report
+    hidden method DoInSection(const AMerge: ref ForeignMerge; const ASymbol: CoffSymbol): bool;
+    begin
+      if ASymbol.SectionNumber > len(AMerge.Source.Sections) then
+        self.DoDamaged(AMerge, NoArgs().Str(ASymbol.SymbolName).Int(ASymbol.SectionNumber).Fill(
+          ADAM_MSG_FOREIGN_REASON_NO_SECTION));
+        return false;
+      end;
+      if ASymbol.SymbolValue > AMerge.Source.Sections[ASymbol.SectionNumber - 1].DataSize then
+        self.DoDamaged(AMerge, NoArgs().Str(ASymbol.SymbolName).Fill(
+          ADAM_MSG_FOREIGN_REASON_PAST_SECTION));
+        return false;
+      end;
+      return true;
+    end;
+
+    // An external symbol of AMerge (record AIndex) into the set (see the header)
+    hidden method DoExternal(const AMerge: ref ForeignMerge; const AIndex: int64;
+      const ASymbol: CoffSymbol);
+    var
+      LSetSection: int64;
+      LKnown: int64;
+    begin
+      if ASymbol.SectionNumber = ADAM_COFF_SYM_UNDEFINED then
+        // A value is a common symbol's size
+        if ASymbol.SymbolValue <> 0 then
+          self.DoUnlinked(AMerge, NoArgs().Str(ASymbol.SymbolName).Fill(
+            ADAM_MSG_FOREIGN_FORM_COMMON));
+          return;
+        end;
+        AMerge.SymbolOf[AIndex] := self.FSet.ReferSymbol(ASymbol.SymbolName, AMerge.Node);
+        return;
+      end;
+      if ASymbol.SectionNumber < 0 then
+        self.DoUnlinked(AMerge, NoArgs().Str(ASymbol.SymbolName).Fill(
+          ADAM_MSG_FOREIGN_FORM_ABSOLUTE));
+        return;
+      end;
+      if not self.DoInSection(AMerge, ASymbol) then
+        return;
+      end;
+      LSetSection := AMerge.SectionOf[ASymbol.SectionNumber - 1];
+      // In a dropped section (a COMDAT copy not kept): the kept copy defines it
+      if LSetSection = 0 then
+        AMerge.SymbolOf[AIndex] := self.FSet.ReferSymbol(ASymbol.SymbolName, AMerge.Node);
+        return;
+      end;
+      LKnown := self.FSet.FindSymbol(ASymbol.SymbolName);
+      if (LKnown <> 0) and (self.FSet.SymbolAt(LKnown).Kind = SymbolKind.Defined) then
+        self.DoReport(ADAM_ERR_FOREIGN_003, AMerge.Node, ADAM_MSG_FOREIGN_TWICE,
+          NoArgs().Str(ASymbol.SymbolName).Str(AMerge.ObjectLabel));
+        return;
+      end;
+      AMerge.SymbolOf[AIndex] := self.FSet.DefineSymbol(ASymbol.SymbolName, LSetSection,
+        ASymbol.SymbolValue, AMerge.Node);
+    end;
+
+    // A static or label symbol of AMerge (record AIndex) in a kept section: an internal set
+    // symbol under a name no other has
+    hidden method DoLocal(const AMerge: ref ForeignMerge; const AIndex: int64;
+      const ASymbol: CoffSymbol);
+    var
+      LSetSection: int64;
+      LName: string;
+      LId: int64;
+    begin
+      if not self.DoInSection(AMerge, ASymbol) then
+        return;
+      end;
+      LSetSection := AMerge.SectionOf[ASymbol.SectionNumber - 1];
+      if LSetSection = 0 then
+        return;
+      end;
+      LName := "<" + IntToStr(AMerge.Serial) + "." + IntToStr(AIndex) + "> " + ASymbol.SymbolName;
+      LId := self.FSet.DefineSymbol(LName, LSetSection, ASymbol.SymbolValue, AMerge.Node);
+      self.FSet.MakeInternal(LId);
+      AMerge.SymbolOf[AIndex] := LId;
+    end;
+
+    // Every symbol record of AMerge into the set, by its storage class (see the header);
+    // records that name no place (a file, an absolute static such as @feat.00, aux records)
+    // map to none
+    hidden method DoSymbols(const AMerge: ref ForeignMerge);
+    var
+      LI: int64;
+      LSymbol: CoffSymbol;
+    begin
+      setlength(AMerge.SymbolOf, len(AMerge.Source.Symbols));
+      for LI := 0 to len(AMerge.Source.Symbols) - 1 do
+        AMerge.SymbolOf[LI] := 0;
+      end;
+      for LI := 0 to len(AMerge.Source.Symbols) - 1 do
+        LSymbol := AMerge.Source.Symbols[LI];
+        if self.FFailed then
+          return;
+        end;
+        if not LSymbol.IsAux then
+          if LSymbol.StorageClass = ADAM_COFF_SYM_CLASS_WEAK_EXTERNAL then
+            self.DoUnlinked(AMerge, NoArgs().Str(LSymbol.SymbolName).Fill(
+              ADAM_MSG_FOREIGN_FORM_WEAK));
+          end;
+          if LSymbol.StorageClass = ADAM_COFF_SYM_CLASS_EXTERNAL then
+            self.DoExternal(AMerge, LI, LSymbol);
+          end;
+          if ((LSymbol.StorageClass = ADAM_COFF_SYM_CLASS_STATIC) or
+            (LSymbol.StorageClass = ADAM_COFF_SYM_CLASS_LABEL)) and (LSymbol.SectionNumber > 0) then
+            self.DoLocal(AMerge, LI, LSymbol);
+          end;
+        end;
+      end;
+    end;
+
+    // AReloc of AMerge's kept section AIndex (0-based) into the set: its kind by the
+    // machine's type, its addend from the field in ABytes (see the header)
+    hidden method DoReloc(const ABytes: ByteArray; const AMerge: ref ForeignMerge;
+      const AIndex: int64; const AReloc: CoffReloc);
+    var
+      LSection: CoffSection;
+      LKind: RelocKind;
+      LWidth: int64;
+      LAddend: int64;
+      LTarget: int64;
+      LAt: int64;
+    begin
+      LSection := AMerge.Source.Sections[AIndex];
+      LWidth := ADAM_FOREIGN_FIELD_32;
+      if AReloc.RelocType = self.FMachine.RelocRel32 then
+        LKind := RelocKind.Rel32;
+      else
+        if AReloc.RelocType = self.FMachine.RelocRva32 then
+          LKind := RelocKind.Rva32;
+        else
+          if AReloc.RelocType <> self.FMachine.RelocAbs64 then
+            self.DoUnlinked(AMerge, NoArgs().Int(AReloc.RelocType).Str(LSection.SectionName).Fill(
+              ADAM_MSG_FOREIGN_FORM_RELOC));
+            return;
+          end;
+          LKind := RelocKind.Abs64;
+          LWidth := ADAM_FOREIGN_FIELD_64;
+        end;
+      end;
+      if (LSection.DataAt = 0) or (AReloc.Offset + LWidth > LSection.DataSize) then
+        self.DoDamaged(AMerge, NoArgs().Str(LSection.SectionName).Int(AReloc.Offset).Fill(
+          ADAM_MSG_FOREIGN_REASON_RELOC_PLACE));
+        return;
+      end;
+      LTarget := AMerge.SymbolOf[AReloc.SymbolIndex];
+      if LTarget = 0 then
+        self.DoReport(ADAM_ERR_FOREIGN_006, AMerge.Node, ADAM_MSG_FOREIGN_DROPPED,
+          NoArgs().Str(AMerge.ObjectLabel).Str(LSection.SectionName).Str(
+          AMerge.Source.Symbols[AReloc.SymbolIndex].SymbolName));
+        return;
+      end;
+      LAt := LSection.DataAt + AReloc.Offset;
+      if LKind = RelocKind.Abs64 then
+        LAddend := int64(GetLe(ABytes, LAt, ADAM_FOREIGN_FIELD_64));
+      else
+        LAddend := DoSigned32(ABytes, LAt);
+      end;
+      self.FSet.AddReloc(AMerge.SectionOf[AIndex], AReloc.Offset, LKind, LTarget, LAddend);
+    end;
+
+    // Every kept section's relocations of AMerge into the set
+    hidden method DoRelocs(const ABytes: ByteArray; const AMerge: ref ForeignMerge);
+    var
+      LI: int64;
+      LR: int64;
+      LSection: CoffSection;
+    begin
+      for LI := 0 to len(AMerge.Source.Sections) - 1 do
+        if AMerge.SectionOf[LI] <> 0 then
+          LSection := AMerge.Source.Sections[LI];
+          for LR := LSection.RelocFirst to LSection.RelocFirst + LSection.RelocCount - 1 do
+            if self.FFailed then
+              return;
+            end;
+            self.DoReloc(ABytes, AMerge, LI, AMerge.Source.Relocs[LR]);
+          end;
+        end;
+      end;
+    end;
+
+    // Member AMember of archive AArchive read and merged into the set (see the header), for
+    // the reference at ANode that pulled it in
+    hidden method DoLoad(const AArchive: int64; const AMember: int64; const ANode: int64);
+    var
+      LArchive: ref ForeignArchive;
+      LMember: ArchiveMember;
+      LMerge: ref ForeignMerge;
+    begin
+      LArchive := self.FArchives[AArchive];
+      if LArchive.Loaded[AMember] then
+        return;
+      end;
+      LArchive.Loaded[AMember] := true;
+      LMember := LArchive.Data.Members[AMember];
+      self.FLoads := self.FLoads + 1;
+      LMerge := ref ForeignMerge(ExtractFileName(LArchive.FilePath) + "(" + LMember.MemberName +
+        ")", ANode, self.FLoads);
+      if not ReadCoffObject(LArchive.Bytes, LMember.DataAt, LMember.Size, LMerge.ObjectLabel,
+        self.DoPlace(ANode), self.FDiagnostics, LMerge.Source) then
+        self.FFailed := true;
+        return;
+      end;
+      if LMerge.Source.Machine <> self.FMachine.Machine then
+        self.DoReport(ADAM_ERR_FOREIGN_002, ANode, ADAM_MSG_FOREIGN_MACHINE,
+          NoArgs().Str(LMerge.ObjectLabel).Str(HexText(LMerge.Source.Machine)).Str(
+          HexText(self.FMachine.Machine)));
+        return;
+      end;
+      self.DoKeep(LMerge);
+      if not self.FFailed then
+        self.DoSections(LArchive.Bytes, LMerge);
+      end;
+      if not self.FFailed then
+        self.DoSymbols(LMerge);
+      end;
+      if not self.FFailed then
+        self.DoRelocs(LArchive.Bytes, LMerge);
+      end;
+    end;
+
+    // The members the set's Undefined symbols need, pulled in (see the header): false after a
+    // report
+    method Run(): bool;
+    var
+      LId: int64;
+      LSymbol: ref SectionSymbol;
+      LKey: int64;
+    begin
+      LId := 1;
+      // The set grows while it is walked: a member's own references are walked in turn
+      while (LId < self.FSet.SymbolCount) and (not self.FFailed) do
+        LSymbol := self.FSet.SymbolAt(LId);
+        if LSymbol.Kind = SymbolKind.Undefined then
+          LKey := self.FMemberOf.Find(LSymbol.SymbolName);
+          if LKey > 0 then
+            self.DoLoad((LKey - 1) div ADAM_FOREIGN_MEMBER_SPAN,
+              (LKey - 1) mod ADAM_FOREIGN_MEMBER_SPAN, LSymbol.Node);
+          end;
+        end;
+        LId := LId + 1;
+      end;
+      return not self.FFailed;
+    end;
+  end;
+
+end.
