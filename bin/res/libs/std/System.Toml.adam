@@ -1,0 +1,834 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.Toml.adam - TOML documents in Adam, over tomlc17's C API
+  (System.Toml.C): a TomlDocument parses a text or a file (read by
+  System.Runtime's ReadFileBytes: target-neutral), then hands out its
+  values by path with typed getters. Every getter returns false on a
+  failure and leaves the reason in ErrorText, in Adam's form
+  "file(line,col): message": a parse error at the place tomlc17 reports, a
+  value error at the value it is about. What tomlc17 hands back is freed by
+  the document's done (or its next parse); no getter result needs freeing.
+
+  A path is keys joined by '.', each bare (A-Z a-z 0-9 _ -) or "quoted"
+  (\" and \\ escaped: TomlQuoteKey writes one), an array's item as [N]
+  after a key or another item: `servers[0].ports[1]`, `"a.b".c`. The empty
+  path is the document's top table (Count / KeyAt over it).
+  Target-neutral: no OS named.
+*******************************************************************************/
+
+module unit System.Toml;
+
+import System.SysUtils, System.Runtime, System.Toml.C;
+
+public type
+  // The kind of a value (TOML v1.0's kinds); Missing for a path that names none
+  TomlKind = choices(Missing, String, Integer, Float, Boolean, LocalDate, LocalTime,
+    LocalDateTime, OffsetDateTime, Array, Table);
+
+  // A date / time value's parts; those its Kind does not hold are 0 (a LocalDate has no
+  // time, a LocalTime no date, only an OffsetDateTime an offset, in minutes east of UTC)
+  TomlDateTime = record
+    Kind: TomlKind;
+    Year: int32;
+    Month: int32;
+    Day: int32;
+    Hour: int32;
+    Minute: int32;
+    Second: int32;
+    Microsecond: int32;
+    OffsetMinutes: int32;
+  end;
+
+const
+  // The errors a document reports (after "file(line,col): ")
+  ADAM_TOML_MSG_NO_DOCUMENT: string = "no document has been parsed";
+  ADAM_TOML_MSG_READ_FAILED: string = "the file cannot be read";
+  ADAM_TOML_MSG_TOO_LARGE: string = "the text is larger than 2 GB";
+  ADAM_TOML_MSG_NO_ROOM: string = "out of memory";
+  ADAM_TOML_MSG_BAD_PATH: string = "bad path ";
+  ADAM_TOML_MSG_AT_BYTE: string = " at byte ";
+  ADAM_TOML_MSG_NOT_FOUND: string = " not found";
+  ADAM_TOML_MSG_IS: string = " is ";
+  ADAM_TOML_MSG_NOT: string = ", not ";
+  ADAM_TOML_MSG_OUT_OF_RANGE: string = " is out of range (";
+  ADAM_TOML_MSG_ITEMS: string = " items)";
+  ADAM_TOML_MSG_KEYS: string = " keys)";
+  ADAM_TOML_MSG_NO_KEY: string = " has no key ";
+  ADAM_TOML_MSG_DOCUMENT: string = "the document";
+  ADAM_TOML_MSG_TABLE: string = "a table";
+  ADAM_TOML_MSG_ARRAY: string = "an array";
+  ADAM_TOML_MSG_LIST: string = "an array or a table";
+  ADAM_TOML_MSG_STAMP: string = "a date or a time";
+  // The name errors carry when ParseText is given none
+  ADAM_TOML_TEXT_NAME: string = "<text>";
+  // The most bytes tomlc17 takes in one parse (its length is a C int)
+  ADAM_TOML_MAX_TEXT: int64 = 2147483647;
+
+// The ACount bytes at AText as an Adam string: the one place C text becomes Adam text
+routine DoTextOf(const AText: ptr to const char; const ACount: int64): string;
+var
+  LText: string;
+  LI: int64;
+begin
+  LText := "";
+  if (AText = nil) or (ACount <= 0) then
+    return LText;
+  end;
+  setlength(LText, ACount);
+  for LI := 0 to ACount - 1 do
+    LText[LI] := AText[LI];
+  end;
+  return LText;
+end;
+
+// The message tomlc17 left in AResult's ErrMsg (NUL-terminated in its array)
+routine DoErrText(const AResult: TomlResult): string;
+var
+  LCount: int64;
+  LText: string;
+  LI: int64;
+begin
+  LCount := 0;
+  while (LCount < int64(ADAM_TOML_ERRMSG_SIZE)) and (int32(AResult.ErrMsg[LCount]) <> 0) do
+    LCount := LCount + 1;
+  end;
+  LText := "";
+  if LCount = 0 then
+    return LText;
+  end;
+  setlength(LText, LCount);
+  for LI := 0 to LCount - 1 do
+    LText[LI] := AResult.ErrMsg[LI];
+  end;
+  return LText;
+end;
+
+// AText's bytes and a NUL in a new getmem block (the caller frees it), as the C API takes a
+// text; nil when there is no room
+routine DoCCopy(const AText: string): ptr to char;
+var
+  LCount: int64;
+  LBlock: ptr to char;
+  LEnd: ptr to uint8;
+  LI: int64;
+begin
+  LCount := len(AText);
+  LBlock := ptr to char(getmem(LCount + 1));
+  if LBlock = nil then
+    return nil;
+  end;
+  for LI := 0 to LCount - 1 do
+    LBlock[LI] := AText[LI];
+  end;
+  LEnd := ptr to uint8(LBlock);
+  LEnd[LCount] := 0;
+  return LBlock;
+end;
+
+// The TomlKind of tomlc17's kind AKind
+routine DoKindOf(const AKind: int32): TomlKind;
+begin
+  if AKind = ADAM_TOML_STRING then
+    return TomlKind.String;
+  end;
+  if AKind = ADAM_TOML_INT64 then
+    return TomlKind.Integer;
+  end;
+  if AKind = ADAM_TOML_FP64 then
+    return TomlKind.Float;
+  end;
+  if AKind = ADAM_TOML_BOOLEAN then
+    return TomlKind.Boolean;
+  end;
+  if AKind = ADAM_TOML_DATE then
+    return TomlKind.LocalDate;
+  end;
+  if AKind = ADAM_TOML_TIME then
+    return TomlKind.LocalTime;
+  end;
+  if AKind = ADAM_TOML_DATETIME then
+    return TomlKind.LocalDateTime;
+  end;
+  if AKind = ADAM_TOML_DATETIMETZ then
+    return TomlKind.OffsetDateTime;
+  end;
+  if AKind = ADAM_TOML_ARRAY then
+    return TomlKind.Array;
+  end;
+  if AKind = ADAM_TOML_TABLE then
+    return TomlKind.Table;
+  end;
+  return TomlKind.Missing;
+end;
+
+// tomlc17's kind AKind in words, for an error ("a string", "an integer", ...)
+routine DoKindText(const AKind: int32): string;
+begin
+  if AKind = ADAM_TOML_STRING then
+    return "a string";
+  end;
+  if AKind = ADAM_TOML_INT64 then
+    return "an integer";
+  end;
+  if AKind = ADAM_TOML_FP64 then
+    return "a float";
+  end;
+  if AKind = ADAM_TOML_BOOLEAN then
+    return "a boolean";
+  end;
+  if AKind = ADAM_TOML_DATE then
+    return "a local date";
+  end;
+  if AKind = ADAM_TOML_TIME then
+    return "a local time";
+  end;
+  if AKind = ADAM_TOML_DATETIME then
+    return "a local date-time";
+  end;
+  if AKind = ADAM_TOML_DATETIMETZ then
+    return "an offset date-time";
+  end;
+  if AKind = ADAM_TOML_ARRAY then
+    return ADAM_TOML_MSG_ARRAY;
+  end;
+  if AKind = ADAM_TOML_TABLE then
+    return ADAM_TOML_MSG_TABLE;
+  end;
+  return "an unknown value";
+end;
+
+// AText placed at AFile: "AFile(ALine,ACol): AText", "AFile(ALine): AText" when the column is
+// not known (0), "AFile: AText" when the line is not either, AText alone with no file
+routine DoAt(const AFile: string; const ALine: int64; const ACol: int64; const AText: string): string;
+begin
+  if AFile = "" then
+    return AText;
+  end;
+  if ALine <= 0 then
+    return AFile + ": " + AText;
+  end;
+  if ACol <= 0 then
+    return AFile + "(" + IntToStr(ALine) + "): " + AText;
+  end;
+  return AFile + "(" + IntToStr(ALine) + "," + IntToStr(ACol) + "): " + AText;
+end;
+
+// tomlc17's parse error AMessage placed at AFile: its "(line L, col C) " or "(line L) " lead
+// becomes the place; a message of any other shape is placed at the file alone
+routine DoParseErrorText(const AFile: string; const AMessage: string): string;
+var
+  LComma: int64;
+  LClose: int64;
+  LLine: int64;
+  LCol: int64;
+begin
+  LClose := IndexOf(") ", AMessage, 0);
+  if (not StartsStr("(line ", AMessage)) or (LClose < 0) then
+    return DoAt(AFile, 0, 0, AMessage);
+  end;
+  LCol := 0;
+  LComma := IndexOf(", col ", AMessage, 0);
+  if (LComma < 0) or (LComma > LClose) then
+    // "(line L) message": the line alone
+    LComma := LClose;
+  else
+    if not TryStrToInt(Substring(AMessage, LComma + 6, LClose - LComma - 6), LCol) then
+      return DoAt(AFile, 0, 0, AMessage);
+    end;
+  end;
+  if not TryStrToInt(Substring(AMessage, 6, LComma - 6), LLine) then
+    return DoAt(AFile, 0, 0, AMessage);
+  end;
+  return DoAt(AFile, LLine, LCol, Substring(AMessage, LClose + 2, len(AMessage) - LClose - 2));
+end;
+
+// APath as an error names it: quoted, or "the document" for the empty path
+routine DoPathText(const APath: string): string;
+begin
+  if APath = "" then
+    return ADAM_TOML_MSG_DOCUMENT;
+  end;
+  return "\"" + APath + "\"";
+end;
+
+// The error of a path that does not parse: APath and the byte AAt where it went wrong
+routine DoBadPath(const APath: string; const AAt: int64): string;
+begin
+  return ADAM_TOML_MSG_BAD_PATH + "\"" + APath + "\"" + ADAM_TOML_MSG_AT_BYTE + IntToStr(AAt);
+end;
+
+// True when AChar may stand in a bare key (A-Z a-z 0-9 _ -)
+routine DoIsBareChar(const AChar: char): bool;
+begin
+  if (AChar >= 'A') and (AChar <= 'Z') then
+    return true;
+  end;
+  if (AChar >= 'a') and (AChar <= 'z') then
+    return true;
+  end;
+  if (AChar >= '0') and (AChar <= '9') then
+    return true;
+  end;
+  return (AChar = '_') or (AChar = '-');
+end;
+
+// The key at AAt in APath, bare or "quoted" (\" and \\ its only escapes), AAt moved past it;
+// false when there is none there
+routine DoReadKey(const APath: string; var AAt: int64; var AKey: string): bool;
+begin
+  AKey := "";
+  if AAt >= len(APath) then
+    return false;
+  end;
+  if APath[AAt] <> '"' then
+    while (AAt < len(APath)) and DoIsBareChar(APath[AAt]) do
+      AKey := AKey + APath[AAt];
+      AAt := AAt + 1;
+    end;
+    return AKey <> "";
+  end;
+  // A quoted key: up to its closing quote
+  AAt := AAt + 1;
+  while AAt < len(APath) do
+    if APath[AAt] = '"' then
+      AAt := AAt + 1;
+      return true;
+    end;
+    if APath[AAt] = '\\' then
+      AAt := AAt + 1;
+      if AAt >= len(APath) then
+        return false;
+      end;
+      if (APath[AAt] <> '"') and (APath[AAt] <> '\\') then
+        return false;
+      end;
+    end;
+    AKey := AKey + APath[AAt];
+    AAt := AAt + 1;
+  end;
+  return false;
+end;
+
+// The index in "[N]" at AAt in APath (decimal digits only), AAt moved past its ']'; false
+// when there is none there
+routine DoReadIndex(const APath: string; var AAt: int64; var AIndex: int64): bool;
+var
+  LStart: int64;
+begin
+  AIndex := 0;
+  if (AAt >= len(APath)) or (APath[AAt] <> '[') then
+    return false;
+  end;
+  AAt := AAt + 1;
+  LStart := AAt;
+  while (AAt < len(APath)) and (APath[AAt] >= '0') and (APath[AAt] <= '9') do
+    AAt := AAt + 1;
+  end;
+  if (AAt = LStart) or (AAt >= len(APath)) or (APath[AAt] <> ']') then
+    return false;
+  end;
+  if not TryStrToInt(Substring(APath, LStart, AAt - LStart), AIndex) then
+    return false;
+  end;
+  AAt := AAt + 1;
+  return true;
+end;
+
+// The index of the key AKey in the table ATable, -1 when it has none
+routine DoFindKey(const ATable: TomlDatum; const AKey: string): int64;
+var
+  LI: int64;
+  LJ: int64;
+  LKey: ptr to const char;
+  LSame: bool;
+begin
+  for LI := 0 to int64(ATable.Data.Tab.Count) - 1 do
+    if int64(ATable.Data.Tab.Lens[LI]) = len(AKey) then
+      LKey := ATable.Data.Tab.Keys[LI];
+      LSame := true;
+      LJ := 0;
+      while LSame and (LJ < len(AKey)) do
+        LSame := LKey[LJ] = AKey[LJ];
+        LJ := LJ + 1;
+      end;
+      if LSame then
+        return LI;
+      end;
+    end;
+  end;
+  return -1;
+end;
+
+// One key step of a path walk: the key at AAt in APath looked up in ADatum (APrefix the path
+// walked so far), ADatum its value; false with AError (ADatum unchanged: the error's place),
+// ABadPath set when the error is the path's own (no key there)
+routine DoStepKey(const APath: string; const APrefix: string; var AAt: int64;
+  var ADatum: TomlDatum; var AError: string; var ABadPath: bool): bool;
+var
+  LKey: string;
+  LIndex: int64;
+begin
+  if not DoReadKey(APath, AAt, LKey) then
+    AError := DoBadPath(APath, AAt);
+    ABadPath := true;
+    return false;
+  end;
+  if ADatum.Kind <> ADAM_TOML_TABLE then
+    AError := DoPathText(APrefix) + ADAM_TOML_MSG_IS + DoKindText(ADatum.Kind) + ADAM_TOML_MSG_NOT +
+      ADAM_TOML_MSG_TABLE;
+    return false;
+  end;
+  LIndex := DoFindKey(ADatum, LKey);
+  if LIndex < 0 then
+    AError := DoPathText(Substring(APath, 0, AAt)) + ADAM_TOML_MSG_NOT_FOUND;
+    return false;
+  end;
+  ADatum := ADatum.Data.Tab.Values[LIndex];
+  return true;
+end;
+
+// One item step of a path walk: the "[N]" at AAt in APath taken from the array ADatum
+// (APrefix the path walked so far), ADatum the item; false with AError (ADatum unchanged),
+// ABadPath set when the error is the path's own (no "[N]" there)
+routine DoStepIndex(const APath: string; const APrefix: string; var AAt: int64;
+  var ADatum: TomlDatum; var AError: string; var ABadPath: bool): bool;
+var
+  LIndex: int64;
+begin
+  if not DoReadIndex(APath, AAt, LIndex) then
+    AError := DoBadPath(APath, AAt);
+    ABadPath := true;
+    return false;
+  end;
+  if ADatum.Kind <> ADAM_TOML_ARRAY then
+    AError := DoPathText(APrefix) + ADAM_TOML_MSG_IS + DoKindText(ADatum.Kind) + ADAM_TOML_MSG_NOT +
+      ADAM_TOML_MSG_ARRAY;
+    return false;
+  end;
+  if LIndex >= int64(ADatum.Data.Arr.Count) then
+    AError := DoPathText(Substring(APath, 0, AAt)) + ADAM_TOML_MSG_OUT_OF_RANGE +
+      IntToStr(int64(ADatum.Data.Arr.Count)) + ADAM_TOML_MSG_ITEMS;
+    return false;
+  end;
+  ADatum := ADatum.Data.Arr.Elems[LIndex];
+  return true;
+end;
+
+// The value at APath under the table ARoot (the header's path form) in ADatum; false with
+// AError and the place of the value the walk stopped at (ALine / ACol; 0 for an error of the
+// path's own, which is the caller's and has no place in the document)
+routine DoSeek(const ARoot: TomlDatum; const APath: string; var ADatum: TomlDatum;
+  var AError: string; var ALine: int64; var ACol: int64): bool;
+var
+  LAt: int64;
+  LPrefix: string;
+  LOk: bool;
+  LBadPath: bool;
+begin
+  ADatum := ARoot;
+  AError := "";
+  LAt := 0;
+  LOk := true;
+  LBadPath := false;
+  while LOk and (LAt < len(APath)) do
+    LPrefix := Substring(APath, 0, LAt);
+    if APath[LAt] = '[' then
+      LOk := DoStepIndex(APath, LPrefix, LAt, ADatum, AError, LBadPath);
+    else
+      // A key: the first step, or one after a '.'
+      if LAt > 0 then
+        if APath[LAt] <> '.' then
+          AError := DoBadPath(APath, LAt);
+          LBadPath := true;
+          LOk := false;
+        else
+          LAt := LAt + 1;
+        end;
+      end;
+      if LOk then
+        LOk := DoStepKey(APath, LPrefix, LAt, ADatum, AError, LBadPath);
+      end;
+    end;
+  end;
+  ALine := int64(ADatum.LineNo);
+  ACol := int64(ADatum.ColNo);
+  if LBadPath then
+    ALine := 0;
+    ACol := 0;
+  end;
+  return LOk;
+end;
+
+// The date / time parts of the stamp ADatum (one of the four date / time kinds)
+routine DoDateTimeOf(const ADatum: TomlDatum): TomlDateTime;
+var
+  LValue: TomlDateTime;
+begin
+  LValue.Kind := DoKindOf(ADatum.Kind);
+  LValue.Year := 0;
+  LValue.Month := 0;
+  LValue.Day := 0;
+  LValue.Hour := 0;
+  LValue.Minute := 0;
+  LValue.Second := 0;
+  LValue.Microsecond := 0;
+  LValue.OffsetMinutes := 0;
+  if ADatum.Kind <> ADAM_TOML_TIME then
+    LValue.Year := int32(ADatum.Data.Stamp.Year);
+    LValue.Month := int32(ADatum.Data.Stamp.Month);
+    LValue.Day := int32(ADatum.Data.Stamp.Day);
+  end;
+  if ADatum.Kind <> ADAM_TOML_DATE then
+    LValue.Hour := int32(ADatum.Data.Stamp.Hour);
+    LValue.Minute := int32(ADatum.Data.Stamp.Minute);
+    LValue.Second := int32(ADatum.Data.Stamp.Second);
+    LValue.Microsecond := ADatum.Data.Stamp.Usec;
+  end;
+  if ADatum.Kind = ADAM_TOML_DATETIMETZ then
+    LValue.OffsetMinutes := int32(ADatum.Data.Stamp.Tz);
+  end;
+  return LValue;
+end;
+
+// AKey as one key of a path: bare when it can be, else quoted with its '"' and '\' escaped
+public routine TomlQuoteKey(const AKey: string): string;
+var
+  LBare: bool;
+  LText: string;
+  LI: int64;
+begin
+  LBare := AKey <> "";
+  for LI := 0 to len(AKey) - 1 do
+    if not DoIsBareChar(AKey[LI]) then
+      LBare := false;
+    end;
+  end;
+  if LBare then
+    return AKey;
+  end;
+  LText := "\"";
+  for LI := 0 to len(AKey) - 1 do
+    if (AKey[LI] = '"') or (AKey[LI] = '\\') then
+      LText := LText + "\\";
+    end;
+    LText := LText + AKey[LI];
+  end;
+  return LText + "\"";
+end;
+
+public type
+  // A parsed TOML document: ParseText / ParseFile, then its values by path. Holds what
+  // tomlc17 hands back until its done or its next parse; a getter's result is its own
+  TomlDocument = object
+    // tomlc17's result of the last parse, freed by Release when Held
+    Parsed: TomlResult;
+    Held: bool;
+    // The name errors are placed at: the file's path, or the name ParseText was given
+    SourceName: string;
+    // The last failure in "file(line,col): message" form; "" after a success
+    LastError: string;
+
+    init();
+    begin
+      self.Held := false;
+      self.SourceName := "";
+      self.LastError := "";
+    end;
+
+    // Frees the last parse's result, if one is held
+    method Release();
+    begin
+      if self.Held then
+        toml_free(self.Parsed);
+        self.Held := false;
+      end;
+    end;
+
+    done;
+    begin
+      self.Release();
+    end;
+
+    // AText as the last error, placed at ALine / ACol (0: not known); always false (what a
+    // failing getter returns)
+    method Fail(const ALine: int64; const ACol: int64; const AText: string): bool;
+    begin
+      self.LastError := DoAt(self.SourceName, ALine, ACol, AText);
+      return false;
+    end;
+
+    // The ACount bytes at AText parsed under SourceName; false with the parse error
+    method DoParse(const AText: ptr to const char; const ACount: int64): bool;
+    var
+      LName: ptr to char;
+    begin
+      if ACount > ADAM_TOML_MAX_TEXT then
+        return self.Fail(0, 0, ADAM_TOML_MSG_TOO_LARGE);
+      end;
+      LName := DoCCopy(self.SourceName);
+      if LName = nil then
+        return self.Fail(0, 0, ADAM_TOML_MSG_NO_ROOM);
+      end;
+      // tomlc17 keeps copies of what it needs: the name is freed here, the text by the caller
+      self.Parsed := toml_parse_named(AText, int32(ACount), ptr to const char(LName));
+      self.Held := true;
+      freemem(LName);
+      if not self.Parsed.Ok then
+        self.LastError := DoParseErrorText(self.SourceName, DoErrText(self.Parsed));
+        return false;
+      end;
+      self.LastError := "";
+      return true;
+    end;
+
+    // The TOML text AText parsed, ASourceName naming it in errors ("<text>" when ""); false
+    // with ErrorText when it is not valid TOML
+    method ParseText(const AText: string; const ASourceName: string): bool;
+    var
+      LText: ptr to char;
+      LOk: bool;
+    begin
+      self.Release();
+      self.SourceName := ASourceName;
+      if ASourceName = "" then
+        self.SourceName := ADAM_TOML_TEXT_NAME;
+      end;
+      LText := DoCCopy(AText);
+      if LText = nil then
+        return self.Fail(0, 0, ADAM_TOML_MSG_NO_ROOM);
+      end;
+      LOk := self.DoParse(ptr to const char(LText), len(AText));
+      freemem(LText);
+      return LOk;
+    end;
+
+    // The file at APath (relative to the working folder) read and parsed, APath naming it in
+    // errors; false with ErrorText when it cannot be read or is not valid TOML
+    method ParseFile(const APath: string): bool;
+    var
+      LPath: ptr to char;
+      LBytes: ptr;
+      LCount: int64;
+      LOk: bool;
+    begin
+      self.Release();
+      self.SourceName := APath;
+      LPath := DoCCopy(APath);
+      if LPath = nil then
+        return self.Fail(0, 0, ADAM_TOML_MSG_NO_ROOM);
+      end;
+      LBytes := ReadFileBytes(ptr to const char(LPath), LCount);
+      freemem(LPath);
+      if LBytes = nil then
+        return self.Fail(0, 0, ADAM_TOML_MSG_READ_FAILED);
+      end;
+      LOk := self.DoParse(ptr to const char(LBytes), LCount);
+      freemem(LBytes);
+      return LOk;
+    end;
+
+    // The last failure in "file(line,col): message" form; "" after a success
+    const method ErrorText(): string;
+    begin
+      return self.LastError;
+    end;
+
+    // True when the last parse succeeded
+    const method IsParsed(): bool;
+    begin
+      return self.Held and self.Parsed.Ok;
+    end;
+
+    // The value at APath in ADatum; false with the error at the place the walk stopped
+    method Find(const APath: string; var ADatum: TomlDatum): bool;
+    var
+      LError: string;
+      LLine: int64;
+      LCol: int64;
+    begin
+      if not self.IsParsed() then
+        return self.Fail(0, 0, ADAM_TOML_MSG_NO_DOCUMENT);
+      end;
+      if not DoSeek(self.Parsed.TopTab, APath, ADatum, LError, LLine, LCol) then
+        return self.Fail(LLine, LCol, LError);
+      end;
+      self.LastError := "";
+      return true;
+    end;
+
+    // The value ADatum (APath's) checked to be of tomlc17's kind AKind; false with the error
+    // at the value when it is not (AWanted names what was wanted)
+    method Expect(const APath: string; const ADatum: TomlDatum; const AKind: int32;
+      const AWanted: string): bool;
+    begin
+      if ADatum.Kind = AKind then
+        return true;
+      end;
+      return self.Fail(int64(ADatum.LineNo), int64(ADatum.ColNo), DoPathText(APath) +
+        ADAM_TOML_MSG_IS + DoKindText(ADatum.Kind) + ADAM_TOML_MSG_NOT + AWanted);
+    end;
+
+    // True when APath names a value (no error recorded either way)
+    const method Has(const APath: string): bool;
+    var
+      LDatum: TomlDatum;
+      LError: string;
+      LLine: int64;
+      LCol: int64;
+    begin
+      if not self.IsParsed() then
+        return false;
+      end;
+      return DoSeek(self.Parsed.TopTab, APath, LDatum, LError, LLine, LCol);
+    end;
+
+    // The kind of the value at APath; Missing when there is none (no error recorded)
+    const method KindOf(const APath: string): TomlKind;
+    var
+      LDatum: TomlDatum;
+      LError: string;
+      LLine: int64;
+      LCol: int64;
+    begin
+      if not self.IsParsed() then
+        return TomlKind.Missing;
+      end;
+      if not DoSeek(self.Parsed.TopTab, APath, LDatum, LError, LLine, LCol) then
+        return TomlKind.Missing;
+      end;
+      return DoKindOf(LDatum.Kind);
+    end;
+
+    // The string at APath in AValue
+    method GetString(const APath: string; var AValue: string): bool;
+    var
+      LDatum: TomlDatum;
+    begin
+      if not self.Find(APath, LDatum) then
+        return false;
+      end;
+      if not self.Expect(APath, LDatum, ADAM_TOML_STRING, DoKindText(ADAM_TOML_STRING)) then
+        return false;
+      end;
+      AValue := DoTextOf(LDatum.Data.Str.Ptr, int64(LDatum.Data.Str.Len));
+      return true;
+    end;
+
+    // The integer at APath in AValue
+    method GetInt64(const APath: string; var AValue: int64): bool;
+    var
+      LDatum: TomlDatum;
+    begin
+      if not self.Find(APath, LDatum) then
+        return false;
+      end;
+      if not self.Expect(APath, LDatum, ADAM_TOML_INT64, DoKindText(ADAM_TOML_INT64)) then
+        return false;
+      end;
+      AValue := LDatum.Data.Int64Value;
+      return true;
+    end;
+
+    // The float at APath in AValue (an integer is not taken: TOML keeps the two apart)
+    method GetFloat64(const APath: string; var AValue: float64): bool;
+    var
+      LDatum: TomlDatum;
+    begin
+      if not self.Find(APath, LDatum) then
+        return false;
+      end;
+      if not self.Expect(APath, LDatum, ADAM_TOML_FP64, DoKindText(ADAM_TOML_FP64)) then
+        return false;
+      end;
+      AValue := LDatum.Data.Float64Value;
+      return true;
+    end;
+
+    // The boolean at APath in AValue
+    method GetBool(const APath: string; var AValue: bool): bool;
+    var
+      LDatum: TomlDatum;
+    begin
+      if not self.Find(APath, LDatum) then
+        return false;
+      end;
+      if not self.Expect(APath, LDatum, ADAM_TOML_BOOLEAN, DoKindText(ADAM_TOML_BOOLEAN)) then
+        return false;
+      end;
+      AValue := LDatum.Data.BoolValue;
+      return true;
+    end;
+
+    // The date / time at APath (any of the four kinds) in AValue
+    method GetDateTime(const APath: string; var AValue: TomlDateTime): bool;
+    var
+      LDatum: TomlDatum;
+    begin
+      if not self.Find(APath, LDatum) then
+        return false;
+      end;
+      if (LDatum.Kind < ADAM_TOML_DATE) or (LDatum.Kind > ADAM_TOML_DATETIMETZ) then
+        return self.Expect(APath, LDatum, ADAM_TOML_DATE, ADAM_TOML_MSG_STAMP);
+      end;
+      AValue := DoDateTimeOf(LDatum);
+      return true;
+    end;
+
+    // The items of the array, or the keys of the table, at APath in ACount
+    method Count(const APath: string; var ACount: int64): bool;
+    var
+      LDatum: TomlDatum;
+    begin
+      if not self.Find(APath, LDatum) then
+        return false;
+      end;
+      if LDatum.Kind = ADAM_TOML_ARRAY then
+        ACount := int64(LDatum.Data.Arr.Count);
+        return true;
+      end;
+      if not self.Expect(APath, LDatum, ADAM_TOML_TABLE, ADAM_TOML_MSG_LIST) then
+        return false;
+      end;
+      ACount := int64(LDatum.Data.Tab.Count);
+      return true;
+    end;
+
+    // The key AIndex (0-based, in the document's order) of the table at APath in AKey; its
+    // value is at APath + "." + TomlQuoteKey(AKey)
+    method KeyAt(const APath: string; const AIndex: int64; var AKey: string): bool;
+    var
+      LDatum: TomlDatum;
+    begin
+      if not self.Find(APath, LDatum) then
+        return false;
+      end;
+      if not self.Expect(APath, LDatum, ADAM_TOML_TABLE, ADAM_TOML_MSG_TABLE) then
+        return false;
+      end;
+      if (AIndex < 0) or (AIndex >= int64(LDatum.Data.Tab.Count)) then
+        return self.Fail(int64(LDatum.LineNo), int64(LDatum.ColNo), DoPathText(APath) +
+          ADAM_TOML_MSG_NO_KEY + IntToStr(AIndex) + " (" + IntToStr(int64(LDatum.Data.Tab.Count)) +
+          ADAM_TOML_MSG_KEYS);
+      end;
+      AKey := DoTextOf(LDatum.Data.Tab.Keys[AIndex], int64(LDatum.Data.Tab.Lens[AIndex]));
+      return true;
+    end;
+  end;
+
+end.

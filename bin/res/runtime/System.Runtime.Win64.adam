@@ -65,12 +65,42 @@ routine __C_specific_handler(const ARecord: ptr; const AFrame: ptr; const AConte
 routine RaiseException(const ACode: uint32; const AFlags: uint32; const ACount: uint32;
   const AArguments: ptr); external "kernel32";
 
+// kernel32: text in a code page as UTF-16 (ACount -1: through its NUL, converted too; AWide
+// nil: the units it needs), a path made full (the units it needs, its NUL counted, when
+// ASize is too small; 0 when it fails), a file opened, read and closed by its handle
+routine MultiByteToWideChar(const ACodePage: uint32; const AFlags: uint32;
+  const AText: ptr to const char; const ACount: int32; const AWide: ptr to uint16;
+  const AWideCount: int32): int32; external "kernel32";
+routine GetFullPathNameW(const AFileName: ptr to uint16; const ASize: uint32;
+  const ABuffer: ptr to uint16; const AFilePart: ptr): uint32; external "kernel32";
+routine CreateFileW(const AFileName: ptr to uint16; const AAccess: uint32; const AShare: uint32;
+  const AAttributes: ptr; const ADisposition: uint32; const AFlags: uint32;
+  const ATemplate: uint64): uint64; external "kernel32";
+routine ReadFile(const AFile: uint64; const ABuffer: ptr; const AToRead: uint32;
+  var ARead: uint32; const AOverlapped: ptr): int32; external "kernel32";
+routine CloseHandle(const AHandle: uint64): int32; external "kernel32";
+
 const
   // The exception code of a raise: a customer code (bit 29 set), severity error (bits 30-31),
   // "ADA" in its low bytes, never one the OS or another runtime uses for its own
   ADAM_PLATFORM_RAISE_CODE: uint32 = 0xE0414441;
   // RaiseException's flag of an exception that cannot be continued
   ADAM_PLATFORM_NONCONTINUABLE: uint32 = 1;
+  // MultiByteToWideChar's code page of UTF-8, and its flag that fails on invalid UTF-8
+  ADAM_PLATFORM_UTF8: uint32 = 65001;
+  ADAM_PLATFORM_UTF8_STRICT: uint32 = 8;
+  // CreateFileW's read access, read sharing, open-only disposition and plain attributes,
+  // and the handle it returns when it cannot open
+  ADAM_PLATFORM_GENERIC_READ: uint32 = 0x80000000;
+  ADAM_PLATFORM_SHARE_READ: uint32 = 1;
+  ADAM_PLATFORM_OPEN_EXISTING: uint32 = 3;
+  ADAM_PLATFORM_ATTRIBUTE_NORMAL: uint32 = 0x80;
+  ADAM_PLATFORM_INVALID_HANDLE: uint64 = 0xFFFFFFFFFFFFFFFF;
+  // The most bytes one ReadFile is asked for (its count is 32-bit)
+  ADAM_PLATFORM_READ_CHUNK: int64 = 0x40000000;
+  // The UTF-16 units of the long-path prefixes "\\?\" and "\\?\UNC\"
+  ADAM_PLATFORM_LONG_PREFIX: int64 = 4;
+  ADAM_PLATFORM_UNC_PREFIX: int64 = 8;
 
 var
   // True once the process's arguments are split (DoReadyArguments)
@@ -213,6 +243,176 @@ begin
   LSlot := __p___argv();
   LArgs := ptr to ptr(LSlot^);
   return ptr to const char(LArgs[int64(AIndex)]);
+end;
+
+// The NUL-terminated UTF-8 text at AText as NUL-terminated UTF-16 in a new block from the C
+// heap (the caller frees it); nil when the text is not valid UTF-8 or there is no room
+routine DoWideOf(const AText: ptr to const char): ptr to uint16;
+var
+  LCount: int32;
+  LWide: ptr to uint16;
+begin
+  LCount := MultiByteToWideChar(ADAM_PLATFORM_UTF8, ADAM_PLATFORM_UTF8_STRICT, AText, -1, nil, 0);
+  if LCount <= 0 then
+    return nil;
+  end;
+  LWide := ptr to uint16(malloc(uint64(LCount) * 2));
+  if LWide = nil then
+    return nil;
+  end;
+  if MultiByteToWideChar(ADAM_PLATFORM_UTF8, ADAM_PLATFORM_UTF8_STRICT, AText, -1, LWide,
+    LCount) <> LCount then
+    free(ptr(LWide));
+    return nil;
+  end;
+  return LWide;
+end;
+
+// The NUL-terminated UTF-16 path at ARelative made full by the OS (the working folder, '/'
+// as '\', "." and ".." resolved) in a new block from the C heap, ACount its units with the
+// NUL; nil when the OS cannot make it full or there is no room
+routine DoFullOf(const ARelative: ptr to uint16; var ACount: int64): ptr to uint16;
+var
+  LNeeded: uint32;
+  LFull: ptr to uint16;
+begin
+  ACount := 0;
+  LNeeded := GetFullPathNameW(ARelative, 0, nil, nil);
+  if LNeeded = 0 then
+    return nil;
+  end;
+  LFull := ptr to uint16(malloc(uint64(LNeeded) * 2));
+  if LFull = nil then
+    return nil;
+  end;
+  // Success returns the units written without the NUL; anything else is a failure or a
+  // path that changed size in between
+  if GetFullPathNameW(ARelative, LNeeded, LFull, nil) <> LNeeded - 1 then
+    free(ptr(LFull));
+    return nil;
+  end;
+  ACount := int64(LNeeded);
+  return LFull;
+end;
+
+// True when the full path AFull (ACount units with its NUL) already has a "\\?\" or "\\.\"
+// prefix, which the file API takes as it is
+routine DoHasDevicePrefix(const AFull: ptr to uint16; const ACount: int64): bool;
+begin
+  if ACount < 5 then
+    return false;
+  end;
+  if (AFull[0] <> 0x5C) or (AFull[1] <> 0x5C) or (AFull[3] <> 0x5C) then
+    return false;
+  end;
+  return (AFull[2] = 0x3F) or (AFull[2] = 0x2E);
+end;
+
+// True when the full path AFull (ACount units with its NUL) is a UNC path (\\server\share)
+routine DoIsUncPath(const AFull: ptr to uint16; const ACount: int64): bool;
+begin
+  if ACount < 3 then
+    return false;
+  end;
+  return (AFull[0] = 0x5C) and (AFull[1] = 0x5C);
+end;
+
+// The NUL-terminated UTF-8 path at APath as the file API takes it at any length: made full
+// (DoFullOf), with the long-path prefix (X:\... -> \\?\X:\..., \\server\share ->
+// \\?\UNC\server\share; a path already \\?\ or \\.\ stays as it is), NUL-terminated UTF-16
+// in a new block from the C heap (the caller frees it); nil when it cannot be made
+routine DoLongPathOf(const APath: ptr to const char): ptr to uint16;
+var
+  LRelative: ptr to uint16;
+  LFull: ptr to uint16;
+  LCount: int64;
+  LLong: ptr to uint16;
+  LAt: int64;
+  LFrom: int64;
+begin
+  LRelative := DoWideOf(APath);
+  if LRelative = nil then
+    return nil;
+  end;
+  LFull := DoFullOf(LRelative, LCount);
+  free(ptr(LRelative));
+  if LFull = nil then
+    return nil;
+  end;
+  if DoHasDevicePrefix(LFull, LCount) then
+    return LFull;
+  end;
+  LLong := ptr to uint16(malloc(uint64(LCount + ADAM_PLATFORM_UNC_PREFIX) * 2));
+  if LLong = nil then
+    free(ptr(LFull));
+    return nil;
+  end;
+  // "\\?\" first, then "UNC\" for a UNC path, whose own leading "\\" is dropped
+  LLong[0] := 0x5C;
+  LLong[1] := 0x5C;
+  LLong[2] := 0x3F;
+  LLong[3] := 0x5C;
+  LAt := ADAM_PLATFORM_LONG_PREFIX;
+  LFrom := 0;
+  if DoIsUncPath(LFull, LCount) then
+    LLong[4] := 0x55;
+    LLong[5] := 0x4E;
+    LLong[6] := 0x43;
+    LLong[7] := 0x5C;
+    LAt := ADAM_PLATFORM_UNC_PREFIX;
+    LFrom := 2;
+  end;
+  // The full path's units from LFrom, its NUL included
+  memcpy(ptr(addr of LLong[LAt]), ptr(addr of LFull[LFrom]), uint64(LCount - LFrom) * 2);
+  free(ptr(LFull));
+  return LLong;
+end;
+
+// Opens the file at the NUL-terminated UTF-8 path APath for reading (relative to the working
+// folder, at any length); AHandle is its handle for PlatformReadFile / PlatformCloseFile.
+// False (AHandle 0) when it cannot be opened (missing, a folder, no access, a path that is
+// not valid UTF-8)
+public routine PlatformOpenFile(const APath: ptr to const char; var AHandle: uint64): bool;
+var
+  LPath: ptr to uint16;
+begin
+  AHandle := 0;
+  LPath := DoLongPathOf(APath);
+  if LPath = nil then
+    return false;
+  end;
+  AHandle := CreateFileW(LPath, ADAM_PLATFORM_GENERIC_READ, ADAM_PLATFORM_SHARE_READ, nil,
+    ADAM_PLATFORM_OPEN_EXISTING, ADAM_PLATFORM_ATTRIBUTE_NORMAL, 0);
+  free(ptr(LPath));
+  if AHandle = ADAM_PLATFORM_INVALID_HANDLE then
+    AHandle := 0;
+    return false;
+  end;
+  return true;
+end;
+
+// Up to ACount bytes (ACount above 0) of the file AHandle (PlatformOpenFile's) read into
+// ABuffer at its current place: the bytes read, 0 at its end, -1 when the read fails
+public routine PlatformReadFile(const AHandle: uint64; const ABuffer: ptr; const ACount: int64): int64;
+var
+  LWant: int64;
+  LRead: uint32;
+begin
+  LWant := ACount;
+  if LWant > ADAM_PLATFORM_READ_CHUNK then
+    LWant := ADAM_PLATFORM_READ_CHUNK;
+  end;
+  LRead := 0;
+  if ReadFile(AHandle, ABuffer, uint32(LWant), LRead, nil) = 0 then
+    return -1;
+  end;
+  return int64(LRead);
+end;
+
+// Closes the file AHandle (PlatformOpenFile's)
+public routine PlatformCloseFile(const AHandle: uint64);
+begin
+  CloseHandle(AHandle);
 end;
 
 end.
