@@ -1,0 +1,218 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  std_customio_ziplink.adam - System.CustomIO's ZipDirectoryContents never
+  walks a folder link (Win64: a junction)
+
+  The test makes a folder in repo\bin\output holding a.txt and a junction
+  "loop" that points back at the folder itself, made here through kernel32
+  (DeviceIoControl FSCTL_SET_REPARSE_POINT on an empty folder: no admin, no
+  developer mode, no mklink, so it runs on any machine from a release).
+  System.Runtime's PathIsLink says the junction is a link and a.txt is not.
+  The folder packs (a walk that followed the junction would recurse until
+  the path was too long and fail), the archive has a.txt and no loop/a.txt.
+  Everything the test made is removed ("cleaned"; RemoveDirectoryW on a
+  junction removes the link only). A junction is Windows' own: on linux64
+  this row's twin makes a symbolic link (adamtest has no target key yet).
+  Each row prints ok or FAIL with its name.
+*******************************************************************************/
+
+/*
+@@test
+  kind run
+  exitcode 0
+  | ok folder made
+  | ok junction made
+  | ok junction is a link
+  | ok file is no link
+  | ok packed
+  | ok packed file
+  | ok no entry through the link
+  | ok cleaned
+  | done 0
+  | [Adam Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+@@end
+*/
+
+module exe std_customio_ziplink;
+
+import System.SysUtils, System.Runtime, System.Windows, System.CustomIO;
+
+const
+  // The row's exe lands in repo\bin\output: `$P:` is output itself
+  CDir: string = "$P:std_customio_ziplink_dir";
+  CZip: string = "$P:std_customio_ziplink.zip";
+  // kernel32's values: GENERIC_WRITE, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS |
+  // FILE_FLAG_OPEN_REPARSE_POINT (a folder opened as itself), INVALID_HANDLE_VALUE,
+  // FSCTL_SET_REPARSE_POINT, IO_REPARSE_TAG_MOUNT_POINT (a junction)
+  CGenericWrite: uint32 = 0x40000000;
+  COpenExisting: uint32 = 3;
+  COpenFlags: uint32 = 0x02200000;
+  CInvalidHandle: uint64 = 0xFFFFFFFFFFFFFFFF;
+  CSetReparsePoint: uint32 = 0x000900A4;
+  CMountPointTag: uint32 = 0xA0000003;
+  // The REPARSE_DATA_BUFFER's header (tag, data length, reserved) and its mount point
+  // header (substitute / print name offsets and lengths) in bytes
+  CReparseHeader: int32 = 8;
+  CMountHeader: int32 = 8;
+
+var
+  GFails: int32;
+  GWide: WideBuffer;
+  GBuffer: array[0..16383] of uint8;
+
+routine CreateFileW(const AFileName: ptr to uint16; const AAccess: uint32;
+  const AShare: uint32; const ASecurity: ptr; const ACreation: uint32; const AFlags: uint32;
+  const ATemplate: uint64): uint64; external "kernel32";
+routine DeviceIoControl(const ADevice: uint64; const ACode: uint32; const AIn: ptr;
+  const AInSize: uint32; const AOut: ptr; const AOutSize: uint32; var AReturned: uint32;
+  const AOverlapped: ptr): int32; external "kernel32";
+routine CloseHandle(const AHandle: uint64): int32; external "kernel32";
+
+routine Check(const AName: string; const AOk: bool);
+begin
+  if AOk then
+    println("ok {}", AName);
+  else
+    println("FAIL {}", AName);
+    GFails := GFails + 1;
+  end;
+end;
+
+// AValue's low 16 bits at GBuffer[AAt], little-endian
+routine Put16(const AAt: int32; const AValue: int32);
+begin
+  GBuffer[AAt] := uint8(AValue & 0xFF);
+  GBuffer[AAt + 1] := uint8((AValue shr 8) & 0xFF);
+end;
+
+// AValue at GBuffer[AAt], little-endian
+routine Put32(const AAt: int32; const AValue: uint32);
+begin
+  GBuffer[AAt] := uint8(AValue & 0xFF);
+  GBuffer[AAt + 1] := uint8((AValue shr 8) & 0xFF);
+  GBuffer[AAt + 2] := uint8((AValue shr 16) & 0xFF);
+  GBuffer[AAt + 3] := uint8((AValue shr 24) & 0xFF);
+end;
+
+// The UTF-16 units in GWide before its NUL
+routine WideCount(): int32;
+var
+  LCount: int32;
+begin
+  LCount := 0;
+  while GWide[LCount] <> 0 do
+    LCount := LCount + 1;
+  end;
+  return LCount;
+end;
+
+// APath resolved (`$P:`) with Windows' own separator
+routine WindowsPath(const APath: string): string;
+begin
+  return ReplaceStr(ResolvePath(APath), "/", "\\");
+end;
+
+// Makes the empty folder ALink a junction to the folder ATarget: a REPARSE_DATA_BUFFER
+// (IO_REPARSE_TAG_MOUNT_POINT) whose substitute name is the NT path \??\<target>, set on
+// the folder opened as itself. True when the OS took it
+routine MakeJunction(const ALink: string; const ATarget: string): bool;
+var
+  LUnits: int32;
+  LBytes: int32;
+  LDataLength: int32;
+  LTotal: int32;
+  LI: int32;
+  LHandle: uint64;
+  LReturned: uint32;
+  LOk: bool;
+begin
+  if not Utf8ToWide("\\??\\" + WindowsPath(ATarget), GWide) then
+    return false;
+  end;
+  LUnits := WideCount();
+  LBytes := LUnits * 2;
+  // The substitute name and its NUL, then an empty print name (its NUL)
+  LDataLength := CMountHeader + LBytes + 2 + 2;
+  LTotal := CReparseHeader + LDataLength;
+  if LTotal > 16384 then
+    return false;
+  end;
+  Put32(0, CMountPointTag);
+  Put16(4, LDataLength);
+  Put16(6, 0);
+  Put16(8, 0);
+  Put16(10, LBytes);
+  Put16(12, LBytes + 2);
+  Put16(14, 0);
+  for LI := 0 to LUnits do
+    Put16(16 + LI * 2, int32(GWide[LI]));
+  end;
+  Put16(16 + LBytes + 2, 0);
+  if not Utf8ToWide(WindowsPath(ALink), GWide) then
+    return false;
+  end;
+  LHandle := CreateFileW(addr of GWide[0], CGenericWrite, 0, nil, COpenExisting, COpenFlags, 0);
+  if LHandle = CInvalidHandle then
+    return false;
+  end;
+  LReturned := 0;
+  LOk := DeviceIoControl(LHandle, CSetReparsePoint, ptr(addr of GBuffer[0]), uint32(LTotal),
+    nil, 0, LReturned, nil) <> 0;
+  CloseHandle(LHandle);
+  return LOk;
+end;
+
+// True when APath is itself a link (System.Runtime's PathIsLink)
+routine IsLink(const APath: string): bool;
+var
+  LText: ptr to char;
+  LLink: bool;
+begin
+  LText := StringToC(ResolvePath(APath));
+  LLink := PathIsLink(ptr to const char(LText));
+  freemem(LText);
+  return LLink;
+end;
+
+// True when AArchive opens and has an entry AEntry
+routine HasEntry(const AArchive: string; const AEntry: string): bool;
+var
+  LSource: IOSource;
+  LFound: bool;
+begin
+  LSource := CreateZipIOSource(AArchive);
+  if LSource = nil then
+    return false;
+  end;
+  LFound := IOSourceExists(LSource, AEntry);
+  IOSourceClose(LSource);
+  return LFound;
+end;
+
+begin
+  GFails := 0;
+  Check("folder made", ForceDirectories(CDir) and WriteAllText(CDir + "/a.txt", "a") and
+    CreateDir(CDir + "/loop"));
+  Check("junction made", MakeJunction(CDir + "/loop", CDir));
+  Check("junction is a link", IsLink(CDir + "/loop"));
+  Check("file is no link", not IsLink(CDir + "/a.txt"));
+  Check("packed", ZipDirectoryContents(CZip, CDir));
+  Check("packed file", HasEntry(CZip, "a.txt"));
+  Check("no entry through the link", not HasEntry(CZip, "loop/a.txt"));
+  Check("cleaned", RemoveDir(CDir + "/loop") and DeleteFile(CDir + "/a.txt") and
+    DeleteFile(CZip) and RemoveDir(CDir));
+  println("{}", "done " + IntToStr(int64(GFails)));
+end.
