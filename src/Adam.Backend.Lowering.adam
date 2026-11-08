@@ -277,6 +277,9 @@ public const
   // module's name follows; both internal)
   ADAM_LOWERING_INITIALIZE_SYMBOL: string = "__adam_initialize_";
   ADAM_LOWERING_FINALIZE_SYMBOL: string = "__adam_finalize_";
+  // The prefix of a module's teardown function's symbol (the module's name follows;
+  // internal): its finalize, then its module variables released, run at process exit
+  ADAM_LOWERING_TEARDOWN_SYMBOL: string = "__adam_teardown_";
 
   // The prefix of a module constant's data blob symbol, when the constant is an aggregate
   // (its module's name, '_' and its own name follow; internal: a constant has no symbol of
@@ -10411,10 +10414,10 @@ public type
     // runs at the entry's start (DoEntryInits); an aggregate's blob holds its initializer's
     // bytes when they fold, else it is Zeroed and its initializer copied in there
     // (DoAggregateData); a text's blob is a Zeroed pointer (the empty text), its
-    // initializer stored at the entry (DoGlobalInit) and its text released at the program's
-    // end (DoReleaseGlobals). LW0001: an external one (M3.13), a constructed one, one of a
-    // type with no machine value (a dynamic array: M3.9, an object: M3.10). A threadstatic
-    // one (BNF sec 3) goes through DoThreadStatic
+    // initializer stored at the entry (DoGlobalInit) and its text released by its module's
+    // teardown at process exit (DoTeardown). LW0001: an external one (M3.13), a constructed
+    // one, one of a type with no machine value (a dynamic array: M3.9, an object: M3.10). A
+    // threadstatic one (BNF sec 3) goes through DoThreadStatic
     hidden method DoGlobal(const ADecl: int64);
     begin
       if self.FTree[ADecl].HasFlag(NodeFlag.ThreadStatic) then
@@ -10429,7 +10432,7 @@ public type
     // flagged ThreadLocal (every thread's starting copy: the loader copies it per thread, so
     // nothing of it runs at the entry; its address is a ThreadAddress, DoDataAddress). A
     // managed one (string, dynamic array, ref) or one holding one is released as its thread
-    // ends: the main thread's at the program's end (DoReleaseGlobals), every other thread's
+    // ends: the main thread's by its module's teardown (DoTeardown), every other thread's
     // by the program's thread release (DoThreadRelease). SEM leaves it a constant
     // initializer or none; LW0001: one whose initializer did not fold into its bytes. The
     // blob is made first, so its uses lower and a refusal is the variable's one report
@@ -10843,11 +10846,11 @@ public type
 
     // The program's thread release, when it has a managed threadstatic or one holding one
     // (DoThreadStatic): a function of its own, internal (ADAM_LOWERING_THREAD_RELEASE_SYMBOL),
-    // that releases the calling thread's copy of each as DoReleaseGlobals releases a module
+    // that releases the calling thread's copy of each as DoTeardown releases a module
     // variable (module by module in reverse FOrder, each module's last declared first),
     // handed to the runtime by the entry at ANode (RuntimeRoutine.SetThreadRelease given its
     // address), which runs it as each thread but the main one ends (the main thread's copies
-    // are DoReleaseGlobals'); nothing without one
+    // are released by their module's teardown, DoTeardown); nothing without one
     hidden method DoThreadRelease(const ANode: int64);
     var
       LDecls: Int64Array;
@@ -10912,11 +10915,13 @@ public type
 
     // The entry function's body: the globals' initializers (DoEntryInits; their
     // temporaries' slots first, DoInitTemporaries), the thread callback noted
-    // (DoThreadCallback) and the thread release handed over (DoThreadRelease), the
-    // initialize chain in FOrder, the program block's statements; then its end block
-    // (FEntryEnd, where the block's end and its returns go): the temporaries released, the
-    // finalize chain in reverse, the module variables' texts released (DoReleaseGlobals: the
-    // main thread's threadstatics too), then the runtime's exit with 0
+    // (DoThreadCallback) and the thread release handed over (DoThreadRelease), the heap
+    // report registered as the first exit handler (so it runs last), then each module in
+    // FOrder: its initialize, then its teardown registered (DoTeardown, BNF sec 1: exit
+    // handlers run last registered first, so the teardowns run in reverse FOrder, each after
+    // every handler registered later); then the program block's statements; then its end
+    // block (FEntryEnd, where the block's end and its returns go): the temporaries released,
+    // then the runtime's exit with 0, which runs the exit handlers
     hidden method DoEntryBody();
     var
       LBody: int64;
@@ -10932,22 +10937,67 @@ public type
       self.DoEntryInits();
       self.DoThreadCallback();
       self.DoThreadRelease(LBody);
+      self.DoAtExit(self.DoRuntimeFunction(RuntimeRoutine.ReportHeap, LBody), LBody);
       for LI := 0 to self.FOrder.Count - 1 do
         self.DoCallSection(self.FOrder[LI], NodeRole.Initialize);
+        self.DoAtExit(self.DoTeardown(self.FOrder[LI], LBody), LBody);
       end;
       self.DoStatements(LBody, NodeRole.Statement);
       if not self.DoEnded() then
         self.DoJumpTo(self.FEntryEnd, LBody);
       end;
-      // The program block's string temporaries released, before the finalize chain
+      // The program block's string temporaries released, before the exit
       self.FBlock := self.FEntryEnd;
       self.DoReleaseManaged(LBody);
-      for LI := self.FOrder.Count - 1 downto 0 do
-        self.DoCallSection(self.FOrder[LI], NodeRole.Finalize);
-      end;
-      self.DoReleaseGlobals(LBody);
       self.DoExit(LBody);
       self.DoEntryCatch(LBody);
+    end;
+
+    // AFunction (0: nothing) registered by the entry at ANode as an exit handler: its code
+    // address handed to the runtime's AtExit
+    hidden method DoAtExit(const AFunction: int64; const ANode: int64);
+    var
+      LAddress: int64;
+    begin
+      if AFunction = 0 then
+        return;
+      end;
+      LAddress := self.DoEmit(IrOp.CodeAddress, IrType.Pointer, ANode);
+      self.FModule.InstrAt(LAddress).Link := AFunction;
+      self.DoCallRuntime(RuntimeRoutine.AtExit, LAddress, 0, ANode);
+    end;
+
+    // The module AModule's teardown, the exit handler the entry at ANode registers right
+    // after its initialize: a function of its own, internal (ADAM_LOWERING_TEARDOWN_SYMBOL and
+    // the module's name), that calls its finalize section, then releases its module variables
+    // and aggregate constants (DoReleaseModuleGlobals); 0 when it has neither. Its body is
+    // lowered aside: the entry goes on where it was after it
+    hidden method DoTeardown(const AModule: int64; const ANode: int64): int64;
+    var
+      LSection: int64;
+      LFunction: int64;
+      LEntryFunction: int64;
+      LEntryBlock: int64;
+    begin
+      LSection := self.FTree.FirstOf(AModule, NodeRole.Finalize);
+      if ((LSection = 0) or (self.FFunctionOf[LSection] = 0)) and
+        (not self.DoHasModuleGlobals(AModule)) then
+        return 0;
+      end;
+      LFunction := self.FModule.AddFunction(ADAM_LOWERING_TEARDOWN_SYMBOL +
+        self.FTree[AModule].Text, IrType.Void, ANode);
+      self.FModule.FunctionAt(LFunction).Internal := true;
+      LEntryFunction := self.FFunction;
+      LEntryBlock := self.FBlock;
+      self.FFunction := LFunction;
+      self.FBlock := self.FModule.AddBlock(LFunction);
+      self.DoCallSection(AModule, NodeRole.Finalize);
+      self.DoReleaseModuleGlobals(AModule, ANode);
+      self.DoEmit(IrOp.Ret, IrType.Void, ANode);
+      self.DoCatchAll(ANode);
+      self.FFunction := LEntryFunction;
+      self.FBlock := LEntryBlock;
+      return LFunction;
     end;
 
     // The entry's catch, after its whole body (ANode its block): its own cleanup scopes
@@ -10958,6 +11008,17 @@ public type
     // it calls the runtime's Unhandled (the report, then the process ends: its return is
     // never reached). A raise a guard's except part catches never gets here (DoGuard)
     hidden method DoEntryCatch(const ANode: int64);
+    begin
+      self.DoCleanupScopes(ANode, self.DoLastBlock());
+      self.DoCatchAll(ANode);
+    end;
+
+    // One catching scope around every block of the function being lowered (FFunction), the
+    // outermost: its filter the platform unit's (RuntimeRoutine.Catch) and its target a block
+    // made last that calls the runtime's Unhandled (the entry's, DoEntryCatch, and each
+    // module's teardown's, DoTeardown: a raise in a finalize is reported as one in the
+    // program block is)
+    hidden method DoCatchAll(const ANode: int64);
     var
       LLast: int64;
       LFilter: int64;
@@ -10966,18 +11027,17 @@ public type
       LId: int64;
     begin
       LLast := self.DoLastBlock();
-      self.DoCleanupScopes(ANode, LLast);
       LFilter := self.DoRuntimeFunction(RuntimeRoutine.Catch, ANode);
       LHandler := self.DoRuntimeFunction(RuntimeRoutine.FrameHandler, ANode);
       LUnhandled := self.DoRuntimeFunction(RuntimeRoutine.Unhandled, ANode);
       if (LFilter = 0) or (LHandler = 0) or (LUnhandled = 0) then
         return;
       end;
-      self.FBlock := self.FModule.AddBlock(self.FEntry);
+      self.FBlock := self.FModule.AddBlock(self.FFunction);
       LId := self.DoEmit(IrOp.Call, IrType.Void, ANode);
       self.FModule.InstrAt(LId).Link := LUnhandled;
       self.DoEmit(IrOp.Ret, IrType.Void, ANode);
-      self.FModule.FunctionAt(self.FEntry).AddScope(0, LLast, LFilter, LLast + 1);
+      self.FModule.FunctionAt(self.FFunction).AddScope(0, LLast, LFilter, LLast + 1);
       self.FModule.FrameHandler := LHandler;
     end;
 
@@ -11006,29 +11066,49 @@ public type
       end;
     end;
 
-    // Every module variable's and aggregate constant's texts released at the program's
-    // end (after the finalize chain, which may still use them), module by module in
-    // reverse FOrder, each module's last declared first (DoReleaseAt)
-    hidden method DoReleaseGlobals(const ANode: int64);
+    // Whether the module declaration ADecl is a module variable or aggregate constant with a
+    // blob whose value its module's teardown releases (it holds a managed value or one that
+    // ends)
+    hidden method DoReleasesAtTeardown(const ADecl: int64): bool;
     var
-      LModule: int64;
-      LDecl: int64;
       LType: int64;
+    begin
+      if (self.FDataOf[ADecl] = 0) or ((self.FTree[ADecl].Kind <> NodeKind.VarDecl) and
+        (self.FTree[ADecl].Kind <> NodeKind.ConstDecl)) then
+        return false;
+      end;
+      LType := self.DoDeclType(ADecl);
+      return self.DoHoldsManaged(LType) or self.DoNeedsEnd(LType);
+    end;
+
+    // Whether the module AModule has a declaration its teardown releases
+    // (DoReleasesAtTeardown)
+    hidden method DoHasModuleGlobals(const AModule: int64): bool;
+    var
       LI: int64;
+    begin
+      for LI := 0 to self.FTree.CountOf(AModule, NodeRole.Declaration) - 1 do
+        if self.DoReleasesAtTeardown(self.FTree.NthOf(AModule, NodeRole.Declaration, LI)) then
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // The module AModule's module variables and aggregate constants released by its teardown
+    // at ANode (after its finalize, which may still use them), its last declared first
+    // (DoReleaseAt; the calling thread's copy of a threadstatic)
+    hidden method DoReleaseModuleGlobals(const AModule: int64; const ANode: int64);
+    var
+      LDecl: int64;
       LJ: int64;
     begin
-      for LI := self.FOrder.Count - 1 downto 0 do
-        LModule := self.FOrder[LI];
-        for LJ := self.FTree.CountOf(LModule, NodeRole.Declaration) - 1 downto 0 do
-          LDecl := self.FTree.NthOf(LModule, NodeRole.Declaration, LJ);
-          if (self.FDataOf[LDecl] <> 0) and ((self.FTree[LDecl].Kind = NodeKind.VarDecl) or
-            (self.FTree[LDecl].Kind = NodeKind.ConstDecl)) then
-            LType := self.DoDeclType(LDecl);
-            if self.DoHoldsManaged(LType) or self.DoNeedsEnd(LType) then
-              if not self.DoReleaseAt(self.DoDataAddress(LDecl, ANode), LType, ANode) then
-                return;
-              end;
-            end;
+      for LJ := self.FTree.CountOf(AModule, NodeRole.Declaration) - 1 downto 0 do
+        LDecl := self.FTree.NthOf(AModule, NodeRole.Declaration, LJ);
+        if self.DoReleasesAtTeardown(LDecl) then
+          if not self.DoReleaseAt(self.DoDataAddress(LDecl, ANode), self.DoDeclType(LDecl),
+            ANode) then
+            return;
           end;
         end;
       end;
