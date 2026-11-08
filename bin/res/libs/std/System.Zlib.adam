@@ -1,0 +1,300 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.Zlib.adam - deflate, inflate and crc32 in Adam, over zlib's C API
+  (System.Zlib.C): whole byte arrays in, whole byte arrays out. ZlibFormat
+  picks the framing: Raw (a zip entry's deflate data), Zlib (RFC 1950) or
+  Gzip (RFC 1952). ZlibDeflate / ZlibInflate return false on a failure and
+  leave the reason in AErrorText; nothing they hand back needs freeing.
+
+  zlib counts a step's bytes in 32 bits: input goes in steps of at most
+  ADAM_ZLIB_MAX_STEP bytes and output grows as it fills, so no size is
+  capped by that count. This unit is outside the compiler's dependency path
+  (not in the shared subset, DESIGN sec 10), so it hands zlib its buffers
+  with `addr of`. Target-neutral: no OS named.
+*******************************************************************************/
+
+module unit System.Zlib;
+
+import System.SysUtils, System.Zlib.C;
+
+public type
+  // The framing around the deflate data: none (a zip entry's), zlib's, gzip's
+  ZlibFormat = choices(Raw, Zlib, Gzip);
+
+const
+  // The output room added when a step finds the output full (it at least doubles)
+  ADAM_ZLIB_CHUNK: int64 = 65536;
+  // The most bytes one step hands zlib (its counts are 32-bit)
+  ADAM_ZLIB_MAX_STEP: int64 = 1073741824;
+  // gzip's window bits are zlib's plus this
+  ADAM_ZLIB_GZIP_BITS: int32 = 16;
+  // The memory level deflateInit uses (zutil.h's DEF_MEM_LEVEL: a private header)
+  ADAM_ZLIB_MEM_LEVEL: int32 = 8;
+  // The errors AErrorText takes
+  ADAM_ZLIB_MSG_PREFIX: string = "zlib: ";
+  ADAM_ZLIB_MSG_CODE: string = "error ";
+  ADAM_ZLIB_MSG_TRUNCATED: string = "the compressed data ends early";
+  ADAM_ZLIB_MSG_NEED_DICT: string = "the data needs a preset dictionary";
+
+// The NUL-terminated text at AText as an Adam string ("" for nil)
+routine DoCText(const AText: ptr to const char): string;
+var
+  LText: string;
+  LCount: int64;
+  LI: int64;
+begin
+  LText := "";
+  if AText = nil then
+    return LText;
+  end;
+  LCount := 0;
+  while int32(AText[LCount]) <> 0 do
+    LCount := LCount + 1;
+  end;
+  setlength(LText, LCount);
+  for LI := 0 to LCount - 1 do
+    LText[LI] := AText[LI];
+  end;
+  return LText;
+end;
+
+// The reason for zlib's code ACode: the stream's message when zlib left one, else the code
+routine DoErrorText(const ACode: int32; const AStream: z_stream): string;
+var
+  LText: string;
+begin
+  LText := DoCText(AStream.msg);
+  if LText = "" then
+    LText := ADAM_ZLIB_MSG_CODE + IntToStr(int64(ACode));
+  end;
+  return ADAM_ZLIB_MSG_PREFIX + LText;
+end;
+
+// ZLIB_VERSION's bytes and a NUL: the C text deflateInit2_ / inflateInit2_ take
+routine DoVersionText(): ByteArray;
+var
+  LText: ByteArray;
+  LI: int64;
+begin
+  setlength(LText, len(ZLIB_VERSION) + 1);
+  for LI := 0 to len(ZLIB_VERSION) - 1 do
+    LText[LI] := uint8(ZLIB_VERSION[LI]);
+  end;
+  LText[len(ZLIB_VERSION)] := 0;
+  return LText;
+end;
+
+// The window bits deflateInit2_ / inflateInit2_ take for AFormat
+routine DoWindowBits(const AFormat: ZlibFormat): int32;
+begin
+  if AFormat = ZlibFormat.Raw then
+    return -MAX_WBITS;
+  end;
+  if AFormat = ZlibFormat.Gzip then
+    return MAX_WBITS + ADAM_ZLIB_GZIP_BITS;
+  end;
+  return MAX_WBITS;
+end;
+
+// AStream with nothing in it: no buffers, zlib's own allocator
+routine DoClearStream(var AStream: z_stream);
+begin
+  AStream.next_in := nil;
+  AStream.avail_in := 0;
+  AStream.total_in := 0;
+  AStream.next_out := nil;
+  AStream.avail_out := 0;
+  AStream.total_out := 0;
+  AStream.msg := nil;
+  AStream.state := nil;
+  AStream.zalloc := nil;
+  AStream.zfree := nil;
+  AStream.opaque := nil;
+  AStream.data_type := 0;
+  AStream.adler := 0;
+  AStream.reserved := 0;
+end;
+
+// AStream's input refilled from AData at AInAt (moved past what it takes) once zlib has
+// taken all it had. cpplink: its const AData binds the caller's array by reference (BNF
+// sec 3), so next_in points into the caller's bytes and stays valid after this returns; a
+// plain (clink) routine takes a const array by value, as a copy freed at its end
+routine cpplink DoFeed(const AData: ByteArray; var AStream: z_stream; var AInAt: int64);
+var
+  LStep: int64;
+begin
+  if (AStream.avail_in <> 0) or (AInAt >= len(AData)) then
+    return;
+  end;
+  LStep := len(AData) - AInAt;
+  if LStep > ADAM_ZLIB_MAX_STEP then
+    LStep := ADAM_ZLIB_MAX_STEP;
+  end;
+  AStream.next_in := addr of AData[AInAt];
+  AStream.avail_in := uint32(LStep);
+  AInAt := AInAt + LStep;
+end;
+
+// AStream's output pointed at AOut from AOutAt on, AOut grown first when it has less than
+// ADAM_ZLIB_CHUNK bytes left there (at least doubled, so growing stays linear)
+routine DoRoom(var AOut: ByteArray; const AOutAt: int64; var AStream: z_stream);
+var
+  LSize: int64;
+  LRoom: int64;
+begin
+  if len(AOut) - AOutAt < ADAM_ZLIB_CHUNK then
+    LSize := len(AOut) * 2;
+    if LSize < AOutAt + ADAM_ZLIB_CHUNK then
+      LSize := AOutAt + ADAM_ZLIB_CHUNK;
+    end;
+    setlength(AOut, LSize);
+  end;
+  LRoom := len(AOut) - AOutAt;
+  if LRoom > ADAM_ZLIB_MAX_STEP then
+    LRoom := ADAM_ZLIB_MAX_STEP;
+  end;
+  AStream.next_out := addr of AOut[AOutAt];
+  AStream.avail_out := uint32(LRoom);
+end;
+
+// The crc-32 of AData carried on from ACrc (0 to start): a zip entry's and gzip's check
+public routine ZlibCrc32(const ACrc: uint32; const AData: ByteArray): uint32;
+var
+  LCrc: culong;
+  LAt: int64;
+  LStep: int64;
+begin
+  LCrc := culong(ACrc);
+  LAt := 0;
+  while LAt < len(AData) do
+    LStep := len(AData) - LAt;
+    if LStep > ADAM_ZLIB_MAX_STEP then
+      LStep := ADAM_ZLIB_MAX_STEP;
+    end;
+    LCrc := crc32(LCrc, addr of AData[LAt], uint32(LStep));
+    LAt := LAt + LStep;
+  end;
+  return uint32(LCrc);
+end;
+
+// AData compressed at ALevel (Z_DEFAULT_COMPRESSION, or 0 none .. 9 best) in
+// AFormat's framing into AOut; false with the reason in AErrorText
+public routine ZlibDeflate(const AData: ByteArray; const AFormat: ZlibFormat;
+  const ALevel: int32; var AOut: ByteArray; var AErrorText: string): bool;
+var
+  LStream: z_stream;
+  LVersion: ByteArray;
+  LCode: int32;
+  LFlush: int32;
+  LInAt: int64;
+  LOutAt: int64;
+  LBefore: int64;
+begin
+  setlength(AOut, 0);
+  AErrorText := "";
+  DoClearStream(LStream);
+  LVersion := DoVersionText();
+  LCode := deflateInit2_(addr of LStream, ALevel, Z_DEFLATED, DoWindowBits(AFormat),
+    ADAM_ZLIB_MEM_LEVEL, Z_DEFAULT_STRATEGY,
+    ptr to const char(addr of LVersion[0]), int32(size(z_stream)));
+  if LCode <> Z_OK then
+    AErrorText := DoErrorText(LCode, LStream);
+    return false;
+  end;
+  LInAt := 0;
+  LOutAt := 0;
+  while LCode <> Z_STREAM_END do
+    DoFeed(AData, LStream, LInAt);
+    // FINISH once the last input is with zlib: it then ends the stream
+    LFlush := Z_NO_FLUSH;
+    if LInAt >= len(AData) then
+      LFlush := Z_FINISH;
+    end;
+    DoRoom(AOut, LOutAt, LStream);
+    LBefore := int64(LStream.avail_out);
+    LCode := deflate(addr of LStream, LFlush);
+    LOutAt := LOutAt + LBefore - int64(LStream.avail_out);
+    // BUF_ERROR is only "no progress this step": the next step has more room or input
+    if (LCode <> Z_OK) and (LCode <> Z_STREAM_END) and
+      (LCode <> Z_BUF_ERROR) then
+      AErrorText := DoErrorText(LCode, LStream);
+      deflateEnd(addr of LStream);
+      setlength(AOut, 0);
+      return false;
+    end;
+  end;
+  deflateEnd(addr of LStream);
+  setlength(AOut, LOutAt);
+  return true;
+end;
+
+// AData (one stream in AFormat's framing) decompressed into AOut; false with the reason in
+// AErrorText (bad data, a stream that ends early, one that needs a dictionary). Bytes after
+// the stream's end are not read
+public routine ZlibInflate(const AData: ByteArray; const AFormat: ZlibFormat;
+  var AOut: ByteArray; var AErrorText: string): bool;
+var
+  LStream: z_stream;
+  LVersion: ByteArray;
+  LCode: int32;
+  LInAt: int64;
+  LOutAt: int64;
+  LBefore: int64;
+begin
+  setlength(AOut, 0);
+  AErrorText := "";
+  DoClearStream(LStream);
+  LVersion := DoVersionText();
+  LCode := inflateInit2_(addr of LStream, DoWindowBits(AFormat),
+    ptr to const char(addr of LVersion[0]), int32(size(z_stream)));
+  if LCode <> Z_OK then
+    AErrorText := DoErrorText(LCode, LStream);
+    return false;
+  end;
+  LInAt := 0;
+  LOutAt := 0;
+  while LCode <> Z_STREAM_END do
+    DoFeed(AData, LStream, LInAt);
+    DoRoom(AOut, LOutAt, LStream);
+    LBefore := int64(LStream.avail_out);
+    LCode := inflate(addr of LStream, Z_NO_FLUSH);
+    LOutAt := LOutAt + LBefore - int64(LStream.avail_out);
+    if LCode = Z_NEED_DICT then
+      AErrorText := ADAM_ZLIB_MSG_PREFIX + ADAM_ZLIB_MSG_NEED_DICT;
+    end;
+    // No progress with every input byte given and room left: the stream is cut short
+    if (LCode = Z_BUF_ERROR) and (LStream.avail_in = 0) and (LInAt >= len(AData)) then
+      AErrorText := ADAM_ZLIB_MSG_PREFIX + ADAM_ZLIB_MSG_TRUNCATED;
+    end;
+    // Every other error is negative (BUF_ERROR alone is "no progress this step")
+    if (LCode < 0) and (LCode <> Z_BUF_ERROR) then
+      AErrorText := DoErrorText(LCode, LStream);
+    end;
+    if AErrorText <> "" then
+      inflateEnd(addr of LStream);
+      setlength(AOut, 0);
+      return false;
+    end;
+  end;
+  inflateEnd(addr of LStream);
+  setlength(AOut, LOutAt);
+  return true;
+end;
+
+end.
