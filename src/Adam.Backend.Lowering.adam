@@ -252,6 +252,19 @@ public const
   // while its parts end by one (its function id follows; internal): the descriptor's done
   // word, it ends the parts (DoEndParts) of the object it is given
   ADAM_LOWERING_REF_END_SYMBOL: string = "__adam_refend";
+  // A task's object (BNF sec 4 task type, System.Runtime's ADAM_RUNTIME_TASK_* words): the
+  // runtime's six words (the thread, the state, joined, the raise's code, its text at
+  // ADAM_LOWERING_TASK_TEXT_OFFSET, the entry at ADAM_LOWERING_TASK_ENTRY_OFFSET), then the
+  // result (DoTaskResultOffset) and the call's copies (DoTaskLayout)
+  ADAM_LOWERING_TASK_WORDS: int64 = 48;
+  ADAM_LOWERING_TASK_TEXT_OFFSET: int64 = 32;
+  ADAM_LOWERING_TASK_ENTRY_OFFSET: int64 = 40;
+  // The prefix of an async call site's task descriptor's read-only data symbol (its data id
+  // follows; a ref descriptor whose done is the runtime's TaskDone)
+  ADAM_LOWERING_TASK_DESCRIPTOR_SYMBOL: string = "__adam_taskdescriptor";
+  // The prefix of an async call site's entry function's symbol (its index follows;
+  // internal): TaskRun calls it with the task's object, it runs the call (DoTaskBody)
+  ADAM_LOWERING_TASK_ENTRY_SYMBOL: string = "__adam_taskentry";
   // The prefix of a polymorphic object type's vtable's read-only data symbol (its data id
   // follows; internal): one function address per slot (Layout's VtableSlots), the slot of
   // an abstract method the runtime's AbstractCall
@@ -423,6 +436,10 @@ public type
     hidden FEndFunctions: ref Int64List;
     hidden FEndTypes: ref Int64List;
     hidden FEndNodes: ref Int64List;
+    // The task entries DoAsync made (DoTaskEntry), their bodies lowered last
+    // (DoTaskBodies): by index, the function and its async expression
+    hidden FTaskEntries: ref Int64List;
+    hidden FTaskNodes: ref Int64List;
 
     init(const ATree: ref SyntaxTree; const ATarget: ref Target; const ADiagnostics: ref Diagnostics);
     begin
@@ -466,6 +483,8 @@ public type
       self.FEndFunctions := ref Int64List();
       self.FEndTypes := ref Int64List();
       self.FEndNodes := ref Int64List();
+      self.FTaskEntries := ref Int64List();
+      self.FTaskNodes := ref Int64List();
     end;
 
     // The IR made so far
@@ -1812,7 +1831,8 @@ public type
         return false;
       end;
       LClass := ClassOf(self.FTree, AType);
-      if LClass = TypeClass.RefType then
+      // a task is a ref block (DoIsRefValue)
+      if (LClass = TypeClass.RefType) or (LClass = TypeClass.TaskType) then
         return ARefs;
       end;
       if (LClass = TypeClass.OwnType) or (LClass = TypeClass.WeakType) then
@@ -2865,6 +2885,10 @@ public type
       if (self.FTree[LAt].Kind = NodeKind.CallExpression) and (not self.DoIsCastCall(LAt)) then
         return self.DoCallResult(LAt);
       end;
+      // an await's result, in the task's object
+      if self.FTree[LAt].Kind = NodeKind.AwaitExpression then
+        return self.DoAwaitResult(LAt);
+      end;
       // a property read through its accessors: its call's result slot, or a bound field
       if self.DoIsPropertyAccess(LAt) then
         return self.DoPropertyGet(LAt);
@@ -3663,12 +3687,14 @@ public type
       return (AType <> 0) and (ClassOf(self.FTree, AType) = TypeClass.DynamicArray);
     end;
 
-    // True when the canonical type AType is a ref (`ref T`): like a text, its value travels
-    // as a pointer (nil or its block, System.Runtime's layout: the object after the
-    // header), DoIrType keeping it Void
+    // True when the canonical type AType is a ref (`ref T`) or a task (`task T`, a ref block
+    // whose descriptor is its async call site's): like a text, its value travels as a
+    // pointer (nil or its block, System.Runtime's layout: the object after the header),
+    // DoIrType keeping it Void
     hidden const method DoIsRefValue(const AType: int64): bool;
     begin
-      return (AType <> 0) and (ClassOf(self.FTree, AType) = TypeClass.RefType);
+      return (AType <> 0) and ((ClassOf(self.FTree, AType) = TypeClass.RefType) or
+        (ClassOf(self.FTree, AType) = TypeClass.TaskType));
     end;
 
     // True when a value of the canonical type AType is a reference to a counted block: a
@@ -3910,6 +3936,13 @@ public type
       end;
       if self.FTree[AId].Kind = NodeKind.RefNew then
         return self.DoRefNew(AId);
+      end;
+      if self.FTree[AId].Kind = NodeKind.AsyncExpression then
+        return self.DoAsync(AId);
+      end;
+      // an await's managed result, borrowed: the task's object holds it
+      if self.FTree[AId].Kind = NodeKind.AwaitExpression then
+        return self.DoAwaitManaged(AId);
       end;
       if self.DoIsConcat(AId) then
         return self.DoConcatValue(AId);
@@ -4158,7 +4191,8 @@ public type
         if self.DoIsManagedCall(LChild) or self.DoIsManagedPropertyCall(LChild) then
           self.DoResultTemporary(LChild);
         end;
-        if (self.FTree[LChild].Kind = NodeKind.RefNew) and self.DoIsRefValue(self.FTree[LChild].ResolvedType) then
+        if ((self.FTree[LChild].Kind = NodeKind.RefNew) or (self.FTree[LChild].Kind = NodeKind.AsyncExpression)) and
+          self.DoIsRefValue(self.FTree[LChild].ResolvedType) then
           self.DoPointerTemporary(LChild, self.FTree[LChild].ResolvedType);
         end;
         if self.DoIsCharCompound(LChild) then
@@ -4544,6 +4578,20 @@ public type
       const AEmitted: ref Int64List): bool;
     var
       LRuns: ref Int64List;
+    begin
+      LRuns := ref Int64List();
+      if not self.DoManagedRuns(AType, 0, LRuns, ANode) then
+        return false;
+      end;
+      return self.DoRunWords(LRuns, ANode, AWords, AEmitted);
+    end;
+
+    // The managed map of the runs ARuns (DoManagedRuns', gathered at their offsets: a
+    // type's, or a task object's parts, DoTaskDescriptorData) added to AWords, in
+    // DoMapWords' layout with the element maps its runs need; false after LW0001 at ANode
+    hidden method DoRunWords(const ARuns: ref Int64List; const ANode: int64; const AWords: ref Int64List;
+      const AEmitted: ref Int64List): bool;
+    var
       LStart: int64;
       LFirstRun: int64;
       LRun: int64;
@@ -4551,18 +4599,14 @@ public type
       LAt: int64;
       LI: int64;
     begin
-      LRuns := ref Int64List();
-      if not self.DoManagedRuns(AType, 0, LRuns, ANode) then
-        return false;
-      end;
       LStart := AWords.Count;
-      AWords.Add(LRuns.Count div ADAM_LOWERING_RUN_WORDS);
+      AWords.Add(ARuns.Count div ADAM_LOWERING_RUN_WORDS);
       LFirstRun := AWords.Count;
-      for LI := 0 to LRuns.Count - 1 do
-        AWords.Add(LRuns[LI]);
+      for LI := 0 to ARuns.Count - 1 do
+        AWords.Add(ARuns[LI]);
       end;
-      for LRun := 0 to (LRuns.Count div ADAM_LOWERING_RUN_WORDS) - 1 do
-        LArray := LRuns[LRun * ADAM_LOWERING_RUN_WORDS + 3];
+      for LRun := 0 to (ARuns.Count div ADAM_LOWERING_RUN_WORDS) - 1 do
+        LArray := ARuns[LRun * ADAM_LOWERING_RUN_WORDS + 3];
         // a text run (0) and a ref run (ADAM_LOWERING_REF_ELEMENT) keep their word
         if (LArray <> 0) and (LArray <> ADAM_LOWERING_REF_ELEMENT) then
           LAt := -1;
@@ -4832,6 +4876,510 @@ public type
         return 0;
       end;
       return LBlock;
+    end;
+
+    // The offset into a task's object of the result of a call whose result type is AResult
+    // (BNF sec 4 task type): past the runtime's words (ADAM_LOWERING_TASK_WORDS), at the
+    // result's alignment. It depends on the result's type alone, so `await` finds it from
+    // the task's type wherever the task was started
+    hidden method DoTaskResultOffset(const AResult: int64): int64;
+    begin
+      return AlignUp(ADAM_LOWERING_TASK_WORDS, TypeAlign(self.FTree, self.FTarget, AResult));
+    end;
+
+    // The call the async expression AAsync starts (its operand, into ACall), the routine it
+    // calls (ADecl; 0 for a routine value) and the signature that call runs (ASig: the
+    // routine, or the routine value's type's signature); false after LW0001 at AAsync for a
+    // call not lowered yet (a method's, a variadic routine's)
+    hidden method DoAsyncTarget(const AAsync: int64; var ACall: int64; var ADecl: int64;
+      var ASig: int64): bool;
+    var
+      LCallee: int64;
+      LType: int64;
+    begin
+      ACall := self.FTree.FirstOf(AAsync, NodeRole.Operand);
+      LCallee := self.FTree.FirstOf(ACall, NodeRole.Callee);
+      ADecl := 0;
+      ASig := 0;
+      if (self.FTree[LCallee].Kind = NodeKind.MemberExpression) and (self.FTree[LCallee].ResolvedDecl <> 0) and
+        (self.FTree[self.FTree[LCallee].ResolvedDecl].Kind = NodeKind.MethodDecl) then
+        self.DoRefuse(AAsync, "async of a method call");
+        return false;
+      end;
+      if self.FTree[LCallee].Kind = NodeKind.NameExpression then
+        ADecl := self.DoCalled(LCallee);
+      end;
+      if ADecl <> 0 then
+        ASig := ADecl;
+      else
+        if not self.DoIsRoutineValue(LCallee) then
+          self.DoRefuse(AAsync, "async of " + self.FTree.ConstructPhrase(ACall));
+          return false;
+        end;
+        LType := self.FTree[LCallee].ResolvedType;
+        if self.DoSignatureOf(LType, AAsync) = 0 then
+          return false;
+        end;
+        ASig := self.FTree[LType].ResolvedDecl;
+      end;
+      if self.FTree[ASig].HasFlag(NodeFlag.Variadic) then
+        self.DoRefuse(AAsync, "async of a variadic routine's call");
+        return false;
+      end;
+      return true;
+    end;
+
+    // The layout of the object of the task the async expression AAsync starts, its call
+    // running the signature ASig: each part's offset into the object added to AOffsets (the
+    // routine value's first when AIndirect, then each parameter's copy), past the runtime's
+    // words and the result (DoTaskResultOffset); the object's size, a multiple of 8
+    hidden method DoTaskLayout(const AAsync: int64; const ASig: int64; const AIndirect: bool;
+      const AOffsets: ref Int64List): int64;
+    var
+      LResult: int64;
+      LAt: int64;
+      LType: int64;
+      LI: int64;
+    begin
+      LAt := ADAM_LOWERING_TASK_WORDS;
+      LResult := self.FTree[self.FTree[AAsync].ResolvedType].ResolvedType;
+      if LResult <> 0 then
+        LAt := self.DoTaskResultOffset(LResult) + TypeSize(self.FTree, self.FTarget, LResult);
+      end;
+      if AIndirect then
+        LAt := AlignUp(LAt, self.FTarget.PointerAlign());
+        AOffsets.Add(LAt);
+        LAt := LAt + self.FTarget.PointerSize();
+      end;
+      for LI := 0 to self.FTree.CountOf(ASig, NodeRole.Param) - 1 do
+        LType := self.DoDeclType(self.FTree.NthOf(ASig, NodeRole.Param, LI));
+        LAt := AlignUp(LAt, TypeAlign(self.FTree, self.FTarget, LType));
+        AOffsets.Add(LAt);
+        LAt := LAt + TypeSize(self.FTree, self.FTarget, LType);
+      end;
+      return AlignUp(LAt, 8);
+    end;
+
+    // The read-only data of the task descriptor of the async expression AAsync (a ref
+    // descriptor, System.Runtime's layout): the object's size ASize, the runtime's TaskDone
+    // as its done, then the managed map over the object: the raise's text, the result's
+    // values, each parameter's copy's at AOffsets (DoTaskLayout's; the routine value, a code
+    // address, holds none); 0 after LW0001
+    hidden method DoTaskDescriptorData(const AAsync: int64; const ASig: int64; const AIndirect: bool;
+      const AOffsets: ref Int64List; const ASize: int64): int64;
+    var
+      LDone: int64;
+      LRuns: ref Int64List;
+      LWords: ref Int64List;
+      LResult: int64;
+      LFirst: int64;
+      LData: int64;
+      LI: int64;
+    begin
+      LDone := self.DoRuntimeFunction(RuntimeRoutine.TaskDone, AAsync);
+      if LDone = 0 then
+        return 0;
+      end;
+      LRuns := ref Int64List();
+      self.DoAddRun(LRuns, ADAM_LOWERING_TASK_TEXT_OFFSET, 1, self.FTarget.PointerSize(), 0);
+      LResult := self.FTree[self.FTree[AAsync].ResolvedType].ResolvedType;
+      if (LResult <> 0) and (not self.DoManagedRuns(LResult, self.DoTaskResultOffset(LResult), LRuns, AAsync)) then
+        return 0;
+      end;
+      LFirst := 0;
+      if AIndirect then
+        LFirst := 1;
+      end;
+      for LI := 0 to self.FTree.CountOf(ASig, NodeRole.Param) - 1 do
+        if not self.DoManagedRuns(self.DoDeclType(self.FTree.NthOf(ASig, NodeRole.Param, LI)),
+          AOffsets[LFirst + LI], LRuns, AAsync) then
+          return 0;
+        end;
+      end;
+      // the size and the done take the first two words: the map's element words count
+      // from the map's own start, word 2
+      LWords := ref Int64List();
+      LWords.Add(ASize);
+      LWords.Add(0);
+      if not self.DoRunWords(LRuns, AAsync, LWords, ref Int64List()) then
+        return 0;
+      end;
+      LData := self.FModule.AddData(ADAM_LOWERING_TASK_DESCRIPTOR_SYMBOL + IntToStr(self.FModule.DataCount),
+        8, AAsync);
+      self.DoAddLe64(LData, LWords[0]);
+      self.FModule.DataAt(LData).AddAddress(self.FModule.FunctionAt(LDone).Symbol, 0);
+      for LI := 2 to LWords.Count - 1 do
+        self.DoAddLe64(LData, LWords[LI]);
+      end;
+      return LData;
+    end;
+
+    // A new entry function for the async expression AAsync (internal, taking the task's
+    // object: TaskRun's argument); its body (DoTaskBody) is lowered last (DoTaskBodies), as
+    // the lowering of the routine holding AAsync is still under way
+    hidden method DoTaskEntry(const AAsync: int64): int64;
+    var
+      LFunction: int64;
+    begin
+      LFunction := self.FModule.AddFunction(ADAM_LOWERING_TASK_ENTRY_SYMBOL + IntToStr(self.FTaskEntries.Count),
+        IrType.Void, AAsync);
+      self.FModule.FunctionAt(LFunction).Internal := true;
+      self.FModule.FunctionAt(LFunction).Signature.AddParam(IrType.Pointer);
+      self.FTaskEntries.Add(LFunction);
+      self.FTaskNodes.Add(AAsync);
+      return LFunction;
+    end;
+
+    // The argument AArg copied into its parameter's place AAddress in a new task's object
+    // (zeroed by RefNew), as a value of the parameter's canonical type AType: a managed one
+    // with a holder added (DoStoreManaged), an aggregate's bytes (DoAggregateCopy: a holder
+    // added to each value it holds), any other value stored; false after LW0001
+    hidden method DoTaskArgument(const AArg: int64; const AType: int64; const AAddress: int64): bool;
+    var
+      LValue: int64;
+      LSource: int64;
+    begin
+      if self.DoIsManaged(AType) then
+        LValue := self.DoValue(AArg);
+        if LValue = 0 then
+          return false;
+        end;
+        return self.DoStoreManaged(AAddress, LValue, AType, AArg) <> 0;
+      end;
+      if self.DoIsAggregate(AType) then
+        LSource := self.DoAggregateSource(AArg);
+        if LSource = 0 then
+          return false;
+        end;
+        self.DoAggregateCopy(AAddress, LSource, AType, AArg);
+        return true;
+      end;
+      LValue := self.DoValue(AArg);
+      if LValue = 0 then
+        return false;
+      end;
+      self.DoStore(AAddress, LValue, AArg);
+      return true;
+    end;
+
+    // The async expression AId (`async F(..)`, BNF sec 6): a new task block (RefNew with the
+    // call site's task descriptor, DoTaskDescriptorData) kept in AId's hidden slot
+    // (DoTemporaries; what an earlier pass left there released first), its entry
+    // (DoTaskEntry) written into it, for a routine value that value, then each argument
+    // copied into its parameter's place (DoTaskArgument: the caller evaluates and copies
+    // them), then its thread started (TaskStart); that block, 0 after LW0001
+    hidden method DoAsync(const AId: int64): int64;
+    var
+      LCall: int64;
+      LDecl: int64;
+      LSig: int64;
+      LIndirect: bool;
+      LOffsets: ref Int64List;
+      LSize: int64;
+      LData: int64;
+      LDescriptor: int64;
+      LBlock: int64;
+      LSlot: int64;
+      LObject: int64;
+      LEntry: int64;
+      LAddress: int64;
+      LValue: int64;
+      LFirst: int64;
+      LParam: int64;
+      LI: int64;
+    begin
+      if not self.DoAsyncTarget(AId, LCall, LDecl, LSig) then
+        return 0;
+      end;
+      LIndirect := LDecl = 0;
+      LOffsets := ref Int64List();
+      LSize := self.DoTaskLayout(AId, LSig, LIndirect, LOffsets);
+      LData := self.DoTaskDescriptorData(AId, LSig, LIndirect, LOffsets, LSize);
+      if LData = 0 then
+        return 0;
+      end;
+      LDescriptor := self.DoEmit(IrOp.Address, IrType.Pointer, AId);
+      self.FModule.InstrAt(LDescriptor).Link := LData;
+      LBlock := self.DoCallRuntime(RuntimeRoutine.RefNew, LDescriptor, 0, AId);
+      if LBlock = 0 then
+        return 0;
+      end;
+      LSlot := self.DoTempSlot(AId);
+      if not self.DoReleaseAt(LSlot, self.FTree[AId].ResolvedType, AId) then
+        return 0;
+      end;
+      self.DoStore(LSlot, LBlock, AId);
+      LObject := self.DoByteOffset(LBlock, ADAM_LOWERING_REF_HEADER, AId);
+      LEntry := self.DoEmit(IrOp.CodeAddress, IrType.Pointer, AId);
+      self.FModule.InstrAt(LEntry).Link := self.DoTaskEntry(AId);
+      LAddress := self.DoByteOffset(LObject, ADAM_LOWERING_TASK_ENTRY_OFFSET, AId);
+      self.DoStore(LAddress, LEntry, AId);
+      LFirst := 0;
+      if LIndirect then
+        LValue := self.DoValue(self.FTree.FirstOf(LCall, NodeRole.Callee));
+        if LValue = 0 then
+          return 0;
+        end;
+        LAddress := self.DoByteOffset(LObject, LOffsets[0], AId);
+        self.DoStore(LAddress, LValue, AId);
+        LFirst := 1;
+      end;
+      for LI := 0 to self.FTree.CountOf(LSig, NodeRole.Param) - 1 do
+        LParam := self.FTree.NthOf(LSig, NodeRole.Param, LI);
+        LAddress := self.DoByteOffset(LObject, LOffsets[LFirst + LI], AId);
+        if not self.DoTaskArgument(self.FTree.NthOf(LCall, NodeRole.Argument, LI), self.DoDeclType(LParam),
+          LAddress) then
+          return 0;
+        end;
+      end;
+      if self.DoCallRuntime(RuntimeRoutine.TaskStart, LBlock, 0, AId) = 0 then
+        return 0;
+      end;
+      return LBlock;
+    end;
+
+    // The operand a task entry passes for the parameter AParam from its copy at AAddress in
+    // the task's object (DoArgument's forms, the copy standing for the argument): for an
+    // aggregate by copy or a parameter by reference the copy's address (the copy is the
+    // task's own, used by this one call), for an aggregate in a register its bytes loaded as
+    // that register's integer, else its value at its type (a managed one borrowed: the
+    // object holds it); 0 after LW0001
+    hidden method DoTaskOperand(const AParam: int64; const AAddress: int64; const ANode: int64): int64;
+    var
+      LType: int64;
+      LIr: IrType;
+    begin
+      LType := self.DoDeclType(AParam);
+      if self.FByCopy[AParam] or self.FByRef[AParam] then
+        return AAddress;
+      end;
+      if self.DoIsAggregate(LType) then
+        return self.DoLoad(AAddress, self.DoAggregateIr(LType), ANode);
+      end;
+      if self.DoIsManaged(LType) then
+        return self.DoLoad(AAddress, IrType.Pointer, ANode);
+      end;
+      LIr := self.DoTypeAt(LType, ANode);
+      if LIr = IrType.Void then
+        return 0;
+      end;
+      return self.DoLoad(AAddress, LIr, ANode);
+    end;
+
+    // The result AId of the call ACall in the entry of the async expression AAsync stored
+    // into the result place of the task's object AObject (DoTaskResultOffset) as a value of
+    // the result type: a managed one from the call's temporary with a holder added
+    // (DoStoreManaged; the temporary is released at the entry's exit), an aggregate from the
+    // call's result slot (DoAggregateCopy), any other the call's value; nothing for a plain
+    // task; false after LW0001
+    hidden method DoTaskResult(const AAsync: int64; const ACall: int64; const AObject: int64;
+      const AId: int64): bool;
+    var
+      LResult: int64;
+      LAddress: int64;
+      LValue: int64;
+    begin
+      LResult := self.FTree[self.FTree[AAsync].ResolvedType].ResolvedType;
+      if LResult = 0 then
+        return true;
+      end;
+      LAddress := self.DoByteOffset(AObject, self.DoTaskResultOffset(LResult), AAsync);
+      if self.DoIsManaged(LResult) then
+        LValue := self.DoLoad(self.DoTempSlot(ACall), IrType.Pointer, AAsync);
+        return self.DoStoreManaged(LAddress, LValue, LResult, AAsync) <> 0;
+      end;
+      if self.DoIsAggregate(LResult) then
+        if self.FSlotOf[ACall] = 0 then
+          raise(ADAM_LOWERING_FAULT_CALL_RESULT + self.FTree.ConstructText(ACall));
+        end;
+        self.DoAggregateCopy(LAddress, self.FSlotOf[ACall], LResult, AAsync);
+        return true;
+      end;
+      self.DoStore(LAddress, AId, AAsync);
+      return true;
+    end;
+
+    // The body of the entry of the async expression AAsync (DoTaskEntry): the task's object
+    // (its one parameter), each parameter's operand made from its copy there
+    // (DoTaskOperand), the call (of its routine, its external, or through the routine value
+    // copied there), its result stored (DoTaskResult), the entry's managed slots released,
+    // the return. A raise of the call leaves it for TaskRun's catching scope
+    hidden method DoTaskBody(const AAsync: int64);
+    var
+      LCall: int64;
+      LDecl: int64;
+      LSig: int64;
+      LIndirect: bool;
+      LOffsets: ref Int64List;
+      LObject: int64;
+      LArgs: ref Int64List;
+      LTarget: int64;
+      LAddress: int64;
+      LFirst: int64;
+      LOperand: int64;
+      LKind: IrOp;
+      LLink: int64;
+      LIrResult: IrType;
+      LId: int64;
+      LI: int64;
+    begin
+      if not self.DoAsyncTarget(AAsync, LCall, LDecl, LSig) then
+        return;
+      end;
+      LIndirect := LDecl = 0;
+      LOffsets := ref Int64List();
+      self.DoTaskLayout(AAsync, LSig, LIndirect, LOffsets);
+      LObject := self.DoEmit(IrOp.Parameter, IrType.Pointer, AAsync);
+      self.FModule.InstrAt(LObject).Imm := 0;
+      // the call's managed result lands in a temporary of the entry (DoEmitCall)
+      if self.DoIsManagedCall(LCall) then
+        self.DoResultTemporary(LCall);
+      end;
+      LFirst := 0;
+      LTarget := 0;
+      if LIndirect then
+        LAddress := self.DoByteOffset(LObject, LOffsets[0], AAsync);
+        LTarget := self.DoLoad(LAddress, IrType.Pointer, AAsync);
+        LFirst := 1;
+      end;
+      LArgs := ref Int64List();
+      for LI := 0 to self.FTree.CountOf(LSig, NodeRole.Param) - 1 do
+        LAddress := self.DoByteOffset(LObject, LOffsets[LFirst + LI], AAsync);
+        LOperand := self.DoTaskOperand(self.FTree.NthOf(LSig, NodeRole.Param, LI), LAddress, AAsync);
+        if LOperand = 0 then
+          return;
+        end;
+        LArgs.Add(LOperand);
+      end;
+      if LIndirect then
+        LKind := IrOp.CallIndirect;
+        LLink := self.DoSignatureOf(self.FTree[self.FTree.FirstOf(LCall, NodeRole.Callee)].ResolvedType, AAsync);
+        if LLink = 0 then
+          return;
+        end;
+        LIrResult := self.FModule.SignatureAt(LLink).ResultType;
+      else
+        if self.FTree.FirstOf(LDecl, NodeRole.External) <> 0 then
+          LKind := IrOp.CallExternal;
+          LLink := self.DoExternal(LDecl);
+          if LLink = 0 then
+            return;
+          end;
+          LIrResult := self.FModule.ExternalAt(LLink).Signature.ResultType;
+        else
+          LKind := IrOp.Call;
+          LLink := self.FFunctionOf[LDecl];
+          if LLink = 0 then
+            return;
+          end;
+          LIrResult := self.FModule.FunctionAt(LLink).Signature.ResultType;
+        end;
+      end;
+      LId := self.DoEmitCallWith(LCall, LSig, LKind, LLink, LIrResult, LTarget, 0, LArgs);
+      if LId = 0 then
+        return;
+      end;
+      if not self.DoTaskResult(AAsync, LCall, LObject, LId) then
+        return;
+      end;
+      self.DoReleaseManaged(AAsync);
+      if not self.DoEnded() then
+        self.DoEmit(IrOp.Ret, IrType.Void, AAsync);
+      end;
+    end;
+
+    // Every task entry's body (DoTaskEntry's functions, DoTaskBody), each in a fresh
+    // function state
+    hidden method DoTaskBodies();
+    var
+      LI: int64;
+    begin
+      for LI := 0 to self.FTaskEntries.Count - 1 do
+        self.FFunction := self.FTaskEntries[LI];
+        self.FBlock := self.FModule.AddBlock(self.FFunction);
+        self.DoStartManaged();
+        self.DoTaskBody(self.FTaskNodes[LI]);
+      end;
+    end;
+
+    // The task the await expression AId waits for (its operand's value, borrowed: its holder
+    // keeps it), once TaskAwait has returned (its call ended; a raise it ended with is
+    // raised again there); 0 after LW0001
+    hidden method DoAwaitBlock(const AId: int64): int64;
+    var
+      LBlock: int64;
+    begin
+      LBlock := self.DoValue(self.FTree.FirstOf(AId, NodeRole.Operand));
+      if LBlock = 0 then
+        return 0;
+      end;
+      if self.DoCallRuntime(RuntimeRoutine.TaskAwait, LBlock, 0, AId) = 0 then
+        return 0;
+      end;
+      return LBlock;
+    end;
+
+    // The address of the result of the task the await expression AId waits for
+    // (DoAwaitBlock): in its object, at DoTaskResultOffset of AId's type; 0 after LW0001
+    hidden method DoAwaitResult(const AId: int64): int64;
+    var
+      LBlock: int64;
+    begin
+      LBlock := self.DoAwaitBlock(AId);
+      if LBlock = 0 then
+        return 0;
+      end;
+      return self.DoByteOffset(LBlock,
+        ADAM_LOWERING_REF_HEADER + self.DoTaskResultOffset(self.FTree[AId].ResolvedType), AId);
+    end;
+
+    // The value of the await expression AId (BNF sec 6) that is no managed value: a plain
+    // task's (a statement: the wait alone, TaskAwait's call standing for it), else its
+    // result read at its type (DoAwaitResult); 0 after LW0001
+    hidden method DoAwaitValue(const AId: int64): int64;
+    var
+      LAddress: int64;
+      LIr: IrType;
+    begin
+      if self.FTree[AId].ResolvedType = 0 then
+        return self.DoAwaitBlock(AId);
+      end;
+      LIr := self.DoTypeAt(self.FTree[AId].ResolvedType, AId);
+      if LIr = IrType.Void then
+        return 0;
+      end;
+      LAddress := self.DoAwaitResult(AId);
+      if LAddress = 0 then
+        return 0;
+      end;
+      return self.DoLoad(LAddress, LIr, AId);
+    end;
+
+    // The managed result of the await expression AId (a text, a dynamic array, a ref or a
+    // task: DoIsManaged), borrowed: read from the task's object (DoAwaitResult), which holds
+    // it as long as the task does; 0 after LW0001
+    hidden method DoAwaitManaged(const AId: int64): int64;
+    var
+      LAddress: int64;
+    begin
+      LAddress := self.DoAwaitResult(AId);
+      if LAddress = 0 then
+        return 0;
+      end;
+      return self.DoLoad(LAddress, IrType.Pointer, AId);
+    end;
+
+    // ready(T) (BNF sec 7): TaskReady on the task's value (borrowed); its bool, 0 after
+    // LW0001
+    hidden method DoReady(const ACall: int64): int64;
+    var
+      LBlock: int64;
+    begin
+      LBlock := self.DoValue(self.FTree.NthOf(ACall, NodeRole.Argument, 0));
+      if LBlock = 0 then
+        return 0;
+      end;
+      return self.DoCallRuntime(RuntimeRoutine.TaskReady, LBlock, 0, ACall);
     end;
 
     // The address of the object the ref AOperand holds (its value, borrowed: the holder
@@ -5615,6 +6163,10 @@ public type
         if (LDecl <> 0) and (self.FTree[LDecl].Kind = NodeKind.IntrinsicDecl) and
           DoIsAtomicIntrinsic(self.FTree[LDecl].Text) then
           return self.DoAtomic(ACall, self.FTree[LDecl].Text);
+        end;
+        if (LDecl <> 0) and (self.FTree[LDecl].Kind = NodeKind.IntrinsicDecl) and
+          (self.FTree[LDecl].Text = "ready") then
+          return self.DoReady(ACall);
         end;
         LDecl := self.DoCalled(LCallee);
       end;
@@ -7139,6 +7691,9 @@ public type
       LKind := self.FTree[AId].Kind;
       if LKind = NodeKind.ParenExpression then
         return self.DoValue(self.FTree.FirstOf(AId, NodeRole.Operand));
+      end;
+      if LKind = NodeKind.AwaitExpression then
+        return self.DoAwaitValue(AId);
       end;
       // A typed pack's read (before the place and call forms its member and call look like)
       if self.DoIsPackAccess(AId) then
@@ -9812,6 +10367,8 @@ public type
       else
         self.DoEntryInits();
       end;
+      // the task entries first: an end function one of them asks for is lowered after
+      self.DoTaskBodies();
       self.DoEndBodies();
     end;
   end;

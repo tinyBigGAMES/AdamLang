@@ -1629,6 +1629,166 @@ begin
   FreeMem(AThread);
 end;
 
+const
+  // A task's object (BNF sec 4 task type: the part of its ref block past the header, its
+  // descriptor the compiler's per call site, its done TaskDone) as words: the thread running
+  // its call (ptr, ThreadStart's; nil when none could start), its state (int64: one of the
+  // ADAM_RUNTIME_TASK_* states, written last by the call's thread, atomically), whether it
+  // was joined (int64: 1 once an await or its last release joined it), the code of the raise
+  // its call ended with (int64), that raise's text (a string value it holds one reference
+  // to: the descriptor's map releases it), its entry (ptr: the compiler's routine of one
+  // pointer for the call site, which reads the call's arguments from the object, runs the
+  // call and stores its result there), then the compiler's words: the arguments' copies and
+  // the result, from word 6 on
+  ADAM_RUNTIME_TASK_THREAD: int64 = 0;
+  ADAM_RUNTIME_TASK_STATE: int64 = 1;
+  ADAM_RUNTIME_TASK_JOINED: int64 = 2;
+  ADAM_RUNTIME_TASK_CODE: int64 = 3;
+  ADAM_RUNTIME_TASK_TEXT: int64 = 4;
+  ADAM_RUNTIME_TASK_ENTRY: int64 = 5;
+  // A task's states: its call still running, ended with its result stored, ended by a raise
+  ADAM_RUNTIME_TASK_RUNNING: int64 = 0;
+  ADAM_RUNTIME_TASK_ENDED: int64 = 1;
+  ADAM_RUNTIME_TASK_RAISED: int64 = 2;
+
+// The object of the task ABlock (a non-nil task value: its ref block), past the header
+routine TaskObject(const ABlock: ptr): ptr;
+var
+  LBytes: ptr to uint8;
+begin
+  LBytes := ptr to uint8(ABlock);
+  return addr of LBytes[24];
+end;
+
+// A task's thread (ThreadStart runs it with the task's object AObject): its entry called
+// inside a catching scope of its own; it ends with its state, ENDED once the entry has
+// stored the result, or RAISED with the raise's code and text kept (a reference added: the
+// raise in flight is the thread's own, released as it ends)
+routine TaskRun(const AObject: ptr);
+var
+  LWords: ptr to int64;
+  LSlots: ptr to ptr;
+  LEntry: ThreadEntry;
+begin
+  LWords := ptr to int64(AObject);
+  LSlots := ptr to ptr(AObject);
+  LEntry := ThreadEntry(LSlots[ADAM_RUNTIME_TASK_ENTRY]);
+  guard
+    LEntry(AObject);
+    atomicstore(LWords[ADAM_RUNTIME_TASK_STATE], ADAM_RUNTIME_TASK_ENDED);
+  except
+    StrAddRef(GRaiseText);
+    LSlots[ADAM_RUNTIME_TASK_TEXT] := GRaiseText;
+    LWords[ADAM_RUNTIME_TASK_CODE] := int64(GRaiseCode);
+    atomicstore(LWords[ADAM_RUNTIME_TASK_STATE], ADAM_RUNTIME_TASK_RAISED);
+  end;
+end;
+
+// `async F(..)`'s start, once the compiler has filled the new task ABlock (its entry, the
+// arguments' copies): its thread started (TaskRun). A thread that cannot be started ends the
+// task at once as if its call had raised (code 1, the text saying so), so its await raises
+// that; nothing else changes
+routine TaskStart(const ABlock: ptr);
+var
+  LObject: ptr;
+  LWords: ptr to int64;
+  LSlots: ptr to ptr;
+  LThread: ptr;
+begin
+  LObject := TaskObject(ABlock);
+  LWords := ptr to int64(LObject);
+  LSlots := ptr to ptr(LObject);
+  LThread := ThreadStart(TaskRun, LObject);
+  if LThread = nil then
+    LSlots[ADAM_RUNTIME_TASK_TEXT] := TextOfC(ptr to const char("a task's thread could not be started"));
+    LWords[ADAM_RUNTIME_TASK_CODE] := 1;
+    atomicstore(LWords[ADAM_RUNTIME_TASK_STATE], ADAM_RUNTIME_TASK_RAISED);
+    return;
+  end;
+  LSlots[ADAM_RUNTIME_TASK_THREAD] := LThread;
+end;
+
+// The task object AObject's thread joined once: the caller that sets its JOINED word first
+// joins the thread (ThreadJoin, which frees its handle); any other waits until the call's
+// thread has written its state
+routine TaskJoin(const AObject: ptr);
+var
+  LWords: ptr to int64;
+  LSlots: ptr to ptr;
+begin
+  LWords := ptr to int64(AObject);
+  LSlots := ptr to ptr(AObject);
+  if atomicswap(LWords[ADAM_RUNTIME_TASK_JOINED], 1) = 0 then
+    ThreadJoin(LSlots[ADAM_RUNTIME_TASK_THREAD]);
+    return;
+  end;
+  while atomicload(LWords[ADAM_RUNTIME_TASK_STATE]) = ADAM_RUNTIME_TASK_RUNNING do
+    PlatformSleep(1);
+  end;
+end;
+
+// `await T` (BNF sec 6): waits for the call of the task ABlock to end, then raises again
+// what it raised (its code and text, a reference added for the new raise); returns when it
+// ended with its result, which the compiler then reads from the object. A nil task raises
+// (code 1)
+routine TaskAwait(const ABlock: ptr);
+var
+  LObject: ptr;
+  LWords: ptr to int64;
+  LSlots: ptr to ptr;
+begin
+  if ABlock = nil then
+    RaiseWith(1, TextOfC(ptr to const char("await of a nil task")));
+  end;
+  LObject := TaskObject(ABlock);
+  LWords := ptr to int64(LObject);
+  LSlots := ptr to ptr(LObject);
+  TaskJoin(LObject);
+  if LWords[ADAM_RUNTIME_TASK_STATE] = ADAM_RUNTIME_TASK_RAISED then
+    StrAddRef(LSlots[ADAM_RUNTIME_TASK_TEXT]);
+    RaiseWith(int32(LWords[ADAM_RUNTIME_TASK_CODE]), LSlots[ADAM_RUNTIME_TASK_TEXT]);
+  end;
+end;
+
+// `ready(T)` (BNF sec 7): true once the call of the task ABlock has ended (its result
+// stored, or raised), without waiting; false for a nil task
+routine TaskReady(const ABlock: ptr): bool;
+var
+  LWords: ptr to int64;
+begin
+  if ABlock = nil then
+    return false;
+  end;
+  LWords := ptr to int64(TaskObject(ABlock));
+  return atomicload(LWords[ADAM_RUNTIME_TASK_STATE]) <> ADAM_RUNTIME_TASK_RUNNING;
+end;
+
+// A task's done (its descriptor's: RefRelease runs it on the object AObject as the last
+// handle goes; the descriptor's map then releases the text, the arguments and the result).
+// A task never awaited (its JOINED word still 0: no handle is left, so no await can be
+// under way) is joined here (BNF sec 4: its last release waits for its thread); if its
+// call raised, the program ends as on a raise nothing caught (Unhandled, with that raise's
+// code and text)
+routine TaskDone(const AObject: ptr);
+var
+  LWords: ptr to int64;
+  LSlots: ptr to ptr;
+begin
+  LWords := ptr to int64(AObject);
+  LSlots := ptr to ptr(AObject);
+  if LWords[ADAM_RUNTIME_TASK_JOINED] <> 0 then
+    return;
+  end;
+  TaskJoin(AObject);
+  if LWords[ADAM_RUNTIME_TASK_STATE] = ADAM_RUNTIME_TASK_RAISED then
+    StrAddRef(LSlots[ADAM_RUNTIME_TASK_TEXT]);
+    StrRelease(GRaiseText);
+    GRaiseText := LSlots[ADAM_RUNTIME_TASK_TEXT];
+    GRaiseCode := int32(LWords[ADAM_RUNTIME_TASK_CODE]);
+    Unhandled();
+  end;
+end;
+
 // A new lock, free, from the heap (counted: LockFree gives it back), or nil when there is
 // no room. One thread holds it at a time: LockEnter waits until it is free. It is not
 // recursive (a thread entering a lock it holds waits forever). It is the OS's own lock, its
