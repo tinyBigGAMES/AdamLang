@@ -427,7 +427,8 @@ public type
     // releases its FManaged at an exit (DoExitBlock): outside its cleanup scopes
     hidden FExitBlocks: ref Int64List;
     // The current function's protected regions being lowered, the innermost last (a guard
-    // with a finally: its body and its except part), whose cleanup a jump out of one runs
+    // with a finally: its body and its except part; a lock's or a taken trylock's
+    // statements: DoLock), whose cleanup (DoRegionCleanup) a jump out of one runs
     // on its way (DoJumpOut); and the jumps out of them waiting for their pads
     // (DoClosePads): by index, the jump, its target (a block, or ADAM_LOWERING_RETURN_PAD),
     // the loop or match it leaves (0: a return) and the depth in FRegions of the region it
@@ -1896,9 +1897,10 @@ public type
     // address, never an SSA value: a record or an overlay (DoIsFieldAggregate), a static
     // array, whose elements sit one after another at its element's size (Layout), or a set
     // (one bit per member, bit i member low + i: Layout.SetRange; its operations work lane
-    // by lane, DoSetLanes). Such a variable starts zeroed, as every variable without an
-    // initializer does here (a record or an overlay by BNF sec 4; a set empty), and a copy
-    // of it copies its bytes (DoCopyBytes)
+    // by lane, DoSetLanes), or a mutex (System.Runtime's words, reached by the address
+    // lock / trylock hand the runtime; never copied: SEM's SM0621). Such a variable starts
+    // zeroed, as every variable without an initializer does here (a record or an overlay by
+    // BNF sec 4; a set empty; a mutex free), and a copy of it copies its bytes (DoCopyBytes)
     hidden const method DoIsAggregate(const AType: int64): bool;
     var
       LClass: TypeClass;
@@ -1910,7 +1912,8 @@ public type
         return true;
       end;
       LClass := ClassOf(self.FTree, AType);
-      return (LClass = TypeClass.StaticArray) or (LClass = TypeClass.SetType);
+      return (LClass = TypeClass.StaticArray) or (LClass = TypeClass.SetType) or
+        (LClass = TypeClass.Mutex);
     end;
 
     // The byte offset of the field AField from the start of the record or overlay AType: a
@@ -8249,6 +8252,10 @@ public type
         self.DoGuard(AId);
         return true;
       end;
+      if (LKind = NodeKind.LockStatement) or (LKind = NodeKind.TryLockStatement) then
+        self.DoLock(AId);
+        return true;
+      end;
       return false;
     end;
 
@@ -8804,10 +8811,132 @@ public type
     end;
 
     // The cleanup of the protected region ANode, lowered where the current block is: a
-    // guard's finally statements
+    // guard's finally statements; a lock's or a taken trylock's MutexLeave of the mutex
+    // whose address DoLock kept (FSlotOf[ANode]: in a funclet, the parent's slot)
     hidden method DoRegionCleanup(const ANode: int64);
+    var
+      LAddress: int64;
     begin
+      if (self.FTree[ANode].Kind = NodeKind.LockStatement) or
+        (self.FTree[ANode].Kind = NodeKind.TryLockStatement) then
+        LAddress := self.DoLoad(self.FSlotOf[ANode], IrType.Pointer, ANode);
+        if self.DoCallRuntime(RuntimeRoutine.MutexLeave, LAddress, 0, ANode) = 0 then
+          return;
+        end;
+        return;
+      end;
       self.DoStatements(ANode, NodeRole.Finally);
+    end;
+
+    // The lock / trylock statement AId (BNF sec 5): its mutex's address read once into a
+    // slot (FSlotOf[AId]: the subject may name an element whose index the statements
+    // change); lock: MutexEnter, trylock: MutexTryEnter with its wait (none: 0, one try),
+    // then a branch to the statements when taken, else to the else statements (made before
+    // the statements, so no scope of the region covers them). The statements are a
+    // protected region (DoEnterRegion) whose cleanup is the MutexLeave (DoRegionCleanup):
+    // where they fall through, in a block after them; on a return, leave or skip, in their
+    // pads (DoClosePads); on an unwind, in a funclet (DoFinallyFunclet) the scope over their
+    // blocks names. LW0001 inside a guard's finally (a funclet's funclet would reach two
+    // frames), and with no frame handler
+    hidden method DoLock(const AId: int64);
+    var
+      LFunction: ref IrFunction;
+      LHandler: int64;
+      LTry: bool;
+      LAddress: int64;
+      LSlot: int64;
+      LLimit: int64;
+      LWait: int64;
+      LTaken: int64;
+      LElse: int64;
+      LBody: int64;
+      LFirst: int64;
+      LLast: int64;
+      LBodyFalls: bool;
+      LBodyEnd: int64;
+      LRelease: int64;
+      LJoin: int64;
+      LFunclet: int64;
+    begin
+      LFunction := self.FModule.FunctionAt(self.FFunction);
+      if LFunction.Parent <> 0 then
+        self.DoRefuse(AId, self.FTree.ConstructPhrase(AId) + " inside a guard's finally");
+        return;
+      end;
+      LHandler := self.DoRuntimeFunction(RuntimeRoutine.FrameHandler, AId);
+      if LHandler = 0 then
+        return;
+      end;
+      LTry := self.FTree[AId].Kind = NodeKind.TryLockStatement;
+      LAddress := self.DoAddressFor(self.FTree.FirstOf(AId, NodeRole.Subject), true);
+      if LAddress = 0 then
+        return;
+      end;
+      LSlot := self.DoSizedSlot(AId, self.FTarget.PointerSize(), self.FTarget.PointerAlign());
+      self.FSlotOf[AId] := LSlot;
+      self.DoStore(LSlot, LAddress, AId);
+      LElse := 0;
+      if LTry then
+        LLimit := self.FTree.FirstOf(AId, NodeRole.Limit);
+        if LLimit <> 0 then
+          LWait := self.DoValue(LLimit);
+          if LWait = 0 then
+            return;
+          end;
+        else
+          LWait := self.DoConstant(IrType.Int64, 0, AId);
+        end;
+        LTaken := self.DoCallRuntime(RuntimeRoutine.MutexTryEnter, LAddress, LWait, AId);
+        if LTaken = 0 then
+          return;
+        end;
+      else
+        if self.DoCallRuntime(RuntimeRoutine.MutexEnter, LAddress, 0, AId) = 0 then
+          return;
+        end;
+      end;
+      // A jump out of the statements lets go of the mutex on its way (DoJumpOut)
+      self.DoEnterRegion(AId);
+      // The else block first: the statements' range starts at their own first block
+      if LTry then
+        LElse := self.FModule.AddBlock(self.FFunction);
+      end;
+      LBody := self.FModule.AddBlock(self.FFunction);
+      if LTry then
+        self.DoBranchOn(LTaken, LBody, LElse, AId);
+      else
+        self.DoJumpTo(LBody, AId);
+      end;
+      // The statements' blocks run from their own first block to the last one they made
+      self.FBlock := LBody;
+      LFirst := LFunction.Blocks.Count - 1;
+      self.DoStatements(AId, NodeRole.Statement);
+      LLast := LFunction.Blocks.Count - 1;
+      LBodyFalls := not self.DoEnded();
+      LBodyEnd := self.FBlock;
+      // Where the statements fall through: the let go, then the code after the statement
+      LRelease := self.FModule.AddBlock(self.FFunction);
+      if LBodyFalls then
+        self.FBlock := LBodyEnd;
+        self.DoJumpTo(LRelease, AId);
+      end;
+      self.FBlock := LRelease;
+      self.DoClosePads(AId);
+      self.DoRegionCleanup(AId);
+      LJoin := self.FModule.AddBlock(self.FFunction);
+      self.DoJumpTo(LJoin, AId);
+      if LTry then
+        self.FBlock := LElse;
+        self.DoStatements(AId, NodeRole.Else);
+        if not self.DoEnded() then
+          self.DoJumpTo(LJoin, AId);
+        end;
+      end;
+      // Added after every scope inside the statements: the innermost comes first
+      LFunclet := self.DoFinallyFunclet(AId);
+      LFunction.AddScope(LFirst, LLast, LFunclet, -1);
+      self.FModule.FrameHandler := LHandler;
+      self.FBlock := LJoin;
     end;
 
     // A return's tail after its last pad, at ANode: the managed slots released, then the
@@ -8945,7 +9074,8 @@ public type
       self.FModule.FrameHandler := LHandler;
     end;
 
-    // The finally statements of the guard AId as a funclet of the current function (IR
+    // The cleanup of the protected region AId (DoRegionCleanup: a guard's finally
+    // statements, a lock's MutexLeave) as a funclet of the current function (IR
     // Parent: it runs in this function's frame, reached through its frame parameter): an
     // internal function (uint8, ptr): void, its symbol the parent's and
     // ADAM_LOWERING_FINALLY_SYMBOL with its id, the statements lowered into it as they are
@@ -8996,7 +9126,7 @@ public type
       self.FModule.InstrAt(LFrame).Imm := 1;
       LFunction.FrameValue := LFrame;
       self.DoStartManaged();
-      self.DoStatements(AId, NodeRole.Finally);
+      self.DoRegionCleanup(AId);
       if not self.DoEnded() then
         self.DoReleaseManaged(AId);
         self.DoEmit(IrOp.Ret, IrType.Void, AId);

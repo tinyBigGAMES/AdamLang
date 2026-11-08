@@ -77,6 +77,20 @@ threadstatic
   // the thread ends (ThreadEnded; the main one's at Halt)
   GRaiseCode: int32;
   GRaiseText: ptr;
+  // This thread's mark: its address names the thread as a mutex's owner (MutexWords.Owner),
+  // no OS call needed; never read or written
+  GMutexSelf: uint8;
+
+type
+  // A mutex's bytes (BNF sec 4; the target lays out ADAM_TARGET_*_MUTEX_SIZE / _ALIGN as
+  // this record): State 0 free, 1 held, 2 held with a thread waiting (or that may be);
+  // Count the times its owner took it (recursive); Owner the owner's mark (GMutexSelf's
+  // address), nil while free. All zero is free: a mutex needs no init
+  MutexWords = record
+    State: int32;
+    Count: int32;
+    Owner: ptr;
+  end;
 
 // Writes the ACount bytes at AText to stdout as they are
 routine WriteText(const AText: ptr; const ACount: int64);
@@ -1829,6 +1843,100 @@ begin
   end;
   PlatformLockDone(ALock);
   FreeMem(ALock);
+end;
+
+// Takes the mutex state at AWords: 0 to 1 when it is free; else it is marked 2 (a thread
+// may wait, so whoever lets go wakes one) and this thread sleeps on it until it is free, up
+// to AMilliseconds (negative: no end, 0: the one try). True when taken. The state is left 2
+// after a timeout: the next let go wakes a thread for nothing, which reads it again
+routine DoMutexTake(const AWords: ptr to MutexWords; const AMilliseconds: int64): bool;
+var
+  LStart: int64;
+  LLeft: int64;
+begin
+  if atomiccas(AWords^.State, 0, 1) then
+    return true;
+  end;
+  if AMilliseconds = 0 then
+    return false;
+  end;
+  LStart := PlatformMilliseconds();
+  // Swapped to 2 and it was 0: free, taken (as held with a waiter, the safe side)
+  while atomicswap(AWords^.State, 2) <> 0 do
+    if AMilliseconds < 0 then
+      PlatformWaitWord(addr of AWords^.State, 2, -1);
+    else
+      LLeft := AMilliseconds - (PlatformMilliseconds() - LStart);
+      if LLeft <= 0 then
+        return false;
+      end;
+      PlatformWaitWord(addr of AWords^.State, 2, LLeft);
+    end;
+  end;
+  return true;
+end;
+
+// lock (BNF sec 5): holds the mutex at AMutex (MutexWords), waiting while another thread
+// holds it; the thread holding it takes it again (its count)
+routine MutexEnter(const AMutex: ptr);
+var
+  LWords: ptr to MutexWords;
+  LSelf: ptr;
+begin
+  LWords := ptr to MutexWords(AMutex);
+  LSelf := addr of GMutexSelf;
+  // Only this thread ever writes its own mark there, so a match is never stale
+  if atomicload(LWords^.Owner) = LSelf then
+    LWords^.Count := LWords^.Count + 1;
+    return;
+  end;
+  DoMutexTake(LWords, -1);
+  atomicstore(LWords^.Owner, LSelf);
+  LWords^.Count := 1;
+end;
+
+// trylock (BNF sec 5): holds the mutex at AMutex when it can, trying once (AMilliseconds
+// 0 or less) or waiting up to AMilliseconds; true when held (taken again by the thread
+// holding it, as MutexEnter)
+routine MutexTryEnter(const AMutex: ptr; const AMilliseconds: int64): bool;
+var
+  LWords: ptr to MutexWords;
+  LSelf: ptr;
+  LWait: int64;
+begin
+  LWords := ptr to MutexWords(AMutex);
+  LSelf := addr of GMutexSelf;
+  if atomicload(LWords^.Owner) = LSelf then
+    LWords^.Count := LWords^.Count + 1;
+    return true;
+  end;
+  LWait := AMilliseconds;
+  if LWait < 0 then
+    LWait := 0;
+  end;
+  if not DoMutexTake(LWords, LWait) then
+    return false;
+  end;
+  atomicstore(LWords^.Owner, LSelf);
+  LWords^.Count := 1;
+  return true;
+end;
+
+// The end of a lock's or a taken trylock's statements (every way out): the mutex at AMutex,
+// which this thread holds, let go once; free after its last take, a waiting thread woken
+routine MutexLeave(const AMutex: ptr);
+var
+  LWords: ptr to MutexWords;
+begin
+  LWords := ptr to MutexWords(AMutex);
+  LWords^.Count := LWords^.Count - 1;
+  if LWords^.Count > 0 then
+    return;
+  end;
+  atomicstore(LWords^.Owner, nil);
+  if atomicswap(LWords^.State, 0) = 2 then
+    PlatformWakeWord(addr of LWords^.State);
+  end;
 end;
 
 // paramcount(): the number of command-line arguments after the program's name

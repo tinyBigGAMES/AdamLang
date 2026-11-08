@@ -123,6 +123,9 @@ public const
   ADAM_SEMANTICS_RUNTIME_TASK_AWAIT: string = "TaskAwait";
   ADAM_SEMANTICS_RUNTIME_TASK_READY: string = "TaskReady";
   ADAM_SEMANTICS_RUNTIME_TASK_DONE: string = "TaskDone";
+  ADAM_SEMANTICS_RUNTIME_MUTEX_ENTER: string = "MutexEnter";
+  ADAM_SEMANTICS_RUNTIME_MUTEX_TRY_ENTER: string = "MutexTryEnter";
+  ADAM_SEMANTICS_RUNTIME_MUTEX_LEAVE: string = "MutexLeave";
   // The platform unit's routines (Target.RuntimeUnit, imported by the runtime unit): the one
   // the OS calls for a frame whose unwind data holds a scope table, the entry's catching
   // scope's filter, and the one the OS calls as a thread starts and ends
@@ -240,6 +243,8 @@ public const
   ADAM_ERR_SEMANTICS_611: string = "SM0611";   // return with a value where the routine returns none
   ADAM_ERR_SEMANTICS_612: string = "SM0612";   // a routine with a result can reach its end without return
   ADAM_ERR_SEMANTICS_613: string = "SM0613";   // a range label in a string match
+  ADAM_ERR_SEMANTICS_620: string = "SM0620";   // a lock / trylock subject that is no mutex place
+  ADAM_ERR_SEMANTICS_621: string = "SM0621";   // a value holding a mutex copied or assigned
   ADAM_ERR_SEMANTICS_700: string = "SM0700";   // a threadstatic variable external, given init arguments or of an object / interface value
   ADAM_ERR_SEMANTICS_701: string = "SM0701";   // async of something that is no call of a routine
   ADAM_ERR_SEMANTICS_702: string = "SM0702";   // async of a call passing a var parameter
@@ -2531,6 +2536,12 @@ public type
         self.DoWritten(LTarget);
       end;
       self.DoSetType(AId, LType);
+      // A mutex is never assigned (a lock would be copied with it): SM0621
+      if HoldsMutex(self.FTree, LType) then
+        self.DoError(LTarget, ADAM_ERR_SEMANTICS_621, ADAM_MSG_SEMANTICS_MUTEX_ASSIGN,
+          NoArgs().Str(self.DoExprText(LTarget)).Str(self.DoText(LType)));
+        return;
+      end;
       if self.FTree[AId].Op = OperatorKind.Assign then
         self.DoPackSource(LSource, LType);
         LField := self.DoBitfieldIn(LTarget);
@@ -4535,6 +4546,12 @@ public type
         self.DoRuntimeRoutine(ADAM_SEMANTICS_RUNTIME_TASK_READY));
       self.FTree.SetRuntimeRoutine(RuntimeRoutine.TaskDone,
         self.DoRuntimeRoutine(ADAM_SEMANTICS_RUNTIME_TASK_DONE));
+      self.FTree.SetRuntimeRoutine(RuntimeRoutine.MutexEnter,
+        self.DoRuntimeRoutine(ADAM_SEMANTICS_RUNTIME_MUTEX_ENTER));
+      self.FTree.SetRuntimeRoutine(RuntimeRoutine.MutexTryEnter,
+        self.DoRuntimeRoutine(ADAM_SEMANTICS_RUNTIME_MUTEX_TRY_ENTER));
+      self.FTree.SetRuntimeRoutine(RuntimeRoutine.MutexLeave,
+        self.DoRuntimeRoutine(ADAM_SEMANTICS_RUNTIME_MUTEX_LEAVE));
     end;
 
     // The runtime routine the intrinsic AName runs (DoIntrinsic writes it into the call's
@@ -5308,6 +5325,11 @@ public type
       if LInit <> 0 then
         self.DoConvert(LInit, LType);
         self.DoPackSource(LInit, LType);
+        // A mutex starts free (all zero) and is never copied in: no initializer (SM0621)
+        if (LType <> 0) and HoldsMutex(self.FTree, LType) then
+          self.DoError(LInit, ADAM_ERR_SEMANTICS_621, ADAM_MSG_SEMANTICS_MUTEX_INIT,
+            NoArgs().Str(self.FTree[AId].Text).Str(self.DoText(LType)));
+        end;
       end;
       if self.FTree[AId].HasFlag(NodeFlag.ThreadStatic) then
         self.DoThreadStatic(AId, LType, LInit);
@@ -5364,12 +5386,18 @@ public type
 
     // A parameter or a field: its type; a value parameter or a field holds its value, so
     // an interface or an abstract object there is SM0338 (a var / const parameter reaches
-    // one by reference)
+    // one by reference). A parameter whose type holds a mutex is var only (SM0621: a mutex
+    // is never copied, and a plain routine's const one is a copy)
     hidden method DoHeldDecl(const AId: int64);
     var
       LType: int64;
     begin
       LType := self.DoDeclType(AId);
+      if (LType <> 0) and (self.FTree[AId].Kind = NodeKind.Param) and
+        (not self.FTree[AId].HasFlag(NodeFlag.VarParam)) and HoldsMutex(self.FTree, LType) then
+        self.DoError(AId, ADAM_ERR_SEMANTICS_621, ADAM_MSG_SEMANTICS_MUTEX_PARAM,
+          NoArgs().Str(self.FTree[AId].Text).Str(self.DoText(LType)));
+      end;
       if (LType = 0) or self.FTree[AId].HasFlag(NodeFlag.VarParam) or
         self.FTree[AId].HasFlag(NodeFlag.ConstParam) then
         return;
@@ -5986,6 +6014,12 @@ public type
           end;
           return (not self.FTree[AId].HasFlag(NodeFlag.ExceptPart)) or
             self.DoListReturns(AId, NodeRole.Except);
+        NodeKind.LockStatement:
+          return self.DoListReturns(AId, NodeRole.Statement);
+        NodeKind.TryLockStatement:
+          // Not taken, the else statements run (none: it falls through)
+          return self.DoListReturns(AId, NodeRole.Statement) and
+            self.DoListReturns(AId, NodeRole.Else);
       else
         // any other statement can complete normally
       end;
@@ -6007,6 +6041,70 @@ public type
       end;
       self.DoError(AId, ADAM_ERR_SEMANTICS_612, ADAM_MSG_SEMANTICS_MISSING_RETURN,
         NoArgs().Str(self.FTree[AId].Text));
+    end;
+
+    // A routine, method or operator AId whose result type holds a mutex: SM0621 at the
+    // result type (a mutex is never copied, so no call hands one back)
+    hidden method DoMutexResult(const AId: int64);
+    var
+      LResult: int64;
+      LType: int64;
+    begin
+      LResult := self.FTree.FirstOf(AId, NodeRole.ReturnType);
+      if LResult = 0 then
+        return;
+      end;
+      LType := CanonicalOf(self.FTree, LResult);
+      if (LType <> 0) and HoldsMutex(self.FTree, LType) then
+        self.DoError(LResult, ADAM_ERR_SEMANTICS_621, ADAM_MSG_SEMANTICS_MUTEX_RESULT,
+          NoArgs().Str(self.FTree[AId].Text).Str(self.DoText(LType)));
+      end;
+    end;
+
+    // True when AExpr is a place a lock / trylock holds (BNF sec 5): assignable storage of
+    // type mutex (a variable, a field, an element, P^; a property has no address)
+    hidden const method DoIsMutexPlace(const AExpr: int64): bool;
+    var
+      LAt: int64;
+      LDecl: int64;
+    begin
+      if self.DoIsNoValue(AExpr) or (not self.DoIsAssignable(AExpr)) then
+        return false;
+      end;
+      LAt := self.DoSkipParens(AExpr);
+      LDecl := self.FTree[LAt].ResolvedDecl;
+      if (LDecl <> 0) and (self.FTree[LDecl].Kind = NodeKind.PropertyDecl) then
+        return false;
+      end;
+      return self.DoClass(self.DoTypeOf(AExpr)) = TypeClass.Mutex;
+    end;
+
+    // A lock / trylock statement AId (BNF sec 5): its subject a mutex place (DoIsMutexPlace;
+    // SM0620 naming the statement and the subject otherwise, silent on a subject whose type
+    // was lost); trylock's wait (its Limit) converted to int64
+    hidden method DoLock(const AId: int64);
+    var
+      LSubject: int64;
+      LLimit: int64;
+      LWord: string;
+    begin
+      LLimit := self.FTree.FirstOf(AId, NodeRole.Limit);
+      if LLimit <> 0 then
+        self.DoConvert(LLimit, self.DoBuiltin("int64"));
+      end;
+      LSubject := self.FTree.FirstOf(AId, NodeRole.Subject);
+      if (LSubject = 0) or self.DoIsMutexPlace(LSubject) then
+        return;
+      end;
+      if (not self.DoIsNoValue(LSubject)) and (self.DoTypeOf(LSubject) = 0) then
+        return;
+      end;
+      LWord := "lock";
+      if self.FTree[AId].Kind = NodeKind.TryLockStatement then
+        LWord := "trylock";
+      end;
+      self.DoError(LSubject, ADAM_ERR_SEMANTICS_620, ADAM_MSG_SEMANTICS_LOCK_SUBJECT,
+        NoArgs().Str(LWord).Str(self.DoExprText(LSubject)));
     end;
 
     // return [value]: the routine it leaves into its ResolvedJump; the value converts to
@@ -6657,10 +6755,14 @@ public type
         (LKind = NodeKind.RepeatStatement) or (LKind = NodeKind.GuardStatement) then
         self.DoCondition(self.FTree.FirstOf(AId, NodeRole.Condition));
       end;
+      if (LKind = NodeKind.LockStatement) or (LKind = NodeKind.TryLockStatement) then
+        self.DoLock(AId);
+      end;
       // Its body typed first: a raise call's callee is resolved by then
       if (LKind = NodeKind.RoutineDecl) or (LKind = NodeKind.MethodDecl) or
         (LKind = NodeKind.OperatorDecl) then
         self.DoReturnPath(AId);
+        self.DoMutexResult(AId);
       end;
     end;
 
