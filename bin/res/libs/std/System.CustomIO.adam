@@ -1,0 +1,1135 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.CustomIO.adam - streams in the style of SDL3's custom IO (PaskalCPP's
+  CustomIO). An IO is a stream behind a table of callbacks (an IOInterface:
+  Read, Write, Seek, Tell, Size, Flush, Close, Truncate), so a routine that
+  takes an IO reads memory, a file or anything a program writes itself:
+  CreateIO(AInterface, AUserData) makes an IO from any interface. The IO
+  routines (IORead, IOWrite, IOSeek, IOTell, IOSize, IOFlush, IOTruncate,
+  IOClose, IOStatus) call through the table and keep the stream's state: a
+  callback left nil is a clean failure, never a crash. IOReadFull /
+  IOWriteFull move a count through any short reads or writes a stream gives;
+  IOReadAll reads a stream to its end into a string; IOSameContent compares
+  two streams to their ends; IOCopy copies one stream to its end into another.
+
+  CreateMemoryIO makes an IO over the caller's memory (read-only, or read /
+  write within its size) or over a buffer of its own that grows as it is
+  written. CreateFileIO makes an IO over a file opened in one of C's fopen
+  modes (FileMode), its path UTF-8: `$P:` (either case) the folder of the
+  program's exe, `$D:` and `$S:` the working folder.
+
+  Target-neutral: files through System.Runtime's file-handle routines, no OS
+  named. Outside the compiler's dependency path (not in the shared subset,
+  DESIGN sec 10): it takes `addr of`.
+*******************************************************************************/
+
+module unit System.CustomIO;
+
+import System.SysUtils, System.Runtime;
+
+public type
+  // The state of an IO after its last operation, read with IOStatus. A short count from
+  // IORead / IOWrite says why here: Eof (no more to read), Error, ReadOnly (the IO cannot
+  // write), WriteOnly (it cannot read), NotReady (a non-blocking source has nothing yet)
+  IOState = choices(Ready, Error, Eof, NotReady, ReadOnly, WriteOnly);
+
+  // Where IOSeek counts its offset from
+  SeekOrigin = choices(FromStart, FromCurrent, FromEnd);
+
+  // How CreateFileIO opens its file, by C's fopen rules: Read ("rb") the file must exist,
+  // read-only; Write ("wb") created or emptied, write-only; ReadWrite ("r+b") the file must
+  // exist, kept, read and write; Append ("ab") created when missing, write-only, every write
+  // lands at the end whatever the position
+  FileMode = choices(Read, Write, ReadWrite, Append);
+
+  // The callbacks of an IOInterface. Each takes the user pointer given to CreateIO. Read /
+  // Write move up to ASize bytes and return the count moved; a short count sets AState (Eof,
+  // Error, NotReady), which comes in as Ready. Seek returns the new position or -1; Tell the
+  // position or -1; Size the size in bytes or -1 when the stream has none. Flush writes out
+  // anything buffered (false on failure, AState says why). Close releases the stream's own
+  // resources (false when that failed). Truncate sets the size to ASize bytes (>= 0):
+  // shorter drops the tail, longer adds zero bytes (false on failure, AState says why)
+  IOReadCallback = routine(const AUserData: ptr; const ABuffer: ptr; const ASize: int64;
+    var AState: IOState): int64;
+  IOWriteCallback = routine(const AUserData: ptr; const ABuffer: ptr; const ASize: int64;
+    var AState: IOState): int64;
+  IOSeekCallback = routine(const AUserData: ptr; const AOffset: int64;
+    const AOrigin: SeekOrigin): int64;
+  IOTellCallback = routine(const AUserData: ptr): int64;
+  IOSizeCallback = routine(const AUserData: ptr): int64;
+  IOFlushCallback = routine(const AUserData: ptr; var AState: IOState): bool;
+  IOCloseCallback = routine(const AUserData: ptr): bool;
+  IOTruncateCallback = routine(const AUserData: ptr; const ASize: int64;
+    var AState: IOState): bool;
+
+  // The table of callbacks behind an IO (SDL3's SDL_IOStreamInterface). Fill the routines
+  // the stream supports and leave the rest nil: the IO routines turn a nil callback into a
+  // failure with the state set. Truncate is optional: a stream that cannot change its size
+  // leaves it nil
+  IOInterface = record
+    Read: IOReadCallback;
+    Write: IOWriteCallback;
+    Seek: IOSeekCallback;
+    Tell: IOTellCallback;
+    Size: IOSizeCallback;
+    Flush: IOFlushCallback;
+    Close: IOCloseCallback;
+    Truncate: IOTruncateCallback;
+  end;
+
+  // What an IO points at: the callbacks CreateIO was given, the user pointer every callback
+  // receives, the state after the last operation. Reach it only through the IO routines
+  IOStream = record
+    Callbacks: IOInterface;
+    UserData: ptr;
+    State: IOState;
+  end;
+
+  // A stream: made by CreateIO or a Create*IO routine, used through the IO routines, ended
+  // with IOClose. nil is no stream (a Create* that failed)
+  IO = ptr to IOStream;
+
+const
+  // The bytes IOReadAll and IOCopy move per step (their chunk arrays are 0..65535), and the
+  // bytes IOSameContent compares per step (its arrays are 0..4095)
+  ADAM_CUSTOMIO_CHUNK: int64 = 65536;
+  ADAM_CUSTOMIO_COMPARE: int64 = 4096;
+  // An owned memory block's first capacity, and the capacity past which doubling would
+  // overflow (2^62 - 1): past it a block grows to exactly what is needed
+  ADAM_CUSTOMIO_GROW_START: int64 = 256;
+  ADAM_CUSTOMIO_GROW_LIMIT: int64 = 4611686018427387903;
+  // The largest int64: a position plus a count past it is no room at all
+  ADAM_CUSTOMIO_INT64_MAX: int64 = 9223372036854775807;
+
+type
+  // A memory IO's user data. Caller memory: Capacity = DataSize at first, never grows.
+  // Owned: the block grows (doubling) as writes pass its end, and IOClose frees it
+  MemoryData = record
+    Data: ptr to uint8;
+    DataSize: int64;
+    Capacity: int64;
+    Position: int64;
+    Owned: bool;
+  end;
+
+  // A file IO's user data: the runtime's file handle, and whether every write lands at the
+  // end (FileMode.Append, C's "a": the end is sought before each write)
+  FileData = record
+    Handle: uint64;
+    Append: bool;
+  end;
+
+// ACount bytes from ASource to ADest (the two do not overlap)
+routine DoCopy(const ADest: ptr to uint8; const ASource: ptr to const uint8; const ACount: int64);
+var
+  LI: int64;
+begin
+  for LI := 0 to ACount - 1 do
+    ADest[LI] := ASource[LI];
+  end;
+end;
+
+// ACount zero bytes at ADest
+routine DoZero(const ADest: ptr to uint8; const ACount: int64);
+var
+  LI: int64;
+begin
+  for LI := 0 to ACount - 1 do
+    ADest[LI] := 0;
+  end;
+end;
+
+// True when the ACount bytes at ALeft and ARight are the same
+routine DoSameBytes(const ALeft: ptr to const uint8; const ARight: ptr to const uint8;
+  const ACount: int64): bool;
+var
+  LI: int64;
+begin
+  for LI := 0 to ACount - 1 do
+    if ALeft[LI] <> ARight[LI] then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// The ACount bytes at ABytes added to the end of AData
+routine DoAppendBytes(var AData: string; const ABytes: ptr to const uint8; const ACount: int64);
+var
+  LOld: int64;
+  LI: int64;
+begin
+  if ACount <= 0 then
+    return;
+  end;
+  LOld := len(AData);
+  setlength(AData, LOld + ACount);
+  for LI := 0 to ACount - 1 do
+    AData[LOld + LI] := char(ABytes[LI]);
+  end;
+end;
+
+// Makes an IO from a table of callbacks and the user pointer they receive (SDL3's
+// SDL_OpenIO). The interface is copied; the user pointer is the caller's and is never freed
+// by the IO (its Close callback may free it). The new IO's state is Ready; nil when there is
+// no room
+public routine CreateIO(const AInterface: IOInterface; const AUserData: ptr): IO;
+var
+  LIO: IO;
+begin
+  LIO := ptr to IOStream(getmem(size(IOStream)));
+  if LIO = nil then
+    return nil;
+  end;
+  LIO->Callbacks := AInterface;
+  LIO->UserData := AUserData;
+  LIO->State := IOState.Ready;
+  return LIO;
+end;
+
+// Reads up to ASize bytes into ABuffer: the count read, 0 to ASize (0 for a nil IO or ASize
+// 0 or less). A short count means the end, an error or no data yet: IOStatus tells which
+// (Eof, Error, NotReady, or WriteOnly when the IO cannot read)
+public routine IORead(const AIO: IO; const ABuffer: ptr; const ASize: int64): int64;
+var
+  LRead: IOReadCallback;
+  LCount: int64;
+begin
+  if AIO = nil then
+    return 0;
+  end;
+  if ASize <= 0 then
+    return 0;
+  end;
+  if ABuffer = nil then
+    AIO->State := IOState.Error;
+    return 0;
+  end;
+  LRead := AIO->Callbacks.Read;
+  if LRead = nil then
+    AIO->State := IOState.WriteOnly;
+    return 0;
+  end;
+  AIO->State := IOState.Ready;
+  LCount := LRead(AIO->UserData, ABuffer, ASize, AIO->State);
+  // A callback outside 0 .. ASize broke its contract: an error, held in range
+  if LCount < 0 then
+    AIO->State := IOState.Error;
+    return 0;
+  end;
+  if LCount > ASize then
+    AIO->State := IOState.Error;
+    return ASize;
+  end;
+  // A short read the callback did not explain is the end of the stream
+  if (LCount < ASize) and (AIO->State = IOState.Ready) then
+    AIO->State := IOState.Eof;
+  end;
+  return LCount;
+end;
+
+// Writes up to ASize bytes from ABuffer: the count written, 0 to ASize (0 for a nil IO or
+// ASize 0 or less). A short count means an error or no room yet: IOStatus tells which
+// (Error, NotReady, or ReadOnly when the IO cannot write)
+public routine IOWrite(const AIO: IO; const ABuffer: ptr; const ASize: int64): int64;
+var
+  LWrite: IOWriteCallback;
+  LCount: int64;
+begin
+  if AIO = nil then
+    return 0;
+  end;
+  if ASize <= 0 then
+    return 0;
+  end;
+  if ABuffer = nil then
+    AIO->State := IOState.Error;
+    return 0;
+  end;
+  LWrite := AIO->Callbacks.Write;
+  if LWrite = nil then
+    AIO->State := IOState.ReadOnly;
+    return 0;
+  end;
+  AIO->State := IOState.Ready;
+  LCount := LWrite(AIO->UserData, ABuffer, ASize, AIO->State);
+  if LCount < 0 then
+    AIO->State := IOState.Error;
+    return 0;
+  end;
+  if LCount > ASize then
+    AIO->State := IOState.Error;
+    return ASize;
+  end;
+  // A short write the callback did not explain is an error
+  if (LCount < ASize) and (AIO->State = IOState.Ready) then
+    AIO->State := IOState.Error;
+  end;
+  return LCount;
+end;
+
+// Moves the stream's position to AOffset counted from AOrigin: the new position, or -1
+// (state Error) when it cannot move there. A move that succeeds sets the state Ready (an Eof
+// is over)
+public routine IOSeek(const AIO: IO; const AOffset: int64; const AOrigin: SeekOrigin): int64;
+var
+  LSeek: IOSeekCallback;
+  LPosition: int64;
+begin
+  if AIO = nil then
+    return -1;
+  end;
+  LSeek := AIO->Callbacks.Seek;
+  if LSeek = nil then
+    AIO->State := IOState.Error;
+    return -1;
+  end;
+  LPosition := LSeek(AIO->UserData, AOffset, AOrigin);
+  if LPosition < 0 then
+    AIO->State := IOState.Error;
+    return -1;
+  end;
+  AIO->State := IOState.Ready;
+  return LPosition;
+end;
+
+// The stream's current position, or -1 when the IO has none (state Error)
+public routine IOTell(const AIO: IO): int64;
+var
+  LTell: IOTellCallback;
+  LPosition: int64;
+begin
+  if AIO = nil then
+    return -1;
+  end;
+  LTell := AIO->Callbacks.Tell;
+  if LTell = nil then
+    AIO->State := IOState.Error;
+    return -1;
+  end;
+  LPosition := LTell(AIO->UserData);
+  if LPosition < 0 then
+    AIO->State := IOState.Error;
+    return -1;
+  end;
+  return LPosition;
+end;
+
+// The stream's size in bytes, or -1 when it has none (a pipe, a nil IO)
+public routine IOSize(const AIO: IO): int64;
+var
+  LSizeOf: IOSizeCallback;
+  LSize: int64;
+begin
+  if AIO = nil then
+    return -1;
+  end;
+  LSizeOf := AIO->Callbacks.Size;
+  if LSizeOf = nil then
+    return -1;
+  end;
+  LSize := LSizeOf(AIO->UserData);
+  if LSize < 0 then
+    return -1;
+  end;
+  return LSize;
+end;
+
+// Writes out anything the stream has buffered: true when flushed (or nothing to flush: an IO
+// with no Flush callback), false on failure
+public routine IOFlush(const AIO: IO): bool;
+var
+  LFlush: IOFlushCallback;
+  LOk: bool;
+begin
+  if AIO = nil then
+    return false;
+  end;
+  LFlush := AIO->Callbacks.Flush;
+  if LFlush = nil then
+    return true;
+  end;
+  AIO->State := IOState.Ready;
+  LOk := LFlush(AIO->UserData, AIO->State);
+  if (not LOk) and (AIO->State = IOState.Ready) then
+    AIO->State := IOState.Error;
+  end;
+  return LOk;
+end;
+
+// Sets the stream's size to ASize bytes, as ftruncate does: shorter drops the tail, longer
+// adds zero bytes. A stream that cannot write cannot change its size (state ReadOnly); one
+// without a Truncate callback cannot either (state Error). Where the position lands is the
+// stream's rule: a file IO keeps it (it may then lie past the end, as with fseek); a memory
+// IO, which never sits past its end, moves back to the new end. False for a nil IO, a
+// negative size (state Error) or a refused or failed change (IOStatus tells which)
+public routine IOTruncate(const AIO: IO; const ASize: int64): bool;
+var
+  LTruncate: IOTruncateCallback;
+  LOk: bool;
+begin
+  if AIO = nil then
+    return false;
+  end;
+  if ASize < 0 then
+    AIO->State := IOState.Error;
+    return false;
+  end;
+  if AIO->Callbacks.Write = nil then
+    AIO->State := IOState.ReadOnly;
+    return false;
+  end;
+  LTruncate := AIO->Callbacks.Truncate;
+  if LTruncate = nil then
+    AIO->State := IOState.Error;
+    return false;
+  end;
+  AIO->State := IOState.Ready;
+  LOk := LTruncate(AIO->UserData, ASize, AIO->State);
+  if (not LOk) and (AIO->State = IOState.Ready) then
+    AIO->State := IOState.Error;
+  end;
+  return LOk;
+end;
+
+// Ends the stream: calls its Close callback, then frees the IO, which is gone afterwards
+// whatever the result. False for a nil IO or when the Close callback failed
+public routine IOClose(const AIO: IO): bool;
+var
+  LClose: IOCloseCallback;
+  LOk: bool;
+begin
+  if AIO = nil then
+    return false;
+  end;
+  LOk := true;
+  LClose := AIO->Callbacks.Close;
+  if LClose <> nil then
+    LOk := LClose(AIO->UserData);
+  end;
+  freemem(AIO);
+  return LOk;
+end;
+
+// The state after the stream's last operation: why a count came up short (Error for a nil IO)
+public routine IOStatus(const AIO: IO): IOState;
+begin
+  if AIO = nil then
+    return IOState.Error;
+  end;
+  return AIO->State;
+end;
+
+// Reads ASize bytes into ABuffer, calling IORead until they are all in or a read gives
+// nothing (the end, an error, a non-blocking source with nothing yet): a stream may answer
+// one IORead with fewer bytes than it has. The count read: ASize, or fewer when the stream
+// stopped first (IOStatus says why); 0 for a nil IO or ASize 0 or less
+public routine IOReadFull(const AIO: IO; const ABuffer: ptr; const ASize: int64): int64;
+var
+  LBytes: ptr to uint8;
+  LDone: int64;
+  LGot: int64;
+begin
+  if (AIO = nil) or (ASize <= 0) then
+    return 0;
+  end;
+  LBytes := ptr to uint8(ABuffer);
+  LDone := 0;
+  while LDone < ASize do
+    LGot := IORead(AIO, ptr(LBytes + LDone), ASize - LDone);
+    if LGot <= 0 then
+      return LDone;
+    end;
+    LDone := LDone + LGot;
+  end;
+  return LDone;
+end;
+
+// Writes ASize bytes from ABuffer, calling IOWrite until they are all out or a write takes
+// nothing (an error, a full or non-blocking stream). The count written: ASize, or fewer when
+// the stream stopped first (IOStatus says why); 0 for a nil IO or ASize 0 or less
+public routine IOWriteFull(const AIO: IO; const ABuffer: ptr; const ASize: int64): int64;
+var
+  LBytes: ptr to uint8;
+  LDone: int64;
+  LPut: int64;
+begin
+  if (AIO = nil) or (ASize <= 0) then
+    return 0;
+  end;
+  LBytes := ptr to uint8(ABuffer);
+  LDone := 0;
+  while LDone < ASize do
+    LPut := IOWrite(AIO, ptr(LBytes + LDone), ASize - LDone);
+    if LPut <= 0 then
+      return LDone;
+    end;
+    LDone := LDone + LPut;
+  end;
+  return LDone;
+end;
+
+// Reads a stream from where it stands to its end into AData, as bytes (a string holds any
+// bytes, zeros included). A stream with a size reads exactly the rest; one without (IOSize
+// -1) reads in chunks until its end. True when the stream was read to its end; false (AData
+// "") for a nil IO or a read that failed (state Error) or stopped short of the end
+public routine IOReadAll(const AIO: IO; var AData: string): bool;
+var
+  LChunk: array[0..65535] of uint8;
+  LSize: int64;
+  LPosition: int64;
+  LRest: int64;
+  LDone: int64;
+  LWant: int64;
+  LGot: int64;
+  LI: int64;
+begin
+  AData := "";
+  if AIO = nil then
+    return false;
+  end;
+  LSize := IOSize(AIO);
+  LPosition := IOTell(AIO);
+  if (LSize >= 0) and (LPosition >= 0) and (LSize >= LPosition) then
+    // The rest of a sized stream: the string sized once, filled chunk by chunk
+    LRest := LSize - LPosition;
+    setlength(AData, LRest);
+    LDone := 0;
+    while LDone < LRest do
+      LWant := LRest - LDone;
+      if LWant > ADAM_CUSTOMIO_CHUNK then
+        LWant := ADAM_CUSTOMIO_CHUNK;
+      end;
+      LGot := IOReadFull(AIO, ptr(addr of LChunk[0]), LWant);
+      if LGot <> LWant then
+        AData := "";
+        return false;
+      end;
+      for LI := 0 to LGot - 1 do
+        AData[LDone + LI] := char(LChunk[LI]);
+      end;
+      LDone := LDone + LGot;
+    end;
+    return true;
+  end;
+  // No size: chunks until the stream says it ended
+  while true do
+    LGot := IOReadFull(AIO, ptr(addr of LChunk[0]), ADAM_CUSTOMIO_CHUNK);
+    DoAppendBytes(AData, addr of LChunk[0], LGot);
+    if LGot < ADAM_CUSTOMIO_CHUNK then
+      if IOStatus(AIO) = IOState.Eof then
+        return true;
+      end;
+      AData := "";
+      return false;
+    end;
+  end;
+  return false;
+end;
+
+// True when two streams hold the same bytes from where each stands to its end (both are read
+// to the end; their positions move); false when they differ, either is nil, or either fails
+// a read before its end
+public routine IOSameContent(const ALeft: IO; const ARight: IO): bool;
+var
+  LLeft: array[0..4095] of uint8;
+  LRight: array[0..4095] of uint8;
+  LGotLeft: int64;
+  LGotRight: int64;
+begin
+  if (ALeft = nil) or (ARight = nil) then
+    return false;
+  end;
+  while true do
+    LGotLeft := IOReadFull(ALeft, ptr(addr of LLeft[0]), ADAM_CUSTOMIO_COMPARE);
+    LGotRight := IOReadFull(ARight, ptr(addr of LRight[0]), ADAM_CUSTOMIO_COMPARE);
+    if LGotLeft <> LGotRight then
+      return false;
+    end;
+    if LGotLeft < ADAM_CUSTOMIO_COMPARE then
+      // The end of both, or a failed read on both: only the end is the same
+      if (IOStatus(ALeft) = IOState.Error) or (IOStatus(ARight) = IOState.Error) then
+        return false;
+      end;
+      return DoSameBytes(addr of LLeft[0], addr of LRight[0], LGotLeft);
+    end;
+    if not DoSameBytes(addr of LLeft[0], addr of LRight[0], ADAM_CUSTOMIO_COMPARE) then
+      return false;
+    end;
+  end;
+  return false;
+end;
+
+// Copies a stream from where it stands to its end into another, where that one stands, in
+// chunks (a stream of any size, sized or not; both positions move). The bytes copied; -1 when
+// either is nil, a read failed (state Error) or a write stopped short (the bytes written up
+// to there stay in ADest)
+public routine IOCopy(const ASource: IO; const ADest: IO): int64;
+var
+  LChunk: array[0..65535] of uint8;
+  LGot: int64;
+  LTotal: int64;
+begin
+  if (ASource = nil) or (ADest = nil) then
+    return -1;
+  end;
+  LTotal := 0;
+  while true do
+    LGot := IOReadFull(ASource, ptr(addr of LChunk[0]), ADAM_CUSTOMIO_CHUNK);
+    if LGot > 0 then
+      if IOWriteFull(ADest, ptr(addr of LChunk[0]), LGot) <> LGot then
+        return -1;
+      end;
+    end;
+    LTotal := LTotal + LGot;
+    if LGot < ADAM_CUSTOMIO_CHUNK then
+      // A short chunk is the end, or a read that failed before it
+      if IOStatus(ASource) = IOState.Error then
+        return -1;
+      end;
+      return LTotal;
+    end;
+  end;
+  return -1;
+end;
+
+// Grows an owned memory block to hold at least ANeeded bytes (doubling from
+// ADAM_CUSTOMIO_GROW_START); false when there is no room
+routine MemoryGrow(const AMemory: ptr to MemoryData; const ANeeded: int64): bool;
+var
+  LCapacity: int64;
+  LBlock: ptr;
+begin
+  LCapacity := AMemory->Capacity;
+  if LCapacity < ADAM_CUSTOMIO_GROW_START then
+    LCapacity := ADAM_CUSTOMIO_GROW_START;
+  end;
+  while LCapacity < ANeeded do
+    // Doubling stops short of overflow: past the limit take exactly what is needed
+    if LCapacity > ADAM_CUSTOMIO_GROW_LIMIT then
+      LCapacity := ANeeded;
+    else
+      LCapacity := LCapacity * 2;
+    end;
+  end;
+  if AMemory->Data = nil then
+    LBlock := getmem(LCapacity);
+  else
+    LBlock := resizemem(ptr(AMemory->Data), LCapacity);
+  end;
+  if LBlock = nil then
+    return false;
+  end;
+  AMemory->Data := ptr to uint8(LBlock);
+  AMemory->Capacity := LCapacity;
+  return true;
+end;
+
+routine MemoryRead(const AUserData: ptr; const ABuffer: ptr; const ASize: int64;
+  var AState: IOState): int64;
+var
+  LMemory: ptr to MemoryData;
+  LCount: int64;
+begin
+  LMemory := ptr to MemoryData(AUserData);
+  LCount := LMemory->DataSize - LMemory->Position;
+  if LCount > ASize then
+    LCount := ASize;
+  end;
+  if LCount <= 0 then
+    AState := IOState.Eof;
+    return 0;
+  end;
+  DoCopy(ptr to uint8(ABuffer), LMemory->Data + LMemory->Position, LCount);
+  LMemory->Position := LMemory->Position + LCount;
+  if LCount < ASize then
+    AState := IOState.Eof;
+  end;
+  return LCount;
+end;
+
+routine MemoryWrite(const AUserData: ptr; const ABuffer: ptr; const ASize: int64;
+  var AState: IOState): int64;
+var
+  LMemory: ptr to MemoryData;
+  LCount: int64;
+begin
+  LMemory := ptr to MemoryData(AUserData);
+  LCount := ASize;
+  // Position + ASize past int64 is no room at all
+  if LCount > ADAM_CUSTOMIO_INT64_MAX - LMemory->Position then
+    AState := IOState.Error;
+    return 0;
+  end;
+  if LMemory->Position + LCount > LMemory->Capacity then
+    if LMemory->Owned then
+      if not MemoryGrow(LMemory, LMemory->Position + LCount) then
+        AState := IOState.Error;
+        return 0;
+      end;
+    else
+      // Caller memory never grows: write what fits
+      LCount := LMemory->Capacity - LMemory->Position;
+    end;
+  end;
+  if LCount <= 0 then
+    AState := IOState.Error;
+    return 0;
+  end;
+  DoCopy(LMemory->Data + LMemory->Position, ptr to const uint8(ABuffer), LCount);
+  LMemory->Position := LMemory->Position + LCount;
+  if LMemory->Position > LMemory->DataSize then
+    LMemory->DataSize := LMemory->Position;
+  end;
+  if LCount < ASize then
+    AState := IOState.Error;
+  end;
+  return LCount;
+end;
+
+routine MemorySeek(const AUserData: ptr; const AOffset: int64; const AOrigin: SeekOrigin): int64;
+var
+  LMemory: ptr to MemoryData;
+  LBase: int64;
+begin
+  LMemory := ptr to MemoryData(AUserData);
+  LBase := 0;
+  if AOrigin = SeekOrigin.FromCurrent then
+    LBase := LMemory->Position;
+  end;
+  if AOrigin = SeekOrigin.FromEnd then
+    LBase := LMemory->DataSize;
+  end;
+  // The target must lie in 0 .. DataSize; compared without forming it (no overflow)
+  if AOffset > LMemory->DataSize - LBase then
+    return -1;
+  end;
+  if AOffset < -LBase then
+    return -1;
+  end;
+  LMemory->Position := LBase + AOffset;
+  return LMemory->Position;
+end;
+
+routine MemoryTell(const AUserData: ptr): int64;
+var
+  LMemory: ptr to MemoryData;
+begin
+  LMemory := ptr to MemoryData(AUserData);
+  return LMemory->Position;
+end;
+
+routine MemorySize(const AUserData: ptr): int64;
+var
+  LMemory: ptr to MemoryData;
+begin
+  LMemory := ptr to MemoryData(AUserData);
+  return LMemory->DataSize;
+end;
+
+// Memory has nothing buffered
+routine MemoryFlush(const AUserData: ptr; var AState: IOState): bool;
+begin
+  return true;
+end;
+
+// The size moves within the block: an owned block grows to hold it, caller memory only up to
+// its capacity. Bytes the IO gains read as zero; the position, which never lies past the
+// end, moves back to a shorter end
+routine MemoryTruncate(const AUserData: ptr; const ASize: int64; var AState: IOState): bool;
+var
+  LMemory: ptr to MemoryData;
+begin
+  LMemory := ptr to MemoryData(AUserData);
+  if ASize > LMemory->Capacity then
+    if not LMemory->Owned then
+      AState := IOState.Error;
+      return false;
+    end;
+    if not MemoryGrow(LMemory, ASize) then
+      AState := IOState.Error;
+      return false;
+    end;
+  end;
+  if ASize > LMemory->DataSize then
+    DoZero(LMemory->Data + LMemory->DataSize, ASize - LMemory->DataSize);
+  end;
+  LMemory->DataSize := ASize;
+  if LMemory->Position > ASize then
+    LMemory->Position := ASize;
+  end;
+  return true;
+end;
+
+routine MemoryClose(const AUserData: ptr): bool;
+var
+  LMemory: ptr to MemoryData;
+begin
+  LMemory := ptr to MemoryData(AUserData);
+  if LMemory->Owned and (LMemory->Data <> nil) then
+    freemem(LMemory->Data);
+  end;
+  freemem(LMemory);
+  return true;
+end;
+
+// The memory IO's callbacks; a read-only one has no Write and no Truncate
+routine MemoryInterface(const AReadOnly: bool): IOInterface;
+var
+  LInterface: IOInterface;
+begin
+  LInterface.Read := MemoryRead;
+  LInterface.Write := nil;
+  LInterface.Truncate := nil;
+  if not AReadOnly then
+    LInterface.Write := MemoryWrite;
+    LInterface.Truncate := MemoryTruncate;
+  end;
+  LInterface.Seek := MemorySeek;
+  LInterface.Tell := MemoryTell;
+  LInterface.Size := MemorySize;
+  LInterface.Flush := MemoryFlush;
+  LInterface.Close := MemoryClose;
+  return LInterface;
+end;
+
+// A memory IO over ALength bytes at AData (owned: a block of its own, AData nil); nil when
+// there is no room
+routine DoCreateMemory(const AData: ptr; const ALength: int64; const AReadOnly: bool;
+  const AOwned: bool): IO;
+var
+  LMemory: ptr to MemoryData;
+  LIO: IO;
+begin
+  LMemory := ptr to MemoryData(getmem(size(MemoryData)));
+  if LMemory = nil then
+    return nil;
+  end;
+  LMemory->Data := ptr to uint8(AData);
+  LMemory->DataSize := ALength;
+  LMemory->Capacity := ALength;
+  LMemory->Position := 0;
+  LMemory->Owned := AOwned;
+  LIO := CreateIO(MemoryInterface(AReadOnly), ptr(LMemory));
+  if LIO = nil then
+    freemem(LMemory);
+  end;
+  return LIO;
+end;
+
+// Makes an IO over the caller's memory: ASize bytes at AData, read-only or read / write. It
+// never grows: a write past the end is a short count (state Error), a seek outside 0 ..
+// ASize fails, IOTruncate moves the size only within those ASize bytes. The memory stays the
+// caller's and must outlive the IO. AReadOnly true: IOWrite fails with state ReadOnly. Nil
+// when AData / ASize are not a valid block (nil is valid only with ASize 0)
+public routine CreateMemoryIO(const AData: ptr; const ASize: int64; const AReadOnly: bool): IO;
+begin
+  if ASize < 0 then
+    return nil;
+  end;
+  if (AData = nil) and (ASize > 0) then
+    return nil;
+  end;
+  return DoCreateMemory(AData, ASize, AReadOnly, false);
+end;
+
+// Makes a read / write IO over the caller's memory (CreateMemoryIO with AReadOnly false)
+public routine CreateMemoryIO(const AData: ptr; const ASize: int64): IO;
+begin
+  return CreateMemoryIO(AData, ASize, false);
+end;
+
+// Makes a read / write IO over a buffer of its own, empty at first, that grows as writes
+// pass its end; IOClose frees the buffer
+public routine CreateMemoryIO(): IO;
+begin
+  return DoCreateMemory(nil, 0, false, true);
+end;
+
+// The runtime's seek origin of AOrigin
+routine DoRuntimeOrigin(const AOrigin: SeekOrigin): int32;
+begin
+  if AOrigin = SeekOrigin.FromCurrent then
+    return ADAM_SEEK_CURRENT;
+  end;
+  if AOrigin = SeekOrigin.FromEnd then
+    return ADAM_SEEK_END;
+  end;
+  return ADAM_SEEK_START;
+end;
+
+// The runtime's file mode of AMode
+routine DoRuntimeMode(const AMode: FileMode): int32;
+begin
+  if AMode = FileMode.Write then
+    return ADAM_FILE_WRITE;
+  end;
+  if AMode = FileMode.ReadWrite then
+    return ADAM_FILE_READ_WRITE;
+  end;
+  if AMode = FileMode.Append then
+    return ADAM_FILE_APPEND;
+  end;
+  return ADAM_FILE_READ;
+end;
+
+// The file IO's callbacks: the user pointer is the FileData CreateFileIO made. The runtime's
+// handle buffers nothing, so a read after a write (or the reverse) needs no seek between, a
+// flush has nothing to write out, and a size change sees every byte written
+routine FileRead(const AUserData: ptr; const ABuffer: ptr; const ASize: int64;
+  var AState: IOState): int64;
+var
+  LFile: ptr to FileData;
+  LBytes: ptr to uint8;
+  LDone: int64;
+  LGot: int64;
+begin
+  LFile := ptr to FileData(AUserData);
+  LBytes := ptr to uint8(ABuffer);
+  LDone := 0;
+  // A handle read may give fewer bytes than asked before the end: read until the end
+  while LDone < ASize do
+    LGot := ReadFileHandle(LFile->Handle, ptr(LBytes + LDone), ASize - LDone);
+    if LGot < 0 then
+      AState := IOState.Error;
+      return LDone;
+    end;
+    if LGot = 0 then
+      leave;
+    end;
+    LDone := LDone + LGot;
+  end;
+  return LDone;
+end;
+
+routine FileWrite(const AUserData: ptr; const ABuffer: ptr; const ASize: int64;
+  var AState: IOState): int64;
+var
+  LFile: ptr to FileData;
+  LBytes: ptr to uint8;
+  LDone: int64;
+  LPut: int64;
+begin
+  LFile := ptr to FileData(AUserData);
+  // Append: the end first, whatever the position (C's "a")
+  if LFile->Append then
+    if SeekFileHandle(LFile->Handle, 0, ADAM_SEEK_END) < 0 then
+      AState := IOState.Error;
+      return 0;
+    end;
+  end;
+  LBytes := ptr to uint8(ABuffer);
+  LDone := 0;
+  while LDone < ASize do
+    LPut := WriteFileHandle(LFile->Handle, ptr(LBytes + LDone), ASize - LDone);
+    if LPut <= 0 then
+      AState := IOState.Error;
+      return LDone;
+    end;
+    LDone := LDone + LPut;
+  end;
+  return LDone;
+end;
+
+routine FileSeek(const AUserData: ptr; const AOffset: int64; const AOrigin: SeekOrigin): int64;
+var
+  LFile: ptr to FileData;
+begin
+  LFile := ptr to FileData(AUserData);
+  return SeekFileHandle(LFile->Handle, AOffset, DoRuntimeOrigin(AOrigin));
+end;
+
+routine FileTell(const AUserData: ptr): int64;
+var
+  LFile: ptr to FileData;
+begin
+  LFile := ptr to FileData(AUserData);
+  return SeekFileHandle(LFile->Handle, 0, ADAM_SEEK_CURRENT);
+end;
+
+routine FileSize(const AUserData: ptr): int64;
+var
+  LFile: ptr to FileData;
+begin
+  LFile := ptr to FileData(AUserData);
+  return FileHandleSize(LFile->Handle);
+end;
+
+// Nothing is buffered: every write is already the file's
+routine FileFlush(const AUserData: ptr; var AState: IOState): bool;
+begin
+  return true;
+end;
+
+routine FileClose(const AUserData: ptr): bool;
+var
+  LFile: ptr to FileData;
+begin
+  LFile := ptr to FileData(AUserData);
+  CloseFileHandle(LFile->Handle);
+  freemem(LFile);
+  return true;
+end;
+
+// The size changes through the open file, never by the path it was opened by; the position
+// is kept (it may then lie past the end)
+routine FileTruncate(const AUserData: ptr; const ASize: int64; var AState: IOState): bool;
+var
+  LFile: ptr to FileData;
+begin
+  LFile := ptr to FileData(AUserData);
+  if not TruncateFileHandle(LFile->Handle, ASize) then
+    AState := IOState.Error;
+    return false;
+  end;
+  return true;
+end;
+
+// The file IO's callbacks for a mode: Read has no Write and no Truncate, Write and Append
+// have no Read
+routine FileInterface(const AMode: FileMode): IOInterface;
+var
+  LInterface: IOInterface;
+begin
+  LInterface.Read := nil;
+  LInterface.Write := nil;
+  LInterface.Truncate := nil;
+  if (AMode = FileMode.Read) or (AMode = FileMode.ReadWrite) then
+    LInterface.Read := FileRead;
+  end;
+  if AMode <> FileMode.Read then
+    LInterface.Write := FileWrite;
+    LInterface.Truncate := FileTruncate;
+  end;
+  LInterface.Seek := FileSeek;
+  LInterface.Tell := FileTell;
+  LInterface.Size := FileSize;
+  LInterface.Flush := FileFlush;
+  LInterface.Close := FileClose;
+  return LInterface;
+end;
+
+// True when APath starts with one of the path prefixes ($P:, $D:, $S:, $R:, either case)
+routine DoHasPrefix(const APath: string): bool;
+var
+  LKind: char;
+begin
+  if len(APath) < 3 then
+    return false;
+  end;
+  if (APath[0] <> '$') or (APath[2] <> ':') then
+    return false;
+  end;
+  LKind := APath[1];
+  return (LKind = 'P') or (LKind = 'p') or (LKind = 'D') or (LKind = 'd') or (LKind = 'S') or
+    (LKind = 's') or (LKind = 'R') or (LKind = 'r');
+end;
+
+// The folder of the program's exe ("" when the runtime cannot read its path)
+routine DoProgramFolder(): string;
+var
+  LBlock: ptr;
+  LCount: int64;
+  LPath: string;
+begin
+  LCount := 0;
+  LBlock := ProgramPath(LCount);
+  if LBlock = nil then
+    return "";
+  end;
+  LPath := StringFromC(ptr to const char(LBlock), LCount);
+  freemem(LBlock);
+  return ExtractFileDir(LPath);
+end;
+
+// APath as the runtime opens it, its blanks trimmed: after `$P:` (either case) the folder of
+// the program's exe joined to the rest; after `$D:` or `$S:` the rest (relative to the working
+// folder); "" for `$R:` (the project root is the compiler's build-time prefix) or a prefix
+// with nothing after it. Any other path is left as it is
+routine DoFilePath(const APath: string): string;
+var
+  LPath: string;
+  LRest: string;
+  LKind: char;
+  LFolder: string;
+begin
+  LPath := Trim(APath);
+  if not DoHasPrefix(LPath) then
+    return LPath;
+  end;
+  LKind := LPath[1];
+  LRest := Trim(Substring(LPath, 3, len(LPath) - 3));
+  if (LRest = "") or (LKind = 'R') or (LKind = 'r') then
+    return "";
+  end;
+  if (LKind = 'P') or (LKind = 'p') then
+    LFolder := DoProgramFolder();
+    if LFolder = "" then
+      return "";
+    end;
+    return LFolder + "/" + LRest;
+  end;
+  return LRest;
+end;
+
+// Makes an IO over a file, opened in one of C's fopen modes (see FileMode); APath is UTF-8,
+// `$P:` the folder of the program's exe, `$D:` / `$S:` the working folder. A Read IO fails
+// IOWrite with state ReadOnly, a Write or Append one fails IORead with state WriteOnly. A file
+// may be positioned past its end, as with fseek; a write there fills the gap with zero bytes.
+// IOClose closes the file. Nil when the file cannot be opened in that mode (a missing file
+// for Read / ReadWrite, a folder, no permission)
+public routine CreateFileIO(const APath: string; const AMode: FileMode): IO;
+var
+  LPath: string;
+  LText: ptr to char;
+  LHandle: uint64;
+  LOpened: bool;
+  LFile: ptr to FileData;
+  LIO: IO;
+begin
+  LPath := DoFilePath(APath);
+  if LPath = "" then
+    return nil;
+  end;
+  LText := StringToC(LPath);
+  if LText = nil then
+    return nil;
+  end;
+  LHandle := 0;
+  LOpened := OpenFileHandle(LText, DoRuntimeMode(AMode), LHandle);
+  freemem(LText);
+  if not LOpened then
+    return nil;
+  end;
+  LFile := ptr to FileData(getmem(size(FileData)));
+  if LFile = nil then
+    CloseFileHandle(LHandle);
+    return nil;
+  end;
+  LFile->Handle := LHandle;
+  LFile->Append := (AMode = FileMode.Append);
+  LIO := CreateIO(FileInterface(AMode), ptr(LFile));
+  if LIO = nil then
+    CloseFileHandle(LHandle);
+    freemem(LFile);
+  end;
+  return LIO;
+end;
+
+end.
