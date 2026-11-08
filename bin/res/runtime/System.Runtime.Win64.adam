@@ -95,6 +95,40 @@ type
     SizeLow: uint32;
   end;
 
+  // FILETIME: 100-nanosecond steps since 1601-01-01 UTC, its low then high 32 bits
+  PlatformFileTime = record
+    Low: uint32;
+    High: uint32;
+  end;
+
+  // WIN32_FIND_DATAW (FindFirstFileW / FindNextFileW): the attributes, three FILETIMEs, the
+  // size's high then low 32 bits, two reserved words, the name (NUL-terminated UTF-16, at
+  // most 260 units) and the 8.3 name
+  PlatformFindData = record
+    Attributes: uint32;
+    Creation: PlatformFileTime;
+    Access: PlatformFileTime;
+    Written: PlatformFileTime;
+    SizeHigh: uint32;
+    SizeLow: uint32;
+    Reserved0: uint32;
+    Reserved1: uint32;
+    FileName: array[0..259] of uint16;
+    ShortName: array[0..13] of uint16;
+  end;
+
+  // SYSTEMTIME: a date and time in fields (Month 1..12, DayOfWeek 0 = Sunday)
+  PlatformSystemTime = record
+    Year: uint16;
+    Month: uint16;
+    DayOfWeek: uint16;
+    Day: uint16;
+    Hour: uint16;
+    Minute: uint16;
+    Second: uint16;
+    Milliseconds: uint16;
+  end;
+
 // kernel32: the file calls of an open handle beyond reading: a write at its place, its place
 // moved (ANewPlace the place after), its size, its end set at its place; a path's attributes
 // and size read without opening it (AInfoLevel 0, GetFileExInfoStandard), a file deleted by
@@ -115,6 +149,22 @@ routine GetModuleFileNameW(const AModule: uint64; const ABuffer: ptr to uint16;
 routine WideCharToMultiByte(const ACodePage: uint32; const AFlags: uint32;
   const AWide: ptr to uint16; const AWideCount: int32; const AText: ptr to char;
   const ACount: int32; const ADefault: ptr; const AUsedDefault: ptr): int32; external "kernel32";
+
+// kernel32: a folder listed (FindFirstFileW over "<folder>\*" gives its first entry and a
+// find handle, ADAM_PLATFORM_INVALID_HANDLE when there is none; FindNextFileW the next, 0 at
+// the end (GetLastError ADAM_PLATFORM_ERROR_NO_MORE_FILES) or on a failure; FindClose ends
+// it); the calling thread's last error; a FILETIME as UTC fields, and UTC fields as the
+// local time of that date (nil: the current time zone, its daylight rule for that year)
+routine FindFirstFileW(const AFileName: ptr to uint16; var AData: PlatformFindData): uint64;
+  external "kernel32";
+routine FindNextFileW(const AFind: uint64; var AData: PlatformFindData): int32;
+  external "kernel32";
+routine FindClose(const AFind: uint64): int32; external "kernel32";
+routine GetLastError(): uint32; external "kernel32";
+routine FileTimeToSystemTime(var AFileTime: PlatformFileTime;
+  var ASystemTime: PlatformSystemTime): int32; external "kernel32";
+routine SystemTimeToTzSpecificLocalTime(const ATimeZone: ptr; var AUniversal: PlatformSystemTime;
+  var ALocal: PlatformSystemTime): int32; external "kernel32";
 
 // kernel32: the handle of a DLL already loaded into the process (0 when it is not: it never
 // loads one), and the address of an export of a loaded DLL by its name (nil when it has
@@ -211,6 +261,10 @@ const
   // and the attribute bit of a folder
   ADAM_PLATFORM_FILE_EX_INFO_STANDARD: int32 = 0;
   ADAM_PLATFORM_ATTRIBUTE_DIRECTORY: uint32 = 0x10;
+  // GetLastError's ERROR_NO_MORE_FILES: FindNextFileW reached the folder's end
+  ADAM_PLATFORM_ERROR_NO_MORE_FILES: uint32 = 18;
+  // The UTF-16 units of the "\*" a folder's path takes for FindFirstFileW (its NUL apart)
+  ADAM_PLATFORM_FIND_SUFFIX: int64 = 2;
   // The UTF-16 units GetModuleFileNameW is first given; doubled while the path does not fit
   ADAM_PLATFORM_MODULE_PATH_START: uint32 = 260;
   // The UTF-16 units of the long-path prefixes "\\?\" and "\\?\UNC\"
@@ -785,6 +839,155 @@ begin
   LOk := DeleteFileW(LPath) <> 0;
   free(ptr(LPath));
   return LOk;
+end;
+
+// The find pattern of the folder at the NUL-terminated UTF-8 path APath: its long path
+// (DoLongPathOf) with "\*" after it (only "*" when it ends in a '\', a drive's root), as
+// NUL-terminated UTF-16 in a new block from the C heap (the caller frees it); nil when it
+// cannot be made
+routine DoFindPatternOf(const APath: ptr to const char): ptr to uint16;
+var
+  LLong: ptr to uint16;
+  LCount: int64;
+  LPattern: ptr to uint16;
+  LAt: int64;
+begin
+  LLong := DoLongPathOf(APath);
+  if LLong = nil then
+    return nil;
+  end;
+  LCount := 0;
+  while LLong[LCount] <> 0 do
+    LCount := LCount + 1;
+  end;
+  LPattern := ptr to uint16(malloc(uint64(LCount + ADAM_PLATFORM_FIND_SUFFIX + 1) * 2));
+  if LPattern = nil then
+    free(ptr(LLong));
+    return nil;
+  end;
+  memcpy(ptr(LPattern), ptr(LLong), uint64(LCount) * 2);
+  free(ptr(LLong));
+  LAt := LCount;
+  if (LCount = 0) or (LPattern[LCount - 1] <> 0x5C) then
+    LPattern[LAt] := 0x5C;
+    LAt := LAt + 1;
+  end;
+  LPattern[LAt] := 0x2A;
+  LPattern[LAt + 1] := 0;
+  return LPattern;
+end;
+
+// True when the find entry AData names "." or ".." (the folder itself, its parent)
+routine DoIsDotEntry(const AData: PlatformFindData): bool;
+begin
+  if AData.FileName[0] <> 0x2E then
+    return false;
+  end;
+  if AData.FileName[1] = 0 then
+    return true;
+  end;
+  return (AData.FileName[1] = 0x2E) and (AData.FileName[2] = 0);
+end;
+
+// Every name in the folder at the NUL-terminated UTF-8 path APath (relative to the working
+// folder, at any length; "." and ".." left out), in the OS's order, as UTF-8 with a NUL
+// after each: the bytes they take, their NULs counted (0 for an empty folder), written into
+// AText while they fit in its ASize bytes (AText nil: only counted), so AText holds them all
+// when the result is at most ASize. -1 when APath is no folder that can be listed (missing,
+// a file, no access, a path that is not valid UTF-8) or the listing fails part way
+public routine PlatformListFolder(const APath: ptr to const char; const AText: ptr to char;
+  const ASize: int64): int64;
+var
+  LPattern: ptr to uint16;
+  LFind: uint64;
+  LData: PlatformFindData;
+  LTotal: int64;
+  LBytes: int32;
+  LOk: bool;
+begin
+  LPattern := DoFindPatternOf(APath);
+  if LPattern = nil then
+    return -1;
+  end;
+  LFind := FindFirstFileW(LPattern, LData);
+  free(ptr(LPattern));
+  if LFind = ADAM_PLATFORM_INVALID_HANDLE then
+    return -1;
+  end;
+  LTotal := 0;
+  LOk := true;
+  while true do
+    if not DoIsDotEntry(LData) then
+      // The name's bytes with its NUL (-1: the units up to and with the NUL)
+      LBytes := WideCharToMultiByte(ADAM_PLATFORM_UTF8, 0, addr of LData.FileName[0], -1, nil,
+        0, nil, nil);
+      if LBytes <= 0 then
+        LOk := false;
+        leave;
+      end;
+      if (AText <> nil) and (LTotal + int64(LBytes) <= ASize) then
+        WideCharToMultiByte(ADAM_PLATFORM_UTF8, 0, addr of LData.FileName[0], -1,
+          addr of AText[LTotal], LBytes, nil, nil);
+      end;
+      LTotal := LTotal + int64(LBytes);
+    end;
+    if FindNextFileW(LFind, LData) = 0 then
+      LOk := GetLastError() = ADAM_PLATFORM_ERROR_NO_MORE_FILES;
+      leave;
+    end;
+  end;
+  FindClose(LFind);
+  if not LOk then
+    return -1;
+  end;
+  return LTotal;
+end;
+
+// The last write time of the file or folder at the NUL-terminated UTF-8 path APath
+// (relative to the working folder, at any length) as the local time of that date (the time
+// zone's daylight rule for its year, as C's localtime): AYear, AMonth 1..12, ADay 1..31,
+// AHour 0..23, AMinute and ASecond 0..59. False (every field 0) when it cannot be read
+public routine PlatformFileLocalTime(const APath: ptr to const char; var AYear: int32;
+  var AMonth: int32; var ADay: int32; var AHour: int32; var AMinute: int32;
+  var ASecond: int32): bool;
+var
+  LPath: ptr to uint16;
+  LData: PlatformAttributeData;
+  LRead: int32;
+  LWritten: PlatformFileTime;
+  LUniversal: PlatformSystemTime;
+  LLocal: PlatformSystemTime;
+begin
+  AYear := 0;
+  AMonth := 0;
+  ADay := 0;
+  AHour := 0;
+  AMinute := 0;
+  ASecond := 0;
+  LPath := DoLongPathOf(APath);
+  if LPath = nil then
+    return false;
+  end;
+  LRead := GetFileAttributesExW(LPath, ADAM_PLATFORM_FILE_EX_INFO_STANDARD, LData);
+  free(ptr(LPath));
+  if LRead = 0 then
+    return false;
+  end;
+  LWritten.Low := LData.WriteLow;
+  LWritten.High := LData.WriteHigh;
+  if FileTimeToSystemTime(LWritten, LUniversal) = 0 then
+    return false;
+  end;
+  if SystemTimeToTzSpecificLocalTime(nil, LUniversal, LLocal) = 0 then
+    return false;
+  end;
+  AYear := int32(LLocal.Year);
+  AMonth := int32(LLocal.Month);
+  ADay := int32(LLocal.Day);
+  AHour := int32(LLocal.Hour);
+  AMinute := int32(LLocal.Minute);
+  ASecond := int32(LLocal.Second);
+  return true;
 end;
 
 // The path of the program's exe as UTF-8 into AText (ASize bytes; a NUL after the path when
