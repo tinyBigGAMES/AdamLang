@@ -76,8 +76,11 @@ const
   ADAM_HOOKIO_CTRL_Z: uint8 = 0x1A;
   // ucrt's _O_BINARY (fcntl.h): _get_fmode's bit for a binary default
   ADAM_HOOKIO_O_BINARY: int32 = 0x8000;
-  // The largest int64: no item count of fread / fwrite may pass it in bytes
+  // The largest int64: the bytes of fread / fwrite are clamped there
   ADAM_HOOKIO_MAX_BYTES: int64 = 9223372036854775807;
+  // The largest size_t (64 bits on every target Adam has): fread / fwrite's byte count past it
+  // is refused
+  ADAM_HOOKIO_MAX_SIZE: uint64 = 18446744073709551615u;
   // The smallest int64 (ucrt's fseek fast track checks its difference against both ends)
   ADAM_HOOKIO_MIN_BYTES: int64 = -9223372036854775807 - 1;
   // ucrt's stdio buffer sizes (corecrt_internal_lowio.h _INTERNAL_BUFSIZ, _SMALL_BUFSIZ): a
@@ -213,9 +216,10 @@ type
     ClearError, Flush, Fileno);
 
   // One stream call on a handle: its arguments (Buffer / Size: the bytes of a read, write,
-  // fgets or fputs; ItemSize: fread / fwrite's element size; Offset / Origin: fseek's; Value:
-  // the byte of fputc / ungetc) and its answer (Answer, set to the call's failure value before
-  // DoWith runs it)
+  // fgets or fputs; ItemSize: fread / fwrite's element size, C's size_t in its bits; Offset /
+  // Origin: fseek's; Value: the byte of fputc / ungetc; Refused: arguments ucrt refuses up
+  // front, fread / fwrite's byte count past size_t: EINVAL) and its answer (Answer, set to the
+  // call's failure value before DoWith runs it)
   HookCall = record
     Op: HookOp;
     Buffer: ptr to uint8;
@@ -224,6 +228,7 @@ type
     Offset: int64;
     Origin: int32;
     Value: int32;
+    Refused: bool;
     Answer: int64;
   end;
 
@@ -260,6 +265,8 @@ var
   GLastId: uint64;
   // How many handles are open (atomic): while it is 0 no address is a handle
   GOpenCount: int64;
+  // Whether the exit flush is registered (DoExitFlush, once, at the first open), under GLock
+  GExitArmed: bool;
   // HookReal's slots of the real functions
   GRealFopen: ptr;
   GRealFopenS: ptr;
@@ -797,7 +804,11 @@ begin
   return LFound;
 end;
 
-// Records AHandle as open
+// The exit flush of open handles' written bytes, defined below
+forward routine DoExitFlush();
+
+// Records AHandle as open. The first open registers the exit flush (System.Runtime's AtExit):
+// a C exit-time routine registered before it runs after it, the heap report last
 routine DoAddHandle(const AHandle: ptr to HookHandle);
 var
   LCount: int64;
@@ -807,6 +818,10 @@ begin
     setlength(GHandles, LCount + 1);
     GHandles[LCount] := AHandle;
     atomicadd(GOpenCount, 1);
+    if not GExitArmed then
+      GExitArmed := true;
+      AtExit(DoExitFlush);
+    end;
   end;
 end;
 
@@ -2307,6 +2322,58 @@ begin
   return LResult;
 end;
 
+// ucrt flushes every open stream's written bytes at exit (its stdio termination); an open
+// handle's do the same, registered by the first open (DoAddHandle). Only bytes still unflushed
+// go to the IO (a handle with none never touches it). A D handle still open is then closed and
+// its entry given back with removal: the OS deletes a D file when the ending process's handle
+// closes. The handle stays in the open list, so a later call on it fails as on a closed one
+// (EBADF) instead of reaching the C runtime. Nothing can report a failure at exit
+routine DoExitFlush();
+var
+  LOpen: array of ptr to HookHandle;
+  LGoing: array of bool;
+  LHandle: ptr to HookHandle;
+  LI: int64;
+begin
+  if atomicload(GOpenCount) = 0 then
+    return;
+  end;
+  lock (GLock) do
+    setlength(LOpen, len(GHandles));
+    for LI := 0 to len(GHandles) - 1 do
+      LHandle := GHandles[LI];
+      LHandle->Users := LHandle->Users + 1;
+      LOpen[LI] := LHandle;
+    end;
+  end;
+  setlength(LGoing, len(LOpen));
+  for LI := 0 to len(LOpen) - 1 do
+    LHandle := LOpen[LI];
+    LGoing[LI] := false;
+    lock (LHandle->Lock->Lock) do
+      if not LHandle->Closed then
+        DoCrtFlushWrittenLocked(LHandle);
+        if LHandle->Temporary then
+          LHandle->Closed := true;
+          if LHandle->Owned then
+            IOClose(LHandle->Stream);
+          end;
+          LHandle->Stream := nil;
+          LGoing[LI] := true;
+        end;
+      end;
+    end;
+  end;
+  // Outside the stream locks: the removal runs the source
+  for LI := 0 to len(LOpen) - 1 do
+    LHandle := LOpen[LI];
+    if LGoing[LI] then
+      DoGiveBackEntry(LHandle, true);
+    end;
+    DoReleaseHandle(LHandle);
+  end;
+end;
+
 // A hooked fclose. False: not a HookIO handle, the caller passes it to the C runtime. True:
 // closed; AResult 0, or EOF when ucrt's flush of written bytes or closing its own IO failed
 // (the handle closes anyway). The handle is freed when the last call holding it gives it back
@@ -2345,17 +2412,37 @@ begin
   return true;
 end;
 
-// The byte count of ACount items of ASize bytes; 0 when either is 0 or less, or the count
-// passes int64
-routine DoItemBytes(const ASize: int64; const ACount: int64): int64;
+// The bytes fread / fwrite move for ACount items of ASize bytes, both C's size_t in their bits,
+// by ucrt's rule: a product past size_t is refused (ARefused: its parameter check, EINVAL, 0,
+// no ferror), a product of 0 moves nothing, and one past int64 (never a real buffer) is
+// clamped there
+routine DoItemBytes(const ASize: int64; const ACount: int64; var ARefused: bool): int64;
+var
+  LSize: uint64;
+  LCount: uint64;
+  LBytes: uint64;
 begin
-  if (ASize <= 0) or (ACount <= 0) then
+  ARefused := false;
+  LSize := uint64(ASize);
+  LCount := uint64(ACount);
+  if (LSize = 0u) or (LCount = 0u) then
     return 0;
   end;
-  if ACount > (ADAM_HOOKIO_MAX_BYTES div ASize) then
+  if LCount > (ADAM_HOOKIO_MAX_SIZE div LSize) then
+    ARefused := true;
     return 0;
   end;
-  return ASize * ACount;
+  LBytes := LSize * LCount;
+  if LBytes > uint64(ADAM_HOOKIO_MAX_BYTES) then
+    return ADAM_HOOKIO_MAX_BYTES;
+  end;
+  return int64(LBytes);
+end;
+
+// The whole items of AItemSize bytes (C's size_t in its bits) in ABytes moved
+routine DoWholeItems(const ABytes: int64; const AItemSize: int64): int64;
+begin
+  return int64(uint64(ABytes) div uint64(AItemSize));
 end;
 
 // A call of AOp whose answer, until it runs, is AFail; no arguments yet
@@ -2370,6 +2457,7 @@ begin
   LCall.Offset := 0;
   LCall.Origin := 0;
   LCall.Value := 0;
+  LCall.Refused := false;
   LCall.Answer := AFail;
   return LCall;
 end;
@@ -2383,19 +2471,31 @@ begin
   return 0;
 end;
 
-// fread: whole elements; a partial one is read and not counted (nothing for no bytes)
+// fread: whole elements; a partial one is read and not counted (nothing for no bytes; a
+// refused count: EINVAL, nothing read, no ferror)
 routine DoCallRead(const AHandle: ptr to HookHandle; var ACall: HookCall);
 begin
+  if ACall.Refused then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return;
+  end;
   if ACall.Size > 0 then
-    ACall.Answer := DoCrtReadLocked(AHandle, ACall.Buffer, ACall.Size) div ACall.ItemSize;
+    ACall.Answer := DoWholeItems(DoCrtReadLocked(AHandle, ACall.Buffer, ACall.Size),
+      ACall.ItemSize);
   end;
 end;
 
-// fwrite: whole elements written (nothing for no bytes)
+// fwrite: whole elements written (nothing for no bytes; a refused count: EINVAL, nothing
+// written, no ferror)
 routine DoCallWrite(const AHandle: ptr to HookHandle; var ACall: HookCall);
 begin
+  if ACall.Refused then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return;
+  end;
   if ACall.Size > 0 then
-    ACall.Answer := DoCrtWriteLocked(AHandle, ACall.Buffer, ACall.Size) div ACall.ItemSize;
+    ACall.Answer := DoWholeItems(DoCrtWriteLocked(AHandle, ACall.Buffer, ACall.Size),
+      ACall.ItemSize);
   end;
 end;
 
@@ -2553,7 +2653,7 @@ begin
   LCall := DoCall(AOp, 0);
   LCall.Buffer := ptr to uint8(ABuffer);
   LCall.ItemSize := ASize;
-  LCall.Size := DoItemBytes(ASize, ACount);
+  LCall.Size := DoItemBytes(ASize, ACount, LCall.Refused);
   if not DoWith(AFile, LCall) then
     return false;
   end;

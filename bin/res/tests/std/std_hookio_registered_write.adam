@@ -1,0 +1,330 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  std_hookio_registered_write.adam - opens that change a registered IO's
+  size (PaskalCPP's std_hookio TestRegisteredWrite)
+
+  "w" over a registered IO empties it as the C runtime's open truncates a
+  file: a handle opened before reads what the "w" handle wrote, slot for
+  slot as against a real file. An IO that cannot change its size (no
+  Truncate): a text "+" open over a trailing Ctrl-Z opens with the byte
+  kept and errno EACCES, and "w" is refused with EINVAL, both as ucrt on a
+  real file a second handle maps (so it cannot shrink).
+*******************************************************************************/
+
+/*
+@@test
+  kind run
+  exitcode 0
+  | ok registered w io
+  | ok registered w real file
+  | ok registered w opened
+  | ok registered w as real file
+  | ok registered w bytes as real file
+  | ok registered w unregister
+  | ok registered w io close
+  | ok noshorten inner
+  | ok noshorten register
+  | ok noshorten update real file
+  | ok noshorten update real mapped
+  | ok noshorten update kept, EACCES
+  | ok noshorten update as real file
+  | ok noshorten update byte kept
+  | ok noshorten w real mapped
+  | ok noshorten w refused EINVAL
+  | ok noshorten w as real file
+  | ok noshorten w kept
+  | ok noshorten unregister
+  | ok noshorten io close
+  | ok noshorten inner close
+  | ok noshorten real removed
+  | done 0
+  | [Adam Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+@@end
+*/
+
+module exe std_hookio_registered_write;
+
+@addlibrarypath "$P:res/tests/std/fixtures";
+
+import System.SysUtils, System.Runtime, System.CustomIO, System.HookIO;
+
+routine clink std_hookio_c_read(APath: ptr to const char; ABuffer: ptr to uint8; ACap: clong;
+  AReportSize: ptr to clong): clong; external "std_hookio_c";
+routine clink std_hookio_c_writeraw(APath: ptr to const char; ABytes: ptr to const uint8;
+  ACount: clong): int32; external "std_hookio_c";
+routine clink std_hookio_c_wover(APath: ptr to const char; AResults: ptr to int64);
+  external "std_hookio_c";
+routine clink std_hookio_c_noshorten(APath: ptr to const char; AMode: ptr to const char;
+  AResults: ptr to int64): int32; external "std_hookio_c";
+
+type
+  // A read / write stream that cannot change its size: every call goes to Inner (a memory IO),
+  // and it has no Truncate callback
+  NoTruncData = record
+    Inner: IO;
+  end;
+
+var
+  GFails: int32;
+
+routine Check(const AName: string; const AOk: bool);
+begin
+  if AOk then
+    println("ok {}", AName);
+  else
+    println("FAIL {}", AName);
+    GFails := GFails + 1;
+  end;
+end;
+
+routine SameBytes(const AFirst: ptr; const ASecond: ptr; const ACount: int64): bool;
+var
+  LFirst: ptr to uint8;
+  LSecond: ptr to uint8;
+  LI: int64;
+begin
+  LFirst := ptr to uint8(AFirst);
+  LSecond := ptr to uint8(ASecond);
+  for LI := 0 to ACount - 1 do
+    if LFirst[LI] <> LSecond[LI] then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// True when ACount slots of AFirst equal ASecond's; on a difference the first differing slot
+// is printed, so a FAIL row names what differs
+routine SameSlots(const AFirst: ptr to int64; const ASecond: ptr to int64;
+  const ACount: int32): bool;
+var
+  LI: int32;
+begin
+  for LI := 0 to ACount - 1 do
+    if AFirst[LI] <> ASecond[LI] then
+      println("  slot {}: io {} real {}", LI, AFirst[LI], ASecond[LI]);
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// Deletes the file at APath; false when it is not deleted
+routine RemovePath(const APath: string): bool;
+var
+  LPath: ptr to char;
+  LOk: bool;
+begin
+  LPath := StringToC(APath);
+  LOk := RemoveFile(LPath);
+  freemem(LPath);
+  return LOk;
+end;
+
+// ACount bytes at ABytes into a new real file at APath (the C runtime's own FILE)
+routine WriteRaw(const APath: string; const ABytes: ptr to uint8; const ACount: int64): bool;
+var
+  LPath: ptr to char;
+  LResult: int32;
+begin
+  LPath := StringToC(APath);
+  LResult := std_hookio_c_writeraw(LPath, ABytes, clong(ACount));
+  freemem(LPath);
+  return LResult = 0;
+end;
+
+// The C fixture's "w" over a file another handle has open, on APath: its 8 slots in AResults
+routine WoverC(const APath: string; const AResults: ptr to int64);
+var
+  LPath: ptr to char;
+begin
+  LPath := StringToC(APath);
+  std_hookio_c_wover(LPath, AResults);
+  freemem(LPath);
+end;
+
+// The C fixture's open of APath in AMode while it cannot shrink: its 5 slots in AResults; 1
+// when a mapping was held during the open
+routine NoShortenC(const APath: string; const AMode: string; const AResults: ptr to int64):
+  int32;
+var
+  LPath: ptr to char;
+  LMode: ptr to char;
+  LMapped: int32;
+begin
+  LPath := StringToC(APath);
+  LMode := StringToC(AMode);
+  LMapped := std_hookio_c_noshorten(LPath, LMode, AResults);
+  freemem(LPath);
+  freemem(LMode);
+  return LMapped;
+end;
+
+// True when AIO's bytes equal the real file at APath's (read "rb" by C)
+routine SameAsRealFile(const AIO: IO; const APath: string): bool;
+var
+  LVirtual: array[0..63] of uint8;
+  LReal: array[0..63] of uint8;
+  LPath: ptr to char;
+  LRealSize: clong;
+  LReport: clong;
+  LSize: int64;
+begin
+  LPath := StringToC(APath);
+  LRealSize := std_hookio_c_read(LPath, addr of LReal[0], 64, addr of LReport);
+  freemem(LPath);
+  LSize := IOSize(AIO);
+  if (LRealSize < 0) or (LSize <> int64(LRealSize)) or (LSize > 64) then
+    return false;
+  end;
+  if IOSeek(AIO, 0, SeekOrigin.FromStart) <> 0 then
+    return false;
+  end;
+  if IORead(AIO, ptr(addr of LVirtual[0]), LSize) <> LSize then
+    return false;
+  end;
+  return SameBytes(ptr(addr of LVirtual[0]), ptr(addr of LReal[0]), LSize);
+end;
+
+routine NoTruncRead(const AUserData: ptr; const ABuffer: ptr; const ASize: int64;
+  var AState: IOState): int64;
+var
+  LInner: IO;
+  LCount: int64;
+begin
+  LInner := ptr to NoTruncData(AUserData)->Inner;
+  LCount := IORead(LInner, ABuffer, ASize);
+  if LCount < ASize then
+    AState := IOStatus(LInner);
+  end;
+  return LCount;
+end;
+
+routine NoTruncWrite(const AUserData: ptr; const ABuffer: ptr; const ASize: int64;
+  var AState: IOState): int64;
+var
+  LInner: IO;
+  LCount: int64;
+begin
+  LInner := ptr to NoTruncData(AUserData)->Inner;
+  LCount := IOWrite(LInner, ABuffer, ASize);
+  if LCount < ASize then
+    AState := IOStatus(LInner);
+  end;
+  return LCount;
+end;
+
+routine NoTruncSeek(const AUserData: ptr; const AOffset: int64; const AOrigin: SeekOrigin):
+  int64;
+begin
+  return IOSeek(ptr to NoTruncData(AUserData)->Inner, AOffset, AOrigin);
+end;
+
+routine NoTruncTell(const AUserData: ptr): int64;
+begin
+  return IOTell(ptr to NoTruncData(AUserData)->Inner);
+end;
+
+routine NoTruncSize(const AUserData: ptr): int64;
+begin
+  return IOSize(ptr to NoTruncData(AUserData)->Inner);
+end;
+
+// Opens that change a registered IO's size. "w" empties the IO as the C runtime's open
+// truncates a file: a handle opened before reads what the "w" handle wrote, against a real
+// file. An IO that cannot change its size (no Truncate): a text "+" open over a trailing Ctrl-Z
+// opens with the byte kept and errno EACCES, and "w" is refused with EINVAL, both against a
+// real file a second handle maps, so it cannot shrink
+routine TestRegisteredWrite();
+var
+  LSample: array[0..7] of uint8;
+  LMemory: IO;
+  LNoTrunc: NoTruncData;
+  LCallbacks: IOInterface;
+  LStream: IO;
+  LPrefix: string;
+  LRealPath: string;
+  LVirtual: array[0..7] of int64;
+  LReal: array[0..7] of int64;
+  LMapped: int32;
+  LI: int32;
+begin
+  LRealPath := paramstr(0) + ".wover.txt";
+  for LI := 0 to 7 do
+    LSample[LI] := uint8(97 + LI);
+  end;
+
+  // "w" over a registered IO holding "abcdefgh"
+  LMemory := CreateMemoryIO();
+  LPrefix := RegisterIO(LMemory);
+  Check("registered w io", (LPrefix <> "") and (IOWrite(LMemory, ptr(addr of LSample[0]), 8) = 8));
+  Check("registered w real file", WriteRaw(LRealPath, addr of LSample[0], 8));
+  WoverC(LPrefix + "/w.txt", addr of LVirtual[0]);
+  WoverC(LRealPath, addr of LReal[0]);
+  Check("registered w opened", (LVirtual[0] = 1) and (LVirtual[3] = 2));
+  Check("registered w as real file", SameSlots(addr of LVirtual[0], addr of LReal[0], 8));
+  Check("registered w bytes as real file", SameAsRealFile(LMemory, LRealPath));
+  Check("registered w unregister", UnregisterIO(LPrefix));
+  Check("registered w io close", IOClose(LMemory));
+
+  // "xy" and a Ctrl-Z in an IO that cannot change its size
+  LSample[0] := uint8('x');
+  LSample[1] := uint8('y');
+  LSample[2] := 26;
+  LMemory := CreateMemoryIO();
+  Check("noshorten inner", IOWrite(LMemory, ptr(addr of LSample[0]), 3) = 3);
+  LNoTrunc.Inner := LMemory;
+  LCallbacks.Read := NoTruncRead;
+  LCallbacks.Write := NoTruncWrite;
+  LCallbacks.Seek := NoTruncSeek;
+  LCallbacks.Tell := NoTruncTell;
+  LCallbacks.Size := NoTruncSize;
+  LCallbacks.Flush := nil;
+  LCallbacks.Close := nil;
+  LCallbacks.Truncate := nil;
+  LStream := CreateIO(LCallbacks, ptr(addr of LNoTrunc));
+  LPrefix := RegisterIO(LStream);
+  Check("noshorten register", LPrefix <> "");
+
+  // "r+t": an update open in text mode drops a trailing Ctrl-Z, which this IO cannot
+  Check("noshorten update real file", WriteRaw(LRealPath, addr of LSample[0], 3));
+  NoShortenC(LPrefix + "/z.txt", "r+t", addr of LVirtual[0]);
+  LMapped := NoShortenC(LRealPath, "r+t", addr of LReal[0]);
+  Check("noshorten update real mapped", LMapped = 1);
+  Check("noshorten update kept, EACCES", (LVirtual[0] = 1) and
+    (LVirtual[1] = int64(ADAM_ERRNO_EACCES)) and (LVirtual[2] = 3));
+  Check("noshorten update as real file", SameSlots(addr of LVirtual[0], addr of LReal[0], 5));
+  Check("noshorten update byte kept", IOSize(LMemory) = 3);
+
+  NoShortenC(LPrefix + "/z.txt", "w", addr of LVirtual[0]);
+  LMapped := NoShortenC(LRealPath, "w", addr of LReal[0]);
+  Check("noshorten w real mapped", LMapped = 1);
+  Check("noshorten w refused EINVAL", (LVirtual[0] = 0) and
+    (LVirtual[1] = int64(ADAM_ERRNO_EINVAL)));
+  Check("noshorten w as real file", SameSlots(addr of LVirtual[0], addr of LReal[0], 5));
+  Check("noshorten w kept", IOSize(LMemory) = 3);
+
+  Check("noshorten unregister", UnregisterIO(LPrefix));
+  Check("noshorten io close", IOClose(LStream));
+  Check("noshorten inner close", IOClose(LMemory));
+  Check("noshorten real removed", RemovePath(LRealPath));
+end;
+
+begin
+  GFails := 0;
+  TestRegisteredWrite();
+  println("done {}", GFails);
+end.
