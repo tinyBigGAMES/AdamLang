@@ -34,9 +34,17 @@
   modes (FileMode), its path UTF-8: `$P:` (either case) the folder of the
   program's exe, `$D:` and `$S:` the working folder.
 
-  Target-neutral: files through System.Runtime's file-handle routines, no OS
-  named. Outside the compiler's dependency path (not in the shared subset,
-  DESIGN sec 10): it takes `addr of`.
+  An IOSource opens IOs by path (SDL3's storage, read side), so a format with
+  several files opens its siblings through the source it came from: an
+  IOSourceInterface of callbacks behind CreateIOSource, used through
+  IOSourceOpen, IOSourceExists, IOSourceSize, IOSourceRemove,
+  IOSourceCanRemove and IOSourceClose, which check and normalize every path
+  (relative, `/` separated, no `..` above the root) before a callback sees
+  it. CreateFolderIOSource makes a source over a folder.
+
+  Target-neutral: files and folders through System.Runtime's file-handle and
+  path routines, no OS named. Outside the compiler's dependency path (not in
+  the shared subset, DESIGN sec 10): it takes `addr of`.
 *******************************************************************************/
 
 module unit System.CustomIO;
@@ -105,6 +113,47 @@ public type
   // with IOClose. nil is no stream (a Create* that failed)
   IO = ptr to IOStream;
 
+  // The callbacks of an IOSourceInterface. Each takes the user pointer given to
+  // CreateIOSource and an entry path already in canonical form (relative, `/` separated, no
+  // `.` or `..`). Open returns the entry's IO in AMode, or nil (missing, or a mode the source
+  // does not offer); Exists is true when the entry exists and can be opened (a folder is not
+  // one); Size is the entry's size in bytes or -1 when it does not exist; Close releases the
+  // source's own resources (false when that failed; IOs already opened stay valid until their
+  // own IOClose); Remove deletes the entry (false when it does not exist or the source
+  // refuses)
+  IOSourceOpenCallback = routine(const AUserData: ptr; const APath: string;
+    const AMode: FileMode): IO;
+  IOSourceExistsCallback = routine(const AUserData: ptr; const APath: string): bool;
+  IOSourceSizeCallback = routine(const AUserData: ptr; const APath: string): int64;
+  IOSourceCloseCallback = routine(const AUserData: ptr): bool;
+  IOSourceRemoveCallback = routine(const AUserData: ptr; const APath: string): bool;
+
+  // The table of callbacks behind an IOSource (SDL3's SDL_StorageInterface, read side): a
+  // source opens IOs by path, so a format with several files (a glTF and its .bin, an .obj
+  // and its .mtl) opens its siblings through the source it came from. The IOSource routines
+  // check and normalize a path before any callback sees it. Leave a callback nil when the
+  // source has no such operation; Remove is optional (nil: the source deletes nothing, as a
+  // read-only one)
+  IOSourceInterface = record
+    Open: IOSourceOpenCallback;
+    Exists: IOSourceExistsCallback;
+    Size: IOSourceSizeCallback;
+    Close: IOSourceCloseCallback;
+    Remove: IOSourceRemoveCallback;
+  end;
+
+  // What an IOSource points at: the callbacks CreateIOSource was given and the user pointer
+  // every callback receives. Reach it only through the IOSource routines
+  IOSourceRecord = record
+    Callbacks: IOSourceInterface;
+    UserData: ptr;
+  end;
+
+  // A source of IOs by path: made by CreateIOSource or a Create*IOSource routine, used
+  // through the IOSource routines, ended with IOSourceClose. nil is no source (a Create*
+  // that failed)
+  IOSource = ptr to IOSourceRecord;
+
 const
   // The bytes IOReadAll and IOCopy move per step (their chunk arrays are 0..65535), and the
   // bytes IOSameContent compares per step (its arrays are 0..4095)
@@ -133,6 +182,14 @@ type
   FileData = record
     Handle: uint64;
     Append: bool;
+  end;
+
+  // A folder source's user data: the folder every entry path is relative to, as C text from
+  // StringToC (RootCount bytes, then a NUL; freed by the source's Close). Kept as C text, not
+  // a string: the record lives in getmem's memory
+  FolderData = record
+    Root: ptr to char;
+    RootCount: int64;
   end;
 
 // ACount bytes from ASource to ADest (the two do not overlap)
@@ -1088,26 +1145,21 @@ begin
   return LRest;
 end;
 
-// Makes an IO over a file, opened in one of C's fopen modes (see FileMode); APath is UTF-8,
-// `$P:` the folder of the program's exe, `$D:` / `$S:` the working folder. A Read IO fails
-// IOWrite with state ReadOnly, a Write or Append one fails IORead with state WriteOnly. A file
-// may be positioned past its end, as with fseek; a write there fills the gap with zero bytes.
-// IOClose closes the file. Nil when the file cannot be opened in that mode (a missing file
-// for Read / ReadWrite, a folder, no permission)
-public routine CreateFileIO(const APath: string; const AMode: FileMode): IO;
+// A file IO over APath, a path as the runtime opens it (DoFilePath's result: no prefix left),
+// opened in AMode; nil when APath is "" or the file cannot be opened so. CreateFileIO and the
+// folder source open their files here
+routine DoOpenFile(const APath: string; const AMode: FileMode): IO;
 var
-  LPath: string;
   LText: ptr to char;
   LHandle: uint64;
   LOpened: bool;
   LFile: ptr to FileData;
   LIO: IO;
 begin
-  LPath := DoFilePath(APath);
-  if LPath = "" then
+  if APath = "" then
     return nil;
   end;
-  LText := StringToC(LPath);
+  LText := StringToC(APath);
   if LText = nil then
     return nil;
   end;
@@ -1130,6 +1182,409 @@ begin
     freemem(LFile);
   end;
   return LIO;
+end;
+
+// Makes an IO over a file, opened in one of C's fopen modes (see FileMode); APath is UTF-8,
+// `$P:` the folder of the program's exe, `$D:` / `$S:` the working folder. A Read IO fails
+// IOWrite with state ReadOnly, a Write or Append one fails IORead with state WriteOnly. A file
+// may be positioned past its end, as with fseek; a write there fills the gap with zero bytes.
+// IOClose closes the file. Nil when the file cannot be opened in that mode (a missing file
+// for Read / ReadWrite, a folder, no permission)
+public routine CreateFileIO(const APath: string; const AMode: FileMode): IO;
+begin
+  return DoOpenFile(DoFilePath(APath), AMode);
+end;
+
+
+// True for a byte no source path may hold: `\` and `:` (a second separator and a drive on
+// Windows), the characters Windows refuses in a name, and the control characters
+routine DoSourceBadChar(const AChar: char): bool;
+begin
+  if uint8(AChar) < 0x20 then
+    return true;
+  end;
+  return (AChar = '\\') or (AChar = ':') or (AChar = '<') or (AChar = '>') or (AChar = '"') or
+    (AChar = '|') or (AChar = '?') or (AChar = '*');
+end;
+
+// True when ASegment is a Windows device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9) in any
+// case, with or without an extension. Windows opens the device for such a name in any
+// folder; it is refused on every target, so a source path means the same file everywhere
+routine DoSourceDevice(const ASegment: string): bool;
+var
+  LEnd: int64;
+  LStem: string;
+  LPrefix: string;
+begin
+  // The stem: the bytes before the first '.'
+  LEnd := 0;
+  while (LEnd < len(ASegment)) and (ASegment[LEnd] <> '.') do
+    LEnd := LEnd + 1;
+  end;
+  // Windows drops trailing spaces before the extension ("CON .txt" is CON)
+  while (LEnd > 0) and (ASegment[LEnd - 1] = ' ') do
+    LEnd := LEnd - 1;
+  end;
+  LStem := UpperCase(Substring(ASegment, 0, LEnd));
+  if (LStem = "CON") or (LStem = "PRN") or (LStem = "AUX") or (LStem = "NUL") then
+    return true;
+  end;
+  if len(LStem) <> 4 then
+    return false;
+  end;
+  LPrefix := Substring(LStem, 0, 3);
+  if (LPrefix <> "COM") and (LPrefix <> "LPT") then
+    return false;
+  end;
+  return (LStem[3] >= '1') and (LStem[3] <= '9');
+end;
+
+// An IOSource path in its one canonical form, "" when it is refused. The path is relative,
+// `/` separated, UTF-8. `.` segments drop out and `..` removes the segment before it
+// (lexically, as in a zip); a `..` that would climb above the source's root is refused.
+// Refused too: an empty path or segment (a leading, doubled or trailing `/`), a bad byte
+// (DoSourceBadChar), a segment ending in `.` or a space (Windows drops those, so two names
+// would mean one file), a device name, and a path that names the root itself
+routine DoSourceNormalize(const APath: string): string;
+var
+  LSegments: StringArray;
+  LParts: StringArray;
+  LCount: int64;
+  LSegment: string;
+  LLast: char;
+  LI: int64;
+begin
+  if APath = "" then
+    return "";
+  end;
+  for LI := 0 to len(APath) - 1 do
+    if DoSourceBadChar(APath[LI]) then
+      return "";
+    end;
+  end;
+  LSegments := SplitString(APath, "/");
+  setlength(LParts, len(LSegments));
+  LCount := 0;
+  for LI := 0 to len(LSegments) - 1 do
+    LSegment := LSegments[LI];
+    if LSegment = "" then
+      return "";
+    end;
+    if LSegment = ".." then
+      if LCount = 0 then
+        return "";
+      end;
+      LCount := LCount - 1;
+    else
+      if LSegment <> "." then
+        LLast := LSegment[len(LSegment) - 1];
+        if (LLast = '.') or (LLast = ' ') then
+          return "";
+        end;
+        if DoSourceDevice(LSegment) then
+          return "";
+        end;
+        LParts[LCount] := LSegment;
+        LCount := LCount + 1;
+      end;
+    end;
+  end;
+  // No part left: the path named the root itself
+  return JoinStrings(LParts, "/", 0, LCount);
+end;
+
+// Makes an IOSource from a table of callbacks and the user pointer they receive. The
+// interface is copied; the user pointer is the caller's and is never freed by the source
+// (its Close callback may free it). Nil when there is no room
+public routine CreateIOSource(const AInterface: IOSourceInterface; const AUserData: ptr): IOSource;
+var
+  LSource: IOSource;
+begin
+  LSource := ptr to IOSourceRecord(getmem(size(IOSourceRecord)));
+  if LSource = nil then
+    return nil;
+  end;
+  LSource->Callbacks := AInterface;
+  LSource->UserData := AUserData;
+  return LSource;
+end;
+
+// Opens an entry of the source as an IO in AMode (a read-only source offers only Read). The
+// path is relative to the source, `/` separated, UTF-8; `.` and `..` are resolved (a `..`
+// above the source's root is refused). Refused before the source is asked: an absolute or
+// empty path, an empty segment (`a//b`, a trailing `/`), `\`, `:`, the other characters
+// Windows refuses in a name, a segment ending in `.` or a space, and a Windows device name
+// (`nul`, `com1.txt`), on every target alike. Nil for a refused path, a missing entry, a mode
+// not offered, a nil source or no Open callback
+public routine IOSourceOpen(const ASource: IOSource; const APath: string; const AMode: FileMode): IO;
+var
+  LOpen: IOSourceOpenCallback;
+  LPath: string;
+begin
+  if ASource = nil then
+    return nil;
+  end;
+  LOpen := ASource->Callbacks.Open;
+  if LOpen = nil then
+    return nil;
+  end;
+  LPath := DoSourceNormalize(APath);
+  if LPath = "" then
+    return nil;
+  end;
+  return LOpen(ASource->UserData, LPath, AMode);
+end;
+
+// Opens an entry of the source for reading (IOSourceOpen with FileMode.Read)
+public routine IOSourceOpen(const ASource: IOSource; const APath: string): IO;
+begin
+  return IOSourceOpen(ASource, APath, FileMode.Read);
+end;
+
+// True when the source has the entry (a file it can open; a folder is not an entry). The
+// path follows IOSourceOpen's rules; a refused path does not exist. False too for a nil
+// source or no Exists callback
+public routine IOSourceExists(const ASource: IOSource; const APath: string): bool;
+var
+  LExists: IOSourceExistsCallback;
+  LPath: string;
+begin
+  if ASource = nil then
+    return false;
+  end;
+  LExists := ASource->Callbacks.Exists;
+  if LExists = nil then
+    return false;
+  end;
+  LPath := DoSourceNormalize(APath);
+  if LPath = "" then
+    return false;
+  end;
+  return LExists(ASource->UserData, LPath);
+end;
+
+// The size in bytes of an entry of the source, without opening it. The path follows
+// IOSourceOpen's rules. -1 for no such entry, a refused path, a nil source or no Size
+// callback (any negative size the callback gives is -1)
+public routine IOSourceSize(const ASource: IOSource; const APath: string): int64;
+var
+  LSizeOf: IOSourceSizeCallback;
+  LPath: string;
+  LSize: int64;
+begin
+  if ASource = nil then
+    return -1;
+  end;
+  LSizeOf := ASource->Callbacks.Size;
+  if LSizeOf = nil then
+    return -1;
+  end;
+  LPath := DoSourceNormalize(APath);
+  if LPath = "" then
+    return -1;
+  end;
+  LSize := LSizeOf(ASource->UserData, LPath);
+  if LSize < 0 then
+    return -1;
+  end;
+  return LSize;
+end;
+
+// Deletes an entry of the source. The path follows IOSourceOpen's rules. IOs already opened
+// on the entry stay valid; whether the entry can go while one is open is the source's (a
+// folder source on Windows refuses while a file IO on it is open). False for a missing
+// entry, a refused path, a source that refused, a nil source or no Remove callback (a source
+// that deletes nothing, such as a zip)
+public routine IOSourceRemove(const ASource: IOSource; const APath: string): bool;
+var
+  LRemove: IOSourceRemoveCallback;
+  LPath: string;
+begin
+  if ASource = nil then
+    return false;
+  end;
+  LRemove := ASource->Callbacks.Remove;
+  if LRemove = nil then
+    return false;
+  end;
+  LPath := DoSourceNormalize(APath);
+  if LPath = "" then
+    return false;
+  end;
+  return LRemove(ASource->UserData, LPath);
+end;
+
+// True when the source can delete entries (it has a Remove callback), so a caller can refuse
+// up front what IOSourceRemove would not do later (a zip source cannot); false for a nil
+// source
+public routine IOSourceCanRemove(const ASource: IOSource): bool;
+begin
+  if ASource = nil then
+    return false;
+  end;
+  return ASource->Callbacks.Remove <> nil;
+end;
+
+// Ends the source: calls its Close callback, then frees the IOSource. IOs opened from it stay
+// valid until their own IOClose. False for a nil source or when the Close callback failed
+public routine IOSourceClose(const ASource: IOSource): bool;
+var
+  LClose: IOSourceCloseCallback;
+  LOk: bool;
+begin
+  if ASource = nil then
+    return false;
+  end;
+  LOk := true;
+  LClose := ASource->Callbacks.Close;
+  if LClose <> nil then
+    LOk := LClose(ASource->UserData);
+  end;
+  freemem(ASource);
+  return LOk;
+end;
+
+// The file an entry of a folder source names: the folder joined with the canonical entry
+// path, as the runtime opens it (the folder is never "": CreateFolderIOSource refuses it)
+routine DoFolderFile(const AUserData: ptr; const APath: string): string;
+var
+  LFolder: ptr to FolderData;
+  LRoot: string;
+  LLast: char;
+begin
+  LFolder := ptr to FolderData(AUserData);
+  LRoot := StringFromC(ptr to const char(LFolder->Root), LFolder->RootCount);
+  LLast := LRoot[len(LRoot) - 1];
+  if (LLast = '/') or (LLast = '\\') then
+    return LRoot + APath;
+  end;
+  return LRoot + "/" + APath;
+end;
+
+// What is at an entry of a folder source (the runtime's ADAM_PATH_*), ASize the size of a
+// file; ADAM_PATH_NONE when its path cannot be made
+routine DoFolderKind(const AUserData: ptr; const APath: string; var ASize: int64): int32;
+var
+  LText: ptr to char;
+  LKind: int32;
+begin
+  ASize := 0;
+  LText := StringToC(DoFolderFile(AUserData, APath));
+  if LText = nil then
+    return ADAM_PATH_NONE;
+  end;
+  LKind := PathKind(LText, ASize);
+  freemem(LText);
+  return LKind;
+end;
+
+// The folder source's callbacks: an entry is a file under the folder, opened as a file IO
+routine FolderOpen(const AUserData: ptr; const APath: string; const AMode: FileMode): IO;
+begin
+  return DoOpenFile(DoFolderFile(AUserData, APath), AMode);
+end;
+
+routine FolderExists(const AUserData: ptr; const APath: string): bool;
+var
+  LSize: int64;
+begin
+  return DoFolderKind(AUserData, APath, LSize) = ADAM_PATH_FILE;
+end;
+
+routine FolderSize(const AUserData: ptr; const APath: string): int64;
+var
+  LSize: int64;
+begin
+  if DoFolderKind(AUserData, APath, LSize) <> ADAM_PATH_FILE then
+    return -1;
+  end;
+  return LSize;
+end;
+
+// Deletes the entry's file; false when it is not a file (a folder is not an entry) or the
+// file system refuses (a read-only file, one open in a file IO on Windows)
+routine FolderRemove(const AUserData: ptr; const APath: string): bool;
+var
+  LSize: int64;
+  LText: ptr to char;
+  LOk: bool;
+begin
+  if DoFolderKind(AUserData, APath, LSize) <> ADAM_PATH_FILE then
+    return false;
+  end;
+  LText := StringToC(DoFolderFile(AUserData, APath));
+  if LText = nil then
+    return false;
+  end;
+  LOk := RemoveFile(LText);
+  freemem(LText);
+  return LOk;
+end;
+
+// Frees the folder source's user data
+routine FolderClose(const AUserData: ptr): bool;
+var
+  LFolder: ptr to FolderData;
+begin
+  LFolder := ptr to FolderData(AUserData);
+  freemem(LFolder->Root);
+  freemem(LFolder);
+  return true;
+end;
+
+// The folder source's callback table
+routine FolderInterface(): IOSourceInterface;
+var
+  LInterface: IOSourceInterface;
+begin
+  LInterface.Open := FolderOpen;
+  LInterface.Exists := FolderExists;
+  LInterface.Size := FolderSize;
+  LInterface.Close := FolderClose;
+  LInterface.Remove := FolderRemove;
+  return LInterface;
+end;
+
+// Makes an IOSource over a folder: every entry is a file under it, its IOs file IOs
+// (CreateFileIO's rules, every FileMode). The folder's path is UTF-8, with CreateFileIO's
+// prefixes (`$P:` the folder of the program's exe, `$D:` / `$S:` the working folder); entry
+// paths are relative to it (IOSourceOpen's rules), so nothing outside the folder is reached
+// by a `..`. Opening in Write or Append creates the file, never a folder; IOSourceRemove
+// deletes the entry's file. Nil when the path is not an existing folder
+public routine CreateFolderIOSource(const APath: string): IOSource;
+var
+  LPath: string;
+  LText: ptr to char;
+  LSize: int64;
+  LFolder: ptr to FolderData;
+  LSource: IOSource;
+begin
+  LPath := DoFilePath(APath);
+  if LPath = "" then
+    return nil;
+  end;
+  LText := StringToC(LPath);
+  if LText = nil then
+    return nil;
+  end;
+  LSize := 0;
+  if PathKind(LText, LSize) <> ADAM_PATH_FOLDER then
+    freemem(LText);
+    return nil;
+  end;
+  LFolder := ptr to FolderData(getmem(size(FolderData)));
+  if LFolder = nil then
+    freemem(LText);
+    return nil;
+  end;
+  LFolder->Root := LText;
+  LFolder->RootCount := len(LPath);
+  LSource := CreateIOSource(FolderInterface(), ptr(LFolder));
+  if LSource = nil then
+    freemem(LText);
+    freemem(LFolder);
+  end;
+  return LSource;
 end;
 
 end.
