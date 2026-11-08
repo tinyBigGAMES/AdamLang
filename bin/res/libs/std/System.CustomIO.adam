@@ -42,6 +42,15 @@
   (relative, `/` separated, no `..` above the root) before a callback sees
   it. CreateFolderIOSource makes a source over a folder.
 
+  CreateZipIOSource makes a read-only source over a zip archive read through
+  an IO or a file: its central directory is read once (ZIP64, stored and
+  deflated entries, ZipCrypto, names in UTF-8, CP437 or the Info-ZIP Unicode
+  Path field) and each entry opens as a read-only IO that seeks without
+  reading from the start again. CreateZipFileIO opens one entry of an
+  archive; GetZipEntryInfo reads an entry's size and CRC-32 without opening
+  it. minizip (System.Minizip.C) reads the archive through the IO, zlib
+  (System.Zlib.C) inflates in place, ZipCrypto is decrypted here.
+
   Target-neutral: files and folders through System.Runtime's file-handle and
   path routines, no OS named. Outside the compiler's dependency path (not in
   the shared subset, DESIGN sec 10): it takes `addr of`.
@@ -49,7 +58,7 @@
 
 module unit System.CustomIO;
 
-import System.SysUtils, System.Runtime;
+import System.SysUtils, System.Runtime, System.Zlib.C, System.Minizip.C;
 
 public type
   // The state of an IO after its last operation, read with IOStatus. A short count from
@@ -165,6 +174,24 @@ const
   ADAM_CUSTOMIO_GROW_LIMIT: int64 = 4611686018427387903;
   // The largest int64: a position plus a count past it is no room at all
   ADAM_CUSTOMIO_INT64_MAX: int64 = 9223372036854775807;
+  // A zip entry under ADAM_CUSTOMIO_ZIP_WHOLE_LIMIT bytes is read whole when opened. A
+  // deflated entry read in place keeps an access point about every ADAM_CUSTOMIO_ZIP_SPAN
+  // output bytes, an encrypted stored one every ADAM_CUSTOMIO_ZIP_KEY_SPAN; the archive gives
+  // ADAM_CUSTOMIO_ZIP_CHUNK compressed bytes per step; a deflate point remembers
+  // ADAM_CUSTOMIO_ZIP_WINDOW bytes of output (deflate's window); the ZipCrypto header in
+  // front of an encrypted entry's data is ADAM_CUSTOMIO_ZIP_CRYPT_HEADER bytes; zlib's crc32
+  // takes a 32-bit count, so it is handed at most ADAM_CUSTOMIO_ZIP_CRC_PIECE bytes at once
+  ADAM_CUSTOMIO_ZIP_WHOLE_LIMIT: int64 = 262144;
+  ADAM_CUSTOMIO_ZIP_SPAN: int64 = 1048576;
+  ADAM_CUSTOMIO_ZIP_KEY_SPAN: int64 = 65536;
+  ADAM_CUSTOMIO_ZIP_CHUNK: int64 = 16384;
+  ADAM_CUSTOMIO_ZIP_WINDOW: int64 = 32768;
+  ADAM_CUSTOMIO_ZIP_CRYPT_HEADER: int64 = 12;
+  ADAM_CUSTOMIO_ZIP_CRC_PIECE: int64 = 1073741824;
+  // CP437's characters 0x80 .. 0xFF as Unicode code points, four upper-case hex digits each
+  // (a name without the UTF-8 flag is CP437, APPNOTE appendix D; the values are Python's
+  // cp437 codec): Adam has no array literal, so the table is text, read by DoZipCp437
+  ADAM_CUSTOMIO_ZIP_CP437: string = "00C700FC00E900E200E400E000E500E700EA00EB00E800EF00EE00EC00C400C500C900E600C600F400F600F200FB00F900FF00D600DC00A200A300A520A7019200E100ED00F300FA00F100D100AA00BA00BF231000AC00BD00BC00A100AB00BB259125922593250225242561256225562555256325512557255D255C255B251025142534252C251C2500253C255E255F255A25542569256625602550256C25672568256425652559255825522553256B256A2518250C25882584258C2590258003B100DF039303C003A303C300B503C403A6039803A903B4221E03C603B52229226100B1226522642320232100F7224800B0221900B7221A207F00B225A000A0";
 
 type
   // A memory IO's user data. Caller memory: Capacity = DataSize at first, never grows.
@@ -1585,6 +1612,1735 @@ begin
     freemem(LFolder);
   end;
   return LSource;
+end;
+
+// The zip source. minizip (System.Minizip.C) reads the archive THROUGH its IO: minizip's
+// zlib_filefunc64_def is the bridge below (ZipBridge*), which reads, seeks and tells on that
+// IO. The directory is read once into a table of entries. An entry IO reads its data whole
+// through minizip when it is small, else in place: stored bytes straight from the archive,
+// deflated ones through zlib (System.Zlib.C) from access points, ZipCrypto decrypted here
+type
+  // How a zip entry IO reads. Whole: under ADAM_CUSTOMIO_ZIP_WHOLE_LIMIT, read whole through
+  // minizip when opened (its CRC check), seek free. Direct: stored, not encrypted: bytes
+  // read in place at any offset. Decode: deflated, or stored and encrypted: read in place
+  // from access points (zran: about every ADAM_CUSTOMIO_ZIP_SPAN bytes of output, the byte /
+  // bit the deflate stream stands at and its last 32 KB of output; for an encrypted entry
+  // the ZipCrypto keys there too, stored entries every ADAM_CUSTOMIO_ZIP_KEY_SPAN), so a seek
+  // decodes at most one interval; points are made as the output first passes them. Direct
+  // and Decode check the CRC as Python's zipfile does: over the output from 0 to the
+  // furthest point ever read (the frontier); the frontier reaching the end with another CRC
+  // fails the IO
+  ZipKind = choices(Whole, Direct, Decode);
+
+  // The ZipCrypto keys (minizip's crypt.h schedule, APPNOTE 6.1), copied by value
+  ZipKeys = record
+    Key0: uint32;
+    Key1: uint32;
+    Key2: uint32;
+  end;
+
+  // The archive a zip source reads, shared by the source and every entry IO opened from it
+  // (an entry IO stays valid after IOSourceClose): Refs counts them, and the last one to let
+  // go closes the archive when it is Owned (the source opened it by path). Single-threaded,
+  // as every IO is
+  ZipArchiveData = record
+    Stream: IO;
+    Owned: bool;
+    Refs: int64;
+  end;
+
+  // The bridge's state: minizip's stream and opaque pointer both point here. Archive holds
+  // one reference, the source's; Failed is set when a seek or tell failed (minizip's
+  // testerror)
+  ZipBridgeData = record
+    Archive: ptr to ZipArchiveData;
+    Failed: bool;
+  end;
+
+  // One entry of the directory: its canonical path as C text (NameCount bytes, then a NUL),
+  // where minizip finds it again (by file position, never by name) and what reading it
+  // needs. Compressed counts an encryption header in; DosDate is the DOS date shl 16 | the
+  // DOS time (the password check of a bit-3 entry); Compression is minizip's method (0
+  // stored, Z_DEFLATED); Flags bit 0 encrypted, bit 3 sizes and CRC after the data
+  ZipEntryData = record
+    EntryName: ptr to char;
+    NameCount: int64;
+    Position: unz64_file_pos;
+    Compressed: int64;
+    Uncompressed: int64;
+    Crc: uint32;
+    DosDate: uint32;
+    Compression: uint32;
+    Flags: uint32;
+  end;
+
+  // A zip source's user data: the bridge, minizip's file table and handle on the archive,
+  // the password as C text (PasswordCount bytes; nil when there is none) and the directory
+  // (EntryCount entries in the archive's order, room for EntryCapacity), read once when the
+  // source is made
+  ZipTableData = record
+    Bridge: ZipBridgeData;
+    Funcs: zlib_filefunc64_def;
+    Handle: unzFile;
+    Password: ptr to char;
+    PasswordCount: int64;
+    Entries: ptr to ZipEntryData;
+    EntryCount: int64;
+    EntryCapacity: int64;
+  end;
+
+  // A place decoding starts again from. InAt and KeysAt count from the entry's first data
+  // byte (past the ZipCrypto header). OutAt: the output offset it stands at; InAt: the first
+  // whole compressed byte still to read; Bits (deflated): bits of the byte before InAt still
+  // unread; KeysAt (encrypted): where Keys hold (at or before the first byte read); Window
+  // (deflated): the output before OutAt, up to 32 KB (WindowCount bytes, nil when none)
+  ZipPointData = record
+    OutAt: int64;
+    InAt: int64;
+    Bits: int32;
+    KeysAt: int64;
+    Keys: ZipKeys;
+    Window: ptr to uint8;
+    WindowCount: int64;
+  end;
+
+  // A zip entry IO's user data; the entry's facts are copied in, since the IO outlives its
+  // source. Whole: the entry's bytes. Direct and Decode: Archive (one reference, let go when
+  // the IO closes), DataStart (the archive offset of the first data byte), DataSize (the
+  // compressed bytes from there), the frontier and the CRC of the output up to it. Decode:
+  // the cursor (InAt the next compressed byte the archive gives, OutAt the output offset of
+  // the next byte decoded, Keys the keys for the byte at InAt), where Input's bytes start
+  // and the keys there (ChunkAt / ChunkKeys) and the same for the chunk read before it,
+  // Input (the compressed bytes read, decrypted; Inflater's next_in / avail_in walk them for
+  // both kinds, a stored entry never calls inflate), Ring (deflated: the output by offset
+  // mod 32 KB, the windows of new points) and the points (PointCount, Points[0] at 0)
+  ZipEntryIOData = record
+    Kind: ZipKind;
+    EntrySize: int64;
+    EntryCrc: uint32;
+    EntryDosDate: uint32;
+    EntryFlags: uint32;
+    Position: int64;
+    Failed: bool;
+    Whole: ptr to uint8;
+    Archive: ptr to ZipArchiveData;
+    DataStart: int64;
+    DataSize: int64;
+    Deflated: bool;
+    Encrypted: bool;
+    Frontier: int64;
+    FrontierCrc: uint32;
+    CursorValid: bool;
+    InAt: int64;
+    OutAt: int64;
+    Keys: ZipKeys;
+    ChunkAt: int64;
+    ChunkKeys: ZipKeys;
+    PrevChunkAt: int64;
+    PrevChunkKeys: ZipKeys;
+    Input: ptr to uint8;
+    Inflater: z_stream;
+    InflaterReady: bool;
+    Ring: ptr to uint8;
+    Points: ptr to ZipPointData;
+    PointCount: int64;
+    PointCapacity: int64;
+  end;
+
+// The 16-bit and 32-bit little-endian values at AAt
+routine DoZipU16(const AAt: ptr to const uint8): uint32;
+begin
+  return uint32(AAt[0]) | (uint32(AAt[1]) shl 8);
+end;
+
+routine DoZipU32(const AAt: ptr to const uint8): uint32;
+begin
+  return uint32(AAt[0]) | (uint32(AAt[1]) shl 8) | (uint32(AAt[2]) shl 16) |
+    (uint32(AAt[3]) shl 24);
+end;
+
+// CP437's character AByte (0x80 .. 0xFF) as a Unicode code point: its four hex digits in
+// ADAM_CUSTOMIO_ZIP_CP437 (digits and upper-case A .. F)
+routine DoZipCp437(const AByte: uint8): uint32;
+var
+  LTable: string;
+  LAt: int64;
+  LI: int64;
+  LCode: uint32;
+  LDigit: uint32;
+begin
+  LTable := ADAM_CUSTOMIO_ZIP_CP437;
+  LAt := (int64(AByte) - 0x80) * 4;
+  LCode := 0;
+  for LI := 0 to 3 do
+    LDigit := uint32(uint8(LTable[LAt + LI]));
+    if LDigit >= 0x41 then
+      LDigit := LDigit - 0x41 + 10;
+    else
+      LDigit := LDigit - 0x30;
+    end;
+    LCode := (LCode shl 4) | LDigit;
+  end;
+  return LCode;
+end;
+
+// ACode added to the end of AText as UTF-8
+routine DoZipAppendCode(var AText: string; const ACode: uint32);
+var
+  LAt: int64;
+begin
+  LAt := len(AText);
+  setlength(AText, LAt + 4);
+  EncodeUtf8Char(AText, LAt, ACode);
+  setlength(AText, LAt);
+end;
+
+// A CP437 name (ACount bytes at AName) as UTF-8
+routine DoZipCp437Text(const AName: ptr to const uint8; const ACount: int64): string;
+var
+  LText: string;
+  LI: int64;
+begin
+  LText := "";
+  for LI := 0 to ACount - 1 do
+    if AName[LI] < 0x80 then
+      DoZipAppendCode(LText, uint32(AName[LI]));
+    else
+      DoZipAppendCode(LText, DoZipCp437(AName[LI]));
+    end;
+  end;
+  return LText;
+end;
+
+// The Info-ZIP Unicode Path field (0x7075) in an entry's extra data (AExtraCount bytes at
+// AExtra; minizip hands it over raw): its UTF-8 name when its CRC is the raw name's (a stale
+// one, left by a rename, is ignored), else "". A field running past the extra data ends the
+// walk: minizip's own reading decides the entry
+routine DoZipUnicodePath(const ARaw: ptr to const uint8; const ARawCount: int64;
+  const AExtra: ptr to const uint8; const AExtraCount: int64): string;
+var
+  LAt: int64;
+  LId: uint32;
+  LField: int64;
+  LData: ptr to const uint8;
+  LCrc: uint32;
+begin
+  LAt := 0;
+  while AExtraCount - LAt >= 4 do
+    LId := DoZipU16(AExtra + LAt);
+    LField := int64(DoZipU16(AExtra + LAt + 2));
+    LData := AExtra + LAt + 4;
+    if AExtraCount - LAt - 4 < LField then
+      leave;
+    end;
+    if (LId = 0x7075) and (LField >= 5) and (LData[0] = 1) then
+      LCrc := uint32(crc32(0, ARaw, uInt(ARawCount)));
+      if LCrc = DoZipU32(LData + 1) then
+        return StringFromC(ptr to const char(LData + 5), LField - 5);
+      end;
+    end;
+    LAt := LAt + 4 + LField;
+  end;
+  return "";
+end;
+
+// Takes one more reference on the archive
+routine DoZipHold(const AArchive: ptr to ZipArchiveData);
+begin
+  AArchive->Refs := AArchive->Refs + 1;
+end;
+
+// Lets go of a reference: the last one closes an owned archive and frees the record; false
+// when that close failed
+routine DoZipLetGo(const AArchive: ptr to ZipArchiveData): bool;
+var
+  LOk: bool;
+begin
+  if AArchive = nil then
+    return true;
+  end;
+  AArchive->Refs := AArchive->Refs - 1;
+  if AArchive->Refs > 0 then
+    return true;
+  end;
+  LOk := true;
+  if AArchive->Owned and (AArchive->Stream <> nil) then
+    LOk := IOClose(AArchive->Stream);
+  end;
+  freemem(AArchive);
+  return LOk;
+end;
+
+// Reads ASize bytes from the archive's position, calling IORead until they are all in or it
+// returns 0 (a user IO may return short counts that are not the end); the count read
+routine DoZipReadLoop(const AArchive: ptr to ZipArchiveData; const ABuffer: ptr to uint8;
+  const ASize: int64): int64;
+var
+  LDone: int64;
+  LGot: int64;
+begin
+  LDone := 0;
+  while LDone < ASize do
+    LGot := IORead(AArchive->Stream, ptr(ABuffer + LDone), ASize - LDone);
+    if (LGot <= 0) or (LGot > ASize - LDone) then
+      leave;
+    end;
+    LDone := LDone + LGot;
+  end;
+  return LDone;
+end;
+
+// Reads ASize bytes at archive offset AAt: the count read (short at the end or on an
+// error), or -1 when the seek failed. Every read seeks first, so the source and its entry
+// IOs share the archive's one position safely
+routine DoZipReadAt(const AArchive: ptr to ZipArchiveData; const AAt: int64;
+  const ABuffer: ptr to uint8; const ASize: int64): int64;
+begin
+  if IOSeek(AArchive->Stream, AAt, SeekOrigin.FromStart) <> AAt then
+    return -1;
+  end;
+  return DoZipReadLoop(AArchive, ABuffer, ASize);
+end;
+// minizip's file functions over the archive's IO. Their parameters are plain, as the
+// zlib_filefunc64_def routine types take them. Open: the archive is open already (the
+// source's IO), so the stream is the bridge itself
+routine ZipBridgeOpen(AOpaque: voidpf; AFileName: ptr; AMode: int32): voidpf;
+begin
+  return AOpaque;
+end;
+
+// Reads ASize bytes from the archive's position (DoZipReadLoop)
+routine ZipBridgeRead(AOpaque: voidpf; AStream: voidpf; ABuffer: ptr; ASize: uLong): uLong;
+var
+  LBridge: ptr to ZipBridgeData;
+begin
+  LBridge := ptr to ZipBridgeData(AStream);
+  return uLong(DoZipReadLoop(LBridge->Archive, ptr to uint8(ABuffer), int64(ASize)));
+end;
+
+// The source never writes
+routine ZipBridgeWrite(AOpaque: voidpf; AStream: voidpf; ABuffer: ptr; ASize: uLong): uLong;
+begin
+  return 0;
+end;
+
+// The archive's position; all ones (C's (ZPOS64_T)-1) when the tell failed
+routine ZipBridgeTell(AOpaque: voidpf; AStream: voidpf): ZPOS64_T;
+var
+  LBridge: ptr to ZipBridgeData;
+  LAt: int64;
+begin
+  LBridge := ptr to ZipBridgeData(AStream);
+  LAt := IOTell(LBridge->Archive->Stream);
+  if LAt < 0 then
+    LBridge->Failed := true;
+    LAt := -1;
+  end;
+  return ZPOS64_T(LAt);
+end;
+
+// 0 when the seek landed, -1 when it failed (minizip's contract). minizip moves back over an
+// entry's extra field with a relative seek whose offset is a negative number wrapped into
+// the unsigned ZPOS64_T (its own fopen table hands that to fseeko64, which reads it as
+// signed), so a relative (current / end) offset is the two's-complement int64; only a
+// from-start offset must fit in int64 as it is
+routine ZipBridgeSeek(AOpaque: voidpf; AStream: voidpf; AOffset: ZPOS64_T;
+  AOrigin: int32): clong;
+var
+  LBridge: ptr to ZipBridgeData;
+  LOrigin: SeekOrigin;
+  LKnown: bool;
+begin
+  LBridge := ptr to ZipBridgeData(AStream);
+  LKnown := false;
+  LOrigin := SeekOrigin.FromStart;
+  if (AOrigin = ZLIB_FILEFUNC_SEEK_SET) and (AOffset <= ZPOS64_T(ADAM_CUSTOMIO_INT64_MAX)) then
+    LKnown := true;
+  end;
+  if AOrigin = ZLIB_FILEFUNC_SEEK_CUR then
+    LOrigin := SeekOrigin.FromCurrent;
+    LKnown := true;
+  end;
+  if AOrigin = ZLIB_FILEFUNC_SEEK_END then
+    LOrigin := SeekOrigin.FromEnd;
+    LKnown := true;
+  end;
+  if not LKnown then
+    LBridge->Failed := true;
+    return -1;
+  end;
+  if IOSeek(LBridge->Archive->Stream, int64(AOffset), LOrigin) < 0 then
+    LBridge->Failed := true;
+    return -1;
+  end;
+  return 0;
+end;
+
+// The archive stays open: the source closes it (opened by path) or the caller does
+routine ZipBridgeClose(AOpaque: voidpf; AStream: voidpf): int32;
+begin
+  return 0;
+end;
+
+routine ZipBridgeError(AOpaque: voidpf; AStream: voidpf): int32;
+var
+  LBridge: ptr to ZipBridgeData;
+begin
+  LBridge := ptr to ZipBridgeData(AStream);
+  if LBridge->Failed then
+    return -1;
+  end;
+  return 0;
+end;
+
+// AEntry added to the end of ATable's directory (the room doubles as it fills); false when
+// there is no room
+routine DoZipAddEntry(const ATable: ptr to ZipTableData; const AEntry: ZipEntryData): bool;
+var
+  LCapacity: int64;
+  LEntries: ptr to ZipEntryData;
+begin
+  if ATable->EntryCount = ATable->EntryCapacity then
+    LCapacity := ATable->EntryCapacity * 2;
+    if LCapacity = 0 then
+      LCapacity := 16;
+    end;
+    LEntries := ptr to ZipEntryData(getmem(LCapacity * size(ZipEntryData)));
+    if LEntries = nil then
+      return false;
+    end;
+    if ATable->Entries <> nil then
+      DoCopy(ptr to uint8(ptr(LEntries)), ptr to uint8(ptr(ATable->Entries)),
+        ATable->EntryCount * size(ZipEntryData));
+      freemem(ATable->Entries);
+    end;
+    ATable->Entries := LEntries;
+    ATable->EntryCapacity := LCapacity;
+  end;
+  ATable->Entries[ATable->EntryCount] := AEntry;
+  ATable->EntryCount := ATable->EntryCount + 1;
+  return true;
+end;
+
+// True when AEntry's canonical path is APath
+routine DoZipSameName(const AEntry: ptr to ZipEntryData; const APath: string): bool;
+var
+  LI: int64;
+begin
+  if AEntry->NameCount <> len(APath) then
+    return false;
+  end;
+  for LI := 0 to AEntry->NameCount - 1 do
+    if AEntry->EntryName[LI] <> APath[LI] then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// The entry a canonical source path names, or nil. Of two entries with one name the later
+// is found (as Python's zipfile): the walk starts at the end
+routine DoZipFind(const ATable: ptr to ZipTableData; const APath: string): ptr to ZipEntryData;
+var
+  LI: int64;
+  LEntry: ptr to ZipEntryData;
+begin
+  LI := ATable->EntryCount - 1;
+  while LI >= 0 do
+    LEntry := addr of ATable->Entries[LI];
+    if DoZipSameName(LEntry, APath) then
+      return LEntry;
+    end;
+    LI := LI - 1;
+  end;
+  return nil;
+end;
+
+// Records minizip's current entry (AInfo, its raw name ARawCount bytes at ARaw, its extra
+// data AExtraCount bytes at AExtra) in the directory; false when minizip cannot give its
+// place, a size passes int64 or there is no room. The name is UTF-8 when flag bit 11 says
+// so, else the Unicode Path field's when it is current, else CP437. A folder (a name ending
+// in `/`) is not an entry, nor is a name no source path reaches (absolute, climbing out,
+// `\`: IOSourceOpen's rules); both are passed over
+routine DoZipRecord(const ATable: ptr to ZipTableData; const AInfo: unz_file_info64;
+  const ARaw: ptr to const uint8; const ARawCount: int64; const AExtra: ptr to const uint8;
+  const AExtraCount: int64): bool;
+var
+  LText: string;
+  LName: string;
+  LEntry: ZipEntryData;
+begin
+  if (AInfo.compressed_size > ZPOS64_T(ADAM_CUSTOMIO_INT64_MAX)) or
+    (AInfo.uncompressed_size > ZPOS64_T(ADAM_CUSTOMIO_INT64_MAX)) then
+    return false;
+  end;
+  if (AInfo.flag & 0x0800) <> 0 then
+    LText := StringFromC(ptr to const char(ARaw), ARawCount);
+  else
+    LText := DoZipUnicodePath(ARaw, ARawCount, AExtra, AExtraCount);
+    if LText = "" then
+      LText := DoZipCp437Text(ARaw, ARawCount);
+    end;
+  end;
+  if (len(LText) > 0) and (LText[len(LText) - 1] = '/') then
+    return true;
+  end;
+  LName := DoSourceNormalize(LText);
+  if LName = "" then
+    return true;
+  end;
+  DoZero(ptr to uint8(ptr(addr of LEntry)), size(ZipEntryData));
+  if unzGetFilePos64(ATable->Handle, addr of LEntry.Position) <> UNZ_OK then
+    return false;
+  end;
+  LEntry.Compressed := int64(AInfo.compressed_size);
+  LEntry.Uncompressed := int64(AInfo.uncompressed_size);
+  LEntry.Crc := uint32(AInfo.crc);
+  LEntry.DosDate := uint32(AInfo.dosDate);
+  LEntry.Compression := uint32(AInfo.compression_method);
+  LEntry.Flags := uint32(AInfo.flag);
+  LEntry.EntryName := StringToC(LName);
+  if LEntry.EntryName = nil then
+    return false;
+  end;
+  LEntry.NameCount := len(LName);
+  if not DoZipAddEntry(ATable, LEntry) then
+    freemem(LEntry.EntryName);
+    return false;
+  end;
+  return true;
+end;
+
+// Reads minizip's current entry into the directory (DoZipRecord); false when minizip cannot
+// read its header or there is no room. minizip is asked twice: for the name's and the extra
+// data's sizes, then for their bytes
+routine DoZipEntry(const ATable: ptr to ZipTableData): bool;
+var
+  LInfo: unz_file_info64;
+  LRaw: ptr to uint8;
+  LExtra: ptr to uint8;
+  LRawCount: int64;
+  LExtraCount: int64;
+  LOk: bool;
+begin
+  DoZero(ptr to uint8(ptr(addr of LInfo)), size(unz_file_info64));
+  if unzGetCurrentFileInfo64(ATable->Handle, addr of LInfo, nil, 0, nil, 0, nil, 0) <> UNZ_OK then
+    return false;
+  end;
+  LRawCount := int64(LInfo.size_filename);
+  LExtraCount := int64(LInfo.size_file_extra);
+  // One byte more than asked for each, so a count of 0 still has a buffer
+  LRaw := ptr to uint8(getmem(LRawCount + 1));
+  if LRaw = nil then
+    return false;
+  end;
+  LExtra := ptr to uint8(getmem(LExtraCount + 1));
+  if LExtra = nil then
+    freemem(LRaw);
+    return false;
+  end;
+  LOk := unzGetCurrentFileInfo64(ATable->Handle, addr of LInfo, ptr to char(ptr(LRaw)),
+    uLong(LRawCount), ptr(LExtra), uLong(LExtraCount), nil, 0) = UNZ_OK;
+  if LOk then
+    LOk := DoZipRecord(ATable, LInfo, LRaw, LRawCount, LExtra, LExtraCount);
+  end;
+  freemem(LRaw);
+  freemem(LExtra);
+  return LOk;
+end;
+
+// Walks minizip's directory once into the entry table; false when an entry cannot be read (a
+// bad header signature) or the bridge failed. An archive with no entries has an empty table
+// (minizip's first-file call would read a header that is not there)
+routine DoZipDirectory(const ATable: ptr to ZipTableData): bool;
+var
+  LGlobal: unz_global_info64;
+  LStatus: int32;
+begin
+  DoZero(ptr to uint8(ptr(addr of LGlobal)), size(unz_global_info64));
+  if unzGetGlobalInfo64(ATable->Handle, addr of LGlobal) <> UNZ_OK then
+    return false;
+  end;
+  if LGlobal.number_entry = 0 then
+    return not ATable->Bridge.Failed;
+  end;
+  LStatus := unzGoToFirstFile(ATable->Handle);
+  while LStatus = UNZ_OK do
+    if not DoZipEntry(ATable) then
+      return false;
+    end;
+    LStatus := unzGoToNextFile(ATable->Handle);
+  end;
+  return (LStatus = UNZ_END_OF_LIST_OF_FILE) and not ATable->Bridge.Failed;
+end;
+
+// Frees a zip source's user data: closes minizip's handle and lets go of the source's
+// reference on the archive (the last reference closes an owned archive); false when
+// minizip's close or the archive's failed
+routine DoZipFree(const ATable: ptr to ZipTableData): bool;
+var
+  LOk: bool;
+  LI: int64;
+begin
+  if ATable = nil then
+    return true;
+  end;
+  LOk := true;
+  if ATable->Handle <> nil then
+    LOk := unzClose(ATable->Handle) = UNZ_OK;
+  end;
+  if not DoZipLetGo(ATable->Bridge.Archive) then
+    LOk := false;
+  end;
+  for LI := 0 to ATable->EntryCount - 1 do
+    freemem(ATable->Entries[LI].EntryName);
+  end;
+  if ATable->Entries <> nil then
+    freemem(ATable->Entries);
+  end;
+  if ATable->Password <> nil then
+    freemem(ATable->Password);
+  end;
+  freemem(ATable);
+  return LOk;
+end;
+
+// Opens AArchive with minizip through the bridge and reads its directory: the zip source's
+// user data, or nil when minizip refuses the archive (no end record, cut short, a bad
+// signature, several disks), an entry cannot be read or there is no room. From the call on,
+// an owned archive (AOwned) is this side's: closed here when the source cannot be made,
+// else by the last of the source and its entry IOs to let go
+routine DoZipCreate(const AArchive: IO; const AOwned: bool; const APassword: string): ptr to ZipTableData;
+var
+  LArchive: ptr to ZipArchiveData;
+  LTable: ptr to ZipTableData;
+begin
+  LArchive := ptr to ZipArchiveData(getmem(size(ZipArchiveData)));
+  if LArchive = nil then
+    if AOwned then
+      IOClose(AArchive);
+    end;
+    return nil;
+  end;
+  LArchive->Stream := AArchive;
+  LArchive->Owned := AOwned;
+  LArchive->Refs := 1;
+  LTable := ptr to ZipTableData(getmem(size(ZipTableData)));
+  if LTable = nil then
+    DoZipLetGo(LArchive);
+    return nil;
+  end;
+  // Every field nil, 0 or false until set; the table holds the record's first reference
+  DoZero(ptr to uint8(ptr(LTable)), size(ZipTableData));
+  LTable->Bridge.Archive := LArchive;
+  if len(APassword) > 0 then
+    LTable->Password := StringToC(APassword);
+    if LTable->Password = nil then
+      DoZipFree(LTable);
+      return nil;
+    end;
+    LTable->PasswordCount := len(APassword);
+  end;
+  LTable->Funcs.zopen64_file := ZipBridgeOpen;
+  LTable->Funcs.zread_file := ZipBridgeRead;
+  LTable->Funcs.zwrite_file := ZipBridgeWrite;
+  LTable->Funcs.ztell64_file := ZipBridgeTell;
+  LTable->Funcs.zseek64_file := ZipBridgeSeek;
+  LTable->Funcs.zclose_file := ZipBridgeClose;
+  LTable->Funcs.zerror_file := ZipBridgeError;
+  LTable->Funcs.opaque := ptr(addr of LTable->Bridge);
+  // The path is unused: the bridge's open hands back the open archive
+  LTable->Handle := unzOpen2_64(ptr to const char(""), addr of LTable->Funcs);
+  if (LTable->Handle = nil) or not DoZipDirectory(LTable) then
+    DoZipFree(LTable);
+    return nil;
+  end;
+  return LTable;
+end;
+
+// One step of ZipCrypto's CRC (the raw CRC-32 step, no pre / post inversion) over AByte,
+// through zlib's table
+routine DoZipCrcByte(const ATable: ptr to const z_crc_t; const ACrc: uint32;
+  const AByte: uint32): uint32;
+begin
+  return ATable[int64((ACrc xor AByte) & 0xFF)] xor (ACrc shr 8);
+end;
+
+// The keys moved on by one plain byte (crypt.h's update_keys)
+routine DoZipUpdateKeys(var AKeys: ZipKeys; const ATable: ptr to const z_crc_t;
+  const AByte: uint32);
+begin
+  AKeys.Key0 := DoZipCrcByte(ATable, AKeys.Key0, AByte);
+  AKeys.Key1 := AKeys.Key1 + (AKeys.Key0 & 0xFF);
+  AKeys.Key1 := AKeys.Key1 * uint32(134775813) + 1;
+  AKeys.Key2 := DoZipCrcByte(ATable, AKeys.Key2, AKeys.Key1 shr 24);
+end;
+
+// The byte the keys stand at (crypt.h's decrypt_byte): the stream byte is XORed with it
+routine DoZipDecryptByte(const AKeys: ZipKeys): uint32;
+var
+  LTemp: uint32;
+begin
+  LTemp := (AKeys.Key2 & 0xFFFF) | 2;
+  return ((LTemp * (LTemp xor 1)) shr 8) & 0xFF;
+end;
+
+// The keys for a password (ACount bytes at APassword; crypt.h's init_keys)
+routine DoZipInitKeys(var AKeys: ZipKeys; const APassword: ptr to const char;
+  const ACount: int64);
+var
+  LTable: ptr to const z_crc_t;
+  LI: int64;
+begin
+  LTable := get_crc_table();
+  AKeys.Key0 := 305419896;
+  AKeys.Key1 := 591751049;
+  AKeys.Key2 := 878082192;
+  for LI := 0 to ACount - 1 do
+    DoZipUpdateKeys(AKeys, LTable, uint32(uint8(APassword[LI])));
+  end;
+end;
+
+// Decrypts ACount bytes in place, moving AKeys on (crypt.h's zdecode)
+routine DoZipDecrypt(var AKeys: ZipKeys; const ABytes: ptr to uint8; const ACount: int64);
+var
+  LTable: ptr to const z_crc_t;
+  LI: int64;
+  LByte: uint32;
+begin
+  LTable := get_crc_table();
+  for LI := 0 to ACount - 1 do
+    LByte := uint32(ABytes[LI]) xor DoZipDecryptByte(AKeys);
+    DoZipUpdateKeys(AKeys, LTable, LByte);
+    ABytes[LI] := uint8(LByte);
+  end;
+end;
+
+// ACrc continued over ACount bytes at ABytes (zlib's crc32 takes 32-bit counts)
+routine DoZipCrc(const ACrc: uint32; const ABytes: ptr to const uint8; const ACount: int64): uint32;
+var
+  LCrc: uint32;
+  LAt: ptr to const uint8;
+  LLeft: int64;
+  LCount: int64;
+begin
+  LCrc := ACrc;
+  LAt := ABytes;
+  LLeft := ACount;
+  while LLeft > 0 do
+    LCount := LLeft;
+    if LCount > ADAM_CUSTOMIO_ZIP_CRC_PIECE then
+      LCount := ADAM_CUSTOMIO_ZIP_CRC_PIECE;
+    end;
+    LCrc := uint32(crc32(uLong(LCrc), LAt, uInt(LCount)));
+    LAt := LAt + LCount;
+    LLeft := LLeft - LCount;
+  end;
+  return LCrc;
+end;
+// ACount output bytes at offset AAt: the part past the frontier goes into the CRC; the
+// frontier at the end with another CRC than the directory's fails the IO. Bytes that start
+// past the frontier (a direct read after a seek) leave it where it is
+routine DoZipFrontier(const AIO: ptr to ZipEntryIOData; const AAt: int64;
+  const ABytes: ptr to const uint8; const ACount: int64);
+var
+  LEnd: int64;
+  LSkip: int64;
+begin
+  LEnd := AAt + ACount;
+  if (AAt > AIO->Frontier) or (LEnd <= AIO->Frontier) then
+    return;
+  end;
+  LSkip := AIO->Frontier - AAt;
+  AIO->FrontierCrc := DoZipCrc(AIO->FrontierCrc, ABytes + LSkip, ACount - LSkip);
+  AIO->Frontier := LEnd;
+  if (AIO->Frontier >= AIO->EntrySize) and (AIO->FrontierCrc <> AIO->EntryCrc) then
+    AIO->Failed := true;
+  end;
+end;
+
+// The ZipCrypto check (APPNOTE 6.1.6): the 12-byte header at the data's start, decrypted
+// with the password, ends in the CRC's high byte (the DOS time's when bit 3 puts the CRC
+// after the data). minizip never checks it, so a wrong password would only show as garbage.
+// True when it fits; AKeys are then the keys for the data's first byte
+routine DoZipPasswordFits(const AIO: ptr to ZipEntryIOData; const ATable: ptr to ZipTableData;
+  var AKeys: ZipKeys): bool;
+var
+  // ADAM_CUSTOMIO_ZIP_CRYPT_HEADER bytes
+  LHeader: array[0..11] of uint8;
+  LCheck: uint32;
+begin
+  if DoZipReadAt(ATable->Bridge.Archive, AIO->DataStart, addr of LHeader[0],
+    ADAM_CUSTOMIO_ZIP_CRYPT_HEADER) <> ADAM_CUSTOMIO_ZIP_CRYPT_HEADER then
+    return false;
+  end;
+  DoZipInitKeys(AKeys, ptr to const char(ATable->Password), ATable->PasswordCount);
+  DoZipDecrypt(AKeys, addr of LHeader[0], ADAM_CUSTOMIO_ZIP_CRYPT_HEADER);
+  LCheck := (AIO->EntryCrc shr 24) & 0xFF;
+  if (AIO->EntryFlags & 0x0008) <> 0 then
+    LCheck := (AIO->EntryDosDate shr 8) & 0xFF;
+  end;
+  return uint32(LHeader[11]) = LCheck;
+end;
+
+// Reads the whole entry through minizip (its current file is the entry); false on a read
+// error, a size other than the directory's or a CRC mismatch (minizip's close reports it
+// once all was read)
+routine DoZipReadWhole(const ATable: ptr to ZipTableData; const AIO: ptr to ZipEntryIOData): bool;
+var
+  LSize: int64;
+  LPassword: ptr to const char;
+  LMethod: int32;
+  LLevel: int32;
+  LDone: int64;
+  LGot: int32;
+  LAsk: int64;
+  LMore: uint8;
+  LClosed: int32;
+begin
+  LSize := AIO->EntrySize;
+  LPassword := nil;
+  if AIO->Encrypted then
+    LPassword := ptr to const char(ATable->Password);
+  end;
+  // One byte more than the size, so an empty entry still has a buffer
+  AIO->Whole := ptr to uint8(getmem(LSize + 1));
+  if AIO->Whole = nil then
+    return false;
+  end;
+  LMethod := 0;
+  LLevel := 0;
+  if unzOpenCurrentFile3(ATable->Handle, addr of LMethod, addr of LLevel, 0, LPassword) <> UNZ_OK then
+    return false;
+  end;
+  LDone := 0;
+  LGot := 1;
+  while (LDone < LSize) and (LGot > 0) do
+    LAsk := LSize - LDone;
+    if LAsk > ADAM_CUSTOMIO_CHUNK then
+      LAsk := ADAM_CUSTOMIO_CHUNK;
+    end;
+    LGot := unzReadCurrentFile(ATable->Handle, ptr(AIO->Whole + LDone), uint32(LAsk));
+    if LGot > 0 then
+      LDone := LDone + LGot;
+    end;
+  end;
+  // One more read must find the end: an entry longer than its size is broken
+  if (LGot >= 0) and (LDone = LSize) then
+    LMore := 0;
+    LGot := unzReadCurrentFile(ATable->Handle, ptr(addr of LMore), 1);
+  end;
+  LClosed := unzCloseCurrentFile(ATable->Handle);
+  return (LDone = LSize) and (LGot = 0) and (LClosed = UNZ_OK) and not ATable->Bridge.Failed;
+end;
+
+// Frees an entry IO's user data, letting go of its archive reference; false when the last
+// reference's close of the archive failed
+routine DoZipEntryFree(const AIO: ptr to ZipEntryIOData): bool;
+var
+  LOk: bool;
+  LI: int64;
+begin
+  if AIO = nil then
+    return true;
+  end;
+  if AIO->InflaterReady then
+    inflateEnd(addr of AIO->Inflater);
+  end;
+  LOk := true;
+  if AIO->Archive <> nil then
+    LOk := DoZipLetGo(AIO->Archive);
+  end;
+  for LI := 0 to AIO->PointCount - 1 do
+    if AIO->Points[LI].Window <> nil then
+      freemem(AIO->Points[LI].Window);
+    end;
+  end;
+  if AIO->Points <> nil then
+    freemem(AIO->Points);
+  end;
+  if AIO->Whole <> nil then
+    freemem(AIO->Whole);
+  end;
+  if AIO->Input <> nil then
+    freemem(AIO->Input);
+  end;
+  if AIO->Ring <> nil then
+    freemem(AIO->Ring);
+  end;
+  freemem(AIO);
+  return LOk;
+end;
+
+// APoint added to the end of AIO's points (the room doubles as it fills); false when there
+// is no room
+routine DoZipAddPoint(const AIO: ptr to ZipEntryIOData; const APoint: ZipPointData): bool;
+var
+  LCapacity: int64;
+  LPoints: ptr to ZipPointData;
+begin
+  if AIO->PointCount = AIO->PointCapacity then
+    LCapacity := AIO->PointCapacity * 2;
+    if LCapacity = 0 then
+      LCapacity := 8;
+    end;
+    LPoints := ptr to ZipPointData(getmem(LCapacity * size(ZipPointData)));
+    if LPoints = nil then
+      return false;
+    end;
+    if AIO->Points <> nil then
+      DoCopy(ptr to uint8(ptr(LPoints)), ptr to uint8(ptr(AIO->Points)),
+        AIO->PointCount * size(ZipPointData));
+      freemem(AIO->Points);
+    end;
+    AIO->Points := LPoints;
+    AIO->PointCapacity := LCapacity;
+  end;
+  AIO->Points[AIO->PointCount] := APoint;
+  AIO->PointCount := AIO->PointCount + 1;
+  return true;
+end;
+
+// The output offset of AIO's last point
+routine DoZipLastPoint(const AIO: ptr to ZipEntryIOData): int64;
+begin
+  return AIO->Points[AIO->PointCount - 1].OutAt;
+end;
+
+// inflateInit2_ for raw deflate (-15: a zip entry has no zlib header), zlib's version and
+// z_stream's size passed as zlib.h's inflateInit2 macro passes them
+routine DoZipInflateInit(const AIO: ptr to ZipEntryIOData): int32;
+var
+  LVersion: ptr to char;
+  LCode: int32;
+begin
+  LVersion := StringToC(ZLIB_VERSION);
+  if LVersion = nil then
+    return Z_MEM_ERROR;
+  end;
+  LCode := inflateInit2_(addr of AIO->Inflater, -15, ptr to const char(LVersion),
+    int32(size(z_stream)));
+  freemem(LVersion);
+  return LCode;
+end;
+
+// Finds where the entry's data starts: minizip, asked for the entry raw and without a
+// password, stops at the first data byte (the ZipCrypto header when there is one), its
+// position counting the data before the archive (a self-extractor) in. An encrypted entry
+// needs the password and its header must fit it (AKeys are then the data's first byte's);
+// DataStart / DataSize are then past the header. False when any of that fails
+routine DoZipDataStart(const ATable: ptr to ZipTableData; const AEntry: ptr to ZipEntryData;
+  const AIO: ptr to ZipEntryIOData; var AKeys: ZipKeys): bool;
+var
+  LMethod: int32;
+  LLevel: int32;
+  LStart: ZPOS64_T;
+begin
+  if AIO->Encrypted and (ATable->PasswordCount = 0) then
+    return false;
+  end;
+  ATable->Bridge.Failed := false;
+  LMethod := 0;
+  LLevel := 0;
+  if unzGoToFilePos64(ATable->Handle, addr of AEntry->Position) <> UNZ_OK then
+    return false;
+  end;
+  if unzOpenCurrentFile3(ATable->Handle, addr of LMethod, addr of LLevel, 1, nil) <> UNZ_OK then
+    return false;
+  end;
+  LStart := unzGetCurrentFileZStreamPos64(ATable->Handle);
+  unzCloseCurrentFile(ATable->Handle);
+  if (LStart = 0) or (LStart > ZPOS64_T(ADAM_CUSTOMIO_INT64_MAX)) then
+    return false;
+  end;
+  AIO->DataStart := int64(LStart);
+  AIO->DataSize := AEntry->Compressed;
+  if not AIO->Encrypted then
+    return true;
+  end;
+  if (AIO->DataSize < ADAM_CUSTOMIO_ZIP_CRYPT_HEADER) or
+    not DoZipPasswordFits(AIO, ATable, AKeys) then
+    return false;
+  end;
+  AIO->DataStart := AIO->DataStart + ADAM_CUSTOMIO_ZIP_CRYPT_HEADER;
+  AIO->DataSize := AIO->DataSize - ADAM_CUSTOMIO_ZIP_CRYPT_HEADER;
+  return true;
+end;
+
+// Sets up an entry IO that reads in place: Direct for a stored entry that is not
+// encrypted, else Decode with its first point at 0 (AKeys, the keys for the data's first
+// byte). Stored entries have as many data bytes as output bytes. False for a method other
+// than stored / deflated, a stored size that does not match, or no room
+routine DoZipInPlace(const ATable: ptr to ZipTableData; const AEntry: ptr to ZipEntryData;
+  const AIO: ptr to ZipEntryIOData; const AKeys: ZipKeys): bool;
+var
+  LStored: bool;
+  LFirst: ZipPointData;
+begin
+  LStored := AEntry->Compression = 0;
+  if (not LStored) and (not AIO->Deflated) then
+    return false;
+  end;
+  if LStored and (AIO->DataSize <> AEntry->Uncompressed) then
+    return false;
+  end;
+  AIO->Archive := ATable->Bridge.Archive;
+  DoZipHold(AIO->Archive);
+  if LStored and not AIO->Encrypted then
+    AIO->Kind := ZipKind.Direct;
+    return true;
+  end;
+  AIO->Kind := ZipKind.Decode;
+  AIO->Input := ptr to uint8(getmem(ADAM_CUSTOMIO_ZIP_CHUNK));
+  if AIO->Input = nil then
+    return false;
+  end;
+  if AIO->Deflated then
+    AIO->Ring := ptr to uint8(getmem(ADAM_CUSTOMIO_ZIP_WINDOW));
+    if AIO->Ring = nil then
+      return false;
+    end;
+  end;
+  DoZero(ptr to uint8(ptr(addr of LFirst)), size(ZipPointData));
+  LFirst.Keys := AKeys;
+  return DoZipAddPoint(AIO, LFirst);
+end;
+
+// Opens the entry a canonical source path names for reading: the entry IO's user data, or
+// nil when the zip does not have it, it is encrypted and the password is missing or wrong,
+// its method is neither stored nor deflated (in place), it cannot be read whole (a read
+// error, a CRC mismatch), or there is no room
+routine DoZipEntryOpen(const ATable: ptr to ZipTableData; const APath: string): ptr to ZipEntryIOData;
+var
+  LEntry: ptr to ZipEntryData;
+  LIO: ptr to ZipEntryIOData;
+  LKeys: ZipKeys;
+begin
+  LEntry := DoZipFind(ATable, APath);
+  if LEntry = nil then
+    return nil;
+  end;
+  LIO := ptr to ZipEntryIOData(getmem(size(ZipEntryIOData)));
+  if LIO = nil then
+    return nil;
+  end;
+  DoZero(ptr to uint8(ptr(LIO)), size(ZipEntryIOData));
+  LIO->EntrySize := LEntry->Uncompressed;
+  LIO->EntryCrc := LEntry->Crc;
+  LIO->EntryDosDate := LEntry->DosDate;
+  LIO->EntryFlags := LEntry->Flags;
+  LIO->Encrypted := (LEntry->Flags & 0x0001) <> 0;
+  LIO->Deflated := LEntry->Compression = uint32(Z_DEFLATED);
+  LKeys.Key0 := 0;
+  LKeys.Key1 := 0;
+  LKeys.Key2 := 0;
+  if not DoZipDataStart(ATable, LEntry, LIO, LKeys) then
+    DoZipEntryFree(LIO);
+    return nil;
+  end;
+  // A small entry: read whole now, the archive no longer needed
+  if LIO->EntrySize < ADAM_CUSTOMIO_ZIP_WHOLE_LIMIT then
+    LIO->Kind := ZipKind.Whole;
+    if not DoZipReadWhole(ATable, LIO) then
+      DoZipEntryFree(LIO);
+      return nil;
+    end;
+    return LIO;
+  end;
+  if not DoZipInPlace(ATable, LEntry, LIO, LKeys) then
+    DoZipEntryFree(LIO);
+    return nil;
+  end;
+  return LIO;
+end;
+// Reads the next chunk of compressed bytes into Input, decrypted, for the decoder (InAt short
+// of DataSize); false when the archive gave fewer
+routine DoZipFill(const AIO: ptr to ZipEntryIOData): bool;
+var
+  LCount: int64;
+begin
+  LCount := AIO->DataSize - AIO->InAt;
+  if LCount > ADAM_CUSTOMIO_ZIP_CHUNK then
+    LCount := ADAM_CUSTOMIO_ZIP_CHUNK;
+  end;
+  AIO->PrevChunkAt := AIO->ChunkAt;
+  AIO->PrevChunkKeys := AIO->ChunkKeys;
+  AIO->ChunkAt := AIO->InAt;
+  AIO->ChunkKeys := AIO->Keys;
+  if DoZipReadAt(AIO->Archive, AIO->DataStart + AIO->InAt, AIO->Input, LCount) <> LCount then
+    return false;
+  end;
+  if AIO->Encrypted then
+    DoZipDecrypt(AIO->Keys, AIO->Input, LCount);
+  end;
+  AIO->InAt := AIO->InAt + LCount;
+  AIO->Inflater.next_in := AIO->Input;
+  AIO->Inflater.avail_in := uInt(LCount);
+  return true;
+end;
+
+// A deflate point where inflate stopped at a block boundary (zran's addpoint): the byte /
+// bit the stream stands at, the keys for the first byte a restart reads (it reads the byte
+// before InAt when Bits is not 0) and the last 32 KB of output; false when there is no room
+routine DoZipInflatePoint(const AIO: ptr to ZipEntryIOData): bool;
+var
+  LPoint: ZipPointData;
+  LFirst: int64;
+  LKeep: int64;
+  LI: int64;
+begin
+  DoZero(ptr to uint8(ptr(addr of LPoint)), size(ZipPointData));
+  LPoint.OutAt := AIO->OutAt;
+  LPoint.Bits := AIO->Inflater.data_type & 7;
+  LPoint.InAt := AIO->InAt - int64(AIO->Inflater.avail_in);
+  LFirst := LPoint.InAt;
+  if LPoint.Bits <> 0 then
+    LFirst := LFirst - 1;
+  end;
+  // InAt lies in the chunk Input holds, so the first byte read is in it or is the last
+  // byte of the chunk before
+  if LFirst >= AIO->ChunkAt then
+    LPoint.KeysAt := AIO->ChunkAt;
+    LPoint.Keys := AIO->ChunkKeys;
+  else
+    LPoint.KeysAt := AIO->PrevChunkAt;
+    LPoint.Keys := AIO->PrevChunkKeys;
+  end;
+  LKeep := AIO->OutAt;
+  if LKeep > ADAM_CUSTOMIO_ZIP_WINDOW then
+    LKeep := ADAM_CUSTOMIO_ZIP_WINDOW;
+  end;
+  LPoint.Window := ptr to uint8(getmem(LKeep + 1));
+  if LPoint.Window = nil then
+    return false;
+  end;
+  LPoint.WindowCount := LKeep;
+  for LI := 0 to LKeep - 1 do
+    LPoint.Window[LI] := AIO->Ring[(AIO->OutAt - LKeep + LI) mod ADAM_CUSTOMIO_ZIP_WINDOW];
+  end;
+  if not DoZipAddPoint(AIO, LPoint) then
+    freemem(LPoint.Window);
+    return false;
+  end;
+  return true;
+end;
+
+// Up to AMax next output bytes of a deflated entry into ADest (nil: discarded): the count, 0
+// at the stream's end, -1 on an error (bad data, the stream cut short, no room for a point)
+routine DoZipInflateStep(const AIO: ptr to ZipEntryIOData; const ADest: ptr to uint8;
+  const AMax: int64): int64;
+var
+  LRingAt: int64;
+  LRoom: int64;
+  LTo: ptr to uint8;
+  LInBefore: uInt;
+  LStatus: int32;
+  LMade: int64;
+begin
+  while true do
+    if (AIO->Inflater.avail_in = 0) and (AIO->InAt < AIO->DataSize) and not DoZipFill(AIO) then
+      return -1;
+    end;
+    // Output goes into the ring at its offset, then to ADest
+    LRingAt := AIO->OutAt mod ADAM_CUSTOMIO_ZIP_WINDOW;
+    LRoom := ADAM_CUSTOMIO_ZIP_WINDOW - LRingAt;
+    if LRoom > AMax then
+      LRoom := AMax;
+    end;
+    LTo := AIO->Ring + LRingAt;
+    LInBefore := AIO->Inflater.avail_in;
+    AIO->Inflater.next_out := LTo;
+    AIO->Inflater.avail_out := uInt(LRoom);
+    // Z_BLOCK: inflate also stops at every block boundary, where a point can be
+    LStatus := inflate(addr of AIO->Inflater, Z_BLOCK);
+    LMade := LRoom - int64(AIO->Inflater.avail_out);
+    if (LStatus <> Z_OK) and (LStatus <> Z_STREAM_END) and (LStatus <> Z_BUF_ERROR) then
+      return -1;
+    end;
+    if LMade > 0 then
+      if ADest <> nil then
+        DoCopy(ADest, LTo, LMade);
+      end;
+      DoZipFrontier(AIO, AIO->OutAt, LTo, LMade);
+      AIO->OutAt := AIO->OutAt + LMade;
+    end;
+    // data_type bit 128: stopped at a block boundary; bit 64: after the last block
+    if ((AIO->Inflater.data_type & 128) <> 0) and ((AIO->Inflater.data_type & 64) = 0) and
+      (AIO->OutAt > DoZipLastPoint(AIO) + ADAM_CUSTOMIO_ZIP_SPAN) then
+      if not DoZipInflatePoint(AIO) then
+        return -1;
+      end;
+    end;
+    if LMade > 0 then
+      return LMade;
+    end;
+    if LStatus = Z_STREAM_END then
+      return 0;
+    end;
+    // Nothing read, nothing made: the stream is cut short (or stuck)
+    if AIO->Inflater.avail_in = LInBefore then
+      return -1;
+    end;
+  end;
+  return -1;
+end;
+
+// Up to AMax next output bytes of an encrypted stored entry into ADest (nil: discarded): the
+// count, 0 at the end, -1 on a read error or no room for a point. A point (keys only) is
+// kept at a chunk start every ADAM_CUSTOMIO_ZIP_KEY_SPAN bytes
+routine DoZipStoredStep(const AIO: ptr to ZipEntryIOData; const ADest: ptr to uint8;
+  const AMax: int64): int64;
+var
+  LPoint: ZipPointData;
+  LCount: int64;
+  LFrom: ptr to const uint8;
+begin
+  if AIO->Inflater.avail_in = 0 then
+    if AIO->InAt >= AIO->DataSize then
+      return 0;
+    end;
+    if AIO->InAt >= DoZipLastPoint(AIO) + ADAM_CUSTOMIO_ZIP_KEY_SPAN then
+      DoZero(ptr to uint8(ptr(addr of LPoint)), size(ZipPointData));
+      LPoint.OutAt := AIO->InAt;
+      LPoint.InAt := AIO->InAt;
+      LPoint.KeysAt := AIO->InAt;
+      LPoint.Keys := AIO->Keys;
+      if not DoZipAddPoint(AIO, LPoint) then
+        return -1;
+      end;
+    end;
+    if not DoZipFill(AIO) then
+      return -1;
+    end;
+  end;
+  LCount := int64(AIO->Inflater.avail_in);
+  if LCount > AMax then
+    LCount := AMax;
+  end;
+  LFrom := AIO->Inflater.next_in;
+  if ADest <> nil then
+    DoCopy(ADest, LFrom, LCount);
+  end;
+  DoZipFrontier(AIO, AIO->OutAt, LFrom, LCount);
+  AIO->Inflater.next_in := LFrom + LCount;
+  AIO->Inflater.avail_in := AIO->Inflater.avail_in - uInt(LCount);
+  AIO->OutAt := AIO->OutAt + LCount;
+  return LCount;
+end;
+
+// The decoder's next step, by the entry's kind
+routine DoZipStep(const AIO: ptr to ZipEntryIOData; const ADest: ptr to uint8;
+  const AMax: int64): int64;
+begin
+  if AIO->Deflated then
+    return DoZipInflateStep(AIO, ADest, AMax);
+  end;
+  return DoZipStoredStep(AIO, ADest, AMax);
+end;
+
+// Primes a deflated entry's restart at APoint, whose first byte read is AFirst (zran's
+// extract): inflate reset (or set up), given the bits of the byte before InAt and the
+// point's window, the ring filled from it so points made later get their windows. False
+// when the archive or zlib failed
+routine DoZipRestartInflate(const AIO: ptr to ZipEntryIOData; const APoint: ZipPointData;
+  const AFirst: int64): bool;
+var
+  LReset: int32;
+  LByte: uint8;
+  LI: int64;
+begin
+  if AIO->InflaterReady then
+    LReset := inflateReset(addr of AIO->Inflater);
+  else
+    LReset := DoZipInflateInit(AIO);
+  end;
+  if LReset <> Z_OK then
+    return false;
+  end;
+  AIO->InflaterReady := true;
+  AIO->Inflater.next_in := AIO->Input;
+  AIO->Inflater.avail_in := 0;
+  if APoint.Bits <> 0 then
+    LByte := 0;
+    if DoZipReadAt(AIO->Archive, AIO->DataStart + AFirst, addr of LByte, 1) <> 1 then
+      return false;
+    end;
+    if AIO->Encrypted then
+      DoZipDecrypt(AIO->Keys, addr of LByte, 1);
+    end;
+    AIO->InAt := AFirst + 1;
+    AIO->ChunkAt := AIO->InAt;
+    AIO->ChunkKeys := AIO->Keys;
+    if inflatePrime(addr of AIO->Inflater, APoint.Bits, int32(LByte) shr (8 - APoint.Bits)) <> Z_OK then
+      return false;
+    end;
+  end;
+  if APoint.WindowCount > 0 then
+    if inflateSetDictionary(addr of AIO->Inflater, APoint.Window, uInt(APoint.WindowCount)) <> Z_OK then
+      return false;
+    end;
+    for LI := 0 to APoint.WindowCount - 1 do
+      AIO->Ring[(APoint.OutAt - APoint.WindowCount + LI) mod ADAM_CUSTOMIO_ZIP_WINDOW] :=
+        APoint.Window[LI];
+    end;
+  end;
+  return true;
+end;
+
+// Puts the decoder at APoint: the keys moved on from KeysAt to the first byte read (an
+// encrypted entry's bytes up to it decrypted and dropped), the cursor there, inflate primed
+// for a deflated entry. False when the archive or zlib failed
+routine DoZipRestart(const AIO: ptr to ZipEntryIOData; const APoint: ZipPointData): bool;
+var
+  LFirst: int64;
+  LAt: int64;
+  LCount: int64;
+begin
+  LFirst := APoint.InAt;
+  if APoint.Bits <> 0 then
+    LFirst := LFirst - 1;
+  end;
+  AIO->CursorValid := false;
+  AIO->Keys := APoint.Keys;
+  if AIO->Encrypted then
+    LAt := APoint.KeysAt;
+    while LAt < LFirst do
+      LCount := LFirst - LAt;
+      if LCount > ADAM_CUSTOMIO_ZIP_CHUNK then
+        LCount := ADAM_CUSTOMIO_ZIP_CHUNK;
+      end;
+      if DoZipReadAt(AIO->Archive, AIO->DataStart + LAt, AIO->Input, LCount) <> LCount then
+        return false;
+      end;
+      DoZipDecrypt(AIO->Keys, AIO->Input, LCount);
+      LAt := LAt + LCount;
+    end;
+  end;
+  AIO->InAt := LFirst;
+  AIO->ChunkAt := LFirst;
+  AIO->ChunkKeys := AIO->Keys;
+  AIO->PrevChunkAt := LFirst;
+  AIO->PrevChunkKeys := AIO->Keys;
+  AIO->Inflater.next_in := AIO->Input;
+  AIO->Inflater.avail_in := 0;
+  if AIO->Deflated then
+    if not DoZipRestartInflate(AIO, APoint, LFirst) then
+      return false;
+    end;
+  end;
+  AIO->OutAt := APoint.OutAt;
+  AIO->CursorValid := true;
+  return true;
+end;
+
+// The index of the last point at or before output offset AAt (Points[0] is at 0; the points
+// are in output order)
+routine DoZipPointBefore(const AIO: ptr to ZipEntryIOData; const AAt: int64): int64;
+var
+  LLow: int64;
+  LHigh: int64;
+  LMid: int64;
+begin
+  LLow := 0;
+  LHigh := AIO->PointCount - 1;
+  while LLow < LHigh do
+    LMid := (LLow + LHigh + 1) div 2;
+    if AIO->Points[LMid].OutAt <= AAt then
+      LLow := LMid;
+    else
+      LHigh := LMid - 1;
+    end;
+  end;
+  return LLow;
+end;
+
+// Reads ASize bytes (at most what is left) at the position of a Decode entry: from the
+// cursor when it is at or before the position with no point nearer, else from the last
+// point at or before it; the count read
+routine DoZipDecodeRead(const AIO: ptr to ZipEntryIOData; const ABuffer: ptr to uint8;
+  const ASize: int64): int64;
+var
+  LPoint: int64;
+  LFrom: ZipPointData;
+  LDone: int64;
+  LGot: int64;
+begin
+  LPoint := DoZipPointBefore(AIO, AIO->Position);
+  if (not AIO->CursorValid) or (AIO->OutAt > AIO->Position) or
+    (AIO->Points[LPoint].OutAt > AIO->OutAt) then
+    // A copy: restarting adds no point, but the points are not held across it
+    LFrom := AIO->Points[LPoint];
+    if not DoZipRestart(AIO, LFrom) then
+      AIO->Failed := true;
+      return 0;
+    end;
+  end;
+  // Up to the position, the output dropped
+  while AIO->OutAt < AIO->Position do
+    if DoZipStep(AIO, nil, AIO->Position - AIO->OutAt) <= 0 then
+      AIO->Failed := true;
+      AIO->CursorValid := false;
+      return 0;
+    end;
+  end;
+  LDone := 0;
+  while LDone < ASize do
+    // ASize is at most what is left, so the end here is an error too
+    LGot := DoZipStep(AIO, ABuffer + LDone, ASize - LDone);
+    if LGot <= 0 then
+      AIO->Failed := true;
+      AIO->CursorValid := false;
+      leave;
+    end;
+    LDone := LDone + LGot;
+  end;
+  AIO->Position := AIO->Position + LDone;
+  return LDone;
+end;
+
+// Reads ASize bytes (at most what is left) at the position of a Direct entry, in place; the
+// count read
+routine DoZipDirectRead(const AIO: ptr to ZipEntryIOData; const ABuffer: ptr to uint8;
+  const ASize: int64): int64;
+var
+  LGot: int64;
+begin
+  LGot := DoZipReadAt(AIO->Archive, AIO->DataStart + AIO->Position, ABuffer, ASize);
+  if LGot < ASize then
+    AIO->Failed := true;
+  end;
+  if LGot < 0 then
+    LGot := 0;
+  end;
+  DoZipFrontier(AIO, AIO->Position, ABuffer, LGot);
+  AIO->Position := AIO->Position + LGot;
+  return LGot;
+end;
+
+// The entry IO's read: up to ASize bytes into ABuffer, the count read (short at the end, or
+// with Failed set after an error)
+routine DoZipEntryRead(const AIO: ptr to ZipEntryIOData; const ABuffer: ptr to uint8;
+  const ASize: int64): int64;
+var
+  LCount: int64;
+begin
+  LCount := AIO->EntrySize - AIO->Position;
+  if LCount > ASize then
+    LCount := ASize;
+  end;
+  if LCount <= 0 then
+    return 0;
+  end;
+  if AIO->Kind = ZipKind.Whole then
+    DoCopy(ABuffer, AIO->Whole + AIO->Position, LCount);
+    AIO->Position := AIO->Position + LCount;
+    return LCount;
+  end;
+  if AIO->Kind = ZipKind.Direct then
+    return DoZipDirectRead(AIO, ABuffer, LCount);
+  end;
+  return DoZipDecodeRead(AIO, ABuffer, LCount);
+end;
+
+// The zip entry IO's callbacks: the user pointer is the ZipEntryIOData DoZipEntryOpen made.
+// Read: a read error or a CRC mismatch is the IO's error (every later read fails too); a
+// short count otherwise is the end
+routine ZipEntryRead(const AUserData: ptr; const ABuffer: ptr; const ASize: int64;
+  var AState: IOState): int64;
+var
+  LIO: ptr to ZipEntryIOData;
+  LCount: int64;
+begin
+  LIO := ptr to ZipEntryIOData(AUserData);
+  LCount := 0;
+  if not LIO->Failed then
+    LCount := DoZipEntryRead(LIO, ptr to uint8(ABuffer), ASize);
+  end;
+  if LIO->Failed then
+    AState := IOState.Error;
+  end;
+  return LCount;
+end;
+
+// The new position, or -1 when the target lies outside 0 .. the entry's size (as the memory
+// IO). Only the position moves; the next read decodes
+routine ZipEntrySeek(const AUserData: ptr; const AOffset: int64; const AOrigin: SeekOrigin): int64;
+var
+  LIO: ptr to ZipEntryIOData;
+  LBase: int64;
+begin
+  LIO := ptr to ZipEntryIOData(AUserData);
+  LBase := 0;
+  if AOrigin = SeekOrigin.FromCurrent then
+    LBase := LIO->Position;
+  end;
+  if AOrigin = SeekOrigin.FromEnd then
+    LBase := LIO->EntrySize;
+  end;
+  // The target must lie in 0 .. size; compared without forming it (no overflow)
+  if (AOffset > LIO->EntrySize - LBase) or (AOffset < -LBase) then
+    return -1;
+  end;
+  LIO->Position := LBase + AOffset;
+  return LIO->Position;
+end;
+
+routine ZipEntryTell(const AUserData: ptr): int64;
+var
+  LIO: ptr to ZipEntryIOData;
+begin
+  LIO := ptr to ZipEntryIOData(AUserData);
+  return LIO->Position;
+end;
+
+routine ZipEntrySize(const AUserData: ptr): int64;
+var
+  LIO: ptr to ZipEntryIOData;
+begin
+  LIO := ptr to ZipEntryIOData(AUserData);
+  return LIO->EntrySize;
+end;
+
+// Frees the entry IO, letting go of its archive reference
+routine ZipEntryClose(const AUserData: ptr): bool;
+begin
+  return DoZipEntryFree(ptr to ZipEntryIOData(AUserData));
+end;
+
+// The zip entry IO's callback table: read-only, nothing to flush or truncate
+routine ZipEntryInterface(): IOInterface;
+var
+  LInterface: IOInterface;
+begin
+  LInterface.Read := ZipEntryRead;
+  LInterface.Write := nil;
+  LInterface.Seek := ZipEntrySeek;
+  LInterface.Tell := ZipEntryTell;
+  LInterface.Size := ZipEntrySize;
+  LInterface.Flush := nil;
+  LInterface.Close := ZipEntryClose;
+  LInterface.Truncate := nil;
+  return LInterface;
+end;
+// The zip source's callbacks: the user pointer is the ZipTableData DoZipCreate made. Open:
+// an entry as a read-only IO; nil for any other mode, a missing entry, a missing or wrong
+// password, a method other than stored / deflated, or an entry that cannot be read
+routine ZipOpen(const AUserData: ptr; const APath: string; const AMode: FileMode): IO;
+var
+  LEntry: ptr to ZipEntryIOData;
+  LIO: IO;
+begin
+  if AMode <> FileMode.Read then
+    return nil;
+  end;
+  LEntry := DoZipEntryOpen(ptr to ZipTableData(AUserData), APath);
+  if LEntry = nil then
+    return nil;
+  end;
+  LIO := CreateIO(ZipEntryInterface(), ptr(LEntry));
+  if LIO = nil then
+    DoZipEntryFree(LEntry);
+  end;
+  return LIO;
+end;
+
+routine ZipExists(const AUserData: ptr; const APath: string): bool;
+begin
+  return DoZipFind(ptr to ZipTableData(AUserData), APath) <> nil;
+end;
+
+routine ZipSize(const AUserData: ptr; const APath: string): int64;
+var
+  LEntry: ptr to ZipEntryData;
+begin
+  LEntry := DoZipFind(ptr to ZipTableData(AUserData), APath);
+  if LEntry = nil then
+    return -1;
+  end;
+  return LEntry->Uncompressed;
+end;
+
+// Frees the directory, letting go of the source's hold on the archive (the last holder
+// closes an owned archive); false when a close failed
+routine ZipClose(const AUserData: ptr): bool;
+begin
+  return DoZipFree(ptr to ZipTableData(AUserData));
+end;
+
+// The zip source's callback table: read-only, so no Remove
+routine ZipInterface(): IOSourceInterface;
+var
+  LInterface: IOSourceInterface;
+begin
+  LInterface.Open := ZipOpen;
+  LInterface.Exists := ZipExists;
+  LInterface.Size := ZipSize;
+  LInterface.Close := ZipClose;
+  LInterface.Remove := nil;
+  return LInterface;
+end;
+
+// A zip source over AArchive: minizip opens it through the bridge and the directory is read
+// once; nil when AArchive is nil, minizip refuses it or an entry cannot be read. An owned
+// archive (AOwned) is the source's from the call on: closed here when the source cannot be
+// made, else by the last of the source and its entry IOs to let go
+routine ZipCreate(const AArchive: IO; const AOwned: bool; const APassword: string): IOSource;
+var
+  LTable: ptr to ZipTableData;
+  LSource: IOSource;
+begin
+  if AArchive = nil then
+    return nil;
+  end;
+  LTable := DoZipCreate(AArchive, AOwned, APassword);
+  if LTable = nil then
+    return nil;
+  end;
+  LSource := CreateIOSource(ZipInterface(), ptr(LTable));
+  if LSource = nil then
+    DoZipFree(LTable);
+  end;
+  return LSource;
+end;
+
+// One entry of a fresh zip source as an IO; the source is closed at once (the entry IO
+// keeps the archive open on its own)
+routine ZipEntryOf(const ASource: IOSource; const AEntry: string): IO;
+var
+  LIO: IO;
+begin
+  if ASource = nil then
+    return nil;
+  end;
+  LIO := IOSourceOpen(ASource, AEntry);
+  IOSourceClose(ASource);
+  return LIO;
+end;
+
+// Makes a read-only IOSource over a zip archive read through an IO: the archive may be a
+// file, memory, an entry of another source or any IO that reads and seeks. Its central
+// directory is read once, here: ZIP64 archives, data before the archive (a self-extractor)
+// and names in UTF-8, CP437 or an Info-ZIP Unicode Path field are read. Entry paths follow
+// IOSourceOpen's rules and match the archive's names exactly (case included, on every
+// target); a folder is not an entry, a name no path can reach (absolute, `..` above the
+// root, `\`) is never found, and of two entries with one name the later is found.
+// IOSourceSize gives an entry's uncompressed size; IOSourceOpen opens an entry
+// (FileMode.Read only) as a read-only IO that seeks without reading from the start again
+// (stored and deflated entries, ZipCrypto encrypted or not): an entry under 256 KB is read
+// whole when opened, a larger one in place. An encrypted entry opens only with the right
+// password. A CRC that does not match gives nil from the open (small entry) or fails the
+// read that reaches the end (large entry, state Error). An entry IO stays valid after
+// IOSourceClose. The archive IO stays the caller's: never closed by the source, its
+// position moved by every read, it must outlive the source and its entry IOs. APassword is
+// the password for the encrypted entries ("" for none). Nil when AArchive is nil or not a
+// valid zip (no end record, cut short, a bad signature, several disks)
+public routine CreateZipIOSource(const AArchive: IO; const APassword: string): IOSource;
+begin
+  return ZipCreate(AArchive, false, APassword);
+end;
+
+// Makes a read-only IOSource over a zip archive read through an IO, with no password
+// (CreateZipIOSource(AArchive, ""))
+public routine CreateZipIOSource(const AArchive: IO): IOSource;
+begin
+  return ZipCreate(AArchive, false, "");
+end;
+
+// Makes a read-only IOSource over a zip file: CreateZipIOSource over the file opened as
+// CreateFileIO(APath, FileMode.Read) opens it (UTF-8, `$P:` / `$D:` / `$S:`). The source
+// owns that file: it is closed once the source (IOSourceClose) and every entry IO opened
+// from it (IOClose) are closed. Nil when the file cannot be opened or is not a valid zip
+public routine CreateZipIOSource(const APath: string; const APassword: string): IOSource;
+begin
+  return ZipCreate(CreateFileIO(APath, FileMode.Read), true, APassword);
+end;
+
+// Makes a read-only IOSource over a zip file, with no password (CreateZipIOSource(APath,
+// ""))
+public routine CreateZipIOSource(const APath: string): IOSource;
+begin
+  return ZipCreate(CreateFileIO(APath, FileMode.Read), true, "");
+end;
+
+// Opens one entry of a zip archive read through an IO as a read-only IO: IOSourceOpen on
+// CreateZipIOSource(AArchive, APassword), the source closed again at once (the entry IO
+// keeps what it needs). Reading, seeking, passwords and CRC as CreateZipIOSource says; the
+// archive is the caller's and must outlive the IO. Nil when it is not a valid zip, has no
+// such entry, the password is missing or wrong, or the entry cannot be read
+public routine CreateZipFileIO(const AArchive: IO; const AEntry: string; const APassword: string): IO;
+begin
+  return ZipEntryOf(ZipCreate(AArchive, false, APassword), AEntry);
+end;
+
+// Opens one entry of a zip archive read through an IO, with no password
+// (CreateZipFileIO(AArchive, AEntry, ""))
+public routine CreateZipFileIO(const AArchive: IO; const AEntry: string): IO;
+begin
+  return ZipEntryOf(ZipCreate(AArchive, false, ""), AEntry);
+end;
+
+// Opens one entry of a zip file as a read-only IO: the file opened as
+// CreateZipIOSource(APath, APassword) opens it, and closed when the IO is (IOClose). Nil
+// when the file cannot be opened or is not a valid zip, has no such entry, the password is
+// missing or wrong, or the entry cannot be read
+public routine CreateZipFileIO(const APath: string; const AEntry: string; const APassword: string): IO;
+begin
+  return ZipEntryOf(ZipCreate(CreateFileIO(APath, FileMode.Read), true, APassword), AEntry);
+end;
+
+// Opens one entry of a zip file, with no password (CreateZipFileIO(APath, AEntry, ""))
+public routine CreateZipFileIO(const APath: string; const AEntry: string): IO;
+begin
+  return ZipEntryOf(ZipCreate(CreateFileIO(APath, FileMode.Read), true, ""), AEntry);
+end;
+
+public type
+  // What a zip's central directory records about one entry, read by GetZipEntryInfo without
+  // opening or decoding the entry: Size, its uncompressed size in bytes; Crc, the CRC-32 of
+  // its uncompressed bytes as the directory records it (the CRC an entry IO checks its bytes
+  // against)
+  ZipEntryInfo = record
+    Size: int64;
+    Crc: uint32;
+  end;
+
+// Reads an entry's uncompressed size and CRC-32 from a zip file's central directory, without
+// opening or decoding the entry: a cache of an extracted entry compares its file against
+// these to know it is current. The zip is opened as CreateZipIOSource(APath, APassword)
+// opens it and closed again before the call returns. The directory is never encrypted, so
+// an encrypted entry's info reads with any password; APassword is kept so the call names
+// the archive the way CreateZipFileIO does. AInfo is set when the call succeeds and left as
+// it was otherwise. True when the zip has the entry; false when the file cannot be opened
+// or is not a valid zip, the path is refused or no entry has it
+public routine GetZipEntryInfo(const APath: string; const AEntry: string; const APassword: string;
+  var AInfo: ZipEntryInfo): bool;
+var
+  LSource: IOSource;
+  LPath: string;
+  LEntry: ptr to ZipEntryData;
+  LSize: int64;
+  LCrc: uint32;
+begin
+  LSource := ZipCreate(CreateFileIO(APath, FileMode.Read), true, APassword);
+  if LSource = nil then
+    return false;
+  end;
+  LPath := DoSourceNormalize(AEntry);
+  if LPath = "" then
+    IOSourceClose(LSource);
+    return false;
+  end;
+  LEntry := DoZipFind(ptr to ZipTableData(LSource->UserData), LPath);
+  if LEntry = nil then
+    IOSourceClose(LSource);
+    return false;
+  end;
+  LSize := LEntry->Uncompressed;
+  LCrc := LEntry->Crc;
+  IOSourceClose(LSource);
+  AInfo.Size := LSize;
+  AInfo.Crc := LCrc;
+  return true;
 end;
 
 end.

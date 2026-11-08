@@ -1,0 +1,451 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  std_customio_seek.adam - System.CustomIO's zip entry seek cost (PaskalCPP's
+  std_customio_seek)
+
+  A large deflated zip entry seeks from its access points, not from the
+  start. The program builds its own fixture at run time: 32 MiB of lines of
+  pseudo-random words (every 1 MB compresses about the same), deflated with
+  System.Zlib into a one-entry zip, seek.txt, written to repo\bin\output and
+  removed again at the end (never committed, never left behind). It reads
+  the archive through an IO of its own that counts the archive bytes each
+  seek pulls in, so the cost of a seek is measured in compressed bytes, not
+  in time.
+
+  A first seek to near the end inflates from 0 (the restart cost, what a
+  zip stream without access points pays on every backward seek) and leaves
+  the access points behind it. After that, a backward seek, 200 seeks in a
+  random order and a seek from the end each pull in at most one interval of
+  compressed bytes (System.CustomIO keeps a point about every 1 MiB of
+  output and reads 16 KiB chunks: the bound is twice the interval's share
+  of the archive plus two chunks), never more than restarting from 0 would,
+  and every byte read equals the fixture.
+*******************************************************************************/
+
+/*
+@@test
+  kind run
+  exitcode 0
+  | ok seek fixture built
+  | ok seek zip create
+  | ok seek zip written
+  | ok seek zip close
+  | ok seek zip open
+  | ok seek source
+  | ok seek entry
+  | ok seek entry size
+  | ok seek restart reads
+  | ok seek restart pulls the whole stream
+  | ok seek back reads
+  | ok seek back within one interval
+  | ok seek back cheaper than restart
+  | ok seek random reads
+  | ok seek random each within one interval
+  | ok seek random cheaper than restart
+  | ok seek from end
+  | ok seek from end within one interval
+  | ok seek entry close
+  | ok seek source close
+  | ok seek archive close
+  | ok seek zip removed
+  | ok seek zip gone
+  | done 0
+  | [Adam Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+@@end
+*/
+
+module exe std_customio_seek;
+
+import System.SysUtils, System.Windows, System.Zlib, System.CustomIO;
+
+const
+  // The entry's size: 32 intervals
+  ADAM_SEEK_SIZE: int64 = 33554432;
+  // System.CustomIO's access-point interval (output bytes) and read chunk
+  ADAM_SEEK_SPAN: int64 = 1048576;
+  ADAM_SEEK_CHUNK: int64 = 16384;
+  // Bytes read after each seek, and the number of random seeks
+  ADAM_SEEK_READ: int64 = 64;
+  ADAM_SEEK_COUNT: int32 = 200;
+  // The fixture's 32 words, split at the spaces
+  ADAM_SEEK_WORDS: string = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa quebec romeo sierra tango uniform victor whiskey xray yankee zulu paskal stream seek point window inflate";
+
+type
+  // An IO over another IO that counts the bytes read through it
+  CountData = record
+    Inner: IO;
+    Bytes: int64;
+  end;
+
+var
+  GFails: int32;
+  // The fixture: the entry's text, and the archive holding it deflated as seek.txt
+  GText: ByteArray;
+  GZip: ByteArray;
+  GState: uint64;
+
+routine Check(const AName: string; const AOk: bool);
+begin
+  if AOk then
+    println("ok {}", AName);
+  else
+    println("FAIL {}", AName);
+    GFails := GFails + 1;
+  end;
+end;
+
+// The next pseudo-random number below ALimit (a 64-bit LCG, high bits)
+routine SeekNext(const ALimit: int64): int64;
+begin
+  GState := GState * 6364136223846793005u + 1442695040888963407u;
+  return int64((GState shr 33) mod uint64(ALimit));
+end;
+
+// AValue's low 16 / 32 bits added to the end of AOut, little-endian
+routine Put16(var AOut: ByteArray; const AValue: uint32);
+var
+  LAt: int64;
+begin
+  LAt := len(AOut);
+  setlength(AOut, LAt + 2);
+  AOut[LAt] := uint8(AValue & 0xFF);
+  AOut[LAt + 1] := uint8((AValue shr 8) & 0xFF);
+end;
+
+routine Put32(var AOut: ByteArray; const AValue: uint32);
+begin
+  Put16(AOut, AValue & 0xFFFF);
+  Put16(AOut, AValue shr 16);
+end;
+
+// AText's bytes added to the end of AOut
+routine PutText(var AOut: ByteArray; const AText: string);
+var
+  LAt: int64;
+  LI: int64;
+begin
+  LAt := len(AOut);
+  setlength(AOut, LAt + len(AText));
+  for LI := 0 to len(AText) - 1 do
+    AOut[LAt + LI] := uint8(AText[LI]);
+  end;
+end;
+
+// The fields the local header and the central header share
+routine PutHeader(var AOut: ByteArray; const ACrc: uint32; const APacked: uint32;
+  const ASize: uint32; const AName: string);
+begin
+  // version needed, flags, deflated, time, date 2026-10-21
+  Put16(AOut, 20);
+  Put16(AOut, 0);
+  Put16(AOut, 8);
+  Put16(AOut, 0);
+  Put16(AOut, 0x5D55);
+  Put32(AOut, ACrc);
+  Put32(AOut, APacked);
+  Put32(AOut, ASize);
+  Put16(AOut, uint32(len(AName)));
+  // extra length
+  Put16(AOut, 0);
+end;
+
+// ASize bytes of numbered lines of words into GText, written once: the room is made first,
+// then each line goes in where the last ended
+routine BuildText(const ASize: int64);
+var
+  LWords: StringArray;
+  LLine: string;
+  LAt: int64;
+  LNumber: int64;
+  LI: int64;
+  LJ: int64;
+begin
+  LWords := SplitString(ADAM_SEEK_WORDS, " ");
+  setlength(GText, ASize);
+  LAt := 0;
+  LNumber := 0;
+  while LAt < ASize do
+    LLine := IntToStr(LNumber) + ":";
+    for LJ := 0 to 7 do
+      LLine := LLine + " " + LWords[SeekNext(32)];
+    end;
+    LLine := LLine + "\n";
+    LI := 0;
+    while (LI < len(LLine)) and (LAt < ASize) do
+      GText[LAt] := uint8(LLine[LI]);
+      LAt := LAt + 1;
+      LI := LI + 1;
+    end;
+    LNumber := LNumber + 1;
+  end;
+end;
+
+// The text, deflated (raw, level 6) into a one-entry zip in GZip; false when zlib fails
+routine BuildZip(const ASize: int64): bool;
+var
+  LPacked: ByteArray;
+  LError: string;
+  LCrc: uint32;
+  LCentralAt: uint32;
+  LCentralSize: uint32;
+  LName: string;
+  LAt: int64;
+  LI: int64;
+begin
+  LName := "seek.txt";
+  GState := 20261021;
+  BuildText(ASize);
+  if not ZlibDeflate(GText, ZlibFormat.Raw, 6, LPacked, LError) then
+    return false;
+  end;
+  LCrc := ZlibCrc32(0, GText);
+  // Local header, name, data
+  setlength(GZip, 0);
+  Put32(GZip, 0x04034B50);
+  PutHeader(GZip, LCrc, uint32(len(LPacked)), uint32(ASize), LName);
+  PutText(GZip, LName);
+  LAt := len(GZip);
+  setlength(GZip, LAt + len(LPacked));
+  for LI := 0 to len(LPacked) - 1 do
+    GZip[LAt + LI] := LPacked[LI];
+  end;
+  // Central directory: one header (version made by, the shared fields, comment length,
+  // disk, internal and external attributes, local header offset, the name)
+  LCentralAt := uint32(len(GZip));
+  Put32(GZip, 0x02014B50);
+  Put16(GZip, 20);
+  PutHeader(GZip, LCrc, uint32(len(LPacked)), uint32(ASize), LName);
+  Put16(GZip, 0);
+  Put16(GZip, 0);
+  Put16(GZip, 0);
+  Put32(GZip, 0);
+  Put32(GZip, 0);
+  PutText(GZip, LName);
+  LCentralSize := uint32(len(GZip)) - LCentralAt;
+  // End of central directory: disk, directory disk, entries here, entries, directory
+  // size and offset, comment length
+  Put32(GZip, 0x06054B50);
+  Put16(GZip, 0);
+  Put16(GZip, 0);
+  Put16(GZip, 1);
+  Put16(GZip, 1);
+  Put32(GZip, LCentralSize);
+  Put32(GZip, LCentralAt);
+  Put16(GZip, 0);
+  return true;
+end;
+
+// True when ACount bytes at ABytes equal the text at AAt
+routine SeekSame(const AAt: int64; const ABytes: ptr to const uint8; const ACount: int64): bool;
+var
+  LI: int64;
+begin
+  if (AAt < 0) or (AAt + ACount > len(GText)) then
+    return false;
+  end;
+  for LI := 0 to ACount - 1 do
+    if GText[AAt + LI] <> ABytes[LI] then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// The counting IO's callbacks: the user pointer is a CountData
+routine CountRead(const AUserData: ptr; const ABuffer: ptr; const ASize: int64;
+  var AState: IOState): int64;
+var
+  LCount: ptr to CountData;
+  LGot: int64;
+begin
+  LCount := ptr to CountData(AUserData);
+  LGot := IORead(LCount->Inner, ABuffer, ASize);
+  LCount->Bytes := LCount->Bytes + LGot;
+  if LGot < ASize then
+    AState := IOStatus(LCount->Inner);
+  end;
+  return LGot;
+end;
+
+routine CountSeek(const AUserData: ptr; const AOffset: int64; const AOrigin: SeekOrigin): int64;
+var
+  LCount: ptr to CountData;
+begin
+  LCount := ptr to CountData(AUserData);
+  return IOSeek(LCount->Inner, AOffset, AOrigin);
+end;
+
+routine CountTell(const AUserData: ptr): int64;
+var
+  LCount: ptr to CountData;
+begin
+  LCount := ptr to CountData(AUserData);
+  return IOTell(LCount->Inner);
+end;
+
+routine CountSize(const AUserData: ptr): int64;
+var
+  LCount: ptr to CountData;
+begin
+  LCount := ptr to CountData(AUserData);
+  return IOSize(LCount->Inner);
+end;
+
+routine CountClose(const AUserData: ptr): bool;
+var
+  LCount: ptr to CountData;
+begin
+  LCount := ptr to CountData(AUserData);
+  return IOClose(LCount->Inner);
+end;
+
+// What restarting from 0 costs to reach AAt: the archive's share of the output up to AAt,
+// from the restart run's own count (at most a few MiB times 32 MiB: well inside int64)
+routine RestartCost(const ARestart: int64; const AAt: int64): int64;
+begin
+  return (ARestart * AAt) div ADAM_SEEK_SIZE;
+end;
+
+// Seeks the entry to AAt, reads ADAM_SEEK_READ bytes there and checks them; the archive
+// bytes the seek and the read pulled in, -1 when they failed
+routine SeekCost(const AEntry: IO; const ACount: ptr to CountData; const AAt: int64): int64;
+var
+  LBytes: array[0..63] of uint8;
+begin
+  ACount->Bytes := 0;
+  if IOSeek(AEntry, AAt, SeekOrigin.FromStart) <> AAt then
+    return -1;
+  end;
+  if IORead(AEntry, ptr(addr of LBytes[0]), ADAM_SEEK_READ) <> ADAM_SEEK_READ then
+    return -1;
+  end;
+  if not SeekSame(AAt, addr of LBytes[0], ADAM_SEEK_READ) then
+    return -1;
+  end;
+  return ACount->Bytes;
+end;
+
+routine TestSeek();
+var
+  LPath: string;
+  LFile: IO;
+  LCallbacks: IOInterface;
+  LCount: CountData;
+  LCountAt: ptr to CountData;
+  LArchive: IO;
+  LZip: IOSource;
+  LEntry: IO;
+  LLimit: int64;
+  LRestart: int64;
+  LTarget: int64;
+  LCost: int64;
+  LWorst: int64;
+  LTotal: int64;
+  LRestartTotal: int64;
+  LPrevious: int64;
+  LAllRead: bool;
+  LI: int32;
+begin
+  LPath := "$P:std_customio_seek.zip";
+  Check("seek fixture built", BuildZip(ADAM_SEEK_SIZE));
+  LFile := CreateFileIO(LPath, FileMode.Write);
+  Check("seek zip create", LFile <> nil);
+  Check("seek zip written", IOWrite(LFile, ptr(addr of GZip[0]), len(GZip)) = len(GZip));
+  Check("seek zip close", IOClose(LFile));
+
+  LCount.Inner := CreateFileIO(LPath, FileMode.Read);
+  Check("seek zip open", LCount.Inner <> nil);
+  LCount.Bytes := 0;
+  LCountAt := addr of LCount;
+  LCallbacks.Read := CountRead;
+  LCallbacks.Write := nil;
+  LCallbacks.Seek := CountSeek;
+  LCallbacks.Tell := CountTell;
+  LCallbacks.Size := CountSize;
+  LCallbacks.Flush := nil;
+  LCallbacks.Close := CountClose;
+  LCallbacks.Truncate := nil;
+  LArchive := CreateIO(LCallbacks, ptr(LCountAt));
+  LZip := CreateZipIOSource(LArchive);
+  Check("seek source", LZip <> nil);
+  LEntry := IOSourceOpen(LZip, "seek.txt");
+  Check("seek entry", LEntry <> nil);
+  Check("seek entry size", IOSize(LEntry) = ADAM_SEEK_SIZE);
+  // One interval's share of the archive, twice, plus two chunks
+  LLimit := 2 * (len(GZip) div (ADAM_SEEK_SIZE div ADAM_SEEK_SPAN)) + 2 * ADAM_SEEK_CHUNK;
+
+  // Restarting from 0: the first seek has no points past the start yet
+  LRestart := SeekCost(LEntry, LCountAt, ADAM_SEEK_SIZE - ADAM_SEEK_READ);
+  Check("seek restart reads", LRestart > 0);
+  Check("seek restart pulls the whole stream", LRestart >= (len(GZip) div 10) * 9);
+
+  // Back to a third: from the nearest point, not from 0
+  LTarget := ADAM_SEEK_SIZE div 3 + 12345;
+  LCost := SeekCost(LEntry, LCountAt, LTarget);
+  Check("seek back reads", LCost > 0);
+  Check("seek back within one interval", LCost <= LLimit);
+  Check("seek back cheaper than restart", LCost < RestartCost(LRestart, LTarget));
+
+  // Random order: every seek within one interval, the whole run cheaper than a restart for
+  // each backward seek (forward: from where it stood)
+  LAllRead := true;
+  LWorst := 0;
+  LTotal := 0;
+  LRestartTotal := 0;
+  LPrevious := LTarget + ADAM_SEEK_READ;
+  for LI := 1 to ADAM_SEEK_COUNT do
+    LTarget := SeekNext(ADAM_SEEK_SIZE - ADAM_SEEK_READ);
+    LCost := SeekCost(LEntry, LCountAt, LTarget);
+    if LCost < 0 then
+      LAllRead := false;
+    end;
+    if LCost > LWorst then
+      LWorst := LCost;
+    end;
+    LTotal := LTotal + LCost;
+    if LTarget < LPrevious then
+      LRestartTotal := LRestartTotal + RestartCost(LRestart, LTarget);
+    else
+      LRestartTotal := LRestartTotal + RestartCost(LRestart, LTarget - LPrevious);
+    end;
+    LPrevious := LTarget + ADAM_SEEK_READ;
+  end;
+  Check("seek random reads", LAllRead);
+  Check("seek random each within one interval", LWorst <= LLimit);
+  Check("seek random cheaper than restart", LTotal < LRestartTotal);
+
+  // From the end
+  LCount.Bytes := 0;
+  Check("seek from end", IOSeek(LEntry, -ADAM_SEEK_READ, SeekOrigin.FromEnd) = ADAM_SEEK_SIZE - ADAM_SEEK_READ);
+  LCost := SeekCost(LEntry, LCountAt, ADAM_SEEK_SIZE - ADAM_SEEK_READ);
+  Check("seek from end within one interval", (LCost > 0) and (LCost <= LLimit));
+
+  Check("seek entry close", IOClose(LEntry));
+  Check("seek source close", IOSourceClose(LZip));
+  Check("seek archive close", IOClose(LArchive));
+  // The program wrote the archive, so it removes it: nothing is left in repo\bin\output and
+  // no later run depends on an old copy
+  Check("seek zip removed", DeleteFile(LPath));
+  Check("seek zip gone", not FileExists(LPath));
+  setlength(GText, 0);
+  setlength(GZip, 0);
+end;
+
+begin
+  GFails := 0;
+  TestSeek();
+  println("{}", "done " + IntToStr(int64(GFails)));
+end.
