@@ -289,6 +289,13 @@ public const
   ADAM_LOWERING_FINALLY_SYMBOL: string = "$finally";
   // A function's cleanup funclet's symbol: the function's and this (DoCleanupFunclet)
   ADAM_LOWERING_CLEANUP_SYMBOL: string = "$cleanup";
+  // A waiting jump's target when it is a return (DoPadJump): no block, the return's tail
+  // after its last pad (DoPadReturn)
+  ADAM_LOWERING_RETURN_PAD: int64 = -1;
+  // The bytes (and alignment) of the slot a return's value waits in while the cleanups run
+  // (DoEnterRegion): the largest IR value, an Int64, a Float64 or a pointer on Adam's
+  // 64-bit targets
+  ADAM_LOWERING_PAD_VALUE_BYTES: int64 = 8;
   // The directive that adds a library to the build (BNF sec 2), recorded on the IR module
   ADAM_LOWERING_DIRECTIVE_LINK: string = "@linklibrary";
 
@@ -419,6 +426,22 @@ public type
     // The positions (in its Blocks) of the current function's exit blocks, where it
     // releases its FManaged at an exit (DoExitBlock): outside its cleanup scopes
     hidden FExitBlocks: ref Int64List;
+    // The current function's protected regions being lowered, the innermost last (a guard
+    // with a finally: its body and its except part), whose cleanup a jump out of one runs
+    // on its way (DoJumpOut); and the jumps out of them waiting for their pads
+    // (DoClosePads): by index, the jump, its target (a block, or ADAM_LOWERING_RETURN_PAD),
+    // the loop or match it leaves (0: a return) and the depth in FRegions of the region it
+    // waits on (-1 once its pad is made)
+    hidden FRegions: ref Int64List;
+    hidden FPadJumps: ref Int64List;
+    hidden FPadTargets: ref Int64List;
+    hidden FPadLoops: ref Int64List;
+    hidden FPadDepths: ref Int64List;
+    // The slot a return's value waits in while the cleanups run, made as the outermost
+    // region is entered (DoEnterRegion; 0: none, the function gives no value), and the
+    // value's IR type (the function's result type)
+    hidden FPadValueSlot: int64;
+    hidden FPadValueType: IrType;
     hidden FTempOf: array of int64;
     // By a canonical type's node id: the data blob of its managed map (DoManagedMap), and of
     // a dynamic array type's element map (DoElementMap); 0: none made yet, -1: refused
@@ -475,6 +498,7 @@ public type
       self.FManaged := ref Int64List();
       self.FManagedType := ref Int64List();
       self.FExitBlocks := ref Int64List();
+      self.DoStartRegions();
       setlength(self.FTempOf, ATree.Count);
       setlength(self.FManagedMapOf, ATree.Count);
       setlength(self.FElementMapOf, ATree.Count);
@@ -4212,12 +4236,25 @@ public type
     end;
 
     // A new FManaged for the function about to be lowered (none of its slots yet, no exit
-    // block)
+    // block, no protected region: DoStartRegions)
     hidden method DoStartManaged();
     begin
       self.FManaged := ref Int64List();
       self.FManagedType := ref Int64List();
       self.FExitBlocks := ref Int64List();
+      self.DoStartRegions();
+    end;
+
+    // No protected region and no waiting jump for the function about to be lowered
+    hidden method DoStartRegions();
+    begin
+      self.FRegions := ref Int64List();
+      self.FPadJumps := ref Int64List();
+      self.FPadTargets := ref Int64List();
+      self.FPadLoops := ref Int64List();
+      self.FPadDepths := ref Int64List();
+      self.FPadValueSlot := 0;
+      self.FPadValueType := IrType.Void;
     end;
 
     // True when the current function cleans up its own managed slots as an unwind leaves it
@@ -8065,25 +8102,26 @@ public type
 
     // The return statement AId, with or without a value; in the program block it ends the
     // program as the block's end does (a jump to the entry's end block: the finalize
-    // chain, then the runtime's exit with 0); in a section it leaves the section
+    // chain, then the runtime's exit with 0); in a section it leaves the section. Inside a
+    // protected region the cleanups run first (DoJumpOut, DoKeepReturn: the value is read
+    // before them and kept)
     hidden method DoReturn(const AId: int64);
     var
       LExpr: int64;
       LValue: int64;
       LId: int64;
-      LPart: string;
     begin
-      LPart := self.DoLeftGuardPart(AId, 0);
-      if LPart <> "" then
-        self.DoRefuse(AId, self.FTree.ConstructPhrase(AId) + " that leaves a guard's " + LPart);
-        return;
-      end;
       if (self.FEntry <> 0) and (self.FFunction = self.FEntry) then
-        self.DoJumpTo(self.FEntryEnd, AId);
+        if not self.DoJumpOut(self.FEntryEnd, 0, AId) then
+          self.DoJumpTo(self.FEntryEnd, AId);
+        end;
         return;
       end;
       LExpr := self.FTree.FirstOf(AId, NodeRole.Value);
       if LExpr = 0 then
+        if self.DoJumpOut(ADAM_LOWERING_RETURN_PAD, 0, AId) then
+          return;
+        end;
         self.DoReleaseManaged(AId);
         self.DoExitParts(AId);
         self.DoEmit(IrOp.Ret, IrType.Void, AId);
@@ -8104,6 +8142,9 @@ public type
         if self.DoCallRuntime(RuntimeRoutine.StrAddRef, LValue, 0, AId) = 0 then
           return;
         end;
+      end;
+      if self.DoKeepReturn(LValue, AId) then
+        return;
       end;
       self.DoReleaseManaged(AId);
       LId := self.DoEmit(IrOp.Ret, IrType.Void, AId);
@@ -8131,6 +8172,9 @@ public type
         self.DoAggregateCopy(LValue, LSource, LType, AId);
       else
         LValue := self.DoLoad(LSource, self.DoAggregateIr(LType), AId);
+      end;
+      if self.DoKeepReturn(LValue, AId) then
+        return;
       end;
       self.DoReleaseManaged(AId);
       LId := self.DoEmit(IrOp.Ret, IrType.Void, AId);
@@ -8604,21 +8648,14 @@ public type
     end;
 
     // The leave or skip AId: a jump to the exit (leave) or the next block (skip) of the loop
-    // or match its ResolvedJump names; LW0001 when that statement got no blocks (one not
-    // lowered yet), and for one that leaves a guard's part with a finally to run
-    // (DoLeftGuardPart)
+    // or match its ResolvedJump names, through the cleanups of every protected region it
+    // leaves (DoJumpOut); LW0001 when that statement got no blocks (one not lowered yet)
     hidden method DoLeaveSkip(const AId: int64);
     var
       LTarget: int64;
       LBlock: int64;
-      LPart: string;
     begin
       LTarget := self.FTree[AId].ResolvedJump;
-      LPart := self.DoLeftGuardPart(AId, LTarget);
-      if LPart <> "" then
-        self.DoRefuse(AId, self.FTree.ConstructPhrase(AId) + " that leaves a guard's " + LPart);
-        return;
-      end;
       if self.FTree[AId].Kind = NodeKind.LeaveStatement then
         LBlock := self.FExitOf[LTarget];
       else
@@ -8628,40 +8665,169 @@ public type
         self.DoRefuse(AId, self.FTree.ConstructPhrase(AId));
         return;
       end;
+      if self.DoJumpOut(LBlock, LTarget, AId) then
+        return;
+      end;
       self.DoJumpTo(LBlock, AId);
     end;
 
-    // The part of a guard the jump AId leaves on its way out to AOuter, a node around it (0:
-    // as far as its module): "body" for a guard's body (its Statement role), "except part"
-    // for the except part of a guard with a finally, "" for neither. Such a jump would run
-    // the guard's finally on its way out, which code generation does not do yet (a leave or
-    // skip of a loop inside the part, the guard's own sites, stays inside it; a jump out of
-    // an except part with no finally to run is a plain jump). SEM's DoCrossesFinally is the
-    // twin for a finally's statements
-    hidden const method DoLeftGuardPart(const AId: int64; const AOuter: int64): string;
+    // The protected region ANode entered (a guard with a finally, before its body): jumps
+    // out of it from here on wait for its pads (DoClosePads). Entering the outermost one
+    // makes the slot a return's value waits in (FPadValueSlot, when the function gives a
+    // value): made here, it is set before every return inside and read in every pad after
+    hidden method DoEnterRegion(const ANode: int64);
+    var
+      LType: IrType;
+    begin
+      if self.FRegions.Count = 0 then
+        self.FPadValueSlot := 0;
+        LType := self.FModule.FunctionAt(self.FFunction).Signature.ResultType;
+        if LType <> IrType.Void then
+          self.FPadValueType := LType;
+          self.FPadValueSlot := self.DoSizedSlot(ANode, ADAM_LOWERING_PAD_VALUE_BYTES,
+            ADAM_LOWERING_PAD_VALUE_BYTES);
+        end;
+      end;
+      self.FRegions.Add(ANode);
+    end;
+
+    // True when the protected region at ADepth of FRegions is left by a jump out of the loop
+    // or match ALoop (0: a return, which leaves every region of its function): the region
+    // lies inside ALoop
+    hidden const method DoRegionLeft(const ADepth: int64; const ALoop: int64): bool;
     var
       LAt: int64;
-      LParent: int64;
     begin
-      LAt := AId;
-      LParent := self.FTree.ParentOf(LAt);
-      while (LParent <> 0) and (LParent <> AOuter) do
-        if self.FTree[LParent].Kind = NodeKind.GuardStatement then
-          if self.FTree.RoleOf(LAt) = NodeRole.Statement then
-            return "body";
-          end;
-          if (self.FTree.RoleOf(LAt) = NodeRole.Except) and
-            (self.FTree.CountOf(LParent, NodeRole.Finally) > 0) then
-            return "except part";
-          end;
-        end;
-        if self.FTree[LParent].Kind = NodeKind.Module then
-          return "";
-        end;
-        LAt := LParent;
-        LParent := self.FTree.ParentOf(LAt);
+      if ALoop = 0 then
+        return true;
       end;
-      return "";
+      LAt := self.FTree.ParentOf(self.FRegions[ADepth]);
+      while LAt <> 0 do
+        if LAt = ALoop then
+          return true;
+        end;
+        LAt := self.FTree.ParentOf(LAt);
+      end;
+      return false;
+    end;
+
+    // True when a jump toward ATarget (a block, or ADAM_LOWERING_RETURN_PAD) out of the loop
+    // or match ALoop (0: a return) leaves a protected region: then it is made as a jump
+    // waiting on the innermost one (DoPadJump), at ANode. The regions are nested, so it
+    // leaves one only when it leaves the innermost
+    hidden method DoJumpOut(const ATarget: int64; const ALoop: int64; const ANode: int64): bool;
+    begin
+      if self.FRegions.Count = 0 then
+        return false;
+      end;
+      if not self.DoRegionLeft(self.FRegions.Count - 1, ALoop) then
+        return false;
+      end;
+      self.DoPadJump(ATarget, ALoop, ANode);
+      return true;
+    end;
+
+    // A jump from the current block, at ANode, toward ATarget out of ALoop (DoJumpOut's),
+    // its target left for the innermost region's pad (DoClosePads adds it)
+    hidden method DoPadJump(const ATarget: int64; const ALoop: int64; const ANode: int64);
+    var
+      LJump: int64;
+    begin
+      LJump := self.DoEmit(IrOp.Jump, IrType.Void, ANode);
+      self.FPadJumps.Add(LJump);
+      self.FPadTargets.Add(ATarget);
+      self.FPadLoops.Add(ALoop);
+      self.FPadDepths.Add(self.FRegions.Count - 1);
+    end;
+
+    // True when the return at ANode keeps its value AValue for after the cleanups: it is
+    // inside a protected region, so the value is stored in FPadValueSlot and the return is a
+    // jump waiting on the region (DoPadJump); its tail is DoPadReturn's
+    hidden method DoKeepReturn(const AValue: int64; const ANode: int64): bool;
+    begin
+      if self.FRegions.Count = 0 then
+        return false;
+      end;
+      self.DoStore(self.FPadValueSlot, AValue, ANode);
+      self.DoPadJump(ADAM_LOWERING_RETURN_PAD, 0, ANode);
+      return true;
+    end;
+
+    // The protected region ANode left (the innermost of FRegions, every block it covers
+    // made): one pad block per target its waiting jumps go to, made now so that no scope of
+    // ANode covers it (a raise in its cleanup never runs ANode's cleanup again); each pad
+    // runs ANode's cleanup (DoRegionCleanup), then goes on to the next region's pad when the
+    // jump leaves that one too (DoJumpOut), else to its target (a return's: DoPadReturn).
+    // The current block comes back as it was
+    hidden method DoClosePads(const ANode: int64);
+    var
+      LDepth: int64;
+      LBlock: int64;
+      LCount: int64;
+      LPad: int64;
+      LTarget: int64;
+      LLoop: int64;
+      LI: int64;
+      LJ: int64;
+    begin
+      LDepth := self.FRegions.Count - 1;
+      self.FRegions.RemoveLast();
+      LBlock := self.FBlock;
+      // The jumps made by the pads (waiting on outer regions) come after LCount
+      LCount := self.FPadJumps.Count;
+      for LI := 0 to LCount - 1 do
+        if self.FPadDepths[LI] = LDepth then
+          LTarget := self.FPadTargets[LI];
+          LLoop := self.FPadLoops[LI];
+          LPad := self.FModule.AddBlock(self.FFunction);
+          // Every jump of this region toward the same target goes to the one pad
+          for LJ := LI to LCount - 1 do
+            if (self.FPadDepths[LJ] = LDepth) and (self.FPadTargets[LJ] = LTarget) then
+              self.FModule.InstrAt(self.FPadJumps[LJ]).Targets.Add(LPad);
+              self.FPadDepths.Put(LJ, -1);
+            end;
+          end;
+          self.FBlock := LPad;
+          self.DoRegionCleanup(ANode);
+          if not self.DoEnded() then
+            if not self.DoJumpOut(LTarget, LLoop, ANode) then
+              if LTarget = ADAM_LOWERING_RETURN_PAD then
+                self.DoPadReturn(ANode);
+              else
+                self.DoJumpTo(LTarget, ANode);
+              end;
+            end;
+          end;
+        end;
+      end;
+      self.FBlock := LBlock;
+    end;
+
+    // The cleanup of the protected region ANode, lowered where the current block is: a
+    // guard's finally statements
+    hidden method DoRegionCleanup(const ANode: int64);
+    begin
+      self.DoStatements(ANode, NodeRole.Finally);
+    end;
+
+    // A return's tail after its last pad, at ANode: the managed slots released, then the
+    // value DoKeepReturn kept returned; with none (the function gives no value) its parts
+    // ended and the return, as a return without a value does
+    hidden method DoPadReturn(const ANode: int64);
+    var
+      LValue: int64;
+      LId: int64;
+    begin
+      if self.FPadValueSlot = 0 then
+        self.DoReleaseManaged(ANode);
+        self.DoExitParts(ANode);
+        self.DoEmit(IrOp.Ret, IrType.Void, ANode);
+        return;
+      end;
+      LValue := self.DoLoad(self.FPadValueSlot, self.FPadValueType, ANode);
+      self.DoReleaseManaged(ANode);
+      LId := self.DoEmit(IrOp.Ret, IrType.Void, ANode);
+      self.FModule.InstrAt(LId).Operands.Add(LValue);
     end;
 
     // The guard AId (BNF sec 5) with an except part, a finally part or both: its body in
@@ -8673,7 +8839,9 @@ public type
     // through, the same statements again as a funclet (DoFinallyFunclet) and a scope over
     // the body's and the except part's blocks naming it, added after the catching scope, so
     // an unwind leaving the guard runs them too and a raise the except part catches runs them
-    // after it (the module's FrameHandler, the platform unit's, is the frame's handler). A
+    // after it (the module's FrameHandler, the platform unit's, is the frame's handler); a
+    // return, leave or skip out of the body or the except part runs them on its way (a
+    // protected region: DoEnterRegion, its pads DoClosePads). A
     // guard with neither part, or with an empty finally and no except part, leaves the body
     // alone. LW0001 for a guard inside a finally (a funclet's funclet would reach two
     // frames), and with no frame handler or filter
@@ -8719,6 +8887,10 @@ public type
           return;
         end;
       end;
+      // A jump out of the body or the except part runs the finally on its way (DoJumpOut)
+      if LFinally then
+        self.DoEnterRegion(AId);
+      end;
       // The body's blocks run from its own first block to the last one it made
       LBody := self.FModule.AddBlock(self.FFunction);
       self.DoJumpTo(LBody, AId);
@@ -8755,6 +8927,11 @@ public type
         self.DoJumpTo(LJoin, AId);
       end;
       self.FBlock := LJoin;
+      // The pads of the jumps out of the body and the except part, after every block the
+      // finally's scope covers
+      if LFinally then
+        self.DoClosePads(AId);
+      end;
       // Added after every guard inside the body and the except part: the innermost scope
       // comes first, the catching scope before this guard's finally
       if LExcept then
@@ -8782,6 +8959,13 @@ public type
       LManaged: ref Int64List;
       LManagedType: ref Int64List;
       LExitBlocks: ref Int64List;
+      LRegions: ref Int64List;
+      LPadJumps: ref Int64List;
+      LPadTargets: ref Int64List;
+      LPadLoops: ref Int64List;
+      LPadDepths: ref Int64List;
+      LPadValueSlot: int64;
+      LPadValueType: IrType;
       LFunclet: int64;
       LFunction: ref IrFunction;
       LFrame: int64;
@@ -8791,6 +8975,13 @@ public type
       LManaged := self.FManaged;
       LManagedType := self.FManagedType;
       LExitBlocks := self.FExitBlocks;
+      LRegions := self.FRegions;
+      LPadJumps := self.FPadJumps;
+      LPadTargets := self.FPadTargets;
+      LPadLoops := self.FPadLoops;
+      LPadDepths := self.FPadDepths;
+      LPadValueSlot := self.FPadValueSlot;
+      LPadValueType := self.FPadValueType;
       // The id AddFunction hands out next, so the symbol is the function's own
       LFunclet := self.FModule.AddFunction(self.FModule.FunctionAt(LParent).Symbol +
         ADAM_LOWERING_FINALLY_SYMBOL + IntToStr(self.FModule.FunctionCount), IrType.Void, AId);
@@ -8815,6 +9006,13 @@ public type
       self.FManaged := LManaged;
       self.FManagedType := LManagedType;
       self.FExitBlocks := LExitBlocks;
+      self.FRegions := LRegions;
+      self.FPadJumps := LPadJumps;
+      self.FPadTargets := LPadTargets;
+      self.FPadLoops := LPadLoops;
+      self.FPadDepths := LPadDepths;
+      self.FPadValueSlot := LPadValueSlot;
+      self.FPadValueType := LPadValueType;
       return LFunclet;
     end;
 
