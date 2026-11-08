@@ -88,6 +88,10 @@ public const
   ADAM_X64_SELECT_STRING_SOURCE: string = "rsi";
   ADAM_X64_SELECT_STRING_COUNT: string = "rcx";
   ADAM_X64_SELECT_STRING_BYTE: string = "rax";
+  // The registers the atomics work in (the SDM's lock cmpxchg r/m, r compares with rax: the
+  // value travels there for every atomic, and a cas's new value in rcx)
+  ADAM_X64_SELECT_ATOMIC_VALUE: string = "rax";
+  ADAM_X64_SELECT_ATOMIC_NEW: string = "rcx";
 
 // The bytes of a value of AType; raises for void (AInstr: the instruction it is the type of)
 routine DoWidth(const AType: IrType; const AInstr: int64): int64;
@@ -353,8 +357,10 @@ type
           for LK := 0 to LInstr.Operands.Count - 1 do
             LOperand := LInstr.Operands[LK];
             self.DoParentSlot(LOperand);
-            // A load's or a store's address (operand 0) is folded, not a value
-            if ((LInstr.Kind <> IrOp.Load) and (LInstr.Kind <> IrOp.Store)) or (LK <> 0) then
+            // A load's, a store's or an atomic's address (operand 0) is folded, not a value
+            // (DoAddressOf reaches a slot as memory)
+            if ((LInstr.Kind <> IrOp.Load) and (LInstr.Kind <> IrOp.Store) and
+              (not IsAtomicOp(LInstr.Kind))) or (LK <> 0) then
               if self.FModule.IsInstr(LOperand) then
                 self.FUsedAsValue.Put(LOperand, 1);
               end;
@@ -766,6 +772,59 @@ type
       LInstr.ImplicitUses.Add(LCount);
       LInstr.ImplicitDefs.Add(LDest);
       LInstr.ImplicitDefs.Add(LCount);
+    end;
+
+    // The atomics (sequentially consistent, x86-TSO): atomicload is a plain mov (aligned 4 /
+    // 8 bytes, and every atomic store is an xchg, so a load needs no fence); the others move
+    // the value into rax first. atomicadd: lock xadd [P], rax leaves the old value in rax;
+    // atomicswap / atomicstore: xchg [P], rax (a full barrier); atomiccas: the expected
+    // value in rax, the new one in rcx, lock cmpxchg [P], rcx, then sete. rax (and rcx) are
+    // live from their movs to the atomic, so allocation gives neither as a scratch there
+    hidden method DoAtomic(const AId: int64; const AInstr: ref IrInstr);
+    var
+      LRax: int64;
+      LRcx: int64;
+      LType: IrType;
+      LWidth: int64;
+      LOp: X64Op;
+      LInstr: ref MachineInstr;
+      LSet: ref MachineInstr;
+    begin
+      if AInstr.Kind = IrOp.AtomicLoad then
+        self.DoCopy(AInstr.ValueType, self.DoVReg(AId), self.DoAddressOf(AInstr.Operands[0]),
+          AId, AInstr.Node);
+        return;
+      end;
+      LRax := self.DoPhysical(ADAM_X64_SELECT_ATOMIC_VALUE);
+      LType := self.FModule.InstrAt(AInstr.Operands[1]).ValueType;
+      LWidth := DoWidth(LType, AInstr.Operands[1]);
+      self.DoCopy(LType, PhysicalOperand(LRax), self.DoVReg(AInstr.Operands[1]), AId, AInstr.Node);
+      if AInstr.Kind = IrOp.AtomicCas then
+        LRcx := self.DoPhysical(ADAM_X64_SELECT_ATOMIC_NEW);
+        self.DoCopy(LType, PhysicalOperand(LRcx), self.DoVReg(AInstr.Operands[2]), AId,
+          AInstr.Node);
+        LInstr := self.DoEmit(X64Op.LockCmpxchg, LWidth, AInstr.Node);
+        LInstr.AddOperand(self.DoAddressOf(AInstr.Operands[0]));
+        LInstr.AddOperand(PhysicalOperand(LRcx));
+        LInstr.ImplicitUses.Add(LRax);
+        LInstr.ImplicitDefs.Add(LRax);
+        LSet := self.DoEmit(X64Op.SetCC, 0, AInstr.Node);
+        LSet.Cond := X64Cond.Equal;
+        LSet.AddOperand(self.DoVReg(AId));
+        self.DoEmitPair(X64Op.MovZX8, 4, self.DoVReg(AId), self.DoVReg(AId), AInstr.Node);
+        return;
+      end;
+      LOp := X64Op.Xchg;
+      if AInstr.Kind = IrOp.AtomicAdd then
+        LOp := X64Op.LockXadd;
+      end;
+      LInstr := self.DoEmit(LOp, LWidth, AInstr.Node);
+      LInstr.AddOperand(self.DoAddressOf(AInstr.Operands[0]));
+      LInstr.AddOperand(PhysicalOperand(LRax));
+      LInstr.ImplicitDefs.Add(LRax);
+      if AInstr.Kind <> IrOp.AtomicStore then
+        self.DoCopy(AInstr.ValueType, self.DoVReg(AId), PhysicalOperand(LRax), AId, AInstr.Node);
+      end;
     end;
 
     // neg / not: the operand moved into the result, negated or complemented there; a float's
@@ -1398,6 +1457,8 @@ type
         IrOp.FDiv: self.DoFloatArith(AId, LInstr);
         IrOp.Compare: self.DoCompare(AId, LInstr);
         IrOp.Copy, IrOp.Fill: self.DoBytes(AId, LInstr);
+        IrOp.AtomicAdd, IrOp.AtomicSwap, IrOp.AtomicCas, IrOp.AtomicLoad, IrOp.AtomicStore:
+          self.DoAtomic(AId, LInstr);
       end;
     end;
 
