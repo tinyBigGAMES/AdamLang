@@ -1,0 +1,298 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  std_hookabi_rt.adam - System.HookAbi's run-time level (HookInstall /
+  HookUninstall, the Hook record): a replacement of the C runtime's getenv
+  answers "hooked" for STD_HOOKABI_RT and passes every other name to the
+  record's Original. HookInstall writes it into the import slot of getenv
+  in every loaded module and in every module loaded later; HookUninstall
+  gives each slot back what it held.
+
+  Covered (win64): the refusals (nil name, empty name, nil replacement, a
+  name no module defines, the same record twice, a second record for the
+  same name, uninstalling what is not installed); an install while a
+  library is loaded and unloaded around it (the unload drops its slots,
+  nothing is written into the gone module); an install before a library
+  loads (the load is patched as it happens), the program's own getenv and
+  the library's both hooked, then uninstalled, both real again; and an
+  install after the load. The library std_hookabi_rt_dll (a fixture, its
+  full path in argument 1) reads STD_HOOKABI_RT through its own getenv
+  import slot.
+
+  Each row prints ok or FAIL with its name; the last is `done <failures>`.
+*******************************************************************************/
+
+/*
+@@test
+  kind run
+  args "<DIR>/fixtures/std_hookabi_rt_dll.dll"
+  exitcode 0
+  | ok set real
+  | ok refuse nil name
+  | ok refuse empty name
+  | ok refuse nil replacement
+  | ok refuse unknown name
+  | ok refuse uninstall not installed
+  | ok install for twice
+  | ok refuse same record twice
+  | ok refuse second record same name
+  | ok uninstall for twice
+  | ok unloaded install
+  | ok unloaded library call hooked
+  | ok unloaded unload
+  | ok unloaded uninstall
+  | ok unloaded own call real
+  | ok unloaded reload real
+  | ok unloaded reload unload
+  | ok before install
+  | ok before own call hooked
+  | ok before load
+  | ok before library call hooked
+  | ok before uninstall
+  | ok before library call real
+  | ok before own call real
+  | ok before uninstall twice refused
+  | ok before unload
+  | ok after load
+  | ok after library call real first
+  | ok after install
+  | ok after library call hooked
+  | ok after uninstall
+  | ok after library call real
+  | ok after unload
+  | done 0
+  | [Adam Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+@@end
+*/
+
+module exe std_hookabi_rt;
+
+import System.SysUtils, System.HookAbi;
+
+type
+  // getenv's C signature, and the library's one export (its env reader)
+  GetenvFn = routine(const AName: ptr to const char): ptr to const char;
+  EnvFn = routine(): ptr to const char;
+
+// ucrtbase: the environment read and set, two C strings compared
+routine getenv(const AName: ptr to const char): ptr to const char; external "ucrtbase";
+routine _putenv_s(const AName: ptr to const char; const AValue: ptr to const char): int32;
+  external "ucrtbase";
+routine strcmp(const ALeft: ptr to const char; const ARight: ptr to const char): int32;
+  external "ucrtbase";
+
+// kernel32: a library loaded by name, an export found, a library let go
+routine LoadLibraryA(const AFileName: ptr to const char): uint64; external "kernel32";
+routine GetProcAddress(const AModule: uint64; const AName: ptr to const char): ptr;
+  external "kernel32";
+routine FreeLibrary(const AModule: uint64): int32; external "kernel32";
+
+var
+  // The real getenv the replacement calls (the record's Original), and the failures seen
+  GOriginal: ptr;
+  GReplacement: GetenvFn;
+  GFails: int64;
+
+// The replacement: "hooked" for STD_HOOKABI_RT, else the real getenv (never getenv itself,
+// which would reach the replacement again)
+routine HookGetenv(const AName: ptr to const char): ptr to const char;
+var
+  LReal: GetenvFn;
+begin
+  if (AName <> nil) and (strcmp(AName, ptr to const char("STD_HOOKABI_RT")) = 0) then
+    return ptr to const char("hooked");
+  end;
+  if GOriginal = nil then
+    return nil;
+  end;
+  LReal := GetenvFn(GOriginal);
+  return LReal(AName);
+end;
+
+// AText's bytes and a NUL in a new getmem block (the caller frees it), as a C routine takes
+// a string; nil when there is no room
+routine DoCCopy(const AText: string): ptr to char;
+var
+  LCount: int64;
+  LBlock: ptr to char;
+  LEnd: ptr to uint8;
+  LI: int64;
+begin
+  LCount := len(AText);
+  LBlock := ptr to char(getmem(LCount + 1));
+  if LBlock = nil then
+    return nil;
+  end;
+  for LI := 0 to LCount - 1 do
+    LBlock[LI] := AText[LI];
+  end;
+  LEnd := ptr to uint8(LBlock);
+  LEnd[LCount] := 0;
+  return LBlock;
+end;
+
+// ALabel printed as ok or FAIL (a failure counted)
+routine Check(const AName: string; const AOk: bool);
+begin
+  if AOk then
+    println("ok {}", AName);
+  else
+    println("FAIL {}", AName);
+    GFails := GFails + 1;
+  end;
+end;
+
+// True when the C string AValue equals AWant (never nil)
+routine EnvEquals(const AValue: ptr to const char; const AWant: ptr to const char): bool;
+begin
+  return (AValue <> nil) and (strcmp(AValue, AWant) = 0);
+end;
+
+// The program's own getenv of STD_HOOKABI_RT
+routine OwnEnv(): ptr to const char;
+begin
+  return getenv(ptr to const char("STD_HOOKABI_RT"));
+end;
+
+// The library AHandle's STD_HOOKABI_RT through its own getenv slot (its std_hookabi_rt_env
+// export); nil when the library or the export is missing
+routine CallLib(const AHandle: uint64): ptr to const char;
+var
+  LEnv: EnvFn;
+  LProc: ptr;
+begin
+  if AHandle = 0 then
+    return nil;
+  end;
+  LProc := GetProcAddress(AHandle, ptr to const char("std_hookabi_rt_env"));
+  if LProc = nil then
+    return nil;
+  end;
+  LEnv := EnvFn(LProc);
+  return LEnv();
+end;
+
+// The fixture library loaded by the full path in argument 1; 0 when it cannot be loaded
+routine LoadDll(): uint64;
+var
+  LPath: ptr to char;
+  LHandle: uint64;
+begin
+  LPath := DoCCopy(paramstr(1));
+  if LPath = nil then
+    return 0;
+  end;
+  LHandle := LoadLibraryA(ptr to const char(LPath));
+  freemem(LPath);
+  return LHandle;
+end;
+
+// Every refusal: nothing is installed by any of them
+routine TestRefused();
+var
+  LHook: Hook;
+  LOther: Hook;
+begin
+  Check("refuse nil name", (not HookInstall(LHook, nil, ptr(GReplacement))) and
+    (HookErrno() = ADAM_HOOK_EINVAL) and (LHook.State = nil));
+  Check("refuse empty name", (not HookInstall(LHook, ptr to const char(""),
+    ptr(GReplacement))) and (HookErrno() = ADAM_HOOK_EINVAL));
+  Check("refuse nil replacement", (not HookInstall(LHook, ptr to const char("getenv"),
+    nil)) and (HookErrno() = ADAM_HOOK_EINVAL));
+  Check("refuse unknown name", (not HookInstall(LHook,
+    ptr to const char("adam_no_such_function"), ptr(GReplacement))) and
+    (HookErrno() = ADAM_HOOK_ENOENT) and (LHook.State = nil));
+  Check("refuse uninstall not installed", (not HookUninstall(LHook)) and
+    (HookErrno() = ADAM_HOOK_EINVAL));
+
+  Check("install for twice", HookInstall(LHook, ptr to const char("getenv"),
+    ptr(GReplacement)));
+  Check("refuse same record twice", (not HookInstall(LHook, ptr to const char("getenv"),
+    ptr(GReplacement))) and (HookErrno() = ADAM_HOOK_EEXIST));
+  Check("refuse second record same name", (not HookInstall(LOther,
+    ptr to const char("getenv"), ptr(GReplacement))) and
+    (HookErrno() = ADAM_HOOK_EEXIST) and (LOther.State = nil));
+  Check("uninstall for twice", HookUninstall(LHook) and (LHook.State = nil));
+end;
+
+// The library unloads while installed: the uninstall writes nothing into it. Runs first,
+// before the other tests keep the library loaded on this thread
+routine TestUnloaded();
+var
+  LHook: Hook;
+  LLibrary: uint64;
+begin
+  LLibrary := LoadDll();
+  Check("unloaded install", (LLibrary <> 0) and
+    HookInstall(LHook, ptr to const char("getenv"), ptr(GReplacement)));
+  GOriginal := LHook.Original;
+  Check("unloaded library call hooked", EnvEquals(CallLib(LLibrary), ptr to const char("hooked")));
+  Check("unloaded unload", FreeLibrary(LLibrary) <> 0);
+  Check("unloaded uninstall", HookUninstall(LHook) and (LHook.State = nil));
+  Check("unloaded own call real", EnvEquals(OwnEnv(), ptr to const char("real")));
+  LLibrary := LoadDll();
+  Check("unloaded reload real", EnvEquals(CallLib(LLibrary), ptr to const char("real")));
+  Check("unloaded reload unload", FreeLibrary(LLibrary) <> 0);
+end;
+
+// Installed before the library loads: the load is patched as it happens
+routine TestBeforeLoad();
+var
+  LHook: Hook;
+  LLibrary: uint64;
+begin
+  Check("before install", HookInstall(LHook, ptr to const char("getenv"),
+    ptr(GReplacement)) and (LHook.State <> nil));
+  GOriginal := LHook.Original;
+  Check("before own call hooked", EnvEquals(OwnEnv(), ptr to const char("hooked")));
+  LLibrary := LoadDll();
+  Check("before load", LLibrary <> 0);
+  Check("before library call hooked", EnvEquals(CallLib(LLibrary), ptr to const char("hooked")));
+  Check("before uninstall", HookUninstall(LHook) and (LHook.State = nil));
+  Check("before library call real", EnvEquals(CallLib(LLibrary), ptr to const char("real")));
+  Check("before own call real", EnvEquals(OwnEnv(), ptr to const char("real")));
+  Check("before uninstall twice refused", (not HookUninstall(LHook)) and
+    (HookErrno() = ADAM_HOOK_EINVAL));
+  Check("before unload", FreeLibrary(LLibrary) <> 0);
+end;
+
+// Installed after the load: the uninstall gives the library's slot back what it held
+routine TestAfterLoad();
+var
+  LHook: Hook;
+  LLibrary: uint64;
+begin
+  LLibrary := LoadDll();
+  Check("after load", LLibrary <> 0);
+  Check("after library call real first", EnvEquals(CallLib(LLibrary), ptr to const char("real")));
+  Check("after install", HookInstall(LHook, ptr to const char("getenv"), ptr(GReplacement)));
+  GOriginal := LHook.Original;
+  Check("after library call hooked", EnvEquals(CallLib(LLibrary), ptr to const char("hooked")));
+  Check("after uninstall", HookUninstall(LHook) and (LHook.State = nil));
+  Check("after library call real", EnvEquals(CallLib(LLibrary), ptr to const char("real")));
+  Check("after unload", FreeLibrary(LLibrary) <> 0);
+end;
+
+begin
+  GFails := 0;
+  GReplacement := HookGetenv;
+  Check("set real", _putenv_s(ptr to const char("STD_HOOKABI_RT"),
+    ptr to const char("real")) = 0);
+  TestRefused();
+  TestUnloaded();
+  TestBeforeLoad();
+  TestAfterLoad();
+  println("{}", "done " + IntToStr(GFails));
+end.
