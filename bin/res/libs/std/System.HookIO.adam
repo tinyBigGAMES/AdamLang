@@ -1,0 +1,1689 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.HookIO.adam - C's file calls on Adam streams (PaskalCPP's HookIO)
+
+  RegisterIO / RegisterIOSource put an IO or an IOSource (System.CustomIO)
+  under a prefix, `io://<n>`. From then on fopen("io://<n>/<name>"), in the
+  program or inside any C library linked into it, opens that IO (each open
+  a handle of its own, with its own place, on the shared IO) or the
+  source's entry <name> (the handle owns the entry's IO). The hooks are
+  System.HookAbi's link-time kind: public routines of the C names, so they
+  bind every reference in the final link, the runtime's own `external`
+  fwrite (its printing) included. A FILE that is not a HookIO handle goes
+  to the real function (HookReal, found once): real files and printing work
+  as before.
+
+  A handle is told by its address in the open list (a real FILE's bytes are
+  never read: ucrt's FILE is opaque); while no handle is open a stream call
+  on a real FILE takes no lock. The registry and the open list share one
+  lock, never held while CustomIO runs. Every handle on one registered IO
+  shares that IO's stream lock (they share its position); a source entry's
+  handle has a lock of its own.
+
+  Modes are read as ucrt's fopen reads them (r / w / a, then +, b / t,
+  c / n, S / R, T, D, N, x with w, and a ccs= part); a mode it refuses is
+  EINVAL. w empties the IO (a read-only IO: EACCES), x fails with EEXIST
+  when the target exists, and D removes a source entry when its last D
+  handle closes (ucrt's share rules: a D handle and a plain one on one
+  entry refuse each other with EACCES). An unregistered prefix, a missing
+  entry or a path the source refuses is ENOENT; an entry the source does
+  not offer in the mode is EACCES. A ccs= open is EINVAL until the wide
+  stream model is built. Reads and writes go to the IO at the handle's
+  place.
+*******************************************************************************/
+
+module unit System.HookIO;
+
+import System.SysUtils, System.Runtime, System.HookAbi, System.CustomIO;
+
+const
+  // The scheme every virtual path starts with, and its length
+  ADAM_HOOKIO_SCHEME: string = "io://";
+  ADAM_HOOKIO_SCHEME_LENGTH: int64 = 5;
+  // C's EOF: fclose's result when the close failed
+  ADAM_HOOKIO_EOF: int32 = -1;
+  // The byte that ends a text-mode file on Windows (ucrt drops a trailing one at a "+" open)
+  ADAM_HOOKIO_CTRL_Z: uint8 = 0x1A;
+  // ucrt's _O_BINARY (fcntl.h): _get_fmode's bit for a binary default
+  ADAM_HOOKIO_O_BINARY: int32 = 0x8000;
+  // The largest int64: no item count of fread / fwrite may pass it in bytes
+  ADAM_HOOKIO_MAX_BYTES: int64 = 9223372036854775807;
+
+type
+  // The lock every handle on one stream shares: a registered IO's (Listed: one per IO in
+  // GStreamLocks however often the IO is registered) or a source entry's handle's own. Users:
+  // the entries and handles that hold it; it goes with its last user
+  HookStreamLock = record
+    Stream: IO;
+    Listed: bool;
+    Users: int64;
+    Lock: mutex;
+  end;
+
+  // A registered prefix: exactly one of Stream (RegisterIO, with its stream lock) and Source
+  // (RegisterIOSource)
+  HookEntry = record
+    Id: uint64;
+    Stream: IO;
+    Source: IOSource;
+    Lock: ptr to HookStreamLock;
+  end;
+
+  // How open handles use one source entry (ucrt's share rules for D): the plain and the D
+  // handles, counted before the entry opens; Removing while its last D close removes it
+  HookEntryUse = record
+    Source: IOSource;
+    EntryName: string;
+    Plain: int64;
+    Temporary: int64;
+    Removing: bool;
+  end;
+
+  // What a mode string asks for, as ucrt's fopen reads it. First: 'r', 'w' or 'a'. Mode: r
+  // Read, w Write, a Append, any with + ReadWrite (First then says whether the open empties,
+  // w, or appends, a). Text: reads and writes translate. Exclusive: x. Temporary: D.
+  // Encoded: a ccs= part, Encoding its name (1 UTF-8, 2 UTF-16LE, 3 UNICODE)
+  HookOpenMode = record
+    First: char;
+    Mode: FileMode;
+    Plus: bool;
+    Text: bool;
+    Exclusive: bool;
+    Temporary: bool;
+    Encoded: bool;
+    Encoding: int32;
+  end;
+
+  // An open handle, what a hooked open returns in place of a FILE*. Owned: the handle opened
+  // Stream itself (a source entry) and closes it with the handle; else Stream is a registered
+  // IO every handle on it shares. Position: the handle's place in Stream. Appending: opened
+  // with a or a+ (every write lands at the IO's end). Lock: the stream lock that guards every
+  // field and every call on Stream. AtEnd / Failed: feof / ferror. Closed: fclose ran. Text:
+  // opened in text mode. Source / EntryName / Temporary: the source entry the handle opened
+  // and whether with D (Source nil on a registered IO, and once the use is given back).
+  // Users: the open list and every call that found the handle; the last one frees it
+  HookHandle = record
+    Stream: IO;
+    Owned: bool;
+    Position: int64;
+    Mode: FileMode;
+    Appending: bool;
+    Lock: ptr to HookStreamLock;
+    AtEnd: bool;
+    Failed: bool;
+    Closed: bool;
+    Text: bool;
+    Source: IOSource;
+    EntryName: string;
+    Temporary: bool;
+    Users: int64;
+  end;
+
+  // The real functions' types, called through HookReal's slots
+  FopenFn = routine(const APath: ptr to const char; const AMode: ptr to const char): ptr;
+  FopenSFn = routine(const AFile: ptr to ptr; const APath: ptr to const char;
+    const AMode: ptr to const char): int32;
+  WfopenFn = routine(const APath: ptr to const wchar; const AMode: ptr to const wchar): ptr;
+  FcloseFn = routine(const AFile: ptr): int32;
+  FreadFn = routine(const ABuffer: ptr; const ASize: int64; const ACount: int64;
+    const AFile: ptr): int64;
+  FwriteFn = routine(const ABuffer: ptr; const ASize: int64; const ACount: int64;
+    const AFile: ptr): int64;
+  GetFmodeFn = routine(const AMode: ptr to int32): int32;
+
+var
+  // The registry lock: the entries, the stream locks, the open list and the entry uses. Never
+  // held while CustomIO runs: a source that opens files comes back through these hooks
+  GLock: mutex;
+  GEntries: array of HookEntry;
+  GStreamLocks: array of ptr to HookStreamLock;
+  GHandles: array of ptr to HookHandle;
+  GEntryUses: array of ptr to HookEntryUse;
+  // The last prefix number handed out (0 is never one), under GLock
+  GLastId: uint64;
+  // How many handles are open (atomic): while it is 0 no address is a handle
+  GOpenCount: int64;
+  // HookReal's slots of the real functions
+  GRealFopen: ptr;
+  GRealFopenS: ptr;
+  GRealWfopen: ptr;
+  GRealFclose: ptr;
+  GRealFread: ptr;
+  GRealFwrite: ptr;
+  GRealGetFmode: ptr;
+
+threadstatic
+  // How deep this thread is inside HookIO's own path work (a hooked open): while it is above
+  // 0 a plain path is never looked up in a path source, so a source's own opens reach the real
+  // file system
+  GPathDepth: int32;
+
+// Gives back one user of ALock (nil: nothing); its last user takes it out of GStreamLocks and
+// frees it
+routine DoReleaseLock(const ALock: ptr to HookStreamLock);
+var
+  LLock: ptr to HookStreamLock;
+  LFree: bool;
+  LCount: int64;
+  LI: int64;
+begin
+  if ALock = nil then
+    return;
+  end;
+  LFree := false;
+  lock (GLock) do
+    ALock->Users := ALock->Users - 1;
+    if ALock->Users = 0 then
+      LFree := true;
+      if ALock->Listed then
+        LCount := len(GStreamLocks);
+        LI := 0;
+        while (LI < LCount) and (GStreamLocks[LI] <> ALock) do
+          LI := LI + 1;
+        end;
+        if LI < LCount then
+          while LI < LCount - 1 do
+            GStreamLocks[LI] := GStreamLocks[LI + 1];
+            LI := LI + 1;
+          end;
+          setlength(GStreamLocks, LCount - 1);
+        end;
+      end;
+    end;
+  end;
+  if LFree then
+    LLock := ALock;
+    destroy(LLock);
+  end;
+end;
+
+// AStream's shared stream lock with one more user, made on first use (the caller holds
+// GLock); nil when there is no room. One IO has one lock however often it is registered,
+// also after an unregister while its handles stay open
+routine DoStreamLockOf(const AStream: IO): ptr to HookStreamLock;
+var
+  LLock: ptr to HookStreamLock;
+  LCount: int64;
+  LI: int64;
+begin
+  for LI := 0 to len(GStreamLocks) - 1 do
+    LLock := GStreamLocks[LI];
+    if LLock->Stream = AStream then
+      LLock->Users := LLock->Users + 1;
+      return LLock;
+    end;
+  end;
+  create(LLock);
+  if LLock = nil then
+    return nil;
+  end;
+  LLock->Stream := AStream;
+  LLock->Listed := true;
+  LLock->Users := 1;
+  LCount := len(GStreamLocks);
+  setlength(GStreamLocks, LCount + 1);
+  GStreamLocks[LCount] := LLock;
+  return LLock;
+end;
+
+// A stream lock of a handle's own, with the handle as its one user (a source entry's IO is
+// that handle's alone); nil when there is no room
+routine DoOwnLock(): ptr to HookStreamLock;
+var
+  LLock: ptr to HookStreamLock;
+begin
+  create(LLock);
+  if LLock <> nil then
+    LLock->Users := 1;
+  end;
+  return LLock;
+end;
+
+// True when APath from AFrom on is virtual (starts with io://). AId: its prefix number, 0 when
+// the number is missing, has a leading zero, passes uint64 or is followed by anything but the
+// end or '/' (no prefix is 0, so the path is a missing file). ARest: what follows the number,
+// "" or "/<name>"
+routine DoParse(const APath: string; const AFrom: int64; var AId: uint64;
+  var ARest: string): bool;
+var
+  LCount: int64;
+  LAt: int64;
+  LId: uint64;
+  LDigit: uint64;
+  LDigits: bool;
+begin
+  AId := 0;
+  ARest := "";
+  LCount := len(APath);
+  if Substring(APath, AFrom, ADAM_HOOKIO_SCHEME_LENGTH) <> ADAM_HOOKIO_SCHEME then
+    return false;
+  end;
+  LAt := AFrom + ADAM_HOOKIO_SCHEME_LENGTH;
+  if (LAt < LCount) and (APath[LAt] = '0') then
+    return true;
+  end;
+  LId := 0;
+  LDigits := false;
+  while (LAt < LCount) and (APath[LAt] >= '0') and (APath[LAt] <= '9') do
+    LDigit := uint64(int32(APath[LAt]) - 48);
+    // Past the largest number: no such prefix
+    if LId > ((18446744073709551615u - LDigit) div 10) then
+      return true;
+    end;
+    LId := (LId * 10) + LDigit;
+    LDigits := true;
+    LAt := LAt + 1;
+  end;
+  if not LDigits then
+    return true;
+  end;
+  if (LAt < LCount) and (APath[LAt] <> '/') then
+    return true;
+  end;
+  AId := LId;
+  ARest := Substring(APath, LAt, LCount - LAt);
+  return true;
+end;
+
+// Where APath's io:// path starts when every leading "./" (or ".\", the same step on Windows)
+// is followed by one, else 0. A C library joining a folder with no root and a name writes
+// "./<folder>" (raylib's GetDirectoryPath), so "./io://3/a.png" names "io://3/a.png"
+routine DoSkipCurrentFolder(const APath: string): int64;
+var
+  LAt: int64;
+begin
+  LAt := 0;
+  while (LAt + 1 < len(APath)) and (APath[LAt] = '.') and
+    ((APath[LAt + 1] = '/') or (APath[LAt + 1] = '\\')) do
+    LAt := LAt + 2;
+  end;
+  if (LAt > 0) and (Substring(APath, LAt, ADAM_HOOKIO_SCHEME_LENGTH) = ADAM_HOOKIO_SCHEME) then
+    return LAt;
+  end;
+  return 0;
+end;
+
+// True when APath names a virtual path (io://, after DoSkipCurrentFolder)
+routine DoIsVirtual(const APath: string): bool;
+begin
+  return Substring(APath, DoSkipCurrentFolder(APath), ADAM_HOOKIO_SCHEME_LENGTH) =
+    ADAM_HOOKIO_SCHEME;
+end;
+
+// Past the spaces of AText from AAt on
+routine DoSkipSpaces(const AText: string; const AAt: int64): int64;
+var
+  LAt: int64;
+begin
+  LAt := AAt;
+  while (LAt < len(AText)) and (AText[LAt] = ' ') do
+    LAt := LAt + 1;
+  end;
+  return LAt;
+end;
+
+// True when AText from AAt on starts with AWord, ASCII letters compared without case
+routine DoStartsNoCase(const AText: string; const AAt: int64; const AWord: string): bool;
+var
+  LI: int64;
+  LHave: int32;
+  LWant: int32;
+begin
+  if AAt + len(AWord) > len(AText) then
+    return false;
+  end;
+  for LI := 0 to len(AWord) - 1 do
+    LHave := int32(AText[AAt + LI]);
+    LWant := int32(AWord[LI]);
+    if (LHave >= 97) and (LHave <= 122) then
+      LHave := LHave - 32;
+    end;
+    if (LWant >= 97) and (LWant <= 122) then
+      LWant := LWant - 32;
+    end;
+    if LHave <> LWant then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// ucrt's encoding part after the comma, AText from AAt on: spaces, "ccs" (lower case only),
+// spaces, '=', spaces, UTF-8, UTF-16LE or UNICODE (any case, tried in that order, each as a
+// prefix of what follows), spaces, the end. False: EINVAL. AEncoding: 1 UTF-8, 2 UTF-16LE,
+// 3 UNICODE
+routine DoParseEncoding(const AText: string; const AAt: int64; var AEncoding: int32): bool;
+var
+  LAt: int64;
+begin
+  LAt := DoSkipSpaces(AText, AAt);
+  if Substring(AText, LAt, 3) <> "ccs" then
+    return false;
+  end;
+  LAt := DoSkipSpaces(AText, LAt + 3);
+  if (LAt >= len(AText)) or (AText[LAt] <> '=') then
+    return false;
+  end;
+  LAt := DoSkipSpaces(AText, LAt + 1);
+  if DoStartsNoCase(AText, LAt, "UTF-8") then
+    LAt := LAt + 5;
+    AEncoding := 1;
+  else
+    if DoStartsNoCase(AText, LAt, "UTF-16LE") then
+      LAt := LAt + 8;
+      AEncoding := 2;
+    else
+      if not DoStartsNoCase(AText, LAt, "UNICODE") then
+        return false;
+      end;
+      LAt := LAt + 7;
+      AEncoding := 3;
+    end;
+  end;
+  LAt := DoSkipSpaces(AText, LAt);
+  return LAt = len(AText);
+end;
+
+// True when a mode with neither b nor t opens in text mode: ucrt's _get_fmode says _O_TEXT
+// (its default; a program linked with binmode.o has _O_BINARY). True when it cannot be asked
+routine DoDefaultText(): bool;
+var
+  LFound: ptr;
+  LGet: GetFmodeFn;
+  LMode: int32;
+begin
+  LFound := HookReal(GRealGetFmode, ptr to const char("_get_fmode"));
+  if LFound = nil then
+    return true;
+  end;
+  LGet := GetFmodeFn(LFound);
+  LMode := 0;
+  if LGet(addr of LMode) <> 0 then
+    return true;
+  end;
+  return (LMode & ADAM_HOOKIO_O_BINARY) = 0;
+end;
+
+// AResult's First and Mode from the mode's first letter; false when it is not r, w or a
+routine DoParseFirst(const AFirst: char; var AResult: HookOpenMode): bool;
+begin
+  AResult.First := AFirst;
+  if AFirst = 'r' then
+    AResult.Mode := FileMode.Read;
+    return true;
+  end;
+  if AFirst = 'w' then
+    AResult.Mode := FileMode.Write;
+    return true;
+  end;
+  if AFirst = 'a' then
+    AResult.Mode := FileMode.Append;
+    return true;
+  end;
+  return false;
+end;
+
+// AMode as ucrt's fopen parses it (corecrt_internal_stdio.h __acrt_stdio_parse_mode, Windows
+// Kits 10.0.26100): leading spaces, then r, w or a, then any of: + (once); b or t (one of the
+// two, once); c or n (one of the two, once); S or R (one of the two, once); T (once); D
+// (once); N (any number); x (only when the first letter is w); spaces; or a comma, which
+// starts the encoding part (DoParseEncoding). Anything else, or a rule broken: false (fopen's
+// EINVAL). Text: t, or neither b nor t while _get_fmode says _O_TEXT. c / n (commit on
+// flush), S / R / T (caching hints) and N (not inherited) change nothing an IO can show
+routine DoParseMode(const AMode: string; var AResult: HookOpenMode): bool;
+var
+  LAt: int64;
+  LChar: char;
+  LKnown: bool;
+  LBinary: bool;
+  LTextFlag: bool;
+  LCommit: bool;
+  LCaching: bool;
+  LShortLived: bool;
+  LComma: bool;
+begin
+  AResult.First := 'r';
+  AResult.Mode := FileMode.Read;
+  AResult.Plus := false;
+  AResult.Text := false;
+  AResult.Exclusive := false;
+  AResult.Temporary := false;
+  AResult.Encoded := false;
+  AResult.Encoding := 0;
+  LBinary := false;
+  LTextFlag := false;
+  LCommit := false;
+  LCaching := false;
+  LShortLived := false;
+  LComma := false;
+  LAt := DoSkipSpaces(AMode, 0);
+  if LAt >= len(AMode) then
+    return false;
+  end;
+  if not DoParseFirst(AMode[LAt], AResult) then
+    return false;
+  end;
+  LAt := LAt + 1;
+  while (not LComma) and (LAt < len(AMode)) do
+    LChar := AMode[LAt];
+    LKnown := false;
+    if LChar = '+' then
+      if AResult.Plus then
+        return false;
+      end;
+      AResult.Plus := true;
+      LKnown := true;
+    end;
+    if (LChar = 'b') or (LChar = 't') then
+      if LBinary or LTextFlag then
+        return false;
+      end;
+      LBinary := LChar = 'b';
+      LTextFlag := LChar = 't';
+      LKnown := true;
+    end;
+    if (LChar = 'c') or (LChar = 'n') then
+      if LCommit then
+        return false;
+      end;
+      LCommit := true;
+      LKnown := true;
+    end;
+    if (LChar = 'S') or (LChar = 'R') then
+      if LCaching then
+        return false;
+      end;
+      LCaching := true;
+      LKnown := true;
+    end;
+    if LChar = 'T' then
+      if LShortLived then
+        return false;
+      end;
+      LShortLived := true;
+      LKnown := true;
+    end;
+    if LChar = 'D' then
+      if AResult.Temporary then
+        return false;
+      end;
+      AResult.Temporary := true;
+      LKnown := true;
+    end;
+    if LChar = 'x' then
+      // ucrt allows x only with the truncating open, w
+      if AResult.First <> 'w' then
+        return false;
+      end;
+      AResult.Exclusive := true;
+      LKnown := true;
+    end;
+    if LChar = ',' then
+      LComma := true;
+      LKnown := true;
+    end;
+    if (LChar = 'N') or (LChar = ' ') then
+      LKnown := true;
+    end;
+    if not LKnown then
+      return false;
+    end;
+    LAt := LAt + 1;
+  end;
+  if LComma then
+    if not DoParseEncoding(AMode, LAt, AResult.Encoding) then
+      return false;
+    end;
+    AResult.Encoded := true;
+  end;
+  // ucrt: + gives _O_RDWR and _IOUPDATE whatever the first letter
+  if AResult.Plus then
+    AResult.Mode := FileMode.ReadWrite;
+  end;
+  AResult.Text := (not LBinary) and (LTextFlag or DoDefaultText());
+  return true;
+end;
+
+// True when the parsed mode asks for something HookIO does not open yet, refused with EINVAL:
+// a ccs= open (a wide-text stream), until the wide stream model is built
+routine DoModeNotBuilt(const AMode: HookOpenMode): bool;
+begin
+  return AMode.Encoded;
+end;
+
+// True when the open must fail with EEXIST because the target exists: x with a creating open
+routine DoExclusive(const AMode: HookOpenMode): bool;
+begin
+  return AMode.Exclusive and (AMode.First <> 'r');
+end;
+
+// The registered entry of AId copied out under the lock, its stream lock with one more user
+// (the open gives it back when it is done); false when none
+routine DoFind(const AId: uint64; var AEntry: HookEntry): bool;
+var
+  LI: int64;
+begin
+  lock (GLock) do
+    for LI := 0 to len(GEntries) - 1 do
+      if GEntries[LI].Id = AId then
+        AEntry := GEntries[LI];
+        if AEntry.Lock <> nil then
+          AEntry.Lock->Users := AEntry.Lock->Users + 1;
+        end;
+        return true;
+      end;
+    end;
+  end;
+  return false;
+end;
+
+// Registers one stream under the next prefix number; "" when both are nil or there is no room.
+// The prefix text is built before the entry is added, so a failure registers nothing
+routine DoRegister(const AStream: IO; const ASource: IOSource): string;
+var
+  LEntry: HookEntry;
+  LPrefix: string;
+  LCount: int64;
+begin
+  if (AStream = nil) and (ASource = nil) then
+    return "";
+  end;
+  LEntry.Id := 0;
+  LEntry.Stream := AStream;
+  LEntry.Source := ASource;
+  LEntry.Lock := nil;
+  lock (GLock) do
+    if AStream <> nil then
+      LEntry.Lock := DoStreamLockOf(AStream);
+      if LEntry.Lock = nil then
+        return "";
+      end;
+    end;
+    LEntry.Id := GLastId + 1;
+    LPrefix := ADAM_HOOKIO_SCHEME + UIntToStr(LEntry.Id);
+    LCount := len(GEntries);
+    setlength(GEntries, LCount + 1);
+    GEntries[LCount] := LEntry;
+    GLastId := LEntry.Id;
+  end;
+  return LPrefix;
+end;
+
+// Removes a registered prefix (exactly `io://<n>`); false when it is not one
+routine DoUnregister(const APrefix: string): bool;
+var
+  LId: uint64;
+  LRest: string;
+  LLock: ptr to HookStreamLock;
+  LFound: bool;
+  LCount: int64;
+  LI: int64;
+begin
+  if not DoParse(APrefix, 0, LId, LRest) then
+    return false;
+  end;
+  if (LId = 0) or (len(LRest) <> 0) then
+    return false;
+  end;
+  LFound := false;
+  LLock := nil;
+  lock (GLock) do
+    LCount := len(GEntries);
+    LI := 0;
+    while (LI < LCount) and (GEntries[LI].Id <> LId) do
+      LI := LI + 1;
+    end;
+    if LI < LCount then
+      LFound := true;
+      LLock := GEntries[LI].Lock;
+      while LI < LCount - 1 do
+        GEntries[LI] := GEntries[LI + 1];
+        LI := LI + 1;
+      end;
+      setlength(GEntries, LCount - 1);
+    end;
+  end;
+  DoReleaseLock(LLock);
+  return LFound;
+end;
+
+// Records AHandle as open
+routine DoAddHandle(const AHandle: ptr to HookHandle);
+var
+  LCount: int64;
+begin
+  lock (GLock) do
+    LCount := len(GHandles);
+    setlength(GHandles, LCount + 1);
+    GHandles[LCount] := AHandle;
+    atomicadd(GOpenCount, 1);
+  end;
+end;
+
+// The handle behind AFile with one more user (given back with DoReleaseHandle), or nil when
+// AFile is not one (a real FILE, nil). While no handle is open no lock is taken
+routine DoFindHandle(const AFile: ptr): ptr to HookHandle;
+var
+  LHandle: ptr to HookHandle;
+  LI: int64;
+begin
+  if (AFile = nil) or (atomicload(GOpenCount) = 0) then
+    return nil;
+  end;
+  lock (GLock) do
+    for LI := 0 to len(GHandles) - 1 do
+      LHandle := GHandles[LI];
+      if ptr(LHandle) = AFile then
+        LHandle->Users := LHandle->Users + 1;
+        return LHandle;
+      end;
+    end;
+  end;
+  return nil;
+end;
+
+// Takes AFile out of the open list: its handle, still holding the open list's user, or nil
+// when AFile is not one
+routine DoTakeHandle(const AFile: ptr): ptr to HookHandle;
+var
+  LHandle: ptr to HookHandle;
+  LCount: int64;
+  LI: int64;
+begin
+  if (AFile = nil) or (atomicload(GOpenCount) = 0) then
+    return nil;
+  end;
+  LHandle := nil;
+  lock (GLock) do
+    LCount := len(GHandles);
+    LI := 0;
+    while (LI < LCount) and (ptr(GHandles[LI]) <> AFile) do
+      LI := LI + 1;
+    end;
+    if LI < LCount then
+      LHandle := GHandles[LI];
+      while LI < LCount - 1 do
+        GHandles[LI] := GHandles[LI + 1];
+        LI := LI + 1;
+      end;
+      setlength(GHandles, LCount - 1);
+      atomicadd(GOpenCount, -1);
+    end;
+  end;
+  return LHandle;
+end;
+
+// Frees a handle no one holds any more, its stream lock's user given back first
+routine DoFreeHandle(const AHandle: ptr to HookHandle);
+var
+  LHandle: ptr to HookHandle;
+begin
+  DoReleaseLock(AHandle->Lock);
+  LHandle := AHandle;
+  destroy(LHandle);
+end;
+
+// Gives back one user of AHandle; the last one frees it
+routine DoReleaseHandle(const AHandle: ptr to HookHandle);
+var
+  LFree: bool;
+begin
+  lock (GLock) do
+    AHandle->Users := AHandle->Users - 1;
+    LFree := AHandle->Users = 0;
+  end;
+  if LFree then
+    DoFreeHandle(AHandle);
+  end;
+end;
+
+// The place of ASource's entry AEntry in GEntryUses (the caller holds GLock), or -1
+routine DoFindEntryUse(const ASource: IOSource; const AEntry: string): int64;
+var
+  LUse: ptr to HookEntryUse;
+  LI: int64;
+begin
+  for LI := 0 to len(GEntryUses) - 1 do
+    LUse := GEntryUses[LI];
+    if (LUse->Source = ASource) and (LUse->EntryName = AEntry) then
+      return LI;
+    end;
+  end;
+  return -1;
+end;
+
+// Takes the use record at AAt out of GEntryUses (the caller holds GLock) and frees it
+routine DoDropEntryUseAt(const AAt: int64);
+var
+  LUse: ptr to HookEntryUse;
+  LCount: int64;
+  LI: int64;
+begin
+  LUse := GEntryUses[AAt];
+  LCount := len(GEntryUses);
+  LI := AAt;
+  while LI < LCount - 1 do
+    GEntryUses[LI] := GEntryUses[LI + 1];
+    LI := LI + 1;
+  end;
+  setlength(GEntryUses, LCount - 1);
+  destroy(LUse);
+end;
+
+// Takes a use of a source entry before it is opened (ucrt's share rules for D: a D open asks
+// DELETE access and shares deletion, every other open shares reading and writing only, so a D
+// handle and a plain one refuse each other). False with errno set: EACCES when the other kind
+// holds it, ENOENT while its last D close is removing it, ENOMEM
+routine DoReserveEntry(const ASource: IOSource; const AEntry: string;
+  const ATemporary: bool): bool;
+var
+  LUse: ptr to HookEntryUse;
+  LAt: int64;
+  LCount: int64;
+begin
+  lock (GLock) do
+    LAt := DoFindEntryUse(ASource, AEntry);
+    if LAt >= 0 then
+      LUse := GEntryUses[LAt];
+    else
+      create(LUse);
+      if LUse = nil then
+        SetCErrno(ADAM_ERRNO_ENOMEM);
+        return false;
+      end;
+      LUse->Source := ASource;
+      LUse->EntryName := AEntry;
+      LCount := len(GEntryUses);
+      setlength(GEntryUses, LCount + 1);
+      GEntryUses[LCount] := LUse;
+    end;
+    if LUse->Removing then
+      SetCErrno(ADAM_ERRNO_ENOENT);
+      return false;
+    end;
+    if (ATemporary and (LUse->Plain > 0)) or ((not ATemporary) and (LUse->Temporary > 0)) then
+      SetCErrno(ADAM_ERRNO_EACCES);
+      return false;
+    end;
+    if ATemporary then
+      LUse->Temporary := LUse->Temporary + 1;
+    else
+      LUse->Plain := LUse->Plain + 1;
+    end;
+  end;
+  return true;
+end;
+
+// Gives a use back. True when it was the entry's last D use and ARemove asks for the removal:
+// the entry is then marked Removing and the caller removes it (DoFinishRemove). ARemove is
+// false when the open that took the use failed before its IO was opened
+routine DoReleaseEntry(const ASource: IOSource; const AEntry: string; const ATemporary: bool;
+  const ARemove: bool): bool;
+var
+  LUse: ptr to HookEntryUse;
+  LAt: int64;
+begin
+  lock (GLock) do
+    LAt := DoFindEntryUse(ASource, AEntry);
+    if LAt < 0 then
+      return false;
+    end;
+    LUse := GEntryUses[LAt];
+    if ATemporary then
+      LUse->Temporary := LUse->Temporary - 1;
+    else
+      LUse->Plain := LUse->Plain - 1;
+    end;
+    if ATemporary and ARemove and (LUse->Temporary = 0) then
+      LUse->Removing := true;
+      return true;
+    end;
+    if (LUse->Plain = 0) and (LUse->Temporary = 0) and (not LUse->Removing) then
+      DoDropEntryUseAt(LAt);
+    end;
+  end;
+  return false;
+end;
+
+// Removes an entry whose last D handle closed (GLock is not held: the source runs), then
+// forgets its use. The result is not reported: ucrt's fclose cannot see whether the OS deleted
+// the file either
+routine DoFinishRemove(const ASource: IOSource; const AEntry: string);
+var
+  LAt: int64;
+begin
+  IOSourceRemove(ASource, AEntry);
+  lock (GLock) do
+    LAt := DoFindEntryUse(ASource, AEntry);
+    if LAt >= 0 then
+      DoDropEntryUseAt(LAt);
+    end;
+  end;
+end;
+
+// Gives back the entry use a handle holds, once (Source is cleared), and removes the entry when
+// that was its last D handle. A no-op on a registered IO
+routine DoGiveBackEntry(const AHandle: ptr to HookHandle; const ARemove: bool);
+var
+  LSource: IOSource;
+begin
+  LSource := AHandle->Source;
+  if LSource = nil then
+    return;
+  end;
+  AHandle->Source := nil;
+  if DoReleaseEntry(LSource, AHandle->EntryName, AHandle->Temporary, ARemove) then
+    DoFinishRemove(LSource, AHandle->EntryName);
+  end;
+end;
+
+// The entry name in a path's rest after the prefix: "/<entry>" -> "<entry>"
+routine DoEntryName(const ARest: string): string;
+begin
+  if (len(ARest) > 0) and (ARest[0] = '/') then
+    return Substring(ARest, 1, len(ARest) - 1);
+  end;
+  return ARest;
+end;
+
+// True when the open's target exists: always for a registered IO (every name under its prefix
+// is that IO), IOSourceExists for a source entry
+routine DoExists(const AEntry: HookEntry; const ARest: string): bool;
+begin
+  if AEntry.Stream <> nil then
+    return true;
+  end;
+  return IOSourceExists(AEntry.Source, DoEntryName(ARest));
+end;
+
+// w / w+ empty the handle's IO, as the C runtime's open truncates the file (on a registered IO
+// every other handle sees it emptied). An IO that cannot write refuses the open with EACCES (a
+// read-only file); one that cannot be emptied (no Truncate, or a failed one) with ucrt's EINVAL
+// for a file it cannot truncate. False with errno set; the handle starts at 0
+routine DoEmptyIO(const AHandle: ptr to HookHandle): bool;
+var
+  LEmptied: bool;
+  LReadOnly: bool;
+begin
+  LEmptied := false;
+  LReadOnly := false;
+  lock (AHandle->Lock->Lock) do
+    LEmptied := IOTruncate(AHandle->Stream, 0);
+    if not LEmptied then
+      LReadOnly := IOStatus(AHandle->Stream) = IOState.ReadOnly;
+    end;
+  end;
+  if not LEmptied then
+    if LReadOnly then
+      SetCErrno(ADAM_ERRNO_EACCES);
+    else
+      SetCErrno(ADAM_ERRNO_EINVAL);
+    end;
+    return false;
+  end;
+  AHandle->Position := 0;
+  return true;
+end;
+
+// Where a write-only append handle ("a") starts, as ucrt opens it: its descriptor at 0 (lowio
+// moves it to the end at each write, so ftell before the first write is 0, measured). "a+"
+// starts at 0 too
+routine DoAppendStart(const AHandle: ptr to HookHandle): bool;
+begin
+  AHandle->Position := 0;
+  return true;
+end;
+
+// The body of DoDropCtrlZ, under the handle's stream lock
+routine DoDropCtrlZLocked(const AHandle: ptr to HookHandle);
+var
+  LEnd: int64;
+  LLast: uint8;
+begin
+  LEnd := IOSize(AHandle->Stream);
+  // An IO with no size may still know its end
+  if LEnd < 0 then
+    LEnd := IOSeek(AHandle->Stream, 0, SeekOrigin.FromEnd);
+  end;
+  // An empty file: ucrt's seek to -1 from the end fails with EINVAL; the open goes on
+  if LEnd = 0 then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return;
+  end;
+  if LEnd < 0 then
+    return;
+  end;
+  if IOSeek(AHandle->Stream, LEnd - 1, SeekOrigin.FromStart) <> LEnd - 1 then
+    return;
+  end;
+  // A failed read of the last byte is not an error (ucrt reads 0 bytes)
+  LLast := 0;
+  if IORead(AHandle->Stream, addr of LLast, 1) <> 1 then
+    return;
+  end;
+  if LLast <> ADAM_HOOKIO_CTRL_Z then
+    return;
+  end;
+  // A shorten that fails does not fail the open: ucrt goes on with the byte kept and errno
+  // left at EACCES
+  if not IOTruncate(AHandle->Stream, LEnd - 1) then
+    SetCErrno(ADAM_ERRNO_EACCES);
+  end;
+end;
+
+// ucrt's open of a text-mode file for reading and writing (any "+") drops one trailing Ctrl-Z
+// so that appending works (lowio\open.cpp truncate_ctrl_z_if_present): nothing for an empty IO
+// or one that cannot seek to its end; when the last byte is 0x1A the IO is shortened by one.
+// The handle starts at 0 either way
+routine DoDropCtrlZ(const AHandle: ptr to HookHandle);
+begin
+  lock (AHandle->Lock->Lock) do
+    DoDropCtrlZLocked(AHandle);
+  end;
+  AHandle->Position := 0;
+end;
+
+// w+ / a+ on a source entry: CustomIO has no mode that creates AND reads, so a missing entry
+// is created first by IOSourceOpen in Write (w+) or Append (a+) and closed at once; the handle
+// then opens it ReadWrite. False with errno set: ENOENT when the source would not create it,
+// EIO when closing the new entry failed
+routine DoCreateEntry(const ASource: IOSource; const AEntry: string;
+  const AParsed: HookOpenMode): bool;
+var
+  LCreated: IO;
+  LMode: FileMode;
+begin
+  if IOSourceExists(ASource, AEntry) then
+    return true;
+  end;
+  LMode := FileMode.Append;
+  if AParsed.First = 'w' then
+    LMode := FileMode.Write;
+  end;
+  LCreated := IOSourceOpen(ASource, AEntry, LMode);
+  if LCreated = nil then
+    SetCErrno(ADAM_ERRNO_ENOENT);
+    return false;
+  end;
+  if not IOClose(LCreated) then
+    SetCErrno(ADAM_ERRNO_EIO);
+    return false;
+  end;
+  return true;
+end;
+
+// ucrt's D open asks DELETE access, which a file that cannot be deleted refuses with EACCES
+// before anything is opened. For an entry: a source that cannot remove entries (a zip), or an
+// existing entry that does not open for writing. A missing entry opened with r is left to the
+// open's own ENOENT. False with errno set
+routine DoTemporaryAllowed(const ASource: IOSource; const AEntry: string;
+  const AParsed: HookOpenMode): bool;
+var
+  LExists: bool;
+  LProbe: IO;
+begin
+  LExists := IOSourceExists(ASource, AEntry);
+  if (not LExists) and (AParsed.First = 'r') then
+    return true;
+  end;
+  if not IOSourceCanRemove(ASource) then
+    SetCErrno(ADAM_ERRNO_EACCES);
+    return false;
+  end;
+  if not LExists then
+    return true;
+  end;
+  LProbe := IOSourceOpen(ASource, AEntry, FileMode.ReadWrite);
+  if LProbe = nil then
+    SetCErrno(ADAM_ERRNO_EACCES);
+    return false;
+  end;
+  IOClose(LProbe);
+  return true;
+end;
+
+// A handle on a registered IO, sharing the entry's stream lock (one more user for the
+// handle). w / w+ empty the IO (DoEmptyIO); a starts where ucrt's does (DoAppendStart); a+ at 0
+routine DoOpenShared(const AEntry: HookEntry; const AParsed: HookOpenMode;
+  const AHandle: ptr to HookHandle): bool;
+begin
+  lock (GLock) do
+    AEntry.Lock->Users := AEntry.Lock->Users + 1;
+  end;
+  AHandle->Stream := AEntry.Stream;
+  AHandle->Lock := AEntry.Lock;
+  AHandle->Owned := false;
+  AHandle->Position := 0;
+  if AParsed.First = 'w' then
+    return DoEmptyIO(AHandle);
+  end;
+  if AParsed.Mode = FileMode.Append then
+    return DoAppendStart(AHandle);
+  end;
+  return true;
+end;
+
+// A handle's IO on the source entry AEntry; the handle owns the IO and a stream lock of its
+// own. w+ / a+ open it ReadWrite (DoCreateEntry first), w+ then empties it (DoEmptyIO). A
+// failed open sets errno: EACCES when the entry exists (the source does not offer that mode),
+// ENOENT otherwise (missing, or a path IOSourceOpen refuses)
+routine DoOpenEntryIO(const ASource: IOSource; const AEntry: string; const AParsed: HookOpenMode;
+  const AHandle: ptr to HookHandle): bool;
+var
+  LCreating: bool;
+  LStream: IO;
+  LFailed: bool;
+  LError: int32;
+begin
+  LCreating := AParsed.Plus and (AParsed.First <> 'r');
+  if LCreating and (not DoCreateEntry(ASource, AEntry, AParsed)) then
+    return false;
+  end;
+  LStream := IOSourceOpen(ASource, AEntry, AParsed.Mode);
+  if LStream = nil then
+    if IOSourceExists(ASource, AEntry) then
+      SetCErrno(ADAM_ERRNO_EACCES);
+    else
+      SetCErrno(ADAM_ERRNO_ENOENT);
+    end;
+    return false;
+  end;
+  AHandle->Stream := LStream;
+  AHandle->Owned := true;
+  AHandle->Position := 0;
+  AHandle->Lock := DoOwnLock();
+  if AHandle->Lock = nil then
+    IOClose(LStream);
+    AHandle->Stream := nil;
+    SetCErrno(ADAM_ERRNO_ENOMEM);
+    return false;
+  end;
+  LFailed := false;
+  if AParsed.Mode = FileMode.Append then
+    LFailed := not DoAppendStart(AHandle);
+  end;
+  if (not LFailed) and LCreating and (AParsed.First = 'w') then
+    LFailed := not DoEmptyIO(AHandle);
+  end;
+  if LFailed then
+    // errno is set by the step that failed; the close must not change it
+    LError := CErrno();
+    IOClose(LStream);
+    AHandle->Stream := nil;
+    SetCErrno(LError);
+    return false;
+  end;
+  return true;
+end;
+
+// A handle on a source entry (DoOpenEntryIO): the handle takes a use of the entry first (ucrt's
+// share rules for D, DoReserveEntry) and a D open checks the entry can be removed
+// (DoTemporaryAllowed); the handle keeps the entry and gives the use back at its close
+routine DoOpenEntry(const ASource: IOSource; const ARest: string; const AParsed: HookOpenMode;
+  const AHandle: ptr to HookHandle): bool;
+var
+  LEntry: string;
+  LError: int32;
+begin
+  LEntry := DoEntryName(ARest);
+  if AParsed.Temporary and (not DoTemporaryAllowed(ASource, LEntry, AParsed)) then
+    return false;
+  end;
+  if not DoReserveEntry(ASource, LEntry, AParsed.Temporary) then
+    return false;
+  end;
+  if not DoOpenEntryIO(ASource, LEntry, AParsed, AHandle) then
+    LError := CErrno();
+    DoReleaseEntry(ASource, LEntry, AParsed.Temporary, false);
+    SetCErrno(LError);
+    return false;
+  end;
+  AHandle->Source := ASource;
+  AHandle->EntryName := LEntry;
+  AHandle->Temporary := AParsed.Temporary;
+  return true;
+end;
+
+// The open once a path named its target. AFound: AEntry is the registered IO or IOSource the
+// path names (false: nothing is registered under it, ENOENT once the mode is read); ARest: ""
+// or "/<entry>"; ACallerErrno: errno as the caller left it (a successful open leaves it so).
+// The new handle, or nil with errno set
+routine DoOpenOn(const AFound: bool; const AEntry: HookEntry; const ARest: string;
+  const AMode: string; const ACallerErrno: int32): ptr;
+var
+  LParsed: HookOpenMode;
+  LHandle: ptr to HookHandle;
+  LOpened: bool;
+  LOpenErrno: int32;
+begin
+  // ucrt reads the mode before it touches the file
+  if not DoParseMode(AMode, LParsed) then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return nil;
+  end;
+  if DoModeNotBuilt(LParsed) then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return nil;
+  end;
+  if not AFound then
+    SetCErrno(ADAM_ERRNO_ENOENT);
+    return nil;
+  end;
+  // x: the creating open fails when its target exists
+  if DoExclusive(LParsed) and DoExists(AEntry, ARest) then
+    SetCErrno(ADAM_ERRNO_EEXIST);
+    return nil;
+  end;
+  create(LHandle);
+  if LHandle = nil then
+    SetCErrno(ADAM_ERRNO_ENOMEM);
+    return nil;
+  end;
+  LHandle->Users := 1;
+  LHandle->Mode := LParsed.Mode;
+  LHandle->Appending := LParsed.First = 'a';
+  LHandle->Text := LParsed.Text;
+  // errno is set by the open that fails
+  if AEntry.Stream <> nil then
+    LOpened := DoOpenShared(AEntry, LParsed, LHandle);
+  else
+    LOpened := DoOpenEntry(AEntry.Source, ARest, LParsed, LHandle);
+  end;
+  if not LOpened then
+    DoFreeHandle(LHandle);
+    return nil;
+  end;
+  SetCErrno(ACallerErrno);
+  // A text open for reading and writing drops a trailing Ctrl-Z, as ucrt's does
+  if LParsed.Text and (LParsed.Mode = FileMode.ReadWrite) then
+    DoDropCtrlZ(LHandle);
+  end;
+  LOpenErrno := CErrno();
+  DoAddHandle(LHandle);
+  SetCErrno(LOpenErrno);
+  return ptr(LHandle);
+end;
+
+// A hooked open of APath in AMode (both UTF-8). False: not a virtual path, the caller passes it
+// to the C runtime. True: handled; AResult is the new handle, or nil with errno set
+routine DoOpenText(const APath: string; const AMode: string; var AResult: ptr): bool;
+var
+  LEntry: HookEntry;
+  LRest: string;
+  LId: uint64;
+  LFound: bool;
+  LCallerErrno: int32;
+begin
+  // errno as the caller left it: a successful open leaves it so; what the source's work set
+  // (a missing entry's ENOENT before it is created) never leaks out
+  LCallerErrno := CErrno();
+  AResult := nil;
+  if not DoParse(APath, DoSkipCurrentFolder(APath), LId, LRest) then
+    return false;
+  end;
+  LEntry.Id := 0;
+  LEntry.Stream := nil;
+  LEntry.Source := nil;
+  LEntry.Lock := nil;
+  // The open's own work (the source's real files) never maps a plain path
+  GPathDepth := GPathDepth + 1;
+  LFound := false;
+  if LId <> 0 then
+    LFound := DoFind(LId, LEntry);
+  end;
+  SetCErrno(LCallerErrno);
+  AResult := DoOpenOn(LFound, LEntry, LRest, AMode, LCallerErrno);
+  // The entry's stream lock user DoFind took (a handle holds its own)
+  DoReleaseLock(LEntry.Lock);
+  GPathDepth := GPathDepth - 1;
+  return true;
+end;
+
+// A hooked open of the C texts APath and AMode, as DoOpenText; false for a nil path
+routine DoOpen(const APath: ptr to const char; const AMode: ptr to const char;
+  var AResult: ptr): bool;
+begin
+  AResult := nil;
+  if APath = nil then
+    return false;
+  end;
+  return DoOpenText(StringFromC(APath), StringFromC(AMode), AResult);
+end;
+
+// The leading ASCII units of the NUL-terminated UTF-16 text AText (up to the first unit past
+// 0x7F or the end) as a string: enough to tell a virtual path
+routine DoAsciiPrefix(const AText: ptr to const wchar): string;
+var
+  LText: string;
+  LCount: int64;
+  LUnit: uint32;
+begin
+  LCount := 0;
+  LUnit := uint32(AText[0]);
+  while (LUnit <> 0) and (LUnit < 128) do
+    LCount := LCount + 1;
+    LUnit := uint32(AText[LCount]);
+  end;
+  setlength(LText, LCount);
+  for LCount := 0 to len(LText) - 1 do
+    LText[LCount] := char(uint8(AText[LCount]));
+  end;
+  return LText;
+end;
+
+// The NUL-terminated UTF-16 text AText as UTF-8 in AResult; false for nil, or when it holds a
+// lone surrogate (ucrt converts with WC_ERR_INVALID_CHARS, which refuses one)
+routine DoNarrow(const AText: ptr to const wchar; var AResult: string): bool;
+var
+  LCount: int64;
+  LAt: int64;
+  LOut: int64;
+  LUnit: uint32;
+  LNext: uint32;
+  LCode: uint32;
+begin
+  AResult := "";
+  if AText = nil then
+    return false;
+  end;
+  LCount := 0;
+  while uint32(AText[LCount]) <> 0 do
+    LCount := LCount + 1;
+  end;
+  // Room for the longest form: 3 bytes a unit (a pair, 2 units, is 4 bytes)
+  setlength(AResult, LCount * 3);
+  LOut := 0;
+  LAt := 0;
+  while LAt < LCount do
+    LUnit := uint32(AText[LAt]);
+    LAt := LAt + 1;
+    LCode := LUnit;
+    if (LUnit >= 0xDC00) and (LUnit <= 0xDFFF) then
+      return false;
+    end;
+    if (LUnit >= 0xD800) and (LUnit <= 0xDBFF) then
+      if LAt >= LCount then
+        return false;
+      end;
+      LNext := uint32(AText[LAt]);
+      if (LNext < 0xDC00) or (LNext > 0xDFFF) then
+        return false;
+      end;
+      LAt := LAt + 1;
+      LCode := 0x10000 + ((LUnit - 0xD800) shl 10) + (LNext - 0xDC00);
+    end;
+    EncodeUtf8Char(AResult, LOut, LCode);
+  end;
+  setlength(AResult, LOut);
+  return true;
+end;
+
+// A hooked _wfopen: as DoOpenText after converting to UTF-8. Only a path that starts with io://
+// (after any leading "./" or ".\") is converted; such a path that does not convert is a missing
+// file (ENOENT), such a mode is refused (EINVAL). Any other path goes to the C runtime
+routine DoOpenWide(const APath: ptr to const wchar; const AMode: ptr to const wchar;
+  var AResult: ptr): bool;
+var
+  LPath: string;
+  LMode: string;
+begin
+  AResult := nil;
+  if APath = nil then
+    return false;
+  end;
+  if not DoIsVirtual(DoAsciiPrefix(APath)) then
+    return false;
+  end;
+  if not DoNarrow(APath, LPath) then
+    SetCErrno(ADAM_ERRNO_ENOENT);
+    return true;
+  end;
+  if not DoNarrow(AMode, LMode) then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return true;
+  end;
+  return DoOpenText(LPath, LMode, AResult);
+end;
+
+// A hooked fclose. False: not a HookIO handle, the caller passes it to the C runtime. True:
+// closed; AResult 0, or EOF when closing its own IO failed (the handle closes anyway). The
+// handle is freed when the last call holding it gives it back
+routine DoClose(const AFile: ptr; var AResult: int32): bool;
+var
+  LHandle: ptr to HookHandle;
+  LOk: bool;
+begin
+  AResult := 0;
+  LHandle := DoTakeHandle(AFile);
+  if LHandle = nil then
+    return false;
+  end;
+  LOk := true;
+  lock (LHandle->Lock->Lock) do
+    if not LHandle->Closed then
+      LHandle->Closed := true;
+      if LHandle->Owned and (not IOClose(LHandle->Stream)) then
+        LOk := false;
+      end;
+      LHandle->Stream := nil;
+    end;
+  end;
+  // The entry use goes back once the IO is closed: a D entry's last handle removes it, as the
+  // OS deletes the file at the last close
+  DoGiveBackEntry(LHandle, true);
+  // The open list's user
+  DoReleaseHandle(LHandle);
+  if not LOk then
+    AResult := ADAM_HOOKIO_EOF;
+  end;
+  return true;
+end;
+
+// The body of a read, under the handle's stream lock: up to ATotal bytes into ABuffer from the
+// handle's place, the count read back. A short read sets the end (the IO's Eof) or the error
+// state; a handle that cannot read is in the error state at once
+routine DoReadLocked(const AHandle: ptr to HookHandle; const ABuffer: ptr;
+  const ATotal: int64): int64;
+var
+  LGot: int64;
+begin
+  if AHandle->Closed then
+    return 0;
+  end;
+  if (AHandle->Mode = FileMode.Write) or (AHandle->Mode = FileMode.Append) then
+    AHandle->Failed := true;
+    return 0;
+  end;
+  if IOSeek(AHandle->Stream, AHandle->Position, SeekOrigin.FromStart) <> AHandle->Position then
+    AHandle->Failed := true;
+    return 0;
+  end;
+  LGot := IORead(AHandle->Stream, ABuffer, ATotal);
+  AHandle->Position := AHandle->Position + LGot;
+  if LGot < ATotal then
+    if IOStatus(AHandle->Stream) = IOState.Eof then
+      AHandle->AtEnd := true;
+    else
+      AHandle->Failed := true;
+    end;
+  end;
+  return LGot;
+end;
+
+// The body of a write, under the handle's stream lock: ATotal bytes from ABuffer at the
+// handle's place (an appending handle's at the IO's end), the count written back; a short
+// write sets the error state, as does a handle that cannot write
+routine DoWriteLocked(const AHandle: ptr to HookHandle; const ABuffer: ptr;
+  const ATotal: int64): int64;
+var
+  LPlace: int64;
+  LPut: int64;
+begin
+  if AHandle->Closed then
+    return 0;
+  end;
+  if AHandle->Mode = FileMode.Read then
+    AHandle->Failed := true;
+    return 0;
+  end;
+  if AHandle->Appending then
+    LPlace := IOSeek(AHandle->Stream, 0, SeekOrigin.FromEnd);
+  else
+    LPlace := IOSeek(AHandle->Stream, AHandle->Position, SeekOrigin.FromStart);
+    if LPlace <> AHandle->Position then
+      LPlace := -1;
+    end;
+  end;
+  if LPlace < 0 then
+    AHandle->Failed := true;
+    return 0;
+  end;
+  LPut := IOWrite(AHandle->Stream, ABuffer, ATotal);
+  AHandle->Position := LPlace + LPut;
+  if LPut < ATotal then
+    AHandle->Failed := true;
+  end;
+  return LPut;
+end;
+
+// The byte count of ACount items of ASize bytes; 0 when either is 0 or less, or the count
+// passes int64
+routine DoItemBytes(const ASize: int64; const ACount: int64): int64;
+begin
+  if (ASize <= 0) or (ACount <= 0) then
+    return 0;
+  end;
+  if ACount > (ADAM_HOOKIO_MAX_BYTES div ASize) then
+    return 0;
+  end;
+  return ASize * ACount;
+end;
+
+// A hooked fread / fwrite (AWrite). False: not a HookIO handle, the caller passes it to the C
+// runtime. True: handled; AResult is the count of whole items moved
+routine DoTransfer(const ABuffer: ptr; const ASize: int64; const ACount: int64;
+  const AFile: ptr; const AWrite: bool; var AResult: int64): bool;
+var
+  LHandle: ptr to HookHandle;
+  LTotal: int64;
+  LMoved: int64;
+begin
+  AResult := 0;
+  LHandle := DoFindHandle(AFile);
+  if LHandle = nil then
+    return false;
+  end;
+  LTotal := DoItemBytes(ASize, ACount);
+  LMoved := 0;
+  if LTotal > 0 then
+    lock (LHandle->Lock->Lock) do
+      if AWrite then
+        LMoved := DoWriteLocked(LHandle, ABuffer, LTotal);
+      else
+        LMoved := DoReadLocked(LHandle, ABuffer, LTotal);
+      end;
+    end;
+    AResult := LMoved div ASize;
+  end;
+  DoReleaseHandle(LHandle);
+  return true;
+end;
+
+// The IO behind a handle: the registered IO, or the entry's IO for a source; nil for anything
+// else, and for a handle being closed
+routine DoStream(const AFile: ptr): IO;
+var
+  LHandle: ptr to HookHandle;
+  LStream: IO;
+begin
+  LHandle := DoFindHandle(AFile);
+  if LHandle = nil then
+    return nil;
+  end;
+  lock (LHandle->Lock->Lock) do
+    LStream := LHandle->Stream;
+  end;
+  DoReleaseHandle(LHandle);
+  return LStream;
+end;
+
+// The hooks: C's names (public: their plain C names). Each hands a path or a FILE that is not
+// HookIO's to the real function, found once (System.HookAbi's HookReal); when the C runtime has
+// no such function the call fails with ENOSYS.
+
+// fopen: a virtual path opens a handle (see the unit header)
+public routine fopen(const APath: ptr to const char; const AMode: ptr to const char): ptr;
+var
+  LFile: ptr;
+  LFound: ptr;
+  LReal: FopenFn;
+begin
+  if DoOpen(APath, AMode, LFile) then
+    return LFile;
+  end;
+  LFound := HookReal(GRealFopen, ptr to const char("fopen"));
+  if LFound = nil then
+    SetCErrno(ADAM_ERRNO_ENOSYS);
+    return nil;
+  end;
+  LReal := FopenFn(LFound);
+  return LReal(APath, AMode);
+end;
+
+// fopen_s: the stream in AFile^, 0 or the error code returned. A nil AFile is the real
+// function's to refuse
+public routine fopen_s(const AFile: ptr to ptr; const APath: ptr to const char;
+  const AMode: ptr to const char): int32;
+var
+  LFile: ptr;
+  LFound: ptr;
+  LReal: FopenSFn;
+begin
+  if (AFile <> nil) and DoOpen(APath, AMode, LFile) then
+    AFile^ := LFile;
+    if LFile = nil then
+      return CErrno();
+    end;
+    return 0;
+  end;
+  LFound := HookReal(GRealFopenS, ptr to const char("fopen_s"));
+  if LFound = nil then
+    if AFile <> nil then
+      AFile^ := nil;
+    end;
+    SetCErrno(ADAM_ERRNO_ENOSYS);
+    return ADAM_ERRNO_ENOSYS;
+  end;
+  LReal := FopenSFn(LFound);
+  return LReal(AFile, APath, AMode);
+end;
+
+// _wfopen: a UTF-16 path, opened as fopen opens its UTF-8 form
+public routine _wfopen(const APath: ptr to const wchar; const AMode: ptr to const wchar): ptr;
+var
+  LFile: ptr;
+  LFound: ptr;
+  LReal: WfopenFn;
+begin
+  if DoOpenWide(APath, AMode, LFile) then
+    return LFile;
+  end;
+  LFound := HookReal(GRealWfopen, ptr to const char("_wfopen"));
+  if LFound = nil then
+    SetCErrno(ADAM_ERRNO_ENOSYS);
+    return nil;
+  end;
+  LReal := WfopenFn(LFound);
+  return LReal(APath, AMode);
+end;
+
+// fclose: a handle is closed (its own IO with it), anything else goes to the C runtime
+public routine fclose(const AFile: ptr): int32;
+var
+  LResult: int32;
+  LFound: ptr;
+  LReal: FcloseFn;
+begin
+  if DoClose(AFile, LResult) then
+    return LResult;
+  end;
+  LFound := HookReal(GRealFclose, ptr to const char("fclose"));
+  if LFound = nil then
+    SetCErrno(ADAM_ERRNO_ENOSYS);
+    return ADAM_HOOKIO_EOF;
+  end;
+  LReal := FcloseFn(LFound);
+  return LReal(AFile);
+end;
+
+// fread: a handle reads from its IO at its place
+public routine fread(const ABuffer: ptr; const ASize: int64; const ACount: int64;
+  const AFile: ptr): int64;
+var
+  LResult: int64;
+  LFound: ptr;
+  LReal: FreadFn;
+begin
+  if DoTransfer(ABuffer, ASize, ACount, AFile, false, LResult) then
+    return LResult;
+  end;
+  LFound := HookReal(GRealFread, ptr to const char("fread"));
+  if LFound = nil then
+    SetCErrno(ADAM_ERRNO_ENOSYS);
+    return 0;
+  end;
+  LReal := FreadFn(LFound);
+  return LReal(ABuffer, ASize, ACount, AFile);
+end;
+
+// fwrite: a handle writes to its IO at its place. The runtime's own printing comes here too
+// (its `external` fwrite binds to this hook): stdout is no handle, so it goes to the real one
+public routine fwrite(const ABuffer: ptr; const ASize: int64; const ACount: int64;
+  const AFile: ptr): int64;
+var
+  LResult: int64;
+  LFound: ptr;
+  LReal: FwriteFn;
+begin
+  if DoTransfer(ABuffer, ASize, ACount, AFile, true, LResult) then
+    return LResult;
+  end;
+  LFound := HookReal(GRealFwrite, ptr to const char("fwrite"));
+  if LFound = nil then
+    SetCErrno(ADAM_ERRNO_ENOSYS);
+    return 0;
+  end;
+  LReal := FwriteFn(LFound);
+  return LReal(ABuffer, ASize, ACount, AFile);
+end;
+
+// Registers an IO under a new prefix: from now on fopen("<prefix>") and fopen("<prefix>/<any
+// name>"), in the program or in any C library linked into it, opens it. Every open gets its
+// own handle with its own place. The IO stays the caller's: the registry never closes it.
+// The prefix, `io://<n>`; "" when AIO is nil or there is no room
+public routine RegisterIO(const AIO: IO): string;
+begin
+  return DoRegister(AIO, nil);
+end;
+
+// Registers an IOSource under a new prefix: from now on fopen("<prefix>/<entry>"), in the
+// program or in any C library linked into it, opens that entry of the source (IOSourceOpen).
+// The source stays the caller's: the registry never closes it. The prefix, `io://<n>`; ""
+// when ASource is nil or there is no room
+public routine RegisterIOSource(const ASource: IOSource): string;
+begin
+  return DoRegister(nil, ASource);
+end;
+
+// Removes a prefix: opening a path under it fails as a missing file does (ENOENT) from now on.
+// Handles already open stay as they are; close them before closing what was registered. True
+// when APrefix (exactly what RegisterIO / RegisterIOSource returned) was registered
+public routine UnregisterIO(const APrefix: string): bool;
+begin
+  return DoUnregister(APrefix);
+end;
+
+// The IO behind a handle a hooked open returned: the registered IO, or the entry's IO for a
+// source; nil for a C runtime FILE or nil
+public routine FileIO(const AFile: ptr): IO;
+begin
+  return DoStream(AFile);
+end;
+
+end.
