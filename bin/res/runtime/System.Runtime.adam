@@ -41,7 +41,14 @@
   (adam.exe's phase lines); ReadFileBytes reads a file whole into a getmem
   block (System.Toml's file parse: the std's one target-neutral file read);
   FindCRuntimeFunction and FindLoadedFunction find a C function by name, the
-  C runtime's or a loaded library's (System.HookAbi's HookReal).
+  C runtime's or a loaded library's (System.HookAbi's HookReal). ThreadStart
+  and ThreadJoin start a thread and wait for its end; LockCreate, LockEnter,
+  LockLeave and LockFree are the OS's lock (H4t2b).
+
+  Threads: every routine here may run on any thread at once. The heap counts
+  and every string, dynamic array and ref count change only through the
+  atomics (BNF sec 7); the raise in flight is threadstatic, one per thread;
+  a started thread runs inside its own catching scope (ThreadRun).
 *******************************************************************************/
 
 module unit System.Runtime;
@@ -49,15 +56,21 @@ module unit System.Runtime;
 var
   // The heap report's counts (Adam's own report, split as PaskalCPP's detail_report_leaks):
   // every block the heap routines below hand out, and every one they take back; a count is
-  // never negative
+  // never negative. Every thread counts into them, so they change only through atomicadd
   GAllocs: uint64;
   GFrees: uint64;
   // The heap report prints as the process ends (set in the initialize section; a program
   // turns it off with SetHeapReport)
   GHeapReport: bool;
-  // The raise in flight (RaiseWith): its code (PaskalCPP's: 1 for raise, 11 for a set item
-  // out of range) and its text, a string value this holds one reference to (nil: the
-  // empty text); read by Unhandled
+  // 0 until a thread reports a raise nothing caught (Unhandled): the first one that takes
+  // it (atomicswap) reports and ends the process, any other waits for that end
+  GUnhandled: int32;
+
+threadstatic
+  // The raise in flight on this thread (RaiseWith): its code (PaskalCPP's: 1 for raise, 11
+  // for a set item out of range) and its text, a string value this holds one reference to
+  // (nil: the empty text); read by Unhandled. Each thread has its own (H4t2b), released at
+  // a started thread's end (ThreadRun)
   GRaiseCode: int32;
   GRaiseText: ptr;
 
@@ -145,11 +158,11 @@ begin
     return;
   end;
   print("[Adam Heap] Allocs: ");
-  WriteUInt(GAllocs);
+  WriteUInt(atomicload(GAllocs));
   print(", Frees: ");
-  WriteUInt(GFrees);
+  WriteUInt(atomicload(GFrees));
   print(", Leaked: ");
-  WriteInt(int64(GAllocs) - int64(GFrees));
+  WriteInt(int64(atomicload(GAllocs)) - int64(atomicload(GFrees)));
   println();
 end;
 
@@ -167,10 +180,17 @@ begin
   PlatformFlush();
 end;
 
+// Declared below, with the strings
+forward routine StrRelease(const AText: ptr);
+
 // Ends the process with the exit code ACode (the heap report runs as it ends, see the
-// initialize section)
+// initialize section). The last raise an except part caught on this thread is released
+// first: a thread keeps its raise in flight until its next raise or its end (ThreadRun's
+// for a started thread, this for the main one), so the report counts it as given back
 routine Halt(const ACode: int32);
 begin
+  StrRelease(GRaiseText);
+  GRaiseText := nil;
   PlatformExit(ACode);
 end;
 
@@ -185,7 +205,7 @@ begin
   end;
   LBlock := PlatformAlloc(ASize);
   if LBlock <> nil then
-    GAllocs := GAllocs + 1;
+    atomicadd(GAllocs, 1u);
   end;
   return LBlock;
 end;
@@ -202,7 +222,7 @@ begin
   end;
   if ASize <= 0 then
     PlatformFree(APointer);
-    GFrees := GFrees + 1;
+    atomicadd(GFrees, 1u);
     return nil;
   end;
   LBlock := PlatformResize(APointer, ASize);
@@ -216,7 +236,7 @@ begin
     return;
   end;
   PlatformFree(APointer);
-  GFrees := GFrees + 1;
+  atomicadd(GFrees, 1u);
 end;
 
 const
@@ -615,7 +635,9 @@ begin
   return LBlock;
 end;
 
-// One more holder of the string AText (nil and a literal's block count nothing)
+// One more holder of the string AText (nil and a literal's block count nothing). Holders
+// on other threads may add and drop at the same time, so the count changes through
+// atomicadd; a literal's count is negative and never changes, so a plain read tells it
 routine StrAddRef(const AText: ptr);
 var
   LHeader: ptr to int64;
@@ -625,12 +647,13 @@ begin
   end;
   LHeader := ptr to int64(AText);
   if LHeader[0] >= 0 then
-    LHeader[0] := LHeader[0] + 1;
+    atomicadd(LHeader[0], 1);
   end;
 end;
 
 // One holder less of the string AText: its block freed when it was the last (nil and a
-// literal's block count nothing)
+// literal's block count nothing). The holder whose atomicadd took the count from 1 to 0
+// is the last, on whichever thread it is
 routine StrRelease(const AText: ptr);
 var
   LHeader: ptr to int64;
@@ -642,8 +665,7 @@ begin
   if LHeader[0] < 0 then
     return;
   end;
-  LHeader[0] := LHeader[0] - 1;
-  if LHeader[0] = 0 then
+  if atomicadd(LHeader[0], -1) = 1 then
     FreeMem(AText);
   end;
 end;
@@ -811,9 +833,9 @@ begin
   if ABlock = nil then
     return;
   end;
+  // The holder whose atomicadd took the count from 1 to 0 ends the object (any thread)
   LHeader := ptr to int64(ABlock);
-  LHeader[0] := LHeader[0] - 1;
-  if LHeader[0] <> 0 then
+  if atomicadd(LHeader[0], -1) <> 1 then
     return;
   end;
   LSlots := ptr to ptr(ABlock);
@@ -909,9 +931,9 @@ begin
   if AArray = nil then
     return;
   end;
+  // The holder whose atomicadd took the count from 1 to 0 ends the array (any thread)
   LHeader := ptr to int64(AArray);
-  LHeader[0] := LHeader[0] - 1;
-  if LHeader[0] = 0 then
+  if atomicadd(LHeader[0], -1) = 1 then
     ArrElements(AArray, AElement, 0, LHeader[1], false);
     FreeMem(AArray);
   end;
@@ -946,7 +968,7 @@ begin
     return nil;
   end;
   LHeader := ptr to int64(LArray);
-  if LHeader[0] = 1 then
+  if atomicload(LHeader[0]) = 1 then
     return LArray;
   end;
   LCopy := ArrNew(LHeader[1], AElement);
@@ -987,7 +1009,7 @@ begin
     LKept := ALength;
   end;
   LHeader := ptr to int64(LOld);
-  if (LOld <> nil) and (LHeader[0] = 1) then
+  if (LOld <> nil) and (atomicload(LHeader[0]) = 1) then
     // the slot's own block: the dropped elements released, then resized where it is
     // (maybe moved), its kept elements as they were, the added ones zeroed
     ArrElements(LOld, AElement, LKept, LOldLength - LKept, false);
@@ -1159,7 +1181,7 @@ begin
     return nil;
   end;
   LHeader := ptr to int64(LText);
-  if LHeader[0] = 1 then
+  if atomicload(LHeader[0]) = 1 then
     return LText;
   end;
   LCopy := TextNew(LHeader[1], AUnit);
@@ -1214,7 +1236,7 @@ begin
     LKept := ALength;
   end;
   LHeader := ptr to int64(LOld);
-  if (LOld <> nil) and (LHeader[0] = 1) then
+  if (LOld <> nil) and (atomicload(LHeader[0]) = 1) then
     // the slot's own block: resized where it is (maybe moved), its units kept
     LBlock := ResizeMem(LOld, 16 + (ALength + 1) * AUnit);
     LHeader := ptr to int64(LBlock);
@@ -1476,12 +1498,20 @@ end;
 // what the program wrote to stdout flushed first, then `unhandled exception <code>: <text>`
 // and a newline to stderr, then the process ends at once with exit code 1 (no exit-time
 // handler, so no heap report: std::_Exit). The frames between the raise and the entry are
-// unwound before it runs (their finally and cleanup funclets ran)
+// unwound before it runs (their finally and cleanup funclets ran). The entry's catching
+// scope runs it on the main thread, ThreadRun's on a started one, each with its own raise
+// in flight; when two threads get here, the first reports and ends the process and the
+// other waits for that end, so one whole report is all that is printed
 routine Unhandled();
 var
   LHeader: ptr to int64;
   LBytes: ptr to uint8;
 begin
+  if atomicswap(GUnhandled, 1) <> 0 then
+    while true do
+      PlatformSleep(1000);
+    end;
+  end;
   PlatformFlush();
   WriteErrorC(ptr to const char("unhandled exception "));
   WriteIntTo(int64(GRaiseCode), true);
@@ -1493,6 +1523,127 @@ begin
   end;
   WriteErrorC(ptr to const char("\n"));
   PlatformQuit(1);
+end;
+
+const
+  // The block ThreadStart hands out per thread: its entry (ptr), its argument (ptr), then
+  // its OS handle (uint64)
+  ADAM_RUNTIME_THREAD_BLOCK: int64 = 24;
+
+public type
+  // A started thread's entry (ThreadStart): a routine of one pointer, the argument
+  // ThreadStart was given; the thread ends when it returns
+  ThreadEntry = routine(const AArg: ptr);
+
+// A started thread's own start (PlatformThreadStart runs it on the new thread): its entry
+// and argument read from ABlock (ThreadStart's), then the entry called inside the thread's
+// own catching scope, so a raise nothing in the entry catches is reported and ends the
+// process as on the main thread (Unhandled). The thread's raise in flight is released as it
+// ends: its threadstatic copy dies with the thread
+routine ThreadRun(const ABlock: ptr);
+var
+  LSlots: ptr to ptr;
+  LEntry: ThreadEntry;
+  LArg: ptr;
+begin
+  LSlots := ptr to ptr(ABlock);
+  LEntry := ThreadEntry(LSlots[0]);
+  LArg := LSlots[1];
+  guard
+    LEntry(LArg);
+  except
+    Unhandled();
+  end;
+  StrRelease(GRaiseText);
+  GRaiseText := nil;
+  GRaiseCode := 0;
+end;
+
+// A new thread running AEntry(AArg), started at once: its handle for ThreadJoin, or nil
+// when it could not be started (no room, or the OS refused). Every started thread is
+// joined: ThreadJoin waits for its end and frees what the handle holds. A runtime routine a
+// program may name (see the header)
+public routine ThreadStart(const AEntry: ThreadEntry; const AArg: ptr): ptr;
+var
+  LBlock: ptr;
+  LSlots: ptr to ptr;
+  LWords: ptr to uint64;
+  LHandle: uint64;
+begin
+  LBlock := GetMem(ADAM_RUNTIME_THREAD_BLOCK);
+  if LBlock = nil then
+    return nil;
+  end;
+  // The entry and its argument are in place before the thread starts; the OS handle is
+  // written after it, into the word the thread never reads
+  LSlots := ptr to ptr(LBlock);
+  LSlots[0] := ptr(AEntry);
+  LSlots[1] := AArg;
+  LWords := ptr to uint64(LBlock);
+  LWords[2] := 0;
+  LHandle := PlatformThreadStart(ThreadRun, LBlock);
+  if LHandle = 0 then
+    FreeMem(LBlock);
+    return nil;
+  end;
+  LWords[2] := LHandle;
+  return LBlock;
+end;
+
+// Waits for the thread AThread (ThreadStart's) to end, then frees what its handle holds;
+// nil does nothing. A runtime routine a program may name (see the header)
+public routine ThreadJoin(const AThread: ptr);
+var
+  LWords: ptr to uint64;
+begin
+  if AThread = nil then
+    return;
+  end;
+  LWords := ptr to uint64(AThread);
+  PlatformThreadJoin(LWords[2]);
+  FreeMem(AThread);
+end;
+
+// A new lock, free, from the heap (counted: LockFree gives it back), or nil when there is
+// no room. One thread holds it at a time: LockEnter waits until it is free. It is not
+// recursive (a thread entering a lock it holds waits forever). It is the OS's own lock, its
+// size the platform's (PlatformLockSize). A runtime routine a program may name (see the
+// header)
+public routine LockCreate(): ptr;
+var
+  LLock: ptr;
+begin
+  LLock := GetMem(PlatformLockSize());
+  if LLock = nil then
+    return nil;
+  end;
+  PlatformLockInit(LLock);
+  return LLock;
+end;
+
+// Waits until the lock ALock (LockCreate's) is free, then holds it. A runtime routine a
+// program may name (see the header)
+public routine LockEnter(const ALock: ptr);
+begin
+  PlatformLockEnter(ALock);
+end;
+
+// Lets go of the lock ALock, which this thread holds. A runtime routine a program may name
+// (see the header)
+public routine LockLeave(const ALock: ptr);
+begin
+  PlatformLockLeave(ALock);
+end;
+
+// The lock ALock (LockCreate's) back to the heap: no thread holds it or waits for it; nil
+// does nothing. A runtime routine a program may name (see the header)
+public routine LockFree(const ALock: ptr);
+begin
+  if ALock = nil then
+    return;
+  end;
+  PlatformLockDone(ALock);
+  FreeMem(ALock);
 end;
 
 // paramcount(): the number of command-line arguments after the program's name

@@ -209,6 +209,13 @@ routine VirtualProtect(const AAddress: ptr; const ASize: uint64; const ANewProte
 // given back exclusively
 routine AcquireSRWLockExclusive(var ALock: uint64); external "kernel32";
 routine ReleaseSRWLockExclusive(var ALock: uint64); external "kernel32";
+// The threads (PlatformThreadStart, PlatformThreadJoin, PlatformSleep)
+routine CreateThread(const AAttributes: ptr; const AStackSize: uint64;
+  const AStart: routine(AParameter: ptr): uint32; const AParameter: ptr; const AFlags: uint32;
+  const AThreadId: ptr): uint64; external "kernel32";
+routine WaitForSingleObject(const AHandle: uint64; const AMilliseconds: uint32): uint32;
+  external "kernel32";
+routine Sleep(const AMilliseconds: uint32); external "kernel32";
 
 // ucrtbase: the calling thread's errno, two C strings compared (0 when equal), a C
 // string's length
@@ -222,6 +229,10 @@ type
   // was loaded, 2 one is unloading; AData its LDR_DLL_NOTIFICATION_DATA (Flags, FullDllName,
   // BaseDllName, DllBase, SizeOfImage); it runs inside the loader's lock
   PlatformDllNotification = routine(const AReason: uint32; const AData: ptr; const AContext: ptr);
+
+  // What a thread PlatformThreadStart made runs first (System.Runtime's ThreadRun), given
+  // the block it was started with
+  PlatformThreadRun = routine(const ABlock: ptr);
 
   // One import slot a run-time hook wrote: the slot, what it held, the load address of the
   // module it is in (a module that went away is never written again)
@@ -369,8 +380,10 @@ public const
   ADAM_PLATFORM_PATH_FOLDER: int32 = 2;
 
 var
-  // True once the process's arguments are split (DoReadyArguments)
+  // True once the process's arguments are split (DoReadyArguments); the lock (an SRWLOCK,
+  // zero is free) makes the split run once when threads ask at the same time
   GArgumentsReady: bool;
+  GArgumentsLock: uint64;
   // The run-time hooks (PlatformHookInstall). The run lock makes installs and uninstalls run
   // one at a time and may be held while the loader's lock is taken; the table lock guards
   // the entries and their slots and is never held while the loader's lock is taken (the DLL
@@ -492,13 +505,114 @@ begin
   return __C_specific_handler(ARecord, AFrame, AContext, ADispatch);
 end;
 
+const
+  // WaitForSingleObject's INFINITE: wait until the object is signaled, however long
+  ADAM_PLATFORM_WAIT_INFINITE: uint32 = 0xFFFFFFFF;
+  // A lock's size in bytes (an SRWLOCK: one pointer-sized word, zero is free)
+  ADAM_PLATFORM_LOCK_SIZE: int64 = 8;
+
+// The OS's start of a thread PlatformThreadStart made (CreateThread's start routine):
+// AParameter is its two-word block from the C heap (the run routine, then its block), freed
+// here before the run routine is called on this thread; the thread's exit code is 0
+routine DoThreadProc(AParameter: ptr): uint32;
+var
+  LSlots: ptr to ptr;
+  LRun: PlatformThreadRun;
+  LBlock: ptr;
+begin
+  LSlots := ptr to ptr(AParameter);
+  LRun := PlatformThreadRun(LSlots[0]);
+  LBlock := LSlots[1];
+  free(AParameter);
+  LRun(LBlock);
+  return 0;
+end;
+
+// A new thread that runs ARun(ABlock) (System.Runtime's ThreadRun), started at once: its
+// handle (PlatformThreadJoin's), or 0 when it could not be started (no room, or the OS
+// refused)
+public routine PlatformThreadStart(const ARun: routine(const ABlock: ptr); const ABlock: ptr): uint64;
+var
+  LSlots: ptr to ptr;
+  LHandle: uint64;
+begin
+  LSlots := ptr to ptr(malloc(16));
+  if LSlots = nil then
+    return 0;
+  end;
+  LSlots[0] := ptr(ARun);
+  LSlots[1] := ABlock;
+  LHandle := CreateThread(nil, 0, DoThreadProc, ptr(LSlots), 0, nil);
+  if LHandle = 0 then
+    free(ptr(LSlots));
+  end;
+  return LHandle;
+end;
+
+// Waits for the thread AThread (PlatformThreadStart's) to end, then closes its handle
+public routine PlatformThreadJoin(const AThread: uint64);
+begin
+  WaitForSingleObject(AThread, ADAM_PLATFORM_WAIT_INFINITE);
+  CloseHandle(AThread);
+end;
+
+// The calling thread sleeps for AMilliseconds
+public routine PlatformSleep(const AMilliseconds: uint32);
+begin
+  Sleep(AMilliseconds);
+end;
+
+// A lock's size in bytes (System.Runtime's LockCreate takes that many from the heap)
+public routine PlatformLockSize(): int64;
+begin
+  return ADAM_PLATFORM_LOCK_SIZE;
+end;
+
+// The lock at ALock (PlatformLockSize bytes) made free: an SRWLOCK's zero
+public routine PlatformLockInit(const ALock: ptr);
+var
+  LWord: ptr to uint64;
+begin
+  LWord := ptr to uint64(ALock);
+  LWord^ := 0;
+end;
+
+// Waits until the lock at ALock is free, then holds it (exclusively)
+public routine PlatformLockEnter(const ALock: ptr);
+var
+  LWord: ptr to uint64;
+begin
+  LWord := ptr to uint64(ALock);
+  AcquireSRWLockExclusive(LWord^);
+end;
+
+// Lets go of the lock at ALock, which the calling thread holds
+public routine PlatformLockLeave(const ALock: ptr);
+var
+  LWord: ptr to uint64;
+begin
+  LWord := ptr to uint64(ALock);
+  ReleaseSRWLockExclusive(LWord^);
+end;
+
+// The lock at ALock no longer used (no thread holds it or waits for it): an SRWLOCK holds
+// nothing of the OS's, so nothing is given back
+public routine PlatformLockDone(const ALock: ptr);
+begin
+  return;
+end;
+
 // The process's arguments split from its command line, the first time it is asked
 routine DoReadyArguments();
 begin
+  // Taken on every ask: two threads asking first at once would split the command line
+  // twice, one reading argv while the other rebuilds it
+  AcquireSRWLockExclusive(GArgumentsLock);
   if not GArgumentsReady then
     _configure_narrow_argv(1);
     GArgumentsReady := true;
   end;
+  ReleaseSRWLockExclusive(GArgumentsLock);
 end;
 
 // The number of the process's arguments, its own name included (C's argc)
