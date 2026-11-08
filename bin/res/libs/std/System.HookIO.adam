@@ -44,26 +44,55 @@
   entry refuse each other with EACCES). An unregistered prefix, a missing
   entry or a path the source refuses is ENOENT; an entry the source does
   not offer in the mode is EACCES. A ccs= open is EINVAL until the wide
-  stream model is built. Reads and writes go to the IO at the handle's
-  place.
+  stream model is built.
+
+  Every stream call on a handle (fread, fwrite, fgetc, fgets, ungetc,
+  fputc, fputs, fseek, ftell, rewind, fflush, feof / ferror / clearerr and
+  their _nolock forms) runs on a model of ucrt's own FILE: its buffer, its
+  read / write / update flags and lowio's place, as ucrt's sources do it
+  (fills, the direct path past a buffer's size, ungot bytes in the buffer,
+  ftell's arithmetic, fseek's fast track, flush on a switch and at fclose),
+  so a C library sees on a handle what ucrt gives on a real file of the
+  same bytes. fflush(NULL) flushes every open handle too.
 *******************************************************************************/
 
 module unit System.HookIO;
 
 import System.SysUtils, System.Runtime, System.HookAbi, System.CustomIO;
 
+public const
+  // C's EOF: what the hooked stream calls return on a failure or at the end
+  ADAM_HOOKIO_EOF: int32 = -1;
+  // C's fseek origins (SEEK_SET, SEEK_CUR, SEEK_END)
+  ADAM_HOOKIO_SEEK_SET: int32 = 0;
+  ADAM_HOOKIO_SEEK_CUR: int32 = 1;
+  ADAM_HOOKIO_SEEK_END: int32 = 2;
+
 const
   // The scheme every virtual path starts with, and its length
   ADAM_HOOKIO_SCHEME: string = "io://";
   ADAM_HOOKIO_SCHEME_LENGTH: int64 = 5;
-  // C's EOF: fclose's result when the close failed
-  ADAM_HOOKIO_EOF: int32 = -1;
   // The byte that ends a text-mode file on Windows (ucrt drops a trailing one at a "+" open)
   ADAM_HOOKIO_CTRL_Z: uint8 = 0x1A;
   // ucrt's _O_BINARY (fcntl.h): _get_fmode's bit for a binary default
   ADAM_HOOKIO_O_BINARY: int32 = 0x8000;
   // The largest int64: no item count of fread / fwrite may pass it in bytes
   ADAM_HOOKIO_MAX_BYTES: int64 = 9223372036854775807;
+  // The smallest int64 (ucrt's fseek fast track checks its difference against both ends)
+  ADAM_HOOKIO_MIN_BYTES: int64 = -9223372036854775807 - 1;
+  // ucrt's stdio buffer sizes (corecrt_internal_lowio.h _INTERNAL_BUFSIZ, _SMALL_BUFSIZ): a
+  // fill asks for the big size, the first fill after an fseek of a read-only stream the small
+  ADAM_HOOKIO_BUFFER_SIZE: int64 = 4096;
+  ADAM_HOOKIO_SMALL_BUFFER_SIZE: int64 = 512;
+  // lowio's largest read (INT_MAX) and write (UINT_MAX - 1) at a time
+  ADAM_HOOKIO_LOW_READ_MAX: int64 = 2147483647;
+  ADAM_HOOKIO_LOW_WRITE_MAX: int64 = 4294967294;
+  // The largest place ucrt's ftell gives in its long (LONG_MAX on Windows)
+  ADAM_HOOKIO_LONG_MAX: int64 = 2147483647;
+  // fputs's result on success (ucrt's)
+  ADAM_HOOKIO_PUTS_OK: int32 = 0;
+  // The byte fgets stops after
+  ADAM_HOOKIO_NEWLINE: int32 = 10;
 
 type
   // The lock every handle on one stream shares: a registered IO's (Listed: one per IO in
@@ -110,14 +139,57 @@ type
     Encoding: int32;
   end;
 
+  // Who made a ucrt FILE's buffer (corecrt_internal_stdio.h): Crt is _IOBUFFER_CRT (the first
+  // fill, ungetc or setvbuf with no array), User _IOBUFFER_USER (the caller's array, setvbuf /
+  // setbuf), Single _IOBUFFER_NONE (setvbuf _IONBF: the FILE's own 2-byte _charbuf)
+  HookCrtBufferKind = choices(Crt, User, Single);
+
+  // A ucrt FILE's main buffer: memory the model made (Owned) or the caller's own array handed
+  // to setvbuf / setbuf (Caller, never freed here), which the CRT fills itself, so the caller
+  // sees the bytes there as a real FILE leaves them; Size bytes
+  HookCrtBuffer = record
+    Owned: array of uint8;
+    Caller: ptr to uint8;
+    Size: int64;
+  end;
+
+  // The state of a ucrt FILE (Windows Kits 10.0.26100 ucrt: stdio _filbuf.cpp, fread.cpp,
+  // ftell.cpp, fseek.cpp, ungetc.cpp, fwrite.cpp, fputc.cpp, _flsbuf.cpp, fflush.cpp; lowio
+  // read.cpp, write.cpp). The stdio side: Buffer holds the last fill; Next is the next byte in
+  // it (_ptr - _base), Count the bytes left (_cnt), BufferSize the size the next fill asks for
+  // (_bufsiz). While writing, [0, Next) are the bytes written and not yet flushed and Count is
+  // the room left. HasBuffer: the buffer exists (any _IOBUFFER_* bit), Kind says who made it.
+  // StreamRead / StreamWrite / StreamUpdate are _IOREAD / _IOWRITE / _IOUPDATE; StreamCtrlZ
+  // is _IOCTRLZ (a fill of a read-only stream met a Ctrl-Z; cleared only by setvbuf);
+  // SetvbufBuffer is _IOBUFFER_SETVBUF. The lowio side, over the handle's Position: LowEof is
+  // FEOFLAG (a text read met a Ctrl-Z; lowio reads nothing until a seek clears it), LowCrlf is
+  // FCRLF (the last text read began with a newline). A binary handle never sets either
+  HookCrtModel = record
+    Buffer: HookCrtBuffer;
+    Next: int64;
+    Count: int64;
+    BufferSize: int64;
+    HasBuffer: bool;
+    Kind: HookCrtBufferKind;
+    StreamRead: bool;
+    StreamWrite: bool;
+    StreamUpdate: bool;
+    StreamCtrlZ: bool;
+    SetvbufBuffer: bool;
+    LowEof: bool;
+    LowCrlf: bool;
+  end;
+
   // An open handle, what a hooked open returns in place of a FILE*. Owned: the handle opened
   // Stream itself (a source entry) and closes it with the handle; else Stream is a registered
-  // IO every handle on it shares. Position: the handle's place in Stream. Appending: opened
-  // with a or a+ (every write lands at the IO's end). Lock: the stream lock that guards every
-  // field and every call on Stream. AtEnd / Failed: feof / ferror. Closed: fclose ran. Text:
-  // opened in text mode. Source / EntryName / Temporary: the source entry the handle opened
-  // and whether with D (Source nil on a registered IO, and once the use is given back).
-  // Users: the open list and every call that found the handle; the last one frees it
+  // IO every handle on it shares. Position: the handle's place in Stream (lowio's descriptor
+  // place). Appending: opened with a or a+ (every write lands at the IO's end). Lock: the
+  // stream lock that guards every field and every call on Stream. AtEnd / Failed: feof /
+  // ferror. Closed: fclose ran. Text: opened in text mode. Source / EntryName / Temporary: the
+  // source entry the handle opened and whether with D (Source nil on a registered IO, and once
+  // the use is given back). Users: the open list and every call that found the handle; the last
+  // one frees it. Crt: the state of ucrt's own FILE, what every read, write, ungetc, ftell and
+  // fseek runs on, so that a handle gives what ucrt gives on a real file of the same bytes
   HookHandle = record
     Stream: IO;
     Owned: bool;
@@ -133,6 +205,26 @@ type
     EntryName: string;
     Temporary: bool;
     Users: int64;
+    Crt: HookCrtModel;
+  end;
+
+  // The stream calls DoWith runs on a handle
+  HookOp = choices(Read, Write, Get, Gets, Unget, Put, Puts, Seek, Tell, Rewind, AtEnd, Failed,
+    ClearError, Flush, Fileno);
+
+  // One stream call on a handle: its arguments (Buffer / Size: the bytes of a read, write,
+  // fgets or fputs; ItemSize: fread / fwrite's element size; Offset / Origin: fseek's; Value:
+  // the byte of fputc / ungetc) and its answer (Answer, set to the call's failure value before
+  // DoWith runs it)
+  HookCall = record
+    Op: HookOp;
+    Buffer: ptr to uint8;
+    Size: int64;
+    ItemSize: int64;
+    Offset: int64;
+    Origin: int32;
+    Value: int32;
+    Answer: int64;
   end;
 
   // The real functions' types, called through HookReal's slots
@@ -146,6 +238,15 @@ type
   FwriteFn = routine(const ABuffer: ptr; const ASize: int64; const ACount: int64;
     const AFile: ptr): int64;
   GetFmodeFn = routine(const AMode: ptr to int32): int32;
+  FileIntFn = routine(const AFile: ptr): int32;
+  FileVoidFn = routine(const AFile: ptr);
+  CharFileFn = routine(const AChar: int32; const AFile: ptr): int32;
+  FgetsFn = routine(const AText: ptr to char; const ACount: int32; const AFile: ptr): ptr to char;
+  FputsFn = routine(const AText: ptr to const char; const AFile: ptr): int32;
+  FseekFn = routine(const AFile: ptr; const AOffset: clong; const AOrigin: int32): int32;
+  Fseeki64Fn = routine(const AFile: ptr; const AOffset: int64; const AOrigin: int32): int32;
+  FtellFn = routine(const AFile: ptr): clong;
+  Ftelli64Fn = routine(const AFile: ptr): int64;
 
 var
   // The registry lock: the entries, the stream locks, the open list and the entry uses. Never
@@ -167,6 +268,39 @@ var
   GRealFread: ptr;
   GRealFwrite: ptr;
   GRealGetFmode: ptr;
+  GRealFgetc: ptr;
+  GRealGetc: ptr;
+  GRealFgetcNolock: ptr;
+  GRealGetcNolock: ptr;
+  GRealFgets: ptr;
+  GRealUngetc: ptr;
+  GRealUngetcNolock: ptr;
+  GRealFeof: ptr;
+  GRealFerror: ptr;
+  GRealClearerr: ptr;
+  GRealFseek: ptr;
+  GRealFseekNolock: ptr;
+  GRealFseeki64: ptr;
+  GRealFseeki64Nolock: ptr;
+  GRealFtell: ptr;
+  GRealFtellNolock: ptr;
+  GRealFtelli64: ptr;
+  GRealFtelli64Nolock: ptr;
+  GRealRewind: ptr;
+  GRealFileno: ptr;
+  GRealUnderFileno: ptr;
+  GRealLockFile: ptr;
+  GRealUnlockFile: ptr;
+  GRealFputc: ptr;
+  GRealPutc: ptr;
+  GRealFputcNolock: ptr;
+  GRealPutcNolock: ptr;
+  GRealFputs: ptr;
+  GRealFflush: ptr;
+  GRealFflushNolock: ptr;
+  GRealFreadNolock: ptr;
+  GRealFwriteNolock: ptr;
+  GRealFcloseNolock: ptr;
 
 threadstatic
   // How deep this thread is inside HookIO's own path work (a hooked open): while it is above
@@ -1199,6 +1333,10 @@ begin
   LHandle->Mode := LParsed.Mode;
   LHandle->Appending := LParsed.First = 'a';
   LHandle->Text := LParsed.Text;
+  // ucrt's open: 'r' sets _IOREAD, 'w' / 'a' _IOWRITE, '+' _IOUPDATE and neither of the others
+  LHandle->Crt.StreamUpdate := LParsed.Mode = FileMode.ReadWrite;
+  LHandle->Crt.StreamRead := LParsed.Mode = FileMode.Read;
+  LHandle->Crt.StreamWrite := (LParsed.Mode = FileMode.Write) or (LParsed.Mode = FileMode.Append);
   // errno is set by the open that fails
   if AEntry.Stream <> nil then
     LOpened := DoOpenShared(AEntry, LParsed, LHandle);
@@ -1361,9 +1499,817 @@ begin
   return DoOpenText(LPath, LMode, AResult);
 end;
 
+// lowio's descriptor rights: a handle opened for reading (r, or any mode with +) reads
+routine DoCanRead(const AHandle: ptr to HookHandle): bool;
+begin
+  return (AHandle->Mode = FileMode.Read) or (AHandle->Mode = FileMode.ReadWrite);
+end;
+
+// lowio's descriptor rights: a handle opened with anything but r writes
+routine DoCanWrite(const AHandle: ptr to HookHandle): bool;
+begin
+  return AHandle->Mode <> FileMode.Read;
+end;
+
+// Moves the IO to the handle's Position: another handle on the same IO, or a seek that only
+// tried a target, may have left it elsewhere. False: the IO cannot go there
+routine DoSyncLocked(const AHandle: ptr to HookHandle): bool;
+begin
+  if IOTell(AHandle->Stream) = AHandle->Position then
+    return true;
+  end;
+  return IOSeek(AHandle->Stream, AHandle->Position, SeekOrigin.FromStart) = AHandle->Position;
+end;
+
+// The first byte of the model's buffer: the caller's array or the model's own (only asked
+// once the buffer exists: HasBuffer)
+routine DoCrtData(const AHandle: ptr to HookHandle): ptr to uint8;
+begin
+  if AHandle->Crt.Buffer.Caller <> nil then
+    return AHandle->Crt.Buffer.Caller;
+  end;
+  return addr of AHandle->Crt.Buffer.Owned[0];
+end;
+
+// lowio's _write (write.cpp): ASize bytes at AData to the IO at the handle's Position. Append
+// mode writes at the IO's end: lowio seeks there first and ignores a failed seek (its lseek
+// also clears the Ctrl-Z end). A handle opened without write access writes nothing: -1 with
+// EBADF (ucrt maps the OS refusal to it). A short write sets Failed: nothing written is -1
+// with ENOSPC, else the count with EIO. Returns the count written or -1
+routine DoLowWriteLocked(const AHandle: ptr to HookHandle; const AData: ptr to uint8;
+  const ASize: int64): int64;
+var
+  LEnd: int64;
+  LGot: int64;
+begin
+  if not DoCanWrite(AHandle) then
+    SetCErrno(ADAM_ERRNO_EBADF);
+    return -1;
+  end;
+  if AHandle->Appending then
+    LEnd := IOSeek(AHandle->Stream, 0, SeekOrigin.FromEnd);
+    if LEnd >= 0 then
+      AHandle->Position := LEnd;
+    end;
+    AHandle->Crt.LowEof := false;
+  end;
+  if not DoSyncLocked(AHandle) then
+    AHandle->Failed := true;
+    SetCErrno(ADAM_ERRNO_EIO);
+    return -1;
+  end;
+  LGot := IOWrite(AHandle->Stream, ptr(AData), ASize);
+  if LGot < 0 then
+    LGot := 0;
+  end;
+  AHandle->Position := AHandle->Position + LGot;
+  if LGot < ASize then
+    AHandle->Failed := true;
+    if LGot = 0 then
+      SetCErrno(ADAM_ERRNO_ENOSPC);
+      return -1;
+    end;
+    SetCErrno(ADAM_ERRNO_EIO);
+  end;
+  return LGot;
+end;
+
+// lowio's _read (read.cpp): up to ASize bytes of the IO at the handle's Position into AData,
+// as they are (a text handle's too: its translation is not lowio's here). 0 at the end, and
+// after a Ctrl-Z end (LowEof) until a seek clears it; -1 on a failure: a handle opened
+// without read access EBADF, an IO that cannot read EIO. No stdio flag changes here
+routine DoLowReadLocked(const AHandle: ptr to HookHandle; const AData: ptr to uint8;
+  const ASize: int64): int64;
+var
+  LGot: int64;
+begin
+  if (ASize <= 0) or AHandle->Crt.LowEof then
+    return 0;
+  end;
+  if not DoCanRead(AHandle) then
+    SetCErrno(ADAM_ERRNO_EBADF);
+    return -1;
+  end;
+  if not DoSyncLocked(AHandle) then
+    SetCErrno(ADAM_ERRNO_EIO);
+    return -1;
+  end;
+  LGot := IORead(AHandle->Stream, ptr(AData), ASize);
+  if LGot < 0 then
+    LGot := 0;
+  end;
+  AHandle->Position := AHandle->Position + LGot;
+  if (LGot = 0) and (IOStatus(AHandle->Stream) <> IOState.Eof) then
+    SetCErrno(ADAM_ERRNO_EIO);
+    return -1;
+  end;
+  return LGot;
+end;
+
+// ucrt's buffer allocation (_getbuf.cpp __acrt_stdio_allocate_buffer_nolock), once: the big
+// size, empty (Next and Count 0)
+routine DoCrtAllocateLocked(const AHandle: ptr to HookHandle);
+begin
+  if AHandle->Crt.HasBuffer then
+    return;
+  end;
+  setlength(AHandle->Crt.Buffer.Owned, ADAM_HOOKIO_BUFFER_SIZE);
+  AHandle->Crt.Buffer.Caller := nil;
+  AHandle->Crt.Buffer.Size := ADAM_HOOKIO_BUFFER_SIZE;
+  AHandle->Crt.BufferSize := ADAM_HOOKIO_BUFFER_SIZE;
+  AHandle->Crt.HasBuffer := true;
+  AHandle->Crt.Kind := HookCrtBufferKind.Crt;
+  AHandle->Crt.Next := 0;
+  AHandle->Crt.Count := 0;
+end;
+
+// The small fill size after an fseek applies only to a buffer ucrt made itself on its own
+// (has_crt_buffer() and not _IOBUFFER_SETVBUF)
+routine DoCrtOwnBuffer(const AHandle: ptr to HookHandle): bool;
+begin
+  return AHandle->Crt.HasBuffer and (AHandle->Crt.Kind = HookCrtBufferKind.Crt) and
+    (not AHandle->Crt.SetvbufBuffer);
+end;
+
+// ucrt's has_big_buffer(): a buffer ucrt or the caller made, not _IONBF's 2-byte _charbuf
+routine DoCrtBigBuffer(const AHandle: ptr to HookHandle): bool;
+begin
+  return AHandle->Crt.HasBuffer and (AHandle->Crt.Kind <> HookCrtBufferKind.Single);
+end;
+
+// ucrt's buffer flush (fflush.cpp __acrt_stdio_flush_nolock): only a stream that writes and
+// does not read, with a big buffer, flushes. The buffer empties (Next, Count 0), then its
+// [0, Next) bytes go to lowio; a short write sets Failed and is EOF. An update stream that
+// wrote bytes stops writing; one that had none to write keeps writing (ucrt returns before
+// that step). Returns 0 or EOF
+routine DoCrtFlushLocked(const AHandle: ptr to HookHandle): int32;
+var
+  LBytes: int64;
+begin
+  if AHandle->Crt.StreamRead or (not AHandle->Crt.StreamWrite) or
+    (not DoCrtBigBuffer(AHandle)) then
+    return 0;
+  end;
+  LBytes := AHandle->Crt.Next;
+  AHandle->Crt.Next := 0;
+  AHandle->Crt.Count := 0;
+  if LBytes <= 0 then
+    return 0;
+  end;
+  if DoLowWriteLocked(AHandle, DoCrtData(AHandle), LBytes) <> LBytes then
+    AHandle->Failed := true;
+    return ADAM_HOOKIO_EOF;
+  end;
+  if AHandle->Crt.StreamUpdate then
+    AHandle->Crt.StreamWrite := false;
+  end;
+  return 0;
+end;
+
+// A read form on an update stream that holds written bytes, where ucrt's read would take the
+// buffer's stale bytes past them (fgetc, fread, while the buffer has room left) or read past
+// them straight from lowio (ADirect: fread's direct path is next), after which no flush ever
+// writes them. C requires an fflush between a write and a read; the read takes it here, so
+// the written bytes land and the read starts at the caller's place. A write-only stream ("w",
+// "a") holding written bytes would hand back the buffer's stale bytes the same way: it is
+// refused as ucrt's _filbuf refuses a writing stream (Failed, errno untouched). False: the
+// read reads nothing
+routine DoCrtLeaveWriteLocked(const AHandle: ptr to HookHandle; const ADirect: bool): bool;
+begin
+  if (not AHandle->Crt.StreamUpdate) and AHandle->Crt.StreamWrite and
+    (not AHandle->Crt.StreamRead) and (AHandle->Crt.Count > 0) then
+    AHandle->Failed := true;
+    return false;
+  end;
+  if (not AHandle->Crt.StreamUpdate) or (not AHandle->Crt.StreamWrite) or
+    AHandle->Crt.StreamRead or (AHandle->Crt.Next = 0) then
+    return true;
+  end;
+  if (AHandle->Crt.Count <= 0) and (not ADirect) then
+    return true;
+  end;
+  return DoCrtFlushLocked(AHandle) = 0;
+end;
+
+// ucrt's refill (_filbuf.cpp common_refill_and_read_nolock): the buffer is made on the first
+// fill, filled with up to BufferSize bytes and its first byte returned. Nothing read: EOF with
+// AtEnd (the end) or Failed (a failure). A read-only stream whose fill met a Ctrl-Z sets
+// StreamCtrlZ; a fill at the small size puts the big size back for the next one. A stream
+// that writes is refused: Failed, EOF, errno untouched
+routine DoCrtRefillLocked(const AHandle: ptr to HookHandle): int32;
+var
+  LData: ptr to uint8;
+  LGot: int64;
+  LByte: uint8;
+begin
+  if AHandle->Crt.StreamWrite then
+    AHandle->Failed := true;
+    return ADAM_HOOKIO_EOF;
+  end;
+  AHandle->Crt.StreamRead := true;
+  DoCrtAllocateLocked(AHandle);
+  AHandle->Crt.Next := 0;
+  LData := DoCrtData(AHandle);
+  LGot := DoLowReadLocked(AHandle, LData, AHandle->Crt.BufferSize);
+  if LGot <= 0 then
+    if LGot < 0 then
+      AHandle->Failed := true;
+    else
+      AHandle->AtEnd := true;
+    end;
+    AHandle->Crt.Count := 0;
+    return ADAM_HOOKIO_EOF;
+  end;
+  AHandle->Crt.Count := LGot;
+  if (not AHandle->Crt.StreamWrite) and (not AHandle->Crt.StreamUpdate) and
+    AHandle->Crt.LowEof then
+    AHandle->Crt.StreamCtrlZ := true;
+  end;
+  if (AHandle->Crt.BufferSize = ADAM_HOOKIO_SMALL_BUFFER_SIZE) and DoCrtOwnBuffer(AHandle) then
+    AHandle->Crt.BufferSize := ADAM_HOOKIO_BUFFER_SIZE;
+  end;
+  AHandle->Crt.Count := AHandle->Crt.Count - 1;
+  LByte := LData[AHandle->Crt.Next];
+  AHandle->Crt.Next := AHandle->Crt.Next + 1;
+  return int32(LByte);
+end;
+
+// A read of up to ASize bytes into AData, as ucrt's fread (fread.cpp _fread_nolock_s): the
+// buffer's bytes first; with the buffer empty, a request of at least one buffer's size reads
+// the largest whole multiple of it straight from lowio (at most INT_MAX bytes at a time),
+// bypassing the buffer; a smaller one refills. A short count at the end sets AtEnd, after a
+// failure Failed. Written bytes still in the buffer are flushed first where ucrt would read
+// past them (DoCrtLeaveWriteLocked). A count left below 0 by a refused fputc is an empty
+// buffer, as ucrt's getc macro takes it
+routine DoCrtReadLocked(const AHandle: ptr to HookHandle; const AData: ptr to uint8;
+  const ASize: int64): int64;
+var
+  LDone: int64;
+  LBufferSize: int64;
+  LRemaining: int64;
+  LTake: int64;
+  LLimit: int64;
+  LGot: int64;
+  LByte: int32;
+begin
+  LDone := 0;
+  if AHandle->Crt.HasBuffer then
+    LBufferSize := AHandle->Crt.BufferSize;
+  else
+    LBufferSize := ADAM_HOOKIO_BUFFER_SIZE;
+  end;
+  if not DoCrtLeaveWriteLocked(AHandle, ASize >= LBufferSize) then
+    return 0;
+  end;
+  while LDone < ASize do
+    LRemaining := ASize - LDone;
+    if AHandle->Crt.HasBuffer and (AHandle->Crt.Count > 0) then
+      LTake := LRemaining;
+      if LTake > AHandle->Crt.Count then
+        LTake := AHandle->Crt.Count;
+      end;
+      CopyBytes(AData + LDone, DoCrtData(AHandle) + AHandle->Crt.Next, LTake);
+      AHandle->Crt.Count := AHandle->Crt.Count - LTake;
+      AHandle->Crt.Next := AHandle->Crt.Next + LTake;
+      LDone := LDone + LTake;
+    else
+      if LRemaining >= LBufferSize then
+        LLimit := LRemaining;
+        if LLimit > ADAM_HOOKIO_LOW_READ_MAX then
+          LLimit := ADAM_HOOKIO_LOW_READ_MAX;
+        end;
+        LTake := LLimit - (LLimit mod LBufferSize);
+        // The buffer no longer holds what precedes the place
+        AHandle->Crt.Next := 0;
+        AHandle->Crt.Count := 0;
+        LGot := DoLowReadLocked(AHandle, AData + LDone, LTake);
+        if LGot = 0 then
+          AHandle->AtEnd := true;
+          leave;
+        end;
+        if LGot < 0 then
+          AHandle->Failed := true;
+          leave;
+        end;
+        LDone := LDone + LGot;
+      else
+        LByte := DoCrtRefillLocked(AHandle);
+        if LByte = ADAM_HOOKIO_EOF then
+          leave;
+        end;
+        AData[LDone] := uint8(LByte);
+        LDone := LDone + 1;
+        LBufferSize := AHandle->Crt.BufferSize;
+      end;
+    end;
+  end;
+  return LDone;
+end;
+
+// ucrt's ftell (ftell.cpp common_ftell_nolock, common_ftell_read_mode_nolock), ungot bytes in
+// the buffer counted as the buffer's own: in read mode the place minus the bytes left, in
+// write mode the place plus the bytes not yet flushed. ucrt finds the descriptor's place with
+// an lseek, and lowio's lseek clears FEOFLAG: so does this. -1 with EINVAL for a stream that
+// neither reads, writes nor updates. lowio hands every handle's bytes as they are
+// (DoLowReadLocked), so no newline is counted twice
+routine DoCrtTellLocked(const AHandle: ptr to HookHandle): int64;
+var
+  LLow: int64;
+  LOffset: int64;
+begin
+  LLow := AHandle->Position;
+  // ucrt's ftell first sets a negative count to 0: a putc refused by _flsbuf (a read-only
+  // stream) leaves it at -1
+  if AHandle->Crt.Count < 0 then
+    AHandle->Crt.Count := 0;
+  end;
+  AHandle->Crt.LowEof := false;
+  // No buffer, or the _IONBF one (not a big buffer)
+  if (not AHandle->Crt.HasBuffer) or (AHandle->Crt.Kind = HookCrtBufferKind.Single) then
+    return LLow - AHandle->Crt.Count;
+  end;
+  LOffset := AHandle->Crt.Next;
+  if (not AHandle->Crt.StreamRead) and (not AHandle->Crt.StreamWrite) and
+    (not AHandle->Crt.StreamUpdate) then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return -1;
+  end;
+  if LLow = 0 then
+    return LOffset;
+  end;
+  if not AHandle->Crt.StreamRead then
+    return LLow + LOffset;
+  end;
+  if AHandle->Crt.Count = 0 then
+    return LLow;
+  end;
+  return LLow - AHandle->Crt.Count;
+end;
+
+// ucrt's buffer drop on fseek / rewind (__acrt_stdio_reset_buffer and the flag rules after
+// it): the buffer empties (ungetc's bytes with it); an update stream forgets whether it read
+// or wrote; a read-only stream's next fill asks for the small size after an fseek
+// (ASmallBuffer), not after a rewind
+routine DoCrtResetLocked(const AHandle: ptr to HookHandle; const ASmallBuffer: bool);
+begin
+  AHandle->Crt.Next := 0;
+  AHandle->Crt.Count := 0;
+  if AHandle->Crt.StreamUpdate then
+    AHandle->Crt.StreamRead := false;
+    AHandle->Crt.StreamWrite := false;
+    return;
+  end;
+  if ASmallBuffer and AHandle->Crt.StreamRead and DoCrtOwnBuffer(AHandle) then
+    AHandle->Crt.BufferSize := ADAM_HOOKIO_SMALL_BUFFER_SIZE;
+  end;
+end;
+
+// ucrt's fseek fast track for a read-only binary stream (fseek.cpp
+// common_fseek_binary_mode_read_only_fast_track_nolock): a target from the start or the
+// caller's place that lies within the buffer (back to its start, on to its last byte read
+// ahead) only moves Next; the buffer, the descriptor and the next fill's size stay. The
+// start's place is taken as the descriptor's place minus the bytes left. True: done
+routine DoCrtSeekInBufferLocked(const AHandle: ptr to HookHandle; const AOffset: int64;
+  const AOrigin: int32): bool;
+var
+  LMove: int64;
+  LHere: int64;
+begin
+  if AOrigin = ADAM_HOOKIO_SEEK_END then
+    return false;
+  end;
+  if (not AHandle->Crt.HasBuffer) or AHandle->Crt.StreamWrite or AHandle->Crt.StreamUpdate then
+    return false;
+  end;
+  if (AHandle->Crt.Count <= 0) or AHandle->Text then
+    return false;
+  end;
+  LMove := AOffset;
+  if AOrigin = ADAM_HOOKIO_SEEK_SET then
+    LHere := AHandle->Position - AHandle->Crt.Count;
+    // ucrt refuses the fast track when the difference overflows
+    if (LHere < 0) and (AOffset > ADAM_HOOKIO_MAX_BYTES + LHere) then
+      return false;
+    end;
+    if (LHere > 0) and (AOffset < ADAM_HOOKIO_MIN_BYTES + LHere) then
+      return false;
+    end;
+    LMove := AOffset - LHere;
+  end;
+  if (LMove < 0 - AHandle->Crt.Next) or (LMove > AHandle->Crt.Count) then
+    return false;
+  end;
+  AHandle->Crt.Next := AHandle->Crt.Next + LMove;
+  AHandle->Crt.Count := AHandle->Crt.Count - LMove;
+  return true;
+end;
+
+// ucrt's fseek: AOffset from the start (SEEK_SET), the caller's place (SEEK_CUR) or the end
+// (SEEK_END); an unknown origin fails with EINVAL. Past a valid origin AtEnd is cleared
+// whether or not the seek then succeeds; a read-only binary stream whose target lies in its
+// buffer only moves in it (DoCrtSeekInBufferLocked); otherwise SEEK_CUR's place is ucrt's
+// ftell, the buffer is flushed and dropped (a read-only stream's next fill asks for the small
+// size) and the descriptor moves: the target must be reachable in the IO (past the end when
+// the IO allows it); before the start or out of reach fails with EINVAL; success clears the
+// Ctrl-Z end. Returns 0 or -1
+routine DoSeekLocked(const AHandle: ptr to HookHandle; const AOffset: int64;
+  const AOrigin: int32): int32;
+var
+  LBase: int64;
+  LTarget: int64;
+begin
+  if (AOrigin <> ADAM_HOOKIO_SEEK_SET) and (AOrigin <> ADAM_HOOKIO_SEEK_CUR) and
+    (AOrigin <> ADAM_HOOKIO_SEEK_END) then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return -1;
+  end;
+  AHandle->AtEnd := false;
+  if DoCrtSeekInBufferLocked(AHandle, AOffset, AOrigin) then
+    return 0;
+  end;
+  // SEEK_CUR's place is taken before the buffer is flushed and dropped (the flush's result
+  // is not checked: ucrt's fseek does not)
+  LBase := 0;
+  if AOrigin = ADAM_HOOKIO_SEEK_CUR then
+    LBase := DoCrtTellLocked(AHandle);
+  end;
+  DoCrtFlushLocked(AHandle);
+  DoCrtResetLocked(AHandle, true);
+  if AOrigin = ADAM_HOOKIO_SEEK_END then
+    LBase := IOSize(AHandle->Stream);
+    // An IO with no size may still know its end
+    if LBase < 0 then
+      LBase := IOSeek(AHandle->Stream, 0, SeekOrigin.FromEnd);
+    end;
+    if LBase < 0 then
+      SetCErrno(ADAM_ERRNO_EINVAL);
+      return -1;
+    end;
+  end;
+  // LBase is never below 0 here but for a place before the start (ungetc at 0); the sum is
+  // checked before it is formed
+  if (AOffset > 0) and (LBase > ADAM_HOOKIO_MAX_BYTES - AOffset) then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return -1;
+  end;
+  LTarget := LBase + AOffset;
+  if LTarget < 0 then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return -1;
+  end;
+  if IOSeek(AHandle->Stream, LTarget, SeekOrigin.FromStart) <> LTarget then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return -1;
+  end;
+  AHandle->Position := LTarget;
+  // lowio's lseek clears the Ctrl-Z end
+  AHandle->Crt.LowEof := false;
+  return 0;
+end;
+
+// One byte as ucrt's _fgetc_nolock reads it (--_cnt >= 0 ? *_ptr++ : _filbuf): the buffer's
+// next byte, a refill when the buffer is empty (EOF as the refill gives it). Written bytes in
+// the buffer are flushed first (DoCrtLeaveWriteLocked)
+routine DoCrtGetLocked(const AHandle: ptr to HookHandle): int32;
+var
+  LByte: uint8;
+begin
+  if not DoCrtLeaveWriteLocked(AHandle, false) then
+    return ADAM_HOOKIO_EOF;
+  end;
+  if AHandle->Crt.HasBuffer and (AHandle->Crt.Count > 0) then
+    AHandle->Crt.Count := AHandle->Crt.Count - 1;
+    LByte := DoCrtData(AHandle)[AHandle->Crt.Next];
+    AHandle->Crt.Next := AHandle->Crt.Next + 1;
+    return int32(LByte);
+  end;
+  return DoCrtRefillLocked(AHandle);
+end;
+
+// ucrt's ungetc (ungetc.cpp _ungetc_nolock, a file stream, text or binary alike): AChar goes
+// into the buffer in front of the next byte. Refused (EOF) for EOF itself, for a stream that
+// has not read unless it is an update stream that writes, and when the next byte is already
+// the buffer's first while bytes are left (one ungot byte at the front, no room for another).
+// A stream with no buffer gets one first; at the front of an empty buffer the byte takes its
+// first slot. AtEnd is cleared, the stream counts as reading. Returns the byte (0..255) or
+// EOF. On an update stream holding written bytes ucrt puts the byte over the last one
+// written and the rest are lost: here the ungetc behaves as after the fflush C requires
+// before a read (the written bytes land, the stream no longer writes, and ucrt's rule then
+// refuses the byte)
+routine DoCrtUngetLocked(const AHandle: ptr to HookHandle; const AChar: int32): int32;
+var
+  LData: ptr to uint8;
+begin
+  if AChar = ADAM_HOOKIO_EOF then
+    return ADAM_HOOKIO_EOF;
+  end;
+  if AHandle->Crt.StreamUpdate and (not AHandle->Crt.StreamRead) and (AHandle->Crt.Next <> 0) and
+    (DoCrtFlushLocked(AHandle) = ADAM_HOOKIO_EOF) then
+    return ADAM_HOOKIO_EOF;
+  end;
+  if (not AHandle->Crt.StreamRead) and
+    (not (AHandle->Crt.StreamUpdate and AHandle->Crt.StreamWrite)) then
+    return ADAM_HOOKIO_EOF;
+  end;
+  DoCrtAllocateLocked(AHandle);
+  if AHandle->Crt.Next = 0 then
+    if AHandle->Crt.Count <> 0 then
+      return ADAM_HOOKIO_EOF;
+    end;
+    AHandle->Crt.Next := 1;
+  end;
+  AHandle->Crt.Next := AHandle->Crt.Next - 1;
+  LData := DoCrtData(AHandle);
+  LData[AHandle->Crt.Next] := uint8(AChar & 0xFF);
+  AHandle->Crt.Count := AHandle->Crt.Count + 1;
+  AHandle->AtEnd := false;
+  AHandle->Crt.StreamRead := true;
+  return AChar & 0xFF;
+end;
+
+// _flsbuf.cpp stream_is_at_end_of_file_nolock: feof is set; else not when a big buffer's Next
+// is at its start; else the descriptor's place is the IO's size (an IO with no size is not at
+// the end, as a failed query is not)
+routine DoCrtAtEndLocked(const AHandle: ptr to HookHandle): bool;
+var
+  LSize: int64;
+begin
+  if AHandle->AtEnd then
+    return true;
+  end;
+  if DoCrtBigBuffer(AHandle) and (AHandle->Crt.Next = 0) then
+    return false;
+  end;
+  LSize := IOSize(AHandle->Stream);
+  if LSize < 0 then
+    return false;
+  end;
+  return AHandle->Position = LSize;
+end;
+
+// _flsbuf.cpp write_buffer_nolock: with a big buffer its written bytes go to lowio (none: an
+// append stream's descriptor goes to the IO's end, a failed seek is Failed), the buffer then
+// holds the character's ASize bytes alone (Next ASize, Count the rest); without one the
+// character goes to lowio by itself. True when every byte asked was written
+routine DoCrtWriteBufferLocked(const AHandle: ptr to HookHandle; const AChar: ptr to uint8;
+  const ASize: int64): bool;
+var
+  LToWrite: int64;
+  LWritten: int64;
+  LEnd: int64;
+begin
+  if not DoCrtBigBuffer(AHandle) then
+    return DoLowWriteLocked(AHandle, AChar, ASize) = ASize;
+  end;
+  LToWrite := AHandle->Crt.Next;
+  LWritten := 0;
+  AHandle->Crt.Next := ASize;
+  AHandle->Crt.Count := AHandle->Crt.BufferSize - ASize;
+  if LToWrite > 0 then
+    LWritten := DoLowWriteLocked(AHandle, DoCrtData(AHandle), LToWrite);
+  else
+    if AHandle->Appending then
+      LEnd := IOSeek(AHandle->Stream, 0, SeekOrigin.FromEnd);
+      if LEnd < 0 then
+        // ucrt returns its EOF from this bool function here, which is true: the stream is
+        // flagged, the character is not stored, and its caller reports success
+        AHandle->Failed := true;
+        return true;
+      end;
+      // lowio's lseek clears the Ctrl-Z end
+      AHandle->Position := LEnd;
+      AHandle->Crt.LowEof := false;
+    end;
+  end;
+  CopyBytes(DoCrtData(AHandle), AChar, ASize);
+  return LWritten = LToWrite;
+end;
+
+// ucrt's flush-and-write (_flsbuf.cpp common_flush_and_write_nolock) of a character of ASize
+// bytes: a stream that neither writes nor updates fails (EBADF, Failed). A reading stream may
+// turn to writing only at the end (DoCrtAtEndLocked); its buffer is dropped either way, and
+// elsewhere it fails (Failed). The stream then writes, AtEnd is cleared, a stream with no
+// buffer gets ucrt's, and the character goes through DoCrtWriteBufferLocked (a short write:
+// Failed). False: the character failed (the caller's EOF)
+routine DoCrtFlushAndWriteCharLocked(const AHandle: ptr to HookHandle; const AChar: ptr to uint8;
+  const ASize: int64): bool;
+var
+  LSwitch: bool;
+begin
+  if (not AHandle->Crt.StreamWrite) and (not AHandle->Crt.StreamUpdate) then
+    SetCErrno(ADAM_ERRNO_EBADF);
+    AHandle->Failed := true;
+    return false;
+  end;
+  if AHandle->Crt.StreamRead then
+    LSwitch := DoCrtAtEndLocked(AHandle);
+    AHandle->Crt.Count := 0;
+    if not LSwitch then
+      AHandle->Failed := true;
+      return false;
+    end;
+    AHandle->Crt.Next := 0;
+    AHandle->Crt.StreamRead := false;
+  end;
+  AHandle->Crt.StreamWrite := true;
+  AHandle->AtEnd := false;
+  AHandle->Crt.Count := 0;
+  DoCrtAllocateLocked(AHandle);
+  if not DoCrtWriteBufferLocked(AHandle, AChar, ASize) then
+    AHandle->Failed := true;
+    return false;
+  end;
+  return true;
+end;
+
+// __acrt_stdio_flush_and_write_narrow_nolock: the byte (0..255) or EOF
+routine DoCrtFlushAndWriteLocked(const AHandle: ptr to HookHandle; const AChar: int32): int32;
+var
+  LByte: uint8;
+begin
+  LByte := uint8(AChar & 0xFF);
+  if not DoCrtFlushAndWriteCharLocked(AHandle, addr of LByte, 1) then
+    return ADAM_HOOKIO_EOF;
+  end;
+  return AChar & 0xFF;
+end;
+
+// One byte as ucrt's _fputc_nolock writes it: into the buffer while it has room (--_cnt >=
+// 0), else DoCrtFlushAndWriteLocked. Returns the byte (0..255) or EOF. ucrt's fast path also
+// stores into a buffer holding bytes read ahead, and on an update stream the byte is then lost
+// (a reading buffer is never flushed): here the write takes the fseek(SEEK_CUR, 0) C requires
+// between a read and a write first, so the byte lands at the caller's place. A read-only
+// stream keeps ucrt's rule (the byte replaces the next byte read ahead and fputc succeeds):
+// nothing could have been written there
+routine DoCrtPutLocked(const AHandle: ptr to HookHandle; const AChar: int32): int32;
+var
+  LData: ptr to uint8;
+begin
+  if AHandle->Crt.StreamUpdate and AHandle->Crt.StreamRead and (AHandle->Crt.Count > 0) then
+    DoSeekLocked(AHandle, 0, ADAM_HOOKIO_SEEK_CUR);
+  end;
+  AHandle->Crt.Count := AHandle->Crt.Count - 1;
+  if AHandle->Crt.Count < 0 then
+    return DoCrtFlushAndWriteLocked(AHandle, AChar);
+  end;
+  LData := DoCrtData(AHandle);
+  LData[AHandle->Crt.Next] := uint8(AChar & 0xFF);
+  AHandle->Crt.Next := AHandle->Crt.Next + 1;
+  return AChar & 0xFF;
+end;
+
+// A write of ASize bytes from AData, as ucrt's fwrite (fwrite.cpp _fwrite_nolock_internal):
+// while a big buffer has room the bytes are copied in (a reading stream with bytes read ahead
+// stops there, nothing flagged); with no room, at least one buffer's size goes first through
+// a flush and then straight to lowio as the largest whole multiple of that size (at most
+// UINT_MAX - 1 bytes at a time); less goes one byte through DoCrtFlushAndWriteLocked, after
+// which the buffer's own size counts. A failure stops the write (Failed). Returns the count
+// written
+routine DoCrtWriteLocked(const AHandle: ptr to HookHandle; const AData: ptr to uint8;
+  const ASize: int64): int64;
+var
+  LBufferSize: int64;
+  LRemaining: int64;
+  LTake: int64;
+  LGot: int64;
+  LAt: int64;
+begin
+  if ASize <= 0 then
+    return 0;
+  end;
+  if AHandle->Crt.HasBuffer then
+    LBufferSize := AHandle->Crt.BufferSize;
+  else
+    LBufferSize := ADAM_HOOKIO_BUFFER_SIZE;
+  end;
+  LRemaining := ASize;
+  LAt := 0;
+  while LRemaining <> 0 do
+    if DoCrtBigBuffer(AHandle) and (AHandle->Crt.Count <> 0) then
+      if AHandle->Crt.Count < 0 then
+        AHandle->Failed := true;
+        leave;
+      end;
+      if AHandle->Crt.StreamRead then
+        leave;
+      end;
+      LTake := LRemaining;
+      if LTake > AHandle->Crt.Count then
+        LTake := AHandle->Crt.Count;
+      end;
+      CopyBytes(DoCrtData(AHandle) + AHandle->Crt.Next, AData + LAt, LTake);
+      LRemaining := LRemaining - LTake;
+      AHandle->Crt.Count := AHandle->Crt.Count - LTake;
+      AHandle->Crt.Next := AHandle->Crt.Next + LTake;
+      LAt := LAt + LTake;
+    else
+      if LRemaining >= LBufferSize then
+        if DoCrtBigBuffer(AHandle) and (DoCrtFlushLocked(AHandle) <> 0) then
+          leave;
+        end;
+        LTake := LRemaining;
+        if LBufferSize > 0 then
+          LTake := LRemaining - (LRemaining mod LBufferSize);
+        end;
+        if LTake > ADAM_HOOKIO_LOW_WRITE_MAX then
+          LTake := ADAM_HOOKIO_LOW_WRITE_MAX;
+        end;
+        LGot := DoLowWriteLocked(AHandle, AData + LAt, LTake);
+        if LGot < 0 then
+          AHandle->Failed := true;
+          leave;
+        end;
+        if LGot > LTake then
+          LGot := LTake;
+        end;
+        LRemaining := LRemaining - LGot;
+        LAt := LAt + LGot;
+        if LGot < LTake then
+          AHandle->Failed := true;
+          leave;
+        end;
+      else
+        if DoCrtFlushAndWriteLocked(AHandle, int32(AData[LAt])) = ADAM_HOOKIO_EOF then
+          leave;
+        end;
+        LAt := LAt + 1;
+        LRemaining := LRemaining - 1;
+        LBufferSize := AHandle->Crt.BufferSize;
+        if LBufferSize <= 0 then
+          LBufferSize := 1;
+        end;
+      end;
+    end;
+  end;
+  return ASize - LRemaining;
+end;
+
+// The IO's IOFlush for a handle that writes; 0 or EOF (Failed, errno EIO)
+routine DoFlushIOLocked(const AHandle: ptr to HookHandle): int32;
+begin
+  if not DoCanWrite(AHandle) then
+    return 0;
+  end;
+  if IOFlush(AHandle->Stream) then
+    return 0;
+  end;
+  AHandle->Failed := true;
+  SetCErrno(ADAM_ERRNO_EIO);
+  return ADAM_HOOKIO_EOF;
+end;
+
+// What fflush(NULL) does to one handle: only a handle holding written bytes flushes them
+// (ucrt's common_flush_all: a stream that writes and does not read). 0 or EOF
+routine DoCrtFlushWrittenLocked(const AHandle: ptr to HookHandle): int32;
+begin
+  if AHandle->Crt.StreamRead or (not AHandle->Crt.StreamWrite) then
+    return 0;
+  end;
+  return DoCrtFlushLocked(AHandle);
+end;
+
+// fflush(NULL)'s half for HookIO: every open handle's written bytes, then its IO's IOFlush,
+// each under its own stream lock (the list is copied out under the registry lock, each handle
+// held by one more user meanwhile); 0, or EOF when any failed
+routine DoFlushAll(): int32;
+var
+  LOpen: array of ptr to HookHandle;
+  LHandle: ptr to HookHandle;
+  LResult: int32;
+  LI: int64;
+begin
+  LResult := 0;
+  if atomicload(GOpenCount) = 0 then
+    return LResult;
+  end;
+  lock (GLock) do
+    setlength(LOpen, len(GHandles));
+    for LI := 0 to len(GHandles) - 1 do
+      LHandle := GHandles[LI];
+      LHandle->Users := LHandle->Users + 1;
+      LOpen[LI] := LHandle;
+    end;
+  end;
+  for LI := 0 to len(LOpen) - 1 do
+    LHandle := LOpen[LI];
+    lock (LHandle->Lock->Lock) do
+      if not LHandle->Closed then
+        if DoCrtFlushWrittenLocked(LHandle) <> 0 then
+          LResult := ADAM_HOOKIO_EOF;
+        end;
+        if DoFlushIOLocked(LHandle) <> 0 then
+          LResult := ADAM_HOOKIO_EOF;
+        end;
+      end;
+    end;
+    DoReleaseHandle(LHandle);
+  end;
+  return LResult;
+end;
+
 // A hooked fclose. False: not a HookIO handle, the caller passes it to the C runtime. True:
-// closed; AResult 0, or EOF when closing its own IO failed (the handle closes anyway). The
-// handle is freed when the last call holding it gives it back
+// closed; AResult 0, or EOF when ucrt's flush of written bytes or closing its own IO failed
+// (the handle closes anyway). The handle is freed when the last call holding it gives it back
 routine DoClose(const AFile: ptr; var AResult: int32): bool;
 var
   LHandle: ptr to HookHandle;
@@ -1377,6 +2323,10 @@ begin
   LOk := true;
   lock (LHandle->Lock->Lock) do
     if not LHandle->Closed then
+      // ucrt's fclose flushes the written bytes first; a failure makes the close EOF
+      if DoCrtFlushLocked(LHandle) <> 0 then
+        LOk := false;
+      end;
       LHandle->Closed := true;
       if LHandle->Owned and (not IOClose(LHandle->Stream)) then
         LOk := false;
@@ -1395,73 +2345,6 @@ begin
   return true;
 end;
 
-// The body of a read, under the handle's stream lock: up to ATotal bytes into ABuffer from the
-// handle's place, the count read back. A short read sets the end (the IO's Eof) or the error
-// state; a handle that cannot read is in the error state at once
-routine DoReadLocked(const AHandle: ptr to HookHandle; const ABuffer: ptr;
-  const ATotal: int64): int64;
-var
-  LGot: int64;
-begin
-  if AHandle->Closed then
-    return 0;
-  end;
-  if (AHandle->Mode = FileMode.Write) or (AHandle->Mode = FileMode.Append) then
-    AHandle->Failed := true;
-    return 0;
-  end;
-  if IOSeek(AHandle->Stream, AHandle->Position, SeekOrigin.FromStart) <> AHandle->Position then
-    AHandle->Failed := true;
-    return 0;
-  end;
-  LGot := IORead(AHandle->Stream, ABuffer, ATotal);
-  AHandle->Position := AHandle->Position + LGot;
-  if LGot < ATotal then
-    if IOStatus(AHandle->Stream) = IOState.Eof then
-      AHandle->AtEnd := true;
-    else
-      AHandle->Failed := true;
-    end;
-  end;
-  return LGot;
-end;
-
-// The body of a write, under the handle's stream lock: ATotal bytes from ABuffer at the
-// handle's place (an appending handle's at the IO's end), the count written back; a short
-// write sets the error state, as does a handle that cannot write
-routine DoWriteLocked(const AHandle: ptr to HookHandle; const ABuffer: ptr;
-  const ATotal: int64): int64;
-var
-  LPlace: int64;
-  LPut: int64;
-begin
-  if AHandle->Closed then
-    return 0;
-  end;
-  if AHandle->Mode = FileMode.Read then
-    AHandle->Failed := true;
-    return 0;
-  end;
-  if AHandle->Appending then
-    LPlace := IOSeek(AHandle->Stream, 0, SeekOrigin.FromEnd);
-  else
-    LPlace := IOSeek(AHandle->Stream, AHandle->Position, SeekOrigin.FromStart);
-    if LPlace <> AHandle->Position then
-      LPlace := -1;
-    end;
-  end;
-  if LPlace < 0 then
-    AHandle->Failed := true;
-    return 0;
-  end;
-  LPut := IOWrite(AHandle->Stream, ABuffer, ATotal);
-  AHandle->Position := LPlace + LPut;
-  if LPut < ATotal then
-    AHandle->Failed := true;
-  end;
-  return LPut;
-end;
-
 // The byte count of ACount items of ASize bytes; 0 when either is 0 or less, or the count
 // passes int64
 routine DoItemBytes(const ASize: int64; const ACount: int64): int64;
@@ -1475,34 +2358,436 @@ begin
   return ASize * ACount;
 end;
 
-// A hooked fread / fwrite (AWrite). False: not a HookIO handle, the caller passes it to the C
-// runtime. True: handled; AResult is the count of whole items moved
-routine DoTransfer(const ABuffer: ptr; const ASize: int64; const ACount: int64;
-  const AFile: ptr; const AWrite: bool; var AResult: int64): bool;
+// A call of AOp whose answer, until it runs, is AFail; no arguments yet
+routine DoCall(const AOp: HookOp; const AFail: int64): HookCall;
+var
+  LCall: HookCall;
+begin
+  LCall.Op := AOp;
+  LCall.Buffer := nil;
+  LCall.Size := 0;
+  LCall.ItemSize := 0;
+  LCall.Offset := 0;
+  LCall.Origin := 0;
+  LCall.Value := 0;
+  LCall.Answer := AFail;
+  return LCall;
+end;
+
+// C's truth value of a flag: 1 or 0
+routine DoFlagValue(const AFlag: bool): int64;
+begin
+  if AFlag then
+    return 1;
+  end;
+  return 0;
+end;
+
+// fread: whole elements; a partial one is read and not counted (nothing for no bytes)
+routine DoCallRead(const AHandle: ptr to HookHandle; var ACall: HookCall);
+begin
+  if ACall.Size > 0 then
+    ACall.Answer := DoCrtReadLocked(AHandle, ACall.Buffer, ACall.Size) div ACall.ItemSize;
+  end;
+end;
+
+// fwrite: whole elements written (nothing for no bytes)
+routine DoCallWrite(const AHandle: ptr to HookHandle; var ACall: HookCall);
+begin
+  if ACall.Size > 0 then
+    ACall.Answer := DoCrtWriteLocked(AHandle, ACall.Buffer, ACall.Size) div ACall.ItemSize;
+  end;
+end;
+
+// fgets: up to Size - 1 bytes into Buffer, stopping after a newline, then a 0; Answer 1. One
+// getc at a time, as ucrt's fgets reads. Answer stays 0 (C's nil) when nothing was read before
+// the end, on an error of this call (the error flag is sticky: only a new error counts), and
+// for no buffer or a count of 0 or less (EINVAL)
+routine DoCallGets(const AHandle: ptr to HookHandle; var ACall: HookCall);
+var
+  LFailedBefore: bool;
+  LCount: int64;
+  LByte: int32;
+begin
+  LFailedBefore := AHandle->Failed;
+  if (ACall.Buffer = nil) or (ACall.Size <= 0) then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return;
+  end;
+  LCount := 0;
+  while LCount < ACall.Size - 1 do
+    LByte := DoCrtGetLocked(AHandle);
+    if LByte = ADAM_HOOKIO_EOF then
+      leave;
+    end;
+    ACall.Buffer[LCount] := uint8(LByte);
+    LCount := LCount + 1;
+    if LByte = ADAM_HOOKIO_NEWLINE then
+      leave;
+    end;
+  end;
+  if AHandle->Failed and (not LFailedBefore) then
+    return;
+  end;
+  if (LCount = 0) and (ACall.Size > 1) then
+    return;
+  end;
+  ACall.Buffer[LCount] := 0;
+  ACall.Answer := 1;
+end;
+
+// fputs: Size bytes of Buffer through ucrt's fwrite; ucrt's success value, else EOF. No text
+// (nil) is refused like ucrt's invalid parameter (EINVAL)
+routine DoCallPuts(const AHandle: ptr to HookHandle; var ACall: HookCall);
+begin
+  if ACall.Buffer = nil then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return;
+  end;
+  if DoCrtWriteLocked(AHandle, ACall.Buffer, ACall.Size) = ACall.Size then
+    ACall.Answer := ADAM_HOOKIO_PUTS_OK;
+  end;
+end;
+
+// rewind, as ucrt's (rewind.cpp): written bytes are flushed, the buffer is dropped without
+// fseek's small-size rule (and never by its fast track), both flags and the Ctrl-Z end are
+// cleared, then the descriptor goes to 0; a failed seek sets Failed again
+routine DoCallRewind(const AHandle: ptr to HookHandle);
+begin
+  DoCrtFlushLocked(AHandle);
+  DoCrtResetLocked(AHandle, false);
+  AHandle->AtEnd := false;
+  AHandle->Failed := false;
+  AHandle->Crt.LowEof := false;
+  if IOSeek(AHandle->Stream, 0, SeekOrigin.FromStart) = 0 then
+    AHandle->Position := 0;
+  else
+    AHandle->Failed := true;
+  end;
+end;
+
+// clearerr: both flags, and the Ctrl-Z end as ucrt's clears it
+routine DoCallClearError(const AHandle: ptr to HookHandle);
+begin
+  AHandle->AtEnd := false;
+  AHandle->Failed := false;
+  AHandle->Crt.LowEof := false;
+end;
+
+// fflush of one handle: ucrt's flush of its written bytes (a reading stream is left alone),
+// then the IO's own IOFlush; 0 or EOF
+routine DoCallFlush(const AHandle: ptr to HookHandle; var ACall: HookCall);
+begin
+  if DoCrtFlushLocked(AHandle) = ADAM_HOOKIO_EOF then
+    return;
+  end;
+  ACall.Answer := DoFlushIOLocked(AHandle);
+end;
+
+// ACall run on AHandle, under its stream lock. fileno: a handle has no descriptor (EBADF, the
+// answer stays -1)
+routine DoRun(const AHandle: ptr to HookHandle; var ACall: HookCall);
+begin
+  match ACall.Op of
+    HookOp.Read: DoCallRead(AHandle, ACall);
+    HookOp.Write: DoCallWrite(AHandle, ACall);
+    HookOp.Get: ACall.Answer := DoCrtGetLocked(AHandle);
+    HookOp.Gets: DoCallGets(AHandle, ACall);
+    HookOp.Unget: ACall.Answer := DoCrtUngetLocked(AHandle, ACall.Value);
+    HookOp.Put: ACall.Answer := DoCrtPutLocked(AHandle, ACall.Value);
+    HookOp.Puts: DoCallPuts(AHandle, ACall);
+    HookOp.Seek: ACall.Answer := DoSeekLocked(AHandle, ACall.Offset, ACall.Origin);
+    HookOp.Tell: ACall.Answer := DoCrtTellLocked(AHandle);
+    HookOp.Rewind: DoCallRewind(AHandle);
+    HookOp.AtEnd: ACall.Answer := DoFlagValue(AHandle->AtEnd);
+    HookOp.Failed: ACall.Answer := DoFlagValue(AHandle->Failed);
+    HookOp.ClearError: DoCallClearError(AHandle);
+    HookOp.Flush: DoCallFlush(AHandle, ACall);
+    HookOp.Fileno: SetCErrno(ADAM_ERRNO_EBADF);
+  end;
+end;
+
+// Runs ACall on AFile's handle under its stream lock. False: AFile is not a HookIO handle (the
+// hook then calls the C runtime). A handle closed by a call that raced this one fails with
+// EBADF (the call does not run; its answer stays the failure value)
+routine DoWith(const AFile: ptr; var ACall: HookCall): bool;
 var
   LHandle: ptr to HookHandle;
-  LTotal: int64;
-  LMoved: int64;
 begin
-  AResult := 0;
   LHandle := DoFindHandle(AFile);
   if LHandle = nil then
     return false;
   end;
-  LTotal := DoItemBytes(ASize, ACount);
-  LMoved := 0;
-  if LTotal > 0 then
-    lock (LHandle->Lock->Lock) do
-      if AWrite then
-        LMoved := DoWriteLocked(LHandle, ABuffer, LTotal);
-      else
-        LMoved := DoReadLocked(LHandle, ABuffer, LTotal);
-      end;
+  lock (LHandle->Lock->Lock) do
+    if LHandle->Closed then
+      SetCErrno(ADAM_ERRNO_EBADF);
+    else
+      DoRun(LHandle, ACall);
     end;
-    AResult := LMoved div ASize;
   end;
   DoReleaseHandle(LHandle);
   return true;
+end;
+
+// The real function AName (HookReal fills ASlot once); nil with ENOSYS when the C runtime has
+// no such function
+routine DoReal(var ASlot: ptr; const AName: ptr to const char): ptr;
+var
+  LFound: ptr;
+begin
+  LFound := HookReal(ASlot, AName);
+  if LFound = nil then
+    SetCErrno(ADAM_ERRNO_ENOSYS);
+  end;
+  return LFound;
+end;
+
+// A hooked fread / fwrite (AOp Read / Write) of ACount items of ASize bytes at ABuffer. False:
+// not a HookIO handle. True: handled; AResult is the count of whole items moved
+routine DoTransfer(const AOp: HookOp; const ABuffer: ptr; const ASize: int64;
+  const ACount: int64; const AFile: ptr; var AResult: int64): bool;
+var
+  LCall: HookCall;
+begin
+  AResult := 0;
+  LCall := DoCall(AOp, 0);
+  LCall.Buffer := ptr to uint8(ABuffer);
+  LCall.ItemSize := ASize;
+  LCall.Size := DoItemBytes(ASize, ACount);
+  if not DoWith(AFile, LCall) then
+    return false;
+  end;
+  AResult := LCall.Answer;
+  return true;
+end;
+
+// A hooked C function of int (FILE*) form (fgetc, getc, feof, ferror, fileno and their
+// _nolock forms): AOp on a handle, AFail when it fails; anything else goes to the real
+// function AName (ASlot its slot), AFail with ENOSYS when the C runtime has none
+routine DoFileInt(const AOp: HookOp; const AFail: int32; const AFile: ptr; var ASlot: ptr;
+  const AName: ptr to const char): int32;
+var
+  LCall: HookCall;
+  LFound: ptr;
+  LReal: FileIntFn;
+begin
+  LCall := DoCall(AOp, AFail);
+  if DoWith(AFile, LCall) then
+    return int32(LCall.Answer);
+  end;
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return AFail;
+  end;
+  LReal := FileIntFn(LFound);
+  return LReal(AFile);
+end;
+
+// A hooked C function of void (FILE*) form (rewind, clearerr): AOp on a handle, anything else
+// goes to the real function AName (ASlot its slot)
+routine DoFileVoid(const AOp: HookOp; const AFile: ptr; var ASlot: ptr;
+  const AName: ptr to const char);
+var
+  LCall: HookCall;
+  LFound: ptr;
+  LReal: FileVoidFn;
+begin
+  LCall := DoCall(AOp, 0);
+  if DoWith(AFile, LCall) then
+    return;
+  end;
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return;
+  end;
+  LReal := FileVoidFn(LFound);
+  LReal(AFile);
+end;
+
+// A hooked C function of int (int, FILE*) form (fputc, putc, ungetc and their _nolock forms):
+// AOp with the byte AChar on a handle (EOF when it fails), anything else goes to the real
+// function AName (ASlot its slot)
+routine DoCharFile(const AOp: HookOp; const AChar: int32; const AFile: ptr; var ASlot: ptr;
+  const AName: ptr to const char): int32;
+var
+  LCall: HookCall;
+  LFound: ptr;
+  LReal: CharFileFn;
+begin
+  LCall := DoCall(AOp, ADAM_HOOKIO_EOF);
+  LCall.Value := AChar;
+  if DoWith(AFile, LCall) then
+    return int32(LCall.Answer);
+  end;
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return ADAM_HOOKIO_EOF;
+  end;
+  LReal := CharFileFn(LFound);
+  return LReal(AChar, AFile);
+end;
+
+// A hooked fseek of AOffset from AOrigin. False: not a HookIO handle. True: AResult 0 or -1
+routine DoSeekCall(const AFile: ptr; const AOffset: int64; const AOrigin: int32;
+  var AResult: int32): bool;
+var
+  LCall: HookCall;
+begin
+  AResult := -1;
+  LCall := DoCall(HookOp.Seek, -1);
+  LCall.Offset := AOffset;
+  LCall.Origin := AOrigin;
+  if not DoWith(AFile, LCall) then
+    return false;
+  end;
+  AResult := int32(LCall.Answer);
+  return true;
+end;
+
+// A hooked ftell. False: not a HookIO handle. True: APlace is ucrt's ftell on the handle's
+// model as it is (its own refusals set errno; ucrt checks no sign)
+routine DoTellCall(const AFile: ptr; var APlace: int64): bool;
+var
+  LCall: HookCall;
+begin
+  APlace := -1;
+  LCall := DoCall(HookOp.Tell, -1);
+  if not DoWith(AFile, LCall) then
+    return false;
+  end;
+  APlace := LCall.Answer;
+  return true;
+end;
+
+// fseek / _fseek_nolock (C's long offset)
+routine DoFseek(const AFile: ptr; const AOffset: clong; const AOrigin: int32; var ASlot: ptr;
+  const AName: ptr to const char): int32;
+var
+  LResult: int32;
+  LFound: ptr;
+  LReal: FseekFn;
+begin
+  if DoSeekCall(AFile, int64(AOffset), AOrigin, LResult) then
+    return LResult;
+  end;
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return -1;
+  end;
+  LReal := FseekFn(LFound);
+  return LReal(AFile, AOffset, AOrigin);
+end;
+
+// _fseeki64 / _fseeki64_nolock (a 64-bit offset)
+routine DoFseeki64(const AFile: ptr; const AOffset: int64; const AOrigin: int32;
+  var ASlot: ptr; const AName: ptr to const char): int32;
+var
+  LResult: int32;
+  LFound: ptr;
+  LReal: Fseeki64Fn;
+begin
+  if DoSeekCall(AFile, AOffset, AOrigin, LResult) then
+    return LResult;
+  end;
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return -1;
+  end;
+  LReal := Fseeki64Fn(LFound);
+  return LReal(AFile, AOffset, AOrigin);
+end;
+
+// ftell / _ftell_nolock: a place past what a long holds is -1 with EINVAL, as ucrt's ftell
+// gives (a negative place goes back as it is)
+routine DoFtell(const AFile: ptr; var ASlot: ptr; const AName: ptr to const char): clong;
+var
+  LPlace: int64;
+  LFound: ptr;
+  LReal: FtellFn;
+begin
+  if DoTellCall(AFile, LPlace) then
+    if LPlace > ADAM_HOOKIO_LONG_MAX then
+      SetCErrno(ADAM_ERRNO_EINVAL);
+      return clong(-1);
+    end;
+    return clong(LPlace);
+  end;
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return clong(-1);
+  end;
+  LReal := FtellFn(LFound);
+  return LReal(AFile);
+end;
+
+// _ftelli64 / _ftelli64_nolock
+routine DoFtelli64(const AFile: ptr; var ASlot: ptr; const AName: ptr to const char): int64;
+var
+  LPlace: int64;
+  LFound: ptr;
+  LReal: Ftelli64Fn;
+begin
+  if DoTellCall(AFile, LPlace) then
+    return LPlace;
+  end;
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return -1;
+  end;
+  LReal := Ftelli64Fn(LFound);
+  return LReal(AFile);
+end;
+
+// fflush / _fflush_nolock: a handle's written bytes, then its IO's IOFlush. Anything else
+// goes to the real function AName (ASlot its slot); NULL flushes every open handle too (EOF
+// when any of them failed, else the C runtime's result)
+routine DoFlush(const AFile: ptr; var ASlot: ptr; const AName: ptr to const char): int32;
+var
+  LCall: HookCall;
+  LFound: ptr;
+  LReal: FileIntFn;
+  LOurs: int32;
+  LResult: int32;
+begin
+  LCall := DoCall(HookOp.Flush, ADAM_HOOKIO_EOF);
+  if DoWith(AFile, LCall) then
+    return int32(LCall.Answer);
+  end;
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return ADAM_HOOKIO_EOF;
+  end;
+  LReal := FileIntFn(LFound);
+  if AFile = nil then
+    LOurs := DoFlushAll();
+    LResult := LReal(AFile);
+    if LOurs <> 0 then
+      return ADAM_HOOKIO_EOF;
+    end;
+    return LResult;
+  end;
+  return LReal(AFile);
+end;
+
+// _lock_file / _unlock_file: nothing on a handle (it has no CRT lock: each call takes its
+// stream lock itself); anything else goes to the real function AName (ASlot its slot)
+routine DoLockFile(const AFile: ptr; var ASlot: ptr; const AName: ptr to const char);
+var
+  LHandle: ptr to HookHandle;
+  LFound: ptr;
+  LReal: FileVoidFn;
+begin
+  LHandle := DoFindHandle(AFile);
+  if LHandle <> nil then
+    DoReleaseHandle(LHandle);
+    return;
+  end;
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return;
+  end;
+  LReal := FileVoidFn(LFound);
+  LReal(AFile);
 end;
 
 // The IO behind a handle: the registered IO, or the entry's IO for a source; nil for anything
@@ -1612,7 +2897,7 @@ begin
   return LReal(AFile);
 end;
 
-// fread: a handle reads from its IO at its place
+// fread: a handle reads through its ucrt FILE model
 public routine fread(const ABuffer: ptr; const ASize: int64; const ACount: int64;
   const AFile: ptr): int64;
 var
@@ -1620,20 +2905,39 @@ var
   LFound: ptr;
   LReal: FreadFn;
 begin
-  if DoTransfer(ABuffer, ASize, ACount, AFile, false, LResult) then
+  if DoTransfer(HookOp.Read, ABuffer, ASize, ACount, AFile, LResult) then
     return LResult;
   end;
-  LFound := HookReal(GRealFread, ptr to const char("fread"));
+  LFound := DoReal(GRealFread, ptr to const char("fread"));
   if LFound = nil then
-    SetCErrno(ADAM_ERRNO_ENOSYS);
     return 0;
   end;
   LReal := FreadFn(LFound);
   return LReal(ABuffer, ASize, ACount, AFile);
 end;
 
-// fwrite: a handle writes to its IO at its place. The runtime's own printing comes here too
-// (its `external` fwrite binds to this hook): stdout is no handle, so it goes to the real one
+// _fread_nolock: fread (a handle has no CRT lock)
+public routine _fread_nolock(const ABuffer: ptr; const ASize: int64; const ACount: int64;
+  const AFile: ptr): int64;
+var
+  LResult: int64;
+  LFound: ptr;
+  LReal: FreadFn;
+begin
+  if DoTransfer(HookOp.Read, ABuffer, ASize, ACount, AFile, LResult) then
+    return LResult;
+  end;
+  LFound := DoReal(GRealFreadNolock, ptr to const char("_fread_nolock"));
+  if LFound = nil then
+    return 0;
+  end;
+  LReal := FreadFn(LFound);
+  return LReal(ABuffer, ASize, ACount, AFile);
+end;
+
+// fwrite: a handle writes through its ucrt FILE model. The runtime's own printing comes here
+// too (its `external` fwrite binds to this hook): stdout is no handle, so it goes to the real
+// one
 public routine fwrite(const ABuffer: ptr; const ASize: int64; const ACount: int64;
   const AFile: ptr): int64;
 var
@@ -1641,16 +2945,259 @@ var
   LFound: ptr;
   LReal: FwriteFn;
 begin
-  if DoTransfer(ABuffer, ASize, ACount, AFile, true, LResult) then
+  if DoTransfer(HookOp.Write, ABuffer, ASize, ACount, AFile, LResult) then
     return LResult;
   end;
-  LFound := HookReal(GRealFwrite, ptr to const char("fwrite"));
+  LFound := DoReal(GRealFwrite, ptr to const char("fwrite"));
   if LFound = nil then
-    SetCErrno(ADAM_ERRNO_ENOSYS);
     return 0;
   end;
   LReal := FwriteFn(LFound);
   return LReal(ABuffer, ASize, ACount, AFile);
+end;
+
+// _fwrite_nolock: fwrite
+public routine _fwrite_nolock(const ABuffer: ptr; const ASize: int64; const ACount: int64;
+  const AFile: ptr): int64;
+var
+  LResult: int64;
+  LFound: ptr;
+  LReal: FwriteFn;
+begin
+  if DoTransfer(HookOp.Write, ABuffer, ASize, ACount, AFile, LResult) then
+    return LResult;
+  end;
+  LFound := DoReal(GRealFwriteNolock, ptr to const char("_fwrite_nolock"));
+  if LFound = nil then
+    return 0;
+  end;
+  LReal := FwriteFn(LFound);
+  return LReal(ABuffer, ASize, ACount, AFile);
+end;
+
+// fgetc / getc and their _nolock forms: the byte (0..255) or EOF
+public routine fgetc(const AFile: ptr): int32;
+begin
+  return DoFileInt(HookOp.Get, ADAM_HOOKIO_EOF, AFile, GRealFgetc, ptr to const char("fgetc"));
+end;
+
+public routine getc(const AFile: ptr): int32;
+begin
+  return DoFileInt(HookOp.Get, ADAM_HOOKIO_EOF, AFile, GRealGetc, ptr to const char("getc"));
+end;
+
+public routine _fgetc_nolock(const AFile: ptr): int32;
+begin
+  return DoFileInt(HookOp.Get, ADAM_HOOKIO_EOF, AFile, GRealFgetcNolock,
+    ptr to const char("_fgetc_nolock"));
+end;
+
+public routine _getc_nolock(const AFile: ptr): int32;
+begin
+  return DoFileInt(HookOp.Get, ADAM_HOOKIO_EOF, AFile, GRealGetcNolock,
+    ptr to const char("_getc_nolock"));
+end;
+
+// fgets: up to ACount - 1 bytes into AText, stopping after a newline, then a 0; AText, or nil
+// when nothing was read before the end, on an error, or for a count of 0 or less (EINVAL)
+public routine fgets(const AText: ptr to char; const ACount: int32; const AFile: ptr): ptr to char;
+var
+  LCall: HookCall;
+  LFound: ptr;
+  LReal: FgetsFn;
+begin
+  LCall := DoCall(HookOp.Gets, 0);
+  LCall.Buffer := ptr to uint8(ptr(AText));
+  LCall.Size := int64(ACount);
+  if DoWith(AFile, LCall) then
+    if LCall.Answer = 0 then
+      return nil;
+    end;
+    return AText;
+  end;
+  LFound := DoReal(GRealFgets, ptr to const char("fgets"));
+  if LFound = nil then
+    return nil;
+  end;
+  LReal := FgetsFn(LFound);
+  return LReal(AText, ACount, AFile);
+end;
+
+// ungetc / _ungetc_nolock: AChar put back by ucrt's rules; the byte (0..255) or EOF
+public routine ungetc(const AChar: int32; const AFile: ptr): int32;
+begin
+  return DoCharFile(HookOp.Unget, AChar, AFile, GRealUngetc, ptr to const char("ungetc"));
+end;
+
+public routine _ungetc_nolock(const AChar: int32; const AFile: ptr): int32;
+begin
+  return DoCharFile(HookOp.Unget, AChar, AFile, GRealUngetcNolock,
+    ptr to const char("_ungetc_nolock"));
+end;
+
+// feof / ferror: 1 when the flag is set, else 0
+public routine feof(const AFile: ptr): int32;
+begin
+  return DoFileInt(HookOp.AtEnd, 0, AFile, GRealFeof, ptr to const char("feof"));
+end;
+
+public routine ferror(const AFile: ptr): int32;
+begin
+  return DoFileInt(HookOp.Failed, 0, AFile, GRealFerror, ptr to const char("ferror"));
+end;
+
+// clearerr: both flags cleared
+public routine clearerr(const AFile: ptr);
+begin
+  DoFileVoid(HookOp.ClearError, AFile, GRealClearerr, ptr to const char("clearerr"));
+end;
+
+// fseek / _fseek_nolock / _fseeki64 / _fseeki64_nolock: 0 or -1
+public routine fseek(const AFile: ptr; const AOffset: clong; const AOrigin: int32): int32;
+begin
+  return DoFseek(AFile, AOffset, AOrigin, GRealFseek, ptr to const char("fseek"));
+end;
+
+public routine _fseek_nolock(const AFile: ptr; const AOffset: clong; const AOrigin: int32): int32;
+begin
+  return DoFseek(AFile, AOffset, AOrigin, GRealFseekNolock, ptr to const char("_fseek_nolock"));
+end;
+
+public routine _fseeki64(const AFile: ptr; const AOffset: int64; const AOrigin: int32): int32;
+begin
+  return DoFseeki64(AFile, AOffset, AOrigin, GRealFseeki64, ptr to const char("_fseeki64"));
+end;
+
+public routine _fseeki64_nolock(const AFile: ptr; const AOffset: int64;
+  const AOrigin: int32): int32;
+begin
+  return DoFseeki64(AFile, AOffset, AOrigin, GRealFseeki64Nolock,
+    ptr to const char("_fseeki64_nolock"));
+end;
+
+// ftell / _ftell_nolock / _ftelli64 / _ftelli64_nolock: the caller's place, or -1
+public routine ftell(const AFile: ptr): clong;
+begin
+  return DoFtell(AFile, GRealFtell, ptr to const char("ftell"));
+end;
+
+public routine _ftell_nolock(const AFile: ptr): clong;
+begin
+  return DoFtell(AFile, GRealFtellNolock, ptr to const char("_ftell_nolock"));
+end;
+
+public routine _ftelli64(const AFile: ptr): int64;
+begin
+  return DoFtelli64(AFile, GRealFtelli64, ptr to const char("_ftelli64"));
+end;
+
+public routine _ftelli64_nolock(const AFile: ptr): int64;
+begin
+  return DoFtelli64(AFile, GRealFtelli64Nolock, ptr to const char("_ftelli64_nolock"));
+end;
+
+// rewind: to the start, both flags cleared
+public routine rewind(const AFile: ptr);
+begin
+  DoFileVoid(HookOp.Rewind, AFile, GRealRewind, ptr to const char("rewind"));
+end;
+
+// fileno / _fileno: a handle has no descriptor (-1 with EBADF)
+public routine fileno(const AFile: ptr): int32;
+begin
+  return DoFileInt(HookOp.Fileno, -1, AFile, GRealFileno, ptr to const char("fileno"));
+end;
+
+public routine _fileno(const AFile: ptr): int32;
+begin
+  return DoFileInt(HookOp.Fileno, -1, AFile, GRealUnderFileno, ptr to const char("_fileno"));
+end;
+
+// _lock_file / _unlock_file: nothing on a handle
+public routine _lock_file(const AFile: ptr);
+begin
+  DoLockFile(AFile, GRealLockFile, ptr to const char("_lock_file"));
+end;
+
+public routine _unlock_file(const AFile: ptr);
+begin
+  DoLockFile(AFile, GRealUnlockFile, ptr to const char("_unlock_file"));
+end;
+
+// fputc / putc and their _nolock forms: the byte written (0..255) or EOF
+public routine fputc(const AChar: int32; const AFile: ptr): int32;
+begin
+  return DoCharFile(HookOp.Put, AChar, AFile, GRealFputc, ptr to const char("fputc"));
+end;
+
+public routine putc(const AChar: int32; const AFile: ptr): int32;
+begin
+  return DoCharFile(HookOp.Put, AChar, AFile, GRealPutc, ptr to const char("putc"));
+end;
+
+public routine _fputc_nolock(const AChar: int32; const AFile: ptr): int32;
+begin
+  return DoCharFile(HookOp.Put, AChar, AFile, GRealFputcNolock,
+    ptr to const char("_fputc_nolock"));
+end;
+
+public routine _putc_nolock(const AChar: int32; const AFile: ptr): int32;
+begin
+  return DoCharFile(HookOp.Put, AChar, AFile, GRealPutcNolock,
+    ptr to const char("_putc_nolock"));
+end;
+
+// fputs: ucrt's success value (0) or EOF
+public routine fputs(const AText: ptr to const char; const AFile: ptr): int32;
+var
+  LCall: HookCall;
+  LFound: ptr;
+  LReal: FputsFn;
+begin
+  LCall := DoCall(HookOp.Puts, ADAM_HOOKIO_EOF);
+  LCall.Buffer := ptr to uint8(ptr(AText));
+  LCall.Size := CTextLength(AText);
+  if DoWith(AFile, LCall) then
+    return int32(LCall.Answer);
+  end;
+  LFound := DoReal(GRealFputs, ptr to const char("fputs"));
+  if LFound = nil then
+    return ADAM_HOOKIO_EOF;
+  end;
+  LReal := FputsFn(LFound);
+  return LReal(AText, AFile);
+end;
+
+// fflush: a handle's written bytes, then its IO's own flush; fflush(NULL) flushes every
+// stream, the C runtime's and every handle. The runtime's own `external` fflush binds here
+// too: stdout is no handle, so it goes to the real one
+public routine fflush(const AFile: ptr): int32;
+begin
+  return DoFlush(AFile, GRealFflush, ptr to const char("fflush"));
+end;
+
+// _fflush_nolock: fflush
+public routine _fflush_nolock(const AFile: ptr): int32;
+begin
+  return DoFlush(AFile, GRealFflushNolock, ptr to const char("_fflush_nolock"));
+end;
+
+// _fclose_nolock: fclose
+public routine _fclose_nolock(const AFile: ptr): int32;
+var
+  LResult: int32;
+  LFound: ptr;
+  LReal: FcloseFn;
+begin
+  if DoClose(AFile, LResult) then
+    return LResult;
+  end;
+  LFound := DoReal(GRealFcloseNolock, ptr to const char("_fclose_nolock"));
+  if LFound = nil then
+    return ADAM_HOOKIO_EOF;
+  end;
+  LReal := FcloseFn(LFound);
+  return LReal(AFile);
 end;
 
 // Registers an IO under a new prefix: from now on fopen("<prefix>") and fopen("<prefix>/<any
