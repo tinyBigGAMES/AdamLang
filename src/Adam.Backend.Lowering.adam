@@ -326,6 +326,8 @@ public const
   // Raised when a static array's low bound has no value (Layout gave the type a size, so it
   // folded: a broken invariant)
   ADAM_LOWERING_FAULT_LOW_BOUND: string = "Lowering: no low bound for the static array ";
+  // Raised when a static array printed as a range has no folded high bound (DoRangeElements)
+  ADAM_LOWERING_FAULT_HIGH_BOUND: string = "Lowering: no high bound for the static array ";
   // Raised when a record or a field has no layout (Layout gave none: a broken invariant)
   ADAM_LOWERING_FAULT_FIELD_OFFSET: string = "Lowering: no layout for the record or field ";
   // Raised when a set literal reaches a set's value with no set type (SEM gives every set
@@ -465,6 +467,13 @@ public type
     hidden FPadValueSlot: int64;
     hidden FPadValueType: IrType;
     hidden FTempOf: array of int64;
+    // By a print / println / FormatStr call's node id: one more than the index in
+    // FRangeSlots of its first range scratch string (DoRangeTemporaries; 0: none), then one
+    // per range level of its placeholders that is written into a scratch (a width or `?s`:
+    // DoRangeNeedsScratch), the level's index added. Hidden string slots, emptied at the
+    // function's start, released at its exits
+    hidden FRangeScratchOf: array of int64;
+    hidden FRangeSlots: ref Int64List;
     // By a canonical type's node id: the data blob of its managed map (DoManagedMap), and of
     // a dynamic array type's element map (DoElementMap); 0: none made yet, -1: refused
     // once, not again
@@ -525,6 +534,8 @@ public type
       self.FExitBlocks := ref Int64List();
       self.DoStartRegions();
       setlength(self.FTempOf, ATree.Count);
+      setlength(self.FRangeScratchOf, ATree.Count);
+      self.FRangeSlots := ref Int64List();
       setlength(self.FManagedMapOf, ATree.Count);
       setlength(self.FElementMapOf, ATree.Count);
       setlength(self.FChoiceNamesOf, ATree.Count);
@@ -3740,18 +3751,19 @@ public type
     // True when the placeholder AItem writes no spec (`{}` / `{N}`, or a `:` with nothing
     // after it): its argument in its form's own text
     hidden const method DoIsPlainItem(const AItem: FormatItem): bool;
-    var
-      LSpec: FormatSpec;
     begin
-      if len(AItem.Specs) <> 1 then
-        return false;
-      end;
-      LSpec := AItem.Specs[0];
-      return (LSpec.Fill = "") and (LSpec.Align = FormatAlign.None) and
-        (LSpec.Sign = FormatSign.None) and (not LSpec.Alternate) and (not LSpec.ZeroPad) and
-        (LSpec.Width = 0) and (LSpec.WidthArgument = -1) and (LSpec.Precision = -1) and
-        (LSpec.PrecisionArgument = -1) and (not LSpec.Localized) and
-        (not LSpec.ClearBrackets) and (LSpec.Presentation = "");
+      return (len(AItem.Specs) = 1) and self.DoIsPlainSpec(AItem.Specs[0]);
+    end;
+
+    // True when the spec level ASpec writes nothing (DefaultFormatSpec's fields): its value
+    // in its form's own text
+    hidden const method DoIsPlainSpec(const ASpec: FormatSpec): bool;
+    begin
+      return (ASpec.Fill = "") and (ASpec.Align = FormatAlign.None) and
+        (ASpec.Sign = FormatSign.None) and (not ASpec.Alternate) and (not ASpec.ZeroPad) and
+        (ASpec.Width = 0) and (ASpec.WidthArgument = -1) and (ASpec.Precision = -1) and
+        (ASpec.PrecisionArgument = -1) and (not ASpec.Localized) and
+        (not ASpec.ClearBrackets) and (ASpec.Presentation = "");
     end;
 
     // The bytes of AText as a data blob, written to the print sink ASink (an IR value: nil
@@ -3784,11 +3796,59 @@ public type
     end;
 
     // The call of print / println ACall (ANewLine: println): its pieces written to stdout
-    // (DoPrintPieces, the print sink nil); the last call, 0 after LW0001
+    // (DoPrintPieces, the print sink nil). When its text can raise as it is written
+    // (DoPrintMayRaise; its hidden slot made by DoTemporaries) they go into that slot's
+    // string first (emptied by StrTake), then that string to stdout at once (StrWrite) and
+    // the slot emptied again: a raise leaves none of the print's text written, as
+    // std::print formats its whole text before it writes any. The last call, 0 after LW0001
     hidden method DoPrint(const ACall: int64; const AIntrinsic: int64; const ANewLine: bool): int64;
+    var
+      LSlot: int64;
     begin
-      return self.DoPrintPieces(ACall, AIntrinsic, self.DoConstant(IrType.Pointer, 0, ACall),
-        ANewLine);
+      if not self.DoPrintMayRaise(ACall) then
+        return self.DoPrintPieces(ACall, AIntrinsic, self.DoConstant(IrType.Pointer, 0, ACall),
+          ANewLine);
+      end;
+      LSlot := self.DoTempSlot(ACall);
+      if self.DoCallRuntime(RuntimeRoutine.StrTake, LSlot, self.DoConstant(IrType.Pointer, 0, ACall),
+        ACall) = 0 then
+        return 0;
+      end;
+      if self.DoPrintPieces(ACall, AIntrinsic, LSlot, ANewLine) = 0 then
+        return 0;
+      end;
+      if self.DoCallRuntime(RuntimeRoutine.StrWrite, self.DoConstant(IrType.Pointer, 0, ACall),
+        self.DoLoad(LSlot, IrType.Pointer, ACall), ACall) = 0 then
+        return 0;
+      end;
+      return self.DoCallRuntime(RuntimeRoutine.StrTake, LSlot, self.DoConstant(IrType.Pointer, 0, ACall),
+        ACall);
+    end;
+
+    // True when the text of the print / println call ACall can raise while it is written
+    // (DoPrint then writes it into a scratch string first). The runtime raises libc++'s
+    // format errors as it writes in exactly these cases: a width or a precision taken from
+    // an argument (SpecWidth: negative, past the maximum, no integer) and an integer's `c`
+    // out of a char's range (SinkSpecInt), at any level of a placeholder's spec (a range's
+    // element's too). A print writer that gains a raise is added here
+    hidden const method DoPrintMayRaise(const ACall: int64): bool;
+    var
+      LPlan: FormatPlan;
+      LSpec: FormatSpec;
+      LI: int64;
+      LJ: int64;
+    begin
+      LPlan := self.FTree.FormatOf(ACall);
+      for LI := 0 to len(LPlan.Items) - 1 do
+        for LJ := 0 to len(LPlan.Items[LI].Specs) - 1 do
+          LSpec := LPlan.Items[LI].Specs[LJ];
+          if (LSpec.WidthArgument >= 0) or (LSpec.PrecisionArgument >= 0) or
+            (LSpec.Presentation = "c") then
+            return true;
+          end;
+        end;
+      end;
+      return false;
     end;
 
     // The call FormatStr(F, ..) ACall (M3.8f2b): print's pieces of it (DoPrintPieces)
@@ -3818,10 +3878,11 @@ public type
     // FormatPlan): every argument after the format evaluated first, each once, in order
     // (std::format's arguments, the ones no placeholder names too); then each placeholder's
     // text before it written by the runtime's text writer (ACall's ResolvedCallee), then its
-    // argument's text by its print form (DoPrintValue; with a spec DoPrintSpecValue), then
-    // the text after the last (a newline after it for println). With no placeholder the
-    // text is written as it is, even when empty. The last call, 0 after LW0001 (no runtime
-    // unit; a text's or a float's spec: M3.8f4 / f5; a set or an array: M3.8f6)
+    // argument's text by its print form (DoPrintValue; with a spec DoPrintSpecValue; a static
+    // array, evaluated to its address, as a range: DoPrintRangeOf), then the text after the
+    // last (a newline after it for println). With no placeholder the text is written as it
+    // is, even when empty. The last call, 0 after LW0001 (no runtime unit; a set: M3.8f6b; a
+    // dynamic array: M3.9)
     hidden method DoPrintPieces(const ACall: int64; const AIntrinsic: int64; const ASink: int64;
       const ANewLine: bool): int64;
     var
@@ -3845,15 +3906,20 @@ public type
       LValues := ref Int64List();
       for LI := 1 to self.FTree.CountOf(ACall, NodeRole.Argument) - 1 do
         LArg := self.FTree.NthOf(ACall, NodeRole.Argument, LI);
-        // a set or an array element by element (M3.8f6) is not written yet; SEM turned
-        // every unprintable form away
+        // a static array is written element by element from its address (DoPrintRangeOf);
+        // a set (M3.8f6b) and a dynamic array (M3.9) are not written yet; SEM turned every
+        // unprintable form away
         LForm := PrintFormOf(self.FTree, self.DoUsedType(LArg));
         if LForm = PrintForm.Range then
-          self.DoRefuse(LArg, "a print argument of type '" + TypeText(self.FTree, self.DoUsedType(LArg)) +
-            "'");
-          return 0;
+          if ClassOf(self.FTree, self.DoUsedType(LArg)) <> TypeClass.StaticArray then
+            self.DoRefuse(LArg, "a print argument of type '" + TypeText(self.FTree, self.DoUsedType(LArg)) +
+              "'");
+            return 0;
+          end;
+          LValue := self.DoAddressFor(LArg, false);
+        else
+          LValue := self.DoValue(LArg);
         end;
-        LValue := self.DoValue(LArg);
         if LValue = 0 then
           return 0;
         end;
@@ -3871,11 +3937,16 @@ public type
         if len(LPlan.Items[LI].Text) > 0 then
           LId := self.DoWriteText(LWriter, ASink, LPlan.Items[LI].Text, ACall);
         end;
-        if self.DoIsPlainItem(LPlan.Items[LI]) then
-          LId := self.DoPrintValue(ASink, LValues[LPlan.Items[LI].Argument],
-            self.FTree.NthOf(ACall, NodeRole.Argument, LPlan.Items[LI].Argument + 1));
+        LArg := self.FTree.NthOf(ACall, NodeRole.Argument, LPlan.Items[LI].Argument + 1);
+        if PrintFormOf(self.FTree, self.DoUsedType(LArg)) = PrintForm.Range then
+          LId := self.DoPrintRangeOf(ASink, LValues[LPlan.Items[LI].Argument], self.DoUsedType(LArg),
+            LPlan.Items[LI], 0, ACall, LValues, LArg);
         else
-          LId := self.DoPrintSpecValue(ASink, LValues, ACall, LPlan.Items[LI]);
+          if self.DoIsPlainItem(LPlan.Items[LI]) then
+            LId := self.DoPrintValue(ASink, LValues[LPlan.Items[LI].Argument], LArg);
+          else
+            LId := self.DoPrintSpecValue(ASink, LValues, ACall, LPlan.Items[LI]);
+          end;
         end;
         if LId = 0 then
           return 0;
@@ -3939,13 +4010,21 @@ public type
     end;
 
     // The call at AArg writing AValue, the value of the print argument AArg, to the print
-    // sink ASink by its writer (DoPrintWriter): the sink first; a text passed as it is; any
-    // other value converted to the writer's parameter type (an integer widened to 64 bits by
-    // its signedness); a choices value with its type's names table (DoChoiceNamesData). 0
-    // after LW0001
+    // sink ASink in its form's own text (DoPrintValueOf by the argument's type); 0 after
+    // LW0001
     hidden method DoPrintValue(const ASink: int64; const AValue: int64; const AArg: int64): int64;
+    begin
+      return self.DoPrintValueOf(ASink, AValue, self.DoUsedType(AArg), AArg);
+    end;
+
+    // The call at ANode writing AValue, a value of the canonical type AType (a print
+    // argument's, a range's element's), to the print sink ASink by its writer
+    // (DoPrintWriter): the sink first; a text passed as it is; any other value converted to
+    // the writer's parameter type (an integer widened to 64 bits by its signedness); a
+    // choices value with its type's names table (DoChoiceNamesData). 0 after LW0001
+    hidden method DoPrintValueOf(const ASink: int64; const AValue: int64; const AType: int64;
+      const ANode: int64): int64;
     var
-      LType: int64;
       LKind: RuntimeRoutine;
       LFunction: int64;
       LOperand: int64;
@@ -3953,30 +4032,29 @@ public type
       LTable: int64;
       LAddress: int64;
     begin
-      LType := self.DoUsedType(AArg);
-      LKind := self.DoPrintWriter(LType);
+      LKind := self.DoPrintWriter(AType);
       if LKind = RuntimeRoutine.StrWrite then
-        return self.DoCallRuntime(RuntimeRoutine.StrWrite, ASink, AValue, AArg);
+        return self.DoCallRuntime(RuntimeRoutine.StrWrite, ASink, AValue, ANode);
       end;
-      LFunction := self.DoRuntimeFunction(LKind, AArg);
+      LFunction := self.DoRuntimeFunction(LKind, ANode);
       if LFunction = 0 then
         return 0;
       end;
       LOperand := AValue;
-      if not self.DoIsText(LType) then
+      if not self.DoIsText(AType) then
         LOperand := self.DoConvertIr(AValue, self.FModule.FunctionAt(LFunction).Signature.ParamTypes[1],
-          AArg);
+          ANode);
       end;
       LArgs := ref Int64List();
       LArgs.Add(ASink);
       LArgs.Add(LOperand);
       if LKind = RuntimeRoutine.WriteChoice then
-        LTable := self.DoChoiceNamesData(LType, AArg);
-        LAddress := self.DoEmit(IrOp.Address, IrType.Pointer, AArg);
+        LTable := self.DoChoiceNamesData(AType, ANode);
+        LAddress := self.DoEmit(IrOp.Address, IrType.Pointer, ANode);
         self.FModule.InstrAt(LAddress).Link := LTable;
         LArgs.Add(LAddress);
       end;
-      return self.DoCallRuntimeArgs(LKind, LArgs, AArg);
+      return self.DoCallRuntimeArgs(LKind, LArgs, ANode);
     end;
 
     // The runtime routine that writes a print argument of the print form AForm with a spec
@@ -3986,7 +4064,7 @@ public type
     // wstring WriteSpecWideText, a wchar WriteSpecWideChar, a ptr to char / wchar
     // WriteSpecCText / WriteSpecWideCText; (M3.8f5) a float32 / float64 WriteSpecFloat32 /
     // WriteSpecFloat64 (by the IR type of AType, the value's type); true with it in AKind,
-    // false for a form whose specs are not written yet (a range: M3.8f6)
+    // false for a form with no SinkSpec* routine of its own (a range: DoPrintRangeOf)
     hidden const method DoSpecWriter(const AForm: PrintForm; const AType: int64;
       var AKind: RuntimeRoutine): bool;
     begin
@@ -4145,19 +4223,35 @@ public type
     end;
 
     // The call writing the argument of the placeholder AItem (with a spec) of the print call
-    // ACall to the print sink ASink (AValues its arguments' values after the format), by its
-    // form's SinkSpec* routine (DoSpecWriter): the sink, the value as the routine's parameter
-    // type (an integer's signedness after it; a choices value's names table after it), the
-    // spec's words (DoSpecData), the width operand, a text form's precision operand
-    // (DoSpecCountOperand both; DoSpecTakesPrecision). A text value goes as it is, as
-    // DoPrintValue passes one. 0 after LW0001: a nested spec, a form whose specs come later
+    // ACall to the print sink ASink (AValues its arguments' values after the format): its one
+    // spec by DoPrintSpecOf (a range's levels are DoPrintRangeOf's). 0 after LW0001: a nested
+    // spec on a form that is no range
     hidden method DoPrintSpecValue(const ASink: int64; const AValues: ref Int64List;
       const ACall: int64; const AItem: FormatItem): int64;
     var
-      LSpec: FormatSpec;
       LArg: int64;
-      LType: int64;
-      LForm: PrintForm;
+    begin
+      LArg := self.FTree.NthOf(ACall, NodeRole.Argument, AItem.Argument + 1);
+      if len(AItem.Specs) <> 1 then
+        self.DoRefuse(self.FTree.FirstOf(ACall, NodeRole.Argument), "a format placeholder with a spec");
+        return 0;
+      end;
+      return self.DoPrintSpecOf(ASink, AValues[AItem.Argument], self.DoUsedType(LArg), AItem.Specs[0],
+        ACall, AValues, LArg);
+    end;
+
+    // The call at ANode writing AValue, a value of the canonical type AType (a print
+    // argument's, a range's element's), with the spec ASpec to the print sink ASink, by its
+    // form's SinkSpec* routine (DoSpecWriter): the sink, the value as the routine's parameter
+    // type (an integer's signedness after it; a choices value's names table after it), the
+    // spec's words (DoSpecData), the width operand, a text form's precision operand
+    // (DoSpecCountOperand both, from the print call ACall's argument values AValues;
+    // DoSpecTakesPrecision). A text value goes as it is, as DoPrintValueOf passes one. 0
+    // after LW0001: a form with no SinkSpec* routine
+    hidden method DoPrintSpecOf(const ASink: int64; const AValue: int64; const AType: int64;
+      const ASpec: FormatSpec; const ACall: int64; const AValues: ref Int64List;
+      const ANode: int64): int64;
+    var
       LKind: RuntimeRoutine;
       LFunction: int64;
       LArgs: ref Int64List;
@@ -4165,55 +4259,413 @@ public type
       LWidth: int64;
       LPrecision: int64;
     begin
-      LArg := self.FTree.NthOf(ACall, NodeRole.Argument, AItem.Argument + 1);
-      LType := self.DoUsedType(LArg);
-      LForm := PrintFormOf(self.FTree, LType);
-      LSpec := AItem.Specs[0];
-      if (len(AItem.Specs) <> 1) or (not self.DoSpecWriter(LForm, LType, LKind)) then
-        self.DoRefuse(self.FTree.FirstOf(ACall, NodeRole.Argument), "a format placeholder with a spec");
+      if not self.DoSpecWriter(PrintFormOf(self.FTree, AType), AType, LKind) then
+        self.DoRefuse(ANode, "a format placeholder with a spec");
         return 0;
       end;
-      LFunction := self.DoRuntimeFunction(LKind, LArg);
+      LFunction := self.DoRuntimeFunction(LKind, ANode);
       if LFunction = 0 then
         return 0;
       end;
       LArgs := ref Int64List();
       LArgs.Add(ASink);
-      if self.DoIsText(LType) then
-        LArgs.Add(AValues[AItem.Argument]);
+      if self.DoIsText(AType) then
+        LArgs.Add(AValue);
       else
-        LArgs.Add(self.DoConvertIr(AValues[AItem.Argument], self.DoParamTypeOf(LFunction, 1), LArg));
+        LArgs.Add(self.DoConvertIr(AValue, self.DoParamTypeOf(LFunction, 1), ANode));
       end;
       if LKind = RuntimeRoutine.WriteSpecInt then
-        if ClassOf(self.FTree, LType) = TypeClass.UnsignedInt then
-          LArgs.Add(self.DoConstant(self.DoParamTypeOf(LFunction, 2), 1, LArg));
+        if ClassOf(self.FTree, AType) = TypeClass.UnsignedInt then
+          LArgs.Add(self.DoConstant(self.DoParamTypeOf(LFunction, 2), 1, ANode));
         else
-          LArgs.Add(self.DoConstant(self.DoParamTypeOf(LFunction, 2), 0, LArg));
+          LArgs.Add(self.DoConstant(self.DoParamTypeOf(LFunction, 2), 0, ANode));
         end;
       end;
       if LKind = RuntimeRoutine.WriteSpecChoice then
-        LAddress := self.DoEmit(IrOp.Address, IrType.Pointer, LArg);
-        self.FModule.InstrAt(LAddress).Link := self.DoChoiceNamesData(LType, LArg);
+        LAddress := self.DoEmit(IrOp.Address, IrType.Pointer, ANode);
+        self.FModule.InstrAt(LAddress).Link := self.DoChoiceNamesData(AType, ANode);
         LArgs.Add(LAddress);
       end;
-      LAddress := self.DoEmit(IrOp.Address, IrType.Pointer, LArg);
-      self.FModule.InstrAt(LAddress).Link := self.DoSpecData(LSpec, LArg);
+      LAddress := self.DoEmit(IrOp.Address, IrType.Pointer, ANode);
+      self.FModule.InstrAt(LAddress).Link := self.DoSpecData(ASpec, ANode);
       LArgs.Add(LAddress);
-      LWidth := self.DoSpecCountOperand(ACall, AValues, LSpec.WidthArgument,
+      LWidth := self.DoSpecCountOperand(ACall, AValues, ASpec.WidthArgument,
         self.DoParamTypeOf(LFunction, LArgs.Count));
       if LWidth = 0 then
         return 0;
       end;
       LArgs.Add(LWidth);
       if self.DoSpecTakesPrecision(LKind) then
-        LPrecision := self.DoSpecCountOperand(ACall, AValues, LSpec.PrecisionArgument,
+        LPrecision := self.DoSpecCountOperand(ACall, AValues, ASpec.PrecisionArgument,
           self.DoParamTypeOf(LFunction, LArgs.Count));
         if LPrecision = 0 then
           return 0;
         end;
         LArgs.Add(LPrecision);
       end;
-      return self.DoCallRuntimeArgs(LKind, LArgs, LArg);
+      return self.DoCallRuntimeArgs(LKind, LArgs, ANode);
+    end;
+
+    // The spec of level ALevel of the placeholder AItem (Specs[0] its own, then a range's
+    // element's, ...): the one written, else the unwritten one (DefaultFormatSpec: a range's
+    // element with no spec of its own)
+    hidden const method DoLevelSpec(const AItem: FormatItem; const ALevel: int64): FormatSpec;
+    begin
+      if ALevel < len(AItem.Specs) then
+        return AItem.Specs[ALevel];
+      end;
+      return DefaultFormatSpec();
+    end;
+
+    // True when a range level with the spec ASpec is written into a scratch string first,
+    // that string then written to the sink by the string formatter with the spec: a width
+    // (libc++'s range_formatter pads its whole text: __write_string_no_precision) or `?s`
+    // (its chars escaped as one string: __format_as_string)
+    hidden const method DoRangeNeedsScratch(const ASpec: FormatSpec): bool;
+    begin
+      return (ASpec.Width > 0) or (ASpec.WidthArgument >= 0) or (ASpec.Presentation = "?s");
+    end;
+
+    // The range levels the placeholder AItem writes for a print argument of the canonical
+    // type AType: one per range it goes through (an array whose element is an array: one
+    // more), none past a range written as a string (`s` / `?s`) or a set; 0 when AType is
+    // no range
+    hidden const method DoRangeLevels(const AItem: FormatItem; const AType: int64): int64;
+    var
+      LType: int64;
+      LSpec: FormatSpec;
+      LLevels: int64;
+    begin
+      LType := AType;
+      LLevels := 0;
+      while PrintFormOf(self.FTree, LType) = PrintForm.Range do
+        LSpec := self.DoLevelSpec(AItem, LLevels);
+        LLevels := LLevels + 1;
+        if (LSpec.Presentation <> "") or (ClassOf(self.FTree, LType) = TypeClass.SetType) then
+          return LLevels;
+        end;
+        LType := TargetOf(self.FTree, LType);
+      end;
+      return LLevels;
+    end;
+
+    // The range scratch strings of the print / println / FormatStr call ACall
+    // (FRangeScratchOf, FRangeSlots): one per level down to the deepest of its
+    // placeholders' range levels written into a scratch (DoRangeNeedsScratch), each a
+    // hidden string slot empty from the function's start, one of FManaged (a level's string
+    // is emptied before each use by StrTake, as FormatStr's is); none for a call that needs
+    // none
+    hidden method DoRangeTemporaries(const ACall: int64);
+    var
+      LPlan: FormatPlan;
+      LArg: int64;
+      LLevels: int64;
+      LLevel: int64;
+      LCount: int64;
+      LSlot: int64;
+      LI: int64;
+    begin
+      LPlan := self.FTree.FormatOf(ACall);
+      LCount := 0;
+      for LI := 0 to len(LPlan.Items) - 1 do
+        LArg := self.FTree.NthOf(ACall, NodeRole.Argument, LPlan.Items[LI].Argument + 1);
+        LLevels := self.DoRangeLevels(LPlan.Items[LI], self.DoUsedType(LArg));
+        for LLevel := 0 to LLevels - 1 do
+          if self.DoRangeNeedsScratch(self.DoLevelSpec(LPlan.Items[LI], LLevel)) and
+            (LLevel + 1 > LCount) then
+            LCount := LLevel + 1;
+          end;
+        end;
+      end;
+      if LCount = 0 then
+        return;
+      end;
+      self.FRangeScratchOf[ACall] := self.FRangeSlots.Count + 1;
+      for LI := 0 to LCount - 1 do
+        LSlot := self.DoSizedSlot(ACall, self.FTarget.PointerSize(), self.FTarget.PointerAlign());
+        self.DoStore(LSlot, self.DoConstant(IrType.Pointer, 0, ACall), ACall);
+        self.DoAddManaged(LSlot, 0, ACall);
+        self.FRangeSlots.Add(LSlot);
+      end;
+    end;
+
+    // The scratch string slot of range level ALevel of the print call ACall
+    // (DoRangeTemporaries); raises when there is none (a broken invariant: the scan and the
+    // lowering disagree)
+    hidden const method DoRangeScratch(const ACall: int64; const ALevel: int64): int64;
+    begin
+      if self.FRangeScratchOf[ACall] = 0 then
+        raise(ADAM_LOWERING_FAULT_TEMP + IntToStr(ACall));
+      end;
+      return self.FRangeSlots[self.FRangeScratchOf[ACall] - 1 + ALevel];
+    end;
+
+    // The runtime routine that writes an element of the print form AForm in the debug form a
+    // range gives an element with no spec of its own where it differs from `?`'s
+    // (PaskalCPP's formatters: a wchar in apostrophes as a char, WriteDebugWideChar; a ptr
+    // to char / wchar's nil as `nil`, WriteDebugCText / WriteDebugWideCText); false for any
+    // other form
+    hidden const method DoDebugWriter(const AForm: PrintForm; var AKind: RuntimeRoutine): bool;
+    begin
+      if AForm = PrintForm.WideChar then
+        AKind := RuntimeRoutine.WriteDebugWideChar;
+        return true;
+      end;
+      if AForm = PrintForm.CText then
+        AKind := RuntimeRoutine.WriteDebugCText;
+        return true;
+      end;
+      if AForm = PrintForm.WideCText then
+        AKind := RuntimeRoutine.WriteDebugWideCText;
+        return true;
+      end;
+      return false;
+    end;
+
+    // The call at ANode writing AValue, an element of the canonical type AType of a range
+    // that writes no type and no element spec, in the debug form libc++'s range_formatter
+    // sets on its element's formatter (__set_debug_format) as PaskalCPP's formatters take
+    // it: a char, a string and a wstring as `?` writes them (DoPrintSpecOf); a wchar, a ptr
+    // to char / wchar by DoDebugWriter's routine (the C texts with the `?` spec's words);
+    // every other form, a choices value too, its own text (DoPrintValueOf). The print call
+    // ACall and its argument values AValues as DoPrintSpecOf takes them. 0 after LW0001
+    hidden method DoPrintDebugOf(const ASink: int64; const AValue: int64; const AType: int64;
+      const ACall: int64; const AValues: ref Int64List; const ANode: int64): int64;
+    var
+      LForm: PrintForm;
+      LSpec: FormatSpec;
+      LKind: RuntimeRoutine;
+      LFunction: int64;
+      LArgs: ref Int64List;
+      LAddress: int64;
+    begin
+      LForm := PrintFormOf(self.FTree, AType);
+      LSpec := DefaultFormatSpec();
+      LSpec.Presentation := "?";
+      if (LForm = PrintForm.Char) or (LForm = PrintForm.Text) or (LForm = PrintForm.WideText) then
+        return self.DoPrintSpecOf(ASink, AValue, AType, LSpec, ACall, AValues, ANode);
+      end;
+      if not self.DoDebugWriter(LForm, LKind) then
+        return self.DoPrintValueOf(ASink, AValue, AType, ANode);
+      end;
+      LFunction := self.DoRuntimeFunction(LKind, ANode);
+      if LFunction = 0 then
+        return 0;
+      end;
+      LArgs := ref Int64List();
+      LArgs.Add(ASink);
+      LArgs.Add(self.DoConvertIr(AValue, self.DoParamTypeOf(LFunction, 1), ANode));
+      if LKind <> RuntimeRoutine.WriteDebugWideChar then
+        LAddress := self.DoEmit(IrOp.Address, IrType.Pointer, ANode);
+        self.FModule.InstrAt(LAddress).Link := self.DoSpecData(LSpec, ANode);
+        LArgs.Add(LAddress);
+      end;
+      return self.DoCallRuntimeArgs(LKind, LArgs, ANode);
+    end;
+
+    // The calls writing range level ALevel of the placeholder AItem of the print call ACall
+    // (AValues its arguments' values after the format) to the print sink ASink: the static
+    // array of the canonical type AType at AAddress as libc++'s range_formatter formats it
+    // with the level's spec (DoLevelSpec). With a width or `?s` (DoRangeNeedsScratch) the
+    // width operand first (std::format reads a range's spec before its elements), then the
+    // elements into the level's scratch string (DoRangeScratch, emptied by StrTake), then
+    // that string to ASink by the string formatter with the level's spec (WriteSpecStr: its
+    // fill, align and width, `?s` the debug form, no precision); else the elements straight
+    // to ASink (DoRangeElements). The last call, 0 after LW0001 (a dynamic array: M3.9; a
+    // set: M3.8f6b)
+    hidden method DoPrintRangeOf(const ASink: int64; const AAddress: int64; const AType: int64;
+      const AItem: FormatItem; const ALevel: int64; const ACall: int64; const AValues: ref Int64List;
+      const ANode: int64): int64;
+    var
+      LSpec: FormatSpec;
+      LSlot: int64;
+      LFunction: int64;
+      LWidth: int64;
+      LArgs: ref Int64List;
+      LAddress: int64;
+    begin
+      if ClassOf(self.FTree, AType) <> TypeClass.StaticArray then
+        self.DoRefuse(ANode, "a print argument of type '" + TypeText(self.FTree, AType) + "'");
+        return 0;
+      end;
+      LSpec := self.DoLevelSpec(AItem, ALevel);
+      if not self.DoRangeNeedsScratch(LSpec) then
+        return self.DoRangeElements(ASink, AAddress, AType, AItem, ALevel, ACall, AValues, ANode);
+      end;
+      LFunction := self.DoRuntimeFunction(RuntimeRoutine.WriteSpecStr, ANode);
+      if LFunction = 0 then
+        return 0;
+      end;
+      LWidth := self.DoSpecCountOperand(ACall, AValues, LSpec.WidthArgument,
+        self.DoParamTypeOf(LFunction, 3));
+      if LWidth = 0 then
+        return 0;
+      end;
+      LSlot := self.DoRangeScratch(ACall, ALevel);
+      if self.DoCallRuntime(RuntimeRoutine.StrTake, LSlot, self.DoConstant(IrType.Pointer, 0, ANode),
+        ANode) = 0 then
+        return 0;
+      end;
+      if self.DoRangeElements(LSlot, AAddress, AType, AItem, ALevel, ACall, AValues, ANode) = 0 then
+        return 0;
+      end;
+      LArgs := ref Int64List();
+      LArgs.Add(ASink);
+      LArgs.Add(self.DoLoad(LSlot, IrType.Pointer, ANode));
+      LAddress := self.DoEmit(IrOp.Address, IrType.Pointer, ANode);
+      self.FModule.InstrAt(LAddress).Link := self.DoSpecData(LSpec, ANode);
+      LArgs.Add(LAddress);
+      LArgs.Add(LWidth);
+      LArgs.Add(self.DoConstant(self.DoParamTypeOf(LFunction, 4), -1, ANode));
+      return self.DoCallRuntimeArgs(RuntimeRoutine.WriteSpecStr, LArgs, ANode);
+    end;
+
+    // The calls writing the elements of the static array of the canonical type AType at
+    // AAddress, range level ALevel of the placeholder AItem (its spec DoLevelSpec), to the
+    // print sink ASink as libc++'s range_formatter writes them: `s` / `?s` its chars one
+    // after another (the string's bytes: __format_as_string); else `[` and `]` around them
+    // unless `n`, ", " between them (__format_as_sequence); each by DoRangeElement. The first
+    // element at AAddress, then a loop over a counter slot from 1 while below the count, each
+    // element's address AAddress moved by the counter (DoMovePointer). The last call, 0
+    // after LW0001; a bound with no value faults
+    hidden method DoRangeElements(const ASink: int64; const AAddress: int64; const AType: int64;
+      const AItem: FormatItem; const ALevel: int64; const ACall: int64; const AValues: ref Int64List;
+      const ANode: int64): int64;
+    var
+      LSpec: FormatSpec;
+      LWriter: int64;
+      LElement: int64;
+      LLow: int64;
+      LHigh: int64;
+      LCount: int64;
+      LSequence: bool;
+      LBrackets: bool;
+      LId: int64;
+    begin
+      LSpec := self.DoLevelSpec(AItem, ALevel);
+      LWriter := self.FFunctionOf[self.FTree[ACall].ResolvedCallee];
+      LElement := TargetOf(self.FTree, AType);
+      if not BoundValue(self.FTree, self.FTarget, self.FTree.FirstOf(self.FTree[AType].ResolvedDecl,
+        NodeRole.LowBound), LLow) then
+        raise(ADAM_LOWERING_FAULT_LOW_BOUND + TypeText(self.FTree, AType));
+      end;
+      if not BoundValue(self.FTree, self.FTarget, self.FTree.FirstOf(self.FTree[AType].ResolvedDecl,
+        NodeRole.HighBound), LHigh) then
+        raise(ADAM_LOWERING_FAULT_HIGH_BOUND + TypeText(self.FTree, AType));
+      end;
+      LCount := LHigh - LLow + 1;
+      LSequence := LSpec.Presentation = "";
+      LBrackets := LSequence and (not LSpec.ClearBrackets);
+      LId := -1;
+      if LBrackets then
+        LId := self.DoWriteText(LWriter, ASink, "[", ACall);
+      end;
+      if LCount > 0 then
+        LId := self.DoRangeElement(ASink, AAddress, LElement, AItem, ALevel, ACall, AValues, ANode);
+        if LId = 0 then
+          return 0;
+        end;
+      end;
+      if LCount > 1 then
+        if not self.DoRangeLoop(ASink, AAddress, AType, LCount, LSequence, AItem, ALevel, ACall,
+          AValues, ANode) then
+          return 0;
+        end;
+      end;
+      if LBrackets then
+        LId := self.DoWriteText(LWriter, ASink, "]", ACall);
+      end;
+      return LId;
+    end;
+
+    // The loop writing elements 1 .. ACount - 1 of the static array of the canonical type
+    // AType at AAddress (range level ALevel of the placeholder AItem) to the print sink
+    // ASink: a counter slot from 1; a head block testing it below ACount, to the body or
+    // the exit; the body ", " first when ASequence (DoRangeElements), the element at
+    // AAddress moved by the counter (DoMovePointer, DoRangeElement), the counter one more,
+    // back to the head; the exit the current block after it. False after LW0001
+    hidden method DoRangeLoop(const ASink: int64; const AAddress: int64; const AType: int64;
+      const ACount: int64; const ASequence: bool; const AItem: FormatItem; const ALevel: int64;
+      const ACall: int64; const AValues: ref Int64List; const ANode: int64): bool;
+    var
+      LWriter: int64;
+      LCounter: int64;
+      LHead: int64;
+      LBody: int64;
+      LExit: int64;
+      LIndex: int64;
+      LLimit: int64;
+      LOne: int64;
+      LNext: int64;
+    begin
+      LWriter := self.FFunctionOf[self.FTree[ACall].ResolvedCallee];
+      LCounter := self.DoSizedSlot(ANode, 8, 8);
+      self.DoStore(LCounter, self.DoConstant(IrType.Int64, 1, ANode), ANode);
+      LHead := self.FModule.AddBlock(self.FFunction);
+      LBody := self.FModule.AddBlock(self.FFunction);
+      LExit := self.FModule.AddBlock(self.FFunction);
+      self.DoJumpTo(LHead, ANode);
+      self.FBlock := LHead;
+      LIndex := self.DoLoad(LCounter, IrType.Int64, ANode);
+      LLimit := self.DoConstant(IrType.Int64, ACount, ANode);
+      self.DoBranchOn(self.DoCompareWith(IrPredicate.SLess, LIndex, LLimit, ANode), LBody, LExit, ANode);
+      self.FBlock := LBody;
+      // the counter read again in the body: its value is the body's own, whatever blocks an
+      // element's writing adds after it
+      LIndex := self.DoLoad(LCounter, IrType.Int64, ANode);
+      if ASequence then
+        if self.DoWriteText(LWriter, ASink, ", ", ACall) = 0 then
+          return false;
+        end;
+      end;
+      if self.DoRangeElement(ASink, self.DoMovePointer(AAddress, LIndex, AType, false, ANode),
+        TargetOf(self.FTree, AType), AItem, ALevel, ACall, AValues, ANode) = 0 then
+        return false;
+      end;
+      LOne := self.DoConstant(IrType.Int64, 1, ANode);
+      LNext := self.DoEmit(IrOp.Add, IrType.Int64, ANode);
+      self.FModule.InstrAt(LNext).Operands.Add(LIndex);
+      self.FModule.InstrAt(LNext).Operands.Add(LOne);
+      self.DoStore(LCounter, LNext, ANode);
+      self.DoJumpTo(LHead, ANode);
+      self.FBlock := LExit;
+      return true;
+    end;
+
+    // The call writing the element of the canonical type AElement at AAddress of range level
+    // ALevel of the placeholder AItem (its spec DoLevelSpec) to the print sink ASink: an
+    // array the next level (DoPrintRangeOf); else its value (a text's pointer, any other by
+    // its IR type): `s` / `?s` a char in its own text; with the element spec written after
+    // the level's `:` by DoPrintSpecOf (one that writes nothing: its own text); with none in
+    // the debug form (DoPrintDebugOf: libc++ sets it when a range writes no type and no
+    // element spec). 0 after LW0001
+    hidden method DoRangeElement(const ASink: int64; const AAddress: int64; const AElement: int64;
+      const AItem: FormatItem; const ALevel: int64; const ACall: int64; const AValues: ref Int64List;
+      const ANode: int64): int64;
+    var
+      LSpec: FormatSpec;
+      LValue: int64;
+    begin
+      LSpec := self.DoLevelSpec(AItem, ALevel);
+      if (LSpec.Presentation = "") and (PrintFormOf(self.FTree, AElement) = PrintForm.Range) then
+        return self.DoPrintRangeOf(ASink, AAddress, AElement, AItem, ALevel + 1, ACall, AValues, ANode);
+      end;
+      if self.DoIsText(AElement) then
+        LValue := self.DoLoad(AAddress, IrType.Pointer, ANode);
+      else
+        LValue := self.DoLoad(AAddress, self.DoIrType(AElement), ANode);
+      end;
+      if LSpec.Presentation <> "" then
+        return self.DoPrintValueOf(ASink, LValue, AElement, ANode);
+      end;
+      if ALevel + 1 < len(AItem.Specs) then
+        if self.DoIsPlainSpec(AItem.Specs[ALevel + 1]) then
+          return self.DoPrintValueOf(ASink, LValue, AElement, ANode);
+        end;
+        return self.DoPrintSpecOf(ASink, LValue, AElement, AItem.Specs[ALevel + 1], ACall, AValues,
+          ANode);
+      end;
+      return self.DoPrintDebugOf(ASink, LValue, AElement, ACall, AValues, ANode);
     end;
 
     // True when the SinkSpec* routine AKind takes a precision operand after the width (the
@@ -4811,8 +5263,9 @@ public type
 
     // A hidden slot for every temporary under ARoot: each concatenation's result, each char
     // side's text (a concatenation's, a `+=`'s), each utf8 / paramstr call's string, each
-    // call's result that holds texts (DoResultTemporary) and each dynamic array's array
-    // literal's block (DoDynamicLiteral)
+    // call's result that holds texts (DoResultTemporary), each dynamic array's array
+    // literal's block (DoDynamicLiteral) and each print call's range scratch strings
+    // (DoRangeTemporaries)
     hidden method DoTemporaries(const ARoot: int64);
     var
       LChild: int64;
@@ -4823,6 +5276,15 @@ public type
         if self.DoIsUtf8Call(LChild) or self.DoIsTextIntrinsicCall(LChild) or
           self.DoIsIntrinsicCall(LChild, "FormatStr") then
           self.DoTemporary(LChild);
+        end;
+        if self.DoIsIntrinsicCall(LChild, "print") or self.DoIsIntrinsicCall(LChild, "println") then
+          if self.DoPrintMayRaise(LChild) then
+            self.DoTemporary(LChild);
+          end;
+          self.DoRangeTemporaries(LChild);
+        end;
+        if self.DoIsIntrinsicCall(LChild, "FormatStr") then
+          self.DoRangeTemporaries(LChild);
         end;
         if self.DoIsManagedCall(LChild) or self.DoIsManagedPropertyCall(LChild) then
           self.DoResultTemporary(LChild);
