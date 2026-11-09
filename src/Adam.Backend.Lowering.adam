@@ -446,6 +446,15 @@ public type
     // expression's node id, the hidden slot its temporary lives in (DoTemporaries)
     hidden FManaged: ref Int64List;
     hidden FManagedType: ref Int64List;
+    // Beside each of FManaged: its live flag's bool slot (DoAddManaged: one for a value
+    // object that ends by a done, else 0), true while the slot holds a built object, so
+    // the exits, an unwind and a full expression's end end it only then and a move (the
+    // object's bytes taken by another slot) clears it (pcpp's truth: C++'s moved value is
+    // never ended twice)
+    hidden FManagedLive: ref Int64List;
+    // By the node id of a local or a temporary (DoAddManaged's ANode): its live flag's slot
+    // (0: none)
+    hidden FLiveOf: array of int64;
     // The positions (in its Blocks) of the current function's exit blocks, where it
     // releases its FManaged at an exit (DoExitBlock): outside its cleanup scopes
     hidden FExitBlocks: ref Int64List;
@@ -534,10 +543,12 @@ public type
       self.FEntryEnd := 0;
       self.FManaged := ref Int64List();
       self.FManagedType := ref Int64List();
+      self.FManagedLive := ref Int64List();
       self.FExitBlocks := ref Int64List();
       self.DoStartRegions();
       setlength(self.FTempOf, ATree.Count);
       setlength(self.FTempTypeOf, ATree.Count);
+      setlength(self.FLiveOf, ATree.Count);
       setlength(self.FRangeScratchOf, ATree.Count);
       self.FRangeSlots := ref Int64List();
       setlength(self.FManagedMapOf, ATree.Count);
@@ -768,6 +779,12 @@ public type
       end;
       if self.DoIsAggregate(LType) then
         AResult := self.DoAggregateIr(LType);
+        // a value object that ends by a done always goes back through the hidden pointer
+        // (C++'s rule for a type that is not trivial): the caller's slot is the result
+        // the callee moves into, ended once by the caller (its live flag)
+        if self.DoNeedsEnd(LType) then
+          AResult := IrType.Void;
+        end;
         if AResult = IrType.Void then
           self.FHiddenResult[ARoutine] := true;
           AResult := IrType.Pointer;
@@ -1532,6 +1549,61 @@ public type
         return true;
       end;
       return false;
+    end;
+
+    // LW0001 at ANode when a value of the canonical type AType cannot be MOVED here yet (a
+    // call's result, `return` of a local: its bytes taken, the source's live flag cleared,
+    // never copied): one holding a copy decl or an own or a weak (M3.10f); a done moves
+    // (pcpp's truth: ended once, by the slot it lands in); true after the report
+    hidden method DoRefuseMoved(const AType: int64; const ANode: int64): bool;
+    begin
+      if self.DoHoldsMember(AType, NodeKind.CopyDecl) then
+        self.DoRefuse(ANode, "the lifetime of type '" + TypeText(self.FTree, AType) + "'");
+        return true;
+      end;
+      if self.DoHoldsOwner(AType, false) then
+        self.DoRefuse(ANode, "the owners in type '" + TypeText(self.FTree, AType) + "'");
+        return true;
+      end;
+      return false;
+    end;
+
+    // The node whose live flag (FLiveOf) owns the value object AExpr names, when AExpr
+    // (through parentheses) can be MOVED from: a call's result in its temporary, or a
+    // local variable of the current routine; 0 for anything else (a field, a parameter,
+    // self: copying one is not built yet). AExpr is not lowered here
+    hidden const method DoMoveSource(const AExpr: int64): int64;
+    var
+      LAt: int64;
+      LDecl: int64;
+    begin
+      LAt := AExpr;
+      while self.FTree[LAt].Kind = NodeKind.ParenExpression do
+        LAt := self.FTree.FirstOf(LAt, NodeRole.Operand);
+      end;
+      if self.FTree[LAt].Kind = NodeKind.CallExpression then
+        if self.FLiveOf[LAt] <> 0 then
+          return LAt;
+        end;
+        return 0;
+      end;
+      if self.FTree[LAt].Kind = NodeKind.NameExpression then
+        LDecl := self.FTree[LAt].ResolvedDecl;
+        if (LDecl <> 0) and (self.FTree[LDecl].Kind = NodeKind.VarDecl) and (self.FLiveOf[LDecl] <> 0) then
+          return LDecl;
+        end;
+      end;
+      return 0;
+    end;
+
+    // The value object of the canonical type AType (DoNeedsEnd) at ASource moved to ADest
+    // at ANode: its bytes copied, its source's live flag (AFrom, DoMoveSource) cleared, so
+    // only the slot it lands in ends it
+    hidden method DoMoveObject(const ADest: int64; const ASource: int64; const AFrom: int64;
+      const AType: int64; const ANode: int64);
+    begin
+      self.DoCopyBytes(ADest, ASource, TypeSize(self.FTree, self.FTarget, AType), ANode);
+      self.DoSetLive(AFrom, false, ANode);
     end;
 
     // The init of the object type AType that takes no argument (what builds it as a parent
@@ -5482,7 +5554,12 @@ public type
         end;
       end;
       LType := self.FTree[AId].ResolvedType;
-      return self.DoIsManaged(LType) or (self.DoIsAggregate(LType) and self.DoHoldsManaged(LType));
+      if self.DoIsManaged(LType) then
+        return true;
+      end;
+      // a value object that ends by a done is a temporary too (ended at its full
+      // expression's end under its live flag: DoEndTemporary)
+      return self.DoIsAggregate(LType) and (self.DoHoldsManaged(LType) or self.DoNeedsEnd(LType));
     end;
 
     // A hidden slot for every temporary under ARoot: each concatenation's result, each char
@@ -5562,8 +5639,9 @@ public type
 
     // The temporary AId's hidden slot (FTempOf; none: nothing) released at its type
     // (FTempTypeOf, DoReleaseAt) and emptied: a pointer one set to nil, an aggregate one
-    // zeroed. A value object that ends by a done keeps the function's lifetime (zeroed, it
-    // would still be ended again at the exits)
+    // zeroed. A value object that ends by a done is ended only while its live flag holds
+    // (DoReleaseLive: a call that never ran, a short-circuited one, or a result moved out
+    // by an initializer or an assignment left nothing to end), the flag cleared
     hidden method DoEndTemporary(const AId: int64);
     var
       LSlot: int64;
@@ -5575,10 +5653,7 @@ public type
       end;
       LType := self.FTempTypeOf[AId];
       if (LType <> 0) and self.DoIsAggregate(LType) then
-        if self.DoNeedsEnd(LType) then
-          return;
-        end;
-        if not self.DoReleaseAt(LSlot, LType, AId) then
+        if not self.DoReleaseLive(LSlot, LType, self.FLiveOf[AId], false, AId) then
           return;
         end;
         self.DoFill(LSlot, TypeSize(self.FTree, self.FTarget, LType), AId);
@@ -5596,6 +5671,7 @@ public type
     begin
       self.FManaged := ref Int64List();
       self.FManagedType := ref Int64List();
+      self.FManagedLive := ref Int64List();
       self.FExitBlocks := ref Int64List();
       self.DoStartRegions();
     end;
@@ -5654,22 +5730,95 @@ public type
       end;
       self.FManaged.Add(ASlot);
       self.FManagedType.Add(AType);
+      self.FManagedLive.Add(self.DoLiveFlag(AType, ANode));
       return true;
     end;
 
-    // Every slot of FManaged released (DoReleaseAt), the last made first: at each of the
-    // current function's exits (a return, its end), in an exit block of its own when the
-    // function cleans up (DoExitBlock: what follows, its parts ended and its return, goes
-    // there too)
+    // The live flag of a slot ANode owns that holds a value of the canonical type AType
+    // (FManagedLive, FLiveOf): for a value object that ends by a done a bool slot, false
+    // (made with the slot, before any of the function's code runs: nothing built yet), else
+    // 0
+    hidden method DoLiveFlag(const AType: int64; const ANode: int64): int64;
+    var
+      LFlag: int64;
+    begin
+      if (AType = 0) or (not self.DoIsAggregate(AType)) or (not self.DoNeedsEnd(AType)) then
+        return 0;
+      end;
+      LFlag := self.DoSizedSlot(ANode, 1, 1);
+      self.DoStore(LFlag, self.DoConstant(IrType.Bool, 0, ANode), ANode);
+      self.FLiveOf[ANode] := LFlag;
+      return LFlag;
+    end;
+
+    // The live flag of the slot the local or temporary AId owns (FLiveOf; none: nothing)
+    // set to AValue at ANode: true once its object is built or moved in, false once it is
+    // ended or moved out
+    hidden method DoSetLive(const AId: int64; const AValue: bool; const ANode: int64);
+    var
+      LValue: int64;
+    begin
+      if (AId = 0) or (self.FLiveOf[AId] = 0) then
+        return;
+      end;
+      LValue := 0;
+      if AValue then
+        LValue := 1;
+      end;
+      self.DoStore(self.FLiveOf[AId], self.DoConstant(IrType.Bool, LValue, ANode), ANode);
+    end;
+
+    // The value of the canonical type AType at AAddress released (DoReleaseAt) only while
+    // its live flag ALive holds (0: always), the flag then cleared: a branch over the
+    // release into a join where the current block goes on. AExit: the release is part of
+    // an exit (DoReleaseManaged), so its blocks are exit blocks too (FExitBlocks: outside
+    // the cleanup scopes); false after LW0001
+    hidden method DoReleaseLive(const AAddress: int64; const AType: int64; const ALive: int64;
+      const AExit: bool; const ANode: int64): bool;
+    var
+      LRelease: int64;
+      LJoin: int64;
+      LDone: bool;
+    begin
+      if ALive = 0 then
+        return self.DoReleaseAt(AAddress, AType, ANode);
+      end;
+      LRelease := self.FModule.AddBlock(self.FFunction);
+      if AExit then
+        self.FExitBlocks.Add(self.FModule.FunctionAt(self.FFunction).Blocks.Count - 1);
+      end;
+      LJoin := self.FModule.AddBlock(self.FFunction);
+      if AExit then
+        self.FExitBlocks.Add(self.FModule.FunctionAt(self.FFunction).Blocks.Count - 1);
+      end;
+      self.DoBranchOn(self.DoLoad(ALive, IrType.Bool, ANode), LRelease, LJoin, ANode);
+      self.FBlock := LRelease;
+      // cleared first: a done that raises never finds its object live again
+      self.DoStore(ALive, self.DoConstant(IrType.Bool, 0, ANode), ANode);
+      LDone := self.DoReleaseAt(AAddress, AType, ANode);
+      if not self.DoEnded() then
+        self.DoJumpTo(LJoin, ANode);
+      end;
+      self.FBlock := LJoin;
+      return LDone;
+    end;
+
+    // Every slot of FManaged released (DoReleaseLive under its live flag), the last made
+    // first: at each of the current function's exits (a return, its end), in an exit block
+    // of its own when the function cleans up (DoExitBlock: what follows, its parts ended
+    // and its return, goes there too)
     hidden method DoReleaseManaged(const ANode: int64);
     var
+      LExit: bool;
       LI: int64;
     begin
-      if self.DoCleansUp() then
+      LExit := self.DoCleansUp();
+      if LExit then
         self.DoExitBlock(ANode);
       end;
       for LI := self.FManaged.Count - 1 downto 0 do
-        if not self.DoReleaseAt(self.FManaged[LI], self.FManagedType[LI], ANode) then
+        if not self.DoReleaseLive(self.FManaged[LI], self.FManagedType[LI], self.FManagedLive[LI],
+          LExit, ANode) then
           return;
         end;
       end;
@@ -7477,13 +7626,13 @@ public type
       // The hidden result slot is made before the arguments are lowered (each operand is
       // emitted before the instruction that uses it)
       LType := self.DoResultType(ASig);
-      // a result that needs its type's lifetime code (a done) or holds an owner waits for
-      // it (its temporary would never end)
-      if self.DoIsAggregate(LType) and self.DoRefuseObject(LType, false, ACall) then
+      // a result is moved into the caller's slot, never copied: one of a type with a copy
+      // decl or an owner waits for them (a done is moved: its live flag, DoEndTemporary)
+      if self.DoIsAggregate(LType) and self.DoRefuseMoved(LType, ACall) then
         return 0;
       end;
       LHidden := 0;
-      if self.FHiddenResult[ASig] and self.DoHoldsManaged(LType) then
+      if self.FHiddenResult[ASig] and (self.DoHoldsManaged(LType) or self.DoNeedsEnd(LType)) then
         LHidden := self.DoTempSlot(ACall);
         self.FSlotOf[ACall] := LHidden;
       else
@@ -7514,6 +7663,10 @@ public type
       end;
       for LI := 0 to LArgs.Count - 1 do
         self.FModule.InstrAt(LId).Operands.Add(LArgs[LI]);
+      end;
+      // the callee has built (or moved) its object into the call's temporary: live now
+      if (LHidden <> 0) and self.DoNeedsEnd(LType) then
+        self.DoSetLive(ACall, true, ACall);
       end;
       if (LHidden = 0) and self.DoIsAggregate(LType) then
         LSlot := self.DoSlot(ACall, LType, false);
@@ -9530,7 +9683,8 @@ public type
 
     // The aggregate assignment AId (a record, an overlay or a static array): the source's
     // address first, then the target's (the scalar path's order), then the value copied
-    // (DoAggregateCopy: its bytes, its texts by its text map)
+    // (DoAggregateCopy: its bytes, its texts by its text map); a value object that ends by
+    // a done takes a call's result instead (DoMoveAssign)
     hidden method DoAggregateAssign(const AId: int64);
     var
       LTarget: int64;
@@ -9538,6 +9692,10 @@ public type
       LDest: int64;
     begin
       LTarget := self.FTree.FirstOf(AId, NodeRole.Target);
+      if self.DoNeedsEnd(self.FTree[LTarget].ResolvedType) then
+        self.DoMoveAssign(AId);
+        return;
+      end;
       LSource := self.DoAggregateSource(self.FTree.FirstOf(AId, NodeRole.Source));
       if LSource = 0 then
         return;
@@ -9547,6 +9705,49 @@ public type
         return;
       end;
       self.DoAggregateCopy(LDest, LSource, self.FTree[LTarget].ResolvedType, AId);
+    end;
+
+    // The assignment AId of a value object that ends by a done (pcpp's truth, C++'s move
+    // assignment): the source, a call's result, made first; then the target's old object
+    // ended (a local under its live flag) and the result moved in (DoMoveObject), the
+    // target live. Copying one from a place is not built yet (LW0001)
+    hidden method DoMoveAssign(const AId: int64);
+    var
+      LTarget: int64;
+      LType: int64;
+      LFrom: int64;
+      LTo: int64;
+      LSource: int64;
+      LDest: int64;
+      LLive: int64;
+    begin
+      LTarget := self.FTree.FirstOf(AId, NodeRole.Target);
+      LType := self.FTree[LTarget].ResolvedType;
+      LFrom := self.DoMoveSource(self.FTree.FirstOf(AId, NodeRole.Source));
+      if (LFrom = 0) or (self.FTree[LFrom].Kind <> NodeKind.CallExpression) then
+        self.DoRefuse(AId, "the lifetime of type '" + TypeText(self.FTree, LType) + "'");
+        return;
+      end;
+      LSource := self.DoAggregateSource(self.FTree.FirstOf(AId, NodeRole.Source));
+      if LSource = 0 then
+        return;
+      end;
+      LDest := self.DoAddressFor(LTarget, true);
+      if LDest = 0 then
+        return;
+      end;
+      // a local is ended only while live; any other place (a field, a var parameter's
+      // object) always holds a built one
+      LTo := self.DoMoveSource(LTarget);
+      LLive := 0;
+      if LTo <> 0 then
+        LLive := self.FLiveOf[LTo];
+      end;
+      if not self.DoReleaseLive(LDest, LType, LLive, false, AId) then
+        return;
+      end;
+      self.DoMoveObject(LDest, LSource, LFrom, LType, AId);
+      self.DoSetLive(LTo, true, AId);
     end;
 
     // The return statement AId, with or without a value; in the program block it ends the
@@ -9609,16 +9810,31 @@ public type
       LType: int64;
       LSource: int64;
       LValue: int64;
+      LFrom: int64;
       LId: int64;
     begin
       LType := self.DoUsedType(AExpr);
+      // a value object that ends by a done is moved out (a local or a call's result: pcpp's
+      // truth, the local never ended here), never copied (LW0001: not built yet)
+      LFrom := 0;
+      if self.DoNeedsEnd(LType) then
+        LFrom := self.DoMoveSource(AExpr);
+        if (LFrom = 0) or (self.FResultSlot = 0) then
+          self.DoRefuse(AExpr, "the lifetime of type '" + TypeText(self.FTree, LType) + "'");
+          return;
+        end;
+      end;
       LSource := self.DoAggregateSource(AExpr);
       if LSource = 0 then
         return;
       end;
       if self.FResultSlot <> 0 then
         LValue := self.DoLoad(self.FResultSlot, IrType.Pointer, AId);
-        self.DoAggregateCopy(LValue, LSource, LType, AId);
+        if LFrom <> 0 then
+          self.DoMoveObject(LValue, LSource, LFrom, LType, AId);
+        else
+          self.DoAggregateCopy(LValue, LSource, LType, AId);
+        end;
       else
         LValue := self.DoLoad(LSource, self.DoAggregateIr(LType), AId);
       end;
@@ -10543,6 +10759,7 @@ public type
       LBlock: int64;
       LManaged: ref Int64List;
       LManagedType: ref Int64List;
+      LManagedLive: ref Int64List;
       LExitBlocks: ref Int64List;
       LRegions: ref Int64List;
       LPadJumps: ref Int64List;
@@ -10559,6 +10776,7 @@ public type
       LBlock := self.FBlock;
       LManaged := self.FManaged;
       LManagedType := self.FManagedType;
+      LManagedLive := self.FManagedLive;
       LExitBlocks := self.FExitBlocks;
       LRegions := self.FRegions;
       LPadJumps := self.FPadJumps;
@@ -10590,6 +10808,7 @@ public type
       self.FBlock := LBlock;
       self.FManaged := LManaged;
       self.FManagedType := LManagedType;
+      self.FManagedLive := LManagedLive;
       self.FExitBlocks := LExitBlocks;
       self.FRegions := LRegions;
       self.FPadJumps := LPadJumps;
@@ -10632,7 +10851,8 @@ public type
       LFunction.FrameValue := LFrame;
       LDone := true;
       for LI := self.FManaged.Count - 1 downto 0 do
-        if LDone and (not self.DoReleaseAt(self.FManaged[LI], self.FManagedType[LI], ANode)) then
+        if LDone and (not self.DoReleaseLive(self.FManaged[LI], self.FManagedType[LI],
+          self.FManagedLive[LI], false, ANode)) then
           LDone := false;
         end;
       end;
@@ -10771,6 +10991,11 @@ public type
       if (not self.FByCopy[AParam]) or (not self.DoHoldsManaged(LType)) then
         return;
       end;
+      // a const value object that ends by a done is borrowed, never copied (pcpp's truth:
+      // C++'s const T&; the caller's slot or temporary keeps it for the call and ends it)
+      if self.FTree[AParam].HasFlag(NodeFlag.ConstParam) and self.DoNeedsEnd(LType) then
+        return;
+      end;
       if self.DoManagedMapData(LType, AParam) = 0 then
         return;
       end;
@@ -10845,12 +11070,14 @@ public type
 
     // The aggregate local ALocal of the type AType (its slot made: DoAggregateLocalSlot):
     // its initializer's value copied in when it has one (DoAggregateSource,
-    // DoAggregateCopy), else an object built
+    // DoAggregateCopy; a value object that ends by a done moved in from a call's result:
+    // DoMoveObject), else an object built; live from then on (DoSetLive)
     hidden method DoAggregateLocalInit(const ALocal: int64; const AType: int64);
     var
       LSlot: int64;
       LInit: int64;
       LSource: int64;
+      LFrom: int64;
     begin
       LSlot := self.FSlotOf[ALocal];
       LInit := self.FTree.FirstOf(ALocal, NodeRole.Initializer);
@@ -10861,12 +11088,30 @@ public type
           self.DoBuildObject(LSlot, AType, self.FTree[ALocal].ResolvedCallee, ALocal,
             NodeRole.ConstructorArgument, ALocal);
         end;
+        // built: from here its exits end it (its live flag)
+        self.DoSetLive(ALocal, true, ALocal);
         return;
       end;
-      LSource := self.DoAggregateSource(LInit);
-      if LSource <> 0 then
-        self.DoAggregateCopy(LSlot, LSource, AType, ALocal);
+      // a value object that ends by a done takes a call's result (pcpp's truth: moved,
+      // ended once, by the local); copying one from a place is not built yet
+      LFrom := 0;
+      if self.DoNeedsEnd(AType) then
+        LFrom := self.DoMoveSource(LInit);
+        if (LFrom = 0) or (self.FTree[LFrom].Kind <> NodeKind.CallExpression) then
+          self.DoRefuse(LInit, "the lifetime of type '" + TypeText(self.FTree, AType) + "'");
+          return;
+        end;
       end;
+      LSource := self.DoAggregateSource(LInit);
+      if LSource = 0 then
+        return;
+      end;
+      if LFrom <> 0 then
+        self.DoMoveObject(LSlot, LSource, LFrom, AType, ALocal);
+        self.DoSetLive(ALocal, true, ALocal);
+        return;
+      end;
+      self.DoAggregateCopy(LSlot, LSource, AType, ALocal);
     end;
 
     // True when the local variable ALocal has init arguments while its type is no object
