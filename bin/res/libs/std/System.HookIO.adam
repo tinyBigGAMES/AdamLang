@@ -58,6 +58,15 @@
   at fclose), so a C library sees on a handle what
   ucrt gives on a real file of the same bytes. fflush(NULL) flushes every
   open handle too.
+
+  freopen on a handle reopens it in place (the same FILE* comes back): the
+  old stream is closed first, then the path opened in the new mode; a path
+  that is neither virtual nor a path source's opens the disk file as an
+  entry of a folder IOSource the handle owns, by fopen's rules. A failed
+  reopen leaves the stream closed and no longer a handle; no path is
+  ucrt's EINVAL, the stream left open. _lock_file / _unlock_file are
+  nothing on a handle, and _pclose refuses one (-1, EBADF), as ucrt
+  refuses any stream _popen did not open.
 *******************************************************************************/
 
 module unit System.HookIO;
@@ -316,7 +325,9 @@ type
   // last UTF-8 read handed fewer bytes than it took from Stream, so a tell walks them again);
   // StartPos: lowio's _startpos (the place in Stream where that read began). Source /
   // EntryName / Temporary: the source entry the handle opened and whether with D (Source nil
-  // on a registered IO, and once the use is given back). Users: the open list and every call
+  // on a registered IO, and once the use is given back). OwnedSource: a folder IOSource the
+  // handle made for itself (a freopen onto a real path, DoReopen), closed once the handle's
+  // entry use is given back (DoCloseOwnedSource). Users: the open list and every call
   // that found the handle; the last one frees it. Crt: the state of ucrt's own FILE, what
   // every read, write, ungetc, ftell and fseek runs on, so that a handle gives what ucrt gives
   // on a real file of the same bytes
@@ -338,6 +349,7 @@ type
     Source: IOSource;
     EntryName: string;
     Temporary: bool;
+    OwnedSource: IOSource;
     Users: int64;
     Crt: HookCrtModel;
   end;
@@ -491,6 +503,8 @@ type
     const AMode: ptr to const char): int32;
   WfopenFn = routine(const APath: ptr to const wchar; const AMode: ptr to const wchar): ptr;
   FcloseFn = routine(const AFile: ptr): int32;
+  FreopenFn = routine(const APath: ptr to const char; const AMode: ptr to const char;
+    const AFile: ptr): ptr;
   FreadFn = routine(const ABuffer: ptr; const ASize: int64; const ACount: int64;
     const AFile: ptr): int64;
   FwriteFn = routine(const ABuffer: ptr; const ASize: int64; const ACount: int64;
@@ -577,6 +591,7 @@ var
   GRealFopenS: ptr;
   GRealWfopen: ptr;
   GRealFclose: ptr;
+  GRealFreopen: ptr;
   GRealFread: ptr;
   GRealFwrite: ptr;
   GRealGetFmode: ptr;
@@ -603,6 +618,7 @@ var
   GRealUnderFileno: ptr;
   GRealLockFile: ptr;
   GRealUnlockFile: ptr;
+  GRealPclose: ptr;
   GRealFputc: ptr;
   GRealPutc: ptr;
   GRealFputcNolock: ptr;
@@ -1833,9 +1849,23 @@ end;
 forward routine DoConfigureTextMode(const AHandle: ptr to HookHandle;
   const AParsed: HookOpenMode): bool;
 
+// Closes the folder source a handle made for itself (a freopen onto a real path, DoReopen),
+// once its entry use is given back. False when closing the source failed
+routine DoCloseOwnedSource(const AHandle: ptr to HookHandle): bool;
+var
+  LSource: IOSource;
+begin
+  LSource := AHandle->OwnedSource;
+  if LSource = nil then
+    return true;
+  end;
+  AHandle->OwnedSource := nil;
+  return IOSourceClose(LSource);
+end;
+
 // Undoes an open that succeeded but cannot be handed out: closes the handle's own IO, gives its
 // entry use back (a D entry goes, as the OS deletes the file when the failed open's handle
-// closes) and frees the handle. errno is kept
+// closes), closes a folder source of its own and frees the handle. errno is kept
 routine DoAbandon(const AHandle: ptr to HookHandle);
 var
   LError: int32;
@@ -1846,6 +1876,7 @@ begin
   end;
   AHandle->Stream := nil;
   DoGiveBackEntry(AHandle, true);
+  DoCloseOwnedSource(AHandle);
   DoFreeHandle(AHandle);
   SetCErrno(LError);
 end;
@@ -3959,6 +3990,37 @@ begin
   end;
 end;
 
+// Closes AHandle's stream where it stands (fclose takes it out of the open list first, freopen
+// keeps it there): ucrt's flush of written bytes, its own IO closed, its entry use given back
+// and a folder source of its own closed. False when the flush or a close failed (the handle
+// closes anyway)
+routine DoShutHandle(const AHandle: ptr to HookHandle): bool;
+var
+  LOk: bool;
+begin
+  LOk := true;
+  lock (AHandle->Lock->Lock) do
+    if not AHandle->Closed then
+      // ucrt's fclose flushes the written bytes first; a failure makes the close EOF
+      if DoCrtFlushLocked(AHandle) <> 0 then
+        LOk := false;
+      end;
+      AHandle->Closed := true;
+      if AHandle->Owned and (not IOClose(AHandle->Stream)) then
+        LOk := false;
+      end;
+      AHandle->Stream := nil;
+    end;
+  end;
+  // The entry use goes back once the IO is closed: a D entry's last handle removes it, as the
+  // OS deletes the file at the last close
+  DoGiveBackEntry(AHandle, true);
+  if not DoCloseOwnedSource(AHandle) then
+    LOk := false;
+  end;
+  return LOk;
+end;
+
 // A hooked fclose. False: not a HookIO handle, the caller passes it to the C runtime. True:
 // closed; AResult 0, or EOF when ucrt's flush of written bytes or closing its own IO failed
 // (the handle closes anyway). The handle is freed when the last call holding it gives it back
@@ -3972,28 +4034,160 @@ begin
   if LHandle = nil then
     return false;
   end;
-  LOk := true;
-  lock (LHandle->Lock->Lock) do
-    if not LHandle->Closed then
-      // ucrt's fclose flushes the written bytes first; a failure makes the close EOF
-      if DoCrtFlushLocked(LHandle) <> 0 then
-        LOk := false;
-      end;
-      LHandle->Closed := true;
-      if LHandle->Owned and (not IOClose(LHandle->Stream)) then
-        LOk := false;
-      end;
-      LHandle->Stream := nil;
-    end;
-  end;
-  // The entry use goes back once the IO is closed: a D entry's last handle removes it, as the
-  // OS deletes the file at the last close
-  DoGiveBackEntry(LHandle, true);
+  LOk := DoShutHandle(LHandle);
   // The open list's user
   DoReleaseHandle(LHandle);
   if not LOk then
     AResult := ADAM_HOOKIO_EOF;
   end;
+  return true;
+end;
+
+// Takes AFile out of the open list and gives the list's user back (a failed freopen leaves the
+// stream closed); a call still holding the handle keeps it alive until it gives it back
+routine DoForgetHandle(const AFile: ptr);
+var
+  LHandle: ptr to HookHandle;
+begin
+  LHandle := DoTakeHandle(AFile);
+  if LHandle <> nil then
+    DoReleaseHandle(LHandle);
+  end;
+end;
+
+// A freopen onto a path that is neither virtual nor a path source's: the file opens as an
+// entry of a folder IOSource over its folder (CustomIO's file IOs take every fopen mode;
+// create / truncate / append / x and the CRT model are a virtual open's, DoOpenOn), and the
+// source is handed back in ASource for the handle to own (DoCloseOwnedSource). The new handle,
+// or nil with errno set (ENOENT when the folder does not exist) and ASource nil
+routine DoOpenReal(const APath: string; const AMode: string; const ACallerErrno: int32;
+  var ASource: IOSource): ptr;
+var
+  LEntry: HookEntry;
+  LFolder: string;
+  LName: string;
+  LCut: int64;
+  LResult: ptr;
+  LError: int32;
+begin
+  ASource := nil;
+  // The last separator (ucrt takes both); -1: a bare name, the current folder's as fopen's
+  LCut := len(APath) - 1;
+  while (LCut >= 0) and (APath[LCut] <> '/') and (APath[LCut] <> '\\') do
+    LCut := LCut - 1;
+  end;
+  if LCut < 0 then
+    LFolder := ".";
+    LName := APath;
+  else
+    // "/name" keeps the root as its folder, "C:\name" its drive's root
+    LFolder := Substring(APath, 0, LCut);
+    if (len(LFolder) = 0) or (LFolder[len(LFolder) - 1] = ':') then
+      LFolder := LFolder + Substring(APath, LCut, 1);
+    end;
+    LName := Substring(APath, LCut + 1, len(APath) - LCut - 1);
+  end;
+  // The source's own file opens never map a plain path
+  GPathDepth := GPathDepth + 1;
+  ASource := CreateFolderIOSource(LFolder);
+  if ASource = nil then
+    GPathDepth := GPathDepth - 1;
+    SetCErrno(ADAM_ERRNO_ENOENT);
+    return nil;
+  end;
+  LEntry.Id := 0;
+  LEntry.Stream := nil;
+  LEntry.Source := ASource;
+  LEntry.Lock := nil;
+  SetCErrno(ACallerErrno);
+  LResult := DoOpenOn(true, LEntry, "/" + LName, AMode, ACallerErrno);
+  GPathDepth := GPathDepth - 1;
+  if LResult <> nil then
+    return LResult;
+  end;
+  // The open failed: its errno stands, the source goes
+  LError := CErrno();
+  IOSourceClose(ASource);
+  ASource := nil;
+  SetCErrno(LError);
+  return nil;
+end;
+
+// A hooked freopen. False: AFile is not a HookIO handle (a real FILE, or nil): the caller
+// passes the call to the C runtime, whatever the path. True: answered; AResult is AFile,
+// reopened in place, or nil (errno set) when the reopen failed.
+// C's order: the old stream is closed first (its flush or close failing is ignored), then
+// APath opened in AMode, and the stream keeps its address: the new handle's state moves into
+// the record AFile names (its users and the callers holding it stay) and the new handle is
+// freed. A path that is neither virtual nor a path source's opens as an entry of a folder
+// source over its folder (DoOpenReal: a real FILE is the C runtime's object, so the stream
+// stays a HookIO handle over the disk file, which owns that source). No path: ucrt refuses it
+// before touching the stream (EINVAL, the stream stays open). A failed open leaves the stream
+// closed and out of the open list
+routine DoReopen(const APath: ptr to const char; const AMode: ptr to const char;
+  const AFile: ptr; var AResult: ptr): bool;
+var
+  LOld: ptr to HookHandle;
+  LNew: ptr to HookHandle;
+  LOldLock: ptr to HookStreamLock;
+  LUsers: int64;
+  LNewFile: ptr;
+  LSource: IOSource;
+  LCallerErrno: int32;
+begin
+  AResult := nil;
+  LCallerErrno := CErrno();
+  LOld := DoFindHandle(AFile);
+  if LOld = nil then
+    return false;
+  end;
+  if APath = nil then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    DoReleaseHandle(LOld);
+    return true;
+  end;
+  // Closed first; the open list keeps AFile, so the address stays a handle
+  DoShutHandle(LOld);
+  LNewFile := nil;
+  LSource := nil;
+  if not DoOpen(APath, AMode, LNewFile) then
+    // A real path: the disk file opens as a folder source's entry, the source the handle's
+    // own from here on
+    SetCErrno(LCallerErrno);
+    LNewFile := DoOpenReal(StringFromC(APath), StringFromC(AMode), LCallerErrno, LSource);
+  end;
+  if LNewFile = nil then
+    // The open failed (errno is its own): the stream stays closed
+    DoForgetHandle(AFile);
+    DoReleaseHandle(LOld);
+    return true;
+  end;
+  LNew := DoTakeHandle(LNewFile);
+  if LNew = nil then
+    DoForgetHandle(AFile);
+    DoReleaseHandle(LOld);
+    if LSource <> nil then
+      IOSourceClose(LSource);
+    end;
+    SetCErrno(ADAM_ERRNO_EBADF);
+    return true;
+  end;
+  // The new state at the old address. The old record keeps its users (the open list's, this
+  // call's, any other call's); its closed stream's lock is given back and the new one's taken
+  // over, so the freed new record gives no lock back. A real path's folder source is the
+  // stream's from here (closed with it, DoShutHandle)
+  lock (GLock) do
+    LUsers := LOld->Users;
+    LOldLock := LOld->Lock;
+    LOld^ := LNew^;
+    LOld->Users := LUsers;
+    LNew->Lock := nil;
+  end;
+  LOld->OwnedSource := LSource;
+  DoReleaseLock(LOldLock);
+  DoFreeHandle(LNew);
+  DoReleaseHandle(LOld);
+  AResult := AFile;
   return true;
 end;
 
@@ -7114,6 +7308,27 @@ begin
   return LReal(AFile);
 end;
 
+// freopen: a handle is reopened in place (DoReopen), whatever the path; a real FILE goes to the
+// C runtime, whatever the path
+public routine freopen(const APath: ptr to const char; const AMode: ptr to const char;
+  const AFile: ptr): ptr;
+var
+  LFile: ptr;
+  LFound: ptr;
+  LReal: FreopenFn;
+begin
+  if DoReopen(APath, AMode, AFile, LFile) then
+    return LFile;
+  end;
+  LFound := HookReal(GRealFreopen, ptr to const char("freopen"));
+  if LFound = nil then
+    SetCErrno(ADAM_ERRNO_ENOSYS);
+    return nil;
+  end;
+  LReal := FreopenFn(LFound);
+  return LReal(APath, AMode, AFile);
+end;
+
 // fread: a handle reads through its ucrt FILE model
 public routine fread(const ABuffer: ptr; const ASize: int64; const ACount: int64;
   const AFile: ptr): int64;
@@ -7339,6 +7554,26 @@ end;
 public routine _unlock_file(const AFile: ptr);
 begin
   DoLockFile(AFile, GRealUnlockFile, ptr to const char("_unlock_file"));
+end;
+
+// _pclose: a handle is never a pipe; ucrt's _pclose refuses a stream _popen did not open with
+// -1 and EBADF and leaves it open, and so does this hook on a handle
+public routine _pclose(const AFile: ptr): int32;
+var
+  LFound: ptr;
+  LReal: FileIntFn;
+begin
+  if DoOwns(AFile) then
+    SetCErrno(ADAM_ERRNO_EBADF);
+    return -1;
+  end;
+  LFound := HookReal(GRealPclose, ptr to const char("_pclose"));
+  if LFound = nil then
+    SetCErrno(ADAM_ERRNO_ENOSYS);
+    return -1;
+  end;
+  LReal := FileIntFn(LFound);
+  return LReal(AFile);
 end;
 
 // fputc / putc and their _nolock forms: the byte written (0..255) or EOF
