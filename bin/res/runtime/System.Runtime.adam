@@ -78,6 +78,15 @@ var
   // handed over by the entry: SetThreadRelease; nil when the program has none), run as each
   // thread but the main one ends (ThreadEnded)
   GThreadRelease: routine();
+  // The tasks whose thread is running their call, counted from TaskStart until the thread's
+  // last step (TaskLeave): the exit waits until none is left (TaskWait)
+  GTasksRunning: int64;
+  // The threads of detached tasks (no await joined them) that ended their call: ThreadStart
+  // blocks linked through their first word (dead once the thread runs), joined later
+  // (TaskReap as a task starts, TaskWait at the exit); GTaskReapHeld is the list's lock
+  // (1 held), taken by atomicswap
+  GTaskReap: ptr;
+  GTaskReapHeld: int32;
 
 threadstatic
   // The raise in flight on this thread (RaiseWith): its code (PaskalCPP's: 1 for raise, 11
@@ -89,6 +98,10 @@ threadstatic
   // This thread's mark: its address names the thread as a mutex's owner (MutexWords.Owner),
   // no OS call needed; never read or written
   GMutexSelf: uint8;
+  // On a task's thread: true while it is counted in GTasksRunning (TaskRun's start until
+  // TaskLeave), and its own ThreadStart block once known (TaskWait never joins itself)
+  GTaskCounted: bool;
+  GTaskSelf: ptr;
 
 type
   // A mutex's bytes (BNF sec 4; the target lays out ADAM_TARGET_*_MUTEX_SIZE / _ALIGN as
@@ -171,9 +184,14 @@ end;
 // The heap report, Adam's own line: `[Adam Heap] Allocs: N, Frees: N, Leaked: N` (DESIGN
 // sec 8: Adam's debug diagnostic, not PaskalCPP's `[Heap]`; every build is a debug build until
 // M6's levels, a release build will not print it). The leak is signed: a block freed that was
-// never counted shows as negative, not wrapped
+// never counted shows as negative, not wrapped. A task a module's teardown started is waited
+// for first (TaskWait again: the entry's own ran before every teardown), so the counts are
+// the whole program's
+forward routine TaskWait();
+
 routine ReportHeap();
 begin
+  TaskWait();
   if not GHeapReport then
     return;
   end;
@@ -3940,13 +3958,17 @@ end;
 // before it runs (their finally and cleanup funclets ran). The entry's catching scope runs it
 // on the main thread, a module teardown's in its finalize, ThreadRun's on a started one, each
 // with its own raise in flight; when two threads get here, the first reports and ends the
-// process and the other waits for that end, so one whole report is all that is printed
+// process and the other waits for that end, so one whole report is all that is printed (a
+// task's thread that waits leaves the running tasks first: the exit never waits for it)
+forward routine TaskLeave();
+
 routine Unhandled();
 var
   LHeader: ptr to int64;
   LBytes: ptr to uint8;
 begin
   if atomicswap(GUnhandled, 1) <> 0 then
+    TaskLeave();
     while true do
       PlatformSleep(1000);
     end;
@@ -4064,27 +4086,57 @@ begin
   FreeMem(AThread);
 end;
 
+// The thread AThread (ThreadStart's, non-nil) joined only if it has ended already, never
+// waiting: true with what its handle holds freed; false leaves it as it was
+routine ThreadTryJoin(const AThread: ptr): bool;
+var
+  LWords: ptr to uint64;
+begin
+  LWords := ptr to uint64(AThread);
+  if not PlatformThreadTryJoin(LWords[2]) then
+    return false;
+  end;
+  FreeMem(AThread);
+  return true;
+end;
+
+// The thread AThread (ThreadStart's, non-nil) never joined: its handle given back and what
+// it holds freed while the thread may still run (a task's thread doing so for itself as
+// the process ends from it: TaskLeave)
+routine ThreadDetach(const AThread: ptr);
+var
+  LWords: ptr to uint64;
+begin
+  LWords := ptr to uint64(AThread);
+  PlatformThreadDetach(LWords[2]);
+  FreeMem(AThread);
+end;
+
 const
   // A task's object (BNF sec 4 task type: the part of its ref block past the header, its
   // descriptor the compiler's per call site, its done TaskDone) as words: the thread running
-  // its call (ptr, ThreadStart's; nil when none could start), its state (int64: one of the
-  // ADAM_RUNTIME_TASK_* states, written last by the call's thread, atomically), whether it
-  // was joined (int64: 1 once an await or its last release joined it), the code of the raise
-  // its call ended with (int64), that raise's text (a string value it holds one reference
-  // to: the descriptor's map releases it), its entry (ptr: the compiler's routine of one
-  // pointer for the call site, which reads the call's arguments from the object, runs the
-  // call and stores its result there), then the compiler's words: the arguments' copies and
-  // the result, from word 6 on
+  // its call (ptr, ThreadStart's, written atomically once it started; nil when none could
+  // start), its state (int64: one of the ADAM_RUNTIME_TASK_* states, written last by the
+  // call's thread, atomically), whether its thread was taken (int64: 1 once an await joined
+  // it or the thread, its call ended with no await joining, detached itself), the code of
+  // the raise its call ended with (int64), that raise's text (a string value it holds one
+  // reference to: the descriptor's map releases it), its entry (ptr: the compiler's routine
+  // of one pointer for the call site, which reads the call's arguments from the object, runs
+  // the call and stores its result there), then the compiler's words: the arguments'
+  // copies and the result, from word 6 on
   ADAM_RUNTIME_TASK_THREAD: int64 = 0;
   ADAM_RUNTIME_TASK_STATE: int64 = 1;
   ADAM_RUNTIME_TASK_JOINED: int64 = 2;
   ADAM_RUNTIME_TASK_CODE: int64 = 3;
   ADAM_RUNTIME_TASK_TEXT: int64 = 4;
   ADAM_RUNTIME_TASK_ENTRY: int64 = 5;
-  // A task's states: its call still running, ended with its result stored, ended by a raise
+  // A task's states: its call still running, ended with its result stored, ended by a raise,
+  // ended by a raise an await has raised again (a task whose call raised ends the program at
+  // its last release only while no await saw that raise: TaskDone)
   ADAM_RUNTIME_TASK_RUNNING: int64 = 0;
   ADAM_RUNTIME_TASK_ENDED: int64 = 1;
   ADAM_RUNTIME_TASK_RAISED: int64 = 2;
+  ADAM_RUNTIME_TASK_CAUGHT: int64 = 3;
 
 // The object of the task ABlock (a non-nil task value: its ref block), past the header
 routine TaskObject(const ABlock: ptr): ptr;
@@ -4095,16 +4147,131 @@ begin
   return addr of LBytes[24];
 end;
 
-// A task's thread (ThreadStart runs it with the task's object AObject): its entry called
-// inside a catching scope of its own; it ends with its state, ENDED once the entry has
-// stored the result, or RAISED with the raise's code and text kept (a reference added: the
-// raise in flight is the thread's own, released as it ends)
+// The ref block of the task object AObject (TaskObject's inverse)
+routine TaskBlock(const AObject: ptr): ptr;
+var
+  LBytes: ptr to uint8;
+begin
+  LBytes := ptr to uint8(AObject);
+  return addr of LBytes[-24];
+end;
+
+// GTaskReap's lock taken (spinning: it is held only for list steps that never wait)
+routine TaskReapEnter();
+begin
+  while atomicswap(GTaskReapHeld, 1) <> 0 do
+    PlatformSleep(0);
+  end;
+end;
+
+// GTaskReap's lock let go
+routine TaskReapLeave();
+begin
+  atomicstore(GTaskReapHeld, 0);
+end;
+
+// The detached task thread AThread (ThreadStart's), its call ended, put on GTaskReap to be
+// joined later; its first word (the entry ThreadRun read as the thread began) is the link
+routine TaskReapAdd(const AThread: ptr);
+var
+  LSlots: ptr to ptr;
+begin
+  LSlots := ptr to ptr(AThread);
+  TaskReapEnter();
+  LSlots[0] := GTaskReap;
+  GTaskReap := AThread;
+  TaskReapLeave();
+end;
+
+// Every thread on GTaskReap that has ended joined and freed, never waiting (a thread still
+// in its last steps stays on the list): run as a task starts, so a program that keeps
+// starting detached tasks holds only the threads still ending
+routine TaskReap();
+var
+  LThread: ptr;
+  LNext: ptr;
+  LSlots: ptr to ptr;
+  LKept: ptr;
+begin
+  TaskReapEnter();
+  LThread := GTaskReap;
+  LKept := nil;
+  while LThread <> nil do
+    LSlots := ptr to ptr(LThread);
+    LNext := LSlots[0];
+    if not ThreadTryJoin(LThread) then
+      LSlots[0] := LKept;
+      LKept := LThread;
+    end;
+    LThread := LNext;
+  end;
+  GTaskReap := LKept;
+  TaskReapLeave();
+end;
+
+// The calling thread leaves the running tasks (nothing on a thread that is not a counted
+// task's): its own thread detached first when it holds itself (GTaskSelf: the process ends
+// from this thread, which must never wait to join itself), then its count dropped
+routine TaskLeave();
+var
+  LSelf: ptr;
+begin
+  if GTaskSelf <> nil then
+    LSelf := GTaskSelf;
+    GTaskSelf := nil;
+    ThreadDetach(LSelf);
+  end;
+  if GTaskCounted then
+    GTaskCounted := false;
+    atomicadd(GTasksRunning, -1);
+  end;
+end;
+
+// The exit's wait for the tasks (the entry's exit handler, registered after every module's
+// initialize so it runs before every teardown; ReportHeap's first step too): the calling
+// thread leaves the running tasks itself (a task's thread may end the process), then waits
+// until no task's call is running, then joins every detached thread (each past its last
+// count step, so a join waits only for its OS end: its threadstatics released, ThreadEnded).
+// A task still running keeps the process waiting (BNF sec 4: a discarded task runs to its
+// end)
+routine TaskWait();
+var
+  LThread: ptr;
+  LNext: ptr;
+  LSlots: ptr to ptr;
+begin
+  TaskLeave();
+  while atomicload(GTasksRunning) > 0 do
+    PlatformSleep(1);
+  end;
+  TaskReapEnter();
+  LThread := GTaskReap;
+  GTaskReap := nil;
+  TaskReapLeave();
+  while LThread <> nil do
+    LSlots := ptr to ptr(LThread);
+    LNext := LSlots[0];
+    ThreadJoin(LThread);
+    LThread := LNext;
+  end;
+end;
+
+// A task's thread (ThreadStart runs it with the task's object AObject; it is counted in
+// GTasksRunning): its entry called inside a catching scope of its own; the state then
+// written, ENDED once the entry has stored the result, or RAISED with the raise's code and
+// text kept (a reference added: the raise in flight is the thread's own, released as it
+// ends). Then its thread is taken: an await that joined it first keeps it, else the task is
+// detached and this thread holds itself (GTaskSelf) until it is on GTaskReap. Then the
+// thread's own reference released (TaskStart's): the last one ends the task here (TaskDone,
+// which may end the process: TaskLeave then detaches GTaskSelf); then it leaves the count
 routine TaskRun(const AObject: ptr);
 var
   LWords: ptr to int64;
   LSlots: ptr to ptr;
   LEntry: ThreadEntry;
+  LThread: ptr;
 begin
+  GTaskCounted := true;
   LWords := ptr to int64(AObject);
   LSlots := ptr to ptr(AObject);
   LEntry := ThreadEntry(LSlots[ADAM_RUNTIME_TASK_ENTRY]);
@@ -4117,30 +4284,57 @@ begin
     LWords[ADAM_RUNTIME_TASK_CODE] := int64(GRaiseCode);
     atomicstore(LWords[ADAM_RUNTIME_TASK_STATE], ADAM_RUNTIME_TASK_RAISED);
   end;
+  // TaskStart writes the thread once ThreadStart has returned it: a call that ended before
+  // that waits for it, so the thread taken below is the real one
+  LThread := atomicload(LSlots[ADAM_RUNTIME_TASK_THREAD]);
+  while LThread = nil do
+    PlatformSleep(0);
+    LThread := atomicload(LSlots[ADAM_RUNTIME_TASK_THREAD]);
+  end;
+  if atomicswap(LWords[ADAM_RUNTIME_TASK_JOINED], 1) = 0 then
+    GTaskSelf := LThread;
+  end;
+  RefRelease(TaskBlock(AObject));
+  if GTaskSelf <> nil then
+    GTaskSelf := nil;
+    TaskReapAdd(LThread);
+  end;
+  TaskLeave();
 end;
 
 // `async F(..)`'s start, once the compiler has filled the new task ABlock (its entry, the
-// arguments' copies): its thread started (TaskRun). A thread that cannot be started ends the
-// task at once as if its call had raised (code 1, the text saying so), so its await raises
-// that; nothing else changes
+// arguments' copies): the detached threads that have ended joined first (TaskReap); then
+// the thread's own reference added (released as its call ends: a task nothing else holds
+// still runs to its end, detached), the task counted as running and its thread started
+// (TaskRun), the thread written last. A thread that cannot be started ends the task at once
+// as if its call had raised (code 1, the text saying so; its reference and count taken
+// back), so its await raises that; nothing else changes
 routine TaskStart(const ABlock: ptr);
 var
   LObject: ptr;
   LWords: ptr to int64;
   LSlots: ptr to ptr;
   LThread: ptr;
+  LHeader: ptr to int64;
 begin
+  TaskReap();
   LObject := TaskObject(ABlock);
   LWords := ptr to int64(LObject);
   LSlots := ptr to ptr(LObject);
+  LHeader := ptr to int64(ABlock);
+  atomicadd(LHeader[0], 1);
+  atomicadd(GTasksRunning, 1);
   LThread := ThreadStart(TaskRun, LObject);
   if LThread = nil then
+    // The caller still holds the task: taking the thread's reference back never ends it
+    atomicadd(LHeader[0], -1);
+    atomicadd(GTasksRunning, -1);
     LSlots[ADAM_RUNTIME_TASK_TEXT] := TextOfC(ptr to const char("a task's thread could not be started"));
     LWords[ADAM_RUNTIME_TASK_CODE] := 1;
     atomicstore(LWords[ADAM_RUNTIME_TASK_STATE], ADAM_RUNTIME_TASK_RAISED);
     return;
   end;
-  LSlots[ADAM_RUNTIME_TASK_THREAD] := LThread;
+  atomicstore(LSlots[ADAM_RUNTIME_TASK_THREAD], LThread);
 end;
 
 // The task object AObject's thread joined once: the caller that sets its JOINED word first
@@ -4163,9 +4357,10 @@ begin
 end;
 
 // `await T` (BNF sec 6): waits for the call of the task ABlock to end, then raises again
-// what it raised (its code and text, a reference added for the new raise); returns when it
-// ended with its result, which the compiler then reads from the object. A nil task raises
-// (code 1)
+// what it raised (its code and text, a reference added for the new raise; the state CAUGHT
+// from then on: an await saw it, so the task's last release does not end the program);
+// returns when it ended with its result, which the compiler then reads from the object. A
+// nil task raises (code 1)
 routine TaskAwait(const ABlock: ptr);
 var
   LObject: ptr;
@@ -4179,7 +4374,10 @@ begin
   LWords := ptr to int64(LObject);
   LSlots := ptr to ptr(LObject);
   TaskJoin(LObject);
-  if LWords[ADAM_RUNTIME_TASK_STATE] = ADAM_RUNTIME_TASK_RAISED then
+  if atomicload(LWords[ADAM_RUNTIME_TASK_STATE]) = ADAM_RUNTIME_TASK_RAISED then
+    atomicstore(LWords[ADAM_RUNTIME_TASK_STATE], ADAM_RUNTIME_TASK_CAUGHT);
+  end;
+  if atomicload(LWords[ADAM_RUNTIME_TASK_STATE]) = ADAM_RUNTIME_TASK_CAUGHT then
     StrAddRef(LSlots[ADAM_RUNTIME_TASK_TEXT]);
     RaiseWith(int32(LWords[ADAM_RUNTIME_TASK_CODE]), LSlots[ADAM_RUNTIME_TASK_TEXT]);
   end;
@@ -4200,10 +4398,10 @@ end;
 
 // A task's done (its descriptor's: RefRelease runs it on the object AObject as the last
 // handle goes; the descriptor's map then releases the text, the arguments and the result).
-// A task never awaited (its JOINED word still 0: no handle is left, so no await can be
-// under way) is joined here (BNF sec 4: its last release waits for its thread); if its
-// call raised, the program ends as on a raise nothing caught (Unhandled, with that raise's
-// code and text)
+// Its call has ended by then (the task's own thread holds a reference until its state is
+// written: TaskRun), so nothing waits here; this may run on that thread. A call that raised
+// with no await seeing it (still RAISED, not CAUGHT) ends the program as on a raise nothing
+// caught (Unhandled, with that raise's code and text)
 routine TaskDone(const AObject: ptr);
 var
   LWords: ptr to int64;
@@ -4211,11 +4409,7 @@ var
 begin
   LWords := ptr to int64(AObject);
   LSlots := ptr to ptr(AObject);
-  if LWords[ADAM_RUNTIME_TASK_JOINED] <> 0 then
-    return;
-  end;
-  TaskJoin(AObject);
-  if LWords[ADAM_RUNTIME_TASK_STATE] = ADAM_RUNTIME_TASK_RAISED then
+  if atomicload(LWords[ADAM_RUNTIME_TASK_STATE]) = ADAM_RUNTIME_TASK_RAISED then
     StrAddRef(LSlots[ADAM_RUNTIME_TASK_TEXT]);
     StrRelease(GRaiseText);
     GRaiseText := LSlots[ADAM_RUNTIME_TASK_TEXT];
