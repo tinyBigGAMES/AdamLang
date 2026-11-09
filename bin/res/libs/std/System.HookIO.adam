@@ -513,6 +513,10 @@ var
   GEntryUses: array of ptr to HookEntryUse;
   // The last prefix number handed out (0 is never one), under GLock
   GLastId: uint64;
+  // The prefix number of the source SetIOPathSource set (0: none), by the atomics. It is a
+  // registered entry like any other, so a lookup copies it out under the lock (DoFind) and a
+  // source unset meanwhile is simply not found
+  GPathSourceId: uint64;
   // How many handles are open (atomic): while it is 0 no address is a handle
   GOpenCount: int64;
   // Whether the exit flush is registered (DoExitFlush, once, at the first open), under GLock
@@ -594,6 +598,10 @@ threadstatic
   // 0 a plain path is never looked up in a path source, so a source's own opens reach the real
   // file system
   GPathDepth: int32;
+  // The prefix number of this thread's own path source (SetIOThreadPathSource; 0: none).
+  // While it is set, this thread's plain paths are looked up in it instead of the program's
+  // path source; other threads never see it
+  GThreadPathSourceId: uint64;
 
 // Gives back one user of ALock (nil: nothing); its last user takes it out of GStreamLocks and
 // frees it
@@ -1007,14 +1015,16 @@ begin
   return false;
 end;
 
-// Registers one stream under the next prefix number; "" when both are nil or there is no room.
-// The prefix text is built before the entry is added, so a failure registers nothing
-routine DoRegister(const AStream: IO; const ASource: IOSource): string;
+// Registers one stream under the next prefix number, AId that number (0 when nothing is
+// registered); "" when both are nil or there is no room. The prefix text is built before the
+// entry is added, so a failure registers nothing
+routine DoRegisterWithId(const AStream: IO; const ASource: IOSource; var AId: uint64): string;
 var
   LEntry: HookEntry;
   LPrefix: string;
   LCount: int64;
 begin
+  AId := 0;
   if (AStream = nil) and (ASource = nil) then
     return "";
   end;
@@ -1036,31 +1046,32 @@ begin
     GEntries[LCount] := LEntry;
     GLastId := LEntry.Id;
   end;
+  AId := LEntry.Id;
   return LPrefix;
 end;
 
-// Removes a registered prefix (exactly `io://<n>`); false when it is not one
-routine DoUnregister(const APrefix: string): bool;
+// Registers one stream under the next prefix number, as DoRegisterWithId
+routine DoRegister(const AStream: IO; const ASource: IOSource): string;
 var
   LId: uint64;
-  LRest: string;
+begin
+  return DoRegisterWithId(AStream, ASource, LId);
+end;
+
+// Removes the entry of prefix number AId; false when none is registered under it
+routine DoUnregisterId(const AId: uint64): bool;
+var
   LLock: ptr to HookStreamLock;
   LFound: bool;
   LCount: int64;
   LI: int64;
 begin
-  if not DoParse(APrefix, 0, LId, LRest) then
-    return false;
-  end;
-  if (LId = 0) or (len(LRest) <> 0) then
-    return false;
-  end;
   LFound := false;
   LLock := nil;
   lock (GLock) do
     LCount := len(GEntries);
     LI := 0;
-    while (LI < LCount) and (GEntries[LI].Id <> LId) do
+    while (LI < LCount) and (GEntries[LI].Id <> AId) do
       LI := LI + 1;
     end;
     if LI < LCount then
@@ -1075,6 +1086,186 @@ begin
   end;
   DoReleaseLock(LLock);
   return LFound;
+end;
+
+// Removes a registered prefix (exactly `io://<n>`); false when it is not one
+routine DoUnregister(const APrefix: string): bool;
+var
+  LId: uint64;
+  LRest: string;
+begin
+  if not DoParse(APrefix, 0, LId, LRest) then
+    return false;
+  end;
+  if (LId = 0) or (len(LRest) <> 0) then
+    return false;
+  end;
+  return DoUnregisterId(LId);
+end;
+
+// The prefix number of a source registered for a path source (nil: 0, nothing registered);
+// false when there is no room, nothing registered
+routine DoPathSourceIdOf(const ASource: IOSource; var AId: uint64): bool;
+var
+  LPrefix: string;
+begin
+  AId := 0;
+  if ASource = nil then
+    return true;
+  end;
+  LPrefix := DoRegisterWithId(nil, ASource, AId);
+  return len(LPrefix) <> 0;
+end;
+
+// Makes ASource the program's path source (nil: none). It is registered under a prefix of its
+// own first (false, nothing changed, when that fails); the one it replaces is unregistered
+// after the swap, so a lookup meanwhile sees either source, never neither by mistake
+routine DoSetPathSource(const ASource: IOSource): bool;
+var
+  LNewId: uint64;
+  LOldId: uint64;
+begin
+  if not DoPathSourceIdOf(ASource, LNewId) then
+    return false;
+  end;
+  LOldId := atomicswap(GPathSourceId, LNewId);
+  if LOldId <> 0 then
+    DoUnregisterId(LOldId);
+  end;
+  return true;
+end;
+
+// Makes ASource this thread's own path source (nil: none, the program's applies again), as
+// DoSetPathSource; only this thread reads GThreadPathSourceId, so the swap needs no atomic
+routine DoSetThreadPathSource(const ASource: IOSource): bool;
+var
+  LNewId: uint64;
+  LOldId: uint64;
+begin
+  if not DoPathSourceIdOf(ASource, LNewId) then
+    return false;
+  end;
+  LOldId := GThreadPathSourceId;
+  GThreadPathSourceId := LNewId;
+  if LOldId <> 0 then
+    DoUnregisterId(LOldId);
+  end;
+  return true;
+end;
+
+// The source this thread's own path source was set from (nil: none set)
+routine DoThreadPathSource(): IOSource;
+var
+  LEntry: HookEntry;
+begin
+  if GThreadPathSourceId = 0 then
+    return nil;
+  end;
+  if not DoFind(GThreadPathSourceId, LEntry) then
+    return nil;
+  end;
+  // A source entry has no stream lock; DoFind's user is given back all the same
+  DoReleaseLock(LEntry.Lock);
+  return LEntry.Source;
+end;
+
+// The prefix number a plain path on this thread is looked up in: the thread's own path source
+// when one is set, else the program's (0: none)
+routine DoActivePathSourceId(): uint64;
+begin
+  if GThreadPathSourceId <> 0 then
+    return GThreadPathSourceId;
+  end;
+  return atomicload(GPathSourceId);
+end;
+
+// True when a plain path may be looked up in a path source: one is set (this thread's own or
+// the program's) and this thread is not inside HookIO's own path work. pcpp also skipped the
+// lookup inside CustomIO's real file system work (InFileSystemWork); Adam's CustomIO opens and
+// queries its files through System.Runtime's file handles and paths, never a hooked C name,
+// so its file IO and folder source never come back through these hooks
+routine DoPathSourceActive(): bool;
+begin
+  return (GPathDepth = 0) and (DoActivePathSourceId() <> 0);
+end;
+
+// A plain path as an entry name of the path source: '\' turned to '/', and every leading "./"
+// or '/' dropped (a source's names are relative), as raylib's file callbacks name them; ""
+// when nothing is left
+routine DoPathEntryName(const APath: string): string;
+var
+  LName: string;
+  LCount: int64;
+  LAt: int64;
+  LI: int64;
+  LSkipping: bool;
+begin
+  LCount := len(APath);
+  LAt := 0;
+  LSkipping := true;
+  while LSkipping do
+    LSkipping := false;
+    if (LAt < LCount) and ((APath[LAt] = '/') or (APath[LAt] = '\\')) then
+      LAt := LAt + 1;
+      LSkipping := true;
+    end;
+    if (not LSkipping) and (LAt + 1 < LCount) and (APath[LAt] = '.') and
+      ((APath[LAt + 1] = '/') or (APath[LAt + 1] = '\\')) then
+      LAt := LAt + 2;
+      LSkipping := true;
+    end;
+  end;
+  setlength(LName, LCount - LAt);
+  for LI := 0 to len(LName) - 1 do
+    if APath[LAt + LI] = '\\' then
+      LName[LI] := '/';
+    else
+      LName[LI] := APath[LAt + LI];
+    end;
+  end;
+  return LName;
+end;
+
+// As DoParse (after DoSkipCurrentFolder), and a plain path the path source holds (this
+// thread's own when set, else the program's): then AId is that source's prefix number and
+// ARest "/<entry>". A plain path the source lacks (or any path while no source is set, or
+// inside HookIO's own path work) is false: the C runtime gets it
+routine DoResolve(const APath: string; var AId: uint64; var ARest: string): bool;
+var
+  LEntry: HookEntry;
+  LSourceId: uint64;
+  LName: string;
+  LExists: bool;
+begin
+  if DoParse(APath, DoSkipCurrentFolder(APath), AId, ARest) then
+    return true;
+  end;
+  if (len(APath) = 0) or (not DoPathSourceActive()) then
+    return false;
+  end;
+  LSourceId := DoActivePathSourceId();
+  if (LSourceId = 0) or (not DoFind(LSourceId, LEntry)) then
+    return false;
+  end;
+  // A source entry has no stream lock; DoFind's user is given back all the same
+  DoReleaseLock(LEntry.Lock);
+  if LEntry.Source = nil then
+    return false;
+  end;
+  LName := DoPathEntryName(APath);
+  if len(LName) = 0 then
+    return false;
+  end;
+  // The lookup is HookIO's own path work: a source that opens files reaches the real ones
+  GPathDepth := GPathDepth + 1;
+  LExists := IOSourceExists(LEntry.Source, LName);
+  GPathDepth := GPathDepth - 1;
+  if not LExists then
+    return false;
+  end;
+  AId := LSourceId;
+  ARest := "/" + LName;
+  return true;
 end;
 
 // The exit flush of open handles' written bytes, defined below
@@ -1673,8 +1864,9 @@ begin
   return ptr(LHandle);
 end;
 
-// A hooked open of APath in AMode (both UTF-8). False: not a virtual path, the caller passes it
-// to the C runtime. True: handled; AResult is the new handle, or nil with errno set
+// A hooked open of APath in AMode (both UTF-8). False: neither a virtual path nor one the path
+// source holds (DoResolve), the caller passes it to the C runtime with errno as it came. True:
+// handled; AResult is the new handle, or nil with errno set
 routine DoOpenText(const APath: string; const AMode: string; var AResult: ptr): bool;
 var
   LEntry: HookEntry;
@@ -1687,7 +1879,9 @@ begin
   // (a missing entry's ENOENT before it is created) never leaks out
   LCallerErrno := CErrno();
   AResult := nil;
-  if not DoParse(APath, DoSkipCurrentFolder(APath), LId, LRest) then
+  if not DoResolve(APath, LId, LRest) then
+    // What a path source's lookup set never reaches the C runtime's open
+    SetCErrno(LCallerErrno);
     return false;
   end;
   LEntry.Id := 0;
@@ -1788,8 +1982,10 @@ begin
 end;
 
 // A hooked _wfopen: as DoOpenText after converting to UTF-8. Only a path that starts with io://
-// (after any leading "./" or ".\") is converted; such a path that does not convert is a missing
-// file (ENOENT), such a mode is refused (EINVAL). Any other path goes to the C runtime
+// (after any leading "./" or ".\") is converted, or any path while a path source is active
+// (else a real path costs no conversion); an io:// path that does not convert is a missing
+// file (ENOENT), such a mode is refused (EINVAL). A plain path or mode that does not convert
+// goes to the C runtime, as any other path does
 routine DoOpenWide(const APath: ptr to const wchar; const AMode: ptr to const wchar;
   var AResult: ptr): bool;
 var
@@ -1801,7 +1997,13 @@ begin
     return false;
   end;
   if not DoIsVirtual(DoAsciiPrefix(APath)) then
-    return false;
+    if not DoPathSourceActive() then
+      return false;
+    end;
+    if (not DoNarrow(APath, LPath)) or (not DoNarrow(AMode, LMode)) then
+      return false;
+    end;
+    return DoOpenText(LPath, LMode, AResult);
   end;
   if not DoNarrow(APath, LPath) then
     SetCErrno(ADAM_ERRNO_ENOENT);
@@ -7189,6 +7391,41 @@ end;
 public routine FileIO(const AFile: ptr): IO;
 begin
   return DoStream(AFile);
+end;
+
+// Makes an IOSource the path source: while it is set, a plain path (not `io://`) that a hooked
+// open names, in the program or in any C library linked into it, is looked up in the source
+// first, as an entry name ('\' as '/', every leading "./" or '/' dropped). When the source has
+// that entry, the path opens as `<prefix>/<entry>` would; otherwise it goes to the real file
+// system untouched. While a hooked open runs, the files a source opens itself reach the real
+// file system. One setting for the whole program; setting a source replaces the one before.
+// The source stays the caller's: unset it (nil) before closing it. CustomIO's file IO and
+// folder source always mean the disk. False when the source could not be registered (no
+// room): nothing changed
+public routine SetIOPathSource(const ASource: IOSource): bool;
+begin
+  return DoSetPathSource(ASource);
+end;
+
+// Makes an IOSource the calling thread's own path source: while it is set, a plain path that a
+// hooked open names on this thread is looked up in it, as SetIOPathSource describes, instead
+// of in the program's path source; every other thread keeps the program's. A loader that pulls
+// in files by plain relative paths sets one for the load and unsets it after, without moving
+// the program's path source under another thread. Set and unset it on the same thread, unset
+// it (nil) before the thread ends and before closing the source; nil: the program's path
+// source applies to this thread again. False when the source could not be registered (no
+// room): nothing changed
+public routine SetIOThreadPathSource(const ASource: IOSource): bool;
+begin
+  return DoSetThreadPathSource(ASource);
+end;
+
+// The calling thread's own path source, as SetIOThreadPathSource last set it on this thread,
+// so a loader can set its own for a call and put the caller's back after; nil when none is set
+// on this thread (the program's path source, if any, applies)
+public routine GetIOThreadPathSource(): IOSource;
+begin
+  return DoThreadPathSource();
 end;
 
 end.
