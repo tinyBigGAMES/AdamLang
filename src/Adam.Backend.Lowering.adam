@@ -48,11 +48,17 @@
     header  items: ptr at 0, count: int32 at P, cursor: int32 at P + 4
             (P + 8 bytes, pointer aligned; a varargs local is one header)
     item    tag: uint64 at 0 (the argument's static type: DoPackTag, what
-            M3.11's run-time check compares), place: ptr at 8 (the address
-            of the caller's copy of the value, at its own type)
-  count / next / get / reset / copy read the header the routine was given
-  (FPackSlot) or a varargs local's own; copy() copies the header (the
-  items are the caller's and outlive the callee and its locals).
+            next / get's run-time check compares), place: ptr at 8 (the
+            address of the caller's copy of the value, at its own type),
+            name: ptr at 8 + P (its type's text, a C string: a raise's
+            message), kind: int64 at 8 + 2P (its VarKind's number:
+            DoPackKindNumber); DoPackItemBytes rounds the item to 8
+  count / next / get / reset / copy / kind read the header the routine was
+  given (FPackSlot) or a varargs local's own; copy() copies the header (the
+  items are the caller's and outlive the callee and its locals). next / get /
+  kind find their item through the runtime's PackItem (the index against
+  the count, next / get's type against the item's tag; raising as pcpp
+  does); next moves the cursor only once its read succeeded (M3.8h).
 
   The slice (M2): routines with value and reference parameters, locals and
   their initializers, expression statements, calls to Adam routines and to
@@ -373,6 +379,67 @@ begin
   return IrOp.AtomicStore;
 end;
 
+// The VarKind value name (System.Runtime's VarKind) of the builtin type named AName; ""
+// for a builtin no pack carries (varargs, mutex)
+routine DoBuiltinKindName(const AName: string): string;
+begin
+  if AName = "int8" then
+    return "Int8";
+  end;
+  if AName = "int16" then
+    return "Int16";
+  end;
+  if AName = "int32" then
+    return "Int32";
+  end;
+  if AName = "int64" then
+    return "Int64";
+  end;
+  if AName = "uint8" then
+    return "UInt8";
+  end;
+  if AName = "uint16" then
+    return "UInt16";
+  end;
+  if AName = "uint32" then
+    return "UInt32";
+  end;
+  if AName = "uint64" then
+    return "UInt64";
+  end;
+  if AName = "clong" then
+    return "CLong";
+  end;
+  if AName = "culong" then
+    return "CULong";
+  end;
+  if AName = "float32" then
+    return "Float32";
+  end;
+  if AName = "float64" then
+    return "Float64";
+  end;
+  if AName = "bool" then
+    return "Bool";
+  end;
+  if AName = "char" then
+    return "Char";
+  end;
+  if AName = "wchar" then
+    return "WChar";
+  end;
+  if AName = "string" then
+    return "String";
+  end;
+  if AName = "wstring" then
+    return "WString";
+  end;
+  if AName = "ptr" then
+    return "Ptr";
+  end;
+  return "";
+end;
+
 public type
   // One lowering pass over a tree (see LowerProgram and the header)
   Lowerer = object
@@ -494,6 +561,9 @@ public type
     // By a canonical choices type's node id: the data blob of its names table, print's
     // (DoChoiceNamesData); 0: none made yet
     hidden FChoiceNamesOf: array of int64;
+    // By its text: the read-only C string blob a typed pack names a type or a member with
+    // (DoPackText), its data id + 1
+    hidden FPackTexts: ref StringIdMap;
     // By an object type's node id: the data blob of its ref descriptor (DoRefDescriptorData);
     // 0: none made yet, -1: refused once, not again
     hidden FDescriptorOf: array of int64;
@@ -554,6 +624,7 @@ public type
       setlength(self.FManagedMapOf, ATree.Count);
       setlength(self.FElementMapOf, ATree.Count);
       setlength(self.FChoiceNamesOf, ATree.Count);
+      self.FPackTexts := ref StringIdMap();
       setlength(self.FDescriptorOf, ATree.Count);
       setlength(self.FVtableOf, ATree.Count);
       self.FEndFunctions := ref Int64List();
@@ -3444,14 +3515,27 @@ public type
       return self.FTarget.PointerSize();
     end;
 
-    // The bytes of one pack item: its tag (uint64) and its place (a ptr at 8), rounded up
-    // to 8 so every item's tag stays aligned
+    // The bytes of one pack item: its tag (uint64), its place (a ptr at 8), its type's name
+    // (a ptr at DoPackNameAt) and its kind (an int64 at DoPackKindAt), rounded up to 8 so
+    // every item's tag stays aligned (System.Runtime's PackEntry)
     hidden method DoPackItemBytes(): int64;
     var
       LBytes: int64;
     begin
-      LBytes := 8 + self.FTarget.PointerSize();
+      LBytes := self.DoPackKindAt() + 8;
       return ((LBytes + 7) div 8) * 8;
+    end;
+
+    // The offset of a pack item's type name (its place's end)
+    hidden method DoPackNameAt(): int64;
+    begin
+      return 8 + self.FTarget.PointerSize();
+    end;
+
+    // The offset of a pack item's kind (its type name's end)
+    hidden method DoPackKindAt(): int64;
+    begin
+      return self.DoPackNameAt() + self.FTarget.PointerSize();
     end;
 
     // The type a pack item of the argument's canonical type AType is stored and tagged as:
@@ -3485,6 +3569,82 @@ public type
         LHash := LHash * 0x100000001B3u;
       end;
       return int64(LHash);
+    end;
+
+    // The address of the read-only C string AText (its bytes and a NUL) a typed pack names
+    // a type or a member with: one blob per text (FPackTexts), an Address at ANode
+    hidden method DoPackText(const AText: string; const ANode: int64): int64;
+    var
+      LData: int64;
+      LAddress: int64;
+      LI: int64;
+    begin
+      LData := self.FPackTexts.Find(AText) - 1;
+      if LData < 0 then
+        LData := self.FModule.AddData(ADAM_LOWERING_TEXT_SYMBOL + IntToStr(self.FModule.DataCount),
+          1, ANode);
+        for LI := 0 to len(AText) - 1 do
+          self.FModule.DataAt(LData).AddByte(uint8(AText[LI]));
+        end;
+        self.FModule.DataAt(LData).AddByte(uint8(0));
+        self.FPackTexts.Put(AText, LData + 1);
+      end;
+      LAddress := self.DoEmit(IrOp.Address, IrType.Pointer, ANode);
+      self.FModule.InstrAt(LAddress).Link := LData;
+      return LAddress;
+    end;
+
+    // The VarKind value name of a pack item of the canonical type AType (System.Runtime's
+    // VarKind, BNF sec 6 kind): a builtin its own name (int32 Int32, clong CLong, ptr Ptr),
+    // any other type what it is; "" for a type no pack carries
+    hidden const method DoPackKindName(const AType: int64): string;
+    begin
+      if self.FTree[AType].Kind = NodeKind.BuiltinTypeDecl then
+        return DoBuiltinKindName(self.FTree[AType].Text);
+      end;
+      match ClassOf(self.FTree, AType) of
+        TypeClass.Pointer: return "Pointer";
+        TypeClass.StaticArray: return "StaticArray";
+        TypeClass.DynamicArray: return "DynamicArray";
+        TypeClass.RecordType: return "Record";
+        TypeClass.ObjectType: return "Object";
+        TypeClass.InterfaceType: return "Interface";
+        TypeClass.OverlayType: return "Overlay";
+        TypeClass.ChoicesType: return "Choices";
+        TypeClass.SetType: return "Set";
+        TypeClass.RoutineType: return "Routine";
+        TypeClass.OwnType: return "Own";
+        TypeClass.RefType: return "Ref";
+        TypeClass.WeakType: return "Weak";
+        TypeClass.TaskType: return "Task";
+      else
+        return "";
+      end;
+    end;
+
+    // The number of the VarKind value a pack item of the canonical type AType carries
+    // (DoPackKindName), as SEM folded it in the runtime's VarKind (SyntaxTree.VarKind); 0
+    // after LW0001 at ANode when the runtime has no VarKind or no such value
+    hidden method DoPackKindNumber(const AType: int64; const ANode: int64): int64;
+    var
+      LName: string;
+      LBody: int64;
+      LMember: int64;
+      LI: int64;
+    begin
+      LName := self.DoPackKindName(AType);
+      if (self.FTree.VarKind <> 0) and (LName <> "") then
+        LBody := BodyOf(self.FTree, self.FTree.VarKind);
+        for LI := 0 to self.FTree.CountOf(LBody, NodeRole.Member) - 1 do
+          LMember := self.FTree.NthOf(LBody, NodeRole.Member, LI);
+          if (self.FTree[LMember].Kind = NodeKind.ChoiceValue) and (self.FTree[LMember].Text = LName) then
+            return int64(self.FTree[LMember].ResolvedConst.Bits);
+          end;
+        end;
+      end;
+      self.DoRefuse(ANode, "a pack argument of type '" + TypeText(self.FTree, AType) +
+        "' with no VarKind value");
+      return 0;
     end;
 
     // The address of the caller's copy of the pack argument AArg at its own type
@@ -3534,8 +3694,8 @@ public type
 
     // The typed pack of the call ACall's arguments from the AFirst-th on (one past a
     // cpplink variadic's fixed parameters), built in the caller's frame: each argument's
-    // copy (DoPackPlace, in order), its item (tag, place), then the header (items, count,
-    // cursor 0); the header's address, 0 after LW0001
+    // copy (DoPackPlace, in order), its item (tag, place, type name, kind), then the header
+    // (items, count, cursor 0); the header's address, 0 after LW0001
     hidden method DoPackArguments(const ACall: int64; const AFirst: int64): int64;
     var
       LCount: int64;
@@ -3543,6 +3703,7 @@ public type
       LItem: int64;
       LArg: int64;
       LPlace: int64;
+      LType: int64;
       LHeader: int64;
       LI: int64;
     begin
@@ -3558,10 +3719,14 @@ public type
         if LPlace = 0 then
           return 0;
         end;
+        LType := self.DoPackType(self.DoUsedType(LArg));
         LItem := self.DoByteOffset(LItems, LI * self.DoPackItemBytes(), LArg);
-        self.DoStore(LItem, self.DoConstant(IrType.UInt64,
-          self.DoPackTag(self.DoPackType(self.DoUsedType(LArg))), LArg), LArg);
+        self.DoStore(LItem, self.DoConstant(IrType.UInt64, self.DoPackTag(LType), LArg), LArg);
         self.DoStore(self.DoByteOffset(LItem, 8, LArg), LPlace, LArg);
+        self.DoStore(self.DoByteOffset(LItem, self.DoPackNameAt(), LArg),
+          self.DoPackText(TypeText(self.FTree, LType), LArg), LArg);
+        self.DoStore(self.DoByteOffset(LItem, self.DoPackKindAt(), LArg),
+          self.DoConstant(IrType.Int64, self.DoPackKindNumber(LType, LArg), LArg), LArg);
       end;
       LHeader := self.DoSizedSlot(ACall, self.DoPackHeaderBytes(), self.FTarget.PointerAlign());
       if LItems = 0 then
@@ -3576,7 +3741,7 @@ public type
     end;
 
     // True when AId reads a typed pack: varargs.<member> in a cpplink variadic (FPackSlot),
-    // a call of next / get / reset / copy on a varargs local, a varargs local's count
+    // a call of next / get / reset / copy / kind on a varargs local, a varargs local's count
     // (SEM typed the receiver varargs: DoPackCall / DoPackMember)
     hidden const method DoIsPackAccess(const AId: int64): bool;
     var
@@ -3623,57 +3788,93 @@ public type
       return self.DoAddress(self.FTree.FirstOf(LMember, NodeRole.Operand));
     end;
 
-    // The index get(I, T) AId reads at: its I (a varargs expression's Argument, a call's
-    // first)
+    // The index get(I, T) / kind(I) AId reads at: its I (a varargs expression's Argument, a
+    // call's first)
     hidden const method DoPackIndexNode(const AId: int64): int64;
     begin
       return self.FTree.FirstOf(AId, NodeRole.Argument);
     end;
 
-    // The place of the item the pack read AId (next / get) names in the header at AHeader:
-    // next takes the cursor's item and moves the cursor one on, get the I-th (BNF sec 6;
-    // the range and type checks that raise are M3.11's); the address the item's place holds,
-    // 0 after LW0001
-    hidden method DoPackItemPlace(const AId: int64; const AHeader: int64): int64;
+    // The address of the item the pack read AId (next / get / kind) names in the header at
+    // AHeader, found by the runtime's PackItem (BNF sec 6: the index against the count,
+    // next / get's T against the item's type, each raising as pcpp does): next takes the
+    // cursor's item and moves the cursor one on once the read succeeded (PackItem returned),
+    // get and kind the I-th; 0 after LW0001
+    hidden method DoPackItem(const AId: int64; const AHeader: int64): int64;
     var
+      LWord: string;
+      LFunction: int64;
       LCursorAt: int64;
       LIndex: int64;
-      LBytes: int64;
-      LScale: int64;
-      LItems: int64;
-      LItem: int64;
+      LWanted: int64;
+      LWantedName: int64;
+      LMember: int64;
+      LType: int64;
+      LOne: int64;
+      LNext: int64;
       LId: int64;
     begin
-      if self.DoPackWord(AId) = "next" then
+      LWord := self.DoPackWord(AId);
+      LFunction := self.DoRuntimeFunction(RuntimeRoutine.PackItem, AId);
+      if LFunction = 0 then
+        return 0;
+      end;
+      LCursorAt := 0;
+      if LWord = "next" then
         LCursorAt := self.DoByteOffset(AHeader, self.DoPackCountAt() + 4, AId);
         LIndex := self.DoLoad(LCursorAt, IrType.Int32, AId);
-        // every operand is emitted before the instruction that uses it
-        LScale := self.DoConstant(IrType.Int32, 1, AId);
-        LId := self.DoEmit(IrOp.Add, IrType.Int32, AId);
-        self.FModule.InstrAt(LId).Operands.Add(LIndex);
-        self.FModule.InstrAt(LId).Operands.Add(LScale);
-        self.DoStore(LCursorAt, LId, AId);
       else
         LIndex := self.DoValue(self.DoPackIndexNode(AId));
         if LIndex = 0 then
           return 0;
         end;
+        LIndex := self.DoConvertIr(LIndex, IrType.Int32, AId);
       end;
-      LBytes := self.DoConvertIr(LIndex, IrType.Int64, AId);
-      LScale := self.DoConstant(IrType.Int64, self.DoPackItemBytes(), AId);
-      LId := self.DoEmit(IrOp.Mul, IrType.Int64, AId);
-      self.FModule.InstrAt(LId).Operands.Add(LBytes);
-      self.FModule.InstrAt(LId).Operands.Add(LScale);
-      LItems := self.DoLoad(AHeader, IrType.Pointer, AId);
-      LItem := self.DoEmit(IrOp.Offset, IrType.Pointer, AId);
-      self.FModule.InstrAt(LItem).Operands.Add(LItems);
-      self.FModule.InstrAt(LItem).Operands.Add(LId);
+      // kind wants no type (a tag of 0); next / get want T's (DoPackTag, as the caller tagged)
+      if LWord = "kind" then
+        LWanted := self.DoConstant(IrType.UInt64, 0, AId);
+        LWantedName := self.DoConstant(IrType.Pointer, 0, AId);
+      else
+        LType := self.DoPackType(self.FTree[AId].ResolvedType);
+        LWanted := self.DoConstant(IrType.UInt64, self.DoPackTag(LType), AId);
+        LWantedName := self.DoPackText(TypeText(self.FTree, LType), AId);
+      end;
+      LMember := self.DoPackText(LWord, AId);
+      // every operand is emitted before the instruction that uses it
+      LId := self.DoEmit(IrOp.Call, self.FModule.FunctionAt(LFunction).Signature.ResultType, AId);
+      self.FModule.InstrAt(LId).Link := LFunction;
+      self.FModule.InstrAt(LId).Operands.Add(AHeader);
+      self.FModule.InstrAt(LId).Operands.Add(LIndex);
+      self.FModule.InstrAt(LId).Operands.Add(LMember);
+      self.FModule.InstrAt(LId).Operands.Add(LWanted);
+      self.FModule.InstrAt(LId).Operands.Add(LWantedName);
+      if LWord = "next" then
+        LOne := self.DoConstant(IrType.Int32, 1, AId);
+        LNext := self.DoEmit(IrOp.Add, IrType.Int32, AId);
+        self.FModule.InstrAt(LNext).Operands.Add(LIndex);
+        self.FModule.InstrAt(LNext).Operands.Add(LOne);
+        self.DoStore(LCursorAt, LNext, AId);
+      end;
+      return LId;
+    end;
+
+    // The place of the item the pack read AId (next / get) names in the header at AHeader
+    // (DoPackItem): the address the item's place holds, 0 after LW0001
+    hidden method DoPackItemPlace(const AId: int64; const AHeader: int64): int64;
+    var
+      LItem: int64;
+    begin
+      LItem := self.DoPackItem(AId, AHeader);
+      if LItem = 0 then
+        return 0;
+      end;
       return self.DoLoad(self.DoByteOffset(LItem, 8, AId), IrType.Pointer, AId);
     end;
 
     // The value of the pack access AId: count (an int32), next / get of a T that is no
-    // aggregate (its place read at T), reset (the cursor set to 0: the store); 0 after
-    // LW0001 (copy is no value: only a varargs local's source, DoPackSourceAddress)
+    // aggregate (its place read at T), reset (the cursor set to 0: the store), kind (the
+    // item's VarKind number at the VarKind's IR type); 0 after LW0001 (copy is no value:
+    // only a varargs local's source, DoPackSourceAddress)
     hidden method DoPackValue(const AId: int64): int64;
     var
       LWord: string;
@@ -3683,12 +3884,13 @@ public type
       LId: int64;
     begin
       LWord := self.DoPackWord(AId);
-      if (LWord <> "count") and (LWord <> "next") and (LWord <> "get") and (LWord <> "reset") then
+      if (LWord <> "count") and (LWord <> "next") and (LWord <> "get") and (LWord <> "reset") and
+        (LWord <> "kind") then
         self.DoRefuse(AId, self.FTree.ConstructPhrase(AId));
         return 0;
       end;
       LIr := IrType.Void;
-      if (LWord = "next") or (LWord = "get") then
+      if (LWord = "next") or (LWord = "get") or (LWord = "kind") then
         LIr := self.DoTypeAt(self.FTree[AId].ResolvedType, AId);
         if LIr = IrType.Void then
           return 0;
@@ -3708,6 +3910,14 @@ public type
         LId := self.DoConstant(LIr, 0, AId);
         self.DoStore(LPlace, LId, AId);
         return LId;
+      end;
+      if LWord = "kind" then
+        LPlace := self.DoPackItem(AId, LHeader);
+        if LPlace = 0 then
+          return 0;
+        end;
+        LId := self.DoLoad(self.DoByteOffset(LPlace, self.DoPackKindAt(), AId), IrType.Int64, AId);
+        return self.DoConvertIr(LId, LIr, AId);
       end;
       LPlace := self.DoPackItemPlace(AId, LHeader);
       if LPlace = 0 then
