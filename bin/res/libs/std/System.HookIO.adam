@@ -74,6 +74,10 @@ const
   ADAM_HOOKIO_SCHEME_LENGTH: int64 = 5;
   // The byte that ends a text-mode file on Windows (ucrt drops a trailing one at a "+" open)
   ADAM_HOOKIO_CTRL_Z: uint8 = 0x1A;
+  // A text handle's line end on Windows: lowio writes each '\n' as "\r\n" and reads "\r\n" as
+  // '\n'
+  ADAM_HOOKIO_CR: uint8 = 13;
+  ADAM_HOOKIO_LF: uint8 = 10;
   // ucrt's _O_BINARY (fcntl.h): _get_fmode's bit for a binary default
   ADAM_HOOKIO_O_BINARY: int32 = 0x8000;
   // The largest int64: the bytes of fread / fwrite are clamped there
@@ -1546,12 +1550,13 @@ begin
   return addr of AHandle->Crt.Buffer.Owned[0];
 end;
 
-// lowio's _write (write.cpp): ASize bytes at AData to the IO at the handle's Position. Append
-// mode writes at the IO's end: lowio seeks there first and ignores a failed seek (its lseek
-// also clears the Ctrl-Z end). A handle opened without write access writes nothing: -1 with
-// EBADF (ucrt maps the OS refusal to it). A short write sets Failed: nothing written is -1
-// with ENOSPC, else the count with EIO. Returns the count written or -1
-routine DoLowWriteLocked(const AHandle: ptr to HookHandle; const AData: ptr to uint8;
+// lowio's write of the descriptor itself (write.cpp): ASize bytes at AData to the IO at the
+// handle's Position, as they are. Append mode writes at the IO's end: lowio seeks there first
+// and ignores a failed seek (its lseek also clears the Ctrl-Z end). A handle opened without
+// write access writes nothing: -1 with EBADF (ucrt maps the OS refusal to it). A short write
+// sets Failed: nothing written is -1 with ENOSPC, else the count with EIO. Returns the count
+// written or -1
+routine DoWriteIOLocked(const AHandle: ptr to HookHandle; const AData: ptr to uint8;
   const ASize: int64): int64;
 var
   LEnd: int64;
@@ -1589,18 +1594,86 @@ begin
   return LGot;
 end;
 
-// lowio's _read (read.cpp): up to ASize bytes of the IO at the handle's Position into AData,
-// as they are (a text handle's too: its translation is not lowio's here). 0 at the end, and
-// after a Ctrl-Z end (LowEof) until a seek clears it; -1 on a failure: a handle opened
-// without read access EBADF, an IO that cannot read EIO. No stdio flag changes here
-routine DoLowReadLocked(const AHandle: ptr to HookHandle; const AData: ptr to uint8;
+// lowio's text-mode _write (write.cpp, ANSI): every '\n' of the ASize bytes at AData goes to
+// the IO as "\r\n". Returns the count of AData's bytes written (after a short IO write only
+// those whose whole translation landed), or -1 when nothing was written
+routine DoWriteTextLocked(const AHandle: ptr to HookHandle; const AData: ptr to uint8;
+  const ASize: int64): int64;
+var
+  LRaw: ByteArray;
+  LLength: int64;
+  LI: int64;
+  LAt: int64;
+  LGot: int64;
+  LUsed: int64;
+  LCount: int64;
+  LTakes: int64;
+begin
+  // Nothing to translate: the descriptor's own rules (EBADF, the append seek) still hold
+  if ASize <= 0 then
+    return DoWriteIOLocked(AHandle, AData, ASize);
+  end;
+  // The raw size first: each '\n' takes two bytes
+  LLength := ASize;
+  for LI := 0 to ASize - 1 do
+    if AData[LI] = ADAM_HOOKIO_LF then
+      LLength := LLength + 1;
+    end;
+  end;
+  setlength(LRaw, LLength);
+  LAt := 0;
+  for LI := 0 to ASize - 1 do
+    if AData[LI] = ADAM_HOOKIO_LF then
+      LRaw[LAt] := ADAM_HOOKIO_CR;
+      LAt := LAt + 1;
+    end;
+    LRaw[LAt] := AData[LI];
+    LAt := LAt + 1;
+  end;
+  LGot := DoWriteIOLocked(AHandle, addr of LRaw[0], LLength);
+  if LGot < 0 then
+    return -1;
+  end;
+  if LGot = LLength then
+    return ASize;
+  end;
+  // A short write: walk the source, each byte took 1 raw byte, a '\n' took 2
+  LUsed := 0;
+  LCount := 0;
+  while LCount < ASize do
+    LTakes := 1;
+    if AData[LCount] = ADAM_HOOKIO_LF then
+      LTakes := 2;
+    end;
+    if (LUsed + LTakes) > LGot then
+      leave;
+    end;
+    LUsed := LUsed + LTakes;
+    LCount := LCount + 1;
+  end;
+  return LCount;
+end;
+
+// lowio's _write: a text handle's bytes translated (DoWriteTextLocked), a binary handle's as
+// they are (DoWriteIOLocked)
+routine DoLowWriteLocked(const AHandle: ptr to HookHandle; const AData: ptr to uint8;
+  const ASize: int64): int64;
+begin
+  if AHandle->Text then
+    return DoWriteTextLocked(AHandle, AData, ASize);
+  end;
+  return DoWriteIOLocked(AHandle, AData, ASize);
+end;
+
+// lowio's read of the descriptor itself (read.cpp): up to ASize bytes of the IO at the
+// handle's Position into AData, as they are. -1 on a failure: a handle opened without read
+// access EBADF, an IO that cannot read EIO; a short count is the end. No stdio flag changes
+// here: lowio has none
+routine DoLowRawLocked(const AHandle: ptr to HookHandle; const AData: ptr to uint8;
   const ASize: int64): int64;
 var
   LGot: int64;
 begin
-  if (ASize <= 0) or AHandle->Crt.LowEof then
-    return 0;
-  end;
   if not DoCanRead(AHandle) then
     SetCErrno(ADAM_ERRNO_EBADF);
     return -1;
@@ -1614,11 +1687,101 @@ begin
     LGot := 0;
   end;
   AHandle->Position := AHandle->Position + LGot;
-  if (LGot = 0) and (IOStatus(AHandle->Stream) <> IOState.Eof) then
+  if (LGot = 0) and (ASize > 0) and (IOStatus(AHandle->Stream) <> IOState.Eof) then
     SetCErrno(ADAM_ERRNO_EIO);
     return -1;
   end;
   return LGot;
+end;
+
+// lowio's text translation of the ACount raw bytes just read into AData, in place (ucrt
+// translate_text_mode_nolock, a seekable file): "\r\n" is '\n', any other '\r' stays. LowCrlf
+// records whether the raw bytes began with '\n'. A Ctrl-Z sets LowEof and ends the bytes
+// delivered; Position stays at the end of the raw read. A '\r' that is the last raw byte
+// reads one more: no byte keeps the '\r'; a '\n' that would be the only byte delivered is
+// taken; otherwise the descriptor steps back onto it and the '\r' is kept only when it was
+// not a '\n' (the next read starts with that '\n', a lone one). Returns the count delivered
+routine DoLowTranslateLocked(const AHandle: ptr to HookHandle; const AData: ptr to uint8;
+  const ACount: int64): int64;
+var
+  LFrom: int64;
+  LTo: int64;
+  LPeek: uint8;
+  LPeekGot: int64;
+  LErrno: int32;
+begin
+  LFrom := 0;
+  LTo := 0;
+  LPeek := 0;
+  AHandle->Crt.LowCrlf := (ACount > 0) and (AData[0] = ADAM_HOOKIO_LF);
+  while LFrom < ACount do
+    if AData[LFrom] = ADAM_HOOKIO_CTRL_Z then
+      AHandle->Crt.LowEof := true;
+      leave;
+    end;
+    if AData[LFrom] <> ADAM_HOOKIO_CR then
+      AData[LTo] := AData[LFrom];
+      LTo := LTo + 1;
+      LFrom := LFrom + 1;
+      skip;
+    end;
+    if (LFrom + 1) < ACount then
+      if AData[LFrom + 1] = ADAM_HOOKIO_LF then
+        AData[LTo] := ADAM_HOOKIO_LF;
+        LFrom := LFrom + 2;
+      else
+        AData[LTo] := ADAM_HOOKIO_CR;
+        LFrom := LFrom + 1;
+      end;
+      LTo := LTo + 1;
+      skip;
+    end;
+    // The '\r' is the last raw byte: look at the next one. A failed look is no byte (ucrt's
+    // ReadFile failure leaves errno alone)
+    LFrom := LFrom + 1;
+    LErrno := CErrno();
+    LPeekGot := DoLowRawLocked(AHandle, addr of LPeek, 1);
+    SetCErrno(LErrno);
+    if LPeekGot <> 1 then
+      AData[LTo] := ADAM_HOOKIO_CR;
+      LTo := LTo + 1;
+      skip;
+    end;
+    if (LPeek = ADAM_HOOKIO_LF) and (LTo = 0) then
+      AData[LTo] := ADAM_HOOKIO_LF;
+      LTo := LTo + 1;
+      skip;
+    end;
+    // A seek back (lowio's lseek clears LowEof, which is not set here)
+    AHandle->Position := AHandle->Position - 1;
+    AHandle->Crt.LowEof := false;
+    if LPeek <> ADAM_HOOKIO_LF then
+      AData[LTo] := ADAM_HOOKIO_CR;
+      LTo := LTo + 1;
+    end;
+  end;
+  return LTo;
+end;
+
+// lowio's _read: 0 at the end, and after a Ctrl-Z end (LowEof) until a seek clears it; -1 on
+// a failure (DoLowRawLocked's errno), else the count: a text handle's translated
+// (DoLowTranslateLocked), a binary handle's as read
+routine DoLowReadLocked(const AHandle: ptr to HookHandle; const AData: ptr to uint8;
+  const ASize: int64): int64;
+var
+  LGot: int64;
+begin
+  if (ASize <= 0) or AHandle->Crt.LowEof then
+    return 0;
+  end;
+  LGot := DoLowRawLocked(AHandle, AData, ASize);
+  if LGot < 0 then
+    return -1;
+  end;
+  if not AHandle->Text then
+    return LGot;
+  end;
+  return DoLowTranslateLocked(AHandle, AData, LGot);
 end;
 
 // ucrt's buffer allocation (_getbuf.cpp __acrt_stdio_allocate_buffer_nolock), once: the big
@@ -1821,16 +1984,43 @@ begin
   return LDone;
 end;
 
+// The '\n' bytes in [AFirst, ALast) of the buffer
+routine DoCrtNewlines(const AHandle: ptr to HookHandle; const AFirst: int64;
+  const ALast: int64): int64;
+var
+  LData: ptr to uint8;
+  LCount: int64;
+  LI: int64;
+begin
+  LCount := 0;
+  if ALast <= AFirst then
+    return 0;
+  end;
+  LData := DoCrtData(AHandle);
+  for LI := AFirst to ALast - 1 do
+    if LData[LI] = ADAM_HOOKIO_LF then
+      LCount := LCount + 1;
+    end;
+  end;
+  return LCount;
+end;
+
 // ucrt's ftell (ftell.cpp common_ftell_nolock, common_ftell_read_mode_nolock), ungot bytes in
 // the buffer counted as the buffer's own: in read mode the place minus the bytes left, in
 // write mode the place plus the bytes not yet flushed. ucrt finds the descriptor's place with
-// an lseek, and lowio's lseek clears FEOFLAG: so does this. -1 with EINVAL for a stream that
-// neither reads, writes nor updates. lowio hands every handle's bytes as they are
-// (DoLowReadLocked), so no newline is counted twice
+// an lseek, and lowio's lseek clears FEOFLAG: so does this (a read that met a Ctrl-Z goes on
+// past it). A text stream counts each newline before Next twice and, in read mode with bytes
+// left in the buffer, estimates the buffer's raw size as ucrt does: at the end of the IO its
+// bytes plus one per newline (plus the Ctrl-Z of StreamCtrlZ), elsewhere the small size for a
+// fill of at most that many bytes, else BufferSize, plus one when LowCrlf. -1 with EINVAL for
+// a stream that neither reads, writes nor updates. No sign check (ucrt has none): an ungot
+// '\n' at the front can make a text place negative
 routine DoCrtTellLocked(const AHandle: ptr to HookHandle): int64;
 var
   LLow: int64;
   LOffset: int64;
+  LBytes: int64;
+  LEnd: int64;
 begin
   LLow := AHandle->Position;
   // ucrt's ftell first sets a negative count to 0: a putc refused by _flsbuf (a read-only
@@ -1849,6 +2039,9 @@ begin
     SetCErrno(ADAM_ERRNO_EINVAL);
     return -1;
   end;
+  if AHandle->Text and (AHandle->Crt.StreamRead or AHandle->Crt.StreamWrite) then
+    LOffset := LOffset + DoCrtNewlines(AHandle, 0, AHandle->Crt.Next);
+  end;
   if LLow = 0 then
     return LOffset;
   end;
@@ -1858,7 +2051,29 @@ begin
   if AHandle->Crt.Count = 0 then
     return LLow;
   end;
-  return LLow - AHandle->Crt.Count;
+  // Binary: lowio - (Count + Next) + Next
+  if not AHandle->Text then
+    return LLow - AHandle->Crt.Count;
+  end;
+  LBytes := AHandle->Crt.Count + AHandle->Crt.Next;
+  // An IO with no size is never "at the end" (ucrt's lseek to the end failed)
+  LEnd := IOSize(AHandle->Stream);
+  if LEnd = LLow then
+    LBytes := LBytes + DoCrtNewlines(AHandle, 0, LBytes);
+    if AHandle->Crt.StreamCtrlZ then
+      LBytes := LBytes + 1;
+    end;
+  else
+    if (LBytes <= ADAM_HOOKIO_SMALL_BUFFER_SIZE) and DoCrtOwnBuffer(AHandle) then
+      LBytes := ADAM_HOOKIO_SMALL_BUFFER_SIZE;
+    else
+      LBytes := AHandle->Crt.BufferSize;
+    end;
+    if AHandle->Crt.LowCrlf then
+      LBytes := LBytes + 1;
+    end;
+  end;
+  return LLow - LBytes + LOffset;
 end;
 
 // ucrt's buffer drop on fseek / rewind (__acrt_stdio_reset_buffer and the flag rules after
