@@ -94,6 +94,14 @@ const
   // fill asks for the big size, the first fill after an fseek of a read-only stream the small
   ADAM_HOOKIO_BUFFER_SIZE: int64 = 4096;
   ADAM_HOOKIO_SMALL_BUFFER_SIZE: int64 = 512;
+  // ucrt's setvbuf modes (stdio.h _IOFBF, _IOLBF, _IONBF), setbuf's size (BUFSIZ), the size of
+  // _IONBF's own _charbuf, and the largest size setvbuf takes (INT_MAX)
+  ADAM_HOOKIO_IOFBF: int32 = 0x0000;
+  ADAM_HOOKIO_IOLBF: int32 = 0x0040;
+  ADAM_HOOKIO_IONBF: int32 = 0x0004;
+  ADAM_HOOKIO_BUFSIZ: uint64 = 512;
+  ADAM_HOOKIO_SINGLE_BUFFER_SIZE: int64 = 2;
+  ADAM_HOOKIO_INT_MAX: uint64 = 2147483647;
   // lowio's largest read (INT_MAX) and write (UINT_MAX - 1) at a time
   ADAM_HOOKIO_LOW_READ_MAX: int64 = 2147483647;
   ADAM_HOOKIO_LOW_WRITE_MAX: int64 = 4294967294;
@@ -224,12 +232,13 @@ type
 
   // The stream calls DoWith runs on a handle
   HookOp = choices(Read, Write, Get, Gets, Unget, Put, Puts, Print, MarkFailed, Scan, Seek,
-    Tell, Rewind, AtEnd, Failed, ClearError, Flush, Fileno);
+    Tell, Rewind, AtEnd, Failed, ClearError, Flush, Setvbuf, Fileno);
 
   // One stream call on a handle: its arguments (Buffer / Size: the bytes of a read, write,
   // fgets, fputs or a formatted print; ItemSize: fread / fwrite's element size, C's size_t in
-  // its bits; Offset / Origin: fseek's; Value: the byte of fputc / ungetc; Refused: arguments
-  // ucrt refuses up front, fread / fwrite's byte count past size_t: EINVAL; ScanReal: the real
+  // its bits; Offset / Origin: fseek's; Value: the byte of fputc / ungetc, setvbuf's mode (its
+  // array in Buffer, its usable size in Size); Refused: arguments ucrt refuses up front,
+  // fread / fwrite's byte count past size_t, setvbuf's mode or size: EINVAL; ScanReal: the real
   // __stdio_common_vfscanf, ScanOptions .. ScanArgs: its arguments, for a scan) and its answer
   // (Answer, set to the call's failure value before DoWith runs it)
   HookCall = record
@@ -291,6 +300,9 @@ type
   VfscanfFn = routine(const AOptions: uint64; const AFile: ptr; const AFormat: ptr to const char;
     const ALocale: ptr; const AArgs: ptr): int32;
   TmpfileFn = routine(): ptr;
+  SetvbufFn = routine(const AFile: ptr; const ABuffer: ptr to char; const AMode: int32;
+    const ASize: uint64): int32;
+  SetbufFn = routine(const AFile: ptr; const ABuffer: ptr to char);
 
 var
   // The registry lock: the entries, the stream locks, the open list and the entry uses. Never
@@ -346,6 +358,8 @@ var
   GRealVsprintf: ptr;
   GRealVfscanf: ptr;
   GRealTmpfile: ptr;
+  GRealSetvbuf: ptr;
+  GRealSetbuf: ptr;
   GRealFflush: ptr;
   GRealFflushNolock: ptr;
   GRealFreadNolock: ptr;
@@ -3296,6 +3310,55 @@ begin
   DoScanStandIn(AHandle, ACall, LStart, LStandIn);
 end;
 
+// The model's buffer dropped as ucrt's setvbuf drops it: bytes read ahead or ungot are lost
+// (the descriptor does not move), _IOCTRLZ and every buffer bit cleared
+routine DoCrtDropBuffer(const AHandle: ptr to HookHandle);
+begin
+  setlength(AHandle->Crt.Buffer.Owned, 0);
+  AHandle->Crt.Buffer.Caller := nil;
+  AHandle->Crt.Buffer.Size := 0;
+  AHandle->Crt.HasBuffer := false;
+  AHandle->Crt.SetvbufBuffer := false;
+  AHandle->Crt.StreamCtrlZ := false;
+  AHandle->Crt.Next := 0;
+  AHandle->Crt.Count := 0;
+end;
+
+// setvbuf, as ucrt's (setvbuf.cpp _setvbuf_internal): Refused, a mode that is not _IOFBF,
+// _IOLBF or _IONBF or, buffering, a size outside 2 .. INT_MAX: -1 with EINVAL (what ucrt's
+// parameter check returns under the MinGW handler). Else bytes written and not yet flushed are
+// flushed (its result not checked, as ucrt's is not) and the buffer is dropped
+// (DoCrtDropBuffer); then _IONBF takes the 2-byte _charbuf, and _IOLBF is _IOFBF: with no
+// array a buffer of Size (the size rounded down to even), else the caller's array at that size
+// (ucrt fills it itself). Answer 0
+routine DoCallSetvbuf(const AHandle: ptr to HookHandle; var ACall: HookCall);
+begin
+  if ACall.Refused then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return;
+  end;
+  DoCrtFlushLocked(AHandle);
+  DoCrtDropBuffer(AHandle);
+  if ACall.Value = ADAM_HOOKIO_IONBF then
+    setlength(AHandle->Crt.Buffer.Owned, ADAM_HOOKIO_SINGLE_BUFFER_SIZE);
+    AHandle->Crt.Buffer.Size := ADAM_HOOKIO_SINGLE_BUFFER_SIZE;
+    AHandle->Crt.Kind := HookCrtBufferKind.Single;
+  else
+    if ACall.Buffer = nil then
+      setlength(AHandle->Crt.Buffer.Owned, ACall.Size);
+      AHandle->Crt.Kind := HookCrtBufferKind.Crt;
+    else
+      AHandle->Crt.Buffer.Caller := ACall.Buffer;
+      AHandle->Crt.Kind := HookCrtBufferKind.User;
+    end;
+    AHandle->Crt.Buffer.Size := ACall.Size;
+    AHandle->Crt.SetvbufBuffer := true;
+  end;
+  AHandle->Crt.BufferSize := AHandle->Crt.Buffer.Size;
+  AHandle->Crt.HasBuffer := true;
+  ACall.Answer := 0;
+end;
+
 // ACall run on AHandle, under its stream lock. fileno: a handle has no descriptor (EBADF, the
 // answer stays -1)
 routine DoRun(const AHandle: ptr to HookHandle; var ACall: HookCall);
@@ -3318,6 +3381,7 @@ begin
     HookOp.Failed: ACall.Answer := DoFlagValue(AHandle->Failed);
     HookOp.ClearError: DoCallClearError(AHandle);
     HookOp.Flush: DoCallFlush(AHandle, ACall);
+    HookOp.Setvbuf: DoCallSetvbuf(AHandle, ACall);
     HookOp.Fileno: SetCErrno(ADAM_ERRNO_EBADF);
   end;
 end;
@@ -4086,6 +4150,79 @@ begin
   end;
   LReal := VfscanfFn(LFound);
   return LReal(AOptions, AFile, AFormat, ALocale, AArgs);
+end;
+
+// A setvbuf call of AMode at ASize bytes over ABuffer (nil: no array): Refused for a mode
+// ucrt refuses or, buffering, a size outside 2 .. INT_MAX; else Size is the usable size
+// (rounded down to even). The failure value is -1
+routine DoSetvbufCall(const ABuffer: ptr to char; const AMode: int32; const ASize: uint64):
+  HookCall;
+var
+  LCall: HookCall;
+begin
+  LCall := DoCall(HookOp.Setvbuf, -1);
+  LCall.Buffer := ptr to uint8(ptr(ABuffer));
+  LCall.Value := AMode;
+  if (AMode <> ADAM_HOOKIO_IONBF) and (AMode <> ADAM_HOOKIO_IOFBF) and
+    (AMode <> ADAM_HOOKIO_IOLBF) then
+    LCall.Refused := true;
+    return LCall;
+  end;
+  if AMode = ADAM_HOOKIO_IONBF then
+    return LCall;
+  end;
+  if (ASize < 2) or (ASize > ADAM_HOOKIO_INT_MAX) then
+    LCall.Refused := true;
+    return LCall;
+  end;
+  LCall.Size := int64(ASize & uint64(0x7FFFFFFE));
+  return LCall;
+end;
+
+// setvbuf: a handle's buffer as ucrt's setvbuf sets it (DoCallSetvbuf): 0, or -1 (EINVAL for
+// a mode or size ucrt refuses). Anything else goes to the real function (-1 with ENOSYS when
+// the C runtime has none)
+public routine setvbuf(const AFile: ptr; const ABuffer: ptr to char; const AMode: int32;
+  const ASize: uint64): int32;
+var
+  LCall: HookCall;
+  LFound: ptr;
+  LReal: SetvbufFn;
+begin
+  LCall := DoSetvbufCall(ABuffer, AMode, ASize);
+  if DoWith(AFile, LCall) then
+    return int32(LCall.Answer);
+  end;
+  LFound := DoReal(GRealSetvbuf, ptr to const char("setvbuf"));
+  if LFound = nil then
+    return -1;
+  end;
+  LReal := SetvbufFn(LFound);
+  return LReal(AFile, ABuffer, AMode, ASize);
+end;
+
+// setbuf, as ucrt's: no array is setvbuf's _IONBF, an array is _IOFBF at BUFSIZ. Anything
+// else goes to the real function (ENOSYS when the C runtime has none)
+public routine setbuf(const AFile: ptr; const ABuffer: ptr to char);
+var
+  LCall: HookCall;
+  LFound: ptr;
+  LReal: SetbufFn;
+begin
+  if ABuffer = nil then
+    LCall := DoSetvbufCall(nil, ADAM_HOOKIO_IONBF, 0);
+  else
+    LCall := DoSetvbufCall(ABuffer, ADAM_HOOKIO_IOFBF, ADAM_HOOKIO_BUFSIZ);
+  end;
+  if DoWith(AFile, LCall) then
+    return;
+  end;
+  LFound := DoReal(GRealSetbuf, ptr to const char("setbuf"));
+  if LFound = nil then
+    return;
+  end;
+  LReal := SetbufFn(LFound);
+  LReal(AFile, ABuffer);
 end;
 
 // fflush: a handle's written bytes, then its IO's own flush; fflush(NULL) flushes every
