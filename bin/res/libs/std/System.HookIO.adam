@@ -169,6 +169,25 @@ const
   // EILSEQ (ERROR_NO_UNICODE_TRANSLATION; any other is EINVAL)
   ADAM_HOOKIO_CP_UTF8: uint32 = 65001;
   ADAM_HOOKIO_ERROR_NO_UNICODE_TRANSLATION: uint32 = 1113;
+  // The query family's answers by ucrt's rules: _access's mode bits (any other is EINVAL; 2
+  // asks for writing, there is no execute bit); a stat's file type and owner bits
+  // (sys/stat.h's _S_IFREG, _S_IREAD, _S_IWRITE; the owner's three, copied to group and
+  // other as ucrt's stat does), and the largest size _stat64i32's 32-bit st_size holds
+  // (LONG_MAX, past it EOVERFLOW); GetFileAttributesA's FILE_ATTRIBUTE_NORMAL /
+  // FILE_ATTRIBUTE_READONLY / INVALID_FILE_ATTRIBUTES and the errors it reports
+  // (ERROR_FILE_NOT_FOUND, ERROR_PROC_NOT_FOUND)
+  ADAM_HOOKIO_ACCESS_VALID: int32 = 6;
+  ADAM_HOOKIO_ACCESS_WRITE: int32 = 2;
+  ADAM_HOOKIO_S_IFREG: uint16 = 0x8000;
+  ADAM_HOOKIO_S_IREAD: uint16 = 0x0100;
+  ADAM_HOOKIO_S_IWRITE: uint16 = 0x0080;
+  ADAM_HOOKIO_S_OWNER: uint16 = 0x01C0;
+  ADAM_HOOKIO_STAT_SIZE_MAX: int64 = 2147483647;
+  ADAM_HOOKIO_ATTRIBUTE_NORMAL: uint32 = 0x80;
+  ADAM_HOOKIO_ATTRIBUTE_READONLY: uint32 = 0x1;
+  ADAM_HOOKIO_ATTRIBUTES_INVALID: uint32 = 0xFFFFFFFF;
+  ADAM_HOOKIO_ERROR_FILE_NOT_FOUND: uint32 = 2;
+  ADAM_HOOKIO_ERROR_PROC_NOT_FOUND: uint32 = 127;
 
 type
   // The lock every handle on one stream shares: a registered IO's (Listed: one per IO in
@@ -188,6 +207,31 @@ type
     Stream: IO;
     Source: IOSource;
     Lock: ptr to HookStreamLock;
+  end;
+
+  // What a query found at a virtual path (DoQuery): whether the file exists, its size (0 when
+  // the IO cannot tell) and whether a write open that empties nothing ("r+") would succeed
+  HookQuery = record
+    Found: bool;
+    Size: int64;
+    Writable: bool;
+  end;
+
+  // ucrt's struct _stat64i32 (sys/stat.h) as Win64 lays it out, 48 bytes: st_dev, st_ino,
+  // st_mode, st_nlink, st_uid, st_gid, st_rdev, st_size (32 bits), st_atime, st_mtime,
+  // st_ctime (64 bits each)
+  HookStat64i32 = record
+    Device: uint32;
+    Inode: uint16;
+    ModeBits: uint16;
+    LinkCount: int16;
+    OwnerId: int16;
+    GroupId: int16;
+    RawDevice: uint32;
+    ByteSize: int32;
+    AccessTime: int64;
+    ModifyTime: int64;
+    ChangeTime: int64;
   end;
 
   // How open handles use one source entry (ucrt's share rules for D): the plain and the D
@@ -486,6 +530,13 @@ type
     const AText: ptr to const uint8; const ACount: int32; const AWide: ptr to uint8;
     const AWideCount: int32): int32;
   GetLastErrorFn = routine(): uint32;
+  // The query family's real functions: ucrt's _access (what mingw's oldnames access reaches
+  // too) and _stat64i32 (mingw's stat64i32 hands a real path to it), kernel32's
+  // GetFileAttributesA, and SetLastError (a missing virtual path's GetFileAttributesA)
+  AccessFn = routine(const APath: ptr to const char; const AMode: int32): int32;
+  Stat64i32Fn = routine(const APath: ptr to const char; const ABuf: ptr): int32;
+  GetFileAttributesAFn = routine(const APath: ptr to const char): uint32;
+  SetLastErrorFn = routine(const ACode: uint32);
   // ucrt's isleadbyte and mbtowc (an ANSI text handle's wide read, in the current locale), and
   // the wide read calls a hook hands a FILE that is not a handle to
   IsleadbyteFn = routine(const AByte: int32): int32;
@@ -592,6 +643,11 @@ var
   GRealCodePage: ptr;
   GRealStrtolL: ptr;
   GRealWcstolL: ptr;
+  GRealAccess: ptr;
+  GRealPlainAccess: ptr;
+  GRealStat64i32: ptr;
+  GRealGetFileAttributesA: ptr;
+  GRealSetLastError: ptr;
 
 threadstatic
   // How deep this thread is inside HookIO's own path work (a hooked open): while it is above
@@ -2014,6 +2070,208 @@ begin
     return true;
   end;
   return DoOpenText(LPath, LMode, AResult);
+end;
+
+// The query family (access, stat, GetFileAttributesA) answers a virtual path, or one the path
+// source holds (DoResolve), as fopen would find it. False: neither, the caller passes it to
+// the C runtime. True: answered in AQuery; a missing file sets errno ENOENT, a found one
+// leaves errno as the caller had it. Writable: a write open that empties nothing ("r+")
+// would succeed: always on a registered IO (DoOpenShared opens it in every mode), on a
+// source entry when IOSourceOpen gives it in ReadWrite (opened and closed at once). Under a
+// registered IO's prefix every name is that IO; a source entry exists when IOSourceExists
+// says so. Directories are not answered: CustomIO has no directory query, and a source's
+// root is a missing file, as opendir finds it. GLock is never held while CustomIO runs
+routine DoQuery(const APath: string; var AQuery: HookQuery): bool;
+var
+  LEntry: HookEntry;
+  LRest: string;
+  LName: string;
+  LId: uint64;
+  LFound: bool;
+  LStream: IO;
+  LCallerErrno: int32;
+begin
+  AQuery.Found := false;
+  AQuery.Size := 0;
+  AQuery.Writable := false;
+  LCallerErrno := CErrno();
+  if not DoResolve(APath, LId, LRest) then
+    SetCErrno(LCallerErrno);
+    return false;
+  end;
+  // The query's own work (the source's real files) never maps a plain path
+  GPathDepth := GPathDepth + 1;
+  LFound := false;
+  if LId <> 0 then
+    LFound := DoFind(LId, LEntry);
+  end;
+  if LFound then
+    if LEntry.Stream <> nil then
+      lock (LEntry.Lock->Lock) do
+        AQuery.Size := IOSize(LEntry.Stream);
+      end;
+      AQuery.Writable := true;
+      AQuery.Found := true;
+    else
+      LName := DoEntryName(LRest);
+      if IOSourceExists(LEntry.Source, LName) then
+        AQuery.Size := IOSourceSize(LEntry.Source, LName);
+        LStream := IOSourceOpen(LEntry.Source, LName, FileMode.ReadWrite);
+        if LStream <> nil then
+          AQuery.Writable := true;
+          IOClose(LStream);
+        end;
+        AQuery.Found := true;
+      end;
+    end;
+    // The entry's stream lock user DoFind took
+    DoReleaseLock(LEntry.Lock);
+  end;
+  GPathDepth := GPathDepth - 1;
+  if AQuery.Size < 0 then
+    AQuery.Size := 0;
+  end;
+  if AQuery.Found then
+    SetCErrno(LCallerErrno);
+  else
+    SetCErrno(ADAM_ERRNO_ENOENT);
+  end;
+  return true;
+end;
+
+// _access (and mingw's oldnames access) on a virtual path: AResult 0, or -1 with errno.
+// AMode: 0, 2, 4 or 6; any other bit is EINVAL, checked before the file as ucrt does. An IO
+// has no execute bit to ask; 2 (write) needs the query's Writable, else EACCES
+routine DoAccess(const APath: ptr to const char; const AMode: int32; var AResult: int32): bool;
+var
+  LPath: string;
+  LRest: string;
+  LId: uint64;
+  LQuery: HookQuery;
+begin
+  AResult := -1;
+  if APath = nil then
+    return false;
+  end;
+  LPath := StringFromC(APath);
+  if not DoResolve(LPath, LId, LRest) then
+    return false;
+  end;
+  if (AMode & (~ADAM_HOOKIO_ACCESS_VALID)) <> 0 then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return true;
+  end;
+  // A path source entry removed between the two lookups: missing, as above
+  if not DoQuery(LPath, LQuery) then
+    SetCErrno(ADAM_ERRNO_ENOENT);
+    return true;
+  end;
+  if not LQuery.Found then
+    return true;
+  end;
+  if ((AMode & ADAM_HOOKIO_ACCESS_WRITE) <> 0) and (not LQuery.Writable) then
+    SetCErrno(ADAM_ERRNO_EACCES);
+    return true;
+  end;
+  AResult := 0;
+  return true;
+end;
+
+// stat64i32 (mingw's stat) on a virtual path: AResult 0 with ABuf (a struct _stat64i32,
+// HookStat64i32) filled, or -1 with errno. A regular file, read for everyone, write as the
+// query's Writable (the owner's bits copied to group and other, as ucrt's stat does), one
+// link, its size, no times (an IO has none: 0). A size past what the 32-bit st_size holds is
+// EOVERFLOW, as ucrt's _stat64i32 gives; a nil ABuf is EINVAL
+routine DoStat(const APath: ptr to const char; const ABuf: ptr; var AResult: int32): bool;
+var
+  LQuery: HookQuery;
+  LStat: ptr to HookStat64i32;
+  LModeBits: uint16;
+begin
+  AResult := -1;
+  if APath = nil then
+    return false;
+  end;
+  if not DoQuery(StringFromC(APath), LQuery) then
+    return false;
+  end;
+  if not LQuery.Found then
+    return true;
+  end;
+  if ABuf = nil then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return true;
+  end;
+  if LQuery.Size > ADAM_HOOKIO_STAT_SIZE_MAX then
+    SetCErrno(ADAM_ERRNO_EOVERFLOW);
+    return true;
+  end;
+  // uint16 operands promote to int32 (C++23 arithmetic): each result is narrowed back
+  LModeBits := uint16(ADAM_HOOKIO_S_IFREG | ADAM_HOOKIO_S_IREAD);
+  if LQuery.Writable then
+    LModeBits := uint16(LModeBits | ADAM_HOOKIO_S_IWRITE);
+  end;
+  LModeBits := uint16(LModeBits | ((LModeBits & ADAM_HOOKIO_S_OWNER) shr 3) |
+    ((LModeBits & ADAM_HOOKIO_S_OWNER) shr 6));
+  LStat := ptr to HookStat64i32(ABuf);
+  LStat->Device := 0;
+  LStat->Inode := 0;
+  LStat->ModeBits := LModeBits;
+  LStat->LinkCount := 1;
+  LStat->OwnerId := 0;
+  LStat->GroupId := 0;
+  LStat->RawDevice := 0;
+  LStat->ByteSize := int32(LQuery.Size);
+  LStat->AccessTime := 0;
+  LStat->ModifyTime := 0;
+  LStat->ChangeTime := 0;
+  AResult := 0;
+  return true;
+end;
+
+// kernel32's SetLastError with ACode; nothing when kernel32 lacks it
+routine DoSetLastError(const ACode: uint32);
+var
+  LFound: ptr;
+  LSet: SetLastErrorFn;
+begin
+  LFound := HookReal(GRealSetLastError, ptr to const char("kernel32.dll"),
+    ptr to const char("SetLastError"));
+  if LFound = nil then
+    return;
+  end;
+  LSet := SetLastErrorFn(LFound);
+  LSet(ACode);
+end;
+
+// GetFileAttributesA on a virtual path: FILE_ATTRIBUTE_NORMAL, or FILE_ATTRIBUTE_READONLY when
+// the query is not Writable; a missing one gives INVALID_FILE_ATTRIBUTES with
+// ERROR_FILE_NOT_FOUND. errno is left as it was (the Win32 call reports through
+// GetLastError only)
+routine DoAttributes(const APath: ptr to const char; var AResult: uint32): bool;
+var
+  LQuery: HookQuery;
+  LCallerErrno: int32;
+begin
+  AResult := ADAM_HOOKIO_ATTRIBUTES_INVALID;
+  if APath = nil then
+    return false;
+  end;
+  LCallerErrno := CErrno();
+  if not DoQuery(StringFromC(APath), LQuery) then
+    return false;
+  end;
+  SetCErrno(LCallerErrno);
+  if not LQuery.Found then
+    DoSetLastError(ADAM_HOOKIO_ERROR_FILE_NOT_FOUND);
+    return true;
+  end;
+  if LQuery.Writable then
+    AResult := ADAM_HOOKIO_ATTRIBUTE_NORMAL;
+  else
+    AResult := ADAM_HOOKIO_ATTRIBUTE_READONLY;
+  end;
+  return true;
 end;
 
 // lowio's descriptor rights: a handle opened for reading (r, or any mode with +) reads
@@ -6756,6 +7014,85 @@ begin
   end;
   LReal := WfopenFn(LFound);
   return LReal(APath, AMode);
+end;
+
+// _access: a virtual path answered as fopen would find it (DoAccess), anything else ucrt's
+public routine _access(const APath: ptr to const char; const AMode: int32): int32;
+var
+  LResult: int32;
+  LFound: ptr;
+  LReal: AccessFn;
+begin
+  if DoAccess(APath, AMode, LResult) then
+    return LResult;
+  end;
+  LFound := HookReal(GRealAccess, ptr to const char("_access"));
+  if LFound = nil then
+    SetCErrno(ADAM_ERRNO_ENOSYS);
+    return -1;
+  end;
+  LReal := AccessFn(LFound);
+  return LReal(APath, AMode);
+end;
+
+// mingw's oldnames access (what C built without the dllimport declaration reaches): the same
+// answer, a real path to ucrt's _access
+public routine access(const APath: ptr to const char; const AMode: int32): int32;
+var
+  LResult: int32;
+  LFound: ptr;
+  LReal: AccessFn;
+begin
+  if DoAccess(APath, AMode, LResult) then
+    return LResult;
+  end;
+  LFound := HookReal(GRealPlainAccess, ptr to const char("_access"));
+  if LFound = nil then
+    SetCErrno(ADAM_ERRNO_ENOSYS);
+    return -1;
+  end;
+  LReal := AccessFn(LFound);
+  return LReal(APath, AMode);
+end;
+
+// mingw's stat (libmingwex's stat64i32, not an import): a virtual path answered (DoStat), a
+// real path to ucrt's _stat64i32. ABuf is a struct _stat64i32
+public routine stat64i32(const APath: ptr to const char; const ABuf: ptr): int32;
+var
+  LResult: int32;
+  LFound: ptr;
+  LReal: Stat64i32Fn;
+begin
+  if DoStat(APath, ABuf, LResult) then
+    return LResult;
+  end;
+  LFound := HookReal(GRealStat64i32, ptr to const char("_stat64i32"));
+  if LFound = nil then
+    SetCErrno(ADAM_ERRNO_ENOSYS);
+    return -1;
+  end;
+  LReal := Stat64i32Fn(LFound);
+  return LReal(APath, ABuf);
+end;
+
+// GetFileAttributesA: a virtual path answered (DoAttributes), anything else kernel32's
+public routine GetFileAttributesA(const APath: ptr to const char): uint32;
+var
+  LResult: uint32;
+  LFound: ptr;
+  LReal: GetFileAttributesAFn;
+begin
+  if DoAttributes(APath, LResult) then
+    return LResult;
+  end;
+  LFound := HookReal(GRealGetFileAttributesA, ptr to const char("kernel32.dll"),
+    ptr to const char("GetFileAttributesA"));
+  if LFound = nil then
+    DoSetLastError(ADAM_HOOKIO_ERROR_PROC_NOT_FOUND);
+    return ADAM_HOOKIO_ATTRIBUTES_INVALID;
+  end;
+  LReal := GetFileAttributesAFn(LFound);
+  return LReal(APath);
 end;
 
 // fclose: a handle is closed (its own IO with it), anything else goes to the C runtime
