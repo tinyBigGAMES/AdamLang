@@ -98,6 +98,10 @@ const
   ADAM_HOOKIO_LONG_MAX: int64 = 2147483647;
   // fputs's result on success (ucrt's)
   ADAM_HOOKIO_PUTS_OK: int32 = 0;
+  // The option ucrt's own printf family adds for __stdio_common_vsprintf
+  // (_CRT_INTERNAL_PRINTF_STANDARD_SNPRINTF_BEHAVIOR): a buffer too small gives the length the
+  // text needs, not -1, so a nil buffer of 0 bytes measures it
+  ADAM_HOOKIO_PRINTF_STANDARD: uint64 = 2;
   // The byte fgets stops after
   ADAM_HOOKIO_NEWLINE: int32 = 10;
 
@@ -216,14 +220,14 @@ type
   end;
 
   // The stream calls DoWith runs on a handle
-  HookOp = choices(Read, Write, Get, Gets, Unget, Put, Puts, Seek, Tell, Rewind, AtEnd, Failed,
-    ClearError, Flush, Fileno);
+  HookOp = choices(Read, Write, Get, Gets, Unget, Put, Puts, Print, MarkFailed, Seek, Tell,
+    Rewind, AtEnd, Failed, ClearError, Flush, Fileno);
 
   // One stream call on a handle: its arguments (Buffer / Size: the bytes of a read, write,
-  // fgets or fputs; ItemSize: fread / fwrite's element size, C's size_t in its bits; Offset /
-  // Origin: fseek's; Value: the byte of fputc / ungetc; Refused: arguments ucrt refuses up
-  // front, fread / fwrite's byte count past size_t: EINVAL) and its answer (Answer, set to the
-  // call's failure value before DoWith runs it)
+  // fgets, fputs or a formatted print; ItemSize: fread / fwrite's element size, C's size_t in
+  // its bits; Offset / Origin: fseek's; Value: the byte of fputc / ungetc; Refused: arguments
+  // ucrt refuses up front, fread / fwrite's byte count past size_t: EINVAL) and its answer
+  // (Answer, set to the call's failure value before DoWith runs it)
   HookCall = record
     Op: HookOp;
     Buffer: ptr to uint8;
@@ -252,6 +256,10 @@ type
   CharFileFn = routine(const AChar: int32; const AFile: ptr): int32;
   FgetsFn = routine(const AText: ptr to char; const ACount: int32; const AFile: ptr): ptr to char;
   FputsFn = routine(const AText: ptr to const char; const AFile: ptr): int32;
+  VfprintfFn = routine(const AOptions: uint64; const AFile: ptr; const AFormat: ptr to const char;
+    const ALocale: ptr; const AArgs: ptr): int32;
+  VsprintfFn = routine(const AOptions: uint64; const ABuffer: ptr to char; const ACount: uint64;
+    const AFormat: ptr to const char; const ALocale: ptr; const AArgs: ptr): int32;
   FseekFn = routine(const AFile: ptr; const AOffset: clong; const AOrigin: int32): int32;
   Fseeki64Fn = routine(const AFile: ptr; const AOffset: int64; const AOrigin: int32): int32;
   FtellFn = routine(const AFile: ptr): clong;
@@ -307,6 +315,8 @@ var
   GRealFputcNolock: ptr;
   GRealPutcNolock: ptr;
   GRealFputs: ptr;
+  GRealVfprintf: ptr;
+  GRealVsprintf: ptr;
   GRealFflush: ptr;
   GRealFflushNolock: ptr;
   GRealFreadNolock: ptr;
@@ -2764,6 +2774,21 @@ begin
   end;
 end;
 
+// A formatted print's Size bytes of Buffer, as ucrt's printf hands its text to a FILE: one
+// byte at a time through the put model, stopping at the first that fails; Size, else the
+// failure value (-1)
+routine DoCallPrint(const AHandle: ptr to HookHandle; var ACall: HookCall);
+var
+  LI: int64;
+begin
+  for LI := 0 to ACall.Size - 1 do
+    if DoCrtPutLocked(AHandle, int32(ACall.Buffer[LI])) = ADAM_HOOKIO_EOF then
+      return;
+    end;
+  end;
+  ACall.Answer := ACall.Size;
+end;
+
 // rewind, as ucrt's (rewind.cpp): written bytes are flushed, the buffer is dropped without
 // fseek's small-size rule (and never by its fast track), both flags and the Ctrl-Z end are
 // cleared, then the descriptor goes to 0; a failed seek sets Failed again
@@ -2811,6 +2836,8 @@ begin
     HookOp.Unget: ACall.Answer := DoCrtUngetLocked(AHandle, ACall.Value);
     HookOp.Put: ACall.Answer := DoCrtPutLocked(AHandle, ACall.Value);
     HookOp.Puts: DoCallPuts(AHandle, ACall);
+    HookOp.Print: DoCallPrint(AHandle, ACall);
+    HookOp.MarkFailed: AHandle->Failed := true;
     HookOp.Seek: ACall.Answer := DoSeekLocked(AHandle, ACall.Offset, ACall.Origin);
     HookOp.Tell: ACall.Answer := DoCrtTellLocked(AHandle);
     HookOp.Rewind: DoCallRewind(AHandle);
@@ -2873,6 +2900,74 @@ begin
     return false;
   end;
   AResult := LCall.Answer;
+  return true;
+end;
+
+// The handle AFile learns a print failed, as ferror shows it (a format error, no room for the
+// text)
+routine DoPrintFailed(const AFile: ptr);
+var
+  LCall: HookCall;
+begin
+  LCall := DoCall(HookOp.MarkFailed, 0);
+  DoWith(AFile, LCall);
+end;
+
+// A formatted write to a handle (pcpp's HookIODoPrint): AFormat with AArgs (a va_list,
+// read by ucrt's own __stdio_common_vsprintf with AOptions and ALocale, so every conversion is
+// ucrt's), the length measured first, then the text written as ucrt's printf writes it. False:
+// AFile is no handle. True: AAnswer is the count, or -1 (a format error or no room for the
+// text marks the handle failed). The va_list is a pointer the formatter reads through, so it
+// is passed twice unread
+routine DoPrint(const AFile: ptr; const AOptions: uint64; const AFormat: ptr to const char;
+  const ALocale: ptr; const AArgs: ptr; var AAnswer: int32): bool;
+var
+  LHandle: ptr to HookHandle;
+  LFound: ptr;
+  LFormat: VsprintfFn;
+  LLength: int32;
+  LText: ptr to char;
+  LCall: HookCall;
+begin
+  AAnswer := -1;
+  LHandle := DoFindHandle(AFile);
+  if LHandle = nil then
+    return false;
+  end;
+  DoReleaseHandle(LHandle);
+  LFound := DoReal(GRealVsprintf, ptr to const char("__stdio_common_vsprintf"));
+  if LFound = nil then
+    DoPrintFailed(AFile);
+    return true;
+  end;
+  LFormat := VsprintfFn(LFound);
+  LLength := LFormat(AOptions | ADAM_HOOKIO_PRINTF_STANDARD, nil, 0, AFormat, ALocale, AArgs);
+  if LLength < 0 then
+    DoPrintFailed(AFile);
+    return true;
+  end;
+  LText := ptr to char(getmem(int64(LLength) + 1));
+  if LText = nil then
+    SetCErrno(ADAM_ERRNO_ENOMEM);
+    DoPrintFailed(AFile);
+    return true;
+  end;
+  LLength := LFormat(AOptions | ADAM_HOOKIO_PRINTF_STANDARD, LText, uint64(LLength) + 1,
+    AFormat, ALocale, AArgs);
+  if LLength < 0 then
+    freemem(LText);
+    DoPrintFailed(AFile);
+    return true;
+  end;
+  LCall := DoCall(HookOp.Print, -1);
+  LCall.Buffer := ptr to uint8(ptr(LText));
+  LCall.Size := int64(LLength);
+  if not DoWith(AFile, LCall) then
+    freemem(LText);
+    return false;
+  end;
+  freemem(LText);
+  AAnswer := int32(LCall.Answer);
   return true;
 end;
 
@@ -3481,6 +3576,28 @@ begin
   end;
   LReal := FputsFn(LFound);
   return LReal(AText, AFile);
+end;
+
+// __stdio_common_vfprintf: what ucrt's fprintf and the headers' inline vfprintf / printf
+// family call (AArgs is their va_list). A handle gets the text ucrt formats, written as ucrt
+// writes it (DoPrint): the count, or -1. Anything else goes to the real function (-1 with
+// ENOSYS when the C runtime has none)
+public routine __stdio_common_vfprintf(const AOptions: uint64; const AFile: ptr;
+  const AFormat: ptr to const char; const ALocale: ptr; const AArgs: ptr): int32;
+var
+  LAnswer: int32;
+  LFound: ptr;
+  LReal: VfprintfFn;
+begin
+  if DoPrint(AFile, AOptions, AFormat, ALocale, AArgs, LAnswer) then
+    return LAnswer;
+  end;
+  LFound := DoReal(GRealVfprintf, ptr to const char("__stdio_common_vfprintf"));
+  if LFound = nil then
+    return -1;
+  end;
+  LReal := VfprintfFn(LFound);
+  return LReal(AOptions, AFile, AFormat, ALocale, AArgs);
 end;
 
 // fflush: a handle's written bytes, then its IO's own flush; fflush(NULL) flushes every
