@@ -72,6 +72,9 @@ const
   // The scheme every virtual path starts with, and its length
   ADAM_HOOKIO_SCHEME: string = "io://";
   ADAM_HOOKIO_SCHEME_LENGTH: int64 = 5;
+  // The bytes copied into a scan's stand-in FILE before its first scan (doubled while the scan
+  // reads past them and the handle has more)
+  ADAM_HOOKIO_SCAN_WINDOW: int64 = 4096;
   // The byte that ends a text-mode file on Windows (ucrt drops a trailing one at a "+" open)
   ADAM_HOOKIO_CTRL_Z: uint8 = 0x1A;
   // A text handle's line end on Windows: lowio writes each '\n' as "\r\n" and reads "\r\n" as
@@ -220,13 +223,14 @@ type
   end;
 
   // The stream calls DoWith runs on a handle
-  HookOp = choices(Read, Write, Get, Gets, Unget, Put, Puts, Print, MarkFailed, Seek, Tell,
-    Rewind, AtEnd, Failed, ClearError, Flush, Fileno);
+  HookOp = choices(Read, Write, Get, Gets, Unget, Put, Puts, Print, MarkFailed, Scan, Seek,
+    Tell, Rewind, AtEnd, Failed, ClearError, Flush, Fileno);
 
   // One stream call on a handle: its arguments (Buffer / Size: the bytes of a read, write,
   // fgets, fputs or a formatted print; ItemSize: fread / fwrite's element size, C's size_t in
   // its bits; Offset / Origin: fseek's; Value: the byte of fputc / ungetc; Refused: arguments
-  // ucrt refuses up front, fread / fwrite's byte count past size_t: EINVAL) and its answer
+  // ucrt refuses up front, fread / fwrite's byte count past size_t: EINVAL; ScanReal: the real
+  // __stdio_common_vfscanf, ScanOptions .. ScanArgs: its arguments, for a scan) and its answer
   // (Answer, set to the call's failure value before DoWith runs it)
   HookCall = record
     Op: HookOp;
@@ -237,8 +241,28 @@ type
     Origin: int32;
     Value: int32;
     Refused: bool;
+    ScanReal: ptr;
+    ScanOptions: uint64;
+    ScanFormat: ptr to const char;
+    ScanLocale: ptr;
+    ScanArgs: ptr;
     Answer: int64;
   end;
+
+  // What a read can change on a handle: a scan's start, put back before the handle moves on
+  // (the replay then leaves the FILE model exactly as the scan's own reads would have).
+  // CallerBytes: the caller's setvbuf array as it was (the model's copy holds only the view of
+  // it, and the stand-in's reads may refill it)
+  HookReadState = record
+    Position: int64;
+    AtEnd: bool;
+    Failed: bool;
+    Crt: HookCrtModel;
+    CallerBytes: array of uint8;
+  end;
+
+  // The bytes a scan's copy moves per step
+  HookScanScratch = array[0..511] of uint8;
 
   // The real functions' types, called through HookReal's slots
   FopenFn = routine(const APath: ptr to const char; const AMode: ptr to const char): ptr;
@@ -264,6 +288,9 @@ type
   Fseeki64Fn = routine(const AFile: ptr; const AOffset: int64; const AOrigin: int32): int32;
   FtellFn = routine(const AFile: ptr): clong;
   Ftelli64Fn = routine(const AFile: ptr): int64;
+  VfscanfFn = routine(const AOptions: uint64; const AFile: ptr; const AFormat: ptr to const char;
+    const ALocale: ptr; const AArgs: ptr): int32;
+  TmpfileFn = routine(): ptr;
 
 var
   // The registry lock: the entries, the stream locks, the open list and the entry uses. Never
@@ -317,6 +344,8 @@ var
   GRealFputs: ptr;
   GRealVfprintf: ptr;
   GRealVsprintf: ptr;
+  GRealVfscanf: ptr;
+  GRealTmpfile: ptr;
   GRealFflush: ptr;
   GRealFflushNolock: ptr;
   GRealFreadNolock: ptr;
@@ -2267,6 +2296,37 @@ begin
   return AChar & 0xFF;
 end;
 
+// ACount bytes read as that many DoCrtGetLocked calls would read them (never fread's direct
+// path, which a scan's getc does not take): the buffer's bytes in bulk, a refill each time it
+// is empty. Returns the count read; short only at the end or a failure (the refill's flags)
+routine DoCrtSkipLocked(const AHandle: ptr to HookHandle; const ACount: int64): int64;
+var
+  LDone: int64;
+  LTake: int64;
+begin
+  LDone := 0;
+  if (ACount > 0) and (not DoCrtLeaveWriteLocked(AHandle, false)) then
+    return 0;
+  end;
+  while LDone < ACount do
+    if AHandle->Crt.HasBuffer and (AHandle->Crt.Count > 0) then
+      LTake := ACount - LDone;
+      if LTake > AHandle->Crt.Count then
+        LTake := AHandle->Crt.Count;
+      end;
+      AHandle->Crt.Count := AHandle->Crt.Count - LTake;
+      AHandle->Crt.Next := AHandle->Crt.Next + LTake;
+      LDone := LDone + LTake;
+    else
+      if DoCrtRefillLocked(AHandle) = ADAM_HOOKIO_EOF then
+        leave;
+      end;
+      LDone := LDone + 1;
+    end;
+  end;
+  return LDone;
+end;
+
 // _flsbuf.cpp stream_is_at_end_of_file_nolock: feof is set; else not when a big buffer's Next
 // is at its start; else the descriptor's place is the IO's size (an IO with no size is not at
 // the end, as a failed query is not)
@@ -2683,6 +2743,11 @@ begin
   LCall.Origin := 0;
   LCall.Value := 0;
   LCall.Refused := false;
+  LCall.ScanReal := nil;
+  LCall.ScanOptions := 0;
+  LCall.ScanFormat := nil;
+  LCall.ScanLocale := nil;
+  LCall.ScanArgs := nil;
   LCall.Answer := AFail;
   return LCall;
 end;
@@ -2824,6 +2889,413 @@ begin
   ACall.Answer := DoFlushIOLocked(AHandle);
 end;
 
+// The real function AName (HookReal fills ASlot once); nil with ENOSYS when the C runtime has
+// no such function
+routine DoReal(var ASlot: ptr; const AName: ptr to const char): ptr;
+var
+  LFound: ptr;
+begin
+  LFound := HookReal(ASlot, AName);
+  if LFound = nil then
+    SetCErrno(ADAM_ERRNO_ENOSYS);
+  end;
+  return LFound;
+end;
+
+// A real temporary FILE (the real tmpfile: deleted on close), the stand-in of a scan; nil when
+// none could be made (errno is tmpfile's, or ENOSYS)
+routine DoRealTemporary(): ptr;
+var
+  LFound: ptr;
+  LTemporary: TmpfileFn;
+begin
+  LFound := DoReal(GRealTmpfile, ptr to const char("tmpfile"));
+  if LFound = nil then
+    return nil;
+  end;
+  LTemporary := TmpfileFn(LFound);
+  return LTemporary();
+end;
+
+// The real fclose of AFile, a real FILE (a scan's stand-in)
+routine DoRealClose(const AFile: ptr);
+var
+  LFound: ptr;
+  LClose: FcloseFn;
+begin
+  LFound := DoReal(GRealFclose, ptr to const char("fclose"));
+  if LFound = nil then
+    return;
+  end;
+  LClose := FcloseFn(LFound);
+  LClose(AFile);
+end;
+
+// The real fwrite of ASize bytes at AData to AFile, a real FILE: whether all were written
+routine DoRealWriteAll(const AData: ptr; const ASize: int64; const AFile: ptr): bool;
+var
+  LFound: ptr;
+  LWrite: FwriteFn;
+begin
+  LFound := DoReal(GRealFwrite, ptr to const char("fwrite"));
+  if LFound = nil then
+    return false;
+  end;
+  LWrite := FwriteFn(LFound);
+  return LWrite(AData, 1, ASize, AFile) = ASize;
+end;
+
+// The real fread of ASize bytes into AData from AFile, a real FILE: whether all were read
+routine DoRealReadAll(const AData: ptr; const ASize: int64; const AFile: ptr): bool;
+var
+  LFound: ptr;
+  LRead: FreadFn;
+begin
+  LFound := DoReal(GRealFread, ptr to const char("fread"));
+  if LFound = nil then
+    return false;
+  end;
+  LRead := FreadFn(LFound);
+  return LRead(AData, 1, ASize, AFile) = ASize;
+end;
+
+// The real rewind of AFile, a real FILE; false when the C runtime has none
+routine DoRealRewind(const AFile: ptr): bool;
+var
+  LFound: ptr;
+  LRewind: FileVoidFn;
+begin
+  LFound := DoReal(GRealRewind, ptr to const char("rewind"));
+  if LFound = nil then
+    return false;
+  end;
+  LRewind := FileVoidFn(LFound);
+  LRewind(AFile);
+  return true;
+end;
+
+// The real _fseeki64 of AFile, a real FILE, to its end: whether it moved there
+routine DoRealSeekEnd(const AFile: ptr): bool;
+var
+  LFound: ptr;
+  LSeek: Fseeki64Fn;
+begin
+  LFound := DoReal(GRealFseeki64, ptr to const char("_fseeki64"));
+  if LFound = nil then
+    return false;
+  end;
+  LSeek := Fseeki64Fn(LFound);
+  return LSeek(AFile, 0, ADAM_HOOKIO_SEEK_END) = 0;
+end;
+
+// Whether AFile, a real FILE, is at its end (the real feof; false when there is none)
+routine DoRealAtEnd(const AFile: ptr): bool;
+var
+  LFound: ptr;
+  LAtEnd: FileIntFn;
+begin
+  LFound := DoReal(GRealFeof, ptr to const char("feof"));
+  if LFound = nil then
+    return false;
+  end;
+  LAtEnd := FileIntFn(LFound);
+  return LAtEnd(AFile) <> 0;
+end;
+
+// The real _ftelli64 of AFile, a real FILE; -1 when the C runtime has none
+routine DoRealTell(const AFile: ptr): int64;
+var
+  LFound: ptr;
+  LTell: Ftelli64Fn;
+begin
+  LFound := DoReal(GRealFtelli64, ptr to const char("_ftelli64"));
+  if LFound = nil then
+    return -1;
+  end;
+  LTell := Ftelli64Fn(LFound);
+  return LTell(AFile);
+end;
+
+// AHandle as a read may change it: the scan's start (the caller's setvbuf bytes included)
+routine DoSaveReadState(const AHandle: ptr to HookHandle): HookReadState;
+var
+  LState: HookReadState;
+begin
+  LState.Position := AHandle->Position;
+  LState.AtEnd := AHandle->AtEnd;
+  LState.Failed := AHandle->Failed;
+  LState.Crt := AHandle->Crt;
+  if (AHandle->Crt.Buffer.Caller <> nil) and (AHandle->Crt.Buffer.Size > 0) then
+    setlength(LState.CallerBytes, AHandle->Crt.Buffer.Size);
+    CopyBytes(addr of LState.CallerBytes[0], AHandle->Crt.Buffer.Caller,
+      AHandle->Crt.Buffer.Size);
+  end;
+  return LState;
+end;
+
+// AStart put back on AHandle, the caller's array bytes included
+routine DoRestoreReadState(const AHandle: ptr to HookHandle; const AStart: HookReadState);
+begin
+  AHandle->Position := AStart.Position;
+  AHandle->AtEnd := AStart.AtEnd;
+  AHandle->Failed := AStart.Failed;
+  AHandle->Crt := AStart.Crt;
+  if (AHandle->Crt.Buffer.Caller <> nil) and (len(AStart.CallerBytes) > 0) then
+    CopyBytes(AHandle->Crt.Buffer.Caller, addr of AStart.CallerBytes[0],
+      len(AStart.CallerBytes));
+  end;
+end;
+
+// A scan on a handle runs the real scan over a stand-in FILE holding the handle's next bytes,
+// and the stand-in reads ahead of what the scan uses: its reads alone would leave the handle
+// past the scan. Afterwards the handle goes back to where the scan started, with the flags it
+// had then, and moves on by exactly AUsed bytes, read as the scan's own getc calls would
+// (DoCrtSkipLocked), so the FILE model ends as a real FILE's; then it takes what the scan's
+// last reads did (DoScanFinish)
+routine DoScanReplay(const AHandle: ptr to HookHandle; const AStart: HookReadState;
+  const AUsed: int64);
+begin
+  DoRestoreReadState(AHandle, AStart);
+  DoCrtSkipLocked(AHandle, AUsed);
+end;
+
+// After the replay: ALookAhead, the scan read one byte past the ones it used and put it back
+// (or met the end there); that read is made again and the byte put back by the model's
+// ungetc, as the scan's getc / ungetc left a real FILE (a read that refilled the buffer, an end
+// met through a refill, AtEnd cleared by the ungetc). Then the flags the stand-in showed:
+// AEnd, the scan read past the last byte; AFailed, a read failed
+routine DoScanFinish(const AHandle: ptr to HookHandle; const ALookAhead: bool;
+  const AEnd: bool; const AFailed: bool);
+var
+  LByte: int32;
+begin
+  if ALookAhead then
+    LByte := DoCrtGetLocked(AHandle);
+    if LByte <> ADAM_HOOKIO_EOF then
+      DoCrtUngetLocked(AHandle, LByte);
+    end;
+  end;
+  if AEnd then
+    AHandle->AtEnd := true;
+  end;
+  if AFailed then
+    AHandle->Failed := true;
+  end;
+end;
+
+// Whether the look-ahead decides anything: a byte taken from the buffer and put back leaves
+// the model as it was, unless the buffer is empty (the get refills) or AtEnd is set (the
+// ungetc clears it)
+routine DoScanLookAheadMatters(const AHandle: ptr to HookHandle): bool;
+begin
+  return (AHandle->Crt.Count <= 0) or AHandle->AtEnd;
+end;
+
+// Replay and finish in one, for a caller that knows ALookAhead up front
+routine DoScanSettle(const AHandle: ptr to HookHandle; const AStart: HookReadState;
+  const AUsed: int64; const ALookAhead: bool; const AEnd: bool; const AFailed: bool);
+begin
+  DoScanReplay(AHandle, AStart, AUsed);
+  DoScanFinish(AHandle, ALookAhead, AEnd, AFailed);
+end;
+
+// Copies the handle's next bytes into AStandIn (at its end) until it holds AWindow of them or
+// the handle has no more (AHandleEnd; AReadFailed when a read failed rather than met the end).
+// False when the stand-in refused a seek or a write (errno is the CRT's)
+routine DoScanFill(const AHandle: ptr to HookHandle; const AStandIn: ptr; const AWindow: int64;
+  var ACopied: int64; var AHandleEnd: bool; var AReadFailed: bool): bool;
+var
+  LScratch: HookScanScratch;
+  LWant: int64;
+  LGot: int64;
+  LFailedBefore: bool;
+begin
+  if not DoRealSeekEnd(AStandIn) then
+    return false;
+  end;
+  while (ACopied < AWindow) and (not AHandleEnd) do
+    LWant := AWindow - ACopied;
+    if LWant > size(HookScanScratch) then
+      LWant := size(HookScanScratch);
+    end;
+    LFailedBefore := AHandle->Failed;
+    LGot := DoCrtReadLocked(AHandle, addr of LScratch[0], LWant);
+    if (LGot > 0) and (not DoRealWriteAll(ptr(addr of LScratch[0]), LGot, AStandIn)) then
+      return false;
+    end;
+    ACopied := ACopied + LGot;
+    if LGot < LWant then
+      AHandleEnd := true;
+      if AHandle->Failed and (not LFailedBefore) then
+        AReadFailed := true;
+      end;
+    end;
+  end;
+  return true;
+end;
+
+// Whether a scan that used AUsed of AStandIn's bytes read one more and put it back (its
+// look-ahead). The scan's reads are a pure function of the bytes: over the same first AUsed
+// bytes alone it makes the same reads, so it reads past them, and meets the end there, exactly
+// when it read one more before. ucrt's conversions take the end and a byte they put back
+// alike (neither is part of the field), so the arguments end as the first run wrote them. The
+// rerun gets a stand-in of its own holding those bytes (AStandIn is left at an unknown place);
+// errno is kept. False when a stand-in refused (errno is the refusing call's; the caller takes
+// it as a failed read)
+routine DoScanLookedAhead(const AStandIn: ptr; const AUsed: int64; const ACall: HookCall;
+  var ALooked: bool): bool;
+var
+  LScratch: HookScanScratch;
+  LErrno: int32;
+  LCut: ptr;
+  LLeft: int64;
+  LStep: int64;
+  LOk: bool;
+  LScan: VfscanfFn;
+begin
+  ALooked := false;
+  LErrno := CErrno();
+  LCut := DoRealTemporary();
+  if LCut = nil then
+    return false;
+  end;
+  LOk := DoRealRewind(AStandIn);
+  LLeft := AUsed;
+  while LOk and (LLeft > 0) do
+    LStep := LLeft;
+    if LStep > size(HookScanScratch) then
+      LStep := size(HookScanScratch);
+    end;
+    LOk := DoRealReadAll(ptr(addr of LScratch[0]), LStep, AStandIn);
+    if LOk then
+      LOk := DoRealWriteAll(ptr(addr of LScratch[0]), LStep, LCut);
+    end;
+    LLeft := LLeft - LStep;
+  end;
+  if LOk then
+    LOk := DoRealRewind(LCut);
+  end;
+  if LOk then
+    LScan := VfscanfFn(ACall.ScanReal);
+    LScan(ACall.ScanOptions, LCut, ACall.ScanFormat, ACall.ScanLocale, ACall.ScanArgs);
+    ALooked := DoRealAtEnd(LCut);
+  end;
+  DoRealClose(LCut);
+  if LOk then
+    SetCErrno(LErrno);
+  end;
+  return LOk;
+end;
+
+// The scan's runs over AStandIn: the handle's next bytes copied in (DoScanFill), the real scan
+// run from the stand-in's start; while it meets the copied bytes' end and the handle has more,
+// twice as many are copied and it runs again over the same arguments (a va_list is a pointer
+// the scan reads through, so every run reads it from its start, and each argument ends as the
+// last run wrote it). AEnd: the last run met the stand-in's end; AUsed: the bytes it used
+// (_ftelli64 of the stand-in, which counts the scan's read-ahead back). False when the
+// stand-in refused the bytes (nothing was scanned)
+routine DoScanRuns(const AHandle: ptr to HookHandle; var ACall: HookCall; const AStandIn: ptr;
+  var ACopied: int64; var AHandleEnd: bool; var AReadFailed: bool; var AEnd: bool;
+  var AUsed: int64): bool;
+var
+  LWindow: int64;
+  LScan: VfscanfFn;
+begin
+  LWindow := ADAM_HOOKIO_SCAN_WINDOW;
+  LScan := VfscanfFn(ACall.ScanReal);
+  while true do
+    if not DoScanFill(AHandle, AStandIn, LWindow, ACopied, AHandleEnd, AReadFailed) then
+      return false;
+    end;
+    DoRealRewind(AStandIn);
+    ACall.Answer := LScan(ACall.ScanOptions, AStandIn, ACall.ScanFormat, ACall.ScanLocale,
+      ACall.ScanArgs);
+    AEnd := DoRealAtEnd(AStandIn);
+    AUsed := DoRealTell(AStandIn);
+    // Done unless the scan reached the copied bytes' end while the handle has more
+    if (not AEnd) or AHandleEnd then
+      leave;
+    end;
+    LWindow := LWindow * 2;
+  end;
+  return true;
+end;
+
+// The scan over AStandIn, a real temporary FILE it closes (DoCallScan); AStart: the handle at
+// the scan's start. The handle is replayed to where the scan stopped, then takes its last
+// reads' look-ahead and flags: a scan that met the stand-in's end met the handle's (the runs'
+// loop); one that stopped at the copied bytes' end read no further; otherwise the look-ahead
+// is found by a rerun, when it matters (DoScanLookAheadMatters)
+routine DoScanStandIn(const AHandle: ptr to HookHandle; var ACall: HookCall;
+  const AStart: HookReadState; const AStandIn: ptr);
+var
+  LCopied: int64;
+  LUsed: int64;
+  LHandleEnd: bool;
+  LReadFailed: bool;
+  LEnd: bool;
+  LLookAhead: bool;
+begin
+  LCopied := 0;
+  LUsed := 0;
+  LHandleEnd := false;
+  LReadFailed := false;
+  LEnd := false;
+  if not DoScanRuns(AHandle, ACall, AStandIn, LCopied, LHandleEnd, LReadFailed, LEnd,
+    LUsed) then
+    // The stand-in refused the bytes: nothing was scanned, the handle is back where it was
+    // with its error flag set
+    DoRealClose(AStandIn);
+    ACall.Answer := ADAM_HOOKIO_EOF;
+    DoScanSettle(AHandle, AStart, 0, false, false, true);
+    return;
+  end;
+  if LUsed < 0 then
+    // Where the scan stopped is unknown: the handle stays at its start, with its error flag
+    // set
+    DoRealClose(AStandIn);
+    DoScanSettle(AHandle, AStart, 0, false, LEnd, true);
+    return;
+  end;
+  DoScanReplay(AHandle, AStart, LUsed);
+  LLookAhead := LEnd;
+  if (not LEnd) and (LUsed < LCopied) and DoScanLookAheadMatters(AHandle) then
+    if not DoScanLookedAhead(AStandIn, LUsed, ACall, LLookAhead) then
+      LReadFailed := true;
+    end;
+  end;
+  DoRealClose(AStandIn);
+  DoScanFinish(AHandle, LLookAhead, LEnd, LReadFailed);
+end;
+
+// fscanf on a handle (pcpp's HookIODoScanHandle, Windows): ucrt has no fopencookie, so the
+// real scan runs over a stand-in, a real temporary FILE holding the handle's next bytes
+// (DoScanStandIn). Written bytes the scan's first read would flush are flushed first (as
+// fgetc's): the saved start then holds none, which the replay would otherwise write a second
+// time. ucrt's scan reads through _filbuf, which refuses a write-only stream with ferror only,
+// errno untouched; no stand-in (errno is tmpfile's) fails as a read that failed. Answer: the
+// real scan's, EOF when it never ran
+routine DoCallScan(const AHandle: ptr to HookHandle; var ACall: HookCall);
+var
+  LStart: HookReadState;
+  LStandIn: ptr;
+begin
+  if not DoCrtLeaveWriteLocked(AHandle, false) then
+    return;
+  end;
+  LStart := DoSaveReadState(AHandle);
+  if not DoCanRead(AHandle) then
+    AHandle->Failed := true;
+    return;
+  end;
+  LStandIn := DoRealTemporary();
+  if LStandIn = nil then
+    AHandle->Failed := true;
+    return;
+  end;
+  DoScanStandIn(AHandle, ACall, LStart, LStandIn);
+end;
+
 // ACall run on AHandle, under its stream lock. fileno: a handle has no descriptor (EBADF, the
 // answer stays -1)
 routine DoRun(const AHandle: ptr to HookHandle; var ACall: HookCall);
@@ -2838,6 +3310,7 @@ begin
     HookOp.Puts: DoCallPuts(AHandle, ACall);
     HookOp.Print: DoCallPrint(AHandle, ACall);
     HookOp.MarkFailed: AHandle->Failed := true;
+    HookOp.Scan: DoCallScan(AHandle, ACall);
     HookOp.Seek: ACall.Answer := DoSeekLocked(AHandle, ACall.Offset, ACall.Origin);
     HookOp.Tell: ACall.Answer := DoCrtTellLocked(AHandle);
     HookOp.Rewind: DoCallRewind(AHandle);
@@ -2869,19 +3342,6 @@ begin
   end;
   DoReleaseHandle(LHandle);
   return true;
-end;
-
-// The real function AName (HookReal fills ASlot once); nil with ENOSYS when the C runtime has
-// no such function
-routine DoReal(var ASlot: ptr; const AName: ptr to const char): ptr;
-var
-  LFound: ptr;
-begin
-  LFound := HookReal(ASlot, AName);
-  if LFound = nil then
-    SetCErrno(ADAM_ERRNO_ENOSYS);
-  end;
-  return LFound;
 end;
 
 // A hooked fread / fwrite (AOp Read / Write) of ACount items of ASize bytes at ABuffer. False:
@@ -3597,6 +4057,34 @@ begin
     return -1;
   end;
   LReal := VfprintfFn(LFound);
+  return LReal(AOptions, AFile, AFormat, ALocale, AArgs);
+end;
+
+// __stdio_common_vfscanf: what ucrt's fscanf / vfscanf and the headers' inline scan forms
+// (fscanf_s, _fscanf_l, ...) call (AArgs is their va_list). A handle is scanned by the real
+// function over a stand-in FILE (DoCallScan), a real FILE by the real function directly (EOF
+// with ENOSYS when the C runtime has none)
+public routine __stdio_common_vfscanf(const AOptions: uint64; const AFile: ptr;
+  const AFormat: ptr to const char; const ALocale: ptr; const AArgs: ptr): int32;
+var
+  LFound: ptr;
+  LReal: VfscanfFn;
+  LCall: HookCall;
+begin
+  LFound := DoReal(GRealVfscanf, ptr to const char("__stdio_common_vfscanf"));
+  if LFound = nil then
+    return ADAM_HOOKIO_EOF;
+  end;
+  LCall := DoCall(HookOp.Scan, ADAM_HOOKIO_EOF);
+  LCall.ScanReal := LFound;
+  LCall.ScanOptions := AOptions;
+  LCall.ScanFormat := AFormat;
+  LCall.ScanLocale := ALocale;
+  LCall.ScanArgs := AArgs;
+  if DoWith(AFile, LCall) then
+    return int32(LCall.Answer);
+  end;
+  LReal := VfscanfFn(LFound);
   return LReal(AOptions, AFile, AFormat, ALocale, AArgs);
 end;
 
