@@ -53,6 +53,9 @@
 
 module unit System.Runtime;
 
+// The Unicode tables print's text specs read (M3.8f4; generated from libc++'s)
+import System.Runtime.Unicode;
+
 var
   // The heap report's counts (Adam's own report, split as PaskalCPP's detail_report_leaks):
   // every block the heap routines below hand out, and every one they take back; a count is
@@ -1694,7 +1697,8 @@ end;
 // libc++'s parsed std-format-spec), in int64 words: [0] the fill's UTF-8 bytes packed
 // little-endian, [1] their count (0: a space), [2] the alignment (ADAM_SPEC_ALIGN_*), [3]
 // the sign (ADAM_SPEC_SIGN_*), [4] 1 for `#`, [5] the width as written (0: none), [6] the
-// type letter's byte (0: none). A width an argument gives comes as an operand of its own
+// type letter's byte (0: none; `?` the debug form), [7] the precision as written (-1: none,
+// M3.8f4). A width or a precision an argument gives comes as an operand of its own
 // (SpecWidth's result; -1: the written one)
 const
   ADAM_SPEC_ALIGN_DEFAULT: int64 = 0;
@@ -1780,32 +1784,357 @@ begin
   end;
 end;
 
-// The columns the ACount UTF-8 bytes at AText take: one per code point (every byte that is
-// no continuation byte)
-routine DoSpecColumns(const AText: ptr to const uint8; const ACount: int64): int64;
+// The code point at AText[AAt] of the ACount UTF-8 bytes at AText, read as libc++'s
+// __code_point_view<char> reads it (Table 3-7's well-formed sequences, tested after
+// decoding); AAt moves past what was read. AValid false for an ill-formed sequence: U+FFFD
+// then, AAt past the sequence when its lead byte's length fits and its bytes are
+// continuations (an overlong form, a surrogate, past U+10FFFF), else past the one byte
+routine DoUtf8Consume(const AText: ptr to const uint8; const ACount: int64; var AAt: int64;
+  var AValid: bool): uint32;
 var
-  LColumns: int64;
+  LLead: uint32;
+  LSize: int64;
+  LValue: uint32;
   LI: int64;
 begin
-  LColumns := 0;
-  for LI := 0 to ACount - 1 do
-    if (AText[LI] & 0xC0) <> 0x80 then
-      LColumns := LColumns + 1;
+  LLead := uint32(AText[AAt]);
+  AValid := true;
+  if LLead < 0x80 then
+    AAt := AAt + 1;
+    return LLead;
+  end;
+  // the sequence's length from the lead byte's leading 1 bits (2 .. 4; any other is none)
+  LSize := 0;
+  LValue := 0;
+  if (LLead & 0xE0) = 0xC0 then
+    LSize := 2;
+    LValue := LLead & 0x1F;
+  end;
+  if (LLead & 0xF0) = 0xE0 then
+    LSize := 3;
+    LValue := LLead & 0x0F;
+  end;
+  if (LLead & 0xF8) = 0xF0 then
+    LSize := 4;
+    LValue := LLead & 0x07;
+  end;
+  AValid := false;
+  if (LSize = 0) or (ACount - AAt < LSize) then
+    AAt := AAt + 1;
+    return 0xFFFD;
+  end;
+  for LI := 1 to LSize - 1 do
+    if (AText[AAt + LI] & 0xC0) <> 0x80 then
+      AAt := AAt + 1;
+      return 0xFFFD;
     end;
+    LValue := (LValue shl 6) | (uint32(AText[AAt + LI]) & 0x3F);
+  end;
+  AAt := AAt + LSize;
+  // an overlong form, a surrogate, a value past the last code point: consumed, ill-formed
+  if (LSize = 2) and (LValue < 0x80) then
+    return 0xFFFD;
+  end;
+  if (LSize = 3) and ((LValue < 0x800) or ((LValue >= 0xD800) and (LValue <= 0xDFFF))) then
+    return 0xFFFD;
+  end;
+  if (LSize = 4) and ((LValue < 0x10000) or (LValue > 0x10FFFF)) then
+    return 0xFFFD;
+  end;
+  AValid := true;
+  return LValue;
+end;
+
+// The rules of libc++'s __extended_grapheme_cluster_break (UAX #29's extended grapheme
+// cluster boundaries) in force between two code points: none, GB9c (an indic conjunct),
+// GB11 (an emoji zwj sequence), GB12 / GB13 (regional indicator pairs); the GB11 states;
+// the GB9c states
+const
+  ADAM_CLUSTER_RULE_NONE: int64 = 0;
+  ADAM_CLUSTER_RULE_INDIC: int64 = 1;
+  ADAM_CLUSTER_RULE_EMOJI: int64 = 2;
+  ADAM_CLUSTER_RULE_REGIONAL: int64 = 3;
+  ADAM_CLUSTER_EMOJI_PICTOGRAPHIC: int64 = 0;
+  ADAM_CLUSTER_EMOJI_EXTEND: int64 = 1;
+  ADAM_CLUSTER_EMOJI_ZWJ: int64 = 2;
+  ADAM_CLUSTER_INDIC_CONSONANT: int64 = 0;
+  ADAM_CLUSTER_INDIC_LINKER: int64 = 1;
+
+type
+  // Where the cluster rules stand (libc++'s __extended_grapheme_cluster_break): the code
+  // point before the next one and its break property (ADAM_UNICODE_GCB_*), the rule in
+  // force (ADAM_CLUSTER_RULE_*), the GB11 and the GB9c state
+  ClusterBreak = record
+    PrevCode: uint32;
+    PrevProperty: int64;
+    Rule: int64;
+    EmojiState: int64;
+    IndicState: int64;
+  end;
+
+// The cluster rules started at the code point ACode (libc++'s constructor: an emoji, a
+// regional indicator or an indic consonant starts its rule)
+routine DoClusterStart(var ABreak: ClusterBreak; const ACode: uint32);
+begin
+  ABreak.PrevCode := ACode;
+  ABreak.PrevProperty := GraphemeProperty(ACode);
+  ABreak.Rule := ADAM_CLUSTER_RULE_NONE;
+  ABreak.EmojiState := ADAM_CLUSTER_EMOJI_PICTOGRAPHIC;
+  ABreak.IndicState := ADAM_CLUSTER_INDIC_CONSONANT;
+  if ABreak.PrevProperty = ADAM_UNICODE_GCB_EXTENDED_PICTOGRAPHIC then
+    ABreak.Rule := ADAM_CLUSTER_RULE_EMOJI;
+    return;
+  end;
+  if ABreak.PrevProperty = ADAM_UNICODE_GCB_REGIONAL_INDICATOR then
+    ABreak.Rule := ADAM_CLUSTER_RULE_REGIONAL;
+    return;
+  end;
+  if IndicProperty(ACode) = ADAM_UNICODE_INCB_CONSONANT then
+    ABreak.Rule := ADAM_CLUSTER_RULE_INDIC;
+  end;
+end;
+
+// True when the break property AProperty is a control's: CR, LF, Control (GB4 / GB5)
+routine DoClusterControl(const AProperty: int64): bool;
+begin
+  return (AProperty = ADAM_UNICODE_GCB_CR) or (AProperty = ADAM_UNICODE_GCB_LF) or
+    (AProperty = ADAM_UNICODE_GCB_CONTROL);
+end;
+
+// True when a cluster breaks before the code point ANext (break property AProperty) with no
+// rule in force (libc++'s __evaluate_none: GB3 .. GB999); a GB9c, GB11 or GB12 start sets
+// its rule
+routine DoClusterNone(var ABreak: ClusterBreak; const ANext: uint32; const AProperty: int64): bool;
+var
+  LPrev: int64;
+begin
+  LPrev := ABreak.PrevProperty;
+  // GB3: CR LF; GB4 / GB5: around any other control
+  if (LPrev = ADAM_UNICODE_GCB_CR) and (AProperty = ADAM_UNICODE_GCB_LF) then
+    return false;
+  end;
+  if DoClusterControl(LPrev) or DoClusterControl(AProperty) then
+    return true;
+  end;
+  // GB6 .. GB8: Hangul syllable sequences
+  if (LPrev = ADAM_UNICODE_GCB_L) and ((AProperty = ADAM_UNICODE_GCB_L) or
+    (AProperty = ADAM_UNICODE_GCB_V) or (AProperty = ADAM_UNICODE_GCB_LV) or
+    (AProperty = ADAM_UNICODE_GCB_LVT)) then
+    return false;
+  end;
+  if ((LPrev = ADAM_UNICODE_GCB_LV) or (LPrev = ADAM_UNICODE_GCB_V)) and
+    ((AProperty = ADAM_UNICODE_GCB_V) or (AProperty = ADAM_UNICODE_GCB_T)) then
+    return false;
+  end;
+  if ((LPrev = ADAM_UNICODE_GCB_LVT) or (LPrev = ADAM_UNICODE_GCB_T)) and
+    (AProperty = ADAM_UNICODE_GCB_T) then
+    return false;
+  end;
+  // GB9 / GB9a / GB9b: before Extend, ZWJ, SpacingMark; after Prepend
+  if (AProperty = ADAM_UNICODE_GCB_EXTEND) or (AProperty = ADAM_UNICODE_GCB_ZWJ) or
+    (AProperty = ADAM_UNICODE_GCB_SPACINGMARK) or (LPrev = ADAM_UNICODE_GCB_PREPEND) then
+    return false;
+  end;
+  // GB9c, GB11, GB12 / GB13 start their rule at the code point they break before
+  if IndicProperty(ANext) = ADAM_UNICODE_INCB_CONSONANT then
+    ABreak.Rule := ADAM_CLUSTER_RULE_INDIC;
+    ABreak.IndicState := ADAM_CLUSTER_INDIC_CONSONANT;
+    return true;
+  end;
+  if AProperty = ADAM_UNICODE_GCB_EXTENDED_PICTOGRAPHIC then
+    ABreak.Rule := ADAM_CLUSTER_RULE_EMOJI;
+    ABreak.EmojiState := ADAM_CLUSTER_EMOJI_PICTOGRAPHIC;
+    return true;
+  end;
+  if AProperty = ADAM_UNICODE_GCB_REGIONAL_INDICATOR then
+    ABreak.Rule := ADAM_CLUSTER_RULE_REGIONAL;
+  end;
+  // GB999
+  return true;
+end;
+
+// True when a cluster breaks before ANext under GB9c (libc++'s
+// __evaluate_GB9c_indic_conjunct_break: a consonant, extends and linkers, a consonant after
+// a linker; anything else ends the rule)
+routine DoClusterIndic(var ABreak: ClusterBreak; const ANext: uint32; const AProperty: int64): bool;
+var
+  LIndic: int64;
+begin
+  LIndic := IndicProperty(ANext);
+  if LIndic <> ADAM_UNICODE_INCB_NONE then
+    if LIndic = ADAM_UNICODE_INCB_EXTEND then
+      return false;
+    end;
+    if LIndic = ADAM_UNICODE_INCB_LINKER then
+      ABreak.IndicState := ADAM_CLUSTER_INDIC_LINKER;
+      return false;
+    end;
+    if (LIndic = ADAM_UNICODE_INCB_CONSONANT) and (ABreak.IndicState = ADAM_CLUSTER_INDIC_LINKER) then
+      ABreak.IndicState := ADAM_CLUSTER_INDIC_CONSONANT;
+      return false;
+    end;
+  end;
+  ABreak.Rule := ADAM_CLUSTER_RULE_NONE;
+  return DoClusterNone(ABreak, ANext, AProperty);
+end;
+
+// True when a cluster breaks before ANext under GB11 (libc++'s __evaluate_GB11_emoji: a
+// pictograph, its extends, a ZWJ, the next pictograph)
+routine DoClusterEmoji(var ABreak: ClusterBreak; const ANext: uint32; const AProperty: int64): bool;
+begin
+  if ABreak.EmojiState = ADAM_CLUSTER_EMOJI_ZWJ then
+    if AProperty = ADAM_UNICODE_GCB_EXTENDED_PICTOGRAPHIC then
+      ABreak.EmojiState := ADAM_CLUSTER_EMOJI_PICTOGRAPHIC;
+      return false;
+    end;
+    ABreak.Rule := ADAM_CLUSTER_RULE_NONE;
+    return DoClusterNone(ABreak, ANext, AProperty);
+  end;
+  if AProperty = ADAM_UNICODE_GCB_EXTEND then
+    ABreak.EmojiState := ADAM_CLUSTER_EMOJI_EXTEND;
+    return false;
+  end;
+  if AProperty = ADAM_UNICODE_GCB_ZWJ then
+    ABreak.EmojiState := ADAM_CLUSTER_EMOJI_ZWJ;
+    return false;
+  end;
+  ABreak.Rule := ADAM_CLUSTER_RULE_NONE;
+  return DoClusterNone(ABreak, ANext, AProperty);
+end;
+
+// True when a cluster breaks before the code point ANext (libc++'s operator(): the rule in
+// force decides); ANext is then the code point before the next one
+routine DoClusterBreaks(var ABreak: ClusterBreak; const ANext: uint32): bool;
+var
+  LProperty: int64;
+  LResult: bool;
+begin
+  LProperty := GraphemeProperty(ANext);
+  if ABreak.Rule = ADAM_CLUSTER_RULE_INDIC then
+    LResult := DoClusterIndic(ABreak, ANext, LProperty);
+  else
+    if ABreak.Rule = ADAM_CLUSTER_RULE_EMOJI then
+      LResult := DoClusterEmoji(ABreak, ANext, LProperty);
+    else
+      if ABreak.Rule = ADAM_CLUSTER_RULE_REGIONAL then
+        // GB12 / GB13: two regional indicators pair, the rule ends either way
+        ABreak.Rule := ADAM_CLUSTER_RULE_NONE;
+        if LProperty = ADAM_UNICODE_GCB_REGIONAL_INDICATOR then
+          LResult := false;
+        else
+          LResult := DoClusterNone(ABreak, ANext, LProperty);
+        end;
+      else
+        LResult := DoClusterNone(ABreak, ANext, LProperty);
+      end;
+    end;
+  end;
+  ABreak.PrevCode := ANext;
+  ABreak.PrevProperty := LProperty;
+  return LResult;
+end;
+
+// The columns of the grapheme clusters of the ACount UTF-8 bytes at AText from AFrom
+// (libc++'s __estimate_column_width_grapheme_clustering): each cluster its first code
+// point's estimated width (EstimatedWidth). ADown (a precision) stops before the cluster
+// that would pass AMaximum, else (a width) it stops once past AMaximum; ALast the byte
+// the counted clusters end at. AFrom is below ACount
+routine DoClusterColumns(const AText: ptr to const uint8; const AFrom: int64; const ACount: int64;
+  const AMaximum: int64; const ADown: bool; var ALast: int64): int64;
+var
+  LBreak: ClusterBreak;
+  LAt: int64;
+  LValid: bool;
+  LCode: uint32;
+  LPosition: int64;
+  LWidth: int64;
+  LColumns: int64;
+begin
+  LColumns := 0;
+  ALast := AFrom;
+  LAt := AFrom;
+  // the first code point starts the rules (libc++'s view constructor reads it)
+  DoClusterStart(LBreak, DoUtf8Consume(AText, ACount, LAt, LValid));
+  while (ALast <> ACount) and (LColumns <= AMaximum) do
+    // one cluster: the code point the rules stand at, then each up to the next break
+    LCode := LBreak.PrevCode;
+    LPosition := LAt;
+    while LAt < ACount do
+      if DoClusterBreaks(LBreak, DoUtf8Consume(AText, ACount, LAt, LValid)) then
+        leave;
+      end;
+      LPosition := LAt;
+    end;
+    LWidth := EstimatedWidth(LCode);
+    if ADown and (LColumns + LWidth > AMaximum) then
+      return LColumns;
+    end;
+    LColumns := LColumns + LWidth;
+    ALast := LPosition;
   end;
   return LColumns;
 end;
 
-// The ACount bytes of text at AText written to the print sink ASink in the width of the
-// spec ASpec (AWidth: an argument's width, -1 none), the fill before and after it as the
-// alignment says (by default after: a text is left aligned)
-routine SinkSpecText(const ASink: ptr to ptr; const AText: ptr; const ACount: int64;
-  const ASpec: ptr to const int64; const AWidth: int64);
+// The columns the ACount UTF-8 bytes at AText take, at most AMaximum (libc++'s
+// __estimate_column_width; ADown its rounding down, a precision's, else up, a width's,
+// which may pass AMaximum by one cluster): ASCII one column a byte, the rest by
+// DoClusterColumns; an ASCII byte before a non-ASCII one is left to the clusters (it may
+// start one). ALast the byte the counted text ends at (AText's end when it all counts)
+routine DoSpecColumns(const AText: ptr to const uint8; const ACount: int64; const AMaximum: int64;
+  const ADown: bool; var ALast: int64): int64;
+var
+  LMaximum: int64;
+  LAt: int64;
+begin
+  ALast := 0;
+  if (ACount = 0) or (AMaximum = 0) then
+    return 0;
+  end;
+  LMaximum := AMaximum;
+  LAt := 0;
+  if AText[0] < 0x80 then
+    repeat
+      LMaximum := LMaximum - 1;
+      LAt := LAt + 1;
+      if LAt = ACount then
+        ALast := ACount;
+        return ACount;
+      end;
+      if LMaximum = 0 then
+        if AText[LAt] < 0x80 then
+          ALast := LAt;
+          return LAt;
+        end;
+        leave;
+      end;
+    until AText[LAt] >= 0x80;
+    // the last ASCII byte goes back to the clusters with its column
+    LAt := LAt - 1;
+    LMaximum := LMaximum + 1;
+  end;
+  return LAt + DoClusterColumns(AText, LAt, ACount, LMaximum, ADown, ALast);
+end;
+
+// The precision the spec ASpec cuts a text to: APrecision when an argument gave one (0 or
+// more), else the written one (-1: none)
+routine DoSpecPrecision(const ASpec: ptr to const int64; const APrecision: int64): int64;
+begin
+  if APrecision >= 0 then
+    return APrecision;
+  end;
+  return ASpec[7];
+end;
+
+// The ACount bytes of text at AText, ASize columns, written to the print sink ASink in the
+// width of the spec ASpec (AWidth: an argument's width, -1 none), the fill before and after
+// it as the alignment says (by default after: a text is left aligned); libc++'s __write
+routine DoSpecPadded(const ASink: ptr to ptr; const AText: ptr; const ACount: int64;
+  const ASize: int64; const ASpec: ptr to const int64; const AWidth: int64);
 var
   LFill: int64;
   LBefore: int64;
 begin
-  LFill := DoSpecWidth(ASpec, AWidth) - DoSpecColumns(ptr to const uint8(AText), ACount);
+  LFill := DoSpecWidth(ASpec, AWidth) - ASize;
   if LFill <= 0 then
     SinkText(ASink, AText, ACount);
     return;
@@ -1820,6 +2149,178 @@ begin
   DoSpecFillOf(ASink, ASpec, LBefore);
   SinkText(ASink, AText, ACount);
   DoSpecFillOf(ASink, ASpec, LFill - LBefore);
+end;
+
+// The ACount bytes of text at AText written to the print sink ASink in the width of the
+// spec ASpec (AWidth: an argument's width, -1 none) by their display width (libc++'s
+// __write_string_no_precision: DoSpecColumns, rounding up)
+routine SinkSpecText(const ASink: ptr to ptr; const AText: ptr; const ACount: int64;
+  const ASpec: ptr to const int64; const AWidth: int64);
+var
+  LWidth: int64;
+  LLast: int64;
+begin
+  LWidth := DoSpecWidth(ASpec, AWidth);
+  if LWidth = 0 then
+    SinkText(ASink, AText, ACount);
+    return;
+  end;
+  DoSpecPadded(ASink, AText, ACount, DoSpecColumns(ptr to const uint8(AText), ACount, LWidth, false, LLast),
+    ASpec, AWidth);
+end;
+
+// The ACount bytes of text at AText written to the print sink ASink with the spec ASpec
+// (AWidth / APrecision: an argument's width / precision, -1 none): with a precision cut to
+// the clusters that fit in it (libc++'s __truncate: DoSpecColumns, rounding down), padded
+// by the columns kept; else SinkSpecText's (libc++'s __write_string)
+routine DoSpecString(const ASink: ptr to ptr; const AText: ptr to const uint8; const ACount: int64;
+  const ASpec: ptr to const int64; const AWidth: int64; const APrecision: int64);
+var
+  LPrecision: int64;
+  LLast: int64;
+  LSize: int64;
+begin
+  LPrecision := DoSpecPrecision(ASpec, APrecision);
+  if LPrecision < 0 then
+    SinkSpecText(ASink, ptr(AText), ACount, ASpec, AWidth);
+    return;
+  end;
+  LSize := DoSpecColumns(AText, ACount, LPrecision, true, LLast);
+  DoSpecPadded(ASink, ptr(AText), LLast, LSize, ASpec, AWidth);
+end;
+
+// The code AValue written to the print sink ASink after the escape's opening APrefix
+// ("\u{" or "\x{"): its shortest lowercase hex, then "}" (libc++'s
+// __write_escaped_code_unit)
+routine DoEscapeHex(const ASink: ptr to ptr; const APrefix: ptr to const char; const AValue: uint32);
+var
+  LDigits: array[0..7] of char;
+  LAt: int64;
+  LRest: uint32;
+  LDigit: uint32;
+begin
+  SinkLiteral(ASink, APrefix);
+  LAt := 8;
+  LRest := AValue;
+  repeat
+    LAt := LAt - 1;
+    LDigit := LRest & 0xF;
+    if LDigit < 10 then
+      LDigits[LAt] := char(48 + LDigit);
+    else
+      LDigits[LAt] := char(87 + LDigit);
+    end;
+    LRest := LRest shr 4;
+  until LRest = 0;
+  SinkText(ASink, addr of LDigits[LAt], 8 - LAt);
+  SinkLiteral(ASink, ptr to const char("}"));
+end;
+
+// True when the well-formed code point ACode is written to the print sink ASink as an
+// escape ([format.string.escaped]/2, libc++'s __is_escaped_sequence_written): \t \n \r,
+// the quote AApostrophe names (\' in a char's form, \" in a string's; the other one as it
+// is), \\, a space as it is; one the escaped output table names (NeedsEscape), or an
+// extending one right after an escape (ALastEscaped), as \u{hex}. False: the caller copies
+// it as it is
+routine DoEscapeWritten(const ASink: ptr to ptr; const ACode: uint32; const ALastEscaped: bool;
+  const AApostrophe: bool): bool;
+begin
+  if ACode = 9 then
+    SinkLiteral(ASink, ptr to const char("\\t"));
+    return true;
+  end;
+  if ACode = 10 then
+    SinkLiteral(ASink, ptr to const char("\\n"));
+    return true;
+  end;
+  if ACode = 13 then
+    SinkLiteral(ASink, ptr to const char("\\r"));
+    return true;
+  end;
+  if ACode = 39 then
+    if AApostrophe then
+      SinkLiteral(ASink, ptr to const char("\\'"));
+    else
+      SinkLiteral(ASink, ptr to const char("'"));
+    end;
+    return true;
+  end;
+  if ACode = 34 then
+    if AApostrophe then
+      SinkLiteral(ASink, ptr to const char("\""));
+    else
+      SinkLiteral(ASink, ptr to const char("\\\""));
+    end;
+    return true;
+  end;
+  if ACode = 92 then
+    SinkLiteral(ASink, ptr to const char("\\\\"));
+    return true;
+  end;
+  if ACode = 32 then
+    SinkLiteral(ASink, ptr to const char(" "));
+    return true;
+  end;
+  if NeedsEscape(ACode) or (ALastEscaped and (GraphemeProperty(ACode) = ADAM_UNICODE_GCB_EXTEND)) then
+    DoEscapeHex(ASink, ptr to const char("\\u{"), ACode);
+    return true;
+  end;
+  return false;
+end;
+
+// The ACount UTF-8 bytes at AText written to the print sink ASink as the debug form's
+// escaped text (libc++'s __escape): each well-formed code point by DoEscapeWritten or as it
+// is, each byte of an ill-formed sequence as \x{hex}. AApostrophe: a char's form (\'),
+// else a string's (\"). An extending first code point is escaped too (as after an escape)
+routine DoSpecEscape(const ASink: ptr to ptr; const AText: ptr to const uint8; const ACount: int64;
+  const AApostrophe: bool);
+var
+  LEscaped: bool;
+  LAt: int64;
+  LFirst: int64;
+  LCode: uint32;
+  LValid: bool;
+  LI: int64;
+begin
+  LEscaped := true;
+  LAt := 0;
+  while LAt < ACount do
+    LFirst := LAt;
+    LCode := DoUtf8Consume(AText, ACount, LAt, LValid);
+    if LValid then
+      LEscaped := DoEscapeWritten(ASink, LCode, LEscaped, AApostrophe);
+      if not LEscaped then
+        SinkText(ASink, ptr(addr of AText[LFirst]), LAt - LFirst);
+      end;
+    else
+      for LI := LFirst to LAt - 1 do
+        DoEscapeHex(ASink, ptr to const char("\\x{"), uint32(AText[LI]));
+      end;
+    end;
+  end;
+end;
+
+// The ACount UTF-8 bytes at AText written to the print sink ASink as the string formatter
+// writes them with the spec ASpec (AWidth / APrecision: an argument's width / precision, -1
+// none): the debug form `?` its escaped text in double quotes (written into a string of its
+// own first, libc++'s __format_escaped_string), then DoSpecString
+routine DoSpecStringOf(const ASink: ptr to ptr; const AText: ptr to const uint8; const ACount: int64;
+  const ASpec: ptr to const int64; const AWidth: int64; const APrecision: int64);
+var
+  LText: ptr;
+  LBytes: ptr to uint8;
+begin
+  if ASpec[6] <> 63 then
+    DoSpecString(ASink, AText, ACount, ASpec, AWidth, APrecision);
+    return;
+  end;
+  LText := nil;
+  SinkLiteral(addr of LText, ptr to const char("\""));
+  DoSpecEscape(addr of LText, AText, ACount, false);
+  SinkLiteral(addr of LText, ptr to const char("\""));
+  LBytes := ptr to uint8(LText);
+  DoSpecString(ASink, ptr to const uint8(addr of LBytes[16]), StrLength(LText), ASpec, AWidth, APrecision);
+  StrRelease(LText);
 end;
 
 // An integer of magnitude AMagnitude (ANegative: below 0) written to the print sink ASink
@@ -1979,16 +2480,30 @@ begin
 end;
 
 // print's form of a char with the spec ASpec (AWidth: an argument's width, -1 none) to the
-// print sink ASink: no type letter or `c` its byte in the width, any other its code as an
-// unsigned number (libc++'s: a char as an integer is its unsigned value) by SinkSpecInt
+// print sink ASink: no type letter or `c` its byte in the width; the debug form `?` its
+// escaped byte in apostrophes (written into a string of its own first), padded by its
+// bytes (libc++'s __format_escaped_char); any other its code as an unsigned number
+// (libc++'s: a char as an integer is its unsigned value) by SinkSpecInt
 routine SinkSpecChar(const ASink: ptr to ptr; const AValue: char; const ASpec: ptr to const int64;
   const AWidth: int64);
 var
   LByte: array[0..0] of char;
+  LText: ptr;
+  LBytes: ptr to uint8;
 begin
+  LByte[0] := AValue;
   if (ASpec[6] = 0) or (ASpec[6] = 99) then
-    LByte[0] := AValue;
     SinkSpecText(ASink, addr of LByte[0], 1, ASpec, AWidth);
+    return;
+  end;
+  if ASpec[6] = 63 then
+    LText := nil;
+    SinkLiteral(addr of LText, ptr to const char("'"));
+    DoSpecEscape(addr of LText, ptr to const uint8(addr of LByte[0]), 1, true);
+    SinkLiteral(addr of LText, ptr to const char("'"));
+    LBytes := ptr to uint8(LText);
+    DoSpecPadded(ASink, addr of LBytes[16], StrLength(LText), StrLength(LText), ASpec, AWidth);
+    StrRelease(LText);
     return;
   end;
   SinkSpecInt(ASink, int64(uint8(AValue)), true, ASpec, AWidth);
@@ -2007,20 +2522,97 @@ begin
   end;
 end;
 
-// print's form of a choices value with the spec ASpec (AWidth: an argument's width, -1
-// none) to the print sink ASink: SinkChoice's text (written into a string of its own
-// first) in the width
-routine SinkSpecChoice(const ASink: ptr to ptr; const ANumber: int64; const ATable: ptr to const int64;
-  const ASpec: ptr to const int64; const AWidth: int64);
+// print's form of a string with the spec ASpec (AWidth / APrecision: an argument's width /
+// precision, -1 none) to the print sink ASink: its bytes by the string formatter
+// (DoSpecStringOf; nil, the empty string, has none)
+routine SinkSpecStr(const ASink: ptr to ptr; const AText: ptr; const ASpec: ptr to const int64;
+  const AWidth: int64; const APrecision: int64);
+var
+  LBytes: ptr to uint8;
+begin
+  if AText = nil then
+    DoSpecStringOf(ASink, nil, 0, ASpec, AWidth, APrecision);
+    return;
+  end;
+  LBytes := ptr to uint8(AText);
+  DoSpecStringOf(ASink, ptr to const uint8(addr of LBytes[16]), StrLength(AText), ASpec, AWidth,
+    APrecision);
+end;
+
+// The string AText (a scratch string a text form was written into) written to the print
+// sink ASink by SinkSpecStr with the spec ASpec, then released: every text form is its
+// UTF-8 text to the string formatter, as std::format sees it
+routine DoSpecScratch(const ASink: ptr to ptr; const AText: ptr; const ASpec: ptr to const int64;
+  const AWidth: int64; const APrecision: int64);
+begin
+  SinkSpecStr(ASink, AText, ASpec, AWidth, APrecision);
+  StrRelease(AText);
+end;
+
+// print's form of a wstring with the spec ASpec (AWidth / APrecision: an argument's width /
+// precision, -1 none) to the print sink ASink: its UTF-8 text (SinkWideText's: an unpaired
+// surrogate U+FFFD) by the string formatter
+routine SinkSpecWideText(const ASink: ptr to ptr; const AText: ptr; const ASpec: ptr to const int64;
+  const AWidth: int64; const APrecision: int64);
 var
   LText: ptr;
-  LBytes: ptr to uint8;
+begin
+  LText := nil;
+  SinkWideText(addr of LText, AText);
+  DoSpecScratch(ASink, LText, ASpec, AWidth, APrecision);
+end;
+
+// print's form of a wchar with the spec ASpec (AWidth / APrecision: an argument's width /
+// precision, -1 none) to the print sink ASink: its UTF-8 text (SinkWideChar's: a surrogate
+// alone U+FFFD) by the string formatter, the debug form in double quotes as std::format
+// formats a wchar converted to UTF-8 text
+routine SinkSpecWideChar(const ASink: ptr to ptr; const AValue: wchar; const ASpec: ptr to const int64;
+  const AWidth: int64; const APrecision: int64);
+var
+  LText: ptr;
+begin
+  LText := nil;
+  SinkWideChar(addr of LText, AValue);
+  DoSpecScratch(ASink, LText, ASpec, AWidth, APrecision);
+end;
+
+// print's form of a ptr to char with the spec ASpec (AWidth / APrecision: an argument's
+// width / precision, -1 none) to the print sink ASink: SinkCText's text (nil "nil") by the
+// string formatter
+routine SinkSpecCText(const ASink: ptr to ptr; const AText: ptr to const char;
+  const ASpec: ptr to const int64; const AWidth: int64; const APrecision: int64);
+var
+  LText: ptr;
+begin
+  LText := nil;
+  SinkCText(addr of LText, AText);
+  DoSpecScratch(ASink, LText, ASpec, AWidth, APrecision);
+end;
+
+// print's form of a ptr to wchar with the spec ASpec (AWidth / APrecision: an argument's
+// width / precision, -1 none) to the print sink ASink: SinkWideCText's UTF-8 text (nil
+// "nil") by the string formatter
+routine SinkSpecWideCText(const ASink: ptr to ptr; const AText: ptr to const wchar;
+  const ASpec: ptr to const int64; const AWidth: int64; const APrecision: int64);
+var
+  LText: ptr;
+begin
+  LText := nil;
+  SinkWideCText(addr of LText, AText);
+  DoSpecScratch(ASink, LText, ASpec, AWidth, APrecision);
+end;
+
+// print's form of a choices value with the spec ASpec (AWidth / APrecision: an argument's
+// width / precision, -1 none) to the print sink ASink: SinkChoice's text (written into a
+// string of its own first) by the string formatter
+routine SinkSpecChoice(const ASink: ptr to ptr; const ANumber: int64; const ATable: ptr to const int64;
+  const ASpec: ptr to const int64; const AWidth: int64; const APrecision: int64);
+var
+  LText: ptr;
 begin
   LText := nil;
   SinkChoice(addr of LText, ANumber, ATable);
-  LBytes := ptr to uint8(LText);
-  SinkSpecText(ASink, addr of LBytes[16], StrLength(LText), ASpec, AWidth);
-  StrRelease(LText);
+  DoSpecScratch(ASink, LText, ASpec, AWidth, APrecision);
 end;
 
 // The integer AValue in decimal ("-" first when negative) written into ABuffer at AAt; AAt
