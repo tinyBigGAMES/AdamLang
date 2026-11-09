@@ -1690,6 +1690,339 @@ begin
   SinkLiteral(ASink, ptr to const char(")"));
 end;
 
+// A placeholder's spec as the compiler writes it for the SinkSpec* routines below (M3.8f3;
+// libc++'s parsed std-format-spec), in int64 words: [0] the fill's UTF-8 bytes packed
+// little-endian, [1] their count (0: a space), [2] the alignment (ADAM_SPEC_ALIGN_*), [3]
+// the sign (ADAM_SPEC_SIGN_*), [4] 1 for `#`, [5] the width as written (0: none), [6] the
+// type letter's byte (0: none). A width an argument gives comes as an operand of its own
+// (SpecWidth's result; -1: the written one)
+const
+  ADAM_SPEC_ALIGN_DEFAULT: int64 = 0;
+  ADAM_SPEC_ALIGN_LEFT: int64 = 1;
+  ADAM_SPEC_ALIGN_CENTER: int64 = 2;
+  ADAM_SPEC_ALIGN_RIGHT: int64 = 3;
+  // `0` with no alignment written: zeros between the sign and prefix and the digits
+  ADAM_SPEC_ALIGN_ZERO: int64 = 4;
+  ADAM_SPEC_SIGN_MINUS: int64 = 0;
+  ADAM_SPEC_SIGN_PLUS: int64 = 1;
+  ADAM_SPEC_SIGN_SPACE: int64 = 2;
+  // A width libc++ takes from an argument at most (__format::__number_max)
+  ADAM_SPEC_WIDTH_MAX: int64 = 2147483647;
+  // How SpecWidth's argument is typed: a signed integer, an unsigned one, no integer
+  ADAM_SPEC_WIDTH_SIGNED: int64 = 0;
+  ADAM_SPEC_WIDTH_UNSIGNED: int64 = 1;
+  ADAM_SPEC_WIDTH_NO_INTEGER: int64 = 2;
+
+// The width a placeholder's `{}` width takes from its argument, AValue's bits typed as
+// AKind says (ADAM_SPEC_WIDTH_*), checked as libc++ checks it when the format runs (a
+// negative one, one past ADAM_SPEC_WIDTH_MAX and an argument of no integer type raise its
+// text; a choices value's width is only checked here)
+routine SpecWidth(const AValue: int64; const AKind: int64): int64;
+begin
+  if AKind = ADAM_SPEC_WIDTH_NO_INTEGER then
+    raise("Replacement argument isn't a standard signed or unsigned integer type");
+  end;
+  if (AKind = ADAM_SPEC_WIDTH_SIGNED) and (AValue < 0) then
+    raise("An argument index may not have a negative value");
+  end;
+  // an unsigned value past int64's range has its top bit set: it is past the maximum too
+  if (AValue < 0) or (AValue > ADAM_SPEC_WIDTH_MAX) then
+    raise("The value of the argument index exceeds its maximum value");
+  end;
+  return AValue;
+end;
+
+// The width the spec ASpec pads to: AWidth when an argument gave one (0 or more), else the
+// written one (0: none)
+routine DoSpecWidth(const ASpec: ptr to const int64; const AWidth: int64): int64;
+begin
+  if AWidth >= 0 then
+    return AWidth;
+  end;
+  return ASpec[5];
+end;
+
+// The fill AFill (its ASize UTF-8 bytes packed little-endian) written ACount times to the
+// print sink ASink, through a buffer written as it fills
+routine DoSpecFill(const ASink: ptr to ptr; const AFill: int64; const ASize: int64;
+  const ACount: int64);
+var
+  LBuffer: array[0..255] of uint8;
+  LAt: int64;
+  LI: int64;
+  LJ: int64;
+begin
+  LAt := 0;
+  for LI := 1 to ACount do
+    // a fill takes at most 4 bytes: the buffer is written before one could pass its end
+    if LAt > 252 then
+      SinkText(ASink, addr of LBuffer[0], LAt);
+      LAt := 0;
+    end;
+    for LJ := 0 to ASize - 1 do
+      LBuffer[LAt] := uint8((uint64(AFill) shr (8 * LJ)) & 0xFF);
+      LAt := LAt + 1;
+    end;
+  end;
+  if LAt > 0 then
+    SinkText(ASink, addr of LBuffer[0], LAt);
+  end;
+end;
+
+// The fill of the spec ASpec written ACount times to the print sink ASink (a space when
+// none was written)
+routine DoSpecFillOf(const ASink: ptr to ptr; const ASpec: ptr to const int64; const ACount: int64);
+begin
+  if ASpec[1] = 0 then
+    DoSpecFill(ASink, 32, 1, ACount);
+  else
+    DoSpecFill(ASink, ASpec[0], ASpec[1], ACount);
+  end;
+end;
+
+// The columns the ACount UTF-8 bytes at AText take: one per code point (every byte that is
+// no continuation byte)
+routine DoSpecColumns(const AText: ptr to const uint8; const ACount: int64): int64;
+var
+  LColumns: int64;
+  LI: int64;
+begin
+  LColumns := 0;
+  for LI := 0 to ACount - 1 do
+    if (AText[LI] & 0xC0) <> 0x80 then
+      LColumns := LColumns + 1;
+    end;
+  end;
+  return LColumns;
+end;
+
+// The ACount bytes of text at AText written to the print sink ASink in the width of the
+// spec ASpec (AWidth: an argument's width, -1 none), the fill before and after it as the
+// alignment says (by default after: a text is left aligned)
+routine SinkSpecText(const ASink: ptr to ptr; const AText: ptr; const ACount: int64;
+  const ASpec: ptr to const int64; const AWidth: int64);
+var
+  LFill: int64;
+  LBefore: int64;
+begin
+  LFill := DoSpecWidth(ASpec, AWidth) - DoSpecColumns(ptr to const uint8(AText), ACount);
+  if LFill <= 0 then
+    SinkText(ASink, AText, ACount);
+    return;
+  end;
+  LBefore := 0;
+  if ASpec[2] = ADAM_SPEC_ALIGN_CENTER then
+    LBefore := LFill div 2;
+  end;
+  if ASpec[2] = ADAM_SPEC_ALIGN_RIGHT then
+    LBefore := LFill;
+  end;
+  DoSpecFillOf(ASink, ASpec, LBefore);
+  SinkText(ASink, AText, ACount);
+  DoSpecFillOf(ASink, ASpec, LFill - LBefore);
+end;
+
+// An integer of magnitude AMagnitude (ANegative: below 0) written to the print sink ASink
+// as libc++'s __format_integer writes it: the sign ('-' when negative, else ASpec's '+' or
+// ' '), with AAlternate the base's prefix (0b / 0B, 0 before a nonzero octal, 0x / 0X), the
+// digits in the base of the type letter ALetter ('b' 'B' 'o' 'x' 'X', any other decimal; X's
+// uppercase); then zeros between the prefix and the digits (ADAM_SPEC_ALIGN_ZERO), or the
+// fill around it all (by default before: a number is right aligned), to the spec's width
+routine DoSpecInteger(const ASink: ptr to ptr; const AMagnitude: uint64; const ANegative: bool;
+  const ALetter: int64; const AAlternate: bool; const ASpec: ptr to const int64;
+  const AWidth: int64);
+var
+  LText: array[0..71] of char;
+  LBase: uint64;
+  LUpper: bool;
+  LAt: int64;
+  LEnd: int64;
+  LStart: int64;
+  LRest: uint64;
+  LDigit: int64;
+  LFill: int64;
+  LBefore: int64;
+begin
+  LBase := 10;
+  if (ALetter = 98) or (ALetter = 66) then
+    LBase := 2;
+  end;
+  if ALetter = 111 then
+    LBase := 8;
+  end;
+  if (ALetter = 120) or (ALetter = 88) then
+    LBase := 16;
+  end;
+  LUpper := ALetter = 88;
+  // [sign][prefix] at the start of LText
+  LAt := 0;
+  if ANegative then
+    LText[0] := '-';
+    LAt := 1;
+  else
+    if ASpec[3] = ADAM_SPEC_SIGN_PLUS then
+      LText[0] := '+';
+      LAt := 1;
+    end;
+    if ASpec[3] = ADAM_SPEC_SIGN_SPACE then
+      LText[0] := ' ';
+      LAt := 1;
+    end;
+  end;
+  if AAlternate and ((LBase <> 8) or (AMagnitude <> 0)) and (LBase <> 10) then
+    LText[LAt] := '0';
+    LAt := LAt + 1;
+    // binary and hex name their base after the 0, in the type letter's case
+    if LBase <> 8 then
+      LText[LAt] := char(ALetter);
+      LAt := LAt + 1;
+    end;
+  end;
+  // The digits are written from the end of LText back toward the prefix (64 at most)
+  LEnd := 72;
+  LStart := LEnd;
+  LRest := AMagnitude;
+  repeat
+    LStart := LStart - 1;
+    LDigit := int64(LRest mod LBase);
+    if LDigit < 10 then
+      LText[LStart] := char(48 + LDigit);
+    else
+      if LUpper then
+        LText[LStart] := char(55 + LDigit);
+      else
+        LText[LStart] := char(87 + LDigit);
+      end;
+    end;
+    LRest := LRest div LBase;
+  until LRest = 0;
+  LFill := DoSpecWidth(ASpec, AWidth) - LAt - (LEnd - LStart);
+  if LFill < 0 then
+    LFill := 0;
+  end;
+  if ASpec[2] = ADAM_SPEC_ALIGN_ZERO then
+    if LAt > 0 then
+      SinkText(ASink, addr of LText[0], LAt);
+    end;
+    DoSpecFill(ASink, 48, 1, LFill);
+    SinkText(ASink, addr of LText[LStart], LEnd - LStart);
+    return;
+  end;
+  LBefore := LFill;
+  if ASpec[2] = ADAM_SPEC_ALIGN_LEFT then
+    LBefore := 0;
+  end;
+  if ASpec[2] = ADAM_SPEC_ALIGN_CENTER then
+    LBefore := LFill div 2;
+  end;
+  DoSpecFillOf(ASink, ASpec, LBefore);
+  if LAt > 0 then
+    SinkText(ASink, addr of LText[0], LAt);
+  end;
+  SinkText(ASink, addr of LText[LStart], LEnd - LStart);
+  DoSpecFillOf(ASink, ASpec, LFill - LBefore);
+end;
+
+// print's form of an integer with the spec ASpec (AWidth: an argument's width, -1 none) to
+// the print sink ASink: AValue's bits, signed unless AUnsigned; `c` the char of that code (a
+// value outside char's range, -128 .. 127 signed, 0 .. 127 unsigned, raises libc++'s text),
+// a text in the width; any other type letter DoSpecInteger's
+routine SinkSpecInt(const ASink: ptr to ptr; const AValue: int64; const AUnsigned: bool;
+  const ASpec: ptr to const int64; const AWidth: int64);
+var
+  LByte: array[0..0] of char;
+  LOutside: bool;
+begin
+  if ASpec[6] = 99 then
+    if AUnsigned then
+      LOutside := (AValue < 0) or (AValue > 127);
+    else
+      LOutside := (AValue < -128) or (AValue > 127);
+    end;
+    if LOutside then
+      raise("Integral value outside the range of the char type");
+    end;
+    LByte[0] := char(AValue & 0xFF);
+    SinkSpecText(ASink, addr of LByte[0], 1, ASpec, AWidth);
+    return;
+  end;
+  if AUnsigned or (AValue >= 0) then
+    DoSpecInteger(ASink, uint64(AValue), false, ASpec[6], ASpec[4] <> 0, ASpec, AWidth);
+  else
+    // the magnitude is taken as uint64 so the most negative int64 has one too
+    DoSpecInteger(ASink, uint64(0) - uint64(AValue), true, ASpec[6], ASpec[4] <> 0, ASpec,
+      AWidth);
+  end;
+end;
+
+// print's form of a bool with the spec ASpec (AWidth: an argument's width, -1 none) to the
+// print sink ASink: no type letter or `s` its text ("true" / "false") in the width, any
+// other its number (1 / 0) by SinkSpecInt
+routine SinkSpecBool(const ASink: ptr to ptr; const AValue: bool; const ASpec: ptr to const int64;
+  const AWidth: int64);
+var
+  LNumber: int64;
+begin
+  if (ASpec[6] = 0) or (ASpec[6] = 115) then
+    if AValue then
+      SinkSpecText(ASink, ptr(ptr to const char("true")), 4, ASpec, AWidth);
+    else
+      SinkSpecText(ASink, ptr(ptr to const char("false")), 5, ASpec, AWidth);
+    end;
+    return;
+  end;
+  LNumber := 0;
+  if AValue then
+    LNumber := 1;
+  end;
+  SinkSpecInt(ASink, LNumber, true, ASpec, AWidth);
+end;
+
+// print's form of a char with the spec ASpec (AWidth: an argument's width, -1 none) to the
+// print sink ASink: no type letter or `c` its byte in the width, any other its code as an
+// unsigned number (libc++'s: a char as an integer is its unsigned value) by SinkSpecInt
+routine SinkSpecChar(const ASink: ptr to ptr; const AValue: char; const ASpec: ptr to const int64;
+  const AWidth: int64);
+var
+  LByte: array[0..0] of char;
+begin
+  if (ASpec[6] = 0) or (ASpec[6] = 99) then
+    LByte[0] := AValue;
+    SinkSpecText(ASink, addr of LByte[0], 1, ASpec, AWidth);
+    return;
+  end;
+  SinkSpecInt(ASink, int64(uint8(AValue)), true, ASpec, AWidth);
+end;
+
+// print's form of a pointer with the spec ASpec (AWidth: an argument's width, -1 none) to
+// the print sink ASink: its address in hex after 0x (`P`: uppercase, after 0X), as libc++'s
+// pointer formatter writes it (DoSpecInteger, the prefix always)
+routine SinkSpecAddress(const ASink: ptr to ptr; const AValue: ptr; const ASpec: ptr to const int64;
+  const AWidth: int64);
+begin
+  if ASpec[6] = 80 then
+    DoSpecInteger(ASink, uint64(AValue), false, 88, true, ASpec, AWidth);
+  else
+    DoSpecInteger(ASink, uint64(AValue), false, 120, true, ASpec, AWidth);
+  end;
+end;
+
+// print's form of a choices value with the spec ASpec (AWidth: an argument's width, -1
+// none) to the print sink ASink: SinkChoice's text (written into a string of its own
+// first) in the width
+routine SinkSpecChoice(const ASink: ptr to ptr; const ANumber: int64; const ATable: ptr to const int64;
+  const ASpec: ptr to const int64; const AWidth: int64);
+var
+  LText: ptr;
+  LBytes: ptr to uint8;
+begin
+  LText := nil;
+  SinkChoice(addr of LText, ANumber, ATable);
+  LBytes := ptr to uint8(LText);
+  SinkSpecText(ASink, addr of LBytes[16], StrLength(LText), ASpec, AWidth);
+  StrRelease(LText);
+end;
+
 // The integer AValue in decimal ("-" first when negative) written into ABuffer at AAt; AAt
 // moves past it
 routine DoFloatPutInt(const ABuffer: ptr to char; var AAt: int64; const AValue: int64);
@@ -1986,6 +2319,21 @@ begin
   PlatformRaise();
 end;
 
+// exccode(): the code of this thread's raise in flight (the last one raised, caught or not;
+// 0 before any)
+routine ExcCode(): int32;
+begin
+  return GRaiseCode;
+end;
+
+// excmsg(): the text of this thread's raise in flight (the last one raised, caught or not;
+// "" before any), a reference the caller holds
+routine ExcMsg(): ptr;
+begin
+  StrAddRef(GRaiseText);
+  return GRaiseText;
+end;
+
 // raise(S): the raise in flight is S with PaskalCPP's code for raise (1, EXC_SOFTWARE),
 // its text held (a reference added: the raising frame's own release of S runs as it
 // unwinds), then raised (RaiseWith); it never returns
@@ -1993,6 +2341,14 @@ routine Raise(const AText: ptr);
 begin
   StrAddRef(AText);
   RaiseWith(1, AText);
+end;
+
+// raisecode(C, S): the raise in flight is S with the code ACode, its text held (Raise's
+// rule), then raised (RaiseWith); it never returns
+routine RaiseCode(const ACode: int32; const AText: ptr);
+begin
+  StrAddRef(AText);
+  RaiseWith(ACode, AText);
 end;
 
 // A new string of the C string AText's bytes (up to its NUL), a reference the caller
