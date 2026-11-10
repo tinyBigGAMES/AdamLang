@@ -50,7 +50,9 @@
   folder; made when it is not there. Its output is split by kind (SU1):
   <output>\bin the exe (and later a dll / pdb), <output>\lib the static libs,
   <output>\acu the compiled units (SU2): a build takes each imported unit
-  from its .acu when it is current (AcuLoader) and writes the .acu of every
+  from its .acu when it is current (AcuPlan decides, AcuLoader loads; a stale
+  unit is first compiled alone into its .acu, so an importer whose import
+  changed only in private stays current) and writes the .acu of every
   module it parsed (a check parses every source). The exe, in bin, is the main
   module's name with the format's exe ending. Its libraries are
   searched in every module's @addlibrarypath folders, in module and
@@ -80,7 +82,8 @@ module unit Adam.Driver.Compiler;
 import System.SysUtils, System.Windows, Adam.Core.Common, Adam.Core.Messages, Adam.Target,
   Adam.Target.Registry,
   Adam.Compiler.SourceText, Adam.Compiler.Diagnostics, Adam.Compiler.SourceFiles,
-  Adam.Compiler.AST, Adam.Compiler.Parser, Adam.Compiler.Semantics, Adam.Compiler.Layout,
+  Adam.Compiler.AST, Adam.Compiler.Conditionals, Adam.Compiler.Parser, Adam.Compiler.Semantics,
+  Adam.Compiler.Layout,
   Adam.Compiler.Symbols, Adam.Backend.Ssa, Adam.Backend.Lowering, Adam.Backend.Sections,
   Adam.Backend.Targets, Adam.Backend.Generate, Adam.Acu.Format, Adam.Acu.Writer,
   Adam.Acu.Reader, Adam.Driver.Project;
@@ -250,6 +253,27 @@ begin
   return 0;
 end;
 
+// The hash AHashes holds for the unit AName (0 when it has none: every module of a tree has
+// one, DoUnitHashes)
+routine DoHashIn(const AHashes: AcuUnitHashArray; const AName: string): uint64;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(AHashes) - 1 do
+    if AHashes[LI].UnitName = AName then
+      return AHashes[LI].Hash;
+    end;
+  end;
+  return 0;
+end;
+
+// The predefined symbols an .acu's header carries for the build in ATree (its triple and
+// mode: Adam.Compiler.Conditionals' PredefinedSymbols), joined
+routine DoDefinesOf(const ATree: ref SyntaxTree): string;
+begin
+  return JoinStrings(PredefinedSymbols(ATree.Triple, ATree.DebugBuild), ADAM_ACU_DEFINE_SEPARATOR);
+end;
+
 type
   // A unit's compiled form waiting to be read: found current by HasUnit, read by LoadUnit
   AcuFound = record
@@ -261,41 +285,404 @@ type
   AcuFoundArray = array of AcuFound;
 
 public type
-  // The build's compiled units (SU2.2, DESIGN sec 3), the parser's UnitLoader: a unit's .acu
-  // in the build's <output>\acu\<triple>\<mode>\ folder (DoAcuDirOf, the folder settled
-  // once the main module's prologue is parsed) taken in place of its source when current:
-  // this format version, the unit's name, this compiler (DoCompilerId), the build's triple,
-  // mode and pack key, and its source as found (path, size and write time; the hash and the
-  // imports' interface hashes are SU2.3's). Its payload is read by Adam.Acu.Reader's group
-  // reader once the parser has loaded its imports (or is loading them in the same group);
-  // a name its import no longer declares is the reader's AU0002 at the import that needs
-  // the unit
+  // Compiles one unit from its source into its .acu for the build an AcuPlan decides for
+  // (the Compiler's own: a unit compile, see AcuPlan). This one compiles nothing
+  UnitCompiler = object
+    // True when the unit AName, its source the file APath, was checked with no error and its
+    // .acu written (with every other unit that compile had to parse); its warnings and
+    // hints then the build's. False: the build parses it from source and reports what it has
+    virtual method CompileUnit(const AName: string; const APath: string): bool;
+    begin
+      return false;
+    end;
+  end;
+
+type
+  // Where a unit stands in an AcuPlan: being decided (its imports are), its .acu current,
+  // or compiled from source by the tree that needs it
+  AcuState = choices(Deciding, Current, Stale);
+
+  // One unit an AcuPlan decided: its state, its .acu's header as last judged, and (Refresh)
+  // the size and write time its source has now when only its write time moved and its bytes
+  // are those compiled, so its .acu is written again with them
+  AcuDecision = record
+    UnitName: string;
+    State: AcuState;
+    Header: AcuHeader;
+    Refresh: bool;
+    RefreshSize: int64;
+    RefreshTime: int64;
+  end;
+
+  AcuDecisionArray = array of AcuDecision;
+
+public type
+  // The build's compiled units (SU2.2 / SU2.3, DESIGN sec 3), decided once per build and
+  // shared by the build's AcuLoader and every unit compile's. A unit's .acu (in the build's
+  // <output>\acu\<triple>\<mode>\ folder, DoAcuDirOf, settled once the main module's
+  // prologue is parsed) is current when its header has this format version, the unit's
+  // name, this compiler (DoCompilerId), the build's triple, mode, predefined symbols and
+  // pack key, its source as found (the path, the size, then the write time, else the
+  // text's Fnv1a64 when only the time moved), and for each import the interface hash that
+  // import has now. A unit's imports are decided before it (each one compiled into its
+  // .acu when not current), so a change in an import's private part leaves the unit
+  // current, a change an importer can see makes it stale. A unit whose own source moved,
+  // its .acu written by a build like this one (DoSameBuild) and its imports all current
+  // (or in its cycle of imports), is compiled alone into its .acu by the UnitCompiler, then
+  // judged again: its importers are then decided against its new interface. A unit with no
+  // such .acu (none yet, another compiler, format or mode: every importer is stale too), or
+  // stale only because an import's interface moved (its importers are stale with it), is
+  // parsed from source by the tree that needs it, with no unit compile: one tree compiles
+  // the whole chain. A unit an import of which cannot be compiled (an error), or whose own
+  // compile fails, is parsed from source by the tree that needs it, which reports what it
+  // has at the import that needs it
+  AcuPlan = object
+    hidden FSources: ref SourceFiles;
+    hidden FCompiler: ref UnitCompiler;
+    hidden FUnits: AcuDecisionArray;
+    hidden FReady: bool;
+    hidden FDir: string;
+    hidden FBackend: ref Backend;
+    hidden FCompilerId: uint64;
+    hidden FTriple: string;
+    hidden FMode: string;
+    hidden FDefines: string;
+    hidden FProjectKey: uint64;
+
+    // ASources: the build's (its imports found as the parser finds them)
+    init(const ASources: ref SourceFiles);
+    begin
+      self.FSources := ASources;
+      self.FCompiler := nil;
+      setlength(self.FUnits, 0);
+      self.FReady := false;
+      self.FDir := "";
+      self.FBackend := nil;
+      self.FCompilerId := 0;
+      self.FTriple := "";
+      self.FMode := "";
+      self.FDefines := "";
+      self.FProjectKey := 0;
+    end;
+
+    // ACompiler compiles each unit the plan finds stale (the build's, before its parse)
+    method SetCompiler(const ACompiler: ref UnitCompiler);
+    begin
+      self.FCompiler := ACompiler;
+    end;
+
+    // No unit compile from now on: the plan's way back to the build's compile ends (the
+    // build has parsed; nothing outlives it in a cycle of references)
+    method Detach();
+    begin
+      self.FCompiler := nil;
+    end;
+
+    // True once Settle ran
+    property Ready: bool read FReady;
+
+    // The units' folder ("" when there is none: no unit comes from an .acu) and the backend
+    // whose object format holds them
+    property Dir: string read FDir;
+    property Format: ref Backend read FBackend;
+
+    // The build's facts settled from its tree ATree (the main module's prologue parsed) and
+    // its output folder ARoot (see DoOutputRootOf)
+    method Settle(const ATree: ref SyntaxTree; const ARoot: string);
+    begin
+      self.FReady := true;
+      self.FBackend := BackendFor(ATree.Triple);
+      if self.FBackend = nil then
+        return;
+      end;
+      self.FDir := DoAcuDirOf(ATree, ARoot);
+      self.FCompilerId := DoCompilerId();
+      self.FTriple := ATree.Triple;
+      self.FMode := AcuModeOf(ATree.DebugBuild);
+      self.FDefines := DoDefinesOf(ATree);
+      self.FProjectKey := DoProjectKeyOf(ATree);
+    end;
+
+    // The index in FUnits of AName (-1: not decided yet)
+    hidden const method DoIndexOf(const AName: string): int64;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FUnits) - 1 do
+        if self.FUnits[LI].UnitName = AName then
+          return LI;
+        end;
+      end;
+      return -1;
+    end;
+
+    // The path of AName's .acu ("" when the folder is none)
+    const method FileOf(const AName: string): string;
+    begin
+      if self.FDir = "" then
+        return "";
+      end;
+      return ResolvePath(AcuFileName(AName), self.FDir);
+    end;
+
+    // AName's .acu as it is on the disk into ABytes and its payload's header into AHeader;
+    // false when there is none of this format version
+    hidden const method DoReadUnit(const AName: string; var ABytes: ByteArray;
+      var AHeader: AcuHeader): bool;
+    var
+      LFile: string;
+      LPayload: ByteArray;
+    begin
+      LFile := self.FileOf(AName);
+      if (LFile = "") or not FileExists(LFile) or not ReadAllBytes(LFile, ABytes) then
+        return false;
+      end;
+      if not self.FBackend.Format.ReadSection(ABytes,
+        self.FBackend.Format.SectionNameOf(SectionKind.Info), LPayload) then
+        return false;
+      end;
+      return ReadAcuHeader(LPayload, AHeader);
+    end;
+
+    // AName's payload as its .acu holds it now (empty when there is none)
+    method PayloadOf(const AName: string): ByteArray;
+    var
+      LBytes: ByteArray;
+      LPayload: ByteArray;
+      LFile: string;
+    begin
+      setlength(LPayload, 0);
+      LFile := self.FileOf(AName);
+      if (LFile <> "") and ReadAllBytes(LFile, LBytes) then
+        if not self.FBackend.Format.ReadSection(LBytes,
+          self.FBackend.Format.SectionNameOf(SectionKind.Info), LPayload) then
+          setlength(LPayload, 0);
+        end;
+      end;
+      return LPayload;
+    end;
+
+    // The header AName was decided current with (its imports, its interface hash)
+    const method HeaderOf(const AName: string): AcuHeader;
+    begin
+      return self.FUnits[self.DoIndexOf(AName)].Header;
+    end;
+
+    // The interface hash AName has now into AHash: a current unit's from its decided header,
+    // a unit still being decided (a cycle of imports) from its .acu as written; false for a
+    // stale unit or one not decided (no hash an importer could match)
+    hidden const method DoHashNow(const AName: string; var AHash: uint64): bool;
+    var
+      LIndex: int64;
+      LBytes: ByteArray;
+      LHeader: AcuHeader;
+    begin
+      LIndex := self.DoIndexOf(AName);
+      if LIndex < 0 then
+        return false;
+      end;
+      if self.FUnits[LIndex].State = AcuState.Current then
+        AHash := self.FUnits[LIndex].Header.InterfaceHash;
+        return true;
+      end;
+      if (self.FUnits[LIndex].State = AcuState.Deciding) and
+        self.DoReadUnit(AName, LBytes, LHeader) then
+        AHash := LHeader.InterfaceHash;
+        return true;
+      end;
+      return false;
+    end;
+
+    // True when AHeader was written by a build like this one: this compiler, the unit's name,
+    // the build's triple, mode, predefined symbols and pack key. Only then can its importers'
+    // .acu be current too, so only then is a stale unit worth compiling alone (a new compiler
+    // or another mode recompiles every unit: each tree parses its own, with no unit compile)
+    hidden const method DoSameBuild(const AHeader: AcuHeader; const AName: string): bool;
+    begin
+      return (AHeader.UnitName = AName) and (AHeader.CompilerId = self.FCompilerId) and
+        (AHeader.Triple = self.FTriple) and (AHeader.Mode = self.FMode) and
+        (AHeader.Defines = self.FDefines) and (AHeader.ProjectKey = self.FProjectKey);
+    end;
+
+    // True when AHeader is current for the unit AName at AIndex, its source the file APath,
+    // but for its imports (see the type's comment): when only the source's write time moved
+    // and its text is the one compiled, the unit's decision is marked for a refresh
+    hidden method DoSelfCurrent(const AIndex: int64; const AHeader: AcuHeader;
+      const AName: string; const APath: string): bool;
+    var
+      LSize: int64;
+      LTime: int64;
+      LText: string;
+    begin
+      if not self.DoSameBuild(AHeader, AName) or (AHeader.SourcePath <> APath) then
+        return false;
+      end;
+      // The stamp before the read, as SourceFiles' Load takes it
+      LSize := FileSize(APath);
+      LTime := FileWriteTime(APath);
+      if LSize <> AHeader.SourceSize then
+        return false;
+      end;
+      if LTime = AHeader.SourceTime then
+        return true;
+      end;
+      if not ReadAllText(APath, LText) or (Fnv1a64(LText) <> AHeader.SourceHash) then
+        return false;
+      end;
+      self.FUnits[AIndex].Refresh := true;
+      self.FUnits[AIndex].RefreshSize := LSize;
+      self.FUnits[AIndex].RefreshTime := LTime;
+      return true;
+    end;
+
+    // True when the unit AName at AIndex, its source the file APath, has a current .acu
+    // (its header then the decision's): its imports decided first. ABlocked: compiling this
+    // unit alone cannot help: it has no .acu of a build like this one (DoSameBuild: none,
+    // another format, compiler or mode), an import cannot be current (its source missing,
+    // its compile failed), or an import's interface moved. Not blocked and not current: its
+    // own source moved, so it alone is compiled and its importers may stay current
+    hidden method DoCheck(const AIndex: int64; const AName: string; const APath: string;
+      var ABlocked: bool): bool;
+    var
+      LBytes: ByteArray;
+      LHeader: AcuHeader;
+      LDir: string;
+      LPath: string;
+      LHash: uint64;
+      LI: int64;
+    begin
+      ABlocked := true;
+      if not self.DoReadUnit(AName, LBytes, LHeader) or not self.DoSameBuild(LHeader, AName) then
+        return false;
+      end;
+      ABlocked := false;
+      LDir := ExtractFileDir(APath);
+      for LI := 0 to len(LHeader.Imports) - 1 do
+        LPath := self.FSources.FindUnit(LHeader.Imports[LI], LDir);
+        if LPath = "" then
+          ABlocked := true;
+        else
+          if not self.Decide(LHeader.Imports[LI], LPath) and
+            (self.FUnits[self.DoIndexOf(LHeader.Imports[LI])].State = AcuState.Stale) then
+            ABlocked := true;
+          end;
+        end;
+      end;
+      if ABlocked then
+        return false;
+      end;
+      // A unit compile in a cycle of imports may have written this unit's .acu meanwhile:
+      // the unit is judged by its .acu as it is now
+      if not self.DoReadUnit(AName, LBytes, LHeader) or
+        not self.DoSelfCurrent(AIndex, LHeader, AName, APath) then
+        return false;
+      end;
+      // An import whose interface moved makes the unit stale with every importer above it:
+      // compiling it alone would not keep them, so the tree that needs it parses its source
+      // (one tree for the whole chain, far cheaper than a unit compile per importer)
+      for LI := 0 to len(LHeader.Imports) - 1 do
+        if not self.DoHashNow(LHeader.Imports[LI], LHash) or
+          (LHash <> LHeader.ImportHashes[LI]) then
+          ABlocked := true;
+          return false;
+        end;
+      end;
+      self.FUnits[AIndex].Header := LHeader;
+      return true;
+    end;
+
+    // True when the unit AName, its source the file APath, is to come from its .acu (see the
+    // type's comment); decided once, a unit being decided (a cycle of imports) is no
+    method Decide(const AName: string; const APath: string): bool;
+    var
+      LIndex: int64;
+      LOk: bool;
+      LBlocked: bool;
+    begin
+      LIndex := self.DoIndexOf(AName);
+      if LIndex >= 0 then
+        return self.FUnits[LIndex].State = AcuState.Current;
+      end;
+      if not self.FReady or (self.FDir = "") then
+        return false;
+      end;
+      LIndex := len(self.FUnits);
+      setlength(self.FUnits, LIndex + 1);
+      self.FUnits[LIndex].UnitName := AName;
+      self.FUnits[LIndex].State := AcuState.Deciding;
+      self.FUnits[LIndex].Refresh := false;
+      self.FUnits[LIndex].RefreshSize := 0;
+      self.FUnits[LIndex].RefreshTime := 0;
+      LOk := self.DoCheck(LIndex, AName, APath, LBlocked);
+      if not LOk and not LBlocked and (self.FCompiler <> nil) then
+        if self.FCompiler.CompileUnit(AName, APath) then
+          LOk := self.DoCheck(LIndex, AName, APath, LBlocked);
+        end;
+      end;
+      if LOk then
+        self.FUnits[LIndex].State := AcuState.Current;
+      else
+        self.FUnits[LIndex].State := AcuState.Stale;
+      end;
+      return LOk;
+    end;
+
+    // The interface hash of the current unit AName (its decided header's)
+    const method InterfaceHashOf(const AName: string): uint64;
+    begin
+      return self.FUnits[self.DoIndexOf(AName)].Header.InterfaceHash;
+    end;
+
+    // True, once, when the current unit AName's .acu is to be written again with the size
+    // and write time its source has now (ASize, ATime; see AcuDecision); its header into
+    // AHeader
+    method TakeRefresh(const AName: string; var AHeader: AcuHeader; var ASize: int64;
+      var ATime: int64): bool;
+    var
+      LIndex: int64;
+    begin
+      LIndex := self.DoIndexOf(AName);
+      if (LIndex < 0) or not self.FUnits[LIndex].Refresh then
+        return false;
+      end;
+      self.FUnits[LIndex].Refresh := false;
+      AHeader := self.FUnits[LIndex].Header;
+      ASize := self.FUnits[LIndex].RefreshSize;
+      ATime := self.FUnits[LIndex].RefreshTime;
+      return true;
+    end;
+  end;
+
+  // The build's compiled units seen by one tree's parse, the parser's UnitLoader: a unit
+  // the build's AcuPlan decides current is taken from its .acu in place of its source. Its
+  // payload is read by Adam.Acu.Reader's group reader once the parser has loaded its imports
+  // (or is loading them in the same group); a name its import no longer declares is the
+  // reader's AU0002 at the import that needs the unit
   AcuLoader = object(UnitLoader)
     hidden FTree: ref SyntaxTree;
     hidden FReports: ref Diagnostics;
     hidden FOutputDir: string;
     hidden FProjectOutput: string;
-    hidden FReady: bool;
-    hidden FDir: string;
-    hidden FBackend: ref Backend;
-    hidden FCompilerId: uint64;
+    hidden FPlan: ref AcuPlan;
     hidden FFound: AcuFoundArray;
     hidden FGroup: ref AcuGroupReader;
 
-    // AOutputDir: the command line's output folder ("" none, see DoOutputRootOf)
-    init(const ATree: ref SyntaxTree; const AReports: ref Diagnostics; const AOutputDir: string);
+    // AOutputDir: the command line's output folder ("" none, see DoOutputRootOf); APlan the
+    // build's (settled by the first loader that needs it: the build's own)
+    init(const ATree: ref SyntaxTree; const AReports: ref Diagnostics; const AOutputDir: string;
+      const APlan: ref AcuPlan);
     begin
       self.FTree := ATree;
       self.FReports := AReports;
       self.FOutputDir := AOutputDir;
       self.FProjectOutput := "";
-      self.FReady := false;
-      self.FDir := "";
-      self.FBackend := nil;
-      self.FCompilerId := 0;
+      self.FPlan := APlan;
       setlength(self.FFound, 0);
       self.FGroup := ref AcuGroupReader(ATree, AReports);
     end;
+
+    // The build's plan
+    property Plan: ref AcuPlan read FPlan;
 
     // A project build's output folder (the Compiler's DoFindProject, before the parse)
     method SetProjectOutput(const AProjectOutput: string);
@@ -303,40 +690,22 @@ public type
       self.FProjectOutput := AProjectOutput;
     end;
 
-    // The folder and the format settled on the first unit asked for: the main module (the
-    // program's first module) has its prologue parsed and the build's triple by then. False
-    // when there is none (no backend for the triple, a folder that cannot be resolved)
+    // The plan settled on the first unit asked for: the main module (the program's first
+    // module) has its prologue parsed and the build's triple by then. False when there is
+    // no folder (no backend for the triple, a folder that cannot be resolved)
     hidden method DoReady(): bool;
     begin
-      if not self.FReady then
-        self.FReady := true;
-        self.FBackend := BackendFor(self.FTree.Triple);
-        if self.FBackend <> nil then
-          self.FDir := DoAcuDirOf(self.FTree, DoOutputRootOf(self.FTree,
-            self.FTree.NthOf(ADAM_AST_PROGRAM, NodeRole.Module, 0), self.FOutputDir,
-            self.FProjectOutput));
-          self.FCompilerId := DoCompilerId();
-        end;
+      if not self.FPlan.Ready then
+        self.FPlan.Settle(self.FTree, DoOutputRootOf(self.FTree,
+          self.FTree.NthOf(ADAM_AST_PROGRAM, NodeRole.Module, 0), self.FOutputDir,
+          self.FProjectOutput));
       end;
-      return self.FDir <> "";
-    end;
-
-    // True when AHeader, the header of AName's .acu, is current for its source APath (see
-    // the type's comment)
-    hidden method DoCurrent(const AHeader: AcuHeader; const AName: string;
-      const APath: string): bool;
-    begin
-      return (AHeader.UnitName = AName) and (AHeader.CompilerId = self.FCompilerId) and
-        (AHeader.Triple = self.FTree.Triple) and (AHeader.Mode = AcuModeOf(self.FTree.DebugBuild)) and
-        (AHeader.ProjectKey = DoProjectKeyOf(self.FTree)) and (AHeader.SourcePath = APath) and
-        (AHeader.SourceSize = FileSize(APath)) and (AHeader.SourceTime = FileWriteTime(APath));
+      return self.FPlan.Dir <> "";
     end;
 
     override method HasUnit(const AName: string; const APath: string;
       var AImports: StringArray): bool;
     var
-      LFile: string;
-      LBytes: ByteArray;
       LPayload: ByteArray;
       LHeader: AcuHeader;
       LCount: int64;
@@ -349,21 +718,15 @@ public type
         AImports := self.FFound[LIndex].Imports;
         return true;
       end;
-      if not self.DoReady() then
+      if not self.DoReady() or not self.FPlan.Decide(AName, APath) then
         return false;
       end;
-      LFile := ResolvePath(AcuFileName(AName), self.FDir);
-      // No file, no object of the format, no payload of this version: compiled from source
-      if (LFile = "") or not FileExists(LFile) or not ReadAllBytes(LFile, LBytes) then
+      // The payload the plan judged (no build writes it again: it is current)
+      LPayload := self.FPlan.PayloadOf(AName);
+      if len(LPayload) = 0 then
         return false;
       end;
-      if not self.FBackend.Format.ReadSection(LBytes,
-        self.FBackend.Format.SectionNameOf(SectionKind.Info), LPayload) then
-        return false;
-      end;
-      if not ReadAcuHeader(LPayload, LHeader) or not self.DoCurrent(LHeader, AName, APath) then
-        return false;
-      end;
+      LHeader := self.FPlan.HeaderOf(AName);
       LCount := len(self.FFound);
       setlength(self.FFound, LCount + 1);
       self.FFound[LCount].UnitName := AName;
@@ -411,6 +774,38 @@ public type
   end;
 
 public type
+  // What a unit compile takes from the build it compiles for (Compiler.CompileUnitFor): the
+  // build's sources (module paths, given texts, project root), its tree (triple, mode,
+  // project secret), its reports (a unit compile's warnings and hints join them), its
+  // project and its plan
+  UnitContext = object
+    Sources: ref SourceFiles;
+    Tree: ref SyntaxTree;
+    Reports: ref Diagnostics;
+    ProjectRoot: string;
+    ProjectOutput: string;
+    ProjectKind: ModuleKind;
+    Plan: ref AcuPlan;
+
+    init(const ASources: ref SourceFiles; const ATree: ref SyntaxTree;
+      const AReports: ref Diagnostics; const AProjectRoot: string; const AProjectOutput: string;
+      const AProjectKind: ModuleKind; const APlan: ref AcuPlan);
+    begin
+      self.Sources := ASources;
+      self.Tree := ATree;
+      self.Reports := AReports;
+      self.ProjectRoot := AProjectRoot;
+      self.ProjectOutput := AProjectOutput;
+      self.ProjectKind := AProjectKind;
+      self.Plan := APlan;
+    end;
+  end;
+
+// The UnitCompiler that compiles each stale unit for the build AContext describes, by a new
+// Compiler (declared past the Compiler, which it makes)
+forward routine DoUnitCompilerFor(const AContext: ref UnitContext): ref UnitCompiler;
+
+public type
   // The phases a compile reports as each ends, in their order (see the header)
   BuildPhase = choices(Parse, Analyze, Lower, Generate, Link);
 
@@ -444,8 +839,10 @@ public type
     hidden FProjectKind: ModuleKind;
     // The main module's resolved path (Check)
     hidden FMainPath: string;
-    // The build's compiled units (Build's; nil for a check: every unit is parsed)
+    // The build's compiled units (Build's; nil for a check: every unit is parsed), decided by
+    // the build's plan (a unit compile shares the build's)
     hidden FLoader: ref AcuLoader;
+    hidden FPlan: ref AcuPlan;
 
     // Tells the listener (when there is one) APhase ended, while no error is reported
     hidden method DoPhaseEnded(const APhase: BuildPhase; const AFirst: int64;
@@ -521,6 +918,7 @@ public type
       self.FExePath := "";
       self.FListener := nil;
       self.FLoader := nil;
+      self.FPlan := nil;
       self.FProjectRoot := "";
       self.FProjectOutput := "";
       self.FProjectKind := ModuleKind.Exe;
@@ -649,15 +1047,29 @@ public type
       if FileExists(LPath) and not self.DoFindProject(LPath) then
         return;
       end;
+      self.DoFrontEnd(false);
+    end;
+
+    // The front end on the main module FMainPath, the project settled (Check's, or the build's
+    // for a unit compile): AUnitMain the main module may be a unit (a unit compile)
+    hidden method DoFrontEnd(const AUnitMain: bool);
+    begin
       // $R: in every file of the build: the project's root when the main module is its main
       self.FSources.SetProjectRoot(self.FProjectRoot);
+      // The build's plan compiles each stale unit alone for this build (its project is known
+      // only now); a unit compile shares the build's plan and its compiler
+      if (self.FPlan <> nil) and not AUnitMain then
+        self.FPlan.SetCompiler(DoUnitCompilerFor(ref UnitContext(self.FSources, self.FTree,
+          self.FReports, self.FProjectRoot, self.FProjectOutput, self.FProjectKind,
+          self.FPlan)));
+      end;
       // A build's units come from their .acu when current (the project's output folder is
       // known only now)
       if self.FLoader <> nil then
         self.FLoader.SetProjectOutput(self.FProjectOutput);
       end;
-      self.FMain := ParseProgramWith(self.FTree, self.FReports, self.FSources, LPath,
-        ADAM_DRIVER_RUNTIME_UNIT, self.FOverrideTarget, self.FLoader);
+      self.FMain := ParseProgramWith(self.FTree, self.FReports, self.FSources, self.FMainPath,
+        ADAM_DRIVER_RUNTIME_UNIT, self.FOverrideTarget, self.FLoader, AUnitMain);
       if self.FMain = 0 then
         return;
       end;
@@ -733,62 +1145,150 @@ public type
       return "";
     end;
 
-    // Every module of the checked tree parsed from its source (a unit taken from its .acu is
-    // current there already) written as its .acu (Adam.Acu.Format) into
-    // <ARoot>\acu\<triple>\<mode>\, each through a temporary file put into place in one step;
-    // false after a report (DR0007 the folder, DR0011 a unit)
-    hidden method DoWriteUnits(const ARoot: string; const ABackend: ref Backend): bool;
+    // The interface hash of every module of the checked tree: one parsed from its source made
+    // now (Adam.Acu.Writer's AcuInterfaceHash), one taken from its .acu as the plan decided it
+    hidden method DoUnitHashes(): AcuUnitHashArray;
     var
-      LDir: string;
-      LHeader: AcuHeader;
+      LHashes: AcuUnitHashArray;
       LI: int64;
       LModule: int64;
-      LSource: string;
+      LCount: int64;
+    begin
+      setlength(LHashes, 0);
+      for LI := 0 to self.FTree.ChildCount(ADAM_AST_PROGRAM) - 1 do
+        LModule := self.FTree.ChildAt(ADAM_AST_PROGRAM, LI);
+        if self.FTree.RoleOf(LModule) = NodeRole.Module then
+          LCount := len(LHashes);
+          setlength(LHashes, LCount + 1);
+          LHashes[LCount].UnitName := self.FTree[LModule].Text;
+          if self.FTree[LModule].HasFlag(NodeFlag.Compiled) then
+            LHashes[LCount].Hash := self.FPlan.InterfaceHashOf(self.FTree[LModule].Text);
+          else
+            LHashes[LCount].Hash := AcuInterfaceHash(self.FTree, LModule);
+          end;
+        end;
+      end;
+      return LHashes;
+    end;
+
+    // The module AModule's .acu written into ADir from AHeader (its Imports and their hashes
+    // made from AHashes): one object of the target's format, the payload in its Info section
+    // (the unit's code sections join it at SU2.4), through a temporary file put into place in
+    // one step; false after DR0011
+    hidden method DoWriteUnit(const ADir: string; const ABackend: ref Backend; const AModule: int64;
+      const AHeader: AcuHeader; const AHashes: AcuUnitHashArray): bool;
+    var
       LSet: ref SectionSet;
       LInfo: int64;
       LPath: string;
       LTemp: string;
     begin
-      LDir := DoAcuDirOf(self.FTree, ARoot);
-      if (LDir = "") or not ForceDirectories(LDir) then
-        self.FReports.Add(Severity.Error, ADAM_ERR_DRIVER_007, NoPlace(),
-          ADAM_MSG_DRIVER_OUTPUT_DIR, NoArgs().Str(LDir));
+      LSet := ref SectionSet();
+      LInfo := LSet.AddSection(ABackend.Format.SectionNameOf(SectionKind.Info),
+        SectionKind.Info, ADAM_ACU_SECTION_ALIGN);
+      LSet.SectionAt(LInfo).PutBytes(WriteAcuPayload(self.FTree, AModule, AHeader, AHashes));
+      LPath := ResolvePath(AcuFileName(AHeader.UnitName), ADir);
+      LTemp := LPath + ".tmp";
+      if (LPath = "") or not WriteAllBytes(LTemp, ABackend.Format.WriteObject(LSet)) or
+        not ReplaceFile(LTemp, LPath) then
+        // The temporary file is this build's own: never left behind
+        DeleteFile(LTemp);
+        self.FReports.Add(Severity.Error, ADAM_ERR_DRIVER_011, self.FTree[AModule].Place,
+          ADAM_MSG_DRIVER_WRITE_ACU, NoArgs().Str(LPath));
         return false;
       end;
-      LHeader.FormatVersion := ADAM_ACU_FORMAT_VERSION;
-      LHeader.CompilerVersion := ADAM_VERSION_STR;
-      LHeader.CompilerId := DoCompilerId();
-      LHeader.Triple := self.FTree.Triple;
-      LHeader.Mode := AcuModeOf(self.FTree.DebugBuild);
-      LHeader.ProjectKey := DoProjectKeyOf(self.FTree);
+      return true;
+    end;
+
+    // Every module of the checked tree parsed from its source written as its .acu
+    // (Adam.Acu.Format) into ADir, the build's <output>\acu\<triple>\<mode>\: its source's
+    // size and write time as they were when its text was read, the text's Fnv1a64, its
+    // interface hash; a unit taken from its .acu is current there already, written again
+    // only when the plan found its source touched but unchanged (the new write time kept, so
+    // its text is not hashed again). False after a report (DR0007 the folder, DR0011 a unit)
+    hidden method DoWriteUnits(const ADir: string; const ABackend: ref Backend): bool;
+    var
+      LHeader: AcuHeader;
+      LHashes: AcuUnitHashArray;
+      LI: int64;
+      LModule: int64;
+      LIndex: int64;
+      LSize: int64;
+      LTime: int64;
+    begin
+      if (ADir = "") or not ForceDirectories(ADir) then
+        self.FReports.Add(Severity.Error, ADAM_ERR_DRIVER_007, NoPlace(),
+          ADAM_MSG_DRIVER_OUTPUT_DIR, NoArgs().Str(ADir));
+        return false;
+      end;
+      LHashes := self.DoUnitHashes();
       for LI := 0 to self.FTree.ChildCount(ADAM_AST_PROGRAM) - 1 do
         LModule := self.FTree.ChildAt(ADAM_AST_PROGRAM, LI);
-        if (self.FTree.RoleOf(LModule) = NodeRole.Module) and
-          not self.FTree[LModule].HasFlag(NodeFlag.Compiled) then
-          LSource := self.DoSourceOf(LModule);
-          LHeader.UnitName := self.FTree[LModule].Text;
-          LHeader.SourcePath := self.FTree[LModule].Place.FileName;
-          LHeader.SourceSize := FileSize(LHeader.SourcePath);
-          LHeader.SourceTime := FileWriteTime(LHeader.SourcePath);
-          LHeader.SourceHash := Fnv1a64(LSource);
-          // One object of the target's format: the payload in its Info section (the unit's
-          // code sections join it at SU2.4)
-          LSet := ref SectionSet();
-          LInfo := LSet.AddSection(ABackend.Format.SectionNameOf(SectionKind.Info),
-            SectionKind.Info, ADAM_ACU_SECTION_ALIGN);
-          LSet.SectionAt(LInfo).PutBytes(WriteAcuPayload(self.FTree, LModule, LHeader));
-          LPath := ResolvePath(AcuFileName(LHeader.UnitName), LDir);
-          LTemp := LPath + ".tmp";
-          if (LPath = "") or not WriteAllBytes(LTemp, ABackend.Format.WriteObject(LSet)) or
-            not ReplaceFile(LTemp, LPath) then
-            // The temporary file is this build's own: never left behind
-            DeleteFile(LTemp);
-            self.FReports.Add(Severity.Error, ADAM_ERR_DRIVER_011, self.FTree[LModule].Place,
-              ADAM_MSG_DRIVER_WRITE_ACU, NoArgs().Str(LPath));
-            return false;
+        if self.FTree.RoleOf(LModule) = NodeRole.Module then
+          if self.FTree[LModule].HasFlag(NodeFlag.Compiled) then
+            if self.FPlan.TakeRefresh(self.FTree[LModule].Text, LHeader, LSize, LTime) then
+              LHeader.SourceSize := LSize;
+              LHeader.SourceTime := LTime;
+              if not self.DoWriteUnit(ADir, ABackend, LModule, LHeader, LHashes) then
+                return false;
+              end;
+            end;
+          else
+            LHeader.FormatVersion := ADAM_ACU_FORMAT_VERSION;
+            LHeader.CompilerVersion := ADAM_VERSION_STR;
+            LHeader.CompilerId := DoCompilerId();
+            LHeader.Triple := self.FTree.Triple;
+            LHeader.Mode := AcuModeOf(self.FTree.DebugBuild);
+            LHeader.Defines := DoDefinesOf(self.FTree);
+            LHeader.ProjectKey := DoProjectKeyOf(self.FTree);
+            LHeader.UnitName := self.FTree[LModule].Text;
+            LHeader.SourcePath := self.FTree[LModule].Place.FileName;
+            LIndex := self.FSources.IndexOf(LHeader.SourcePath);
+            LHeader.SourceSize := 0;
+            LHeader.SourceTime := 0;
+            if LIndex >= 0 then
+              self.FSources.StampOf(LIndex, LHeader.SourceSize, LHeader.SourceTime);
+            end;
+            LHeader.SourceHash := Fnv1a64(self.DoSourceOf(LModule));
+            LHeader.InterfaceHash := DoHashIn(LHashes, LHeader.UnitName);
+            if not self.DoWriteUnit(ADir, ABackend, LModule, LHeader, LHashes) then
+              return false;
+            end;
           end;
         end;
       end;
+      return true;
+    end;
+
+    // The build's own (its AcuPlan's, through DoUnitCompilerFor), on a new Compiler: the unit
+    // at APath compiled into its .acu for the build AContext describes (see UnitCompiler).
+    // It takes the build's module paths, given texts, project, triple, mode and plan (no
+    // project.toml of its own), parses the unit as its main module, and writes the .acu of
+    // every module it parsed. Its reports join the build's when it has no error; an error
+    // leaves the build's untouched (the build parses the unit itself and reports it there)
+    method CompileUnitFor(const AContext: ref UnitContext; const APath: string): bool;
+    begin
+      self.FChecked := true;
+      self.FMainPath := APath;
+      self.FSources.InheritFrom(AContext.Sources);
+      self.FOverrideTarget := AContext.Tree.Triple;
+      self.FTree.SetDebugBuild(AContext.Tree.DebugBuild);
+      if AContext.Tree.InProject then
+        self.FTree.SetProjectSecret(AContext.Tree.ProjectSecret, AContext.Tree.ProjectKey);
+      end;
+      self.FProjectRoot := AContext.ProjectRoot;
+      self.FProjectOutput := AContext.ProjectOutput;
+      self.FProjectKind := AContext.ProjectKind;
+      self.FPlan := AContext.Plan;
+      self.FLoader := ref AcuLoader(self.FTree, self.FReports, "", self.FPlan);
+      self.DoFrontEnd(true);
+      if (self.FMain = 0) or self.FReports.HasErrors() then
+        return false;
+      end;
+      if not self.DoWriteUnits(self.FPlan.Dir, self.FPlan.Format) then
+        return false;
+      end;
+      AContext.Reports.AddFrom(self.FReports);
       return true;
     end;
 
@@ -807,11 +1307,18 @@ public type
       LDir: string;
       LExe: string;
     begin
-      // A build takes each current unit from its .acu (SU2.2); a check parses every source
+      // A build takes each current unit from its .acu (SU2.2), compiling a stale one alone
+      // into its .acu first when that keeps its importers current (SU2.3); a check parses
+      // every source
       if not self.FChecked then
-        self.FLoader := ref AcuLoader(self.FTree, self.FReports, AOutputDir);
+        self.FPlan := ref AcuPlan(self.FSources);
+        self.FLoader := ref AcuLoader(self.FTree, self.FReports, AOutputDir, self.FPlan);
       end;
       self.Check(AMainPath);
+      // Every unit is decided once the parse ends: the plan's way back to this compile ends
+      if self.FPlan <> nil then
+        self.FPlan.Detach();
+      end;
       if (self.FMain = 0) or self.FReports.HasErrors() then
         return;
       end;
@@ -834,7 +1341,7 @@ public type
       if LBackend = nil then
         return;
       end;
-      if not self.DoWriteUnits(LRoot, LBackend) then
+      if not self.DoWriteUnits(DoAcuDirOf(self.FTree, LRoot), LBackend) then
         return;
       end;
       LModule := LowerProgram(self.FTree, self.FTarget, self.FReports);
@@ -888,5 +1395,31 @@ public type
       return ADAM_DRIVER_EXIT_OK;
     end;
   end;
+
+type
+  // The build's UnitCompiler (DoUnitCompilerFor): each unit compiled by a new Compiler for
+  // the build its context describes
+  BuildUnits = object(UnitCompiler)
+    hidden FContext: ref UnitContext;
+
+    init(const AContext: ref UnitContext);
+    begin
+      self.FContext := AContext;
+    end;
+
+    override method CompileUnit(const AName: string; const APath: string): bool;
+    var
+      LUnit: ref Compiler;
+    begin
+      LUnit := ref Compiler();
+      return LUnit.CompileUnitFor(self.FContext, APath);
+    end;
+  end;
+
+// See its forward declaration above
+routine DoUnitCompilerFor(const AContext: ref UnitContext): ref UnitCompiler;
+begin
+  return ref BuildUnits(AContext);
+end;
 
 end.
