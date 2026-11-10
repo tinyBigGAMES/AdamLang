@@ -226,6 +226,11 @@ public const
   ADAM_LOWERING_THREAD_RELEASE_SYMBOL: string = "__adam_threadrelease";
   // The prefix of a string literal's constant block's data symbol (its data id follows)
   ADAM_LOWERING_STRING_SYMBOL: string = "__adam_string";
+  // The exe's allocation site table (M3.12b, DoSiteTable): its read-only data symbol, its
+  // first 8 bytes and its layout's version (the table's header, see DoSiteTable)
+  ADAM_LOWERING_SITES_SYMBOL: string = "__adam_allocsites";
+  ADAM_LOWERING_SITES_MAGIC: string = "AdamSite";
+  ADAM_LOWERING_SITES_VERSION: int64 = 1;
   // A string literal's constant block (System.Runtime's string layout): the ref count of a
   // block never counted or freed, then the length, both int64, the bytes after them
   ADAM_LOWERING_STRING_CONSTANT_COUNT: int64 = -1;
@@ -555,6 +560,22 @@ public type
     // By a temporary's node id (FTempOf): the canonical type its slot is released at when
     // its full expression ends (DoEndTemporary; 0: a text)
     hidden FTempTypeOf: array of int64;
+    // The allocation sites (M3.12b), by site number - 1 in the order Lowering met them: the
+    // allocating construct's node and what it allocates ("string", "dynarray of int32" ...);
+    // renumbered in source order at the end (DoNumberSites)
+    hidden FSiteNodes: array of int64;
+    hidden FSiteWhats: array of string;
+    // By node id: the last site number made at that node (0: none), so the same construct
+    // lowered again (a finally's copy, a pass of its own) keeps its one site (DoSiteOf)
+    hidden FSiteOfNode: array of int64;
+    // Every site id stored into GAllocSite (DoStoreSite): its Constant instruction and the
+    // site number it holds before the renumbering (DoNumberSites patches its Imm)
+    hidden FSiteStores: array of int64;
+    hidden FSiteStoreOf: array of int64;
+    // The site number of the construct being lowered around the current one (0: none): a
+    // runtime call inside it (an argument's concatenation in a FormatStr) clears
+    // GAllocSite back to it, not to 0, so the outer construct's later writes keep its site
+    hidden FSiteOuter: int64;
     // By a print / println / FormatStr call's node id: one more than the index in
     // FRangeSlots of its first range scratch string (DoRangeTemporaries; 0: none), then one
     // per range level of its placeholders that is written into a scratch (a width or `?s`:
@@ -623,12 +644,14 @@ public type
       self.FEntryModule := 0;
       self.FEntry := 0;
       self.FEntryEnd := 0;
+      self.FSiteOuter := 0;
       self.FManaged := ref Int64List();
       self.FManagedType := ref Int64List();
       self.FManagedLive := ref Int64List();
       self.FExitBlocks := ref Int64List();
       self.DoStartRegions();
       setlength(self.FTempOf, ATree.Count);
+      setlength(self.FSiteOfNode, ATree.Count);
       setlength(self.FTempTypeOf, ATree.Count);
       setlength(self.FLiveOf, ATree.Count);
       setlength(self.FRangeScratchOf, ATree.Count);
@@ -1489,6 +1512,7 @@ public type
     // (DoCheckLength, M3.11a); 0 after LW0001
     hidden method DoDynamicElement(const AId: int64; const AWrite: bool): int64;
     var
+      LArgs: ref Int64List;
       LOperand: int64;
       LType: int64;
       LSlot: int64;
@@ -1507,7 +1531,11 @@ public type
         if LMap = 0 then
           return 0;
         end;
-        LBase := self.DoCallRuntime(RuntimeRoutine.ArrUnique, LSlot, LMap, AId);
+        LArgs := ref Int64List();
+        LArgs.Add(LSlot);
+        LArgs.Add(LMap);
+        LBase := self.DoCallRuntimeSite(RuntimeRoutine.ArrUnique, LArgs, AId,
+          self.DoArrayWhat(LType));
       else
         LBase := self.DoValue(LOperand);
       end;
@@ -2746,7 +2774,8 @@ public type
         LArgs.Add(LSlot);
         LArgs.Add(self.DoConstant(IrType.Int64, LCount, AId));
         LArgs.Add(LMap);
-        if self.DoCallRuntimeArgs(RuntimeRoutine.ArrSetLength, LArgs, AId) = 0 then
+        if self.DoCallRuntimeSite(RuntimeRoutine.ArrSetLength, LArgs, AId,
+          self.DoArrayWhat(LType)) = 0 then
           return 0;
         end;
         LBlock := self.DoLoad(LSlot, IrType.Pointer, AId);
@@ -4379,15 +4408,16 @@ public type
       LSlot: int64;
     begin
       if not self.DoPrintMayRaise(ACall) then
-        return self.DoPrintPieces(ACall, AIntrinsic, self.DoConstant(IrType.Pointer, 0, ACall),
-          ANewLine);
+        // straight to stdout: only its range scratch strings (if any) allocate
+        return self.DoSitedPieces(ACall, AIntrinsic, self.DoConstant(IrType.Pointer, 0, ACall),
+          ANewLine, self.FRangeScratchOf[ACall] <> 0);
       end;
       LSlot := self.DoTempSlot(ACall);
       if self.DoCallRuntime(RuntimeRoutine.StrTake, LSlot, self.DoConstant(IrType.Pointer, 0, ACall),
         ACall) = 0 then
         return 0;
       end;
-      if self.DoPrintPieces(ACall, AIntrinsic, LSlot, ANewLine) = 0 then
+      if self.DoSitedPieces(ACall, AIntrinsic, LSlot, ANewLine, true) = 0 then
         return 0;
       end;
       if self.DoCallRuntime(RuntimeRoutine.StrWrite, self.DoConstant(IrType.Pointer, 0, ACall),
@@ -4443,10 +4473,38 @@ public type
         return 0;
       end;
       LIntrinsic := self.FTree[self.FTree.FirstOf(ACall, NodeRole.Callee)].ResolvedDecl;
-      if self.DoPrintPieces(ACall, LIntrinsic, LSlot, false) = 0 then
+      if self.DoSitedPieces(ACall, LIntrinsic, LSlot, false, true) = 0 then
         return 0;
       end;
       return self.DoLoad(LSlot, IrType.Pointer, ACall);
+    end;
+
+    // DoPrintPieces of the print / println / FormatStr call ACall into the sink ASink, its
+    // text's blocks sited when ASited (M3.12b): the call's site ("string": the sink string
+    // and the range scratch strings growing as the pieces are written) stored before the
+    // pieces and made the enclosing one while they lower (an argument's own runtime call
+    // gives GAllocSite back to it), the enclosing construct's stored after them
+    hidden method DoSitedPieces(const ACall: int64; const AIntrinsic: int64; const ASink: int64;
+      const ANewLine: bool; const ASited: bool): int64;
+    var
+      LOuter: int64;
+      LSite: int64;
+      LId: int64;
+    begin
+      LSite := 0;
+      if ASited then
+        LSite := self.DoEnterSite(ACall, "string");
+      end;
+      LOuter := self.FSiteOuter;
+      if LSite <> 0 then
+        self.FSiteOuter := LSite;
+      end;
+      LId := self.DoPrintPieces(ACall, AIntrinsic, ASink, ANewLine);
+      self.FSiteOuter := LOuter;
+      if LId <> 0 then
+        self.DoLeaveSite(LSite, ACall);
+      end;
+      return LId;
     end;
 
     // The pieces of the print / println / FormatStr call ACall (of the intrinsic AIntrinsic;
@@ -5671,24 +5729,171 @@ public type
     end;
 
     // A call at ANode of the runtime unit's routine AKind with the operand AFirst, then
-    // ASecond (0: none); the call (its result when the routine has one), 0 after LW0001
+    // ASecond (0: none), its allocation site stored around it when AKind makes a text
+    // (DoKindWhat, DoCallRuntimeSite); the call (its result when the routine has one), 0
+    // after LW0001
     hidden method DoCallRuntime(const AKind: RuntimeRoutine; const AFirst: int64;
       const ASecond: int64; const ANode: int64): int64;
     var
+      LArgs: ref Int64List;
+    begin
+      LArgs := ref Int64List();
+      LArgs.Add(AFirst);
+      if ASecond <> 0 then
+        LArgs.Add(ASecond);
+      end;
+      return self.DoCallRuntimeSite(AKind, LArgs, ANode, self.DoKindWhat(AKind));
+    end;
+
+    // What the runtime routine AKind allocates on its own construct's behalf when the
+    // routine's kind alone tells it (M3.12b): "string" for a string made or grown (and a
+    // format known only at run time: FormatRun's text), "wstring" for a wstring; "" for
+    // every other kind (allocating nothing, or a kind whose caller names what it allocates:
+    // a dynamic array's element type, an object's type, DoCallRuntimeSite)
+    hidden const method DoKindWhat(const AKind: RuntimeRoutine): string;
+    begin
+      if (AKind = RuntimeRoutine.StrConcat) or (AKind = RuntimeRoutine.StrFromChar) or
+        (AKind = RuntimeRoutine.StrSetLength) or (AKind = RuntimeRoutine.StrUnique) or
+        (AKind = RuntimeRoutine.WStrToUtf8) or (AKind = RuntimeRoutine.FormatRun) then
+        return "string";
+      end;
+      if (AKind = RuntimeRoutine.WStrConcat) or (AKind = RuntimeRoutine.WStrFromChar) or
+        (AKind = RuntimeRoutine.WStrSetLength) or (AKind = RuntimeRoutine.WStrUnique) then
+        return "wstring";
+      end;
+      return "";
+    end;
+
+    // What a dynamic array of the canonical type AType allocates (M3.12b): "dynarray of"
+    // and its element type's text
+    hidden const method DoArrayWhat(const AType: int64): string;
+    begin
+      return "dynarray of " + TypeText(self.FTree, TargetOf(self.FTree, AType));
+    end;
+
+    // True when the program's allocation sites are stored (M3.12b): a debug build only
+    // (SyntaxTree.DebugBuild; a release build gets no site store, no site table: every
+    // runtime call compiles as it would without them), whose runtime declares GAllocSite
+    // (Semantics: SyntaxTree.AllocSite) with its blob made (DoThreadStatic)
+    hidden const method DoSitesOn(): bool;
+    var
+      LDecl: int64;
+    begin
+      if not self.FTree.DebugBuild then
+        return false;
+      end;
+      LDecl := self.FTree.AllocSite;
+      return (LDecl <> 0) and (self.FDataOf[LDecl] <> 0);
+    end;
+
+    // The site number of the allocating construct ANode that allocates AWhat (M3.12b): the
+    // one made at ANode before for the same AWhat (the construct lowered again), else a new
+    // one; numbered in the order met until DoNumberSites renumbers them in source order
+    hidden method DoSiteOf(const ANode: int64; const AWhat: string): int64;
+    var
+      LSite: int64;
+      LI: int64;
+    begin
+      LSite := self.FSiteOfNode[ANode];
+      if (LSite <> 0) and (self.FSiteWhats[LSite - 1] = AWhat) then
+        return LSite;
+      end;
+      // a node making two kinds of block (rare) is searched for its other one
+      if LSite <> 0 then
+        for LI := len(self.FSiteNodes) - 1 downto 0 do
+          if (self.FSiteNodes[LI] = ANode) and (self.FSiteWhats[LI] = AWhat) then
+            return LI + 1;
+          end;
+        end;
+      end;
+      LI := len(self.FSiteNodes);
+      setlength(self.FSiteNodes, LI + 1);
+      setlength(self.FSiteWhats, LI + 1);
+      self.FSiteNodes[LI] := ANode;
+      self.FSiteWhats[LI] := AWhat;
+      self.FSiteOfNode[ANode] := LI + 1;
+      return LI + 1;
+    end;
+
+    // GAllocSite set to the site number ASite (0: none) at ANode, in the calling thread's
+    // copy; a site's constant is recorded for DoNumberSites to give it its final id
+    hidden method DoStoreSite(const ASite: int64; const ANode: int64);
+    var
+      LValue: int64;
+      LI: int64;
+    begin
+      LValue := self.DoConstant(IrType.Int32, ASite, ANode);
+      if ASite <> 0 then
+        LI := len(self.FSiteStores);
+        setlength(self.FSiteStores, LI + 1);
+        setlength(self.FSiteStoreOf, LI + 1);
+        self.FSiteStores[LI] := LValue;
+        self.FSiteStoreOf[LI] := ASite;
+      end;
+      self.DoStore(self.DoDataAddress(self.FTree.AllocSite, ANode), LValue, ANode);
+    end;
+
+    // The site of the construct ANode that allocates AWhat stored into GAllocSite (M3.12b);
+    // the site number, 0 when sites are off or AWhat is "" (nothing stored). The caller
+    // emits its runtime call next, then DoLeaveSite
+    hidden method DoEnterSite(const ANode: int64; const AWhat: string): int64;
+    var
+      LSite: int64;
+    begin
+      if (AWhat = "") or not self.DoSitesOn() then
+        return 0;
+      end;
+      LSite := self.DoSiteOf(ANode, AWhat);
+      self.DoStoreSite(LSite, ANode);
+      return LSite;
+    end;
+
+    // GAllocSite given back to the enclosing construct's site (FSiteOuter; 0: none) at
+    // ANode after the call DoEnterSite stored ASite for (nothing when ASite is 0, or the
+    // block already ended)
+    hidden method DoLeaveSite(const ASite: int64; const ANode: int64);
+    begin
+      if (ASite = 0) or self.DoEnded() then
+        return;
+      end;
+      self.DoStoreSite(self.FSiteOuter, ANode);
+    end;
+
+    // A call at ANode of the runtime unit's routine AKind with the operands AArgs in order,
+    // that allocates AWhat on its construct's behalf ("": nothing): the construct's site
+    // stored into GAllocSite before the call, the enclosing one's after it (DoEnterSite,
+    // DoLeaveSite; M3.12b); the call, 0 after LW0001
+    hidden method DoCallRuntimeSite(const AKind: RuntimeRoutine; const AArgs: ref Int64List;
+      const ANode: int64; const AWhat: string): int64;
+    var
       LFunction: int64;
+      LSite: int64;
       LId: int64;
+      LI: int64;
     begin
       LFunction := self.DoRuntimeFunction(AKind, ANode);
       if LFunction = 0 then
         return 0;
       end;
+      LSite := self.DoEnterSite(ANode, AWhat);
       LId := self.DoEmit(IrOp.Call, self.FModule.FunctionAt(LFunction).Signature.ResultType, ANode);
       self.FModule.InstrAt(LId).Link := LFunction;
-      self.FModule.InstrAt(LId).Operands.Add(AFirst);
-      if ASecond <> 0 then
-        self.FModule.InstrAt(LId).Operands.Add(ASecond);
+      for LI := 0 to AArgs.Count - 1 do
+        self.FModule.InstrAt(LId).Operands.Add(AArgs[LI]);
       end;
+      self.DoLeaveSite(LSite, ANode);
       return LId;
+    end;
+
+    // DoCallRuntimeSite with the one operand AFirst
+    hidden method DoCallRuntimeSiteOne(const AKind: RuntimeRoutine; const AFirst: int64;
+      const ANode: int64; const AWhat: string): int64;
+    var
+      LArgs: ref Int64List;
+    begin
+      LArgs := ref Int64List();
+      LArgs.Add(AFirst);
+      return self.DoCallRuntimeSite(AKind, LArgs, ANode, AWhat);
     end;
 
     // The 8 bytes of AValue, little-endian, added to the data blob AData
@@ -6984,7 +7189,8 @@ public type
       end;
       LDescriptor := self.DoEmit(IrOp.Address, IrType.Pointer, AId);
       self.FModule.InstrAt(LDescriptor).Link := LData;
-      LBlock := self.DoCallRuntime(RuntimeRoutine.RefNew, LDescriptor, 0, AId);
+      LBlock := self.DoCallRuntimeSiteOne(RuntimeRoutine.RefNew, LDescriptor, AId,
+        TypeText(self.FTree, LType));
       if LBlock = 0 then
         return 0;
       end;
@@ -7222,7 +7428,7 @@ public type
       end;
       LDescriptor := self.DoEmit(IrOp.Address, IrType.Pointer, AId);
       self.FModule.InstrAt(LDescriptor).Link := LData;
-      LBlock := self.DoCallRuntime(RuntimeRoutine.RefNew, LDescriptor, 0, AId);
+      LBlock := self.DoCallRuntimeSiteOne(RuntimeRoutine.RefNew, LDescriptor, AId, "task");
       if LBlock = 0 then
         return 0;
       end;
@@ -7512,7 +7718,8 @@ public type
       LTarget := TargetOf(self.FTree, self.FTree[LArgument].ResolvedType);
       if ACreate then
         LSize := self.DoConstant(IrType.Int64, TypeSize(self.FTree, self.FTarget, LTarget), ACall);
-        LCall := self.DoCallRuntime(RuntimeRoutine.CreateMem, LSize, 0, ACall);
+        LCall := self.DoCallRuntimeSiteOne(RuntimeRoutine.CreateMem, LSize, ACall,
+          TypeText(self.FTree, LTarget));
         if LCall = 0 then
           return 0;
         end;
@@ -7633,25 +7840,13 @@ public type
       return LSlot;
     end;
 
-    // A call at ANode of the runtime unit's routine AKind with the operands AArgs in order;
-    // the call, 0 after LW0001
+    // A call at ANode of the runtime unit's routine AKind with the operands AArgs in order,
+    // its allocation site stored around it when AKind makes a text (DoKindWhat,
+    // DoCallRuntimeSite); the call, 0 after LW0001
     hidden method DoCallRuntimeArgs(const AKind: RuntimeRoutine; const AArgs: ref Int64List;
       const ANode: int64): int64;
-    var
-      LFunction: int64;
-      LId: int64;
-      LI: int64;
     begin
-      LFunction := self.DoRuntimeFunction(AKind, ANode);
-      if LFunction = 0 then
-        return 0;
-      end;
-      LId := self.DoEmit(IrOp.Call, self.FModule.FunctionAt(LFunction).Signature.ResultType, ANode);
-      self.FModule.InstrAt(LId).Link := LFunction;
-      for LI := 0 to AArgs.Count - 1 do
-        self.FModule.InstrAt(LId).Operands.Add(AArgs[LI]);
-      end;
-      return LId;
+      return self.DoCallRuntimeSite(AKind, AArgs, ANode, self.DoKindWhat(AKind));
     end;
 
     // The managed value AValue of the canonical type AType (DoIsManaged) stored into the
@@ -8054,7 +8249,8 @@ public type
         LArgs.Add(LSlot);
         LArgs.Add(LLength);
         LArgs.Add(LMap);
-        return self.DoCallRuntimeArgs(RuntimeRoutine.ArrSetLength, LArgs, ACall);
+        return self.DoCallRuntimeSite(RuntimeRoutine.ArrSetLength, LArgs, ACall,
+          self.DoArrayWhat(self.FTree[LFirst].ResolvedType));
       end;
       return self.DoCallRuntime(self.DoTextRoutine(RuntimeRoutine.StrSetLength,
         self.FTree[LFirst].ResolvedType), LSlot, LLength, ACall);
@@ -8162,6 +8358,23 @@ public type
       return self.DoIsRuntimeIntrinsic(self.FTree[LDecl].Text) and self.DoIsText(self.FTree[AId].ResolvedType);
     end;
 
+    // What the call ACall of the runtime intrinsic AIntrinsic allocates (M3.12b): getmem's
+    // and resizemem's blocks by their names, a new string (DoIsTextIntrinsicCall) "string";
+    // "" for the others (freemem, paramcount, raise ...)
+    hidden const method DoIntrinsicWhat(const ACall: int64; const AIntrinsic: int64): string;
+    var
+      LName: string;
+    begin
+      LName := self.FTree[AIntrinsic].Text;
+      if (LName = "getmem") or (LName = "resizemem") then
+        return LName;
+      end;
+      if self.DoIsTextIntrinsicCall(ACall) then
+        return "string";
+      end;
+      return "";
+    end;
+
     // The call ACall of the intrinsic AIntrinsic (DoIsRuntimeIntrinsic): its runtime routine
     // (ACall's ResolvedCallee) called with its arguments, which SEM converted to that
     // routine's parameter types (DoEmitCall); a text-typed one's new block taken into the
@@ -8171,6 +8384,8 @@ public type
     var
       LRoutine: int64;
       LFunction: int64;
+      LSite: int64;
+      LOuter: int64;
       LId: int64;
     begin
       LRoutine := self.FTree[ACall].ResolvedCallee;
@@ -8179,12 +8394,21 @@ public type
         return 0;
       end;
       LFunction := self.FFunctionOf[LRoutine];
+      // the arguments lower inside the call (DoEmitCall): a runtime call among them gives
+      // GAllocSite back to this call's site (FSiteOuter), not to the enclosing one
+      LOuter := self.FSiteOuter;
+      LSite := self.DoEnterSite(ACall, self.DoIntrinsicWhat(ACall, AIntrinsic));
+      if LSite <> 0 then
+        self.FSiteOuter := LSite;
+      end;
       if self.FTree[AIntrinsic].Text = "ProjectPassword" then
         LId := self.DoProjectPassword(ACall, LFunction);
       else
         LId := self.DoEmitCall(ACall, LRoutine, IrOp.Call, LFunction,
           self.FModule.FunctionAt(LFunction).Signature.ResultType, 0, 0);
       end;
+      self.FSiteOuter := LOuter;
+      self.DoLeaveSite(LSite, ACall);
       if (LId = 0) or not self.DoIsTextIntrinsicCall(ACall) then
         return LId;
       end;
@@ -13255,6 +13479,166 @@ public type
       end;
     end;
 
+    // The 4 bytes of AValue, little-endian, added to the data blob AData
+    hidden method DoAddLe32(const AData: int64; const AValue: int64);
+    var
+      LBits: uint64;
+      LI: int64;
+    begin
+      LBits := uint64(AValue);
+      for LI := 0 to 3 do
+        self.FModule.DataAt(AData).AddByte(uint8(LBits & 255));
+        LBits := LBits shr 8;
+      end;
+    end;
+
+    // The index among the program's modules (ADAM_AST_PROGRAM's, in their order) of the
+    // module holding the node ANode; the module count when none holds it
+    hidden const method DoModuleRank(const ANode: int64): int64;
+    var
+      LAt: int64;
+      LCount: int64;
+      LI: int64;
+    begin
+      LAt := ANode;
+      while (LAt <> 0) and (self.FTree.ParentOf(LAt) <> ADAM_AST_PROGRAM) do
+        LAt := self.FTree.ParentOf(LAt);
+      end;
+      LCount := self.FTree.CountOf(ADAM_AST_PROGRAM, NodeRole.Module);
+      for LI := 0 to LCount - 1 do
+        if self.FTree.NthOf(ADAM_AST_PROGRAM, NodeRole.Module, LI) = LAt then
+          return LI;
+        end;
+      end;
+      return LCount;
+    end;
+
+    // The sort key of the site at index AIndex (site number - 1) in source order (M3.12b):
+    // its module's rank (the whole-program AST's file order), then its line, its column,
+    // then the order Lowering met it, packed high to low into one int64 (rank 10 bits, line
+    // 20, column 12, index 21; a line or column past its field is held at the field's top)
+    hidden const method DoSiteKey(const AIndex: int64): int64;
+    var
+      LNode: int64;
+      LRank: int64;
+      LLine: int64;
+      LColumn: int64;
+    begin
+      LNode := self.FSiteNodes[AIndex];
+      LRank := self.DoModuleRank(LNode);
+      if (LRank >= 1024) or (AIndex >= 2097152) then
+        raise("Lowering: allocation sites past the site table's key (M3.12b)");
+      end;
+      LLine := int64(self.FTree[LNode].Place.Line);
+      if LLine > 1048575 then
+        LLine := 1048575;
+      end;
+      LColumn := int64(self.FTree[LNode].Place.Column);
+      if LColumn > 4095 then
+        LColumn := 4095;
+      end;
+      return (LRank shl 53) | (LLine shl 33) | (LColumn shl 21) | AIndex;
+    end;
+
+    // The offset of the text AText in the site table's text pool (ATexts / AOffsets: the
+    // texts in it so far and where each starts; AEnd its length so far), added at its end
+    // (NUL-ended) when not there yet
+    hidden method DoPoolText(var ATexts: StringArray; var AOffsets: Int64Array;
+      var AEnd: int64; const AText: string): int64;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(ATexts) - 1 do
+        if ATexts[LI] = AText then
+          return AOffsets[LI];
+        end;
+      end;
+      LI := len(ATexts);
+      setlength(ATexts, LI + 1);
+      setlength(AOffsets, LI + 1);
+      ATexts[LI] := AText;
+      AOffsets[LI] := AEnd;
+      AEnd := AEnd + len(AText) + 1;
+      return AOffsets[LI];
+    end;
+
+    // The allocation sites given their ids in source order (M3.12b): sorted by DoSiteKey,
+    // site id I the I-th, every stored site constant (FSiteStores) patched to its id, then
+    // the exe's site table written (DoSiteTable)
+    hidden method DoNumberSites();
+    var
+      LKeys: Int64Array;
+      LOrder: Int64Array;
+      LIdOf: Int64Array;
+      LI: int64;
+    begin
+      setlength(LKeys, len(self.FSiteNodes));
+      for LI := 0 to len(self.FSiteNodes) - 1 do
+        LKeys[LI] := self.DoSiteKey(LI);
+      end;
+      SortInt64s(LKeys);
+      setlength(LOrder, len(LKeys));
+      setlength(LIdOf, len(LKeys));
+      for LI := 0 to len(LKeys) - 1 do
+        // the key's low 21 bits are the site's index (DoSiteKey)
+        LOrder[LI] := LKeys[LI] & 2097151;
+        LIdOf[LOrder[LI]] := LI + 1;
+      end;
+      for LI := 0 to len(self.FSiteStores) - 1 do
+        self.FModule.InstrAt(self.FSiteStores[LI]).Imm := LIdOf[self.FSiteStoreOf[LI] - 1];
+      end;
+      self.DoSiteTable(LOrder);
+    end;
+
+    // The exe's allocation site table (M3.12b), read-only data named
+    // ADAM_LOWERING_SITES_SYMBOL, little-endian: the 8 bytes ADAM_LOWERING_SITES_MAGIC, the
+    // layout's version (uint32, ADAM_LOWERING_SITES_VERSION) and the site count N (uint32);
+    // then N records of four uint32, record I being site id I + 1 (AOrder: the sites' indexes
+    // in id order): its line, its column, its file's name (alone, no folder: the same exe
+    // wherever it was built) and what it allocates, each of the two a byte offset into the
+    // pool of NUL-ended texts right after the records (each text once)
+    hidden method DoSiteTable(const AOrder: Int64Array);
+    var
+      LData: int64;
+      LTexts: StringArray;
+      LOffsets: Int64Array;
+      LEnd: int64;
+      LFiles: Int64Array;
+      LWhats: Int64Array;
+      LNode: int64;
+      LI: int64;
+      LJ: int64;
+    begin
+      LEnd := 0;
+      setlength(LFiles, len(AOrder));
+      setlength(LWhats, len(AOrder));
+      for LI := 0 to len(AOrder) - 1 do
+        LNode := self.FSiteNodes[AOrder[LI]];
+        LFiles[LI] := self.DoPoolText(LTexts, LOffsets, LEnd,
+          ExtractFileName(self.FTree[LNode].Place.FileName));
+        LWhats[LI] := self.DoPoolText(LTexts, LOffsets, LEnd, self.FSiteWhats[AOrder[LI]]);
+      end;
+      LData := self.FModule.AddData(ADAM_LOWERING_SITES_SYMBOL, 8, ADAM_AST_PROGRAM);
+      for LI := 0 to len(ADAM_LOWERING_SITES_MAGIC) - 1 do
+        self.FModule.DataAt(LData).AddByte(uint8(ADAM_LOWERING_SITES_MAGIC[LI]));
+      end;
+      self.DoAddLe32(LData, ADAM_LOWERING_SITES_VERSION);
+      self.DoAddLe32(LData, len(AOrder));
+      for LI := 0 to len(AOrder) - 1 do
+        LNode := self.FSiteNodes[AOrder[LI]];
+        self.DoAddLe32(LData, int64(self.FTree[LNode].Place.Line));
+        self.DoAddLe32(LData, int64(self.FTree[LNode].Place.Column));
+        self.DoAddLe32(LData, LFiles[LI]);
+        self.DoAddLe32(LData, LWhats[LI]);
+      end;
+      for LI := 0 to len(LTexts) - 1 do
+        for LJ := 0 to len(LTexts[LI]) - 1 do
+          self.FModule.DataAt(LData).AddByte(uint8(LTexts[LI][LJ]));
+        end;
+        self.FModule.DataAt(LData).AddByte(0);
+      end;
+    end;
+
     // Every module's routines given their functions and its @linklibrary names recorded,
     // then the entry function and the sections', then every body lowered, the sections'
     // then the entry's last (with no entry, the initializers and sections that need one
@@ -13287,6 +13671,10 @@ public type
       // the task entries first: an end function one of them asks for is lowered after
       self.DoTaskBodies();
       self.DoEndBodies();
+      // every function lowered: the sites take their ids in source order (M3.12b)
+      if self.DoSitesOn() then
+        self.DoNumberSites();
+      end;
     end;
   end;
 
