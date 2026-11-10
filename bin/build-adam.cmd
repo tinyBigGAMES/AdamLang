@@ -65,13 +65,15 @@ adam.exe build %MAIN% -o "%OUT%\stageA"
 if errorlevel 1 (echo BUILD FAILED - stage A & exit /b 1)
 copy /y "%OUT%\stageA\adam.exe" adam-stageA.exe >nul
 
+:: B and C are the compiler's own build (--adam-self-build: a release one, no leak tracker);
+:: A is built plainly, since the installed adam.exe may predate the switch
 echo [2/5] stage B: A builds adam
-adam-stageA.exe build %MAIN% -o "%OUT%\stageB"
+adam-stageA.exe build %MAIN% -o "%OUT%\stageB" --adam-self-build
 if errorlevel 1 (echo BUILD FAILED - stage B & goto :failed)
 copy /y "%OUT%\stageB\adam.exe" adam-stageB.exe >nul
 
 echo [3/5] stage C: B builds adam
-adam-stageB.exe build %MAIN% -o "%OUT%\stageC"
+adam-stageB.exe build %MAIN% -o "%OUT%\stageC" --adam-self-build
 if errorlevel 1 (echo BUILD FAILED - stage C & goto :failed)
 
 echo [4/5] B and C compared
