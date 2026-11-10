@@ -18,9 +18,12 @@
   ParseProgram  parses the main module and, through the import clauses,
                 every unit it reaches into the one SyntaxTree. Each module
                 is a Module node under the program (the main module first,
-                then the units in the order their parsing starts); an
-                Import holds the dotted name as written and the unit's
-                module id (ResolvedUnit; 0 when it could not be loaded)
+                then the units in the order a parse of every source starts
+                them, whichever came from a compiled form: DoProgramOrder);
+                an Import holds the dotted name as written and the unit's
+                module id (ResolvedUnit; 0 when it could not be loaded). A
+                UnitLoader is asked for a unit's compiled form before its
+                source is parsed
 
   BNF sec 1-2: the module header (kind, dotted name), the directive prologue
   (a Directive node per build directive, Text its spelling; its arguments
@@ -59,9 +62,10 @@
 
 module unit Adam.Compiler.Parser;
 
-import System.SysUtils, System.Windows, Adam.Core.Common, Adam.Core.Messages, Adam.Target,
-  Adam.Target.Registry, Adam.Compiler.SourceText, Adam.Compiler.Diagnostics, Adam.Compiler.SourceFiles,
-  Adam.Compiler.Lexer, Adam.Compiler.Conditionals, Adam.Compiler.Literals, Adam.Compiler.AST;
+import System.SysUtils, System.Windows, Adam.Core.Common, Adam.Core.Containers, Adam.Core.Messages,
+  Adam.Target, Adam.Target.Registry, Adam.Compiler.SourceText, Adam.Compiler.Diagnostics,
+  Adam.Compiler.SourceFiles, Adam.Compiler.Lexer, Adam.Compiler.Conditionals,
+  Adam.Compiler.Literals, Adam.Compiler.AST;
 
 public const
   ADAM_ERR_PARSER_001: string = "PR0001";   // expected X, found Y
@@ -498,12 +502,48 @@ begin
   return ")";
 end;
 
+public type
+  // Where a unit's compiled form comes from, asked before its source is parsed (the
+  // Driver's: the unit's .acu, DESIGN sec 3). This one has none: every unit is parsed
+  UnitLoader = object
+    // True when the unit AName, whose source is the file APath, has a current compiled
+    // form; AImports then the units it needs in the tree first, in its order. Asked as often
+    // as the parser needs, it changes nothing
+    virtual method HasUnit(const AName: string; const APath: string;
+      var AImports: StringArray): bool;
+    begin
+      setlength(AImports, 0);
+      return false;
+    end;
+
+    // The compiled form HasUnit found for AName appended to the tree, its imports there
+    // already or members of the same group (loaded since the last FinishUnits): its Module
+    // node, attached by FinishUnits; 0 after an error told at APlace (the import that needs
+    // it)
+    virtual method LoadUnit(const AName: string; const APlace: SourcePlace): int64;
+    begin
+      return 0;
+    end;
+
+    // Every unit LoadUnit appended since the last call attached and bound as one group;
+    // false after an error told
+    virtual method FinishUnits(): bool;
+    begin
+      return true;
+    end;
+  end;
+
 type
   // What the parse of one program shares across its files: the tree, the diagnostics,
   // the sources, the modules parsed so far by name, and the names being parsed now (the
   // chain of importers, for a cycle); the build's target triple (settled by the main
   // module's conditional filter, then handed to every import), and the command line's
-  // override / default for it ("" = none; the CLI sets them, M1.11)
+  // override / default for it ("" = none; the CLI sets them, M1.11); the unit loader asked
+  // before an imported unit's source is parsed (nil: every unit is parsed), with what
+  // DoCompilable and DoCompiledUnit keep: each unit's answer (Decided: 1 compiled form,
+  // 2 source), the units being decided (Deciding) and those answered yes while an outer
+  // one is still open (Tentative), the units of the group being loaded (Pending) and how
+  // deep its loads nest (GroupDepth)
   ParseState = object
     Ast: ref SyntaxTree;
     Errors: ref Diagnostics;
@@ -514,6 +554,12 @@ type
     Target: string;
     OverrideTarget: string;
     DefaultTarget: string;
+    Loader: ref UnitLoader;
+    Decided: ref StringIdMap;
+    Deciding: StringArray;
+    Tentative: StringArray;
+    Pending: ref StringIdMap;
+    GroupDepth: int64;
 
     init(const ATree: ref SyntaxTree; const AErrors: ref Diagnostics;
       const ASources: ref SourceFiles);
@@ -524,6 +570,12 @@ type
       self.Target := "";
       self.OverrideTarget := "";
       self.DefaultTarget := "";
+      self.Loader := nil;
+      self.Decided := ref StringIdMap();
+      setlength(self.Deciding, 0);
+      setlength(self.Tentative, 0);
+      self.Pending := ref StringIdMap();
+      self.GroupDepth := 0;
     end;
 
     // The module id of AName when it is parsed already; 0 when it is not
@@ -5085,9 +5137,144 @@ begin
   return LId;
 end;
 
+// True when ANames holds AName
+routine DoHasName(const ANames: StringArray; const AName: string): bool;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(ANames) - 1 do
+    if ANames[LI] = AName then
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+// True when the unit AName, its source the file APath, is to come from the loader's
+// compiled form: it has a current one and every unit it imports is from a compiled form
+// too: in the tree from one already, a member of the group being loaded, or (not loaded
+// yet, found from the unit's folder) one that can come from its own. A unit in the tree or
+// in the chain from its source never can: its names are not resolved while the parse runs,
+// and a compiled form binds to its imports' resolved facts. A unit being decided counts as
+// compiled (units that import each other load as one group). A no is kept at once; a yes
+// once the outermost unit being decided is a yes (each yes below it rested on that)
+routine DoCompilable(const AState: ref ParseState; const AName: string;
+  const APath: string): bool;
+var
+  LImports: StringArray;
+  LDir: string;
+  LI: int64;
+  LId: int64;
+  LPath: string;
+  LOk: bool;
+  LOuter: bool;
+begin
+  if AState.Decided.Find(AName) <> 0 then
+    return AState.Decided.Find(AName) = 1;
+  end;
+  if DoHasName(AState.Deciding, AName) then
+    return true;
+  end;
+  if not AState.Loader.HasUnit(AName, APath, LImports) then
+    AState.Decided.Put(AName, 2);
+    return false;
+  end;
+  LOuter := len(AState.Deciding) = 0;
+  setlength(AState.Deciding, len(AState.Deciding) + 1);
+  AState.Deciding[len(AState.Deciding) - 1] := AName;
+  LDir := ExtractFileDir(APath);
+  LOk := true;
+  for LI := 0 to len(LImports) - 1 do
+    if LOk and (AState.Pending.Find(LImports[LI]) = 0) then
+      LId := AState.ParsedId(LImports[LI]);
+      if LId <> 0 then
+        LOk := AState.Ast[LId].HasFlag(NodeFlag.Compiled);
+      else
+        if AState.IsLoading(LImports[LI]) then
+          LOk := false;
+        else
+          LPath := AState.Sources.FindUnit(LImports[LI], LDir);
+          LOk := (LPath <> "") and DoCompilable(AState, LImports[LI], LPath);
+        end;
+      end;
+    end;
+  end;
+  setlength(AState.Deciding, len(AState.Deciding) - 1);
+  if not LOk then
+    AState.Decided.Put(AName, 2);
+  else
+    setlength(AState.Tentative, len(AState.Tentative) + 1);
+    AState.Tentative[len(AState.Tentative) - 1] := AName;
+  end;
+  if LOuter then
+    if LOk then
+      for LI := 0 to len(AState.Tentative) - 1 do
+        AState.Decided.Put(AState.Tentative[LI], 1);
+      end;
+    end;
+    setlength(AState.Tentative, 0);
+  end;
+  return LOk;
+end;
+
+// The unit AName, its source the file APath, from the loader's compiled form, imported at
+// APlace, when DoCompilable says so: its imports loaded first (in the chain of importers),
+// each from the unit's folder as its own import clause would load it, a member of the
+// group being loaded skipped (units that import each other), then the form appended. The
+// loads nested in the outermost one are one group, attached when it ends. Its module; 0
+// when its source is to be parsed; -1 after an error was told
+routine DoCompiledUnit(const AState: ref ParseState; const AName: string; const APath: string;
+  const APlace: SourcePlace): int64;
+var
+  LImports: StringArray;
+  LDir: string;
+  LI: int64;
+  LLoaded: bool;
+  LId: int64;
+begin
+  if (AState.Loader = nil) or not DoCompilable(AState, AName, APath) then
+    return 0;
+  end;
+  if not AState.Loader.HasUnit(AName, APath, LImports) then
+    return 0;
+  end;
+  AState.Pending.Put(AName, 1);
+  AState.GroupDepth := AState.GroupDepth + 1;
+  LDir := ExtractFileDir(APath);
+  LLoaded := true;
+  AState.Push(AName);
+  for LI := 0 to len(LImports) - 1 do
+    if AState.Pending.Find(LImports[LI]) = 0 then
+      if DoParseUnit(AState, LImports[LI], LDir, APlace) = 0 then
+        LLoaded := false;
+      end;
+    end;
+  end;
+  AState.Pop();
+  LId := 0;
+  if LLoaded then
+    LId := AState.Loader.LoadUnit(AName, APlace);
+  end;
+  if LId <> 0 then
+    AState.Register(AName, LId);
+  end;
+  AState.GroupDepth := AState.GroupDepth - 1;
+  if AState.GroupDepth = 0 then
+    if not AState.Loader.FinishUnits() then
+      LId := 0;
+    end;
+    AState.Pending := ref StringIdMap();
+  end;
+  if LId = 0 then
+    return -1;
+  end;
+  return LId;
+end;
+
 // See its forward declaration above: a unit in the chain of importers is a cycle
-// (PR0011), a unit parsed already is that module, else its file is found (PR0012), read
-// (PR0066) and parsed; a module that is no unit is PR0013 at the import
+// (PR0011), a unit parsed already is that module, else its file is found (PR0012), then
+// taken from the loader's compiled form when it has a current one (DoCompiledUnit), else
+// read (PR0066) and parsed; a module that is no unit is PR0013 at the import
 routine DoParseUnit(const AState: ref ParseState; const AName: string;
   const AImporterDir: string; const APlace: SourcePlace): int64;
 var
@@ -5109,15 +5296,21 @@ begin
         ADAM_MSG_PARSER_UNIT_NOT_FOUND, NoArgs().Str(AName).Str(AName + ADAM_SOURCE_EXT));
       return 0;
     end;
-    LIndex := AState.Sources.Load(LPath);
-    if LIndex < 0 then
-      AState.Errors.Add(Severity.Error, ADAM_ERR_PARSER_066, APlace, ADAM_MSG_PARSER_UNREADABLE,
-        NoArgs().Str(LPath));
+    LId := DoCompiledUnit(AState, AName, LPath, APlace);
+    if LId < 0 then
       return 0;
     end;
-    LId := DoParseFile(AState, LIndex, LPath, AName, false);
     if LId = 0 then
-      return 0;
+      LIndex := AState.Sources.Load(LPath);
+      if LIndex < 0 then
+        AState.Errors.Add(Severity.Error, ADAM_ERR_PARSER_066, APlace, ADAM_MSG_PARSER_UNREADABLE,
+          NoArgs().Str(LPath));
+        return 0;
+      end;
+      LId := DoParseFile(AState, LIndex, LPath, AName, false);
+      if LId = 0 then
+        return 0;
+      end;
     end;
   end;
   LKind := AState.Ast[LId].Module;
@@ -5148,34 +5341,106 @@ end;
 // that unit (Text its name, ResolvedUnit its module) as if it had written one, so its
 // names resolve while ARuntime itself names no OS (user 2026-11-06: win64 is one target
 // among many). No target for the main module's triple loads no platform unit (the Driver
-// reports DR0004). ARuntime's module is recorded as ATree.Runtime
-routine DoRuntimeUnits(const AState: ref ParseState; const AMain: int64; const ARuntime: string);
+// reports DR0004). ARuntime's module is recorded as ATree.Runtime. A runtime taken from its
+// compiled form has that Import already. APlatform / ARuntimeId: the two modules (0 when
+// not loaded)
+routine DoRuntimeUnits(const AState: ref ParseState; const AMain: int64; const ARuntime: string;
+  var APlatform: int64; var ARuntimeId: int64);
 var
   LTarget: ref Target;
   LPlace: SourcePlace;
-  LPlatform: int64;
   LName: string;
-  LRuntime: int64;
   LImport: int64;
+  LI: int64;
+  LHas: bool;
 begin
   LPlace := AState.Ast[AMain].Place;
   LTarget := FindTarget(AState.Ast.Triple);
-  LPlatform := 0;
+  APlatform := 0;
   LName := "";
   if LTarget <> nil then
     LName := LTarget.RuntimeUnit();
-    LPlatform := DoImplicitUnit(AState, LName, LPlace);
+    APlatform := DoImplicitUnit(AState, LName, LPlace);
   end;
-  LRuntime := DoImplicitUnit(AState, ARuntime, LPlace);
-  if LRuntime = 0 then
+  ARuntimeId := DoImplicitUnit(AState, ARuntime, LPlace);
+  if ARuntimeId = 0 then
     return;
   end;
-  AState.Ast.SetRuntime(LRuntime);
-  if LPlatform <> 0 then
-    LImport := AState.Ast.AddChild(LRuntime, NodeRole.Import, NodeKind.Import, LPlace, 0, 0);
-    AState.Ast[LImport].Text := LName;
-    AState.Ast[LImport].ResolvedUnit := LPlatform;
+  AState.Ast.SetRuntime(ARuntimeId);
+  if APlatform <> 0 then
+    LHas := false;
+    for LI := 0 to AState.Ast.CountOf(ARuntimeId, NodeRole.Import) - 1 do
+      if AState.Ast[AState.Ast.NthOf(ARuntimeId, NodeRole.Import, LI)].ResolvedUnit = APlatform then
+        LHas := true;
+      end;
+    end;
+    if not LHas then
+      LImport := AState.Ast.AddChild(ARuntimeId, NodeRole.Import, NodeKind.Import, LPlace, 0, 0);
+      AState.Ast[LImport].Text := LName;
+      AState.Ast[LImport].ResolvedUnit := APlatform;
+    end;
   end;
+end;
+
+// AModule and then, depth first, every unit its Imports name, in their order, appended to
+// AOrder when not in it yet: the order a parse of every source starts them in. Only a
+// Module node under the program counts (0, an unloaded import, is none)
+routine DoModuleOrder(const AState: ref ParseState; const AModule: int64;
+  const AOrder: ref NodeList);
+var
+  LI: int64;
+  LUnit: int64;
+begin
+  if (AModule = 0) or (AOrder.IndexOf(AModule) >= 0) or
+    (AState.Ast.ParentOf(AModule) <> ADAM_AST_PROGRAM) or
+    (AState.Ast[AModule].Kind <> NodeKind.Module) then
+    return;
+  end;
+  AOrder.Add(AModule);
+  for LI := 0 to AState.Ast.CountOf(AModule, NodeRole.Import) - 1 do
+    LUnit := AState.Ast[AState.Ast.NthOf(AModule, NodeRole.Import, LI)].ResolvedUnit;
+    DoModuleOrder(AState, LUnit, AOrder);
+  end;
+end;
+
+// The program's modules put in the one order every build has, whichever were parsed and
+// whichever taken from a compiled form (DESIGN sec 3: the same exe either way): the main
+// module AMain and its imports depth first, then the platform unit APlatform and the
+// runtime ARuntime with theirs (the order a parse of every source makes: those two load
+// last). Every other child of the program (a skipped span's Error node) keeps its place
+routine DoProgramOrder(const AState: ref ParseState; const AMain: int64; const APlatform: int64;
+  const ARuntime: int64);
+var
+  LModules: ref NodeList;
+  LOrder: ref NodeList;
+  LI: int64;
+  LChild: int64;
+  LNext: int64;
+begin
+  LModules := ref NodeList();
+  DoModuleOrder(AState, AMain, LModules);
+  DoModuleOrder(AState, APlatform, LModules);
+  DoModuleOrder(AState, ARuntime, LModules);
+  // A module no import reaches (none today) keeps its parse order after those
+  for LI := 0 to AState.Ast.ChildCount(ADAM_AST_PROGRAM) - 1 do
+    LChild := AState.Ast.ChildAt(ADAM_AST_PROGRAM, LI);
+    if AState.Ast[LChild].Kind = NodeKind.Module then
+      DoModuleOrder(AState, LChild, LModules);
+    end;
+  end;
+  // Each module slot of the program takes the next module of that order
+  LOrder := ref NodeList();
+  LNext := 0;
+  for LI := 0 to AState.Ast.ChildCount(ADAM_AST_PROGRAM) - 1 do
+    LChild := AState.Ast.ChildAt(ADAM_AST_PROGRAM, LI);
+    if AState.Ast[LChild].Kind = NodeKind.Module then
+      LOrder.Add(LModules.Items[LNext]);
+      LNext := LNext + 1;
+    else
+      LOrder.Add(LChild);
+    end;
+  end;
+  AState.Ast.ReorderChildren(ADAM_AST_PROGRAM, LOrder);
 end;
 
 // Parses the program whose main module is the file AMainPath into ATree, reporting into
@@ -5184,18 +5449,23 @@ end;
 // ATree.Runtime. Files come from ASources: a given text in place of the disk, imports looked
 // for in the importer's folder, then in ASources' module paths. AOverrideTarget, when not
 // empty, is the triple the build has whatever the main module's @target says (the command
-// line's -t). The main module's id; 0 when its file cannot be read (PR0066, for the whole
-// file) or has no module header
+// line's -t). ALoader (nil for none) is asked for each imported unit's compiled form before
+// its source is parsed (DoCompiledUnit). The modules end in the one order every build has
+// (DoProgramOrder). The main module's id; 0 when its file cannot be read (PR0066, for the
+// whole file) or has no module header
 public routine ParseProgramWith(const ATree: ref SyntaxTree; const ADiagnostics: ref Diagnostics;
   const ASources: ref SourceFiles; const AMainPath: string; const ARuntime: string;
-  const AOverrideTarget: string): int64;
+  const AOverrideTarget: string; const ALoader: ref UnitLoader): int64;
 var
   LState: ref ParseState;
   LIndex: int64;
   LMain: int64;
+  LPlatform: int64;
+  LRuntime: int64;
 begin
   LState := ref ParseState(ATree, ADiagnostics, ASources);
   LState.OverrideTarget := AOverrideTarget;
+  LState.Loader := ALoader;
   LIndex := ASources.Load(AMainPath);
   if LIndex < 0 then
     ADiagnostics.Add(Severity.Error, ADAM_ERR_PARSER_066, PlaceAt(AMainPath, 0, 0),
@@ -5204,17 +5474,23 @@ begin
   end;
   LMain := DoParseFile(LState, LIndex, AMainPath, ChangeFileExt(ExtractFileName(AMainPath), ""),
     true);
-  if (LMain <> 0) and (ARuntime <> "") then
-    DoRuntimeUnits(LState, LMain, ARuntime);
+  if LMain = 0 then
+    return 0;
   end;
+  LPlatform := 0;
+  LRuntime := 0;
+  if ARuntime <> "" then
+    DoRuntimeUnits(LState, LMain, ARuntime, LPlatform, LRuntime);
+  end;
+  DoProgramOrder(LState, LMain, LPlatform, LRuntime);
   return LMain;
 end;
 
-// ParseProgramWith with no runtime unit: the program as its own imports make it
+// ParseProgramWith with no runtime unit and no loader: the program as its own imports make it
 public routine ParseProgram(const ATree: ref SyntaxTree; const ADiagnostics: ref Diagnostics;
   const ASources: ref SourceFiles; const AMainPath: string): int64;
 begin
-  return ParseProgramWith(ATree, ADiagnostics, ASources, AMainPath, "", "");
+  return ParseProgramWith(ATree, ADiagnostics, ASources, AMainPath, "", "", nil);
 end;
 
 // Parses the whole file APath (from ASources) as one expression (AType false) or one type

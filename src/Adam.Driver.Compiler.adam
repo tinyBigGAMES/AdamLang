@@ -49,7 +49,9 @@
   else a project build's output folder, else output under the working
   folder; made when it is not there. Its output is split by kind (SU1):
   <output>\bin the exe (and later a dll / pdb), <output>\lib the static libs,
-  <output>\acu the compiled units (SU2). The exe, in bin, is the main
+  <output>\acu the compiled units (SU2): a build takes each imported unit
+  from its .acu when it is current (AcuLoader) and writes the .acu of every
+  module it parsed (a check parses every source). The exe, in bin, is the main
   module's name with the format's exe ending. Its libraries are
   searched in every module's @addlibrarypath folders, in module and
   directive order, then res/libs/vendor/<triple> and res/libs/system/<triple>
@@ -81,7 +83,7 @@ import System.SysUtils, System.Windows, Adam.Core.Common, Adam.Core.Messages, Ad
   Adam.Compiler.AST, Adam.Compiler.Parser, Adam.Compiler.Semantics, Adam.Compiler.Layout,
   Adam.Compiler.Symbols, Adam.Backend.Ssa, Adam.Backend.Lowering, Adam.Backend.Sections,
   Adam.Backend.Targets, Adam.Backend.Generate, Adam.Acu.Format, Adam.Acu.Writer,
-  Adam.Driver.Project;
+  Adam.Acu.Reader, Adam.Driver.Project;
 
 public const
   ADAM_ERR_DRIVER_001: string = "DR0001";
@@ -106,6 +108,8 @@ public const
 
   // Raised (an invariant broken) by a malformed IR out of Lowering
   ADAM_DRIVER_FAULT_IR: string = "Driver: Lowering made a malformed IR: ";
+  // Raised (an invariant broken) when the parser loads a unit HasUnit did not find
+  ADAM_DRIVER_FAULT_LOAD: string = "Driver: a compiled unit was loaded unfound: ";
 
   // How many errors one compile keeps; the first one past it leaves one DG0001
   ADAM_DRIVER_ERROR_BUDGET: int64 = 100;
@@ -164,6 +168,248 @@ begin
   return LBackend;
 end;
 
+// The resolved path of the first argument of every directive spelled ASpelling in the
+// module AModule of ATree, in their order (a directive whose path did not resolve was
+// reported there and adds nothing), appended to AList
+routine DoDirectivePathsOf(const ATree: ref SyntaxTree; const AModule: int64;
+  const ASpelling: string; var AList: StringArray);
+var
+  LDirective: int64;
+  LArg: int64;
+  LI: int64;
+begin
+  for LI := 0 to ATree.CountOf(AModule, NodeRole.Directive) - 1 do
+    LDirective := ATree.NthOf(AModule, NodeRole.Directive, LI);
+    if (ATree[LDirective].Text = ASpelling) and
+      (ATree.CountOf(LDirective, NodeRole.Argument) > 0) then
+      LArg := ATree.NthOf(LDirective, NodeRole.Argument, 0);
+      if ATree[LArg].ResolvedPath <> "" then
+        setlength(AList, len(AList) + 1);
+        AList[len(AList) - 1] := ATree[LArg].ResolvedPath;
+      end;
+    end;
+  end;
+end;
+
+// The output folder (see the header) of the build whose main module is AMain in ATree:
+// AOutputDir when not empty, resolved against the working folder; else the main module's
+// @outputpath; else AProjectOutput (a project build's output folder); else output under the
+// working folder. "" when it cannot be resolved
+routine DoOutputRootOf(const ATree: ref SyntaxTree; const AMain: int64; const AOutputDir: string;
+  const AProjectOutput: string): string;
+var
+  LList: StringArray;
+begin
+  if AOutputDir <> "" then
+    return ResolvePath(AOutputDir);
+  end;
+  setlength(LList, 0);
+  if AMain <> 0 then
+    DoDirectivePathsOf(ATree, AMain, ADAM_DRIVER_DIRECTIVE_OUTPUT, LList);
+  end;
+  if len(LList) > 0 then
+    return LList[0];
+  end;
+  if AProjectOutput <> "" then
+    return AProjectOutput;
+  end;
+  return ResolvePath(ADAM_DRIVER_OUTPUT_DIR);
+end;
+
+// The folder of the build's compiled units under the output folder ARoot:
+// <ARoot>\acu\<triple>\<mode>\ for ATree's triple and mode; "" when it cannot be resolved
+routine DoAcuDirOf(const ATree: ref SyntaxTree; const ARoot: string): string;
+var
+  LDir: string;
+begin
+  if ARoot = "" then
+    return "";
+  end;
+  LDir := ResolvePath(ADAM_OUTPUT_ACU_DIR, ARoot);
+  LDir := ResolvePath(ATree.Triple, LDir);
+  return ResolvePath(AcuModeOf(ATree.DebugBuild), LDir);
+end;
+
+// The compiler's identity an .acu's header carries: its version and its exe's size and
+// write time, hashed (any other compiler build is another id)
+routine DoCompilerId(): uint64;
+var
+  LExe: string;
+begin
+  LExe := ProgramFilePath();
+  return Fnv1a64(ADAM_VERSION_STR + "|" + IntToStr(FileSize(LExe)) + "|" +
+    IntToStr(FileWriteTime(LExe)));
+end;
+
+// The pack key an .acu's header carries for the build in ATree: its project's, 0 outside one
+routine DoProjectKeyOf(const ATree: ref SyntaxTree): uint64;
+begin
+  if ATree.InProject then
+    return ATree.ProjectKey;
+  end;
+  return 0;
+end;
+
+type
+  // A unit's compiled form waiting to be read: found current by HasUnit, read by LoadUnit
+  AcuFound = record
+    UnitName: string;
+    Imports: StringArray;
+    Payload: ByteArray;
+  end;
+
+  AcuFoundArray = array of AcuFound;
+
+public type
+  // The build's compiled units (SU2.2, DESIGN sec 3), the parser's UnitLoader: a unit's .acu
+  // in the build's <output>\acu\<triple>\<mode>\ folder (DoAcuDirOf, the folder settled
+  // once the main module's prologue is parsed) taken in place of its source when current:
+  // this format version, the unit's name, this compiler (DoCompilerId), the build's triple,
+  // mode and pack key, and its source as found (path, size and write time; the hash and the
+  // imports' interface hashes are SU2.3's). Its payload is read by Adam.Acu.Reader's group
+  // reader once the parser has loaded its imports (or is loading them in the same group);
+  // a name its import no longer declares is the reader's AU0002 at the import that needs
+  // the unit
+  AcuLoader = object(UnitLoader)
+    hidden FTree: ref SyntaxTree;
+    hidden FReports: ref Diagnostics;
+    hidden FOutputDir: string;
+    hidden FProjectOutput: string;
+    hidden FReady: bool;
+    hidden FDir: string;
+    hidden FBackend: ref Backend;
+    hidden FCompilerId: uint64;
+    hidden FFound: AcuFoundArray;
+    hidden FGroup: ref AcuGroupReader;
+
+    // AOutputDir: the command line's output folder ("" none, see DoOutputRootOf)
+    init(const ATree: ref SyntaxTree; const AReports: ref Diagnostics; const AOutputDir: string);
+    begin
+      self.FTree := ATree;
+      self.FReports := AReports;
+      self.FOutputDir := AOutputDir;
+      self.FProjectOutput := "";
+      self.FReady := false;
+      self.FDir := "";
+      self.FBackend := nil;
+      self.FCompilerId := 0;
+      setlength(self.FFound, 0);
+      self.FGroup := ref AcuGroupReader(ATree, AReports);
+    end;
+
+    // A project build's output folder (the Compiler's DoFindProject, before the parse)
+    method SetProjectOutput(const AProjectOutput: string);
+    begin
+      self.FProjectOutput := AProjectOutput;
+    end;
+
+    // The folder and the format settled on the first unit asked for: the main module (the
+    // program's first module) has its prologue parsed and the build's triple by then. False
+    // when there is none (no backend for the triple, a folder that cannot be resolved)
+    hidden method DoReady(): bool;
+    begin
+      if not self.FReady then
+        self.FReady := true;
+        self.FBackend := BackendFor(self.FTree.Triple);
+        if self.FBackend <> nil then
+          self.FDir := DoAcuDirOf(self.FTree, DoOutputRootOf(self.FTree,
+            self.FTree.NthOf(ADAM_AST_PROGRAM, NodeRole.Module, 0), self.FOutputDir,
+            self.FProjectOutput));
+          self.FCompilerId := DoCompilerId();
+        end;
+      end;
+      return self.FDir <> "";
+    end;
+
+    // True when AHeader, the header of AName's .acu, is current for its source APath (see
+    // the type's comment)
+    hidden method DoCurrent(const AHeader: AcuHeader; const AName: string;
+      const APath: string): bool;
+    begin
+      return (AHeader.UnitName = AName) and (AHeader.CompilerId = self.FCompilerId) and
+        (AHeader.Triple = self.FTree.Triple) and (AHeader.Mode = AcuModeOf(self.FTree.DebugBuild)) and
+        (AHeader.ProjectKey = DoProjectKeyOf(self.FTree)) and (AHeader.SourcePath = APath) and
+        (AHeader.SourceSize = FileSize(APath)) and (AHeader.SourceTime = FileWriteTime(APath));
+    end;
+
+    override method HasUnit(const AName: string; const APath: string;
+      var AImports: StringArray): bool;
+    var
+      LFile: string;
+      LBytes: ByteArray;
+      LPayload: ByteArray;
+      LHeader: AcuHeader;
+      LCount: int64;
+      LIndex: int64;
+    begin
+      setlength(AImports, 0);
+      // Asked again (the parser decides a unit, then loads it): the form found the first time
+      LIndex := self.DoFoundIndex(AName);
+      if LIndex >= 0 then
+        AImports := self.FFound[LIndex].Imports;
+        return true;
+      end;
+      if not self.DoReady() then
+        return false;
+      end;
+      LFile := ResolvePath(AcuFileName(AName), self.FDir);
+      // No file, no object of the format, no payload of this version: compiled from source
+      if (LFile = "") or not FileExists(LFile) or not ReadAllBytes(LFile, LBytes) then
+        return false;
+      end;
+      if not self.FBackend.Format.ReadSection(LBytes,
+        self.FBackend.Format.SectionNameOf(SectionKind.Info), LPayload) then
+        return false;
+      end;
+      if not ReadAcuHeader(LPayload, LHeader) or not self.DoCurrent(LHeader, AName, APath) then
+        return false;
+      end;
+      LCount := len(self.FFound);
+      setlength(self.FFound, LCount + 1);
+      self.FFound[LCount].UnitName := AName;
+      self.FFound[LCount].Imports := LHeader.Imports;
+      self.FFound[LCount].Payload := LPayload;
+      AImports := LHeader.Imports;
+      return true;
+    end;
+
+    // The index in FFound of the form HasUnit found for AName (-1: none)
+    hidden const method DoFoundIndex(const AName: string): int64;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FFound) - 1 do
+        if self.FFound[LI].UnitName = AName then
+          return LI;
+        end;
+      end;
+      return -1;
+    end;
+
+    // The form HasUnit found for AName appended to the group being read and taken off the
+    // list. Raises when there is none (the parser asked for a unit HasUnit did not find: a
+    // compiler defect)
+    override method LoadUnit(const AName: string; const APlace: SourcePlace): int64;
+    var
+      LIndex: int64;
+      LPayload: ByteArray;
+    begin
+      LIndex := self.DoFoundIndex(AName);
+      if LIndex < 0 then
+        raise(ADAM_DRIVER_FAULT_LOAD + AName);
+      end;
+      LPayload := self.FFound[LIndex].Payload;
+      self.FFound[LIndex] := self.FFound[len(self.FFound) - 1];
+      setlength(self.FFound, len(self.FFound) - 1);
+      return self.FGroup.Append(LPayload, APlace);
+    end;
+
+    override method FinishUnits(): bool;
+    begin
+      return self.FGroup.Finish();
+    end;
+  end;
+
 public type
   // The phases a compile reports as each ends, in their order (see the header)
   BuildPhase = choices(Parse, Analyze, Lower, Generate, Link);
@@ -198,6 +444,8 @@ public type
     hidden FProjectKind: ModuleKind;
     // The main module's resolved path (Check)
     hidden FMainPath: string;
+    // The build's compiled units (Build's; nil for a check: every unit is parsed)
+    hidden FLoader: ref AcuLoader;
 
     // Tells the listener (when there is one) APhase ended, while no error is reported
     hidden method DoPhaseEnded(const APhase: BuildPhase; const AFirst: int64;
@@ -272,6 +520,7 @@ public type
       self.FOverrideTarget := "";
       self.FExePath := "";
       self.FListener := nil;
+      self.FLoader := nil;
       self.FProjectRoot := "";
       self.FProjectOutput := "";
       self.FProjectKind := ModuleKind.Exe;
@@ -402,8 +651,13 @@ public type
       end;
       // $R: in every file of the build: the project's root when the main module is its main
       self.FSources.SetProjectRoot(self.FProjectRoot);
+      // A build's units come from their .acu when current (the project's output folder is
+      // known only now)
+      if self.FLoader <> nil then
+        self.FLoader.SetProjectOutput(self.FProjectOutput);
+      end;
       self.FMain := ParseProgramWith(self.FTree, self.FReports, self.FSources, LPath,
-        ADAM_DRIVER_RUNTIME_UNIT, self.FOverrideTarget);
+        ADAM_DRIVER_RUNTIME_UNIT, self.FOverrideTarget, self.FLoader);
       if self.FMain = 0 then
         return;
       end;
@@ -424,22 +678,8 @@ public type
     // there and adds nothing), appended to AList
     hidden const method DoDirectivePaths(const AModule: int64; const ASpelling: string;
       var AList: StringArray);
-    var
-      LDirective: int64;
-      LArg: int64;
-      LI: int64;
     begin
-      for LI := 0 to self.FTree.CountOf(AModule, NodeRole.Directive) - 1 do
-        LDirective := self.FTree.NthOf(AModule, NodeRole.Directive, LI);
-        if (self.FTree[LDirective].Text = ASpelling) and
-          (self.FTree.CountOf(LDirective, NodeRole.Argument) > 0) then
-          LArg := self.FTree.NthOf(LDirective, NodeRole.Argument, 0);
-          if self.FTree[LArg].ResolvedPath <> "" then
-            setlength(AList, len(AList) + 1);
-            AList[len(AList) - 1] := self.FTree[LArg].ResolvedPath;
-          end;
-        end;
-      end;
+      DoDirectivePathsOf(self.FTree, AModule, ASpelling, AList);
     end;
 
     // The folder APrefix + the picked target's triple appended to AList; nothing when the
@@ -476,21 +716,8 @@ public type
     // working folder; else the main module's @outputpath; else a project build's output
     // folder; else output under the working folder. "" when it cannot be resolved
     hidden const method DoOutputDir(const AOutputDir: string): string;
-    var
-      LList: StringArray;
     begin
-      if AOutputDir <> "" then
-        return ResolvePath(AOutputDir);
-      end;
-      setlength(LList, 0);
-      self.DoDirectivePaths(self.FMain, ADAM_DRIVER_DIRECTIVE_OUTPUT, LList);
-      if len(LList) > 0 then
-        return LList[0];
-      end;
-      if self.FProjectOutput <> "" then
-        return self.FProjectOutput;
-      end;
-      return ResolvePath(ADAM_DRIVER_OUTPUT_DIR);
+      return DoOutputRootOf(self.FTree, self.FMain, AOutputDir, self.FProjectOutput);
     end;
 
     // The source text the module AModule was parsed from ("" when no loaded file is its)
@@ -506,18 +733,8 @@ public type
       return "";
     end;
 
-    // The compiler's identity an .acu's header carries: its version and its exe's size and
-    // write time, hashed (any other compiler build is another id)
-    hidden const method DoCompilerId(): uint64;
-    var
-      LExe: string;
-    begin
-      LExe := ProgramFilePath();
-      return Fnv1a64(ADAM_VERSION_STR + "|" + IntToStr(FileSize(LExe)) + "|" +
-        IntToStr(FileWriteTime(LExe)));
-    end;
-
-    // Every module of the checked tree written as its .acu (Adam.Acu.Format) into
+    // Every module of the checked tree parsed from its source (a unit taken from its .acu is
+    // current there already) written as its .acu (Adam.Acu.Format) into
     // <ARoot>\acu\<triple>\<mode>\, each through a temporary file put into place in one step;
     // false after a report (DR0007 the folder, DR0011 a unit)
     hidden method DoWriteUnits(const ARoot: string; const ABackend: ref Backend): bool;
@@ -532,9 +749,7 @@ public type
       LPath: string;
       LTemp: string;
     begin
-      LDir := ResolvePath(ADAM_OUTPUT_ACU_DIR, ARoot);
-      LDir := ResolvePath(self.FTree.Triple, LDir);
-      LDir := ResolvePath(AcuModeOf(self.FTree.DebugBuild), LDir);
+      LDir := DoAcuDirOf(self.FTree, ARoot);
       if (LDir = "") or not ForceDirectories(LDir) then
         self.FReports.Add(Severity.Error, ADAM_ERR_DRIVER_007, NoPlace(),
           ADAM_MSG_DRIVER_OUTPUT_DIR, NoArgs().Str(LDir));
@@ -542,16 +757,14 @@ public type
       end;
       LHeader.FormatVersion := ADAM_ACU_FORMAT_VERSION;
       LHeader.CompilerVersion := ADAM_VERSION_STR;
-      LHeader.CompilerId := self.DoCompilerId();
+      LHeader.CompilerId := DoCompilerId();
       LHeader.Triple := self.FTree.Triple;
       LHeader.Mode := AcuModeOf(self.FTree.DebugBuild);
-      LHeader.ProjectKey := 0;
-      if self.FTree.InProject then
-        LHeader.ProjectKey := self.FTree.ProjectKey;
-      end;
+      LHeader.ProjectKey := DoProjectKeyOf(self.FTree);
       for LI := 0 to self.FTree.ChildCount(ADAM_AST_PROGRAM) - 1 do
         LModule := self.FTree.ChildAt(ADAM_AST_PROGRAM, LI);
-        if self.FTree.RoleOf(LModule) = NodeRole.Module then
+        if (self.FTree.RoleOf(LModule) = NodeRole.Module) and
+          not self.FTree[LModule].HasFlag(NodeFlag.Compiled) then
           LSource := self.DoSourceOf(LModule);
           LHeader.UnitName := self.FTree[LModule].Text;
           LHeader.SourcePath := self.FTree[LModule].Place.FileName;
@@ -594,6 +807,10 @@ public type
       LDir: string;
       LExe: string;
     begin
+      // A build takes each current unit from its .acu (SU2.2); a check parses every source
+      if not self.FChecked then
+        self.FLoader := ref AcuLoader(self.FTree, self.FReports, AOutputDir);
+      end;
       self.Check(AMainPath);
       if (self.FMain = 0) or self.FReports.HasErrors() then
         return;
