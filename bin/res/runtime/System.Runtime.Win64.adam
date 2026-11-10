@@ -46,6 +46,7 @@ routine malloc(const ASize: uint64): ptr; external "ucrtbase";
 routine realloc(const APointer: ptr; const ASize: uint64): ptr; external "ucrtbase";
 routine free(const APointer: ptr); external "ucrtbase";
 routine memcpy(const ADest: ptr; const ASource: ptr; const ACount: uint64): ptr; external "ucrtbase";
+routine memset(const ADest: ptr; const AValue: int32; const ACount: uint64): ptr; external "ucrtbase";
 
 // ucrtbase: the process's arguments, split from its command line by
 // _configure_narrow_argv (a C program's startup code calls it: an Adam exe has none, so
@@ -551,6 +552,378 @@ begin
   end;
 end;
 
+@ifdef DEBUG
+// kernel32: up to ACount return addresses of the calling thread into AFrames, the
+// innermost first, ASkip frames from the caller on left out (the unwinder walks the
+// frames' .pdata / .xdata); the count captured. The frame walk's fallback
+routine RtlCaptureStackBackTrace(const ASkip: uint32; const ACount: uint32;
+  const AFrames: ptr; const AHash: ptr): uint16; external "kernel32";
+// kernel32: the calling thread's registers as they are at the call, into a CONTEXT
+routine RtlCaptureContext(const AContext: ptr); external "kernel32";
+// kernel32: the RUNTIME_FUNCTION of the code at APc (nil: none, a leaf frame), the base
+// of the module holding it into AImageBase
+routine RtlLookupFunctionEntry(const APc: uint64; var AImageBase: uint64;
+  const AHistory: ptr): ptr; external "kernel32";
+// kernel32: the calling thread's stack: its lowest address and one past its highest
+routine GetCurrentThreadStackLimits(var ALow: uint64; var AHigh: uint64); external "kernel32";
+
+// The leak tracker's frame walk (M4.L2). RtlCaptureStackBackTrace costs about 35 ns a
+// frame (its function lookup and its unwind codes' interpretation, every time), paid by
+// every allocation of a debug build. The walk here unwinds the same frames by the same
+// rules (x64 UNWIND_INFO), but a frame's unwind facts are worked out once per return
+// address and kept in a per-thread cache (the exe's own code only: it is never unloaded),
+// so a frame seen before is a few loads. A frame it does not unwind itself (chained or
+// indirect unwind info, a return address inside a prologue, a frame register other than
+// rbp, an unknown code) hands the whole capture to RtlCaptureStackBackTrace: the frames
+// are the same either way
+type
+  // A CONTEXT as RtlCaptureContext fills it (x64: 1232 bytes, 16-aligned), read by offset
+  PlatformContext = record align(16)
+    Bytes: array[0..1231] of uint8;
+  end;
+  // What unwinding one frame takes (DoUnwindFacts): its frame base is rbp - FrameOffset
+  // when Framed, else its rsp; its return address is Total bytes above the base; the
+  // caller's rbp was saved RbpSlot bytes above it (-1: not saved, rbp passes through). Pc:
+  // the return address these facts are for (0: an empty cache entry)
+  PlatformFrameFacts = record
+    Pc: uint64;
+    Total: int64;
+    RbpSlot: int64;
+    FrameOffset: int64;
+    Framed: bool;
+  end;
+  // The unwind codes' running effect (DoUnwindCode): Total bytes from the frame base so
+  // far, RbpSlot as in PlatformFrameFacts, SetFrame once UWOP_SET_FPREG was met, Unknown
+  // once a code the walk does not unwind was met
+  PlatformUnwindState = record
+    Total: int64;
+    RbpSlot: int64;
+    SetFrame: bool;
+    Unknown: bool;
+  end;
+
+const
+  // The per-thread cache's entry count (GFrameCache's length; a power of two)
+  ADAM_PLATFORM_FRAME_CACHE: int64 = 1024;
+  // CONTEXT's Rsp, Rbp and Rip (x64 winnt.h)
+  ADAM_PLATFORM_CONTEXT_RSP: uint64 = 152;
+  ADAM_PLATFORM_CONTEXT_RBP: uint64 = 160;
+  ADAM_PLATFORM_CONTEXT_RIP: uint64 = 248;
+  // UNWIND_INFO's chained-info flag and rbp's register number
+  ADAM_PLATFORM_UNW_FLAG_CHAININFO: uint64 = 4;
+  ADAM_PLATFORM_UNWIND_RBP: uint64 = 5;
+  // The unwind codes (UWOP_*); UWOP_EPILOG exists from version 2 on
+  ADAM_PLATFORM_UWOP_PUSH_NONVOL: uint64 = 0;
+  ADAM_PLATFORM_UWOP_ALLOC_LARGE: uint64 = 1;
+  ADAM_PLATFORM_UWOP_ALLOC_SMALL: uint64 = 2;
+  ADAM_PLATFORM_UWOP_SET_FPREG: uint64 = 3;
+  ADAM_PLATFORM_UWOP_SAVE_NONVOL: uint64 = 4;
+  ADAM_PLATFORM_UWOP_SAVE_NONVOL_FAR: uint64 = 5;
+  ADAM_PLATFORM_UWOP_EPILOG: uint64 = 6;
+  ADAM_PLATFORM_UWOP_SAVE_XMM128: uint64 = 8;
+  ADAM_PLATFORM_UWOP_SAVE_XMM128_FAR: uint64 = 9;
+
+threadstatic
+  // This thread's unwind facts by return address (ADAM_PLATFORM_FRAME_CACHE entries)
+  GFrameCache: array[0..1023] of PlatformFrameFacts;
+  // The exe's base and this thread's stack (0 until the thread's first capture)
+  GFrameExe: uint64;
+  GFrameLow: uint64;
+  GFrameHigh: uint64;
+
+// The byte, uint16 and uint32 at AAddress (little-endian, any alignment)
+routine DoByteAt(const AAddress: uint64): uint64;
+var
+  LAt: ptr to const uint8;
+begin
+  LAt := ptr to const uint8(AAddress);
+  return uint64(LAt^);
+end;
+
+routine DoHalfAt(const AAddress: uint64): uint64;
+var
+  LAt: ptr to const uint16;
+begin
+  LAt := ptr to const uint16(AAddress);
+  return uint64(LAt^);
+end;
+
+routine DoLongAt(const AAddress: uint64): uint64;
+var
+  LAt: ptr to const uint32;
+begin
+  LAt := ptr to const uint32(AAddress);
+  return uint64(LAt^);
+end;
+
+// This thread's walk set up: its stack's bounds and the exe's base
+routine DoFrameStart();
+var
+  LLow: uint64;
+  LHigh: uint64;
+begin
+  LLow := 0;
+  LHigh := 0;
+  GetCurrentThreadStackLimits(LLow, LHigh);
+  GFrameLow := LLow;
+  GFrameHigh := LHigh;
+  GFrameExe := GetModuleHandleW(nil);
+end;
+
+// The unwind code at slot AAt of the UNWIND_INFO at AInfo (version AVersion; AFramed: the
+// function sets a frame register) applied to AState; the slots it takes. The codes are
+// listed last prologue step first: those before UWOP_SET_FPREG ran after the frame
+// register was set, so their allocations are undone by it (Total restarts there) and a
+// push among them has no place the walk knows (Unknown)
+routine DoUnwindCode(const AInfo: uint64; const AAt: uint64; const AVersion: uint64;
+  const AFramed: bool; var AState: PlatformUnwindState): uint64;
+var
+  LSlot: uint64;
+  LOp: uint64;
+  LOpInfo: uint64;
+begin
+  LSlot := AInfo + 4 + AAt * 2;
+  LOp := DoByteAt(LSlot + 1) & 15;
+  LOpInfo := DoByteAt(LSlot + 1) shr 4;
+  if LOp = ADAM_PLATFORM_UWOP_PUSH_NONVOL then
+    if AFramed and not AState.SetFrame then
+      AState.Unknown := true;
+    end;
+    if LOpInfo = ADAM_PLATFORM_UNWIND_RBP then
+      AState.RbpSlot := AState.Total;
+    end;
+    AState.Total := AState.Total + 8;
+    return 1;
+  end;
+  if LOp = ADAM_PLATFORM_UWOP_ALLOC_SMALL then
+    AState.Total := AState.Total + int64(LOpInfo * 8 + 8);
+    return 1;
+  end;
+  if LOp = ADAM_PLATFORM_UWOP_ALLOC_LARGE then
+    if LOpInfo = 0 then
+      AState.Total := AState.Total + int64(DoHalfAt(LSlot + 2) * 8);
+      return 2;
+    end;
+    AState.Total := AState.Total + int64(DoLongAt(LSlot + 2));
+    return 3;
+  end;
+  if LOp = ADAM_PLATFORM_UWOP_SET_FPREG then
+    AState.Total := 0;
+    AState.SetFrame := true;
+    return 1;
+  end;
+  if LOp = ADAM_PLATFORM_UWOP_SAVE_NONVOL then
+    if LOpInfo = ADAM_PLATFORM_UNWIND_RBP then
+      AState.RbpSlot := int64(DoHalfAt(LSlot + 2) * 8);
+    end;
+    return 2;
+  end;
+  if LOp = ADAM_PLATFORM_UWOP_SAVE_NONVOL_FAR then
+    if LOpInfo = ADAM_PLATFORM_UNWIND_RBP then
+      AState.RbpSlot := int64(DoLongAt(LSlot + 2));
+    end;
+    return 3;
+  end;
+  if LOp = ADAM_PLATFORM_UWOP_SAVE_XMM128 then
+    return 2;
+  end;
+  if LOp = ADAM_PLATFORM_UWOP_SAVE_XMM128_FAR then
+    return 3;
+  end;
+  if (LOp = ADAM_PLATFORM_UWOP_EPILOG) and (AVersion = 2) then
+    // an epilogue's description: a return address is never in an epilogue
+    return 1;
+  end;
+  AState.Unknown := true;
+  return 1;
+end;
+
+// AFacts of the function whose RUNTIME_FUNCTION is at AFunction (in the module at
+// AImageBase), for the return address APc in it; false when the walk does not unwind it
+routine DoUnwindFacts(const AImageBase: uint64; const AFunction: uint64; const APc: uint64;
+  var AFacts: PlatformFrameFacts): bool;
+var
+  LInfo: uint64;
+  LHeader: uint64;
+  LVersion: uint64;
+  LFrame: uint64;
+  LCount: uint64;
+  LAt: uint64;
+  LState: PlatformUnwindState;
+begin
+  // UnwindData's low bit: the entry points at another RUNTIME_FUNCTION
+  if (DoLongAt(AFunction + 8) & 1) <> 0 then
+    return false;
+  end;
+  LInfo := AImageBase + DoLongAt(AFunction + 8);
+  LHeader := DoByteAt(LInfo);
+  LVersion := LHeader & 7;
+  if ((LVersion <> 1) and (LVersion <> 2)) or
+    (((LHeader shr 3) & ADAM_PLATFORM_UNW_FLAG_CHAININFO) <> 0) then
+    return false;
+  end;
+  // inside its prologue the codes past APc have not run yet
+  if APc - (AImageBase + DoLongAt(AFunction)) < DoByteAt(LInfo + 1) then
+    return false;
+  end;
+  LFrame := DoByteAt(LInfo + 3);
+  AFacts.Framed := (LFrame & 15) <> 0;
+  if AFacts.Framed and ((LFrame & 15) <> ADAM_PLATFORM_UNWIND_RBP) then
+    return false;
+  end;
+  AFacts.FrameOffset := int64(LFrame shr 4) * 16;
+  LState.Total := 0;
+  LState.RbpSlot := -1;
+  LState.SetFrame := false;
+  LState.Unknown := false;
+  LCount := DoByteAt(LInfo + 2);
+  LAt := 0;
+  while LAt < LCount do
+    LAt := LAt + DoUnwindCode(LInfo, LAt, LVersion, AFacts.Framed, LState);
+  end;
+  if LState.Unknown or (AFacts.Framed <> LState.SetFrame) then
+    return false;
+  end;
+  AFacts.Total := LState.Total;
+  AFacts.RbpSlot := LState.RbpSlot;
+  return true;
+end;
+
+// AFacts of the frame whose return address is APc, worked out (a cache miss), and kept in
+// this thread's cache entry AEntry when APc is the exe's; false when the walk does not
+// unwind it
+routine DoFrameFacts(const APc: uint64; const AEntry: ptr to PlatformFrameFacts;
+  var AFacts: PlatformFrameFacts): bool;
+var
+  LFunction: ptr;
+  LBase: uint64;
+begin
+  LBase := 0;
+  LFunction := RtlLookupFunctionEntry(APc, LBase, nil);
+  if LFunction = nil then
+    // a leaf frame: its return address is at its rsp
+    AFacts.Pc := APc;
+    AFacts.Total := 0;
+    AFacts.RbpSlot := -1;
+    AFacts.FrameOffset := 0;
+    AFacts.Framed := false;
+    return true;
+  end;
+  if not DoUnwindFacts(LBase, uint64(LFunction), APc, AFacts) then
+    return false;
+  end;
+  AFacts.Pc := APc;
+  // the exe is never unloaded; a library's code may be, and other code loaded there
+  if LBase = GFrameExe then
+    AEntry^ := AFacts;
+  end;
+  return true;
+end;
+
+// AFrames' entries AFrom .. ATo - 1 set to nil
+routine DoClearFrames(const AFrames: ptr to uint64; const AFrom: int32; const ATo: int32);
+var
+  LI: int32;
+begin
+  LI := AFrom;
+  while LI < ATo do
+    AFrames[LI] := 0;
+    LI := LI + 1;
+  end;
+end;
+
+// The leak tracker's frames (M4.L2; debug builds only): up to ACount (at most 62) return
+// addresses of the calling thread into AFrames, innermost first, ASkip frames of the
+// caller's own on left out (0: the caller's return address first), nil past the last; the
+// count captured. Frame 0 of the walk is this routine's own. Every allocation of a debug
+// build runs this loop, so a cache hit is unwound here in place, with no call (code at
+// the debug level pays for each one); only a miss calls out (DoFrameFacts)
+public routine PlatformCaptureFrames(const ASkip: int32; const ACount: int32;
+  const AFrames: ptr): int32;
+var
+  LContext: PlatformContext;
+  LFrames: ptr to uint64;
+  LRead: ptr to const uint64;
+  LEntry: ptr to PlatformFrameFacts;
+  LMiss: PlatformFrameFacts;
+  LPc: uint64;
+  LRsp: uint64;
+  LRbp: uint64;
+  LLow: uint64;
+  LHigh: uint64;
+  LBase: uint64;
+  LSlot: uint64;
+  LIndex: int32;
+  LCaptured: int32;
+begin
+  LFrames := ptr to uint64(AFrames);
+  if GFrameExe = 0 then
+    DoFrameStart();
+  end;
+  // the lowest and highest stack addresses an 8-byte read may start at
+  LLow := GFrameLow;
+  LHigh := GFrameHigh - 8;
+  RtlCaptureContext(ptr(addr of LContext));
+  LRead := ptr to const uint64(uint64(ptr(addr of LContext)) + ADAM_PLATFORM_CONTEXT_RIP);
+  LPc := LRead^;
+  LRead := ptr to const uint64(uint64(ptr(addr of LContext)) + ADAM_PLATFORM_CONTEXT_RSP);
+  LRsp := LRead^;
+  LRead := ptr to const uint64(uint64(ptr(addr of LContext)) + ADAM_PLATFORM_CONTEXT_RBP);
+  LRbp := LRead^;
+  LIndex := 0;
+  LCaptured := 0;
+  while LCaptured < ACount do
+    if LIndex > ASkip then
+      LFrames[LCaptured] := LPc;
+      LCaptured := LCaptured + 1;
+    end;
+    if LCaptured >= ACount then
+      return LCaptured;
+    end;
+    // the frame's facts: this thread's cache entry for LPc, else worked out into LMiss
+    LEntry := addr of GFrameCache[int64((LPc xor (LPc shr 10)) &
+      uint64(ADAM_PLATFORM_FRAME_CACHE - 1))];
+    if LEntry^.Pc <> LPc then
+      if not DoFrameFacts(LPc, LEntry, LMiss) then
+        DoClearFrames(LFrames, 0, ACount);
+        // +1: this routine's own frame
+        return int32(RtlCaptureStackBackTrace(uint32(ASkip + 1), uint32(ACount), AFrames,
+          nil));
+      end;
+      LEntry := addr of LMiss;
+    end;
+    // unwound: the caller's rbp (when this frame saved it), return address and rsp; a
+    // slot off the stack or a nil return address is the stack's end
+    LBase := LRsp;
+    if LEntry^.Framed then
+      LBase := LRbp - uint64(LEntry^.FrameOffset);
+    end;
+    LSlot := LBase + uint64(LEntry^.Total);
+    if (LSlot < LLow) or (LSlot > LHigh) then
+      DoClearFrames(LFrames, LCaptured, ACount);
+      return LCaptured;
+    end;
+    if LEntry^.RbpSlot >= 0 then
+      if (LBase + uint64(LEntry^.RbpSlot) < LLow) or (LBase + uint64(LEntry^.RbpSlot) > LHigh) then
+        DoClearFrames(LFrames, LCaptured, ACount);
+        return LCaptured;
+      end;
+      LRead := ptr to const uint64(LBase + uint64(LEntry^.RbpSlot));
+      LRbp := LRead^;
+    end;
+    LRead := ptr to const uint64(LSlot);
+    LPc := LRead^;
+    LRsp := LSlot + 8;
+    if LPc = 0 then
+      DoClearFrames(LFrames, LCaptured, ACount);
+      return LCaptured;
+    end;
+    LIndex := LIndex + 1;
+  end;
+  return LCaptured;
+end;
+@endif
+
 // ASize bytes from the heap, uninitialized; nil when there is no room
 public routine PlatformAlloc(const ASize: int64): ptr;
 begin
@@ -574,6 +947,12 @@ end;
 public routine PlatformCopy(const ADest: ptr; const ASource: ptr; const ACount: int64);
 begin
   memcpy(ADest, ASource, uint64(ACount));
+end;
+
+// ACount bytes at AAddress set to 0
+public routine PlatformZero(const AAddress: ptr; const ACount: int64);
+begin
+  memset(AAddress, 0, uint64(ACount));
 end;
 
 // The handler the OS calls for a frame whose unwind data holds a guard's scope table (the

@@ -25,7 +25,10 @@
                     comes before it) and its unwind data written by the ABI
                     part;
                     then, when any function's frame is probed, the arch's
-                    stack probe, once, the same way; then every data blob,
+                    stack probe, once, the same way; then a debug build's
+                    code-address line table (LineTableMaker: each function's
+                    place rows as file and line, from the tree) into the
+                    module's LineTable blob; then every data blob,
                     kind by kind in that order and in the module's order
                     within a kind, at its alignment, its
                     symbol defined where it starts (internal when the blob
@@ -44,12 +47,18 @@
 
 module unit Adam.Backend.Generate;
 
-import System.SysUtils, Adam.Compiler.Diagnostics, Adam.Compiler.AST, Adam.Backend.Ssa,
-  Adam.Backend.Sections, Adam.Backend.Parts, Adam.Backend.Targets;
+import System.SysUtils, Adam.Core.Containers, Adam.Compiler.SourceText,
+  Adam.Compiler.Diagnostics, Adam.Compiler.AST,
+  Adam.Backend.Ssa, Adam.Backend.Sections, Adam.Backend.Parts, Adam.Backend.Targets;
 
 public const
   // The code section's alignment (a function's own alignment is the arch part's)
   ADAM_GENERATE_CODE_ALIGN: int64 = 16;
+  // The code-address line table's first 8 bytes and its layout's version (LineTableMaker)
+  ADAM_GENERATE_LINES_MAGIC: string = "AdamLine";
+  ADAM_GENERATE_LINES_VERSION: int64 = 1;
+  // A file record's flag: the file is the runtime's (its frames are the runtime's own)
+  ADAM_GENERATE_LINES_RUNTIME: int64 = 1;
   // Raised (an invariant broken) by a module the parts cannot take (see the header)
   ADAM_GENERATE_FAULT_SYMBOL: string = "Generate: no symbol for the data ";
   ADAM_GENERATE_FAULT_ENTRY: string = "Generate: an exe module with no entry function";
@@ -149,10 +158,244 @@ begin
   end;
 end;
 
-// AModule as one SectionSet for ABackend (see the header)
-public routine GenerateSections(const AModule: ref IrModule; const ABackend: ref Backend):
-  ref SectionSet;
+type
+  // The exe's code-address line table (M4.L2; a debug build's, the module's LineTable
+  // blob), little-endian: the 8 bytes ADAM_GENERATE_LINES_MAGIC, the layout's version, the
+  // function, file and row counts (uint32 each); then a 24-byte record per function (its
+  // address, an address word; its byte count, its first row and its row count, uint32
+  // each; 4 zero bytes); an 8-byte record per file (its name, a byte offset into the pool;
+  // its flags: ADAM_GENERATE_LINES_RUNTIME); a 16-byte row each (where it starts from its
+  // function's address, its line, its column, its file's index, uint32 each: the code from
+  // there to the next row is that place's, line 0 a place the tree does not know); then the
+  // pool of NUL-ended names (the file's name alone, no folder: the same exe wherever it was
+  // built). A function's rows are in code order, a place's run of rows merged. The
+  // runtime's files (the runtime unit and the units it imports: the platform unit,
+  // System.Runtime.Unicode) are flagged, so a leak's frames can skip the runtime's own
+  LineTableMaker = object
+    hidden FTree: ref SyntaxTree;
+    hidden FRuntime: StringArray;
+    hidden FFiles: StringArray;
+    // FFiles' index + 1 by full path (a row asks for its file's index: a map, not a scan)
+    hidden FFileIds: ref StringIdMap;
+    // FSymbols' first FSymbolCount entries are used (the array grows by doubling)
+    hidden FSymbols: StringArray;
+    hidden FSymbolCount: int64;
+    hidden FSizes: ref Int64List;
+    hidden FFirsts: ref Int64List;
+    hidden FCounts: ref Int64List;
+    hidden FStarts: ref Int64List;
+    hidden FLines: ref Int64List;
+    hidden FColumns: ref Int64List;
+    hidden FFileOf: ref Int64List;
+
+    init(const ATree: ref SyntaxTree);
+    begin
+      self.FTree := ATree;
+      setlength(self.FRuntime, 0);
+      setlength(self.FFiles, 0);
+      self.FFileIds := ref StringIdMap();
+      setlength(self.FSymbols, 0);
+      self.FSymbolCount := 0;
+      self.FSizes := ref Int64List();
+      self.FFirsts := ref Int64List();
+      self.FCounts := ref Int64List();
+      self.FStarts := ref Int64List();
+      self.FLines := ref Int64List();
+      self.FColumns := ref Int64List();
+      self.FFileOf := ref Int64List();
+      self.DoRuntimeFiles();
+    end;
+
+    // The index of AText in ATexts; -1 when it holds none
+    hidden const method DoIndexOf(const ATexts: StringArray; const AText: string): int64;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(ATexts) - 1 do
+        if ATexts[LI] = AText then
+          return LI;
+        end;
+      end;
+      return -1;
+    end;
+
+    // The runtime unit's file and the files of the units it imports (FRuntime)
+    hidden method DoRuntimeFiles();
+    var
+      LRuntime: int64;
+      LImport: int64;
+      LUnit: int64;
+      LI: int64;
+    begin
+      LRuntime := self.FTree.Runtime;
+      if LRuntime = 0 then
+        return;
+      end;
+      setlength(self.FRuntime, 1);
+      self.FRuntime[0] := self.FTree[LRuntime].Place.FileName;
+      for LI := 0 to self.FTree.CountOf(LRuntime, NodeRole.Import) - 1 do
+        LImport := self.FTree.NthOf(LRuntime, NodeRole.Import, LI);
+        LUnit := self.FTree[LImport].ResolvedUnit;
+        if LUnit <> 0 then
+          setlength(self.FRuntime, len(self.FRuntime) + 1);
+          self.FRuntime[len(self.FRuntime) - 1] := self.FTree[LUnit].Place.FileName;
+        end;
+      end;
+    end;
+
+    // The file index of AFile (a full path), added on its first ask
+    hidden method DoFileIndex(const AFile: string): int64;
+    var
+      LId: int64;
+    begin
+      LId := self.FFileIds.Find(AFile);
+      if LId <> 0 then
+        return LId - 1;
+      end;
+      // a new file: few per program, so FFiles grows by one
+      setlength(self.FFiles, len(self.FFiles) + 1);
+      self.FFiles[len(self.FFiles) - 1] := AFile;
+      self.FFileIds.Put(AFile, len(self.FFiles));
+      return len(self.FFiles) - 1;
+    end;
+
+    // True when the function whose rows start at AFirst has rows (ACount) and its last one
+    // is ALine, AColumn of AFile
+    hidden const method DoSameAsLast(const AFirst: int64; const ACount: int64;
+      const ALine: int64; const AColumn: int64; const AFile: int64): bool;
+    var
+      LLast: int64;
+    begin
+      if ACount = 0 then
+        return false;
+      end;
+      LLast := AFirst + ACount - 1;
+      return (self.FLines.Items[LLast] = ALine) and (self.FColumns.Items[LLast] = AColumn) and
+        (self.FFileOf.Items[LLast] = AFile);
+    end;
+
+    // ACode's rows added (a function with none adds nothing): each row's node's line,
+    // column and file, a row of the same place as the one before it merged into it
+    method Add(const ACode: ref FunctionCode);
+    var
+      LPlace: SourcePlace;
+      LLastName: string;
+      LLine: int64;
+      LColumn: int64;
+      LFile: int64;
+      LFirst: int64;
+      LCount: int64;
+      LI: int64;
+    begin
+      if ACode.PlaceCount() = 0 then
+        return;
+      end;
+      LFirst := self.FStarts.Count;
+      LCount := 0;
+      LFile := -1;
+      LLastName := "";
+      for LI := 0 to ACode.PlaceCount() - 1 do
+        LPlace := self.FTree[ACode.PlaceNodeAt(LI)].Place;
+        LLine := int64(LPlace.Line);
+        LColumn := int64(LPlace.Column);
+        // a function's rows are nearly all of one file, whose nodes share one name block
+        // (the compare is the same-block check): the map is asked only on a change
+        if (LFile < 0) or (LPlace.FileName <> LLastName) then
+          LLastName := LPlace.FileName;
+          LFile := self.DoFileIndex(LLastName);
+        end;
+        if not self.DoSameAsLast(LFirst, LCount, LLine, LColumn, LFile) then
+          self.FStarts.Add(ACode.PlaceStartAt(LI));
+          self.FLines.Add(LLine);
+          self.FColumns.Add(LColumn);
+          self.FFileOf.Add(LFile);
+          LCount := LCount + 1;
+        end;
+      end;
+      if self.FSymbolCount = len(self.FSymbols) then
+        setlength(self.FSymbols, len(self.FSymbols) * 2 + 64);
+      end;
+      self.FSymbols[self.FSymbolCount] := ACode.Symbol;
+      self.FSymbolCount := self.FSymbolCount + 1;
+      self.FSizes.Add(ACode.ByteCount);
+      self.FFirsts.Add(LFirst);
+      self.FCounts.Add(LCount);
+    end;
+
+    // The table's bytes written into ABlob (see the type's header)
+    method Write(const ABlob: ref IrData);
+    var
+      LNames: StringArray;
+      LOffsets: Int64Array;
+      LEnd: int64;
+      LName: string;
+      LFlags: int64;
+      LI: int64;
+      LJ: int64;
+    begin
+      for LI := 0 to len(ADAM_GENERATE_LINES_MAGIC) - 1 do
+        ABlob.AddByte(uint8(ADAM_GENERATE_LINES_MAGIC[LI]));
+      end;
+      ABlob.AddLe32(ADAM_GENERATE_LINES_VERSION);
+      ABlob.AddLe32(self.FSymbolCount);
+      ABlob.AddLe32(len(self.FFiles));
+      ABlob.AddLe32(self.FStarts.Count);
+      for LI := 0 to self.FSymbolCount - 1 do
+        ABlob.AddAddress(self.FSymbols[LI], 0);
+        ABlob.AddLe32(self.FSizes.Items[LI]);
+        ABlob.AddLe32(self.FFirsts.Items[LI]);
+        ABlob.AddLe32(self.FCounts.Items[LI]);
+        ABlob.AddLe32(0);
+      end;
+      // each file's name alone (LNames[I] the name of file I), each name once in the pool:
+      // a file of a name an earlier file has (another folder) takes that file's offset
+      setlength(LOffsets, len(self.FFiles));
+      setlength(LNames, 0);
+      LEnd := 0;
+      for LI := 0 to len(self.FFiles) - 1 do
+        LName := ExtractFileName(self.FFiles[LI]);
+        LJ := self.DoIndexOf(LNames, LName);
+        if LJ >= 0 then
+          LOffsets[LI] := LOffsets[LJ];
+        else
+          LOffsets[LI] := LEnd;
+          LEnd := LEnd + len(LName) + 1;
+        end;
+        setlength(LNames, len(LNames) + 1);
+        LNames[len(LNames) - 1] := LName;
+      end;
+      for LI := 0 to len(self.FFiles) - 1 do
+        LFlags := 0;
+        if self.DoIndexOf(self.FRuntime, self.FFiles[LI]) >= 0 then
+          LFlags := ADAM_GENERATE_LINES_RUNTIME;
+        end;
+        ABlob.AddLe32(LOffsets[LI]);
+        ABlob.AddLe32(LFlags);
+      end;
+      for LI := 0 to self.FStarts.Count - 1 do
+        ABlob.AddLe32(self.FStarts.Items[LI]);
+        ABlob.AddLe32(self.FLines.Items[LI]);
+        ABlob.AddLe32(self.FColumns.Items[LI]);
+        ABlob.AddLe32(self.FFileOf.Items[LI]);
+      end;
+      for LI := 0 to len(LNames) - 1 do
+        // a name already in the pool is not written again (its first file's offset serves)
+        if self.DoIndexOf(LNames, LNames[LI]) = LI then
+          for LJ := 0 to len(LNames[LI]) - 1 do
+            ABlob.AddByte(uint8(LNames[LI][LJ]));
+          end;
+          ABlob.AddByte(0);
+        end;
+      end;
+    end;
+  end;
+
+// AModule as one SectionSet for ABackend (see the header); ATree is the program it was
+// lowered from (the line table's places)
+public routine GenerateSections(const AModule: ref IrModule; const ABackend: ref Backend;
+  const ATree: ref SyntaxTree): ref SectionSet;
 var
+  LLines: ref LineTableMaker;
   LSet: ref SectionSet;
   LCode: int64;
   LReadOnly: int64;
@@ -174,6 +417,10 @@ begin
   LZeroed := DoDataSection(AModule, ABackend, LSet, IrDataKind.Zeroed, false);
   LThread := DoDataSection(AModule, ABackend, LSet, IrDataKind.Variable, true);
   LProbed := false;
+  LLines := nil;
+  if AModule.LineTable <> 0 then
+    LLines := ref LineTableMaker(ATree);
+  end;
   // Each function's code kept by its id: a funclet comes after its parent (Verify), whose
   // frame it reaches the parent's slots in
   setlength(LCodes, AModule.FunctionCount);
@@ -184,6 +431,9 @@ begin
     end;
     LFunction := ABackend.Arch.GenerateFunction(AModule, LF, ABackend.Abi, LSet, LCode, LParent);
     LCodes[LF] := LFunction;
+    if LLines <> nil then
+      LLines.Add(LFunction);
+    end;
     ABackend.Abi.WriteUnwind(LFunction, LSet);
     if (LFunction.Frame <> nil) and (LFunction.Frame.ProbeBytes > 0) then
       LProbed := true;
@@ -192,6 +442,11 @@ begin
   // The stack probe the probed frames call, once, after the functions
   if LProbed then
     ABackend.Abi.WriteUnwind(ABackend.Arch.GenerateProbe(ABackend.Abi, LSet, LCode), LSet);
+  end;
+  // The line table's bytes, now that every function's code is laid out (before the data is
+  // placed: its blob is read-only data)
+  if LLines <> nil then
+    LLines.Write(AModule.DataAt(AModule.LineTable));
   end;
   if LReadOnly <> 0 then
     DoData(AModule, LSet, LReadOnly, IrDataKind.ReadOnly, false);

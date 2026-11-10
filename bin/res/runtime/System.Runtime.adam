@@ -279,42 +279,89 @@ forward routine MutexLeave(const AMutex: ptr);
 forward routine ZeroBytes(const AAddress: ptr; const ACount: int64);
 
 // The leak tracker (M4.L1; debug builds only, BNF sec 9 DEBUG: a release build compiles
-// none of it). Every live heap block's byte count and allocation site (GAllocSite as it is
-// made) sit in an open-addressed table keyed by the block's address, beside the blocks,
-// never a header in them; the table's own memory comes straight from the platform (neither
-// counted nor tracked) and one mutex guards it. At exit the heap report lists, under its
-// [Heap] line, each site still holding blocks (DoReportLeaks)
+// none of it). Every live heap block's byte count, allocation site (GAllocSite as it is
+// made) and the return addresses it was made under (M4.L2, the platform's
+// PlatformCaptureFrames) sit in an open-addressed table keyed by the block's address,
+// beside the blocks, never a header in them; the table's own memory comes straight from
+// the platform (neither counted nor tracked) and one mutex guards it. At exit the heap
+// report lists, under its [Heap] line, each site still holding blocks and its first such
+// block's frames as file:line, from the exe's code-address line table (DoReportLeaks)
 type
   // One slot: the block's address (nil: never used), its byte count (-1: the block was
-  // freed; the address is kept so a later probe walks past it) and its site id (0: the
-  // runtime's own, made outside any compiled construct)
+  // freed; the address is kept so a later probe walks past it), its site id (0: the
+  // runtime's own, made outside any compiled construct), its serial (the tracker's count
+  // of blocks made when it was: the lower, the earlier) and up to 8 return addresses, the
+  // innermost first (nil past the last)
   TrackSlot = record
     Block: ptr;
     Size: int64;
     Site: int32;
+    Serial: int64;
+    Frames: array[0..7] of ptr;
   end;
 
 const
   // The table's first slot count; a power of two, doubled once used slots (live and freed)
   // would pass half of it
   ADAM_RUNTIME_TRACK_START: int64 = 4096;
+  // A slot's frame count (TrackSlot.Frames' length)
+  ADAM_RUNTIME_TRACK_FRAMES: int32 = 8;
+  // The frames of the tracker's own a capture leaves out: DoTrackAdd / DoTrackResize, then
+  // DoGetMem / DoResizeMem
+  ADAM_RUNTIME_TRACK_SKIP: int32 = 2;
+  // The line table's first 8 bytes (Adam.Backend.Generate's LineTableMaker) and a file
+  // record's runtime flag (its frames are the runtime's own: a leak's frames skip them)
+  ADAM_RUNTIME_LINES_MAGIC: string = "AdamLine";
+  ADAM_RUNTIME_LINES_RUNTIME: int64 = 1;
 
 var
   GTrackSlots: ptr to TrackSlot;
   GTrackCapacity: int64;
   GTrackUsed: int64;
+  // The blocks made so far (each slot's serial)
+  GTrackSerial: int64;
   // The blocks the tracker had no room for (its table could not grow): the report says so
   GTrackLost: int64;
   GTrackMutex: MutexWords;
   // The exe's allocation site table (Lowering's __adam_allocsites), handed over by the
-  // entry (HeapSites); nil until then
+  // entry (HeapSites), and its code-address line table (__adam_lines), whose address a
+  // version 2 site table holds; nil until then (no line table: a version 1 table, from a
+  // compiler before M4.L2)
   GSiteTable: ptr to const uint8;
+  GLineTable: ptr to const uint8;
+  // Where the site table's records start (its header's size: 16 at version 1, 24 at 2)
+  GSiteRecords: int64;
+
+// Declared below: the site table's little-endian uint32 and its 8-byte values
+forward routine DoSiteWord(const AAt: int64): int64;
+forward routine DoTableValue(const ATable: ptr to const uint8; const AAt: int64;
+  const ACount: int64): uint64;
 
 // A debug build's entry hands over its exe's site table (M4.L1; the compiler calls it,
-// Semantics' ADAM_SEMANTICS_RUNTIME_HEAP_SITES)
+// Semantics' ADAM_SEMANTICS_RUNTIME_HEAP_SITES): its version 2 header (M4.L2) holds the
+// line table's address after the site count
 routine HeapSites(const ATable: ptr);
 begin
   GSiteTable := ptr to const uint8(ATable);
+  GSiteRecords := 16;
+  if DoSiteWord(8) >= 2 then
+    GLineTable := ptr to const uint8(DoTableValue(GSiteTable, 16, 8));
+    GSiteRecords := 24;
+  end;
+end;
+
+// The slot at AFrom's fields copied into the slot at ATo
+routine DoTrackCopy(const ATo: ptr to TrackSlot; const AFrom: ptr to TrackSlot);
+var
+  LI: int64;
+begin
+  ATo^.Block := AFrom^.Block;
+  ATo^.Size := AFrom^.Size;
+  ATo^.Site := AFrom^.Site;
+  ATo^.Serial := AFrom^.Serial;
+  for LI := 0 to 7 do
+    ATo^.Frames[LI] := AFrom^.Frames[LI];
+  end;
 end;
 
 // The home slot of ABlock in a table of ACapacity (a power of two) slots: the address
@@ -328,26 +375,24 @@ begin
   return int64(LKey & uint64(ACapacity - 1));
 end;
 
-// ABlock (ASize bytes, site ASite) put into the table ASlots of ACapacity slots, in the
-// first never-used or freed slot from its home; true when that slot was never used (one
-// more used slot)
-routine DoTrackPut(const ASlots: ptr to TrackSlot; const ACapacity: int64; const ABlock: ptr;
-  const ASize: int64; const ASite: int32): bool;
+// The live block ASource describes put into the table ASlots of ACapacity slots, in the
+// first never-used or freed slot from its block's home; true when that slot was never used
+// (one more used slot)
+routine DoTrackPut(const ASlots: ptr to TrackSlot; const ACapacity: int64;
+  const ASource: ptr to TrackSlot): bool;
 var
   LAt: int64;
   LSlot: ptr to TrackSlot;
   LFresh: bool;
 begin
-  LAt := DoTrackHome(ABlock, ACapacity);
+  LAt := DoTrackHome(ASource^.Block, ACapacity);
   LSlot := addr of ASlots[LAt];
   while (LSlot^.Block <> nil) and (LSlot^.Size >= 0) do
     LAt := (LAt + 1) & (ACapacity - 1);
     LSlot := addr of ASlots[LAt];
   end;
   LFresh := LSlot^.Block = nil;
-  LSlot^.Block := ABlock;
-  LSlot^.Size := ASize;
-  LSlot^.Site := ASite;
+  DoTrackCopy(LSlot, ASource);
   return LFresh;
 end;
 
@@ -375,7 +420,7 @@ begin
   for LI := 0 to GTrackCapacity - 1 do
     LOld := addr of GTrackSlots[LI];
     if (LOld^.Block <> nil) and (LOld^.Size >= 0) then
-      DoTrackPut(LSlots, LCapacity, LOld^.Block, LOld^.Size, LOld^.Site);
+      DoTrackPut(LSlots, LCapacity, LOld);
       LUsed := LUsed + 1;
     end;
   end;
@@ -388,10 +433,10 @@ begin
   return true;
 end;
 
-// ABlock (ASize bytes, site ASite) recorded live; the table grown first when it would pass
+// The block ASource describes recorded live; the table grown first when it would pass
 // half full, and when it cannot grow and holds one free slot or less the block is counted
 // lost instead (a probe always meets a never-used slot). The caller holds the mutex
-routine DoTrackInsert(const ABlock: ptr; const ASize: int64; const ASite: int32);
+routine DoTrackInsert(const ASource: ptr to TrackSlot);
 begin
   if (GTrackUsed + 1) * 2 > GTrackCapacity then
     if not DoTrackGrow() then
@@ -401,7 +446,7 @@ begin
       end;
     end;
   end;
-  if DoTrackPut(GTrackSlots, GTrackCapacity, ABlock, ASize, ASite) then
+  if DoTrackPut(GTrackSlots, GTrackCapacity, ASource) then
     GTrackUsed := GTrackUsed + 1;
   end;
 end;
@@ -428,11 +473,25 @@ begin
   return nil;
 end;
 
-// A block DoGetMem made: ABlock, ASize bytes, at this thread's allocation site
+// A block DoGetMem made: ABlock, ASize bytes, at this thread's allocation site, under the
+// frames it was asked from (captured before the mutex is taken; only at a compiled site:
+// the report prints no frames under the runtime's own, site 0), the next serial
 routine DoTrackAdd(const ABlock: ptr; const ASize: int64);
+var
+  LNew: TrackSlot;
 begin
+  ZeroBytes(ptr(addr of LNew), size(TrackSlot));
+  LNew.Block := ABlock;
+  LNew.Size := ASize;
+  LNew.Site := GAllocSite;
+  if LNew.Site <> 0 then
+    PlatformCaptureFrames(ADAM_RUNTIME_TRACK_SKIP, ADAM_RUNTIME_TRACK_FRAMES,
+      ptr(addr of LNew.Frames[0]));
+  end;
   MutexEnter(ptr(addr of GTrackMutex));
-  DoTrackInsert(ABlock, ASize, GAllocSite);
+  GTrackSerial := GTrackSerial + 1;
+  LNew.Serial := GTrackSerial;
+  DoTrackInsert(addr of LNew);
   MutexLeave(ptr(addr of GTrackMutex));
 end;
 
@@ -450,42 +509,186 @@ begin
 end;
 
 // The block at AOld resized to ASize bytes, now at ANew (maybe AOld): its byte count
-// updated, its site this thread's allocation site when one is set (the construct that grew
-// it), else the one it had. The caller holds the mutex across the platform's resize too: a
-// moved block's old address is free once the resize returns, and another thread given it
-// must not record it before its old slot is marked freed here
-routine DoTrackMove(const AOld: ptr; const ANew: ptr; const ASize: int64);
+// updated; its site and frames AGrower's when AGrower has a site (the construct that grew
+// it, this thread's allocation site and frames), else the ones it had; its serial kept (a
+// block the table had no room for takes the next). The caller holds the mutex across the
+// platform's resize too: a moved block's old address is free once the resize returns, and
+// another thread given it must not record it before its old slot is marked freed here
+routine DoTrackMove(const AOld: ptr; const ANew: ptr; const ASize: int64;
+  const AGrower: ptr to TrackSlot);
 var
   LSlot: ptr to TrackSlot;
-  LSite: int32;
+  LNew: TrackSlot;
+  LI: int64;
 begin
   LSlot := DoTrackFind(AOld);
-  LSite := GAllocSite;
-  if (LSite = 0) and (LSlot <> nil) then
-    LSite := LSlot^.Site;
+  if LSlot <> nil then
+    DoTrackCopy(addr of LNew, LSlot);
+  else
+    ZeroBytes(ptr(addr of LNew), size(TrackSlot));
+    GTrackSerial := GTrackSerial + 1;
+    LNew.Serial := GTrackSerial;
   end;
+  if AGrower^.Site <> 0 then
+    LNew.Site := AGrower^.Site;
+    for LI := 0 to 7 do
+      LNew.Frames[LI] := AGrower^.Frames[LI];
+    end;
+  end;
+  LNew.Block := ANew;
+  LNew.Size := ASize;
   if (LSlot <> nil) and (AOld = ANew) then
-    LSlot^.Size := ASize;
-    LSlot^.Site := LSite;
+    DoTrackCopy(LSlot, addr of LNew);
   else
     if LSlot <> nil then
       LSlot^.Size := -1;
     end;
-    DoTrackInsert(ANew, ASize, LSite);
+    DoTrackInsert(addr of LNew);
   end;
+end;
+
+// DoResizeMem's debug form: the block at APointer resized by the platform to ASize bytes
+// with the mutex held across it (DoTrackMove), the growing construct's site and frames
+// (when it set a site) captured before; the new address, nil when the heap cannot
+routine DoTrackResize(const APointer: ptr; const ASize: int64): ptr;
+var
+  LGrower: TrackSlot;
+  LBlock: ptr;
+begin
+  ZeroBytes(ptr(addr of LGrower), size(TrackSlot));
+  LGrower.Site := GAllocSite;
+  if LGrower.Site <> 0 then
+    PlatformCaptureFrames(ADAM_RUNTIME_TRACK_SKIP, ADAM_RUNTIME_TRACK_FRAMES,
+      ptr(addr of LGrower.Frames[0]));
+  end;
+  MutexEnter(ptr(addr of GTrackMutex));
+  LBlock := PlatformResize(APointer, ASize);
+  if LBlock <> nil then
+    DoTrackMove(APointer, LBlock, ASize, addr of LGrower);
+  end;
+  MutexLeave(ptr(addr of GTrackMutex));
+  return LBlock;
+end;
+
+// The little-endian unsigned value of ACount (4 or 8) bytes at AAt in the table ATable
+routine DoTableValue(const ATable: ptr to const uint8; const AAt: int64;
+  const ACount: int64): uint64;
+var
+  LValue: uint64;
+  LI: int64;
+begin
+  LValue := 0u;
+  for LI := ACount - 1 downto 0 do
+    LValue := (LValue shl 8) | uint64(ATable[AAt + LI]);
+  end;
+  return LValue;
 end;
 
 // The little-endian uint32 at AAt in the site table
 routine DoSiteWord(const AAt: int64): int64;
+begin
+  return int64(DoTableValue(GSiteTable, AAt, 4));
+end;
+
+// The little-endian uint32 at AAt in the line table
+routine DoLineWord(const AAt: int64): int64;
+begin
+  return int64(DoTableValue(GLineTable, AAt, 4));
+end;
+
+// True when the line table is handed over and starts with ADAM_RUNTIME_LINES_MAGIC
+routine DoLinesKnown(): bool;
 var
-  LValue: int64;
   LI: int64;
 begin
-  LValue := 0;
-  for LI := 3 downto 0 do
-    LValue := (LValue shl 8) | int64(GSiteTable[AAt + LI]);
+  if GLineTable = nil then
+    return false;
   end;
-  return LValue;
+  for LI := 0 to len(ADAM_RUNTIME_LINES_MAGIC) - 1 do
+    if GLineTable[LI] <> uint8(ADAM_RUNTIME_LINES_MAGIC[LI]) then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// The row of the line table's function record AFunction (at its byte offset) holding the
+// code AOffset bytes from its start: the last of its rows starting at or before it; -1
+// when none does
+routine DoLineRow(const AFunction: int64; const AOffset: int64): int64;
+var
+  LRows: int64;
+  LFirst: int64;
+  LCount: int64;
+  LRow: int64;
+  LI: int64;
+begin
+  // header 24 bytes, functions 24 each, files 8 each, then the rows, 16 each
+  // (LineTableMaker)
+  LRows := 24 + DoLineWord(12) * 24 + DoLineWord(16) * 8;
+  LFirst := DoLineWord(AFunction + 12);
+  LCount := DoLineWord(AFunction + 16);
+  LRow := -1;
+  LI := 0;
+  while (LI < LCount) and (DoLineWord(LRows + (LFirst + LI) * 16) <= AOffset) do
+    LRow := LRows + (LFirst + LI) * 16;
+    LI := LI + 1;
+  end;
+  return LRow;
+end;
+
+// The place of the frame AFrame (a return address): the call it returns to (the byte
+// before it), its file's name (AFile), line (ALine) and column (AColumn); false for an
+// address no function of the line table holds (the C runtime's, the OS's), a row of line
+// 0, or a file of the runtime's own
+routine DoFramePlace(const AFrame: uint64; var AFile: ptr to const char; var ALine: int64;
+  var AColumn: int64): bool;
+var
+  LFiles: int64;
+  LPool: int64;
+  LFunction: int64;
+  LStart: uint64;
+  LRow: int64;
+  LFile: int64;
+  LI: int64;
+begin
+  LFiles := 24 + DoLineWord(12) * 24;
+  LPool := LFiles + DoLineWord(16) * 8 + DoLineWord(20) * 16;
+  for LI := 0 to DoLineWord(12) - 1 do
+    LFunction := 24 + LI * 24;
+    LStart := DoTableValue(GLineTable, LFunction, 8);
+    if (AFrame > LStart) and (AFrame - LStart <= uint64(DoLineWord(LFunction + 8))) then
+      LRow := DoLineRow(LFunction, int64(AFrame - LStart) - 1);
+      if LRow < 0 then
+        return false;
+      end;
+      LFile := LFiles + DoLineWord(LRow + 12) * 8;
+      if (DoLineWord(LRow + 4) = 0) or
+        ((DoLineWord(LFile + 4) & ADAM_RUNTIME_LINES_RUNTIME) <> 0) then
+        return false;
+      end;
+      AFile := ptr to const char(addr of GLineTable[LPool + DoLineWord(LFile)]);
+      ALine := DoLineWord(LRow + 4);
+      AColumn := DoLineWord(LRow + 8);
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+// True when the NUL-ended texts AFirst and ASecond are the same
+routine DoSameCText(const AFirst: ptr to const char; const ASecond: ptr to const char): bool;
+var
+  LI: int64;
+begin
+  LI := 0;
+  while AFirst[LI] = ASecond[LI] do
+    if AFirst[LI] = '\0' then
+      return true;
+    end;
+    LI := LI + 1;
+  end;
+  return false;
 end;
 
 // The NUL-ended text at the byte offset AOffset of the site table's pool (APool)
@@ -512,18 +715,77 @@ begin
     println("runtime: {} {}, {} bytes", ALeaks, LNoun, ABytes);
     return;
   end;
-  // the table: 8 magic bytes, version, count, then 16-byte records (line, column, file's
-  // text, what's text), then the pool of texts (Lowering's DoSiteTable)
-  LRecord := 16 + (ASite - 1) * 16;
-  LPool := 16 + ACount * 16;
+  // the table: 8 magic bytes, version, count (version 2: the line table's address), then
+  // 16-byte records (line, column, file's text, what's text), then the pool of texts
+  // (Lowering's DoSiteTable)
+  LRecord := GSiteRecords + (ASite - 1) * 16;
+  LPool := GSiteRecords + ACount * 16;
   println("{}({},{}): {} {}, {} bytes, {}", DoSiteText(LPool, DoSiteWord(LRecord + 8)),
     DoSiteWord(LRecord), DoSiteWord(LRecord + 4), ALeaks, LNoun, ABytes,
     DoSiteText(LPool, DoSiteWord(LRecord + 12)));
 end;
 
+const
+  // The words of one site's tally (DoReportLeaks): its block count, its bytes, the serial
+  // of its earliest block and that block's 8 frames
+  ADAM_RUNTIME_TALLY_WORDS: int64 = 11;
+
+// The live slot ASlot counted into its site's tally at ATally (ADAM_RUNTIME_TALLY_WORDS
+// words): one more block, its bytes, and its serial and frames when it is the site's
+// earliest so far
+routine DoTallySlot(const ATally: ptr to int64; const ASlot: ptr to TrackSlot);
+var
+  LI: int64;
+begin
+  if (ATally[0] = 0) or (ASlot^.Serial < ATally[2]) then
+    ATally[2] := ASlot^.Serial;
+    for LI := 0 to 7 do
+      ATally[3 + LI] := int64(uint64(ASlot^.Frames[LI]));
+    end;
+  end;
+  ATally[0] := ATally[0] + 1;
+  ATally[1] := ATally[1] + ASlot^.Size;
+end;
+
+// Under the leak line of site ASite (of the site table's ACount): its earliest block's
+// frames (ATally's, DoTallySlot), innermost first, each `  file(line,col)` (DoFramePlace;
+// a frame it has no place for left out); the first one shown left out too when it is the
+// site's own line (the leak line says it), so the frames are its callers; nothing without
+// the line table
+routine DoLeakFrames(const ATally: ptr to int64; const ASite: int64; const ACount: int64);
+var
+  LRecord: int64;
+  LSiteFile: ptr to const char;
+  LSiteLine: int64;
+  LFile: ptr to const char;
+  LLine: int64;
+  LColumn: int64;
+  LShown: int64;
+  LI: int64;
+begin
+  if not DoLinesKnown() then
+    return;
+  end;
+  LRecord := GSiteRecords + (ASite - 1) * 16;
+  LSiteFile := DoSiteText(GSiteRecords + ACount * 16, DoSiteWord(LRecord + 8));
+  LSiteLine := DoSiteWord(LRecord);
+  LShown := 0;
+  LI := 0;
+  while (LI < 8) and (ATally[3 + LI] <> 0) do
+    if DoFramePlace(uint64(ATally[3 + LI]), LFile, LLine, LColumn) then
+      if (LShown > 0) or (LLine <> LSiteLine) or not DoSameCText(LFile, LSiteFile) then
+        println("  {}({},{})", LFile, LLine, LColumn);
+      end;
+      LShown := LShown + 1;
+    end;
+    LI := LI + 1;
+  end;
+end;
+
 // Under the [Heap] line: each site still holding blocks, in site id order (0, the
-// runtime's own, first), with its block count and bytes; then the blocks the tracker had
-// no room for, if any. The tally is taken under the mutex, printed after it
+// runtime's own, first), with its block count and bytes, a compiled site's earliest block's
+// frames under it (DoLeakFrames); then the blocks the tracker had no room for, if any. The
+// tally is taken under the mutex, printed after it
 routine DoReportLeaks();
 var
   LCount: int64;
@@ -536,12 +798,12 @@ begin
   if GSiteTable <> nil then
     LCount := DoSiteWord(12);
   end;
-  // two words per site id 0 .. LCount: its block count, then its bytes
-  LTally := ptr to int64(PlatformAlloc((LCount + 1) * 16));
+  // ADAM_RUNTIME_TALLY_WORDS words per site id 0 .. LCount
+  LTally := ptr to int64(PlatformAlloc((LCount + 1) * ADAM_RUNTIME_TALLY_WORDS * 8));
   if LTally = nil then
     return;
   end;
-  ZeroBytes(ptr(LTally), (LCount + 1) * 16);
+  ZeroBytes(ptr(LTally), (LCount + 1) * ADAM_RUNTIME_TALLY_WORDS * 8);
   MutexEnter(ptr(addr of GTrackMutex));
   for LI := 0 to GTrackCapacity - 1 do
     LSlot := addr of GTrackSlots[LI];
@@ -550,14 +812,17 @@ begin
       if (LSite < 0) or (LSite > LCount) then
         LSite := 0;
       end;
-      LTally[LSite * 2] := LTally[LSite * 2] + 1;
-      LTally[LSite * 2 + 1] := LTally[LSite * 2 + 1] + LSlot^.Size;
+      DoTallySlot(addr of LTally[LSite * ADAM_RUNTIME_TALLY_WORDS], LSlot);
     end;
   end;
   MutexLeave(ptr(addr of GTrackMutex));
   for LI := 0 to LCount do
-    if LTally[LI * 2] > 0 then
-      DoLeakLine(LI, LCount, LTally[LI * 2], LTally[LI * 2 + 1]);
+    LSite := LI * ADAM_RUNTIME_TALLY_WORDS;
+    if LTally[LSite] > 0 then
+      DoLeakLine(LI, LCount, LTally[LSite], LTally[LSite + 1]);
+      if LI > 0 then
+        DoLeakFrames(addr of LTally[LSite], LI, LCount);
+      end;
     end;
   end;
   if GTrackLost > 0 then
@@ -593,13 +858,7 @@ var
   LBlock: ptr;
 begin
 @ifdef DEBUG
-  // held across the resize itself (DoTrackMove)
-  MutexEnter(ptr(addr of GTrackMutex));
-  LBlock := PlatformResize(APointer, ASize);
-  if LBlock <> nil then
-    DoTrackMove(APointer, LBlock, ASize);
-  end;
-  MutexLeave(ptr(addr of GTrackMutex));
+  LBlock := DoTrackResize(APointer, ASize);
 @else
   LBlock := PlatformResize(APointer, ASize);
 @endif
@@ -1182,15 +1441,12 @@ begin
   StrRelease(LOld);
 end;
 
-// ACount bytes at AAddress set to 0
+// ACount bytes at AAddress set to 0 (the platform's: a byte loop at the debug level costs
+// the leak tracker's every slot and table)
 routine ZeroBytes(const AAddress: ptr; const ACount: int64);
-var
-  LBytes: ptr to uint8;
-  LI: int64;
 begin
-  LBytes := ptr to uint8(AAddress);
-  for LI := 0 to ACount - 1 do
-    LBytes[LI] := 0;
+  if ACount > 0 then
+    PlatformZero(AAddress, ACount);
   end;
 end;
 
