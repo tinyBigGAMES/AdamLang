@@ -96,6 +96,9 @@ threadstatic
   // the thread ends (ThreadEnded; the main one's at Halt)
   GRaiseCode: int32;
   GRaiseText: ptr;
+  // True while MemoryFail builds its text on this thread: an allocation failing inside it
+  // raises with the empty text (no block needed) instead of failing again without end
+  GMemoryFailing: bool;
   // This thread's mark: its address names the thread as a mutex's owner (MutexWords.Owner),
   // no OS call needed; never read or written
   GMutexSelf: uint8;
@@ -240,15 +243,25 @@ begin
   PlatformExit(ACode);
 end;
 
-// getmem(N): N bytes from the heap, uninitialized, counted; 0 bytes is nil, uncounted
-// (running out raises once exceptions exist, M3.11)
-routine GetMem(const ASize: int64): ptr;
+const
+  // The memory check's code (M3.11c): PaskalCPP's EXC_MEMORY, the code its get_mem /
+  // resize_mem / set_length raise with
+  ADAM_RUNTIME_EXC_MEMORY: int32 = 12;
+  // int64's highest value: a block's byte count past it is no block any heap holds
+  ADAM_RUNTIME_INT64_MAX: int64 = 9223372036854775807;
+
+// Raised with code 12 and the text ABefore, AValue's digits, AAfter (below, with the other
+// raises); it never returns
+forward routine MemoryFail(const ABefore: ptr to const char; const AValue: int64;
+  const AAfter: ptr to const char);
+
+// ASize (above 0) bytes from the heap, uninitialized, counted; nil when the heap cannot give
+// them (nothing counted). The one allocation every block goes through: GetMem raises on its
+// nil, setlength's shapes raise their own text on it
+routine DoGetMem(const ASize: int64): ptr;
 var
   LBlock: ptr;
 begin
-  if ASize <= 0 then
-    return nil;
-  end;
   LBlock := PlatformAlloc(ASize);
   if LBlock <> nil then
     atomicadd(GAllocs, 1u);
@@ -256,23 +269,76 @@ begin
   return LBlock;
 end;
 
+// getmem(N): N bytes from the heap, uninitialized, counted; 0 bytes is nil, uncounted. A
+// negative N raises code 12 `negative memory size N`, a heap that cannot give N bytes `out
+// of memory (N bytes)` (PaskalCPP's get_mem)
+routine GetMem(const ASize: int64): ptr;
+var
+  LBlock: ptr;
+begin
+  if ASize = 0 then
+    return nil;
+  end;
+  if ASize < 0 then
+    MemoryFail(ptr to const char("negative memory size "), ASize, ptr to const char(""));
+  end;
+  LBlock := DoGetMem(ASize);
+  if LBlock = nil then
+    MemoryFail(ptr to const char("out of memory ("), ASize, ptr to const char(" bytes)"));
+  end;
+  return LBlock;
+end;
+
 // resizemem(P, N): the block at P grown or shrunk to N bytes, its contents kept up to the
 // smaller size, maybe moved (the new address); nil P allocates (counted), N of 0 frees P
-// (counted) and is nil
+// (counted) and is nil. A negative N raises code 12 `negative memory size N`, a heap that
+// cannot give N bytes `out of memory (N bytes)` with the block at P as it was (PaskalCPP's
+// resize_mem)
 routine ResizeMem(const APointer: ptr; const ASize: int64): ptr;
 var
   LBlock: ptr;
 begin
+  if ASize < 0 then
+    MemoryFail(ptr to const char("negative memory size "), ASize, ptr to const char(""));
+  end;
   if APointer = nil then
     return GetMem(ASize);
   end;
-  if ASize <= 0 then
+  if ASize = 0 then
     PlatformFree(APointer);
     atomicadd(GFrees, 1u);
     return nil;
   end;
   LBlock := PlatformResize(APointer, ASize);
+  if LBlock = nil then
+    MemoryFail(ptr to const char("out of memory ("), ASize, ptr to const char(" bytes)"));
+  end;
   return LBlock;
+end;
+
+// The bytes a block of ALength (above 0) items of AItem bytes takes, its 16-byte header and
+// AExtra items more (a text's 0 unit) included; -1 when that passes int64's range (no heap
+// holds it: setlength's `out of memory (length N)`)
+routine DoBlockBytes(const ALength: int64; const AItem: int64; const AExtra: int64): int64;
+begin
+  if AItem <= 0 then
+    return 16;
+  end;
+  if ALength > (ADAM_RUNTIME_INT64_MAX - 16) div AItem - AExtra then
+    return -1;
+  end;
+  return 16 + (ALength + AExtra) * AItem;
+end;
+
+// setlength's failure for the length ALength (PaskalCPP's raise_length): code 12, `negative
+// length N` for a negative one, else `out of memory (length N)` (the heap cannot hold it);
+// it never returns
+routine LengthFail(const ALength: int64);
+begin
+  if ALength < 0 then
+    MemoryFail(ptr to const char("negative length "), ALength, ptr to const char(""));
+  end;
+  MemoryFail(ptr to const char("out of memory (length "), ALength, ptr to const char(")"));
 end;
 
 // freemem(P): the block at P back to the heap, counted; nil does nothing
@@ -306,7 +372,9 @@ begin
   while not LDone do
     // One byte is always kept free for the 0 after the bytes
     if ACount + 1 >= ASize then
-      LGrown := ResizeMem(ABlock, ASize * 2);
+      // the heap's resize without ResizeMem's raise: no room is this routine's false, the
+      // block as it was (the caller closes the file and frees it)
+      LGrown := PlatformResize(ABlock, ASize * 2);
       if LGrown = nil then
         return false;
       end;
@@ -347,7 +415,8 @@ begin
     return nil;
   end;
   LSize := ADAM_RUNTIME_READ_START;
-  LBlock := GetMem(LSize);
+  // DoGetMem, not GetMem: no room is this routine's nil, never a raise past the open file
+  LBlock := DoGetMem(LSize);
   LRead := false;
   if LBlock <> nil then
     LRead := DoReadOpenFile(LHandle, LBlock, LSize, ACount);
@@ -476,7 +545,7 @@ begin
   LNeed := PlatformListFolder(APath, nil, 0);
   while LNeed >= 0 do
     // The names' bytes and the closing NUL
-    LBlock := GetMem(LNeed + 1);
+    LBlock := DoGetMem(LNeed + 1);
     if LBlock = nil then
       return nil;
     end;
@@ -519,7 +588,7 @@ begin
   if LNeed <= 0 then
     return nil;
   end;
-  LBlock := GetMem(LNeed + 1);
+  LBlock := DoGetMem(LNeed + 1);
   if LBlock = nil then
     return nil;
   end;
@@ -547,7 +616,7 @@ begin
   if LNeed <= 0 then
     return nil;
   end;
-  LBlock := GetMem(LNeed + 1);
+  LBlock := DoGetMem(LNeed + 1);
   if LBlock = nil then
     return nil;
   end;
@@ -676,27 +745,36 @@ begin
   return LHeader[1];
 end;
 
+// The heap block ABlock (16 + (ALength + 1) * AUnit bytes) made a text block of ALength
+// (above 0) units: its ref count 1, its length, the 0 unit after its units (TextNew's and
+// setlength's new blocks)
+routine DoTextReady(const ABlock: ptr; const ALength: int64; const AUnit: int64);
+var
+  LHeader: ptr to int64;
+  LBytes: ptr to uint8;
+  LI: int64;
+begin
+  LHeader := ptr to int64(ABlock);
+  LHeader[0] := 1;
+  LHeader[1] := ALength;
+  LBytes := ptr to uint8(ABlock);
+  for LI := 0 to AUnit - 1 do
+    LBytes[16 + ALength * AUnit + LI] := 0;
+  end;
+end;
+
 // A new text block of ALength units of AUnit bytes each (1: a string's bytes, 2: a
 // wstring's UTF-16 units): its ref count 1, its units after the header for the caller to
 // fill, the 0 unit after them written; nil for 0 units
 routine TextNew(const ALength: int64; const AUnit: int64): ptr;
 var
   LBlock: ptr;
-  LHeader: ptr to int64;
-  LBytes: ptr to uint8;
-  LI: int64;
 begin
   if ALength <= 0 then
     return nil;
   end;
   LBlock := GetMem(16 + (ALength + 1) * AUnit);
-  LHeader := ptr to int64(LBlock);
-  LHeader[0] := 1;
-  LHeader[1] := ALength;
-  LBytes := ptr to uint8(LBlock);
-  for LI := 0 to AUnit - 1 do
-    LBytes[16 + ALength * AUnit + LI] := 0;
-  end;
+  DoTextReady(LBlock, ALength, AUnit);
   return LBlock;
 end;
 
@@ -817,7 +895,7 @@ end;
 
 // create(P) (BNF sec 7): a block of ASize bytes (a record's or an overlay's size), every
 // byte 0, counted as getmem's; a type of size 0 still gets a block of one byte, so the
-// pointer is never nil after a create
+// pointer is never nil after a create (a heap with no room raises getmem's code 12)
 routine CreateMem(const ASize: int64): ptr;
 var
   LSize: int64;
@@ -828,9 +906,7 @@ begin
     LSize := 1;
   end;
   LBlock := GetMem(LSize);
-  if LBlock <> nil then
-    ZeroBytes(LBlock, LSize);
-  end;
+  ZeroBytes(LBlock, LSize);
   return LBlock;
 end;
 
@@ -1002,21 +1078,30 @@ begin
   end;
 end;
 
+// The heap block ABlock (16 + ALength * AElement[0] bytes) made a dynamic array block of
+// ALength (above 0) elements of the element map AElement: its ref count 1, its length, its
+// elements zeroed (ArrNew's and setlength's new blocks)
+routine DoArrReady(const ABlock: ptr; const ALength: int64; const AElement: ptr to int64);
+var
+  LHeader: ptr to int64;
+begin
+  LHeader := ptr to int64(ABlock);
+  LHeader[0] := 1;
+  LHeader[1] := ALength;
+  ZeroBytes(ArrElementAt(ABlock, AElement, 0), ALength * AElement[0]);
+end;
+
 // A new dynamic array block of ALength elements of the element map AElement: its ref count
 // 1, its elements zeroed; nil for no elements
 routine ArrNew(const ALength: int64; const AElement: ptr to int64): ptr;
 var
   LBlock: ptr;
-  LHeader: ptr to int64;
 begin
   if ALength <= 0 then
     return nil;
   end;
   LBlock := GetMem(16 + ALength * AElement[0]);
-  LHeader := ptr to int64(LBlock);
-  LHeader[0] := 1;
-  LHeader[1] := ALength;
-  ZeroBytes(ArrElementAt(LBlock, AElement, 0), ALength * AElement[0]);
+  DoArrReady(LBlock, ALength, AElement);
   return LBlock;
 end;
 
@@ -1080,27 +1165,36 @@ end;
 
 // setlength(A, N) on the dynamic array variable at ASlot (its element map AElement): N
 // elements after it, the first kept up to the smaller length and any added ones zeroed
-// (std::vector's resize); the same length changes nothing; 0 is no elements, nil (a
-// negative N raises once exceptions exist, M3.11: until then it empties the array too). A
-// shared block is not changed in place: the new one is the slot's own, its kept elements'
-// managed values one more holder
+// (std::vector's resize); the same length changes nothing; 0 is no elements, nil. A
+// negative N raises code 12 `negative length N`, a length the heap cannot hold `out of
+// memory (length N)` (PaskalCPP's set_length), the array then as it was. A shared block is
+// not changed in place: the new one is the slot's own, its kept elements' managed values
+// one more holder
 routine ArrSetLength(const ASlot: ptr to ptr; const ALength: int64; const AElement: ptr to int64);
 var
   LOld: ptr;
   LOldLength: int64;
   LKept: int64;
+  LBytes: int64;
   LHeader: ptr to int64;
   LBlock: ptr;
 begin
+  if ALength < 0 then
+    LengthFail(ALength);
+  end;
   LOld := ASlot^;
   LOldLength := StrLength(LOld);
   if ALength = LOldLength then
     return;
   end;
-  if ALength <= 0 then
+  if ALength = 0 then
     ASlot^ := nil;
     ArrRelease(LOld, AElement);
     return;
+  end;
+  LBytes := DoBlockBytes(ALength, AElement[0], 0);
+  if LBytes < 0 then
+    LengthFail(ALength);
   end;
   LKept := LOldLength;
   if ALength < LKept then
@@ -1109,14 +1203,27 @@ begin
   LHeader := ptr to int64(LOld);
   if (LOld <> nil) and (atomicload(LHeader[0]) = 1) then
     // the slot's own block: the dropped elements released, then resized where it is
-    // (maybe moved), its kept elements as they were, the added ones zeroed
+    // (maybe moved), its kept elements as they were, the added ones zeroed. A growth the
+    // heap refuses has dropped nothing yet, so the array is as it was; a shrink it refuses
+    // keeps the larger block, which holds the shorter array as well
     ArrElements(LOld, AElement, LKept, LOldLength - LKept, false);
-    LBlock := ResizeMem(LOld, 16 + ALength * AElement[0]);
+    LBlock := PlatformResize(LOld, LBytes);
+    if LBlock = nil then
+      if ALength > LOldLength then
+        LengthFail(ALength);
+      end;
+      LBlock := LOld;
+    end;
     LHeader := ptr to int64(LBlock);
     LHeader[1] := ALength;
     ZeroBytes(ArrElementAt(LBlock, AElement, LKept), (ALength - LKept) * AElement[0]);
   else
-    LBlock := ArrNew(ALength, AElement);
+    // a new block, through DoGetMem so no room raises setlength's own text
+    LBlock := DoGetMem(LBytes);
+    if LBlock = nil then
+      LengthFail(ALength);
+    end;
+    DoArrReady(LBlock, ALength, AElement);
     if LKept > 0 then
       PlatformCopy(ArrElementAt(LBlock, AElement, 0), ArrElementAt(LOld, AElement, 0),
         LKept * AElement[0]);
@@ -1305,29 +1412,39 @@ end;
 
 // setlength(S, N) on the text variable at ASlot (AUnit-byte units): N units after it, the
 // first kept up to the smaller length and any added ones 0 (std::string's / wstring's
-// resize); the same length changes nothing; 0 is the empty text, nil (a negative N raises
-// once exceptions exist, M3.11: until then it empties the text too). A block shared or
-// constant is not grown in place: the new one is the slot's own
+// resize); the same length changes nothing; 0 is the empty text, nil. A negative N raises
+// code 12 `negative length N`, a length the heap cannot hold `out of memory (length N)`
+// (PaskalCPP's set_length), the text then as it was. A block shared or constant is not
+// grown in place: the new one is the slot's own
 routine TextSetLength(const ASlot: ptr to ptr; const ALength: int64; const AUnit: int64);
 var
   LOld: ptr;
   LOldLength: int64;
   LKept: int64;
+  LBytes: int64;
   LHeader: ptr to int64;
   LBlock: ptr;
   LTo: ptr to uint8;
   LFrom: ptr to uint8;
   LI: int64;
 begin
+  if ALength < 0 then
+    LengthFail(ALength);
+  end;
   LOld := ASlot^;
   LOldLength := StrLength(LOld);
   if ALength = LOldLength then
     return;
   end;
-  if ALength <= 0 then
+  if ALength = 0 then
     ASlot^ := nil;
     StrRelease(LOld);
     return;
+  end;
+  // the units and the 0 unit after them
+  LBytes := DoBlockBytes(ALength, AUnit, 1);
+  if LBytes < 0 then
+    LengthFail(ALength);
   end;
   LKept := LOldLength;
   if ALength < LKept then
@@ -1335,12 +1452,25 @@ begin
   end;
   LHeader := ptr to int64(LOld);
   if (LOld <> nil) and (atomicload(LHeader[0]) = 1) then
-    // the slot's own block: resized where it is (maybe moved), its units kept
-    LBlock := ResizeMem(LOld, 16 + (ALength + 1) * AUnit);
+    // the slot's own block: resized where it is (maybe moved), its units kept. A growth
+    // the heap refuses leaves the text as it was; a shrink it refuses keeps the larger
+    // block, which holds the shorter text and its 0 unit as well
+    LBlock := PlatformResize(LOld, LBytes);
+    if LBlock = nil then
+      if ALength > LOldLength then
+        LengthFail(ALength);
+      end;
+      LBlock := LOld;
+    end;
     LHeader := ptr to int64(LBlock);
     LHeader[1] := ALength;
   else
-    LBlock := TextNew(ALength, AUnit);
+    // a new block, through DoGetMem so no room raises setlength's own text
+    LBlock := DoGetMem(LBytes);
+    if LBlock = nil then
+      LengthFail(ALength);
+    end;
+    DoTextReady(LBlock, ALength, AUnit);
     if LKept > 0 then
       LTo := ptr to uint8(LBlock);
       LFrom := ptr to uint8(LOld);
@@ -5329,6 +5459,27 @@ begin
   RaiseWith(ADAM_RUNTIME_EXC_NIL_OWNER, TextOfC(ptr to const char("access through a nil own / ref")));
 end;
 
+// The memory check's raise (getmem / resizemem / setlength: PaskalCPP's EXC_MEMORY texts):
+// code 12 with the text ABefore, AValue's digits, AAfter; it never returns. The text takes
+// blocks of its own, so a heap with no room at all could fail again while it is built:
+// that second failure (GMemoryFailing) raises code 12 with the empty text, which needs no
+// block, so it ends instead of failing again without end
+routine MemoryFail(const ABefore: ptr to const char; const AValue: int64;
+  const AAfter: ptr to const char);
+var
+  LText: ptr;
+begin
+  if GMemoryFailing then
+    GMemoryFailing := false;
+    RaiseWith(ADAM_RUNTIME_EXC_MEMORY, nil);
+  end;
+  GMemoryFailing := true;
+  LText := TextJoinTaken(TextOfC(ABefore), IntText(AValue));
+  LText := TextJoinTaken(LText, TextOfC(AAfter));
+  GMemoryFailing := false;
+  RaiseWith(ADAM_RUNTIME_EXC_MEMORY, LText);
+end;
+
 // A raise nothing caught, reported as PaskalCPP's runtime reports it (report_unhandled):
 // what the program wrote to stdout flushed first, then `unhandled exception <code>: <text>`
 // and a newline to stderr, then the process ends with exit code 1 through Halt, so the exit
@@ -5431,7 +5582,7 @@ var
   LWords: ptr to uint64;
   LHandle: uint64;
 begin
-  LBlock := GetMem(ADAM_RUNTIME_THREAD_BLOCK);
+  LBlock := DoGetMem(ADAM_RUNTIME_THREAD_BLOCK);
   if LBlock = nil then
     return nil;
   end;
@@ -5806,7 +5957,7 @@ public routine LockCreate(): ptr;
 var
   LLock: ptr;
 begin
-  LLock := GetMem(PlatformLockSize());
+  LLock := DoGetMem(PlatformLockSize());
   if LLock = nil then
     return nil;
   end;
