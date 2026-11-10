@@ -230,6 +230,9 @@ public const
   // block never counted or freed, then the length, both int64, the bytes after them
   ADAM_LOWERING_STRING_CONSTANT_COUNT: int64 = -1;
   ADAM_LOWERING_STRING_HEADER: int64 = 16;
+  // Where a string's, a wstring's or a dynamic array's block holds its length (units or
+  // elements, int64), after its ref count (System.Runtime's StrLength reads it there)
+  ADAM_LOWERING_BLOCK_LENGTH: int64 = 8;
   // The bytes of one wstring unit (UTF-16, DESIGN sec 8)
   ADAM_LOWERING_WIDE_UNIT: int64 = 2;
   // The prefix of a type's managed map's read-only data symbol (its data id follows): where
@@ -337,7 +340,8 @@ public const
   // Raised when a static array's low bound has no value (Layout gave the type a size, so it
   // folded: a broken invariant)
   ADAM_LOWERING_FAULT_LOW_BOUND: string = "Lowering: no low bound for the static array ";
-  // Raised when a static array printed as a range has no folded high bound (DoRangeElements)
+  // Raised when a static array's high bound has no folded value (an indexed element's
+  // check, DoArrayElement; a range printed, DoRangeElements)
   ADAM_LOWERING_FAULT_HIGH_BOUND: string = "Lowering: no high bound for the static array ";
   // Raised when a record or a field has no layout (Layout gave none: a broken invariant)
   ADAM_LOWERING_FAULT_FIELD_OFFSET: string = "Lowering: no layout for the record or field ";
@@ -1318,6 +1322,76 @@ public type
       return LId;
     end;
 
+    // The index check (M3.11a; DESIGN sec 5: kept at debug and safe) of a static array's
+    // index AIndex (widened to int64) whose position APosition is AIndex less the low bound
+    // ALow: one unsigned compare of the position with AHigh - ALow; outside, a block of its
+    // own calls the runtime's IndexFail (code 14, `index N is out of bounds L..H`), which
+    // never returns (the block still ends in a jump, as every block does). False after
+    // LW0001
+    hidden method DoCheckBounds(const AIndex: int64; const APosition: int64; const ALow: int64;
+      const AHigh: int64; const ANode: int64): bool;
+    var
+      LInRange: int64;
+      LBad: int64;
+      LGood: int64;
+      LArgs: ref Int64List;
+    begin
+      LInRange := self.DoCompareWith(IrPredicate.ULessEqual, self.DoConvertIr(APosition, IrType.UInt64, ANode),
+        self.DoConstant(IrType.UInt64, AHigh - ALow, ANode), ANode);
+      LBad := self.FModule.AddBlock(self.FFunction);
+      LGood := self.FModule.AddBlock(self.FFunction);
+      self.DoBranchOn(LInRange, LGood, LBad, ANode);
+      self.FBlock := LBad;
+      LArgs := ref Int64List();
+      LArgs.Add(AIndex);
+      LArgs.Add(self.DoConstant(IrType.Int64, ALow, ANode));
+      LArgs.Add(self.DoConstant(IrType.Int64, AHigh, ANode));
+      if self.DoCallRuntimeArgs(RuntimeRoutine.IndexFail, LArgs, ANode) = 0 then
+        return false;
+      end;
+      self.DoJumpTo(LGood, ANode);
+      self.FBlock := LGood;
+      return true;
+    end;
+
+    // The index check (M3.11a) of the index AIndex (an int64, counted from 0) into the
+    // block ABlock of a string, a wstring or a dynamic array (nil when empty): a nil block
+    // holds nothing; a held one's length (ADAM_LOWERING_BLOCK_LENGTH) above the index, one
+    // unsigned compare (a negative index is past every length). Outside, a block of its own
+    // calls the runtime's IndexFailIn (code 14, the block's bounds or `it is empty`), which
+    // never returns. False after LW0001
+    hidden method DoCheckLength(const ABlock: int64; const AIndex: int64; const ANode: int64): bool;
+    var
+      LHeld: int64;
+      LBad: int64;
+      LInBlock: int64;
+      LGood: int64;
+      LLength: int64;
+      LInRange: int64;
+      LArgs: ref Int64List;
+    begin
+      LHeld := self.DoCompareWith(IrPredicate.NotEqual, ABlock, self.DoConstant(IrType.Pointer, 0, ANode), ANode);
+      LBad := self.FModule.AddBlock(self.FFunction);
+      LInBlock := self.FModule.AddBlock(self.FFunction);
+      LGood := self.FModule.AddBlock(self.FFunction);
+      self.DoBranchOn(LHeld, LInBlock, LBad, ANode);
+      self.FBlock := LInBlock;
+      LLength := self.DoLoad(self.DoByteOffset(ABlock, ADAM_LOWERING_BLOCK_LENGTH, ANode), IrType.Int64, ANode);
+      LInRange := self.DoCompareWith(IrPredicate.ULess, self.DoConvertIr(AIndex, IrType.UInt64, ANode),
+        self.DoConvertIr(LLength, IrType.UInt64, ANode), ANode);
+      self.DoBranchOn(LInRange, LGood, LBad, ANode);
+      self.FBlock := LBad;
+      LArgs := ref Int64List();
+      LArgs.Add(AIndex);
+      LArgs.Add(ABlock);
+      if self.DoCallRuntimeArgs(RuntimeRoutine.IndexFailIn, LArgs, ANode) = 0 then
+        return false;
+      end;
+      self.DoJumpTo(LGood, ANode);
+      self.FBlock := LGood;
+      return true;
+    end;
+
     // The address of the element of the static array AArray (of the canonical type AType)
     // the index expression AId names: the array's address first, then the index widened to
     // int64 by its own signedness (a char or a wchar by the target's, as its bounds are
@@ -1330,8 +1404,10 @@ public type
     var
       LBase: int64;
       LIndex: int64;
+      LWide: int64;
       LPosition: int64;
       LLow: int64;
+      LHigh: int64;
       LLowValue: int64;
       LId: int64;
     begin
@@ -1343,10 +1419,15 @@ public type
       if LIndex = 0 then
         return 0;
       end;
-      LPosition := self.DoConvertIr(LIndex, IrType.Int64, AId);
+      LWide := self.DoConvertIr(LIndex, IrType.Int64, AId);
+      LPosition := LWide;
       if not BoundValue(self.FTree, self.FTarget, self.FTree.FirstOf(self.FTree[AType].ResolvedDecl,
         NodeRole.LowBound), LLow) then
         raise(ADAM_LOWERING_FAULT_LOW_BOUND + TypeText(self.FTree, AType));
+      end;
+      if not BoundValue(self.FTree, self.FTarget, self.FTree.FirstOf(self.FTree[AType].ResolvedDecl,
+        NodeRole.HighBound), LHigh) then
+        raise(ADAM_LOWERING_FAULT_HIGH_BOUND + TypeText(self.FTree, AType));
       end;
       if LLow <> 0 then
         // every operand is emitted before the instruction that uses it
@@ -1355,6 +1436,9 @@ public type
         self.FModule.InstrAt(LId).Operands.Add(LPosition);
         self.FModule.InstrAt(LId).Operands.Add(LLowValue);
         LPosition := LId;
+      end;
+      if not self.DoCheckBounds(LWide, LPosition, LLow, LHigh, AId) then
+        return 0;
       end;
       return self.DoMovePointer(LBase, LPosition, AType, false, AId);
     end;
@@ -1401,7 +1485,8 @@ public type
     // elements from the block's first (DoMovePointer). To read it, the array's value (a
     // borrowed one); to write it (AWrite: DoAddressFor's write form), the array's own place
     // in its write form, its block made the place's alone first (ArrUnique with the type's
-    // element map: copy on write). Bounds are checked from M3.11 on; 0 after LW0001
+    // element map: copy on write). The index is checked against the block's length
+    // (DoCheckLength, M3.11a); 0 after LW0001
     hidden method DoDynamicElement(const AId: int64; const AWrite: bool): int64;
     var
       LOperand: int64;
@@ -1431,6 +1516,10 @@ public type
       end;
       LIndex := self.DoValue(self.FTree.FirstOf(AId, NodeRole.Index));
       if LIndex = 0 then
+        return 0;
+      end;
+      LIndex := self.DoConvertIr(LIndex, IrType.Int64, AId);
+      if not self.DoCheckLength(LBase, LIndex, AId) then
         return 0;
       end;
       LBase := self.DoByteOffset(LBase, ADAM_LOWERING_ARRAY_HEADER, AId);
@@ -7783,8 +7872,9 @@ public type
     // an array's element), the units after the block's header. To write it (AWrite: an
     // assignment, a compound, a step, an `addr of`), the text variable's block is made its
     // own first (StrUnique / WStrUnique: copy on write, a literal's block copied too:
-    // DoManagedSlot's variables only); to read it, the text's value (a borrowed one). Bounds
-    // are checked from M3.11 on; 0 after LW0001
+    // DoManagedSlot's variables only); to read it, the text's value (a borrowed one). The
+    // index is checked against the text's length in units (DoCheckLength, M3.11a); 0 after
+    // LW0001
     hidden method DoStringElement(const AId: int64; const AWrite: bool): int64;
     var
       LOperand: int64;
@@ -7819,6 +7909,10 @@ public type
       // every operand is emitted before the instruction that uses it; a wstring's unit is
       // 2 bytes, so its index counts twice that many
       LIndex := self.DoConvertIr(LIndex, IrType.Int64, AId);
+      // the index check counts units: before a wstring's index becomes bytes
+      if not self.DoCheckLength(LBase, LIndex, AId) then
+        return 0;
+      end;
       if self.DoIsWideText(LText) then
         LScale := self.DoConstant(IrType.Int64, ADAM_LOWERING_WIDE_UNIT, AId);
         LId := self.DoEmit(IrOp.Mul, IrType.Int64, AId);
