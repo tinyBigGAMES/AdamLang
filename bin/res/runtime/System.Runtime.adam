@@ -111,8 +111,11 @@ threadstatic
   // call that may allocate and 0 right after it, so every block DoGetMem makes inside that
   // call (the runtime's own helpers' included) belongs to the construct; 0 is "runtime",
   // a block the runtime makes outside such a call (a thread block). The compiler
-  // finds it by name (Semantics' ADAM_SEMANTICS_RUNTIME_ALLOC_SITE)
+  // finds it by name (Semantics' ADAM_SEMANTICS_RUNTIME_ALLOC_SITE). Debug builds only
+  // (BNF sec 9 DEBUG): a release build stores no site and has no GAllocSite
+@ifdef DEBUG
   GAllocSite: int32;
+@endif
 
 type
   // A mutex's bytes (BNF sec 4; the target lays out ADAM_TARGET_*_MUTEX_SIZE / _ALIGN as
@@ -196,8 +199,12 @@ end;
 // diagnostic; every build is a debug build until M6's levels, a release build will not print
 // it). The leak is signed: a block freed that was never counted shows as negative, not
 // wrapped. A task a module's teardown started is waited for first (TaskWait again: the
-// entry's own ran before every teardown), so the counts are the whole program's
+// entry's own ran before every teardown), so the counts are the whole program's. A debug
+// build lists under it each site still holding blocks (M4.L1, DoReportLeaks)
 forward routine TaskWait();
+@ifdef DEBUG
+forward routine DoReportLeaks();
+@endif
 
 routine ReportHeap();
 begin
@@ -207,6 +214,9 @@ begin
   end;
   println("[Heap] Allocs: {}, Frees: {}, Leaked: {}", atomicload(GAllocs),
     atomicload(GFrees), int64(atomicload(GAllocs)) - int64(atomicload(GFrees)));
+@ifdef DEBUG
+  DoReportLeaks();
+@endif
 end;
 
 // AOn: the heap report prints as the process ends (the start); off: it does not. A
@@ -262,9 +272,305 @@ const
 forward routine MemoryFail(const ABefore: ptr to const char; const AValue: int64;
   const AAfter: ptr to const char);
 
-// ASize (above 0) bytes from the heap, uninitialized, counted; nil when the heap cannot give
-// them (nothing counted). The one allocation every block goes through: GetMem raises on its
-// nil, setlength's shapes raise their own text on it
+@ifdef DEBUG
+// Declared below: the mutex the tracker holds, ACount bytes zeroed
+forward routine MutexEnter(const AMutex: ptr);
+forward routine MutexLeave(const AMutex: ptr);
+forward routine ZeroBytes(const AAddress: ptr; const ACount: int64);
+
+// The leak tracker (M4.L1; debug builds only, BNF sec 9 DEBUG: a release build compiles
+// none of it). Every live heap block's byte count and allocation site (GAllocSite as it is
+// made) sit in an open-addressed table keyed by the block's address, beside the blocks,
+// never a header in them; the table's own memory comes straight from the platform (neither
+// counted nor tracked) and one mutex guards it. At exit the heap report lists, under its
+// [Heap] line, each site still holding blocks (DoReportLeaks)
+type
+  // One slot: the block's address (nil: never used), its byte count (-1: the block was
+  // freed; the address is kept so a later probe walks past it) and its site id (0: the
+  // runtime's own, made outside any compiled construct)
+  TrackSlot = record
+    Block: ptr;
+    Size: int64;
+    Site: int32;
+  end;
+
+const
+  // The table's first slot count; a power of two, doubled once used slots (live and freed)
+  // would pass half of it
+  ADAM_RUNTIME_TRACK_START: int64 = 4096;
+
+var
+  GTrackSlots: ptr to TrackSlot;
+  GTrackCapacity: int64;
+  GTrackUsed: int64;
+  // The blocks the tracker had no room for (its table could not grow): the report says so
+  GTrackLost: int64;
+  GTrackMutex: MutexWords;
+  // The exe's allocation site table (Lowering's __adam_allocsites), handed over by the
+  // entry (HeapSites); nil until then
+  GSiteTable: ptr to const uint8;
+
+// A debug build's entry hands over its exe's site table (M4.L1; the compiler calls it,
+// Semantics' ADAM_SEMANTICS_RUNTIME_HEAP_SITES)
+routine HeapSites(const ATable: ptr);
+begin
+  GSiteTable := ptr to const uint8(ATable);
+end;
+
+// The home slot of ABlock in a table of ACapacity (a power of two) slots: the address
+// without its always-zero low bits, its high bits folded in
+routine DoTrackHome(const ABlock: ptr; const ACapacity: int64): int64;
+var
+  LKey: uint64;
+begin
+  LKey := uint64(ABlock) shr 4;
+  LKey := LKey xor (LKey shr 17) xor (LKey shr 31);
+  return int64(LKey & uint64(ACapacity - 1));
+end;
+
+// ABlock (ASize bytes, site ASite) put into the table ASlots of ACapacity slots, in the
+// first never-used or freed slot from its home; true when that slot was never used (one
+// more used slot)
+routine DoTrackPut(const ASlots: ptr to TrackSlot; const ACapacity: int64; const ABlock: ptr;
+  const ASize: int64; const ASite: int32): bool;
+var
+  LAt: int64;
+  LSlot: ptr to TrackSlot;
+  LFresh: bool;
+begin
+  LAt := DoTrackHome(ABlock, ACapacity);
+  LSlot := addr of ASlots[LAt];
+  while (LSlot^.Block <> nil) and (LSlot^.Size >= 0) do
+    LAt := (LAt + 1) & (ACapacity - 1);
+    LSlot := addr of ASlots[LAt];
+  end;
+  LFresh := LSlot^.Block = nil;
+  LSlot^.Block := ABlock;
+  LSlot^.Size := ASize;
+  LSlot^.Site := ASite;
+  return LFresh;
+end;
+
+// The table made twice as large (ADAM_RUNTIME_TRACK_START the first time), its live slots
+// moved in and its freed ones dropped; false when the platform has no room (the table as it
+// was). The caller holds the mutex
+routine DoTrackGrow(): bool;
+var
+  LCapacity: int64;
+  LSlots: ptr to TrackSlot;
+  LOld: ptr to TrackSlot;
+  LUsed: int64;
+  LI: int64;
+begin
+  LCapacity := GTrackCapacity * 2;
+  if LCapacity = 0 then
+    LCapacity := ADAM_RUNTIME_TRACK_START;
+  end;
+  LSlots := ptr to TrackSlot(PlatformAlloc(LCapacity * size(TrackSlot)));
+  if LSlots = nil then
+    return false;
+  end;
+  ZeroBytes(ptr(LSlots), LCapacity * size(TrackSlot));
+  LUsed := 0;
+  for LI := 0 to GTrackCapacity - 1 do
+    LOld := addr of GTrackSlots[LI];
+    if (LOld^.Block <> nil) and (LOld^.Size >= 0) then
+      DoTrackPut(LSlots, LCapacity, LOld^.Block, LOld^.Size, LOld^.Site);
+      LUsed := LUsed + 1;
+    end;
+  end;
+  if GTrackSlots <> nil then
+    PlatformFree(ptr(GTrackSlots));
+  end;
+  GTrackSlots := LSlots;
+  GTrackCapacity := LCapacity;
+  GTrackUsed := LUsed;
+  return true;
+end;
+
+// ABlock (ASize bytes, site ASite) recorded live; the table grown first when it would pass
+// half full, and when it cannot grow and holds one free slot or less the block is counted
+// lost instead (a probe always meets a never-used slot). The caller holds the mutex
+routine DoTrackInsert(const ABlock: ptr; const ASize: int64; const ASite: int32);
+begin
+  if (GTrackUsed + 1) * 2 > GTrackCapacity then
+    if not DoTrackGrow() then
+      if GTrackUsed + 2 > GTrackCapacity then
+        GTrackLost := GTrackLost + 1;
+        return;
+      end;
+    end;
+  end;
+  if DoTrackPut(GTrackSlots, GTrackCapacity, ABlock, ASize, ASite) then
+    GTrackUsed := GTrackUsed + 1;
+  end;
+end;
+
+// The live slot of ABlock; nil when the table holds none (a block it had no room for). The
+// caller holds the mutex
+routine DoTrackFind(const ABlock: ptr): ptr to TrackSlot;
+var
+  LAt: int64;
+  LSlot: ptr to TrackSlot;
+begin
+  if GTrackCapacity = 0 then
+    return nil;
+  end;
+  LAt := DoTrackHome(ABlock, GTrackCapacity);
+  LSlot := addr of GTrackSlots[LAt];
+  while LSlot^.Block <> nil do
+    if (LSlot^.Block = ABlock) and (LSlot^.Size >= 0) then
+      return LSlot;
+    end;
+    LAt := (LAt + 1) & (GTrackCapacity - 1);
+    LSlot := addr of GTrackSlots[LAt];
+  end;
+  return nil;
+end;
+
+// A block DoGetMem made: ABlock, ASize bytes, at this thread's allocation site
+routine DoTrackAdd(const ABlock: ptr; const ASize: int64);
+begin
+  MutexEnter(ptr(addr of GTrackMutex));
+  DoTrackInsert(ABlock, ASize, GAllocSite);
+  MutexLeave(ptr(addr of GTrackMutex));
+end;
+
+// The block at ABlock freed: its slot marked freed
+routine DoTrackRemove(const ABlock: ptr);
+var
+  LSlot: ptr to TrackSlot;
+begin
+  MutexEnter(ptr(addr of GTrackMutex));
+  LSlot := DoTrackFind(ABlock);
+  if LSlot <> nil then
+    LSlot^.Size := -1;
+  end;
+  MutexLeave(ptr(addr of GTrackMutex));
+end;
+
+// The block at AOld resized to ASize bytes, now at ANew (maybe AOld): its byte count
+// updated, its site this thread's allocation site when one is set (the construct that grew
+// it), else the one it had. The caller holds the mutex across the platform's resize too: a
+// moved block's old address is free once the resize returns, and another thread given it
+// must not record it before its old slot is marked freed here
+routine DoTrackMove(const AOld: ptr; const ANew: ptr; const ASize: int64);
+var
+  LSlot: ptr to TrackSlot;
+  LSite: int32;
+begin
+  LSlot := DoTrackFind(AOld);
+  LSite := GAllocSite;
+  if (LSite = 0) and (LSlot <> nil) then
+    LSite := LSlot^.Site;
+  end;
+  if (LSlot <> nil) and (AOld = ANew) then
+    LSlot^.Size := ASize;
+    LSlot^.Site := LSite;
+  else
+    if LSlot <> nil then
+      LSlot^.Size := -1;
+    end;
+    DoTrackInsert(ANew, ASize, LSite);
+  end;
+end;
+
+// The little-endian uint32 at AAt in the site table
+routine DoSiteWord(const AAt: int64): int64;
+var
+  LValue: int64;
+  LI: int64;
+begin
+  LValue := 0;
+  for LI := 3 downto 0 do
+    LValue := (LValue shl 8) | int64(GSiteTable[AAt + LI]);
+  end;
+  return LValue;
+end;
+
+// The NUL-ended text at the byte offset AOffset of the site table's pool (APool)
+routine DoSiteText(const APool: int64; const AOffset: int64): ptr to const char;
+begin
+  return ptr to const char(addr of GSiteTable[APool + AOffset]);
+end;
+
+// One leak line: the site's place and what it allocates (id ASite of the site table's
+// ACount), else `runtime` for site 0 or one the table does not hold; ALeaks blocks, ABytes
+// bytes
+routine DoLeakLine(const ASite: int64; const ACount: int64; const ALeaks: int64;
+  const ABytes: int64);
+var
+  LRecord: int64;
+  LPool: int64;
+  LNoun: ptr to const char;
+begin
+  LNoun := ptr to const char("leaks");
+  if ALeaks = 1 then
+    LNoun := ptr to const char("leak");
+  end;
+  if (ASite = 0) or (ASite > ACount) then
+    println("runtime: {} {}, {} bytes", ALeaks, LNoun, ABytes);
+    return;
+  end;
+  // the table: 8 magic bytes, version, count, then 16-byte records (line, column, file's
+  // text, what's text), then the pool of texts (Lowering's DoSiteTable)
+  LRecord := 16 + (ASite - 1) * 16;
+  LPool := 16 + ACount * 16;
+  println("{}({},{}): {} {}, {} bytes, {}", DoSiteText(LPool, DoSiteWord(LRecord + 8)),
+    DoSiteWord(LRecord), DoSiteWord(LRecord + 4), ALeaks, LNoun, ABytes,
+    DoSiteText(LPool, DoSiteWord(LRecord + 12)));
+end;
+
+// Under the [Heap] line: each site still holding blocks, in site id order (0, the
+// runtime's own, first), with its block count and bytes; then the blocks the tracker had
+// no room for, if any. The tally is taken under the mutex, printed after it
+routine DoReportLeaks();
+var
+  LCount: int64;
+  LTally: ptr to int64;
+  LSlot: ptr to TrackSlot;
+  LSite: int64;
+  LI: int64;
+begin
+  LCount := 0;
+  if GSiteTable <> nil then
+    LCount := DoSiteWord(12);
+  end;
+  // two words per site id 0 .. LCount: its block count, then its bytes
+  LTally := ptr to int64(PlatformAlloc((LCount + 1) * 16));
+  if LTally = nil then
+    return;
+  end;
+  ZeroBytes(ptr(LTally), (LCount + 1) * 16);
+  MutexEnter(ptr(addr of GTrackMutex));
+  for LI := 0 to GTrackCapacity - 1 do
+    LSlot := addr of GTrackSlots[LI];
+    if (LSlot^.Block <> nil) and (LSlot^.Size >= 0) then
+      LSite := int64(LSlot^.Site);
+      if (LSite < 0) or (LSite > LCount) then
+        LSite := 0;
+      end;
+      LTally[LSite * 2] := LTally[LSite * 2] + 1;
+      LTally[LSite * 2 + 1] := LTally[LSite * 2 + 1] + LSlot^.Size;
+    end;
+  end;
+  MutexLeave(ptr(addr of GTrackMutex));
+  for LI := 0 to LCount do
+    if LTally[LI * 2] > 0 then
+      DoLeakLine(LI, LCount, LTally[LI * 2], LTally[LI * 2 + 1]);
+    end;
+  end;
+  if GTrackLost > 0 then
+    println("untracked: {} blocks (the leak tracker had no room)", GTrackLost);
+  end;
+  PlatformFree(ptr(LTally));
+end;
+@endif
+
+// ASize (above 0) bytes from the heap, uninitialized, counted (and tracked in a debug
+// build); nil when the heap cannot give them (nothing counted). The one allocation every
+// block goes through: GetMem raises on its nil, setlength's shapes raise their own text on
+// it
 routine DoGetMem(const ASize: int64): ptr;
 var
   LBlock: ptr;
@@ -272,8 +578,43 @@ begin
   LBlock := PlatformAlloc(ASize);
   if LBlock <> nil then
     atomicadd(GAllocs, 1u);
+@ifdef DEBUG
+    DoTrackAdd(LBlock, ASize);
+@endif
   end;
   return LBlock;
+end;
+
+// The block at APointer (not nil) resized to ASize (above 0) bytes, maybe moved (the new
+// address; tracked in a debug build); nil when the heap cannot (the block as it was). The
+// one resize every block goes through
+routine DoResizeMem(const APointer: ptr; const ASize: int64): ptr;
+var
+  LBlock: ptr;
+begin
+@ifdef DEBUG
+  // held across the resize itself (DoTrackMove)
+  MutexEnter(ptr(addr of GTrackMutex));
+  LBlock := PlatformResize(APointer, ASize);
+  if LBlock <> nil then
+    DoTrackMove(APointer, LBlock, ASize);
+  end;
+  MutexLeave(ptr(addr of GTrackMutex));
+@else
+  LBlock := PlatformResize(APointer, ASize);
+@endif
+  return LBlock;
+end;
+
+// The block at APointer (not nil) back to the heap, counted (and its slot freed in a debug
+// build). The one free every block goes through
+routine DoFreeMem(const APointer: ptr);
+begin
+@ifdef DEBUG
+  DoTrackRemove(APointer);
+@endif
+  PlatformFree(APointer);
+  atomicadd(GFrees, 1u);
 end;
 
 // getmem(N): N bytes from the heap, uninitialized, counted; 0 bytes is nil, uncounted. A
@@ -312,11 +653,10 @@ begin
     return GetMem(ASize);
   end;
   if ASize = 0 then
-    PlatformFree(APointer);
-    atomicadd(GFrees, 1u);
+    DoFreeMem(APointer);
     return nil;
   end;
-  LBlock := PlatformResize(APointer, ASize);
+  LBlock := DoResizeMem(APointer, ASize);
   if LBlock = nil then
     MemoryFail(ptr to const char("out of memory ("), ASize, ptr to const char(" bytes)"));
   end;
@@ -354,8 +694,7 @@ begin
   if APointer = nil then
     return;
   end;
-  PlatformFree(APointer);
-  atomicadd(GFrees, 1u);
+  DoFreeMem(APointer);
 end;
 
 const
@@ -381,7 +720,7 @@ begin
     if ACount + 1 >= ASize then
       // the heap's resize without ResizeMem's raise: no room is this routine's false, the
       // block as it was (the caller closes the file and frees it)
-      LGrown := PlatformResize(ABlock, ASize * 2);
+      LGrown := DoResizeMem(ABlock, ASize * 2);
       if LGrown = nil then
         return false;
       end;
@@ -1214,7 +1553,7 @@ begin
     // heap refuses has dropped nothing yet, so the array is as it was; a shrink it refuses
     // keeps the larger block, which holds the shorter array as well
     ArrElements(LOld, AElement, LKept, LOldLength - LKept, false);
-    LBlock := PlatformResize(LOld, LBytes);
+    LBlock := DoResizeMem(LOld, LBytes);
     if LBlock = nil then
       if ALength > LOldLength then
         LengthFail(ALength);
@@ -1462,7 +1801,7 @@ begin
     // the slot's own block: resized where it is (maybe moved), its units kept. A growth
     // the heap refuses leaves the text as it was; a shrink it refuses keeps the larger
     // block, which holds the shorter text and its 0 unit as well
-    LBlock := PlatformResize(LOld, LBytes);
+    LBlock := DoResizeMem(LOld, LBytes);
     if LBlock = nil then
       if ALength > LOldLength then
         LengthFail(ALength);
