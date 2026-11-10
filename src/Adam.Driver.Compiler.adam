@@ -80,7 +80,8 @@ import System.SysUtils, System.Windows, Adam.Core.Common, Adam.Core.Messages, Ad
   Adam.Compiler.SourceText, Adam.Compiler.Diagnostics, Adam.Compiler.SourceFiles,
   Adam.Compiler.AST, Adam.Compiler.Parser, Adam.Compiler.Semantics, Adam.Compiler.Layout,
   Adam.Compiler.Symbols, Adam.Backend.Ssa, Adam.Backend.Lowering, Adam.Backend.Sections,
-  Adam.Backend.Targets, Adam.Backend.Generate, Adam.Driver.Project;
+  Adam.Backend.Targets, Adam.Backend.Generate, Adam.Acu.Format, Adam.Acu.Writer,
+  Adam.Driver.Project;
 
 public const
   ADAM_ERR_DRIVER_001: string = "DR0001";
@@ -93,6 +94,7 @@ public const
   ADAM_ERR_DRIVER_008: string = "DR0008";   // the exe cannot be written
   ADAM_ERR_DRIVER_009: string = "DR0009";   // a main module build cannot output yet (dll / lib: M8)
   ADAM_ERR_DRIVER_010: string = "DR0010";   // project.toml's type is not the main module's kind
+  ADAM_ERR_DRIVER_011: string = "DR0011";   // a unit's .acu cannot be written
 
   // Build's output folder when neither the command line nor @outputpath names one: under
   // the working folder (BNF sec 2)
@@ -491,9 +493,95 @@ public type
       return ResolvePath(ADAM_DRIVER_OUTPUT_DIR);
     end;
 
-    // Check on the program whose main module is AMainPath, then, when nothing stops it, its
-    // exe generated into the output folder AOutputDir ("" for the default; see the header).
-    // Everything goes to Reports; nothing is printed
+    // The source text the module AModule was parsed from ("" when no loaded file is its)
+    hidden const method DoSourceOf(const AModule: int64): string;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to self.FSources.Count - 1 do
+        if self.FSources[LI].FileName = self.FTree[AModule].Place.FileName then
+          return self.FSources[LI].Slice(0, self.FSources[LI].ByteCount);
+        end;
+      end;
+      return "";
+    end;
+
+    // The compiler's identity an .acu's header carries: its version and its exe's size and
+    // write time, hashed (any other compiler build is another id)
+    hidden const method DoCompilerId(): uint64;
+    var
+      LExe: string;
+    begin
+      LExe := ProgramFilePath();
+      return Fnv1a64(ADAM_VERSION_STR + "|" + IntToStr(FileSize(LExe)) + "|" +
+        IntToStr(FileWriteTime(LExe)));
+    end;
+
+    // Every module of the checked tree written as its .acu (Adam.Acu.Format) into
+    // <ARoot>\acu\<triple>\<mode>\, each through a temporary file put into place in one step;
+    // false after a report (DR0007 the folder, DR0011 a unit)
+    hidden method DoWriteUnits(const ARoot: string; const ABackend: ref Backend): bool;
+    var
+      LDir: string;
+      LHeader: AcuHeader;
+      LI: int64;
+      LModule: int64;
+      LSource: string;
+      LSet: ref SectionSet;
+      LInfo: int64;
+      LPath: string;
+      LTemp: string;
+    begin
+      LDir := ResolvePath(ADAM_OUTPUT_ACU_DIR, ARoot);
+      LDir := ResolvePath(self.FTree.Triple, LDir);
+      LDir := ResolvePath(AcuModeOf(self.FTree.DebugBuild), LDir);
+      if (LDir = "") or not ForceDirectories(LDir) then
+        self.FReports.Add(Severity.Error, ADAM_ERR_DRIVER_007, NoPlace(),
+          ADAM_MSG_DRIVER_OUTPUT_DIR, NoArgs().Str(LDir));
+        return false;
+      end;
+      LHeader.FormatVersion := ADAM_ACU_FORMAT_VERSION;
+      LHeader.CompilerVersion := ADAM_VERSION_STR;
+      LHeader.CompilerId := self.DoCompilerId();
+      LHeader.Triple := self.FTree.Triple;
+      LHeader.Mode := AcuModeOf(self.FTree.DebugBuild);
+      LHeader.ProjectKey := 0;
+      if self.FTree.InProject then
+        LHeader.ProjectKey := self.FTree.ProjectKey;
+      end;
+      for LI := 0 to self.FTree.ChildCount(ADAM_AST_PROGRAM) - 1 do
+        LModule := self.FTree.ChildAt(ADAM_AST_PROGRAM, LI);
+        if self.FTree.RoleOf(LModule) = NodeRole.Module then
+          LSource := self.DoSourceOf(LModule);
+          LHeader.UnitName := self.FTree[LModule].Text;
+          LHeader.SourcePath := self.FTree[LModule].Place.FileName;
+          LHeader.SourceSize := FileSize(LHeader.SourcePath);
+          LHeader.SourceTime := FileWriteTime(LHeader.SourcePath);
+          LHeader.SourceHash := Fnv1a64(LSource);
+          // One object of the target's format: the payload in its Info section (the unit's
+          // code sections join it at SU2.4)
+          LSet := ref SectionSet();
+          LInfo := LSet.AddSection(ABackend.Format.SectionNameOf(SectionKind.Info),
+            SectionKind.Info, ADAM_ACU_SECTION_ALIGN);
+          LSet.SectionAt(LInfo).PutBytes(WriteAcuPayload(self.FTree, LModule, LHeader));
+          LPath := ResolvePath(AcuFileName(LHeader.UnitName), LDir);
+          LTemp := LPath + ".tmp";
+          if (LPath = "") or not WriteAllBytes(LTemp, ABackend.Format.WriteObject(LSet)) or
+            not ReplaceFile(LTemp, LPath) then
+            // The temporary file is this build's own: never left behind
+            DeleteFile(LTemp);
+            self.FReports.Add(Severity.Error, ADAM_ERR_DRIVER_011, self.FTree[LModule].Place,
+              ADAM_MSG_DRIVER_WRITE_ACU, NoArgs().Str(LPath));
+            return false;
+          end;
+        end;
+      end;
+      return true;
+    end;
+
+    // Check on the program whose main module is AMainPath, then, when nothing stops it, every
+    // unit's .acu and its exe generated into the output folder AOutputDir ("" for the default;
+    // see the header). Everything goes to Reports; nothing is printed
     method Build(const AMainPath: string; const AOutputDir: string);
     var
       LModule: ref IrModule;
@@ -502,6 +590,7 @@ public type
       LSet: ref SectionSet;
       LLibraries: StringArray;
       LBytes: ByteArray;
+      LRoot: string;
       LDir: string;
       LExe: string;
     begin
@@ -516,6 +605,21 @@ public type
           .Str(LowerCase(ModuleKindText(self.FTree[self.FMain].Module))));
         return;
       end;
+      // The output folder and the backend before anything is lowered: every unit's .acu is
+      // written from the checked tree (SU2.1)
+      LRoot := self.DoOutputDir(AOutputDir);
+      if LRoot = "" then
+        self.FReports.Add(Severity.Error, ADAM_ERR_DRIVER_007, NoPlace(),
+          ADAM_MSG_DRIVER_OUTPUT_DIR, NoArgs().Str(AOutputDir));
+        return;
+      end;
+      LBackend := PickBackend(self.FTree.Triple, self.FTree[self.FMain].Place, self.FReports);
+      if LBackend = nil then
+        return;
+      end;
+      if not self.DoWriteUnits(LRoot, LBackend) then
+        return;
+      end;
       LModule := LowerProgram(self.FTree, self.FTarget, self.FReports);
       if self.FReports.HasErrors() then
         return;
@@ -526,10 +630,6 @@ public type
       end;
       // Function ids start at 1: id 0 is none (Adam.Backend.Ssa)
       self.DoPhaseEnded(BuildPhase.Lower, LModule.FunctionCount - 1, 0, "");
-      LBackend := PickBackend(self.FTree.Triple, self.FTree[self.FMain].Place, self.FReports);
-      if LBackend = nil then
-        return;
-      end;
       LSet := GenerateSections(LModule, LBackend, self.FTree);
       self.DoPhaseEnded(BuildPhase.Generate, self.DoCodeBytes(LSet), 0, "");
       setlength(LLibraries, 0);
@@ -538,14 +638,8 @@ public type
       if self.FReports.HasErrors() then
         return;
       end;
-      LDir := self.DoOutputDir(AOutputDir);
-      if LDir = "" then
-        self.FReports.Add(Severity.Error, ADAM_ERR_DRIVER_007, NoPlace(),
-          ADAM_MSG_DRIVER_OUTPUT_DIR, NoArgs().Str(AOutputDir));
-        return;
-      end;
       // The exe goes to the output folder's bin part (SU1)
-      LDir := ResolvePath(ADAM_OUTPUT_BIN_DIR, LDir);
+      LDir := ResolvePath(ADAM_OUTPUT_BIN_DIR, LRoot);
       if (LDir = "") or not ForceDirectories(LDir) then
         self.FReports.Add(Severity.Error, ADAM_ERR_DRIVER_007, NoPlace(),
           ADAM_MSG_DRIVER_OUTPUT_DIR, NoArgs().Str(LDir));
