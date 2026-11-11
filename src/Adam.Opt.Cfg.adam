@@ -1,0 +1,826 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Opt.Cfg.adam - control flow simplification (PLAN-ADAM M6 O7)
+
+  SimplifyControlFlow reshapes one function's blocks, in rounds until a round
+  changes nothing; each step makes its own graph of the blocks as they stand
+  (DoGraph: terminator edges and a catching scope's unwind edges, as
+  Adam.Opt.Analysis has them), so no step reads a fact an earlier one made
+  stale:
+    fold     a branch on a constant becomes a jump to the arm it takes (the
+             other arm's phis lose this block's value); a branch with one
+             block for both arms becomes a jump to it
+    drop     the blocks the entry does not reach (sccp's bare rets, the
+             blocks adce's jumps skip, a folded branch's dead arm) leave the
+             function, and the phis of the kept blocks lose their values
+    phis     a phi with one value (its block has one predecessor) is that
+             value: every use takes it, the phi goes
+    merge    a block that jumps to a block only it runs into takes that
+             block's code (its phis replaced by their one value), when both
+             are in the same scopes and the other is no resume target and
+             not the entry; a chain of them merges into its first block
+    bypass   a block that is a bare jump (not to itself, not the entry, no
+             resume target) is bypassed: each predecessor jumps straight on
+             and the target's phis take the value from each of them; skipped
+             when the target has phis and one of them runs into it already;
+             the bypassed block is unreached, the next round drops it
+
+  Scopes name blocks by POSITION in IrFunction.Blocks (first to last, the
+  target where a caught exception resumes): every step that removes blocks
+  goes through DoCompact, which renumbers each scope to the kept blocks of
+  its run in the same step and drops a scope with none left (its funclet then
+  runs for no block). A scope that stays keeps its resume block: its blocks
+  reach it by their unwind edge (raised otherwise: a compiler bug). Blocks
+  keep their order, so a scope's run stays a run and a kept target stays
+  outside it.
+
+  A block merged away and every block dropped are left out of the function's
+  list (the module keeps them unused); a moved instruction takes its new
+  block. Phis are only ever this function's: a funclet uses its parent's
+  slots alone, so no other function's operand changes.
+*******************************************************************************/
+
+module unit Adam.Opt.Cfg;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Ssa, Adam.Opt.Analysis;
+
+const
+  // No block / no instruction (a map's missing value), and a block id's mark in a set
+  ADAM_CFG_NONE: int64 = -1;
+  ADAM_CFG_GONE: int64 = 1;
+  // Raised (an invariant broken): a terminator target no block of the function, a kept
+  // scope whose resume block went, a merged block's phi without exactly one value, a chain
+  // of one-value phis that runs round to itself
+  ADAM_CFG_FAULT_NOT_OWN_BLOCK: string = "Opt: simplifycfg found a target no block of the function: b";
+  ADAM_CFG_FAULT_RESUME: string = "Opt: simplifycfg dropped the resume block of a kept scope: b";
+  ADAM_CFG_FAULT_PHI_COUNT: string = "Opt: simplifycfg merged a block whose phi has not one value: i";
+  ADAM_CFG_FAULT_REPLACE_CYCLE: string = "Opt: simplifycfg found one-value phis in a cycle at i";
+
+type
+  // One list of block positions per block
+  BlockPositionLists = array of ref Int64List;
+
+  // One function's control flow simplification (see the header)
+  ControlFlowSimplifier = object
+    hidden FModule: ref IrModule;
+    hidden FFunction: ref IrFunction;
+    // The graph of the blocks as they stand (DoGraph): how many, each block id's
+    // position, each position's predecessors (each once, in block order; a catching
+    // scope's blocks are predecessors of its target), whether the entry reaches it,
+    // whether a scope resumes at it
+    hidden FCount: int64;
+    hidden FPositionOf: ref Int64Map;
+    hidden FPreds: BlockPositionLists;
+    hidden FReached: BoolArray;
+    hidden FResume: BoolArray;
+
+    // The simplification of AModule's function AFunction
+    init(const AModule: ref IrModule; const AFunction: int64);
+    begin
+      self.FModule := AModule;
+      self.FFunction := AModule.FunctionAt(AFunction);
+      self.FCount := 0;
+      self.FPositionOf := ref Int64Map(ADAM_CFG_NONE);
+    end;
+
+    // The terminator of the block ABlock (an id; ADAM_CFG_NONE: it ends in none)
+    hidden const method DoTerminatorOf(const ABlock: int64): int64;
+    var
+      LInstrs: ref Int64List;
+      LLast: int64;
+    begin
+      LInstrs := self.FModule.BlockAt(ABlock).Instrs;
+      if LInstrs.Count = 0 then
+        return ADAM_CFG_NONE;
+      end;
+      LLast := LInstrs[LInstrs.Count - 1];
+      if not IsTerminator(self.FModule.InstrAt(LLast).Kind) then
+        return ADAM_CFG_NONE;
+      end;
+      return LLast;
+    end;
+
+    // True when the block ABlock (an id) has a phi
+    hidden const method DoHasPhi(const ABlock: int64): bool;
+    var
+      LInstrs: ref Int64List;
+      LK: int64;
+    begin
+      LInstrs := self.FModule.BlockAt(ABlock).Instrs;
+      for LK := 0 to LInstrs.Count - 1 do
+        if self.FModule.InstrAt(LInstrs[LK]).Kind = IrOp.Phi then
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // The graph of the blocks as they stand (see the fields)
+    hidden method DoGraph();
+    var
+      LBlocks: ref Int64List;
+      LSuccs: BlockPositionLists;
+      LWork: ref Int64List;
+      LTerminator: ref IrInstr;
+      LTerm: int64;
+      LTarget: int64;
+      LAt: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      LBlocks := self.FFunction.Blocks;
+      self.FCount := LBlocks.Count;
+      self.FPositionOf := ref Int64Map(ADAM_CFG_NONE);
+      setlength(self.FPreds, self.FCount);
+      setlength(self.FReached, self.FCount);
+      setlength(self.FResume, self.FCount);
+      setlength(LSuccs, self.FCount);
+      for LI := 0 to self.FCount - 1 do
+        self.FPositionOf.Put(LBlocks[LI], LI);
+        self.FPreds[LI] := ref Int64List();
+        self.FReached[LI] := false;
+        self.FResume[LI] := false;
+        LSuccs[LI] := ref Int64List();
+      end;
+      for LI := 0 to self.FCount - 1 do
+        LTerm := self.DoTerminatorOf(LBlocks[LI]);
+        if LTerm <> ADAM_CFG_NONE then
+          LTerminator := self.FModule.InstrAt(LTerm);
+          for LK := 0 to LTerminator.Targets.Count - 1 do
+            LTarget := self.FPositionOf.Find(LTerminator.Targets[LK]);
+            if LTarget = ADAM_CFG_NONE then
+              raise(ADAM_CFG_FAULT_NOT_OWN_BLOCK + IntToStr(LTerminator.Targets[LK]));
+            end;
+            if LSuccs[LI].IndexOf(LTarget) < 0 then
+              LSuccs[LI].Add(LTarget);
+            end;
+          end;
+        end;
+      end;
+      // A catching scope's blocks may each raise into its target (scopes name blocks by
+      // position already)
+      for LK := 0 to self.FFunction.ScopeCount() - 1 do
+        LTarget := self.FFunction.ScopeTarget(LK);
+        if LTarget >= 0 then
+          self.FResume[LTarget] := true;
+          for LI := self.FFunction.ScopeFirst(LK) to self.FFunction.ScopeLast(LK) do
+            if LSuccs[LI].IndexOf(LTarget) < 0 then
+              LSuccs[LI].Add(LTarget);
+            end;
+          end;
+        end;
+      end;
+      // Walked in block order, so each block's predecessors come in block order
+      for LI := 0 to self.FCount - 1 do
+        for LK := 0 to LSuccs[LI].Count - 1 do
+          self.FPreds[LSuccs[LI][LK]].Add(LI);
+        end;
+      end;
+      // What the entry reaches, its unwind edges followed
+      LWork := ref Int64List();
+      self.FReached[0] := true;
+      LWork.Add(0);
+      while LWork.Count > 0 do
+        LAt := LWork.RemoveLast();
+        for LK := 0 to LSuccs[LAt].Count - 1 do
+          LTarget := LSuccs[LAt][LK];
+          if not self.FReached[LTarget] then
+            self.FReached[LTarget] := true;
+            LWork.Add(LTarget);
+          end;
+        end;
+      end;
+    end;
+
+    // The phi entries of the block ABlock (an id) that arrive from a block AGone marks
+    // removed
+    hidden method DoTrimPhis(const ABlock: int64; const AGone: ref Int64Map);
+    var
+      LInstrs: ref Int64List;
+      LPhi: ref IrInstr;
+      LOperands: ref Int64List;
+      LTargets: ref Int64List;
+      LK: int64;
+      LE: int64;
+    begin
+      LInstrs := self.FModule.BlockAt(ABlock).Instrs;
+      for LK := 0 to LInstrs.Count - 1 do
+        LPhi := self.FModule.InstrAt(LInstrs[LK]);
+        if LPhi.Kind = IrOp.Phi then
+          LOperands := ref Int64List();
+          LTargets := ref Int64List();
+          for LE := 0 to LPhi.Targets.Count - 1 do
+            if AGone.Find(LPhi.Targets[LE]) <> ADAM_CFG_GONE then
+              LOperands.Add(LPhi.Operands[LE]);
+              LTargets.Add(LPhi.Targets[LE]);
+            end;
+          end;
+          LPhi.Operands := LOperands;
+          LPhi.Targets := LTargets;
+        end;
+      end;
+    end;
+
+    // The phis of the block ABlock (an id) take the value they had from AFrom from ATo
+    hidden method DoRenamePhiSource(const ABlock: int64; const AFrom: int64; const ATo: int64);
+    var
+      LInstrs: ref Int64List;
+      LPhi: ref IrInstr;
+      LEntry: int64;
+      LK: int64;
+    begin
+      LInstrs := self.FModule.BlockAt(ABlock).Instrs;
+      for LK := 0 to LInstrs.Count - 1 do
+        LPhi := self.FModule.InstrAt(LInstrs[LK]);
+        if LPhi.Kind = IrOp.Phi then
+          LEntry := LPhi.Targets.IndexOf(AFrom);
+          if LEntry >= 0 then
+            LPhi.Targets.Put(LEntry, ATo);
+          end;
+        end;
+      end;
+    end;
+
+    // The terminator AInstr made a jump to the block ATo (an id)
+    hidden method DoMakeJump(const AInstr: ref IrInstr; const ATo: int64);
+    begin
+      AInstr.Kind := IrOp.Jump;
+      AInstr.Operands := ref Int64List();
+      AInstr.Targets := ref Int64List();
+      AInstr.Targets.Add(ATo);
+    end;
+
+    // The value AId stands for once AReplace's phis are gone: followed until it names one
+    // that stays (raised when the chain runs round: a compiler bug)
+    hidden const method DoResolve(const AReplace: ref Int64Map; const AId: int64): int64;
+    var
+      LAt: int64;
+      LNext: int64;
+      LSteps: int64;
+    begin
+      LAt := AId;
+      LSteps := 0;
+      LNext := AReplace.Find(LAt);
+      while LNext <> ADAM_CFG_NONE do
+        LSteps := LSteps + 1;
+        if LSteps > AReplace.Count then
+          raise(ADAM_CFG_FAULT_REPLACE_CYCLE + IntToStr(AId));
+        end;
+        LAt := LNext;
+        LNext := AReplace.Find(LAt);
+      end;
+      return LAt;
+    end;
+
+    // Every operand of the function that names a phi AReplace maps made the value it
+    // stands for
+    hidden method DoReplaceUses(const AReplace: ref Int64Map);
+    var
+      LBlocks: ref Int64List;
+      LInstrs: ref Int64List;
+      LInstr: ref IrInstr;
+      LValue: int64;
+      LI: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      LBlocks := self.FFunction.Blocks;
+      for LI := 0 to LBlocks.Count - 1 do
+        LInstrs := self.FModule.BlockAt(LBlocks[LI]).Instrs;
+        for LK := 0 to LInstrs.Count - 1 do
+          LInstr := self.FModule.InstrAt(LInstrs[LK]);
+          for LE := 0 to LInstr.Operands.Count - 1 do
+            LValue := self.DoResolve(AReplace, LInstr.Operands[LE]);
+            if LValue <> LInstr.Operands[LE] then
+              LInstr.Operands.Put(LE, LValue);
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // The blocks AKeep does not keep (by position) dropped from the function: the phis of
+    // the kept ones lose the values they had from them, and each scope covers the kept
+    // blocks of its run, renumbered (one with none left goes; a kept one's resume block
+    // must be kept, raised otherwise: a compiler bug)
+    hidden method DoCompact(const AKeep: BoolArray);
+    var
+      LOld: ref Int64List;
+      LNew: ref Int64List;
+      LGone: ref Int64Map;
+      LNewPosition: Int64Array;
+      LScopeFirst: Int64Array;
+      LScopeLast: Int64Array;
+      LScopeHandler: Int64Array;
+      LScopeTarget: Int64Array;
+      LScopes: int64;
+      LFrom: int64;
+      LTo: int64;
+      LResume: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      LOld := self.FFunction.Blocks;
+      LNew := ref Int64List();
+      LGone := ref Int64Map(ADAM_CFG_NONE);
+      setlength(LNewPosition, LOld.Count);
+      for LI := 0 to LOld.Count - 1 do
+        if AKeep[LI] then
+          LNewPosition[LI] := LNew.Count;
+          LNew.Add(LOld[LI]);
+        else
+          LNewPosition[LI] := ADAM_CFG_NONE;
+          LGone.Put(LOld[LI], ADAM_CFG_GONE);
+        end;
+      end;
+      for LI := 0 to LNew.Count - 1 do
+        self.DoTrimPhis(LNew[LI], LGone);
+      end;
+      // The scopes read out, then added again over the kept blocks in their order
+      LScopes := self.FFunction.ScopeCount();
+      setlength(LScopeFirst, LScopes);
+      setlength(LScopeLast, LScopes);
+      setlength(LScopeHandler, LScopes);
+      setlength(LScopeTarget, LScopes);
+      for LK := 0 to LScopes - 1 do
+        LScopeFirst[LK] := self.FFunction.ScopeFirst(LK);
+        LScopeLast[LK] := self.FFunction.ScopeLast(LK);
+        LScopeHandler[LK] := self.FFunction.ScopeHandler(LK);
+        LScopeTarget[LK] := self.FFunction.ScopeTarget(LK);
+      end;
+      self.FFunction.ClearScopes();
+      for LK := 0 to LScopes - 1 do
+        LFrom := ADAM_CFG_NONE;
+        LTo := ADAM_CFG_NONE;
+        for LI := LScopeFirst[LK] to LScopeLast[LK] do
+          if AKeep[LI] then
+            if LFrom = ADAM_CFG_NONE then
+              LFrom := LNewPosition[LI];
+            end;
+            LTo := LNewPosition[LI];
+          end;
+        end;
+        if LFrom = ADAM_CFG_NONE then
+          // No block of its run is left: the scope goes
+          skip;
+        end;
+        LResume := LScopeTarget[LK];
+        if LResume >= 0 then
+          if not AKeep[LResume] then
+            raise(ADAM_CFG_FAULT_RESUME + IntToStr(LOld[LResume]));
+          end;
+          LResume := LNewPosition[LResume];
+        end;
+        self.FFunction.AddScope(LFrom, LTo, LScopeHandler[LK], LResume);
+      end;
+      self.FFunction.Blocks := LNew;
+    end;
+
+    // fold (see the header): true when any branch became a jump
+    hidden method DoFoldBranches(): bool;
+    var
+      LBlocks: ref Int64List;
+      LBranch: ref IrInstr;
+      LCondition: ref IrInstr;
+      LGone: ref Int64Map;
+      LChanged: bool;
+      LTerm: int64;
+      LTaken: int64;
+      LOther: int64;
+      LI: int64;
+    begin
+      LChanged := false;
+      LBlocks := self.FFunction.Blocks;
+      for LI := 0 to LBlocks.Count - 1 do
+        LTerm := self.DoTerminatorOf(LBlocks[LI]);
+        if LTerm = ADAM_CFG_NONE then
+          skip;
+        end;
+        LBranch := self.FModule.InstrAt(LTerm);
+        if LBranch.Kind <> IrOp.Branch then
+          skip;
+        end;
+        LCondition := self.FModule.InstrAt(LBranch.Operands[0]);
+        if LCondition.Kind = IrOp.Constant then
+          // A bool constant is 0 / 1: true takes the then arm (Targets[0])
+          if LCondition.Imm <> 0 then
+            LTaken := LBranch.Targets[0];
+            LOther := LBranch.Targets[1];
+          else
+            LTaken := LBranch.Targets[1];
+            LOther := LBranch.Targets[0];
+          end;
+          if LOther <> LTaken then
+            LGone := ref Int64Map(ADAM_CFG_NONE);
+            LGone.Put(LBlocks[LI], ADAM_CFG_GONE);
+            self.DoTrimPhis(LOther, LGone);
+          end;
+        else
+          if LBranch.Targets[0] <> LBranch.Targets[1] then
+            skip;
+          end;
+          LTaken := LBranch.Targets[0];
+        end;
+        self.DoMakeJump(LBranch, LTaken);
+        LChanged := true;
+      end;
+      return LChanged;
+    end;
+
+    // drop (see the header): true when any block went
+    hidden method DoDropUnreachable(): bool;
+    var
+      LKeep: BoolArray;
+      LAll: bool;
+      LI: int64;
+    begin
+      self.DoGraph();
+      setlength(LKeep, self.FCount);
+      LAll := true;
+      for LI := 0 to self.FCount - 1 do
+        LKeep[LI] := self.FReached[LI];
+        if not LKeep[LI] then
+          LAll := false;
+        end;
+      end;
+      if LAll then
+        return false;
+      end;
+      self.DoCompact(LKeep);
+      return true;
+    end;
+
+    // phis (see the header): true when any phi went
+    hidden method DoSinglePhis(): bool;
+    var
+      LBlocks: ref Int64List;
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LKept: ref Int64List;
+      LReplace: ref Int64Map;
+      LId: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      LReplace := ref Int64Map(ADAM_CFG_NONE);
+      LBlocks := self.FFunction.Blocks;
+      for LI := 0 to LBlocks.Count - 1 do
+        LBlock := self.FModule.BlockAt(LBlocks[LI]);
+        LKept := ref Int64List();
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LId := LBlock.Instrs[LK];
+          LInstr := self.FModule.InstrAt(LId);
+          if (LInstr.Kind = IrOp.Phi) and (LInstr.Targets.Count = 1) then
+            LReplace.Put(LId, LInstr.Operands[0]);
+          else
+            LKept.Add(LId);
+          end;
+        end;
+        if LKept.Count <> LBlock.Instrs.Count then
+          LBlock.Instrs := LKept;
+        end;
+      end;
+      if LReplace.Count = 0 then
+        return false;
+      end;
+      self.DoReplaceUses(LReplace);
+      return true;
+    end;
+
+    // True when the blocks at positions AOne and AOther are in the same scopes
+    hidden const method DoSameScopes(const AOne: int64; const AOther: int64): bool;
+    var
+      LInOne: bool;
+      LInOther: bool;
+      LK: int64;
+    begin
+      for LK := 0 to self.FFunction.ScopeCount() - 1 do
+        LInOne := (AOne >= self.FFunction.ScopeFirst(LK)) and
+          (AOne <= self.FFunction.ScopeLast(LK));
+        LInOther := (AOther >= self.FFunction.ScopeFirst(LK)) and
+          (AOther <= self.FFunction.ScopeLast(LK));
+        if LInOne <> LInOther then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    // True when the block at position AGuest may merge into the one at AHost, which jumps
+    // to it (see the header); AInto: the block each position has merged into (itself: none)
+    hidden const method DoCanMerge(const AHost: int64; const AGuest: int64;
+      const AInto: Int64Array): bool;
+    var
+      LPred: int64;
+    begin
+      if (AGuest = AHost) or (AGuest = 0) or self.FResume[AGuest] then
+        return false;
+      end;
+      if self.FPreds[AGuest].Count <> 1 then
+        return false;
+      end;
+      // Its one predecessor, or the block that one has merged into this round
+      LPred := self.FPreds[AGuest][0];
+      while AInto[LPred] <> LPred do
+        LPred := AInto[LPred];
+      end;
+      if LPred <> AHost then
+        return false;
+      end;
+      return self.DoSameScopes(AHost, AGuest);
+    end;
+
+    // The block at position AGuest merged into the one at AHost (see the header): its phis
+    // into AReplace, its other instructions after the host's (whose jump goes), its
+    // successors' phis taking their values from the host
+    hidden method DoMergeInto(const AHost: int64; const AGuest: int64;
+      const AReplace: ref Int64Map);
+    var
+      LHost: ref IrBlock;
+      LGuest: ref IrBlock;
+      LInstr: ref IrInstr;
+      LTerminator: ref IrInstr;
+      LKept: ref Int64List;
+      LHostId: int64;
+      LGuestId: int64;
+      LTerm: int64;
+      LId: int64;
+      LK: int64;
+    begin
+      LHostId := self.FFunction.Blocks[AHost];
+      LGuestId := self.FFunction.Blocks[AGuest];
+      LHost := self.FModule.BlockAt(LHostId);
+      LGuest := self.FModule.BlockAt(LGuestId);
+      LKept := ref Int64List();
+      for LK := 0 to LHost.Instrs.Count - 2 do
+        LKept.Add(LHost.Instrs[LK]);
+      end;
+      for LK := 0 to LGuest.Instrs.Count - 1 do
+        LId := LGuest.Instrs[LK];
+        LInstr := self.FModule.InstrAt(LId);
+        if LInstr.Kind = IrOp.Phi then
+          if LInstr.Targets.Count <> 1 then
+            raise(ADAM_CFG_FAULT_PHI_COUNT + IntToStr(LId));
+          end;
+          AReplace.Put(LId, LInstr.Operands[0]);
+        else
+          LInstr.Block := LHostId;
+          LKept.Add(LId);
+        end;
+      end;
+      LHost.Instrs := LKept;
+      LGuest.Instrs := ref Int64List();
+      LTerm := self.DoTerminatorOf(LHostId);
+      if LTerm <> ADAM_CFG_NONE then
+        LTerminator := self.FModule.InstrAt(LTerm);
+        for LK := 0 to LTerminator.Targets.Count - 1 do
+          self.DoRenamePhiSource(LTerminator.Targets[LK], LGuestId, LHostId);
+        end;
+      end;
+    end;
+
+    // merge (see the header): true when any block merged
+    hidden method DoMergeChains(): bool;
+    var
+      LBlocks: ref Int64List;
+      LKeep: BoolArray;
+      LInto: Int64Array;
+      LReplace: ref Int64Map;
+      LJump: ref IrInstr;
+      LMerged: bool;
+      LGoing: bool;
+      LTerm: int64;
+      LNext: int64;
+      LA: int64;
+    begin
+      self.DoGraph();
+      LBlocks := self.FFunction.Blocks;
+      setlength(LKeep, self.FCount);
+      setlength(LInto, self.FCount);
+      for LA := 0 to self.FCount - 1 do
+        LKeep[LA] := true;
+        LInto[LA] := LA;
+      end;
+      LReplace := ref Int64Map(ADAM_CFG_NONE);
+      LMerged := false;
+      for LA := 0 to self.FCount - 1 do
+        if not LKeep[LA] then
+          skip;
+        end;
+        // The host takes block after block while its jump leads to one it may merge
+        LGoing := true;
+        while LGoing do
+          LGoing := false;
+          LTerm := self.DoTerminatorOf(LBlocks[LA]);
+          if LTerm = ADAM_CFG_NONE then
+            skip;
+          end;
+          LJump := self.FModule.InstrAt(LTerm);
+          if LJump.Kind <> IrOp.Jump then
+            skip;
+          end;
+          LNext := self.FPositionOf.Find(LJump.Targets[0]);
+          if not self.DoCanMerge(LA, LNext, LInto) then
+            skip;
+          end;
+          self.DoMergeInto(LA, LNext, LReplace);
+          LKeep[LNext] := false;
+          LInto[LNext] := LA;
+          LMerged := true;
+          LGoing := true;
+        end;
+      end;
+      if not LMerged then
+        return false;
+      end;
+      if LReplace.Count > 0 then
+        self.DoReplaceUses(LReplace);
+      end;
+      self.DoCompact(LKeep);
+      return true;
+    end;
+
+    // True when the bare jump at position AGuest may be bypassed to the block at ATo: ATo
+    // has no phi, or none of AGuest's predecessors runs into it already
+    hidden const method DoCanBypass(const AGuest: int64; const ATo: int64): bool;
+    var
+      LPreds: ref Int64List;
+      LK: int64;
+    begin
+      if not self.DoHasPhi(self.FFunction.Blocks[ATo]) then
+        return true;
+      end;
+      LPreds := self.FPreds[AGuest];
+      for LK := 0 to LPreds.Count - 1 do
+        if self.FPreds[ATo].IndexOf(LPreds[LK]) >= 0 then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    // The bare jump at position AGuest bypassed to the block at ATo: each predecessor's
+    // terminator goes to ATo where it went to AGuest, and each phi of ATo takes the value
+    // it had from AGuest from each of them
+    hidden method DoBypass(const AGuest: int64; const ATo: int64);
+    var
+      LPreds: ref Int64List;
+      LInstrs: ref Int64List;
+      LTerminator: ref IrInstr;
+      LPhi: ref IrInstr;
+      LOperands: ref Int64List;
+      LTargets: ref Int64List;
+      LGuestId: int64;
+      LToId: int64;
+      LValue: int64;
+      LEntry: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      LGuestId := self.FFunction.Blocks[AGuest];
+      LToId := self.FFunction.Blocks[ATo];
+      LPreds := self.FPreds[AGuest];
+      for LK := 0 to LPreds.Count - 1 do
+        LTerminator := self.FModule.InstrAt(self.DoTerminatorOf(self.FFunction.Blocks[LPreds[LK]]));
+        for LE := 0 to LTerminator.Targets.Count - 1 do
+          if LTerminator.Targets[LE] = LGuestId then
+            LTerminator.Targets.Put(LE, LToId);
+          end;
+        end;
+      end;
+      LInstrs := self.FModule.BlockAt(LToId).Instrs;
+      for LK := 0 to LInstrs.Count - 1 do
+        LPhi := self.FModule.InstrAt(LInstrs[LK]);
+        if LPhi.Kind = IrOp.Phi then
+          LEntry := LPhi.Targets.IndexOf(LGuestId);
+          if LEntry >= 0 then
+            LValue := LPhi.Operands[LEntry];
+            LOperands := ref Int64List();
+            LTargets := ref Int64List();
+            for LE := 0 to LPhi.Targets.Count - 1 do
+              if LE <> LEntry then
+                LOperands.Add(LPhi.Operands[LE]);
+                LTargets.Add(LPhi.Targets[LE]);
+              end;
+            end;
+            for LE := 0 to LPreds.Count - 1 do
+              LOperands.Add(LValue);
+              LTargets.Add(self.FFunction.Blocks[LPreds[LE]]);
+            end;
+            LPhi.Operands := LOperands;
+            LPhi.Targets := LTargets;
+          end;
+        end;
+      end;
+    end;
+
+    // bypass (see the header): one change per block a round (a block a bypass touched,
+    // its predecessors and its target, waits for the next round's graph); true when any
+    // block was bypassed
+    hidden method DoForwardEmpty(): bool;
+    var
+      LBlocks: ref Int64List;
+      LTouched: BoolArray;
+      LPreds: ref Int64List;
+      LGuest: ref IrBlock;
+      LJump: ref IrInstr;
+      LChanged: bool;
+      LTo: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      self.DoGraph();
+      LBlocks := self.FFunction.Blocks;
+      setlength(LTouched, self.FCount);
+      for LI := 0 to self.FCount - 1 do
+        LTouched[LI] := false;
+      end;
+      LChanged := false;
+      // The entry (position 0) is never bypassed
+      for LI := 1 to self.FCount - 1 do
+        LGuest := self.FModule.BlockAt(LBlocks[LI]);
+        if (LGuest.Instrs.Count <> 1) or LTouched[LI] or self.FResume[LI] then
+          skip;
+        end;
+        LJump := self.FModule.InstrAt(LGuest.Instrs[0]);
+        if LJump.Kind <> IrOp.Jump then
+          skip;
+        end;
+        LTo := self.FPositionOf.Find(LJump.Targets[0]);
+        if (LTo = LI) or LTouched[LTo] then
+          skip;
+        end;
+        LPreds := self.FPreds[LI];
+        if (LPreds.Count = 0) or (not self.DoCanBypass(LI, LTo)) then
+          skip;
+        end;
+        self.DoBypass(LI, LTo);
+        LTouched[LI] := true;
+        LTouched[LTo] := true;
+        for LK := 0 to LPreds.Count - 1 do
+          LTouched[LPreds[LK]] := true;
+        end;
+        LChanged := true;
+      end;
+      return LChanged;
+    end;
+
+    // The simplification (see the header): rounds until one changes nothing; true when
+    // it changed the function
+    method Run(): bool;
+    var
+      LChanged: bool;
+      LRound: bool;
+    begin
+      LChanged := false;
+      LRound := true;
+      while LRound do
+        LRound := false;
+        if self.DoFoldBranches() then
+          LRound := true;
+        end;
+        if self.DoDropUnreachable() then
+          LRound := true;
+        end;
+        if self.DoSinglePhis() then
+          LRound := true;
+        end;
+        if self.DoMergeChains() then
+          LRound := true;
+        end;
+        if self.DoForwardEmpty() then
+          LRound := true;
+        end;
+        if LRound then
+          LChanged := true;
+        end;
+      end;
+      return LChanged;
+    end;
+  end;
+
+// The pass simplifycfg (see the header) over AModule's function AFunction; AAnalysis is
+// not read (every step makes its own graph of the blocks as they stand)
+public routine SimplifyControlFlow(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LSimplifier: ref ControlFlowSimplifier;
+begin
+  LSimplifier := ref ControlFlowSimplifier(AModule, AFunction);
+  return LSimplifier.Run();
+end;
+
+end.
