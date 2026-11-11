@@ -1,0 +1,953 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Opt.Analysis.adam - the facts the optimizer's passes read (M6)
+
+  FunctionAnalysis holds one function's facts, all computed at once from its
+  IR as it is: a snapshot, so a pass that changes the function makes a new
+  one before it reads facts again.
+
+    blocks          by POSITION in IrFunction.Blocks (0 the entry), as the
+                    function's scopes name them; PositionOf maps a block id
+                    back
+    edges           SuccsOf (the terminator's targets, each once, in its
+                    order, then the unwind edges) and PredsOf (each once, in
+                    block order). An unwind edge goes from every block a
+                    catching scope covers to the block a caught exception
+                    resumes at (the unwinder enters it, no terminator does);
+                    UnwindSuccsOf lists them apart, for a pass that reshapes
+                    terminators. IsExit: the terminator has no target (a Ret),
+                    whatever unwind edge leaves the block
+    order           Rpo: the blocks the entry reaches, in reverse postorder
+                    (successors visited in their terminator's order); a block
+                    the entry does not reach is not Reachable and has no other
+                    fact
+    dominators      Idom (Cooper, Harvey and Kennedy, "A Simple, Fast
+                    Dominance Algorithm"), DomChildren, Dominates, Frontier
+                    (each block's dominance frontier, their per-join walk)
+    post-dominators Ipdom over the reverse graph, from one virtual exit every
+                    exit block (IsExit) leads to:
+                    ADAM_OPT_EXIT_BLOCK for an exit block, ADAM_OPT_NO_BLOCK
+                    for one that reaches no exit (an endless loop) or is
+                    unreachable; PostDominates
+    loops           natural loops, one per header (every back edge into it: a
+                    successor that dominates its block), nested by containment:
+                    LoopHeader, LoopParent, LoopDepth, LoopBlocks; LoopOf a
+                    block's innermost loop. A retreating edge into a block that
+                    does not dominate its source (an irreducible region) makes
+                    no loop
+    uses            UsesOf a value of the function: every instruction of the
+                    function, or of one of its funclets (they reach the
+                    parent's slots), that has it as an operand, once per
+                    operand it fills, in block order
+
+  AnalysisText writes every defined function's facts as text (adam build
+  --emit-ir's .ir, after the IR's own dump): only the IR's ids and orders, so
+  the text is deterministic (DESIGN sec 5).
+*******************************************************************************/
+
+module unit Adam.Opt.Analysis;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Ssa;
+
+public const
+  // A block position that names no block: the entry's idom, an unreachable block's idom
+  // and ipdom, the ipdom of a block that reaches no exit
+  ADAM_OPT_NO_BLOCK: int64 = -1;
+  // The virtual exit every exit block leads to: an exit block's ipdom
+  ADAM_OPT_EXIT_BLOCK: int64 = -2;
+  // A block in no loop, a loop with no loop around it
+  ADAM_OPT_NO_LOOP: int64 = -1;
+  // Raised (an invariant broken) by a function that has no blocks, a position that is no
+  // block's, a block id that is no block of the function, a loop index that is no loop's
+  ADAM_OPT_FAULT_NO_BLOCKS: string = "Opt: no blocks to analyze in f";
+  ADAM_OPT_FAULT_NO_POSITION: string = "Opt: no block position ";
+  ADAM_OPT_FAULT_NOT_OWN_BLOCK: string = "Opt: no block of the function: b";
+  ADAM_OPT_FAULT_NO_LOOP: string = "Opt: no loop ";
+
+type
+  // One list of block positions per block (or per node of a graph over them)
+  BlockLists = array of ref Int64List;
+
+// AValue into AList, which stays ascending with each value once
+routine DoAddSorted(const AList: ref Int64List; const AValue: int64);
+var
+  LAt: int64;
+  LMoving: bool;
+begin
+  if AList.IndexOf(AValue) >= 0 then
+    return;
+  end;
+  AList.Add(AValue);
+  // Each larger value moves up one place until AValue's place is found
+  LAt := AList.Count - 1;
+  LMoving := true;
+  while LMoving do
+    LMoving := false;
+    if LAt > 0 then
+      if AList[LAt - 1] > AValue then
+        AList.Put(LAt, AList[LAt - 1]);
+        LAt := LAt - 1;
+        LMoving := true;
+      end;
+    end;
+  end;
+  AList.Put(LAt, AValue);
+end;
+
+// The nodes of a graph of ACount nodes (ASuccs: each node's successors) that AStart
+// reaches, in reverse postorder, successors visited in their list's order. An explicit
+// stack (a node beside the index of its next successor), so a deep graph needs no deep
+// recursion
+routine DoReversePostorder(const ACount: int64; const AStart: int64;
+  const ASuccs: BlockLists): ref Int64List;
+var
+  LPost: ref Int64List;
+  LStack: ref Int64List;
+  LNext: ref Int64List;
+  LSuccs: ref Int64List;
+  LResultList: ref Int64List;
+  LSeen: BoolArray;
+  LNode: int64;
+  LAt: int64;
+  LSucc: int64;
+  LI: int64;
+begin
+  LPost := ref Int64List();
+  setlength(LSeen, ACount);
+  for LI := 0 to ACount - 1 do
+    LSeen[LI] := false;
+  end;
+  LStack := ref Int64List();
+  LNext := ref Int64List();
+  LSeen[AStart] := true;
+  LStack.Add(AStart);
+  LNext.Add(0);
+  while LStack.Count > 0 do
+    LNode := LStack[LStack.Count - 1];
+    LAt := LNext[LNext.Count - 1];
+    LSuccs := ASuccs[LNode];
+    if LAt < LSuccs.Count then
+      LNext.Put(LNext.Count - 1, LAt + 1);
+      LSucc := LSuccs[LAt];
+      if not LSeen[LSucc] then
+        LSeen[LSucc] := true;
+        LStack.Add(LSucc);
+        LNext.Add(0);
+      end;
+    else
+      // Every successor done: the node is finished (postorder)
+      LPost.Add(LNode);
+      LStack.RemoveLast();
+      LNext.RemoveLast();
+    end;
+  end;
+  LResultList := ref Int64List();
+  for LI := LPost.Count - 1 downto 0 do
+    LResultList.Add(LPost[LI]);
+  end;
+  return LResultList;
+end;
+
+// Cooper, Harvey and Kennedy's intersect: the two fingers walk up the dominators until they
+// meet; the one deeper in the reverse postorder (AOrder: each node's index there) moves
+routine DoIntersect(const AIdom: Int64Array; const AOrder: Int64Array; const AFirst: int64;
+  const ASecond: int64): int64;
+var
+  LA: int64;
+  LB: int64;
+begin
+  LA := AFirst;
+  LB := ASecond;
+  while LA <> LB do
+    while AOrder[LA] > AOrder[LB] do
+      LA := AIdom[LA];
+    end;
+    while AOrder[LB] > AOrder[LA] do
+      LB := AIdom[LB];
+    end;
+  end;
+  return LA;
+end;
+
+// Each node's immediate dominator in a graph of ACount nodes (APreds: each node's
+// predecessors), from ARpo's first node (ARpo: the reverse postorder of the nodes the start
+// reaches), by Cooper, Harvey and Kennedy's iteration; the start and every node ARpo lacks
+// get ADAM_OPT_NO_BLOCK
+routine DoImmediateDominators(const ACount: int64; const APreds: BlockLists;
+  const ARpo: ref Int64List): Int64Array;
+var
+  LIdom: Int64Array;
+  LOrder: Int64Array;
+  LPreds: ref Int64List;
+  LChanged: bool;
+  LNew: int64;
+  LNode: int64;
+  LPred: int64;
+  LI: int64;
+  LK: int64;
+begin
+  setlength(LIdom, ACount);
+  setlength(LOrder, ACount);
+  for LI := 0 to ACount - 1 do
+    LIdom[LI] := ADAM_OPT_NO_BLOCK;
+    LOrder[LI] := -1;
+  end;
+  for LI := 0 to ARpo.Count - 1 do
+    LOrder[ARpo[LI]] := LI;
+  end;
+  // The start is its own dominator while the iteration runs (the intersect stops there),
+  // none once it ends
+  LIdom[ARpo[0]] := ARpo[0];
+  LChanged := true;
+  while LChanged do
+    LChanged := false;
+    for LI := 1 to ARpo.Count - 1 do
+      LNode := ARpo[LI];
+      LPreds := APreds[LNode];
+      LNew := ADAM_OPT_NO_BLOCK;
+      for LK := 0 to LPreds.Count - 1 do
+        LPred := LPreds[LK];
+        // Only a reached predecessor that has a dominator already counts
+        if LOrder[LPred] >= 0 then
+          if LIdom[LPred] <> ADAM_OPT_NO_BLOCK then
+            if LNew = ADAM_OPT_NO_BLOCK then
+              LNew := LPred;
+            else
+              LNew := DoIntersect(LIdom, LOrder, LPred, LNew);
+            end;
+          end;
+        end;
+      end;
+      if LIdom[LNode] <> LNew then
+        LIdom[LNode] := LNew;
+        LChanged := true;
+      end;
+    end;
+  end;
+  LIdom[ARpo[0]] := ADAM_OPT_NO_BLOCK;
+  return LIdom;
+end;
+
+// "b3 b7" for the block positions in APositions (each named by its block id from ABlocks),
+// "-" for none
+routine DoBlockNames(const ABlocks: ref Int64List; const APositions: ref Int64List): string;
+var
+  LText: string;
+  LI: int64;
+begin
+  if APositions.Count = 0 then
+    return "-";
+  end;
+  LText := "";
+  for LI := 0 to APositions.Count - 1 do
+    if LI > 0 then
+      LText := LText + " ";
+    end;
+    LText := LText + "b" + IntToStr(ABlocks[APositions[LI]]);
+  end;
+  return LText;
+end;
+
+public type
+  // One function's facts (see the header)
+  FunctionAnalysis = object
+    hidden FModule: ref IrModule;
+    hidden FFunctionId: int64;
+    hidden FBlocks: ref Int64List;
+    hidden FCount: int64;
+    hidden FPositionOf: ref Int64Map;
+    hidden FSuccs: BlockLists;
+    hidden FUnwind: BlockLists;
+    hidden FExit: BoolArray;
+    hidden FPreds: BlockLists;
+    hidden FRpo: ref Int64List;
+    hidden FRpoIndex: Int64Array;
+    hidden FIdom: Int64Array;
+    hidden FDomChildren: BlockLists;
+    hidden FFrontier: BlockLists;
+    hidden FIpdom: Int64Array;
+    hidden FLoopHeader: ref Int64List;
+    hidden FLoopParent: ref Int64List;
+    hidden FLoopDepth: ref Int64List;
+    hidden FLoopBlocks: BlockLists;
+    hidden FLoopOf: Int64Array;
+    // Each value's uses: FUseIndex maps an instruction id to its list in FUses
+    hidden FUseIndex: ref Int64Map;
+    hidden FUses: BlockLists;
+    hidden FNoUses: ref Int64List;
+
+    // The facts of AModule's function AFunction (defined: it has blocks)
+    init(const AModule: ref IrModule; const AFunction: int64);
+    begin
+      self.FModule := AModule;
+      self.FFunctionId := AFunction;
+      self.FBlocks := AModule.FunctionAt(AFunction).Blocks;
+      self.FCount := self.FBlocks.Count;
+      if self.FCount = 0 then
+        raise(ADAM_OPT_FAULT_NO_BLOCKS + IntToStr(AFunction));
+      end;
+      self.FNoUses := ref Int64List();
+      self.DoEdges();
+      self.DoDominators();
+      self.DoFrontiers();
+      self.DoPostDominators();
+      self.DoLoops();
+      self.DoUses();
+    end;
+
+    // Raises unless APosition is a block's
+    hidden const method DoCheckPosition(const APosition: int64);
+    begin
+      if (APosition < 0) or (APosition >= self.FCount) then
+        raise(ADAM_OPT_FAULT_NO_POSITION + IntToStr(APosition));
+      end;
+    end;
+
+    // Raises unless AIndex is a loop's
+    hidden const method DoCheckLoop(const AIndex: int64);
+    begin
+      if (AIndex < 0) or (AIndex >= self.FLoopHeader.Count) then
+        raise(ADAM_OPT_FAULT_NO_LOOP + IntToStr(AIndex));
+      end;
+    end;
+
+    // Successors from each terminator's targets (each once, in its order), then the unwind
+    // edges of the catching scopes (innermost first, as the scopes are listed); predecessors
+    // from the successors (each once, in block order)
+    hidden method DoEdges();
+    var
+      LFunction: ref IrFunction;
+      LBlock: ref IrBlock;
+      LLast: ref IrInstr;
+      LTarget: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      LFunction := self.FModule.FunctionAt(self.FFunctionId);
+      self.FPositionOf := ref Int64Map(ADAM_OPT_NO_BLOCK);
+      setlength(self.FSuccs, self.FCount);
+      setlength(self.FUnwind, self.FCount);
+      setlength(self.FExit, self.FCount);
+      setlength(self.FPreds, self.FCount);
+      for LI := 0 to self.FCount - 1 do
+        self.FPositionOf.Put(self.FBlocks[LI], LI);
+        self.FSuccs[LI] := ref Int64List();
+        self.FUnwind[LI] := ref Int64List();
+        self.FPreds[LI] := ref Int64List();
+        self.FExit[LI] := true;
+      end;
+      for LI := 0 to self.FCount - 1 do
+        LBlock := self.FModule.BlockAt(self.FBlocks[LI]);
+        if LBlock.Instrs.Count > 0 then
+          LLast := self.FModule.InstrAt(LBlock.Instrs[LBlock.Instrs.Count - 1]);
+          if IsTerminator(LLast.Kind) then
+            for LK := 0 to LLast.Targets.Count - 1 do
+              LTarget := self.FPositionOf.Find(LLast.Targets[LK]);
+              if LTarget = ADAM_OPT_NO_BLOCK then
+                raise(ADAM_OPT_FAULT_NOT_OWN_BLOCK + IntToStr(LLast.Targets[LK]));
+              end;
+              if self.FSuccs[LI].IndexOf(LTarget) < 0 then
+                self.FSuccs[LI].Add(LTarget);
+              end;
+              self.FExit[LI] := false;
+            end;
+          end;
+        end;
+      end;
+      // A catching scope's blocks may each raise into its target (scopes name blocks by
+      // position already)
+      for LK := 0 to LFunction.ScopeCount() - 1 do
+        LTarget := LFunction.ScopeTarget(LK);
+        if LTarget >= 0 then
+          for LI := LFunction.ScopeFirst(LK) to LFunction.ScopeLast(LK) do
+            // Listed as an unwind edge even when the terminator goes there too
+            if self.FUnwind[LI].IndexOf(LTarget) < 0 then
+              self.FUnwind[LI].Add(LTarget);
+            end;
+            if self.FSuccs[LI].IndexOf(LTarget) < 0 then
+              self.FSuccs[LI].Add(LTarget);
+            end;
+          end;
+        end;
+      end;
+      // Walked in block order, so each block's predecessors come in block order
+      for LI := 0 to self.FCount - 1 do
+        for LK := 0 to self.FSuccs[LI].Count - 1 do
+          self.FPreds[self.FSuccs[LI][LK]].Add(LI);
+        end;
+      end;
+    end;
+
+    // The reverse postorder from the entry, each block's idom and its dominator tree
+    // children (in reverse postorder)
+    hidden method DoDominators();
+    var
+      LI: int64;
+      LNode: int64;
+    begin
+      self.FRpo := DoReversePostorder(self.FCount, 0, self.FSuccs);
+      setlength(self.FRpoIndex, self.FCount);
+      for LI := 0 to self.FCount - 1 do
+        self.FRpoIndex[LI] := -1;
+      end;
+      for LI := 0 to self.FRpo.Count - 1 do
+        self.FRpoIndex[self.FRpo[LI]] := LI;
+      end;
+      self.FIdom := DoImmediateDominators(self.FCount, self.FPreds, self.FRpo);
+      setlength(self.FDomChildren, self.FCount);
+      for LI := 0 to self.FCount - 1 do
+        self.FDomChildren[LI] := ref Int64List();
+      end;
+      for LI := 1 to self.FRpo.Count - 1 do
+        LNode := self.FRpo[LI];
+        self.FDomChildren[self.FIdom[LNode]].Add(LNode);
+      end;
+    end;
+
+    // Each block's dominance frontier: from every reached predecessor of a join (two or
+    // more of them), up the dominators to the join's idom, each block passed has the join in
+    // its frontier
+    hidden method DoFrontiers();
+    var
+      LPreds: ref Int64List;
+      LReached: int64;
+      LRunner: int64;
+      LNode: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      setlength(self.FFrontier, self.FCount);
+      for LI := 0 to self.FCount - 1 do
+        self.FFrontier[LI] := ref Int64List();
+      end;
+      for LI := 0 to self.FRpo.Count - 1 do
+        LNode := self.FRpo[LI];
+        LPreds := self.FPreds[LNode];
+        LReached := 0;
+        for LK := 0 to LPreds.Count - 1 do
+          if self.FRpoIndex[LPreds[LK]] >= 0 then
+            LReached := LReached + 1;
+          end;
+        end;
+        if LReached >= 2 then
+          for LK := 0 to LPreds.Count - 1 do
+            if self.FRpoIndex[LPreds[LK]] >= 0 then
+              LRunner := LPreds[LK];
+              while LRunner <> self.FIdom[LNode] do
+                DoAddSorted(self.FFrontier[LRunner], LNode);
+                LRunner := self.FIdom[LRunner];
+              end;
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // Each block's ipdom: the dominators of the reverse graph whose start is a virtual
+    // exit node (number FCount) with an edge to every exit block; only reachable blocks
+    // take part
+    hidden method DoPostDominators();
+    var
+      LSuccs: BlockLists;
+      LPreds: BlockLists;
+      LRpo: ref Int64List;
+      LIdom: Int64Array;
+      LExit: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      LExit := self.FCount;
+      setlength(LSuccs, self.FCount + 1);
+      setlength(LPreds, self.FCount + 1);
+      for LI := 0 to self.FCount do
+        LSuccs[LI] := ref Int64List();
+        LPreds[LI] := ref Int64List();
+      end;
+      // The reverse graph: a block's successors are its reached predecessors; the exit's are
+      // the reached exit blocks
+      for LI := 0 to self.FCount - 1 do
+        if self.Reachable(LI) then
+          for LK := 0 to self.FPreds[LI].Count - 1 do
+            if self.Reachable(self.FPreds[LI][LK]) then
+              LSuccs[LI].Add(self.FPreds[LI][LK]);
+            end;
+          end;
+          for LK := 0 to self.FSuccs[LI].Count - 1 do
+            LPreds[LI].Add(self.FSuccs[LI][LK]);
+          end;
+          if self.FExit[LI] then
+            LSuccs[LExit].Add(LI);
+            LPreds[LI].Add(LExit);
+          end;
+        end;
+      end;
+      LRpo := DoReversePostorder(self.FCount + 1, LExit, LSuccs);
+      LIdom := DoImmediateDominators(self.FCount + 1, LPreds, LRpo);
+      setlength(self.FIpdom, self.FCount);
+      for LI := 0 to self.FCount - 1 do
+        if LIdom[LI] = LExit then
+          self.FIpdom[LI] := ADAM_OPT_EXIT_BLOCK;
+        else
+          self.FIpdom[LI] := LIdom[LI];
+        end;
+      end;
+    end;
+
+    // The natural loops, one per header in reverse postorder (all its back edges' bodies
+    // merged), each body ascending; then each loop's parent (the smallest other loop whose
+    // body holds its header), depth and each block's innermost loop
+    hidden method DoLoops();
+    var
+      LBody: ref Int64List;
+      LWork: ref Int64List;
+      LHeader: int64;
+      LNode: int64;
+      LPred: int64;
+      LBest: int64;
+      LLoop: int64;
+      LDepth: int64;
+      LI: int64;
+      LK: int64;
+      LM: int64;
+    begin
+      self.FLoopHeader := ref Int64List();
+      self.FLoopParent := ref Int64List();
+      self.FLoopDepth := ref Int64List();
+      setlength(self.FLoopBlocks, 0);
+      for LI := 0 to self.FRpo.Count - 1 do
+        LHeader := self.FRpo[LI];
+        LBody := nil;
+        LWork := ref Int64List();
+        for LK := 0 to self.FPreds[LHeader].Count - 1 do
+          LPred := self.FPreds[LHeader][LK];
+          if self.Dominates(LHeader, LPred) then
+            if LBody = nil then
+              LBody := ref Int64List();
+              DoAddSorted(LBody, LHeader);
+            end;
+            if LBody.IndexOf(LPred) < 0 then
+              DoAddSorted(LBody, LPred);
+              LWork.Add(LPred);
+            end;
+          end;
+        end;
+        if LBody <> nil then
+          // Up the reached predecessors from each back edge's source, the header stopping
+          // the walk (it is in the body from the start)
+          while LWork.Count > 0 do
+            LNode := LWork.RemoveLast();
+            for LK := 0 to self.FPreds[LNode].Count - 1 do
+              LPred := self.FPreds[LNode][LK];
+              if self.Reachable(LPred) and (LBody.IndexOf(LPred) < 0) then
+                DoAddSorted(LBody, LPred);
+                LWork.Add(LPred);
+              end;
+            end;
+          end;
+          self.FLoopHeader.Add(LHeader);
+          self.FLoopParent.Add(ADAM_OPT_NO_LOOP);
+          self.FLoopDepth.Add(0);
+          setlength(self.FLoopBlocks, len(self.FLoopBlocks) + 1);
+          self.FLoopBlocks[len(self.FLoopBlocks) - 1] := LBody;
+        end;
+      end;
+      // Natural loops with different headers are nested or apart, so the smallest one that
+      // holds a loop's header is its parent
+      for LI := 0 to self.FLoopHeader.Count - 1 do
+        LBest := ADAM_OPT_NO_LOOP;
+        for LM := 0 to self.FLoopHeader.Count - 1 do
+          if LM <> LI then
+            if self.FLoopBlocks[LM].IndexOf(self.FLoopHeader[LI]) >= 0 then
+              if LBest = ADAM_OPT_NO_LOOP then
+                LBest := LM;
+              else
+                if self.FLoopBlocks[LM].Count < self.FLoopBlocks[LBest].Count then
+                  LBest := LM;
+                end;
+              end;
+            end;
+          end;
+        end;
+        self.FLoopParent.Put(LI, LBest);
+      end;
+      for LI := 0 to self.FLoopHeader.Count - 1 do
+        LDepth := 1;
+        LLoop := self.FLoopParent[LI];
+        while LLoop <> ADAM_OPT_NO_LOOP do
+          LDepth := LDepth + 1;
+          LLoop := self.FLoopParent[LLoop];
+        end;
+        self.FLoopDepth.Put(LI, LDepth);
+      end;
+      setlength(self.FLoopOf, self.FCount);
+      for LI := 0 to self.FCount - 1 do
+        LBest := ADAM_OPT_NO_LOOP;
+        for LM := 0 to self.FLoopHeader.Count - 1 do
+          if self.FLoopBlocks[LM].IndexOf(LI) >= 0 then
+            if LBest = ADAM_OPT_NO_LOOP then
+              LBest := LM;
+            else
+              if self.FLoopBlocks[LM].Count < self.FLoopBlocks[LBest].Count then
+                LBest := LM;
+              end;
+            end;
+          end;
+        end;
+        self.FLoopOf[LI] := LBest;
+      end;
+    end;
+
+    // AFunction's instructions as users of this function's values, block by block, each
+    // operand once
+    hidden method DoAddUsers(const AFunction: int64);
+    var
+      LBlocks: ref Int64List;
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LList: int64;
+      LI: int64;
+      LK: int64;
+      LJ: int64;
+    begin
+      LBlocks := self.FModule.FunctionAt(AFunction).Blocks;
+      for LI := 0 to LBlocks.Count - 1 do
+        LBlock := self.FModule.BlockAt(LBlocks[LI]);
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LInstr := self.FModule.InstrAt(LBlock.Instrs[LK]);
+          for LJ := 0 to LInstr.Operands.Count - 1 do
+            LList := self.FUseIndex.Find(LInstr.Operands[LJ]);
+            if LList >= 0 then
+              self.FUses[LList].Add(LBlock.Instrs[LK]);
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // Every value of the function keyed first, then its users: its own instructions, then
+    // its funclets' (in function order)
+    hidden method DoUses();
+    var
+      LBlock: ref IrBlock;
+      LCount: int64;
+      LI: int64;
+      LK: int64;
+      LF: int64;
+    begin
+      self.FUseIndex := ref Int64Map(-1);
+      setlength(self.FUses, 0);
+      LCount := 0;
+      for LI := 0 to self.FCount - 1 do
+        LBlock := self.FModule.BlockAt(self.FBlocks[LI]);
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          self.FUseIndex.Put(LBlock.Instrs[LK], LCount);
+          LCount := LCount + 1;
+        end;
+      end;
+      setlength(self.FUses, LCount);
+      for LI := 0 to LCount - 1 do
+        self.FUses[LI] := ref Int64List();
+      end;
+      self.DoAddUsers(self.FFunctionId);
+      for LF := 1 to self.FModule.FunctionCount - 1 do
+        if self.FModule.FunctionAt(LF).Parent = self.FFunctionId then
+          self.DoAddUsers(LF);
+        end;
+      end;
+    end;
+
+    // The function analyzed and how many blocks it has
+    property FunctionId: int64 read FFunctionId;
+    property BlockCount: int64 read FCount;
+
+    // The block id at APosition
+    const method BlockAt(const APosition: int64): int64;
+    begin
+      self.DoCheckPosition(APosition);
+      return self.FBlocks[APosition];
+    end;
+
+    // The position of the block ABlock (ADAM_OPT_NO_BLOCK: no block of the function)
+    const method PositionOf(const ABlock: int64): int64;
+    begin
+      return self.FPositionOf.Find(ABlock);
+    end;
+
+    // The positions APosition goes to (its terminator's targets, then its unwind edges), and
+    // those that go to it
+    const method SuccsOf(const APosition: int64): ref Int64List;
+    begin
+      self.DoCheckPosition(APosition);
+      return self.FSuccs[APosition];
+    end;
+
+    const method PredsOf(const APosition: int64): ref Int64List;
+    begin
+      self.DoCheckPosition(APosition);
+      return self.FPreds[APosition];
+    end;
+
+    // The unwind edges among APosition's successors (see the header), and whether its
+    // terminator has no target (an exit)
+    const method UnwindSuccsOf(const APosition: int64): ref Int64List;
+    begin
+      self.DoCheckPosition(APosition);
+      return self.FUnwind[APosition];
+    end;
+
+    const method IsExit(const APosition: int64): bool;
+    begin
+      self.DoCheckPosition(APosition);
+      return self.FExit[APosition];
+    end;
+
+    // The reached positions in reverse postorder, and whether the entry reaches APosition
+    const method Rpo(): ref Int64List;
+    begin
+      return self.FRpo;
+    end;
+
+    const method Reachable(const APosition: int64): bool;
+    begin
+      self.DoCheckPosition(APosition);
+      return self.FRpoIndex[APosition] >= 0;
+    end;
+
+    // APosition's immediate dominator (ADAM_OPT_NO_BLOCK: the entry, an unreachable block)
+    // and the blocks it immediately dominates (in reverse postorder)
+    const method Idom(const APosition: int64): int64;
+    begin
+      self.DoCheckPosition(APosition);
+      return self.FIdom[APosition];
+    end;
+
+    const method DomChildren(const APosition: int64): ref Int64List;
+    begin
+      self.DoCheckPosition(APosition);
+      return self.FDomChildren[APosition];
+    end;
+
+    // True when every path from the entry to AOther passes ADominator (a block dominates
+    // itself); false when either is unreachable
+    const method Dominates(const ADominator: int64; const AOther: int64): bool;
+    var
+      LAt: int64;
+    begin
+      self.DoCheckPosition(ADominator);
+      self.DoCheckPosition(AOther);
+      if not self.Reachable(ADominator) then
+        return false;
+      end;
+      LAt := AOther;
+      while LAt <> ADAM_OPT_NO_BLOCK do
+        if LAt = ADominator then
+          return true;
+        end;
+        LAt := self.FIdom[LAt];
+      end;
+      return false;
+    end;
+
+    // APosition's dominance frontier, ascending
+    const method Frontier(const APosition: int64): ref Int64List;
+    begin
+      self.DoCheckPosition(APosition);
+      return self.FFrontier[APosition];
+    end;
+
+    // APosition's immediate post-dominator (ADAM_OPT_EXIT_BLOCK: the virtual exit,
+    // ADAM_OPT_NO_BLOCK: none)
+    const method Ipdom(const APosition: int64): int64;
+    begin
+      self.DoCheckPosition(APosition);
+      return self.FIpdom[APosition];
+    end;
+
+    // True when every path from AOther to an exit passes APostDominator (a block
+    // post-dominates itself); false when AOther reaches no exit
+    const method PostDominates(const APostDominator: int64; const AOther: int64): bool;
+    var
+      LAt: int64;
+    begin
+      self.DoCheckPosition(APostDominator);
+      self.DoCheckPosition(AOther);
+      if self.FIpdom[AOther] = ADAM_OPT_NO_BLOCK then
+        return false;
+      end;
+      LAt := AOther;
+      while LAt >= 0 do
+        if LAt = APostDominator then
+          return true;
+        end;
+        LAt := self.FIpdom[LAt];
+      end;
+      return false;
+    end;
+
+    // How many loops; loop AIndex's header, parent (ADAM_OPT_NO_LOOP: outermost), depth
+    // (1: outermost) and blocks (ascending, the header among them)
+    const method LoopCount(): int64;
+    begin
+      return self.FLoopHeader.Count;
+    end;
+
+    const method LoopHeader(const AIndex: int64): int64;
+    begin
+      self.DoCheckLoop(AIndex);
+      return self.FLoopHeader[AIndex];
+    end;
+
+    const method LoopParent(const AIndex: int64): int64;
+    begin
+      self.DoCheckLoop(AIndex);
+      return self.FLoopParent[AIndex];
+    end;
+
+    const method LoopDepth(const AIndex: int64): int64;
+    begin
+      self.DoCheckLoop(AIndex);
+      return self.FLoopDepth[AIndex];
+    end;
+
+    const method LoopBlocks(const AIndex: int64): ref Int64List;
+    begin
+      self.DoCheckLoop(AIndex);
+      return self.FLoopBlocks[AIndex];
+    end;
+
+    // APosition's innermost loop (ADAM_OPT_NO_LOOP: none) and its loop depth (0: none)
+    const method LoopOf(const APosition: int64): int64;
+    begin
+      self.DoCheckPosition(APosition);
+      return self.FLoopOf[APosition];
+    end;
+
+    const method LoopDepthOf(const APosition: int64): int64;
+    begin
+      self.DoCheckPosition(APosition);
+      if self.FLoopOf[APosition] = ADAM_OPT_NO_LOOP then
+        return 0;
+      end;
+      return self.FLoopDepth[self.FLoopOf[APosition]];
+    end;
+
+    // The users of the value AInstr (see the header); an empty list for a value that is no
+    // instruction of the function or has no use (read only)
+    const method UsesOf(const AInstr: int64): ref Int64List;
+    var
+      LList: int64;
+    begin
+      LList := self.FUseIndex.Find(AInstr);
+      if LList < 0 then
+        return self.FNoUses;
+      end;
+      return self.FUses[LList];
+    end;
+
+    // "b5" for APosition, "-" for ADAM_OPT_NO_BLOCK, "exit" for ADAM_OPT_EXIT_BLOCK
+    hidden const method DoBlockName(const APosition: int64): string;
+    begin
+      if APosition = ADAM_OPT_NO_BLOCK then
+        return "-";
+      end;
+      if APosition = ADAM_OPT_EXIT_BLOCK then
+        return "exit";
+      end;
+      return "b" + IntToStr(self.FBlocks[APosition]);
+    end;
+
+    // "L2" for the loop AIndex, "-" for ADAM_OPT_NO_LOOP
+    hidden const method DoLoopName(const AIndex: int64): string;
+    begin
+      if AIndex = ADAM_OPT_NO_LOOP then
+        return "-";
+      end;
+      return "L" + IntToStr(AIndex);
+    end;
+
+    // The facts as text: a line per block in block order, a line per loop, a line per
+    // value with uses (in block order); each line ends in a newline
+    const method Text(): string;
+    var
+      LText: string;
+      LBlock: ref IrBlock;
+      LUses: ref Int64List;
+      LI: int64;
+      LK: int64;
+      LJ: int64;
+    begin
+      LText := "analysis f" + IntToStr(self.FFunctionId) + " " +
+        self.FModule.FunctionAt(self.FFunctionId).Symbol + "\n";
+      for LI := 0 to self.FCount - 1 do
+        if self.Reachable(LI) then
+          LText := LText + "  " + self.DoBlockName(LI) + " rpo " +
+            IntToStr(self.FRpoIndex[LI]) + " preds " + DoBlockNames(self.FBlocks,
+            self.FPreds[LI]) + " succs " + DoBlockNames(self.FBlocks, self.FSuccs[LI]);
+          // The unwind edges among the successors, when there are any
+          if self.FUnwind[LI].Count > 0 then
+            LText := LText + " unwind " + DoBlockNames(self.FBlocks, self.FUnwind[LI]);
+          end;
+          LText := LText + " idom " + self.DoBlockName(self.FIdom[LI]) + " df " +
+            DoBlockNames(self.FBlocks, self.FFrontier[LI]) + " ipdom " +
+            self.DoBlockName(self.FIpdom[LI]) + " loop " + self.DoLoopName(self.FLoopOf[LI]) +
+            "\n";
+        else
+          LText := LText + "  " + self.DoBlockName(LI) + " unreachable\n";
+        end;
+      end;
+      for LI := 0 to self.FLoopHeader.Count - 1 do
+        LText := LText + "  loop " + self.DoLoopName(LI) + " header " +
+          self.DoBlockName(self.FLoopHeader[LI]) + " parent " +
+          self.DoLoopName(self.FLoopParent[LI]) + " depth " +
+          IntToStr(self.FLoopDepth[LI]) + " blocks " +
+          DoBlockNames(self.FBlocks, self.FLoopBlocks[LI]) + "\n";
+      end;
+      for LI := 0 to self.FCount - 1 do
+        LBlock := self.FModule.BlockAt(self.FBlocks[LI]);
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LUses := self.UsesOf(LBlock.Instrs[LK]);
+          if LUses.Count > 0 then
+            LText := LText + "  uses i" + IntToStr(LBlock.Instrs[LK]) + ":";
+            for LJ := 0 to LUses.Count - 1 do
+              LText := LText + " i" + IntToStr(LUses[LJ]);
+            end;
+            LText := LText + "\n";
+          end;
+        end;
+      end;
+      return LText;
+    end;
+  end;
+
+// Every defined function of AModule's facts as text (FunctionAnalysis.Text), in function
+// order; a declared function (another unit's code) has none
+public routine AnalysisText(const AModule: ref IrModule): string;
+var
+  LText: string;
+  LAnalysis: ref FunctionAnalysis;
+  LF: int64;
+begin
+  LText := "";
+  for LF := 1 to AModule.FunctionCount - 1 do
+    if not AModule.FunctionAt(LF).Declared then
+      LAnalysis := ref FunctionAnalysis(AModule, LF);
+      LText := LText + LAnalysis.Text();
+    end;
+  end;
+  return LText;
+end;
+
+end.
