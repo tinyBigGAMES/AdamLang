@@ -1,0 +1,628 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Opt.Promote.adam - stack slots promoted to SSA values (M6 O3 mem2reg;
+  O4's SROA joins it here)
+
+  PromoteSlots turns a function's slots into SSA values where nothing but a
+  whole load or store at the slot's own address reaches them: Cytron, Ferrante,
+  Rosen, Wegman and Zadeck's construction, pruned (a phi only where the slot
+  is live on entry to its block), the phis at the iterated dominance frontier
+  of the slot's stores, then one walk of the dominator tree (an explicit
+  stack, so a deep tree needs no deep recursion) renaming every load to the
+  value that reaches it. The loads, stores and slots promoted leave their
+  blocks; each value a load had is used in its place.
+
+  A slot stays in memory when
+    - anything but a whole load or store at its address uses it (the address
+      escapes: a call's argument, an Offset, a Copy / Fill, an atomic, a store
+      of the address itself), or two of its accesses disagree on the value
+      type
+    - a funclet reaches it (a finally runs in the frame while it unwinds)
+    - it is stored inside a catching scope, or would need a phi at the block
+      a caught exception resumes at, or at the entry: the unwinder enters a
+      resume block with no edge copies (and the entry has no edge in), so the
+      value must stay in the frame
+    - an unreachable block touches it
+  A load no store reaches reads a zero of its type, made once at the start of
+  the entry block (a value never written has nothing to keep; the zero keeps
+  the output deterministic, DESIGN sec 5). A phi's edge from an unreachable
+  block carries that zero too.
+*******************************************************************************/
+
+module unit Adam.Opt.Promote;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Ssa, Adam.Opt.Analysis;
+
+type
+  // One list per promoted slot or per block position
+  PromoteLists = array of ref Int64List;
+
+  // One function's promotion (see the header), run once
+  Promoter = object
+    hidden FModule: ref IrModule;
+    hidden FFunctionId: int64;
+    hidden FAnalysis: ref FunctionAnalysis;
+    hidden FCount: int64;
+    // The first instruction id the pass makes (its phis and zeros): an id below it is the
+    // function's own
+    hidden FFirstNew: int64;
+    // Per block position: inside a catching scope; the block a caught exception resumes at
+    hidden FInCatch: BoolArray;
+    hidden FIsResume: BoolArray;
+    // Per block position, stamped with the slot being placed (FStamp): the slot is stored
+    // there, live on entry there, has a phi there
+    hidden FStoreMark: Int64Array;
+    hidden FLiveMark: Int64Array;
+    hidden FPhiMark: Int64Array;
+    hidden FStamp: int64;
+    // The promoted slots in block order, each one's index by slot id, the access its type
+    // is read from, the positions of its phis, its value stack while renaming and its zero
+    // (0: none made yet)
+    hidden FSlots: ref Int64List;
+    hidden FSlotIndex: ref Int64Map;
+    hidden FTypeFrom: ref Int64List;
+    hidden FPhiAt: PromoteLists;
+    hidden FStacks: PromoteLists;
+    hidden FZeros: Int64Array;
+    // Per block position the phis made there, and each phi's slot index by phi id
+    hidden FPhis: PromoteLists;
+    hidden FPhiSlot: ref Int64Map;
+    // Each promoted load's value by load id, and the instructions taken out (1)
+    hidden FValueOf: ref Int64Map;
+    hidden FRemoved: ref Int64Map;
+
+    init(const AModule: ref IrModule; const AFunction: int64;
+      const AAnalysis: ref FunctionAnalysis);
+    begin
+      self.FModule := AModule;
+      self.FFunctionId := AFunction;
+      self.FAnalysis := AAnalysis;
+      self.FCount := AAnalysis.BlockCount;
+      self.FFirstNew := AModule.InstrCount;
+      self.FStamp := 0;
+      self.FSlots := ref Int64List();
+      self.FSlotIndex := ref Int64Map(-1);
+      self.FTypeFrom := ref Int64List();
+      self.FPhiSlot := ref Int64Map(-1);
+      self.FValueOf := ref Int64Map(-1);
+      self.FRemoved := ref Int64Map(0);
+    end;
+
+    // The per-position facts: which blocks a catching scope covers, which ones a caught
+    // exception resumes at; the marks cleared
+    hidden method DoPositions();
+    var
+      LFunction: ref IrFunction;
+      LTarget: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      LFunction := self.FModule.FunctionAt(self.FFunctionId);
+      setlength(self.FInCatch, self.FCount);
+      setlength(self.FIsResume, self.FCount);
+      setlength(self.FStoreMark, self.FCount);
+      setlength(self.FLiveMark, self.FCount);
+      setlength(self.FPhiMark, self.FCount);
+      for LI := 0 to self.FCount - 1 do
+        self.FInCatch[LI] := false;
+        self.FIsResume[LI] := false;
+        self.FStoreMark[LI] := 0;
+        self.FLiveMark[LI] := 0;
+        self.FPhiMark[LI] := 0;
+      end;
+      for LK := 0 to LFunction.ScopeCount() - 1 do
+        LTarget := LFunction.ScopeTarget(LK);
+        if LTarget >= 0 then
+          self.FIsResume[LTarget] := true;
+          for LI := LFunction.ScopeFirst(LK) to LFunction.ScopeLast(LK) do
+            self.FInCatch[LI] := true;
+          end;
+        end;
+      end;
+    end;
+
+    // The value type of the access AAccess (a load's own, a store's value's)
+    hidden const method DoAccessType(const AAccess: int64): IrType;
+    var
+      LInstr: ref IrInstr;
+    begin
+      LInstr := self.FModule.InstrAt(AAccess);
+      if LInstr.Kind = IrOp.Load then
+        return LInstr.ValueType;
+      end;
+      return self.FModule.InstrAt(LInstr.Operands[1]).ValueType;
+    end;
+
+    // True when every use of the slot ASlot is a whole load or store at its address, of one
+    // value type, in a reachable block of this function, no store inside a catching scope
+    // (see the header)
+    hidden const method DoAccessOk(const ASlot: int64): bool;
+    var
+      LUses: ref Int64List;
+      LUser: ref IrInstr;
+      LType: IrType;
+      LAccess: IrType;
+      LPosition: int64;
+      LI: int64;
+    begin
+      LUses := self.FAnalysis.UsesOf(ASlot);
+      if LUses.Count = 0 then
+        return false;
+      end;
+      LType := IrType.Void;
+      for LI := 0 to LUses.Count - 1 do
+        LUser := self.FModule.InstrAt(LUses[LI]);
+        // A funclet's use: its frame reaches the slot while it unwinds
+        if self.FModule.BlockAt(LUser.Block).Owner <> self.FFunctionId then
+          return false;
+        end;
+        LPosition := self.FAnalysis.PositionOf(LUser.Block);
+        if not self.FAnalysis.Reachable(LPosition) then
+          return false;
+        end;
+        LAccess := IrType.Void;
+        if (LUser.Kind = IrOp.Load) and (LUser.Operands[0] = ASlot) then
+          LAccess := LUser.ValueType;
+        end;
+        if (LUser.Kind = IrOp.Store) and (LUser.Operands[0] = ASlot) and
+          (LUser.Operands[1] <> ASlot) then
+          if self.FInCatch[LPosition] then
+            return false;
+          end;
+          LAccess := self.FModule.InstrAt(LUser.Operands[1]).ValueType;
+        end;
+        if LAccess = IrType.Void then
+          return false;
+        end;
+        if (LType <> IrType.Void) and (LAccess <> LType) then
+          return false;
+        end;
+        LType := LAccess;
+      end;
+      return true;
+    end;
+
+    // The positions of the slot ASlot's phis into APhis (pruned: the iterated frontier of its
+    // stores where it is live on entry); false when one would be at the entry or at a block a
+    // caught exception resumes at (the slot then stays). Its uses are its accesses alone
+    // (DoAccessOk), listed in instruction order
+    hidden method DoPlacePhis(const ASlot: int64; const APhis: ref Int64List): bool;
+    var
+      LUses: ref Int64List;
+      LWork: ref Int64List;
+      LStores: ref Int64List;
+      LNext: ref Int64List;
+      LInstr: ref IrInstr;
+      LStamp: int64;
+      LNode: int64;
+      LTo: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      self.FStamp := self.FStamp + 1;
+      LStamp := self.FStamp;
+      LUses := self.FAnalysis.UsesOf(ASlot);
+      LWork := ref Int64List();
+      LStores := ref Int64List();
+      // A block that stores the slot, and one that loads it before any store of its own
+      // (live on entry)
+      for LI := 0 to LUses.Count - 1 do
+        LInstr := self.FModule.InstrAt(LUses[LI]);
+        LNode := self.FAnalysis.PositionOf(LInstr.Block);
+        if LInstr.Kind = IrOp.Store then
+          if self.FStoreMark[LNode] <> LStamp then
+            self.FStoreMark[LNode] := LStamp;
+            LStores.Add(LNode);
+          end;
+        else
+          if (self.FStoreMark[LNode] <> LStamp) and (self.FLiveMark[LNode] <> LStamp) then
+            self.FLiveMark[LNode] := LStamp;
+            LWork.Add(LNode);
+          end;
+        end;
+      end;
+      // Live on entry spreads back through the predecessors until a block that stores it
+      while LWork.Count > 0 do
+        LNode := LWork.RemoveLast();
+        LNext := self.FAnalysis.PredsOf(LNode);
+        for LK := 0 to LNext.Count - 1 do
+          LTo := LNext[LK];
+          if (self.FLiveMark[LTo] <> LStamp) and (self.FStoreMark[LTo] <> LStamp) then
+            self.FLiveMark[LTo] := LStamp;
+            LWork.Add(LTo);
+          end;
+        end;
+      end;
+      // The iterated frontier: a phi is a store of the slot too, so its block's frontier
+      // follows
+      while LStores.Count > 0 do
+        LNode := LStores.RemoveLast();
+        LNext := self.FAnalysis.Frontier(LNode);
+        for LK := 0 to LNext.Count - 1 do
+          LTo := LNext[LK];
+          if (self.FPhiMark[LTo] <> LStamp) and (self.FLiveMark[LTo] = LStamp) then
+            if (LTo = 0) or self.FIsResume[LTo] then
+              return false;
+            end;
+            self.FPhiMark[LTo] := LStamp;
+            APhis.Add(LTo);
+            if self.FStoreMark[LTo] <> LStamp then
+              LStores.Add(LTo);
+            end;
+          end;
+        end;
+      end;
+      return true;
+    end;
+
+    // The slot ASlot promoted, its phis at the positions APhis
+    hidden method DoAddSlot(const ASlot: int64; const APhis: ref Int64List);
+    var
+      LUses: ref Int64List;
+    begin
+      LUses := self.FAnalysis.UsesOf(ASlot);
+      self.FSlotIndex.Put(ASlot, self.FSlots.Count);
+      self.FPhiAt[self.FSlots.Count] := APhis;
+      self.FSlots.Add(ASlot);
+      self.FTypeFrom.Add(LUses[0]);
+    end;
+
+    // Every slot of the function that can be promoted (see the header), in block order;
+    // returns how many
+    hidden method DoCollect(): int64;
+    var
+      LBlock: ref IrBlock;
+      LPhis: ref Int64List;
+      LCount: int64;
+      LId: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      // At most every slot: the lists sized once
+      LCount := 0;
+      for LI := 0 to self.FCount - 1 do
+        LBlock := self.FModule.BlockAt(self.FAnalysis.BlockAt(LI));
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          if self.FModule.InstrAt(LBlock.Instrs[LK]).Kind = IrOp.Slot then
+            LCount := LCount + 1;
+          end;
+        end;
+      end;
+      setlength(self.FPhiAt, LCount);
+      for LI := 0 to self.FCount - 1 do
+        LBlock := self.FModule.BlockAt(self.FAnalysis.BlockAt(LI));
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LId := LBlock.Instrs[LK];
+          if self.FModule.InstrAt(LId).Kind = IrOp.Slot then
+            if self.DoAccessOk(LId) then
+              LPhis := ref Int64List();
+              if self.DoPlacePhis(LId, LPhis) then
+                self.DoAddSlot(LId, LPhis);
+              end;
+            end;
+          end;
+        end;
+      end;
+      return self.FSlots.Count;
+    end;
+
+    // The phis made, at the end of their blocks for now (DoRebuild puts them first), each
+    // slot's in its order of positions
+    hidden method DoMakePhis();
+    var
+      LPositions: ref Int64List;
+      LType: IrType;
+      LNode: int64;
+      LPhi: int64;
+      LPosition: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      setlength(self.FPhis, self.FCount);
+      for LI := 0 to self.FCount - 1 do
+        self.FPhis[LI] := ref Int64List();
+      end;
+      for LK := 0 to self.FSlots.Count - 1 do
+        LType := self.DoAccessType(self.FTypeFrom[LK]);
+        LNode := self.FModule.InstrAt(self.FSlots[LK]).Node;
+        LPositions := self.FPhiAt[LK];
+        for LI := 0 to LPositions.Count - 1 do
+          LPosition := LPositions[LI];
+          LPhi := self.FModule.Emit(self.FAnalysis.BlockAt(LPosition), IrOp.Phi, LType, LNode);
+          self.FPhiSlot.Put(LPhi, LK);
+          self.FPhis[LPosition].Add(LPhi);
+        end;
+      end;
+    end;
+
+    // The zero of slot AIndex's type (see the header), made the first time it is asked for
+    hidden method DoZero(const AIndex: int64): int64;
+    var
+      LNode: int64;
+    begin
+      if self.FZeros[AIndex] = 0 then
+        LNode := self.FModule.InstrAt(self.FSlots[AIndex]).Node;
+        self.FZeros[AIndex] := self.FModule.Emit(self.FAnalysis.BlockAt(0), IrOp.Constant,
+          self.DoAccessType(self.FTypeFrom[AIndex]), LNode);
+      end;
+      return self.FZeros[AIndex];
+    end;
+
+    // The value of slot AIndex where the walk is: its stack's top, the zero when nothing
+    // stored it yet
+    hidden method DoCurrent(const AIndex: int64): int64;
+    var
+      LStack: ref Int64List;
+    begin
+      LStack := self.FStacks[AIndex];
+      if LStack.Count > 0 then
+        return LStack[LStack.Count - 1];
+      end;
+      return self.DoZero(AIndex);
+    end;
+
+    // AValue, or the value a promoted load it is was given
+    hidden const method DoResolved(const AValue: int64): int64;
+    var
+      LValue: int64;
+    begin
+      LValue := self.FValueOf.Find(AValue);
+      if LValue >= 0 then
+        return LValue;
+      end;
+      return AValue;
+    end;
+
+    // The block at APosition renamed: its phis, then each store pushes its value and each
+    // load takes the current one (ALog: each push's slot index, for the walk to pop), then
+    // the phis of its successors get this edge's values
+    hidden method DoRenameBlock(const APosition: int64; const ALog: ref Int64List);
+    var
+      LInstrs: ref Int64List;
+      LPhis: ref Int64List;
+      LTargets: ref Int64List;
+      LInstr: ref IrInstr;
+      LPhi: ref IrInstr;
+      LBlockId: int64;
+      LCount: int64;
+      LLast: int64;
+      LId: int64;
+      LIndex: int64;
+      LTo: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      LBlockId := self.FAnalysis.BlockAt(APosition);
+      LPhis := self.FPhis[APosition];
+      for LI := 0 to LPhis.Count - 1 do
+        LIndex := self.FPhiSlot.Find(LPhis[LI]);
+        self.FStacks[LIndex].Add(LPhis[LI]);
+        ALog.Add(LIndex);
+      end;
+      // The block's own instructions only: a zero made on the way lands in the entry block
+      LInstrs := self.FModule.BlockAt(LBlockId).Instrs;
+      LCount := LInstrs.Count;
+      LLast := 0;
+      for LI := 0 to LCount - 1 do
+        LId := LInstrs[LI];
+        if LId < self.FFirstNew then
+          LLast := LId;
+          LInstr := self.FModule.InstrAt(LId);
+          if (LInstr.Kind = IrOp.Slot) and (self.FSlotIndex.Find(LId) >= 0) then
+            self.FRemoved.Put(LId, 1);
+          end;
+          if LInstr.Kind = IrOp.Load then
+            LIndex := self.FSlotIndex.Find(LInstr.Operands[0]);
+            if LIndex >= 0 then
+              self.FValueOf.Put(LId, self.DoCurrent(LIndex));
+              self.FRemoved.Put(LId, 1);
+            end;
+          end;
+          if LInstr.Kind = IrOp.Store then
+            LIndex := self.FSlotIndex.Find(LInstr.Operands[0]);
+            if LIndex >= 0 then
+              self.FStacks[LIndex].Add(self.DoResolved(LInstr.Operands[1]));
+              ALog.Add(LIndex);
+              self.FRemoved.Put(LId, 1);
+            end;
+          end;
+        end;
+      end;
+      if LLast = 0 then
+        return;
+      end;
+      LInstr := self.FModule.InstrAt(LLast);
+      if not IsTerminator(LInstr.Kind) then
+        return;
+      end;
+      LTargets := LInstr.Targets;
+      for LK := 0 to LTargets.Count - 1 do
+        // Each successor once, however many of the terminator's targets it is
+        if LTargets.IndexOf(LTargets[LK]) = LK then
+          LTo := self.FAnalysis.PositionOf(LTargets[LK]);
+          LPhis := self.FPhis[LTo];
+          for LI := 0 to LPhis.Count - 1 do
+            LPhi := self.FModule.InstrAt(LPhis[LI]);
+            LPhi.Operands.Add(self.DoCurrent(self.FPhiSlot.Find(LPhis[LI])));
+            LPhi.Targets.Add(LBlockId);
+          end;
+        end;
+      end;
+    end;
+
+    // The dominator tree walked from the entry, each block renamed on the way in and its
+    // pushes popped on the way out. A work entry is a position entered, or -(position + 1)
+    // for one being left
+    hidden method DoRename();
+    var
+      LWork: ref Int64List;
+      LLog: ref Int64List;
+      LChildren: ref Int64List;
+      LMarks: Int64Array;
+      LEntry: int64;
+      LPosition: int64;
+      LIndex: int64;
+      LI: int64;
+    begin
+      setlength(self.FStacks, self.FSlots.Count);
+      setlength(self.FZeros, self.FSlots.Count);
+      for LI := 0 to self.FSlots.Count - 1 do
+        self.FStacks[LI] := ref Int64List();
+        self.FZeros[LI] := 0;
+      end;
+      setlength(LMarks, self.FCount);
+      LLog := ref Int64List();
+      LWork := ref Int64List();
+      LWork.Add(0);
+      while LWork.Count > 0 do
+        LEntry := LWork.RemoveLast();
+        if LEntry < 0 then
+          LPosition := -LEntry - 1;
+          while LLog.Count > LMarks[LPosition] do
+            LIndex := LLog.RemoveLast();
+            self.FStacks[LIndex].RemoveLast();
+          end;
+        else
+          LMarks[LEntry] := LLog.Count;
+          self.DoRenameBlock(LEntry, LLog);
+          LWork.Add(-LEntry - 1);
+          // Pushed last first, so the children are entered in their order
+          LChildren := self.FAnalysis.DomChildren(LEntry);
+          LI := LChildren.Count - 1;
+          while LI >= 0 do
+            LWork.Add(LChildren[LI]);
+            LI := LI - 1;
+          end;
+        end;
+      end;
+    end;
+
+    // Each phi's edge from a predecessor the walk never reached (an unreachable block): the
+    // zero, so every edge into its block has its value
+    hidden method DoFillUnreached();
+    var
+      LPhis: ref Int64List;
+      LPreds: ref Int64List;
+      LPhi: ref IrInstr;
+      LI: int64;
+      LK: int64;
+      LJ: int64;
+    begin
+      for LI := 0 to self.FCount - 1 do
+        LPhis := self.FPhis[LI];
+        if LPhis.Count > 0 then
+          LPreds := self.FModule.PredsOf(self.FAnalysis.BlockAt(LI));
+          for LK := 0 to LPhis.Count - 1 do
+            LPhi := self.FModule.InstrAt(LPhis[LK]);
+            for LJ := 0 to LPreds.Count - 1 do
+              if LPhi.Targets.IndexOf(LPreds[LJ]) < 0 then
+                LPhi.Operands.Add(self.DoZero(self.FPhiSlot.Find(LPhis[LK])));
+                LPhi.Targets.Add(LPreds[LJ]);
+              end;
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // Every operand of the function that is a promoted load replaced by its value
+    hidden method DoRewrite();
+    var
+      LInstrs: ref Int64List;
+      LInstr: ref IrInstr;
+      LValue: int64;
+      LI: int64;
+      LK: int64;
+      LJ: int64;
+    begin
+      for LI := 0 to self.FCount - 1 do
+        LInstrs := self.FModule.BlockAt(self.FAnalysis.BlockAt(LI)).Instrs;
+        for LK := 0 to LInstrs.Count - 1 do
+          LInstr := self.FModule.InstrAt(LInstrs[LK]);
+          for LJ := 0 to LInstr.Operands.Count - 1 do
+            LValue := self.FValueOf.Find(LInstr.Operands[LJ]);
+            if LValue >= 0 then
+              LInstr.Operands.Put(LJ, LValue);
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // Each block's list made again: the zeros first in the entry (before every instruction
+    // of the function, so they reach every use), then the block's new phis, then its own
+    // instructions that stay
+    hidden method DoRebuild();
+    var
+      LBlock: ref IrBlock;
+      LKept: ref Int64List;
+      LPhis: ref Int64List;
+      LId: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      for LI := 0 to self.FCount - 1 do
+        LBlock := self.FModule.BlockAt(self.FAnalysis.BlockAt(LI));
+        LKept := ref Int64List();
+        if LI = 0 then
+          for LK := 0 to self.FSlots.Count - 1 do
+            if self.FZeros[LK] <> 0 then
+              LKept.Add(self.FZeros[LK]);
+            end;
+          end;
+        end;
+        LPhis := self.FPhis[LI];
+        for LK := 0 to LPhis.Count - 1 do
+          LKept.Add(LPhis[LK]);
+        end;
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LId := LBlock.Instrs[LK];
+          if (LId < self.FFirstNew) and (self.FRemoved.Find(LId) = 0) then
+            LKept.Add(LId);
+          end;
+        end;
+        LBlock.Instrs := LKept;
+      end;
+    end;
+
+    // The promotion (see the header); true when a slot was promoted
+    method Run(): bool;
+    begin
+      self.DoPositions();
+      if self.DoCollect() = 0 then
+        return false;
+      end;
+      self.DoMakePhis();
+      self.DoRename();
+      self.DoFillUnreached();
+      self.DoRewrite();
+      self.DoRebuild();
+      return true;
+    end;
+  end;
+
+// The pass mem2reg (see the header) over AModule's function AFunction, AAnalysis its facts
+// made just before; true when it promoted a slot
+public routine PromoteSlots(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LPromoter: ref Promoter;
+begin
+  LPromoter := ref Promoter(AModule, AFunction, AAnalysis);
+  return LPromoter.Run();
+end;
+
+end.
