@@ -1,0 +1,1372 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Opt.Loops.adam - the loop passes (M6 O11 on): loop form and licm
+
+  FormLoops puts every loop it can shape in the form each loop pass starts
+  from (every loop pass calls it first):
+    preheader  the header's one entry from outside the loop: a block that
+               only jumps to it, in the header's scopes (a new block takes
+               every outside edge otherwise; the header's phis then get one
+               value from it, a phi of the new block when the edges brought
+               more than one)
+    latch      one back edge: a new block takes every back edge when there
+               are more (the header's phis get one value from it the same
+               way)
+    exits      dedicated: every block a loop edge leaves to has only loop
+               blocks before it (a new block takes the loop's edges to it
+               otherwise)
+    lcssa      a value the loop makes that a block outside it uses reaches
+               that use through a phi in an exit block, and through the
+               phis an SSA update places where the exits' values meet;
+               innermost loops first, so an outer loop closes the phis an
+               inner one made
+  A loop is shaped only when its header is not the entry and no scope
+  resumes at it (an unwind edge cannot be moved); its exits and lcssa only
+  when no unwind edge leaves it. A value is closed only when every block
+  from its uses back to the exits is reached and no resume block (a phi
+  can go there); else it keeps its uses (a use in a block the entry does
+  not reach is left alone). A new block goes beside a block whose scopes it
+  takes (the header, the exit it leads to): it joins every scope that block
+  is in and no other, every position after it moves on by one, so each
+  scope's run stays a run and its resume block its own.
+
+  HoistInvariants is licm, innermost loops first: an instruction of the
+  loop whose operands are all made outside it (or moved out already) goes
+  to the end of the preheader, before its jump, when it is
+    pure     an integer / float / compare / convert / offset op, a
+             constant or an address
+    a load   whose address is invariant, in a loop no scope resumes in, not
+             of a slot a funclet reaches, and that no store, copy, fill,
+             atomic or call of the loop may write: two accesses are apart
+             when their bases are distinct slots, distinct data or
+             threadstatics, or one base with constant ranges apart; a call
+             or an unknown pointer reaches anything but a slot whose
+             address never leaves its loads, stores, copies and fills
+  and, when it may fault (a load not known valid, a division by a value
+  that may fault: Adam.Opt.Dce's rule), only from the header, ahead of any
+  instruction there that has a side effect or may fault and stays: the
+  preheader runs exactly when the header first does, in the same scopes,
+  so the fault comes at the same moment. A check (its compare, branch and
+  raise) never moves ahead of a side effect: branches and calls never
+  move. A moved value still dominates its uses (the preheader dominates
+  the loop); nothing moves out of a loop with no preheader.
+*******************************************************************************/
+
+module unit Adam.Opt.Loops;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Ssa, Adam.Opt.Analysis;
+
+const
+  // No block / no instruction / no value (a map's missing value)
+  ADAM_LOOPS_NONE: int64 = -1;
+  // A slot's escape mark (InvariantHoister.DoSlotFact): its address stays in its loads,
+  // stores, copies and fills; it leaves them; a funclet reaches it
+  ADAM_LOOPS_KEPT: int64 = 0;
+  ADAM_LOOPS_ESCAPED: int64 = 1;
+  ADAM_LOOPS_FUNCLET: int64 = 2;
+  // What an address's base is: a slot, a data blob, a threadstatic, any other pointer
+  ADAM_LOOPS_BASE_SLOT: int64 = 0;
+  ADAM_LOOPS_BASE_DATA: int64 = 1;
+  ADAM_LOOPS_BASE_THREAD: int64 = 2;
+  ADAM_LOOPS_BASE_OTHER: int64 = 3;
+  // An access whose byte count is not known (an atomic's place)
+  ADAM_LOOPS_ANY_SIZE: int64 = -1;
+  // Raised (an invariant broken): a block that ends in no terminator; a loop form that does
+  // not settle
+  ADAM_LOOPS_FAULT_NO_TERMINATOR: string = "Opt: loops found a block with no terminator: b";
+  ADAM_LOOPS_FAULT_UNSETTLED: string = "Opt: loops did not settle the loop form of f";
+
+// The terminator of the block ABlock (an id); raised when it ends in none
+routine DoTerminatorOf(const AModule: ref IrModule; const ABlock: int64): ref IrInstr;
+var
+  LInstrs: ref Int64List;
+  LLast: ref IrInstr;
+begin
+  LInstrs := AModule.BlockAt(ABlock).Instrs;
+  if LInstrs.Count = 0 then
+    raise(ADAM_LOOPS_FAULT_NO_TERMINATOR + IntToStr(ABlock));
+  end;
+  LLast := AModule.InstrAt(LInstrs[LInstrs.Count - 1]);
+  if not IsTerminator(LLast.Kind) then
+    raise(ADAM_LOOPS_FAULT_NO_TERMINATOR + IntToStr(ABlock));
+  end;
+  return LLast;
+end;
+
+// True when the block at APosition is in the run of AFunction's scope AIndex
+routine DoInScope(const AFunction: ref IrFunction; const AIndex: int64;
+  const APosition: int64): bool;
+begin
+  return (AFunction.ScopeFirst(AIndex) <= APosition) and
+    (APosition <= AFunction.ScopeLast(AIndex));
+end;
+
+// True when the blocks at APosition and AOther are in the same scopes
+routine DoSameScopes(const AFunction: ref IrFunction; const APosition: int64;
+  const AOther: int64): bool;
+var
+  LK: int64;
+begin
+  for LK := 0 to AFunction.ScopeCount() - 1 do
+    if DoInScope(AFunction, LK, APosition) then
+      if not DoInScope(AFunction, LK, AOther) then
+        return false;
+      end;
+    else
+      if DoInScope(AFunction, LK, AOther) then
+        return false;
+      end;
+    end;
+  end;
+  return true;
+end;
+
+// True when a scope of AFunction resumes at the block at APosition (an unwind edge runs
+// into it)
+routine DoIsResume(const AFunction: ref IrFunction; const APosition: int64): bool;
+var
+  LK: int64;
+begin
+  for LK := 0 to AFunction.ScopeCount() - 1 do
+    if AFunction.ScopeTarget(LK) = APosition then
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+// The position APosition takes once a new block is put at AAt
+routine DoShifted(const APosition: int64; const AAt: int64): int64;
+begin
+  if APosition >= AAt then
+    return APosition + 1;
+  end;
+  return APosition;
+end;
+
+// A new empty block of AModule's function AFunction put beside the block at AAnchor
+// (before it when ABefore, else after it): it joins every scope the anchor is in and no
+// other, every position from its own on moved by one (see the header); returns its id
+routine DoInsertBlock(const AModule: ref IrModule; const AFunction: int64;
+  const AAnchor: int64; const ABefore: bool): int64;
+var
+  LFunction: ref IrFunction;
+  LOld: ref Int64List;
+  LNew: ref Int64List;
+  LScopeFirst: Int64Array;
+  LScopeLast: Int64Array;
+  LScopeHandler: Int64Array;
+  LScopeTarget: Int64Array;
+  LScopes: int64;
+  LBlock: int64;
+  LAt: int64;
+  LFrom: int64;
+  LTo: int64;
+  LTarget: int64;
+  LI: int64;
+  LK: int64;
+begin
+  LFunction := AModule.FunctionAt(AFunction);
+  LBlock := AModule.AddBlock(AFunction);
+  if ABefore then
+    LAt := AAnchor;
+  else
+    LAt := AAnchor + 1;
+  end;
+  // AddBlock put the new block last: the list made again with it at LAt
+  LOld := LFunction.Blocks;
+  LNew := ref Int64List();
+  for LI := 0 to LOld.Count - 2 do
+    if LI = LAt then
+      LNew.Add(LBlock);
+    end;
+    LNew.Add(LOld[LI]);
+  end;
+  if LAt >= LOld.Count - 1 then
+    LNew.Add(LBlock);
+  end;
+  LFunction.Blocks := LNew;
+  // The scopes read out, then added again moved: one the anchor is in takes the new block
+  LScopes := LFunction.ScopeCount();
+  setlength(LScopeFirst, LScopes);
+  setlength(LScopeLast, LScopes);
+  setlength(LScopeHandler, LScopes);
+  setlength(LScopeTarget, LScopes);
+  for LK := 0 to LScopes - 1 do
+    LScopeFirst[LK] := LFunction.ScopeFirst(LK);
+    LScopeLast[LK] := LFunction.ScopeLast(LK);
+    LScopeHandler[LK] := LFunction.ScopeHandler(LK);
+    LScopeTarget[LK] := LFunction.ScopeTarget(LK);
+  end;
+  LFunction.ClearScopes();
+  for LK := 0 to LScopes - 1 do
+    LFrom := DoShifted(LScopeFirst[LK], LAt);
+    LTo := DoShifted(LScopeLast[LK], LAt);
+    if (LScopeFirst[LK] <= AAnchor) and (AAnchor <= LScopeLast[LK]) then
+      if LAt < LFrom then
+        LFrom := LAt;
+      end;
+      if LAt > LTo then
+        LTo := LAt;
+      end;
+    end;
+    LTarget := LScopeTarget[LK];
+    if LTarget >= 0 then
+      LTarget := DoShifted(LTarget, LAt);
+    end;
+    LFunction.AddScope(LFrom, LTo, LScopeHandler[LK], LTarget);
+  end;
+  return LBlock;
+end;
+
+// A new phi of AType (its node ANode, no entries yet) at the front of the block ABlock (an
+// id); returns its id
+routine DoNewPhi(const AModule: ref IrModule; const ABlock: int64; const AType: IrType;
+  const ANode: int64): int64;
+var
+  LBlock: ref IrBlock;
+  LKept: ref Int64List;
+  LPhi: int64;
+  LI: int64;
+begin
+  LPhi := AModule.Emit(ABlock, IrOp.Phi, AType, ANode);
+  // Emit put it last: the block's list made again with it first
+  LBlock := AModule.BlockAt(ABlock);
+  LKept := ref Int64List();
+  LKept.Add(LPhi);
+  for LI := 0 to LBlock.Instrs.Count - 2 do
+    LKept.Add(LBlock.Instrs[LI]);
+  end;
+  LBlock.Instrs := LKept;
+  return LPhi;
+end;
+
+// The node a new block's jump to ATarget (a block id) takes: ATarget's first instruction's
+routine DoNodeOf(const AModule: ref IrModule; const ATarget: int64): int64;
+var
+  LInstrs: ref Int64List;
+begin
+  LInstrs := AModule.BlockAt(ATarget).Instrs;
+  if LInstrs.Count = 0 then
+    return 0;
+  end;
+  return AModule.InstrAt(LInstrs[0]).Node;
+end;
+
+// The edges from the blocks APreds (ids) to ATarget (a block id) moved to a new block that
+// only jumps to ATarget, put beside the block at AAnchor (ABefore as DoInsertBlock): each
+// phi of ATarget takes one value from the new block (the one the moved edges brought when
+// they all brought one, else a new phi of the new block over them); returns its id
+routine DoSplitEdges(const AModule: ref IrModule; const AFunction: int64;
+  const ATarget: int64; const APreds: ref Int64List; const AAnchor: int64;
+  const ABefore: bool): int64;
+var
+  LTargetInstrs: ref Int64List;
+  LOperands: ref Int64List;
+  LTargets: ref Int64List;
+  LMoved: ref Int64List;
+  LFrom: ref Int64List;
+  LPhi: ref IrInstr;
+  LMerge: ref IrInstr;
+  LTerm: ref IrInstr;
+  LSame: bool;
+  LNew: int64;
+  LJump: int64;
+  LMergeId: int64;
+  LValue: int64;
+  LI: int64;
+  LK: int64;
+  LE: int64;
+begin
+  LNew := DoInsertBlock(AModule, AFunction, AAnchor, ABefore);
+  LTargetInstrs := AModule.BlockAt(ATarget).Instrs;
+  for LK := 0 to LTargetInstrs.Count - 1 do
+    LPhi := AModule.InstrAt(LTargetInstrs[LK]);
+    if LPhi.Kind <> IrOp.Phi then
+      skip;
+    end;
+    LOperands := ref Int64List();
+    LTargets := ref Int64List();
+    LMoved := ref Int64List();
+    LFrom := ref Int64List();
+    for LE := 0 to LPhi.Targets.Count - 1 do
+      if APreds.IndexOf(LPhi.Targets[LE]) >= 0 then
+        LMoved.Add(LPhi.Operands[LE]);
+        LFrom.Add(LPhi.Targets[LE]);
+      else
+        LOperands.Add(LPhi.Operands[LE]);
+        LTargets.Add(LPhi.Targets[LE]);
+      end;
+    end;
+    if LMoved.Count = 0 then
+      skip;
+    end;
+    LSame := true;
+    for LE := 1 to LMoved.Count - 1 do
+      if LMoved[LE] <> LMoved[0] then
+        LSame := false;
+      end;
+    end;
+    if LSame then
+      LValue := LMoved[0];
+    else
+      // The new block's phis come before its jump (emitted below)
+      LMergeId := AModule.Emit(LNew, IrOp.Phi, LPhi.ValueType, LPhi.Node);
+      LMerge := AModule.InstrAt(LMergeId);
+      for LE := 0 to LMoved.Count - 1 do
+        LMerge.Operands.Add(LMoved[LE]);
+        LMerge.Targets.Add(LFrom[LE]);
+      end;
+      LValue := LMergeId;
+    end;
+    LOperands.Add(LValue);
+    LTargets.Add(LNew);
+    LPhi.Operands := LOperands;
+    LPhi.Targets := LTargets;
+  end;
+  LJump := AModule.Emit(LNew, IrOp.Jump, IrType.Void, DoNodeOf(AModule, ATarget));
+  AModule.InstrAt(LJump).Targets.Add(ATarget);
+  for LI := 0 to APreds.Count - 1 do
+    LTerm := DoTerminatorOf(AModule, APreds[LI]);
+    for LE := 0 to LTerm.Targets.Count - 1 do
+      if LTerm.Targets[LE] = ATarget then
+        LTerm.Targets.Put(LE, LNew);
+      end;
+    end;
+  end;
+  return LNew;
+end;
+
+// True when the loop AIndex can be shaped (see the header): its header is not the entry
+// and no scope resumes at it
+routine DoShapeable(const AFunction: ref IrFunction; const AAnalysis: ref FunctionAnalysis;
+  const AIndex: int64): bool;
+var
+  LHeader: int64;
+begin
+  LHeader := AAnalysis.LoopHeader(AIndex);
+  return (LHeader <> 0) and (not DoIsResume(AFunction, LHeader));
+end;
+
+// One mark per block position of a function of ACount blocks: true for the loop AIndex's
+routine DoLoopSet(const AAnalysis: ref FunctionAnalysis; const ACount: int64;
+  const AIndex: int64): BoolArray;
+var
+  LIn: BoolArray;
+  LBlocks: ref Int64List;
+  LI: int64;
+begin
+  setlength(LIn, ACount);
+  for LI := 0 to ACount - 1 do
+    LIn[LI] := false;
+  end;
+  LBlocks := AAnalysis.LoopBlocks(AIndex);
+  for LI := 0 to LBlocks.Count - 1 do
+    LIn[LBlocks[LI]] := true;
+  end;
+  return LIn;
+end;
+
+// The deepest loop depth of AAnalysis's function (0: no loop)
+routine DoMaxDepth(const AAnalysis: ref FunctionAnalysis): int64;
+var
+  LMax: int64;
+  LL: int64;
+begin
+  LMax := 0;
+  for LL := 0 to AAnalysis.LoopCount() - 1 do
+    if AAnalysis.LoopDepth(LL) > LMax then
+      LMax := AAnalysis.LoopDepth(LL);
+    end;
+  end;
+  return LMax;
+end;
+
+// The preheader of the loop AIndex (its blocks AIn) as a position (ADAM_LOOPS_NONE: it has
+// none): the header's one predecessor from outside the loop, reached, a block that only
+// jumps to the header, in the header's scopes
+routine DoPreheaderOf(const AModule: ref IrModule; const AFunction: ref IrFunction;
+  const AAnalysis: ref FunctionAnalysis; const AIndex: int64; const AIn: BoolArray): int64;
+var
+  LPreds: ref Int64List;
+  LHeader: int64;
+  LOutside: int64;
+  LCount: int64;
+  LI: int64;
+begin
+  LHeader := AAnalysis.LoopHeader(AIndex);
+  LPreds := AAnalysis.PredsOf(LHeader);
+  LCount := 0;
+  LOutside := ADAM_LOOPS_NONE;
+  for LI := 0 to LPreds.Count - 1 do
+    if not AIn[LPreds[LI]] then
+      LCount := LCount + 1;
+      LOutside := LPreds[LI];
+    end;
+  end;
+  if LCount <> 1 then
+    return ADAM_LOOPS_NONE;
+  end;
+  if not AAnalysis.Reachable(LOutside) then
+    return ADAM_LOOPS_NONE;
+  end;
+  if (AAnalysis.SuccsOf(LOutside).Count <> 1) or
+    (AAnalysis.UnwindSuccsOf(LOutside).Count <> 0) then
+    return ADAM_LOOPS_NONE;
+  end;
+  if DoTerminatorOf(AModule, AAnalysis.BlockAt(LOutside)).Kind <> IrOp.Jump then
+    return ADAM_LOOPS_NONE;
+  end;
+  if not DoSameScopes(AFunction, LOutside, LHeader) then
+    return ADAM_LOOPS_NONE;
+  end;
+  return LOutside;
+end;
+
+// True when an unwind edge leaves the loop AIndex (its blocks AIn): its exits cannot move
+routine DoUnwindExit(const AAnalysis: ref FunctionAnalysis; const AIndex: int64;
+  const AIn: BoolArray): bool;
+var
+  LBlocks: ref Int64List;
+  LUnwind: ref Int64List;
+  LI: int64;
+  LK: int64;
+begin
+  LBlocks := AAnalysis.LoopBlocks(AIndex);
+  for LI := 0 to LBlocks.Count - 1 do
+    LUnwind := AAnalysis.UnwindSuccsOf(LBlocks[LI]);
+    for LK := 0 to LUnwind.Count - 1 do
+      if not AIn[LUnwind[LK]] then
+        return true;
+      end;
+    end;
+  end;
+  return false;
+end;
+
+// One step of the loop form (see the header): the first loop that lacks a preheader, one
+// latch or a dedicated exit gets it (one new block); false when every loop has its form
+routine DoShapeStep(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LFunction: ref IrFunction;
+  LIn: BoolArray;
+  LBlocks: ref Int64List;
+  LPreds: ref Int64List;
+  LSuccs: ref Int64List;
+  LMoved: ref Int64List;
+  LOutside: bool;
+  LCount: int64;
+  LHeader: int64;
+  LExit: int64;
+  LL: int64;
+  LI: int64;
+  LK: int64;
+  LE: int64;
+begin
+  LFunction := AModule.FunctionAt(AFunction);
+  LCount := LFunction.Blocks.Count;
+  for LL := 0 to AAnalysis.LoopCount() - 1 do
+    if not DoShapeable(LFunction, AAnalysis, LL) then
+      skip;
+    end;
+    LIn := DoLoopSet(AAnalysis, LCount, LL);
+    LHeader := AAnalysis.LoopHeader(LL);
+    LPreds := AAnalysis.PredsOf(LHeader);
+    // The preheader: every edge from outside moved to a new block before the header
+    if DoPreheaderOf(AModule, LFunction, AAnalysis, LL, LIn) = ADAM_LOOPS_NONE then
+      LMoved := ref Int64List();
+      for LI := 0 to LPreds.Count - 1 do
+        if not LIn[LPreds[LI]] then
+          LMoved.Add(AAnalysis.BlockAt(LPreds[LI]));
+        end;
+      end;
+      DoSplitEdges(AModule, AFunction, AAnalysis.BlockAt(LHeader), LMoved, LHeader, true);
+      return true;
+    end;
+    // One latch: every back edge moved to a new block after the header
+    LMoved := ref Int64List();
+    for LI := 0 to LPreds.Count - 1 do
+      if LIn[LPreds[LI]] then
+        LMoved.Add(AAnalysis.BlockAt(LPreds[LI]));
+      end;
+    end;
+    if LMoved.Count > 1 then
+      DoSplitEdges(AModule, AFunction, AAnalysis.BlockAt(LHeader), LMoved, LHeader, false);
+      return true;
+    end;
+    // Dedicated exits: an exit with a block outside the loop before it gets a new block
+    // that takes the loop's edges to it
+    if DoUnwindExit(AAnalysis, LL, LIn) then
+      skip;
+    end;
+    LBlocks := AAnalysis.LoopBlocks(LL);
+    for LI := 0 to LBlocks.Count - 1 do
+      LSuccs := AAnalysis.SuccsOf(LBlocks[LI]);
+      for LK := 0 to LSuccs.Count - 1 do
+        LExit := LSuccs[LK];
+        if LIn[LExit] then
+          skip;
+        end;
+        LPreds := AAnalysis.PredsOf(LExit);
+        LOutside := false;
+        LMoved := ref Int64List();
+        for LE := 0 to LPreds.Count - 1 do
+          if LIn[LPreds[LE]] then
+            LMoved.Add(AAnalysis.BlockAt(LPreds[LE]));
+          else
+            LOutside := true;
+          end;
+        end;
+        if LOutside then
+          // The entry cannot have a block put before it (it stays first)
+          DoSplitEdges(AModule, AFunction, AAnalysis.BlockAt(LExit), LMoved, LExit,
+            LExit <> 0);
+          return true;
+        end;
+      end;
+    end;
+  end;
+  return false;
+end;
+
+type
+  // The lcssa of one loop of a function (see the header): each value the loop makes and
+  // a block outside it uses, closed through its exits' phis
+  LoopCloser = object
+    hidden FModule: ref IrModule;
+    hidden FFunction: ref IrFunction;
+    hidden FFunctionId: int64;
+    hidden FAnalysis: ref FunctionAnalysis;
+    // The loop's blocks, its exits (positions) and whether a position is one
+    hidden FIn: BoolArray;
+    hidden FExits: ref Int64List;
+    hidden FIsExit: BoolArray;
+    // The value being closed, its type and node, and the value each block (by position)
+    // starts with in its closed form (ADAM_LOOPS_NONE: not made yet)
+    hidden FValue: int64;
+    hidden FType: IrType;
+    hidden FNode: int64;
+    hidden FValueAt: Int64Array;
+
+    // The closing of AModule's function AFunction's loops, its facts AAnalysis
+    init(const AModule: ref IrModule; const AFunction: int64;
+      const AAnalysis: ref FunctionAnalysis);
+    begin
+      self.FModule := AModule;
+      self.FFunction := AModule.FunctionAt(AFunction);
+      self.FFunctionId := AFunction;
+      self.FAnalysis := AAnalysis;
+      self.FExits := ref Int64List();
+      self.FValue := ADAM_LOOPS_NONE;
+      self.FType := IrType.Void;
+      self.FNode := 0;
+    end;
+
+    // The exits of the loop AIndex into FExits / FIsExit; false when one has a block
+    // outside the loop before it, is a resume block or is not reached
+    hidden method DoExits(const AIndex: int64): bool;
+    var
+      LBlocks: ref Int64List;
+      LSuccs: ref Int64List;
+      LPreds: ref Int64List;
+      LExit: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      setlength(self.FIsExit, len(self.FIn));
+      for LI := 0 to len(self.FIn) - 1 do
+        self.FIsExit[LI] := false;
+      end;
+      self.FExits := ref Int64List();
+      LBlocks := self.FAnalysis.LoopBlocks(AIndex);
+      for LI := 0 to LBlocks.Count - 1 do
+        LSuccs := self.FAnalysis.SuccsOf(LBlocks[LI]);
+        for LK := 0 to LSuccs.Count - 1 do
+          LExit := LSuccs[LK];
+          if (not self.FIn[LExit]) and (not self.FIsExit[LExit]) then
+            self.FIsExit[LExit] := true;
+            self.FExits.Add(LExit);
+          end;
+        end;
+      end;
+      for LI := 0 to self.FExits.Count - 1 do
+        LExit := self.FExits[LI];
+        if DoIsResume(self.FFunction, LExit) or (not self.FAnalysis.Reachable(LExit)) then
+          return false;
+        end;
+        LPreds := self.FAnalysis.PredsOf(LExit);
+        for LK := 0 to LPreds.Count - 1 do
+          if not self.FIn[LPreds[LK]] then
+            return false;
+          end;
+        end;
+      end;
+      return true;
+    end;
+
+    // True when a phi can go at every block from the places APlaces (positions outside
+    // the loop) back to the exits: each reached, no resume block, not the entry, every
+    // predecessor reached
+    hidden const method DoClosable(const APlaces: ref Int64List): bool;
+    var
+      LSeen: BoolArray;
+      LWork: ref Int64List;
+      LPreds: ref Int64List;
+      LAt: int64;
+      LI: int64;
+    begin
+      setlength(LSeen, len(self.FIn));
+      for LI := 0 to len(self.FIn) - 1 do
+        LSeen[LI] := false;
+      end;
+      LWork := ref Int64List();
+      for LI := 0 to APlaces.Count - 1 do
+        LWork.Add(APlaces[LI]);
+      end;
+      while LWork.Count > 0 do
+        LAt := LWork.RemoveLast();
+        if LSeen[LAt] then
+          skip;
+        end;
+        LSeen[LAt] := true;
+        if self.FIsExit[LAt] then
+          skip;
+        end;
+        // A block outside the loop with a loop block before it is an exit: never here
+        if self.FIn[LAt] or (LAt = 0) or (not self.FAnalysis.Reachable(LAt)) or
+          DoIsResume(self.FFunction, LAt) then
+          return false;
+        end;
+        LPreds := self.FAnalysis.PredsOf(LAt);
+        for LI := 0 to LPreds.Count - 1 do
+          if not self.FAnalysis.Reachable(LPreds[LI]) then
+            return false;
+          end;
+          LWork.Add(LPreds[LI]);
+        end;
+      end;
+      return true;
+    end;
+
+    // The value FValue's closed form has at the start of the block APosition (its end as
+    // well: nothing outside the loop makes it again): an exit's phi of FValue, a lone
+    // predecessor's value, or a phi over the predecessors' values (made before them, so a
+    // cycle meets it)
+    hidden method DoValueAt(const APosition: int64): int64;
+    var
+      LPreds: ref Int64List;
+      LPhi: int64;
+      LValue: int64;
+      LI: int64;
+    begin
+      if self.FValueAt[APosition] <> ADAM_LOOPS_NONE then
+        return self.FValueAt[APosition];
+      end;
+      LPreds := self.FAnalysis.PredsOf(APosition);
+      if self.FIsExit[APosition] then
+        LPhi := DoNewPhi(self.FModule, self.FAnalysis.BlockAt(APosition), self.FType,
+          self.FNode);
+        for LI := 0 to LPreds.Count - 1 do
+          self.FModule.InstrAt(LPhi).Operands.Add(self.FValue);
+          self.FModule.InstrAt(LPhi).Targets.Add(self.FAnalysis.BlockAt(LPreds[LI]));
+        end;
+        self.FValueAt[APosition] := LPhi;
+        return LPhi;
+      end;
+      if LPreds.Count = 1 then
+        LValue := self.DoValueAt(LPreds[0]);
+        self.FValueAt[APosition] := LValue;
+        return LValue;
+      end;
+      LPhi := DoNewPhi(self.FModule, self.FAnalysis.BlockAt(APosition), self.FType,
+        self.FNode);
+      self.FValueAt[APosition] := LPhi;
+      for LI := 0 to LPreds.Count - 1 do
+        LValue := self.DoValueAt(LPreds[LI]);
+        self.FModule.InstrAt(LPhi).Operands.Add(LValue);
+        self.FModule.InstrAt(LPhi).Targets.Add(self.FAnalysis.BlockAt(LPreds[LI]));
+      end;
+      return LPhi;
+    end;
+
+    // The position a use of AId by AUser at operand AEntry is made at (a phi's: the block
+    // the value arrives from); ADAM_LOOPS_NONE when it is not to be closed (in the loop,
+    // not reached, another function's)
+    hidden const method DoOutsidePlace(const AUser: ref IrInstr; const AEntry: int64): int64;
+    var
+      LAt: int64;
+    begin
+      if self.FModule.BlockAt(AUser.Block).Owner <> self.FFunctionId then
+        return ADAM_LOOPS_NONE;
+      end;
+      if AUser.Kind = IrOp.Phi then
+        LAt := self.FAnalysis.PositionOf(AUser.Targets[AEntry]);
+      else
+        LAt := self.FAnalysis.PositionOf(AUser.Block);
+      end;
+      if (LAt < 0) or self.FIn[LAt] or (not self.FAnalysis.Reachable(LAt)) then
+        return ADAM_LOOPS_NONE;
+      end;
+      return LAt;
+    end;
+
+    // The value AId (of the loop) closed: every use outside the loop takes its closed form;
+    // false when none is outside or it cannot be closed (DoClosable)
+    hidden method DoCloseValue(const AId: int64): bool;
+    var
+      LUses: ref Int64List;
+      LPlaces: ref Int64List;
+      LDone: ref Int64Map;
+      LUser: ref IrInstr;
+      LAt: int64;
+      LI: int64;
+      LE: int64;
+    begin
+      LUses := self.FAnalysis.UsesOf(AId);
+      LPlaces := ref Int64List();
+      for LI := 0 to LUses.Count - 1 do
+        LUser := self.FModule.InstrAt(LUses[LI]);
+        for LE := 0 to LUser.Operands.Count - 1 do
+          if LUser.Operands[LE] = AId then
+            LAt := self.DoOutsidePlace(LUser, LE);
+            if LAt <> ADAM_LOOPS_NONE then
+              LPlaces.Add(LAt);
+            end;
+          end;
+        end;
+      end;
+      if LPlaces.Count = 0 then
+        return false;
+      end;
+      if not self.DoClosable(LPlaces) then
+        return false;
+      end;
+      self.FValue := AId;
+      self.FType := self.FModule.InstrAt(AId).ValueType;
+      self.FNode := self.FModule.InstrAt(AId).Node;
+      setlength(self.FValueAt, len(self.FIn));
+      for LI := 0 to len(self.FIn) - 1 do
+        self.FValueAt[LI] := ADAM_LOOPS_NONE;
+      end;
+      // Each user once (the list has it once per operand it fills)
+      LDone := ref Int64Map(ADAM_LOOPS_NONE);
+      for LI := 0 to LUses.Count - 1 do
+        if LDone.Find(LUses[LI]) <> ADAM_LOOPS_NONE then
+          skip;
+        end;
+        LDone.Put(LUses[LI], 1);
+        LUser := self.FModule.InstrAt(LUses[LI]);
+        for LE := 0 to LUser.Operands.Count - 1 do
+          if LUser.Operands[LE] = AId then
+            LAt := self.DoOutsidePlace(LUser, LE);
+            if LAt <> ADAM_LOOPS_NONE then
+              LUser.Operands.Put(LE, self.DoValueAt(LAt));
+            end;
+          end;
+        end;
+      end;
+      return true;
+    end;
+
+    // The loop AIndex closed (see the header); false when it changed nothing
+    method CloseLoop(const AIndex: int64): bool;
+    var
+      LBlocks: ref Int64List;
+      LInstrs: ref Int64List;
+      LChanged: bool;
+      LI: int64;
+      LK: int64;
+    begin
+      if not DoShapeable(self.FFunction, self.FAnalysis, AIndex) then
+        return false;
+      end;
+      self.FIn := DoLoopSet(self.FAnalysis, self.FFunction.Blocks.Count, AIndex);
+      if DoUnwindExit(self.FAnalysis, AIndex, self.FIn) then
+        return false;
+      end;
+      if not self.DoExits(AIndex) then
+        return false;
+      end;
+      LChanged := false;
+      // The new phis go in blocks outside the loop: its blocks' lists stay as they are
+      LBlocks := self.FAnalysis.LoopBlocks(AIndex);
+      for LI := 0 to LBlocks.Count - 1 do
+        LInstrs := self.FModule.BlockAt(self.FAnalysis.BlockAt(LBlocks[LI])).Instrs;
+        for LK := 0 to LInstrs.Count - 1 do
+          if self.FModule.InstrAt(LInstrs[LK]).ValueType = IrType.Void then
+            skip;
+          end;
+          if self.DoCloseValue(LInstrs[LK]) then
+            LChanged := true;
+          end;
+        end;
+      end;
+      return LChanged;
+    end;
+  end;
+
+// Every loop of AModule's function AFunction (its facts AAnalysis) closed, innermost
+// first, the facts made again after a loop that changed (an outer loop then sees the phis
+// an inner one made); true when any changed
+routine DoCloseLoops(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LAnalysis: ref FunctionAnalysis;
+  LCloser: ref LoopCloser;
+  LChanged: bool;
+  LD: int64;
+  LL: int64;
+begin
+  LAnalysis := AAnalysis;
+  LChanged := false;
+  // Closing adds phis, never blocks: the loops keep their numbers in each new analysis
+  for LD := DoMaxDepth(AAnalysis) downto 1 do
+    for LL := 0 to LAnalysis.LoopCount() - 1 do
+      if LAnalysis.LoopDepth(LL) <> LD then
+        skip;
+      end;
+      LCloser := ref LoopCloser(AModule, AFunction, LAnalysis);
+      if LCloser.CloseLoop(LL) then
+        LChanged := true;
+        LAnalysis := ref FunctionAnalysis(AModule, AFunction);
+      end;
+    end;
+  end;
+  return LChanged;
+end;
+
+// AModule's function AFunction (its facts AAnalysis) with every loop it can shape in the
+// loop form (see the header): preheader, one latch, dedicated exits, lcssa; true when it
+// changed the function. Every loop pass calls it first
+public routine FormLoops(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LAnalysis: ref FunctionAnalysis;
+  LChanged: bool;
+  LSteps: int64;
+  LLimit: int64;
+begin
+  if AAnalysis.LoopCount() = 0 then
+    return false;
+  end;
+  LAnalysis := AAnalysis;
+  LChanged := false;
+  LSteps := 0;
+  // Each step adds one block that settles an edge set for good: more steps than this is
+  // a compiler bug (a step that does not settle)
+  LLimit := 4 * AModule.FunctionAt(AFunction).Blocks.Count + 16;
+  while DoShapeStep(AModule, AFunction, LAnalysis) do
+    LChanged := true;
+    LSteps := LSteps + 1;
+    if LSteps > LLimit then
+      raise(ADAM_LOOPS_FAULT_UNSETTLED + IntToStr(AFunction));
+    end;
+    LAnalysis := ref FunctionAnalysis(AModule, AFunction);
+  end;
+  if DoCloseLoops(AModule, AFunction, LAnalysis) then
+    LChanged := true;
+  end;
+  return LChanged;
+end;
+
+// True for the ops licm moves when their operands are invariant (see the header)
+routine DoPure(const AKind: IrOp): bool;
+begin
+  return (AKind = IrOp.Constant) or (AKind = IrOp.Add) or (AKind = IrOp.Sub) or
+    (AKind = IrOp.Mul) or (AKind = IrOp.BitAnd) or (AKind = IrOp.BitOr) or
+    (AKind = IrOp.BitXor) or (AKind = IrOp.Neg) or (AKind = IrOp.BitNot) or
+    (AKind = IrOp.Shl) or (AKind = IrOp.Shr) or (AKind = IrOp.Sar) or
+    (AKind = IrOp.SDiv) or (AKind = IrOp.UDiv) or (AKind = IrOp.SRem) or
+    (AKind = IrOp.URem) or (AKind = IrOp.FDiv) or (AKind = IrOp.Compare) or
+    (AKind = IrOp.Offset) or (AKind = IrOp.Convert) or (AKind = IrOp.Address) or
+    (AKind = IrOp.CodeAddress) or (AKind = IrOp.ImportAddress) or
+    (AKind = IrOp.ThreadAddress);
+end;
+
+// True for the ops that may write memory a load reads
+routine DoWrites(const AKind: IrOp): bool;
+begin
+  return (AKind = IrOp.Store) or (AKind = IrOp.Copy) or (AKind = IrOp.Fill) or
+    (AKind = IrOp.Call) or (AKind = IrOp.CallExternal) or (AKind = IrOp.CallIndirect) or
+    IsAtomicOp(AKind);
+end;
+
+// True for the calls (each may write any memory but a slot whose address stays in its
+// loads and stores)
+routine DoIsCall(const AKind: IrOp): bool;
+begin
+  return (AKind = IrOp.Call) or (AKind = IrOp.CallExternal) or (AKind = IrOp.CallIndirect);
+end;
+
+// What a base of the kind AKind is (ADAM_LOOPS_BASE_*)
+routine DoBaseClass(const AKind: IrOp): int64;
+begin
+  if AKind = IrOp.Slot then
+    return ADAM_LOOPS_BASE_SLOT;
+  end;
+  if AKind = IrOp.Address then
+    return ADAM_LOOPS_BASE_DATA;
+  end;
+  if AKind = IrOp.ThreadAddress then
+    return ADAM_LOOPS_BASE_THREAD;
+  end;
+  return ADAM_LOOPS_BASE_OTHER;
+end;
+
+// True when the byte ranges at AOffset (ASize bytes) and AOther (AOtherSize) off one base
+// may overlap: false only when both offsets are known, both sizes known and they are apart
+routine DoOverlap(const AOffset: int64; const AKnown: bool; const ASize: int64;
+  const AOther: int64; const AOtherKnown: bool; const AOtherSize: int64): bool;
+begin
+  if (not AKnown) or (not AOtherKnown) or (ASize < 0) or (AOtherSize < 0) then
+    return true;
+  end;
+  return not ((AOffset + ASize <= AOther) or (AOther + AOtherSize <= AOffset));
+end;
+
+type
+  // licm over one function (see the header)
+  InvariantHoister = object
+    hidden FModule: ref IrModule;
+    hidden FFunction: ref IrFunction;
+    hidden FFunctionId: int64;
+    hidden FAnalysis: ref FunctionAnalysis;
+    // Each slot's escape mark, made when first asked (missing: not yet)
+    hidden FSlotFacts: ref Int64Map;
+    // The loop being hoisted from: its blocks, its preheader (a block id), the
+    // instructions moved there (in order), those of the loop that may write memory, and
+    // whether a load may move (no scope resumes in the loop)
+    hidden FIn: BoolArray;
+    hidden FPreheader: int64;
+    hidden FMoved: ref Int64List;
+    hidden FWriters: ref Int64List;
+    hidden FLoadsMove: bool;
+
+    // licm over AModule's function AFunction, its facts AAnalysis (blocks and edges it
+    // never changes)
+    init(const AModule: ref IrModule; const AFunction: int64;
+      const AAnalysis: ref FunctionAnalysis);
+    begin
+      self.FModule := AModule;
+      self.FFunction := AModule.FunctionAt(AFunction);
+      self.FFunctionId := AFunction;
+      self.FAnalysis := AAnalysis;
+      self.FSlotFacts := ref Int64Map(ADAM_LOOPS_NONE);
+      self.FPreheader := ADAM_LOOPS_NONE;
+      self.FMoved := ref Int64List();
+      self.FWriters := ref Int64List();
+      self.FLoadsMove := false;
+    end;
+
+    // True when the value AId is made outside the loop (a funclet's parent slot too) or
+    // has moved out already
+    hidden const method DoInvariant(const AId: int64): bool;
+    var
+      LAt: int64;
+    begin
+      LAt := self.FAnalysis.PositionOf(self.FModule.InstrAt(AId).Block);
+      if LAt < 0 then
+        return true;
+      end;
+      return not self.FIn[LAt];
+    end;
+
+    // True when every operand of AInstr is invariant
+    hidden const method DoOperandsInvariant(const AInstr: ref IrInstr): bool;
+    var
+      LE: int64;
+    begin
+      for LE := 0 to AInstr.Operands.Count - 1 do
+        if not self.DoInvariant(AInstr.Operands[LE]) then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    // The slot ASlot's escape mark (ADAM_LOOPS_KEPT / ESCAPED / FUNCLET): whether its
+    // address, or one moved from it, is ever used but as a load's, store's, copy's or
+    // fill's place, or by a funclet
+    hidden method DoSlotFact(const ASlot: int64): int64;
+    var
+      LWork: ref Int64List;
+      LUses: ref Int64List;
+      LUser: ref IrInstr;
+      LFact: int64;
+      LPointer: int64;
+      LI: int64;
+    begin
+      LFact := self.FSlotFacts.Find(ASlot);
+      if LFact <> ADAM_LOOPS_NONE then
+        return LFact;
+      end;
+      LFact := ADAM_LOOPS_KEPT;
+      LWork := ref Int64List();
+      LWork.Add(ASlot);
+      while (LWork.Count > 0) and (LFact <> ADAM_LOOPS_FUNCLET) do
+        LPointer := LWork.RemoveLast();
+        LUses := self.FAnalysis.UsesOf(LPointer);
+        for LI := 0 to LUses.Count - 1 do
+          LUser := self.FModule.InstrAt(LUses[LI]);
+          if self.FModule.BlockAt(LUser.Block).Owner <> self.FFunctionId then
+            LFact := ADAM_LOOPS_FUNCLET;
+            leave;
+          end;
+          if (LUser.Kind = IrOp.Load) or (LUser.Kind = IrOp.Copy) or
+            (LUser.Kind = IrOp.Fill) then
+            skip;
+          end;
+          if (LUser.Kind = IrOp.Store) and (LUser.Operands[1] <> LPointer) then
+            skip;
+          end;
+          if (LUser.Kind = IrOp.Offset) and (LUser.Operands[1] <> LPointer) then
+            LWork.Add(LUses[LI]);
+            skip;
+          end;
+          LFact := ADAM_LOOPS_ESCAPED;
+        end;
+      end;
+      self.FSlotFacts.Put(ASlot, LFact);
+      return LFact;
+    end;
+
+    // The base AAddress is moved from by Offsets (ABase), the bytes they move it by
+    // (AOffset) and whether every step is a constant (AKnown)
+    hidden const method DoBase(const AAddress: int64; var ABase: int64; var AOffset: int64;
+      var AKnown: bool);
+    var
+      LInstr: ref IrInstr;
+      LStep: ref IrInstr;
+      LAt: int64;
+    begin
+      LAt := AAddress;
+      AOffset := 0;
+      AKnown := true;
+      LInstr := self.FModule.InstrAt(LAt);
+      while LInstr.Kind = IrOp.Offset do
+        LStep := self.FModule.InstrAt(LInstr.Operands[1]);
+        if LStep.Kind = IrOp.Constant then
+          AOffset := AOffset + LStep.Imm;
+        else
+          AKnown := false;
+        end;
+        LAt := LInstr.Operands[0];
+        LInstr := self.FModule.InstrAt(LAt);
+      end;
+      ABase := LAt;
+    end;
+
+    // True when the ASize bytes at AAddress and the AOtherSize bytes at AOther may overlap
+    // (see the header)
+    hidden method DoMayAlias(const AAddress: int64; const ASize: int64; const AOther: int64;
+      const AOtherSize: int64): bool;
+    var
+      LBase: ref IrInstr;
+      LOtherBase: ref IrInstr;
+      LKnown: bool;
+      LOtherKnown: bool;
+      LBaseId: int64;
+      LOtherId: int64;
+      LOffset: int64;
+      LOtherOffset: int64;
+      LClass: int64;
+      LOtherClass: int64;
+    begin
+      self.DoBase(AAddress, LBaseId, LOffset, LKnown);
+      self.DoBase(AOther, LOtherId, LOtherOffset, LOtherKnown);
+      if LBaseId = LOtherId then
+        return DoOverlap(LOffset, LKnown, ASize, LOtherOffset, LOtherKnown, AOtherSize);
+      end;
+      LBase := self.FModule.InstrAt(LBaseId);
+      LOtherBase := self.FModule.InstrAt(LOtherId);
+      LClass := DoBaseClass(LBase.Kind);
+      LOtherClass := DoBaseClass(LOtherBase.Kind);
+      if (LClass <> ADAM_LOOPS_BASE_OTHER) and (LOtherClass <> ADAM_LOOPS_BASE_OTHER) then
+        if (LClass <> LOtherClass) or (LClass = ADAM_LOOPS_BASE_SLOT) then
+          return false;
+        end;
+        // Two data / threadstatic addresses are one blob when they name one symbol
+        if self.FModule.DataAt(LBase.Link).Symbol <>
+          self.FModule.DataAt(LOtherBase.Link).Symbol then
+          return false;
+        end;
+        return DoOverlap(LOffset, LKnown, ASize, LOtherOffset, LOtherKnown, AOtherSize);
+      end;
+      // An unknown pointer reaches anything but a slot whose address stays in its accesses
+      if LClass = ADAM_LOOPS_BASE_SLOT then
+        return self.DoSlotFact(LBaseId) <> ADAM_LOOPS_KEPT;
+      end;
+      if LOtherClass = ADAM_LOOPS_BASE_SLOT then
+        return self.DoSlotFact(LOtherId) <> ADAM_LOOPS_KEPT;
+      end;
+      return true;
+    end;
+
+    // True when a writer of the loop may write what the load ALoad reads
+    hidden method DoWrittenInLoop(const ALoad: ref IrInstr): bool;
+    var
+      LWriter: ref IrInstr;
+      LBase: ref IrInstr;
+      LKnown: bool;
+      LBaseId: int64;
+      LOffset: int64;
+      LSize: int64;
+      LLoadSize: int64;
+      LAddress: int64;
+      LI: int64;
+    begin
+      LAddress := ALoad.Operands[0];
+      LLoadSize := IrTypeWidth(ALoad.ValueType) div 8;
+      for LI := 0 to self.FWriters.Count - 1 do
+        LWriter := self.FModule.InstrAt(self.FWriters[LI]);
+        if DoIsCall(LWriter.Kind) then
+          self.DoBase(LAddress, LBaseId, LOffset, LKnown);
+          LBase := self.FModule.InstrAt(LBaseId);
+          if (LBase.Kind <> IrOp.Slot) or (self.DoSlotFact(LBaseId) <> ADAM_LOOPS_KEPT) then
+            return true;
+          end;
+          skip;
+        end;
+        if IsAtomicOp(LWriter.Kind) then
+          // An atomic's place: bytes not counted
+          LSize := ADAM_LOOPS_ANY_SIZE;
+          if self.DoMayAlias(LAddress, LLoadSize,
+            LWriter.Operands[0], LSize) then
+            return true;
+          end;
+          skip;
+        end;
+        if LWriter.Kind = IrOp.Store then
+          LSize := IrTypeWidth(self.FModule.InstrAt(LWriter.Operands[1]).ValueType) div 8;
+        else
+          // A copy's or a fill's destination, Imm bytes
+          LSize := LWriter.Imm;
+        end;
+        if self.DoMayAlias(LAddress, LLoadSize,
+          LWriter.Operands[0], LSize) then
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // True when the address AId is known valid: a slot's, a data blob's or a
+    // threadstatic's, or one of them moved by a constant (Adam.Opt.Dce's rule)
+    hidden const method DoValidAddress(const AId: int64): bool;
+    var
+      LInstr: ref IrInstr;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      if LInstr.Kind = IrOp.Offset then
+        if self.FModule.InstrAt(LInstr.Operands[1]).Kind <> IrOp.Constant then
+          return false;
+        end;
+        LInstr := self.FModule.InstrAt(LInstr.Operands[0]);
+      end;
+      return (LInstr.Kind = IrOp.Slot) or (LInstr.Kind = IrOp.Address) or
+        (LInstr.Kind = IrOp.ThreadAddress);
+    end;
+
+    // True when AInstr may fault: a load whose address is not known valid, a division by
+    // anything but a constant known not to (Adam.Opt.Dce's rule)
+    hidden const method DoMayFault(const AInstr: ref IrInstr): bool;
+    var
+      LDivisor: ref IrInstr;
+      LSigned: bool;
+    begin
+      if AInstr.Kind = IrOp.Load then
+        return not self.DoValidAddress(AInstr.Operands[0]);
+      end;
+      LSigned := (AInstr.Kind = IrOp.SDiv) or (AInstr.Kind = IrOp.SRem);
+      if (not LSigned) and (AInstr.Kind <> IrOp.UDiv) and (AInstr.Kind <> IrOp.URem) then
+        return false;
+      end;
+      LDivisor := self.FModule.InstrAt(AInstr.Operands[1]);
+      if (LDivisor.Kind <> IrOp.Constant) or (LDivisor.Imm = 0) then
+        return true;
+      end;
+      // A constant's Imm is canonical (sign-extended for a signed type): a signed -1 is -1
+      return LSigned and (LDivisor.Imm = -1);
+    end;
+
+    // True when AInstr moves to the preheader (see the header); AClean: it is in the
+    // header with nothing ahead of it there that has a side effect or may fault
+    hidden method DoMoves(const AInstr: ref IrInstr; const AClean: bool): bool;
+    var
+      LKnown: bool;
+      LBase: int64;
+      LOffset: int64;
+    begin
+      if AInstr.Kind = IrOp.Load then
+        if (not self.FLoadsMove) or (not self.DoInvariant(AInstr.Operands[0])) then
+          return false;
+        end;
+        self.DoBase(AInstr.Operands[0], LBase, LOffset, LKnown);
+        if (self.FModule.InstrAt(LBase).Kind = IrOp.Slot) and
+          (self.DoSlotFact(LBase) = ADAM_LOOPS_FUNCLET) then
+          return false;
+        end;
+        if self.DoWrittenInLoop(AInstr) then
+          return false;
+        end;
+      else
+        if (not DoPure(AInstr.Kind)) or (not self.DoOperandsInvariant(AInstr)) then
+          return false;
+        end;
+      end;
+      if self.DoMayFault(AInstr) then
+        return AClean;
+      end;
+      return true;
+    end;
+
+    // licm over the loop AIndex (see the header); true when anything moved
+    hidden method DoHoistLoop(const AIndex: int64): bool;
+    var
+      LBlocks: ref Int64List;
+      LRpo: ref Int64List;
+      LInstrs: ref Int64List;
+      LKept: ref Int64List;
+      LPlaced: ref Int64List;
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LClean: bool;
+      LHeader: int64;
+      LPreheader: int64;
+      LAt: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      if not DoShapeable(self.FFunction, self.FAnalysis, AIndex) then
+        return false;
+      end;
+      self.FIn := DoLoopSet(self.FAnalysis, self.FFunction.Blocks.Count, AIndex);
+      LPreheader := DoPreheaderOf(self.FModule, self.FFunction, self.FAnalysis, AIndex,
+        self.FIn);
+      if LPreheader = ADAM_LOOPS_NONE then
+        return false;
+      end;
+      LHeader := self.FAnalysis.LoopHeader(AIndex);
+      self.FPreheader := self.FAnalysis.BlockAt(LPreheader);
+      self.FMoved := ref Int64List();
+      self.FWriters := ref Int64List();
+      self.FLoadsMove := true;
+      LBlocks := self.FAnalysis.LoopBlocks(AIndex);
+      for LI := 0 to LBlocks.Count - 1 do
+        if DoIsResume(self.FFunction, LBlocks[LI]) then
+          self.FLoadsMove := false;
+        end;
+        LInstrs := self.FModule.BlockAt(self.FAnalysis.BlockAt(LBlocks[LI])).Instrs;
+        for LK := 0 to LInstrs.Count - 1 do
+          if DoWrites(self.FModule.InstrAt(LInstrs[LK]).Kind) then
+            self.FWriters.Add(LInstrs[LK]);
+          end;
+        end;
+      end;
+      // In reverse postorder an operand's block comes before its users' (it dominates
+      // them), so an operand moves before its users are judged
+      LRpo := self.FAnalysis.Rpo();
+      for LI := 0 to LRpo.Count - 1 do
+        LAt := LRpo[LI];
+        if not self.FIn[LAt] then
+          skip;
+        end;
+        LBlock := self.FModule.BlockAt(self.FAnalysis.BlockAt(LAt));
+        LClean := LAt = LHeader;
+        LKept := ref Int64List();
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LInstr := self.FModule.InstrAt(LBlock.Instrs[LK]);
+          if self.DoMoves(LInstr, LClean) then
+            LInstr.Block := self.FPreheader;
+            self.FMoved.Add(LBlock.Instrs[LK]);
+          else
+            LKept.Add(LBlock.Instrs[LK]);
+            if DoWrites(LInstr.Kind) or self.DoMayFault(LInstr) then
+              LClean := false;
+            end;
+          end;
+        end;
+        if LKept.Count <> LBlock.Instrs.Count then
+          LBlock.Instrs := LKept;
+        end;
+      end;
+      if self.FMoved.Count = 0 then
+        return false;
+      end;
+      // The preheader: its own code, the moved instructions in order, its jump
+      LBlock := self.FModule.BlockAt(self.FPreheader);
+      LPlaced := ref Int64List();
+      for LK := 0 to LBlock.Instrs.Count - 2 do
+        LPlaced.Add(LBlock.Instrs[LK]);
+      end;
+      for LK := 0 to self.FMoved.Count - 1 do
+        LPlaced.Add(self.FMoved[LK]);
+      end;
+      LPlaced.Add(LBlock.Instrs[LBlock.Instrs.Count - 1]);
+      LBlock.Instrs := LPlaced;
+      return true;
+    end;
+
+    // licm over every loop, innermost first (what an inner loop moves out its outer loop
+    // judges next); true when anything moved
+    method Run(): bool;
+    var
+      LChanged: bool;
+      LD: int64;
+      LL: int64;
+    begin
+      LChanged := false;
+      for LD := DoMaxDepth(self.FAnalysis) downto 1 do
+        for LL := 0 to self.FAnalysis.LoopCount() - 1 do
+          if self.FAnalysis.LoopDepth(LL) <> LD then
+            skip;
+          end;
+          if self.DoHoistLoop(LL) then
+            LChanged := true;
+          end;
+        end;
+      end;
+      return LChanged;
+    end;
+  end;
+
+// The pass licm (see the header) over AModule's function AFunction with its analysis
+// AAnalysis: the loop form first (FormLoops), then the invariants moved out; true when it
+// changed the function
+public routine HoistInvariants(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LAnalysis: ref FunctionAnalysis;
+  LHoister: ref InvariantHoister;
+  LChanged: bool;
+begin
+  if AAnalysis.LoopCount() = 0 then
+    return false;
+  end;
+  LChanged := FormLoops(AModule, AFunction, AAnalysis);
+  LAnalysis := AAnalysis;
+  if LChanged then
+    LAnalysis := ref FunctionAnalysis(AModule, AFunction);
+  end;
+  LHoister := ref InvariantHoister(AModule, AFunction, LAnalysis);
+  if LHoister.Run() then
+    LChanged := true;
+  end;
+  return LChanged;
+end;
+
+end.
