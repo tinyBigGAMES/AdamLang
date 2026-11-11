@@ -1,0 +1,644 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Opt.Gvn.adam - global value numbering (PLAN-ADAM M6 O9)
+
+  NumberValues walks one function's dominator tree from the entry, keeping a
+  table from each value's key to the first instruction that computed it; a
+  later instruction with the same key, in a block that first one dominates
+  (or after it in its block), is replaced: every use takes the first value
+  and the copy leaves its block. The table is scoped: what a block numbers
+  is forgotten when the walk leaves its subtree, so only a dominating value
+  is ever found.
+
+  A key is the op, the value type, the predicate, Imm, Link and the
+  operands' values (each first resolved through the replaced ones; a
+  constant operand by its type and value, so two constants of one value are
+  one operand). Numbered: the integer and float arithmetic, bits, shifts,
+  divisions (a dominating twin ran first: had it faulted, this one is never
+  reached), compares, offsets, converts and the address ops; an integer
+  add, mul, and, or, xor and an eq / ne compare take their operands in id
+  order (a float add keeps its order: the NaN it gives back is the first
+  operand's). A phi is numbered by its block and its (value, edge) pairs.
+
+  Memory: a load's key adds its memory generation, a number every store,
+  copy, fill, atomic and call that may write gives a new value; a block
+  takes the generation its immediate dominator ended with when that block is
+  its one predecessor over a normal edge, else a new one (another path may
+  have written between them; an unwind edge means a funclet ran). So a load
+  is replaced only by one with no write on any path between them.
+
+  Calls: a call of a routine this module defines that is pure is numbered
+  by its routine and arguments and writes nothing. Pure is found from the
+  callee's IR (Adam has no pure directive): not declared, no funclet, no
+  scope, not variadic, a result, and every instruction a numbered op, a
+  constant, a parameter, ret / jump / branch / phi, a call of a pure routine
+  (one being looked at is not), a slot, or a load / store whose address is
+  one of its own slots (a slot used any other way, a load or store through
+  any other address, any other op: not pure).
+
+  Checks: entering a block whose one predecessor (its immediate dominator,
+  over a normal edge) ends in a branch with two targets, the branch's
+  condition is known in the whole subtree: true on the then edge, false on
+  the else edge. A branch there on that same condition (an identical check,
+  numbered to the same compare) gets the known bool constant as its
+  condition, put just before it; simplifycfg folds it to a jump and drops
+  the raise path left unreached. Blocks and edges are never touched here,
+  so the analysis stays true for the whole walk and the scope ranges as
+  they are; a slot is never numbered (a funclet reaches its parent's).
+*******************************************************************************/
+
+module unit Adam.Opt.Gvn;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Ssa, Adam.Opt.Analysis;
+
+const
+  // No value (a map's missing value), and a key whose scope the walk has left (a
+  // StringIdMap holds no 0)
+  ADAM_GVN_NONE: int64 = -1;
+  ADAM_GVN_GONE: int64 = -1;
+  // A routine's purity: pure, not pure, being found (a call of it inside is not pure)
+  ADAM_GVN_PURE: int64 = 1;
+  ADAM_GVN_IMPURE: int64 = 0;
+  ADAM_GVN_FINDING: int64 = 2;
+  // The undo arrays' first growth
+  ADAM_GVN_FIRST_UNDO: int64 = 16;
+  // Raised (an invariant broken): replaced values that name each other round a cycle
+  ADAM_GVN_FAULT_CYCLE: string = "Opt: gvn found replaced values in a cycle at i";
+
+// True for the ops numbered by their operands alone (see the header)
+routine DoNumbered(const AKind: IrOp): bool;
+begin
+  return (AKind = IrOp.Add) or (AKind = IrOp.Sub) or (AKind = IrOp.Mul) or
+    (AKind = IrOp.BitAnd) or (AKind = IrOp.BitOr) or (AKind = IrOp.BitXor) or
+    (AKind = IrOp.Neg) or (AKind = IrOp.BitNot) or (AKind = IrOp.Shl) or
+    (AKind = IrOp.Shr) or (AKind = IrOp.Sar) or (AKind = IrOp.SDiv) or
+    (AKind = IrOp.UDiv) or (AKind = IrOp.SRem) or (AKind = IrOp.URem) or
+    (AKind = IrOp.FDiv) or (AKind = IrOp.Compare) or (AKind = IrOp.Offset) or
+    (AKind = IrOp.Convert) or (AKind = IrOp.Address) or (AKind = IrOp.CodeAddress) or
+    (AKind = IrOp.ImportAddress);
+end;
+
+// True for the ops that may write memory: a new generation (see the header); a call of a
+// routine of this module is judged by its purity at the call
+routine DoWrites(const AKind: IrOp): bool;
+begin
+  return (AKind = IrOp.Store) or (AKind = IrOp.Copy) or (AKind = IrOp.Fill) or
+    (AKind = IrOp.CallExternal) or (AKind = IrOp.CallIndirect) or IsAtomicOp(AKind);
+end;
+
+// True when AInstr's two operands may change places in its key: an integer add, mul, and,
+// or, xor, and an eq / ne compare (a float's oeq / une too)
+routine DoCommutative(const AInstr: ref IrInstr): bool;
+var
+  LKind: IrOp;
+begin
+  LKind := AInstr.Kind;
+  if LKind = IrOp.Compare then
+    return (AInstr.Predicate = IrPredicate.Equal) or
+      (AInstr.Predicate = IrPredicate.NotEqual) or (AInstr.Predicate = IrPredicate.FEqual) or
+      (AInstr.Predicate = IrPredicate.FNotEqual);
+  end;
+  if IsFloatType(AInstr.ValueType) then
+    return false;
+  end;
+  return (LKind = IrOp.Add) or (LKind = IrOp.Mul) or (LKind = IrOp.BitAnd) or
+    (LKind = IrOp.BitOr) or (LKind = IrOp.BitXor);
+end;
+
+type
+  // One function's numbering (see the header)
+  ValueNumbering = object
+    hidden FModule: ref IrModule;
+    hidden FFunction: ref IrFunction;
+    hidden FAnalysis: ref FunctionAnalysis;
+    // Each replaced value's replacement (the dominating value with its key)
+    hidden FReplace: ref Int64Map;
+    // Each key's first value in the scope the walk is in (ADAM_GVN_GONE: a left one), and
+    // the undo log putting back what each entry overwrote
+    hidden FTable: ref StringIdMap;
+    hidden FUndoKeys: array of string;
+    hidden FUndoIds: array of int64;
+    hidden FUndoCount: int64;
+    // Each condition known in the scope the walk is in (1 true, 0 false), and its undo log
+    hidden FFacts: ref Int64Map;
+    hidden FFactKeys: ref Int64List;
+    hidden FFactValues: ref Int64List;
+    // The memory generation now, the last one given, and the one each block ended with
+    hidden FGen: int64;
+    hidden FLastGen: int64;
+    hidden FGenEnd: array of int64;
+    // Where each block's entries start in the two undo logs
+    hidden FMarkKeys: array of int64;
+    hidden FMarkFacts: array of int64;
+    // Each routine's purity found so far (see the header)
+    hidden FPurity: ref Int64Map;
+    hidden FChanged: bool;
+
+    // The numbering of AModule's function AFunction over its analysis AAnalysis
+    init(const AModule: ref IrModule; const AFunction: int64;
+      const AAnalysis: ref FunctionAnalysis);
+    begin
+      self.FModule := AModule;
+      self.FFunction := AModule.FunctionAt(AFunction);
+      self.FAnalysis := AAnalysis;
+      self.FReplace := ref Int64Map(ADAM_GVN_NONE);
+      self.FTable := ref StringIdMap();
+      self.FUndoCount := 0;
+      self.FFacts := ref Int64Map(ADAM_GVN_NONE);
+      self.FFactKeys := ref Int64List();
+      self.FFactValues := ref Int64List();
+      self.FGen := 0;
+      self.FLastGen := 0;
+      setlength(self.FGenEnd, AAnalysis.BlockCount);
+      setlength(self.FMarkKeys, AAnalysis.BlockCount);
+      setlength(self.FMarkFacts, AAnalysis.BlockCount);
+      self.FPurity := ref Int64Map(ADAM_GVN_NONE);
+      self.FChanged := false;
+    end;
+
+    // The value AId stands for: followed through the replaced values until one that stays
+    // (raised when they run round: a compiler bug)
+    hidden const method DoResolve(const AId: int64): int64;
+    var
+      LAt: int64;
+      LNext: int64;
+      LSteps: int64;
+    begin
+      LAt := AId;
+      LSteps := 0;
+      LNext := self.FReplace.Find(LAt);
+      while LNext <> ADAM_GVN_NONE do
+        LSteps := LSteps + 1;
+        if LSteps > self.FReplace.Count then
+          raise(ADAM_GVN_FAULT_CYCLE + IntToStr(AId));
+        end;
+        LAt := LNext;
+        LNext := self.FReplace.Find(LAt);
+      end;
+      return LAt;
+    end;
+
+    // True when AId is a constant
+    hidden const method DoIsConstant(const AId: int64): bool;
+    begin
+      return self.FModule.InstrAt(AId).Kind = IrOp.Constant;
+    end;
+
+    // AId as a key's operand: a constant by its type and value, any other value by its id
+    hidden const method DoOperandKey(const AId: int64): string;
+    var
+      LInstr: ref IrInstr;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      if LInstr.Kind = IrOp.Constant then
+        return "#" + IrTypeText(LInstr.ValueType) + ":" +
+          IntToStr(IrCanonicalImm(LInstr.ValueType, LInstr.Imm));
+      end;
+      return "i" + IntToStr(AId);
+    end;
+
+    // A new memory generation (see the header)
+    hidden method DoNewGen();
+    begin
+      self.FLastGen := self.FLastGen + 1;
+      self.FGen := self.FLastGen;
+    end;
+
+    // AKey's value AId in the table, what it overwrote logged for the scope's end
+    hidden method DoRemember(const AKey: string; const AId: int64);
+    begin
+      if self.FUndoCount = len(self.FUndoKeys) then
+        setlength(self.FUndoKeys, self.FUndoCount * 2 + ADAM_GVN_FIRST_UNDO);
+        setlength(self.FUndoIds, self.FUndoCount * 2 + ADAM_GVN_FIRST_UNDO);
+      end;
+      self.FUndoKeys[self.FUndoCount] := AKey;
+      self.FUndoIds[self.FUndoCount] := self.FTable.Find(AKey);
+      self.FUndoCount := self.FUndoCount + 1;
+      self.FTable.Put(AKey, AId);
+    end;
+
+    // The table and the facts put back to the marks AKeys and AFacts (a scope left)
+    hidden method DoUndoTo(const AKeys: int64; const AFacts: int64);
+    var
+      LPrevious: int64;
+    begin
+      while self.FUndoCount > AKeys do
+        self.FUndoCount := self.FUndoCount - 1;
+        LPrevious := self.FUndoIds[self.FUndoCount];
+        if LPrevious <= 0 then
+          LPrevious := ADAM_GVN_GONE;
+        end;
+        self.FTable.Put(self.FUndoKeys[self.FUndoCount], LPrevious);
+      end;
+      while self.FFactKeys.Count > AFacts do
+        self.FFacts.Put(self.FFactKeys.RemoveLast(), self.FFactValues.RemoveLast());
+      end;
+    end;
+
+    // ACondition known to be AValue (1 true, 0 false) in the scope, what it overwrote
+    // logged
+    hidden method DoKnow(const ACondition: int64; const AValue: int64);
+    begin
+      self.FFactKeys.Add(ACondition);
+      self.FFactValues.Add(self.FFacts.Find(ACondition));
+      self.FFacts.Put(ACondition, AValue);
+    end;
+
+    // AId numbered by AKey: replaced by the scope's first value with that key, else that
+    // value from now on
+    hidden method DoNumber(const AId: int64; const AKey: string);
+    var
+      LFound: int64;
+    begin
+      LFound := self.FTable.Find(AKey);
+      if LFound > 0 then
+        self.FReplace.Put(AId, LFound);
+        self.FChanged := true;
+        return;
+      end;
+      self.DoRemember(AKey, AId);
+    end;
+
+    // The key of the numbered op AInstr (see the header)
+    hidden const method DoValueKey(const AInstr: ref IrInstr): string;
+    var
+      LKey: string;
+      LE: int64;
+    begin
+      LKey := IrOpText(AInstr.Kind) + " " + IrTypeText(AInstr.ValueType);
+      if AInstr.Kind = IrOp.Compare then
+        LKey := LKey + " " + IrPredicateText(AInstr.Predicate);
+      end;
+      LKey := LKey + " " + IntToStr(AInstr.Imm) + " " + IntToStr(AInstr.Link);
+      // Two non-constant operands of a commutative op in id order (a constant is already
+      // on the right: combine)
+      if (AInstr.Operands.Count = 2) and DoCommutative(AInstr) and
+        (not self.DoIsConstant(AInstr.Operands[0])) and
+        (not self.DoIsConstant(AInstr.Operands[1])) and
+        (AInstr.Operands[0] > AInstr.Operands[1]) then
+        return LKey + " " + self.DoOperandKey(AInstr.Operands[1]) + " " +
+          self.DoOperandKey(AInstr.Operands[0]);
+      end;
+      for LE := 0 to AInstr.Operands.Count - 1 do
+        LKey := LKey + " " + self.DoOperandKey(AInstr.Operands[LE]);
+      end;
+      return LKey;
+    end;
+
+    // The key of the phi AInstr: its block and its (value, edge) pairs
+    hidden const method DoPhiKey(const AInstr: ref IrInstr): string;
+    var
+      LKey: string;
+      LE: int64;
+    begin
+      LKey := "phi " + IrTypeText(AInstr.ValueType) + " b" + IntToStr(AInstr.Block);
+      for LE := 0 to AInstr.Operands.Count - 1 do
+        LKey := LKey + " " + self.DoOperandKey(AInstr.Operands[LE]) + "@" +
+          IntToStr(AInstr.Targets[LE]);
+      end;
+      return LKey;
+    end;
+
+    // The key of the load AInstr: its type, its address and the generation now
+    hidden const method DoLoadKey(const AInstr: ref IrInstr): string;
+    begin
+      return "load " + IrTypeText(AInstr.ValueType) + " " +
+        self.DoOperandKey(AInstr.Operands[0]) + " g" + IntToStr(self.FGen);
+    end;
+
+    // The key of the call AInstr of a pure routine: the routine and its arguments
+    hidden const method DoCallKey(const AInstr: ref IrInstr): string;
+    var
+      LKey: string;
+      LE: int64;
+    begin
+      LKey := "call " + IrTypeText(AInstr.ValueType) + " f" + IntToStr(AInstr.Link);
+      for LE := 0 to AInstr.Operands.Count - 1 do
+        LKey := LKey + " " + self.DoOperandKey(AInstr.Operands[LE]);
+      end;
+      return LKey;
+    end;
+
+    // True when every instruction of AFunction keeps to a pure routine's (see the header)
+    hidden method DoScanPure(const AFunction: ref IrFunction): bool;
+    var
+      LSlots: ref Int64Map;
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LKind: IrOp;
+      LId: int64;
+      LI: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      LSlots := ref Int64Map(ADAM_GVN_NONE);
+      for LI := 0 to AFunction.Blocks.Count - 1 do
+        LBlock := self.FModule.BlockAt(AFunction.Blocks[LI]);
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LId := LBlock.Instrs[LK];
+          if self.FModule.InstrAt(LId).Kind = IrOp.Slot then
+            LSlots.Put(LId, 1);
+          end;
+        end;
+      end;
+      for LI := 0 to AFunction.Blocks.Count - 1 do
+        LBlock := self.FModule.BlockAt(AFunction.Blocks[LI]);
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LInstr := self.FModule.InstrAt(LBlock.Instrs[LK]);
+          LKind := LInstr.Kind;
+          // A slot is only ever a load's or a store's address
+          for LE := 0 to LInstr.Operands.Count - 1 do
+            if LSlots.Find(LInstr.Operands[LE]) <> ADAM_GVN_NONE then
+              if not (((LKind = IrOp.Load) or (LKind = IrOp.Store)) and (LE = 0)) then
+                return false;
+              end;
+            end;
+          end;
+          if (LKind = IrOp.Load) or (LKind = IrOp.Store) then
+            if LSlots.Find(LInstr.Operands[0]) = ADAM_GVN_NONE then
+              return false;
+            end;
+            skip;
+          end;
+          if LKind = IrOp.Call then
+            if not self.DoIsPure(LInstr.Link) then
+              return false;
+            end;
+            skip;
+          end;
+          if not (DoNumbered(LKind) or (LKind = IrOp.Constant) or
+            (LKind = IrOp.Parameter) or (LKind = IrOp.Slot) or (LKind = IrOp.Ret) or
+            (LKind = IrOp.Jump) or (LKind = IrOp.Branch) or (LKind = IrOp.Phi)) then
+            return false;
+          end;
+        end;
+      end;
+      return true;
+    end;
+
+    // True when the routine AFunction is pure (see the header); found once, kept
+    hidden method DoIsPure(const AFunction: int64): bool;
+    var
+      LFunction: ref IrFunction;
+      LState: int64;
+      LPure: bool;
+    begin
+      LState := self.FPurity.Find(AFunction);
+      if LState <> ADAM_GVN_NONE then
+        return LState = ADAM_GVN_PURE;
+      end;
+      if not self.FModule.IsFunction(AFunction) then
+        return false;
+      end;
+      LFunction := self.FModule.FunctionAt(AFunction);
+      if LFunction.Declared or (LFunction.Parent <> 0) or (LFunction.ScopeCount() > 0) or
+        LFunction.Signature.Variadic or
+        (LFunction.Signature.ResultType = IrType.Void) then
+        self.FPurity.Put(AFunction, ADAM_GVN_IMPURE);
+        return false;
+      end;
+      self.FPurity.Put(AFunction, ADAM_GVN_FINDING);
+      LPure := self.DoScanPure(LFunction);
+      if LPure then
+        self.FPurity.Put(AFunction, ADAM_GVN_PURE);
+      else
+        self.FPurity.Put(AFunction, ADAM_GVN_IMPURE);
+      end;
+      return LPure;
+    end;
+
+    // The branch AInstr (block ABlock): its condition known in the scope -> that bool
+    // constant, put just before it, is its condition (see the header)
+    hidden method DoBranch(const AInstr: ref IrInstr; const ABlock: int64);
+    var
+      LInstrs: ref Int64List;
+      LKnown: int64;
+      LId: int64;
+      LTerminator: int64;
+    begin
+      if self.DoIsConstant(AInstr.Operands[0]) then
+        return;
+      end;
+      LKnown := self.FFacts.Find(AInstr.Operands[0]);
+      if LKnown = ADAM_GVN_NONE then
+        return;
+      end;
+      // Emit puts the constant last: it goes back one place, before the branch
+      LId := self.FModule.Emit(ABlock, IrOp.Constant, IrType.Bool, AInstr.Node);
+      self.FModule.InstrAt(LId).Imm := LKnown;
+      LInstrs := self.FModule.BlockAt(ABlock).Instrs;
+      LInstrs.RemoveLast();
+      LTerminator := LInstrs.RemoveLast();
+      LInstrs.Add(LId);
+      LInstrs.Add(LTerminator);
+      AInstr.Operands.Put(0, LId);
+      self.FChanged := true;
+    end;
+
+    // The instruction AId of the block ABlock: its operands resolved, then numbered, a
+    // write giving a new generation, a branch on a known condition made constant
+    hidden method DoVisit(const AId: int64; const ABlock: int64);
+    var
+      LInstr: ref IrInstr;
+      LKind: IrOp;
+      LValue: int64;
+      LE: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      for LE := 0 to LInstr.Operands.Count - 1 do
+        LValue := self.DoResolve(LInstr.Operands[LE]);
+        if LValue <> LInstr.Operands[LE] then
+          LInstr.Operands.Put(LE, LValue);
+          self.FChanged := true;
+        end;
+      end;
+      LKind := LInstr.Kind;
+      if LKind = IrOp.Branch then
+        self.DoBranch(LInstr, ABlock);
+        return;
+      end;
+      if LKind = IrOp.Phi then
+        self.DoNumber(AId, self.DoPhiKey(LInstr));
+        return;
+      end;
+      if LKind = IrOp.Load then
+        self.DoNumber(AId, self.DoLoadKey(LInstr));
+        return;
+      end;
+      if LKind = IrOp.Call then
+        if (LInstr.ValueType <> IrType.Void) and self.DoIsPure(LInstr.Link) then
+          self.DoNumber(AId, self.DoCallKey(LInstr));
+        else
+          self.DoNewGen();
+        end;
+        return;
+      end;
+      if DoWrites(LKind) then
+        self.DoNewGen();
+        return;
+      end;
+      if DoNumbered(LKind) then
+        self.DoNumber(AId, self.DoValueKey(LInstr));
+      end;
+    end;
+
+    // Entering the block at APosition: its generation and the condition its edge makes
+    // known (see the header)
+    hidden method DoEnter(const APosition: int64);
+    var
+      LPreds: ref Int64List;
+      LBlock: ref IrBlock;
+      LTerminator: ref IrInstr;
+      LCondition: int64;
+      LHere: int64;
+      LPred: int64;
+    begin
+      self.DoNewGen();
+      LPreds := self.FAnalysis.PredsOf(APosition);
+      if LPreds.Count <> 1 then
+        return;
+      end;
+      LPred := LPreds[0];
+      if (LPred <> self.FAnalysis.Idom(APosition)) or
+        (self.FAnalysis.UnwindSuccsOf(LPred).IndexOf(APosition) >= 0) then
+        return;
+      end;
+      self.FGen := self.FGenEnd[LPred];
+      LBlock := self.FModule.BlockAt(self.FAnalysis.BlockAt(LPred));
+      LTerminator := self.FModule.InstrAt(LBlock.Instrs[LBlock.Instrs.Count - 1]);
+      if (LTerminator.Kind <> IrOp.Branch) or
+        (LTerminator.Targets[0] = LTerminator.Targets[1]) then
+        return;
+      end;
+      LCondition := self.DoResolve(LTerminator.Operands[0]);
+      if self.DoIsConstant(LCondition) then
+        return;
+      end;
+      LHere := self.FAnalysis.BlockAt(APosition);
+      if LTerminator.Targets[0] = LHere then
+        self.DoKnow(LCondition, 1);
+      end;
+      if LTerminator.Targets[1] = LHere then
+        self.DoKnow(LCondition, 0);
+      end;
+    end;
+
+    // The block at APosition entered, then its instructions visited in order
+    hidden method DoVisitBlock(const APosition: int64);
+    var
+      LBlockId: int64;
+      LInstrs: ref Int64List;
+      LCount: int64;
+      LK: int64;
+    begin
+      self.DoEnter(APosition);
+      LBlockId := self.FAnalysis.BlockAt(APosition);
+      LInstrs := self.FModule.BlockAt(LBlockId).Instrs;
+      // DoBranch reorders only after the terminator, the last one visited
+      LCount := LInstrs.Count;
+      for LK := 0 to LCount - 1 do
+        self.DoVisit(LInstrs[LK], LBlockId);
+      end;
+      self.FGenEnd[APosition] := self.FGen;
+    end;
+
+    // The dominator tree walked from the entry (a stack of enter / leave codes: a position
+    // times two, plus one to leave), each block's entries undone when its subtree is left
+    hidden method DoWalk();
+    var
+      LStack: ref Int64List;
+      LChildren: ref Int64List;
+      LCode: int64;
+      LPosition: int64;
+      LI: int64;
+    begin
+      if (self.FAnalysis.BlockCount = 0) or (not self.FAnalysis.Reachable(0)) then
+        return;
+      end;
+      LStack := ref Int64List();
+      LStack.Add(0);
+      while LStack.Count > 0 do
+        LCode := LStack.RemoveLast();
+        LPosition := LCode div 2;
+        if LCode mod 2 = 1 then
+          self.DoUndoTo(self.FMarkKeys[LPosition], self.FMarkFacts[LPosition]);
+          skip;
+        end;
+        self.FMarkKeys[LPosition] := self.FUndoCount;
+        self.FMarkFacts[LPosition] := self.FFactKeys.Count;
+        self.DoVisitBlock(LPosition);
+        LStack.Add(LPosition * 2 + 1);
+        // The children pushed last first, so the first is walked first
+        LChildren := self.FAnalysis.DomChildren(LPosition);
+        for LI := 0 to LChildren.Count - 1 do
+          LStack.Add(LChildren[LChildren.Count - 1 - LI] * 2);
+        end;
+      end;
+    end;
+
+    // Every block (an unreached one too) swept: each operand resolved, each replaced
+    // value left out
+    hidden method DoSweep();
+    var
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LNew: ref Int64List;
+      LId: int64;
+      LI: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      for LI := 0 to self.FFunction.Blocks.Count - 1 do
+        LBlock := self.FModule.BlockAt(self.FFunction.Blocks[LI]);
+        LNew := ref Int64List();
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LId := LBlock.Instrs[LK];
+          if self.FReplace.Find(LId) <> ADAM_GVN_NONE then
+            skip;
+          end;
+          LInstr := self.FModule.InstrAt(LId);
+          for LE := 0 to LInstr.Operands.Count - 1 do
+            LInstr.Operands.Put(LE, self.DoResolve(LInstr.Operands[LE]));
+          end;
+          LNew.Add(LId);
+        end;
+        LBlock.Instrs := LNew;
+      end;
+    end;
+
+    // The numbering (see the header); true when it changed the function
+    method Run(): bool;
+    begin
+      self.DoWalk();
+      if self.FChanged then
+        self.DoSweep();
+      end;
+      return self.FChanged;
+    end;
+  end;
+
+// The pass gvn (see the header) over AModule's function AFunction with its analysis
+// AAnalysis (blocks and edges it never changes); true when it changed the function
+public routine NumberValues(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LNumbering: ref ValueNumbering;
+begin
+  LNumbering := ref ValueNumbering(AModule, AFunction, AAnalysis);
+  return LNumbering.Run();
+end;
+
+end.
