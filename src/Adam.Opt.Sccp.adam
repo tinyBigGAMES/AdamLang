@@ -1,0 +1,977 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Opt.Sccp.adam - sparse conditional constant propagation (PLAN-ADAM M6
+  O5)
+
+  PropagateConstants is Wegman and Zadeck's SCCP over one function in SSA
+  form. Every value starts unknown (top); a block runs only once an edge
+  into it is found to run (the entry from the start; a catching scope's
+  resume block by the unwind edges of the blocks it covers); two worklists,
+  edges found to run and values whose lattice fell, drive the solve until
+  neither has work. A value falls from top to one known constant to
+  overdefined, never back up. A phi meets only the operands whose edge runs,
+  so a value that stays one constant around a loop is found; a branch on a
+  known bool runs only its taken edge.
+
+  Folding is the machine's arithmetic exactly (the code Adam.X64.Select
+  emits for each op), so an optimized program computes what a debug one
+  does:
+    - an integer wraps at its type's width: computed on 64 bits, then cut
+      and sign- or zero-extended as the type is (ReadLowBits: the form
+      Lowering writes a constant's Imm in; a float32's Imm its 32 bits); a
+      shift's count is masked as the hardware masks it, to 0..63 at 64 bits
+      and to 0..31 below (an 8-bit shl by 9 is 0)
+    - sdiv / udiv / srem / urem by zero, and the lowest signed value by -1,
+      are never folded: the division stays and faults where the debug one
+      does
+    - a convert is the machine's own: the low bits, an extension by the
+      source's signedness, a ptr and a 64-bit integer as they are; a float to
+      an integer only when its truncation fits the target (outside it the
+      hardware's result is C's undefined behaviour, left to the hardware);
+      float32 <-> float64 when there is no NaN and float32 holds the value
+    - a float add / sub / mul / fdiv is done in its own type (the compiler
+      runs the same scalar SSE op the program would), never folded when the
+      result is a NaN (its payload is the hardware's); a float neg flips the
+      sign bit; a float compare follows IrPredicate's NaN rules
+
+  The function is then rewritten: a value found constant becomes a constant
+  in its own place (its uses unchanged; a folded phi moves after the phis
+  that stay), a branch on a known bool becomes a jump to its taken target, a
+  phi drops the operands whose edge never runs, and a block no edge runs
+  into is emptied to a bare ret (a zero of the result type when the function
+  has one; its slots stay, as a funclet may reach them), so no running block
+  keeps an edge from it. The emptied blocks stay where they are (scope
+  ranges name blocks by position): O7's CFG simplify drops them and
+  renumbers the scopes.
+*******************************************************************************/
+
+module unit Adam.Opt.Sccp;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Ssa, Adam.Opt.Analysis;
+
+const
+  // A value's place in the lattice: not known yet, one known constant, overdefined
+  ADAM_SCCP_TOP: int64 = 0;
+  ADAM_SCCP_KNOWN: int64 = 1;
+  ADAM_SCCP_OVER: int64 = 2;
+  // The largest float32 as a float64: a float64 past it is never narrowed here
+  ADAM_SCCP_FLOAT32_MAX: float64 = 3.4028234663852886e38;
+  // The sign bit of a float32 and of a float64 (a float neg flips it)
+  ADAM_SCCP_SIGN32: uint64 = 0x80000000u;
+  ADAM_SCCP_SIGN64: uint64 = 0x8000000000000000u;
+
+// The bits a value of AType is computed at: 8 for a bool, an integer's or a float's own
+// width, 64 for a ptr
+routine DoWidthOf(const AType: IrType): int64;
+begin
+  if (AType = IrType.Bool) or (AType = IrType.Int8) or (AType = IrType.UInt8) then
+    return 8;
+  end;
+  if (AType = IrType.Int16) or (AType = IrType.UInt16) then
+    return 16;
+  end;
+  if (AType = IrType.Int32) or (AType = IrType.UInt32) or (AType = IrType.Float32) then
+    return 32;
+  end;
+  return 64;
+end;
+
+// AValue as a constant of AType holds it (see the header): the type's low bits,
+// sign-extended for a signed integer, zero-extended for any other type
+routine DoCanonical(const AType: IrType; const AValue: int64): int64;
+begin
+  return ReadLowBits(AValue, DoWidthOf(AType), IsSignedType(AType));
+end;
+
+// The value of a constant AValue of the float type AType, as a float64 (a float32
+// widened: exact, a NaN stays a NaN)
+routine DoFloatOf(const AType: IrType; const AValue: int64): float64;
+begin
+  if AType = IrType.Float32 then
+    return float64(Float32FromBits(uint32(AValue)));
+  end;
+  return Float64FromBits(uint64(AValue));
+end;
+
+// The integer ALeft AKind ARight of AType (add, sub, mul, and, or, xor; an offset adds a
+// ptr and an int64), wrapped at the type's width
+routine DoFoldInteger(const AKind: IrOp; const AType: IrType; const ALeft: int64;
+  const ARight: int64): int64;
+var
+  LLeft: uint64;
+  LRight: uint64;
+begin
+  LLeft := uint64(ALeft);
+  LRight := uint64(ARight);
+  if AKind = IrOp.Sub then
+    return DoCanonical(AType, int64(LLeft - LRight));
+  end;
+  if AKind = IrOp.Mul then
+    return DoCanonical(AType, int64(LLeft * LRight));
+  end;
+  if AKind = IrOp.BitAnd then
+    return DoCanonical(AType, int64(LLeft & LRight));
+  end;
+  if AKind = IrOp.BitOr then
+    return DoCanonical(AType, int64(LLeft | LRight));
+  end;
+  if AKind = IrOp.BitXor then
+    return DoCanonical(AType, int64(LLeft xor LRight));
+  end;
+  return DoCanonical(AType, int64(LLeft + LRight));
+end;
+
+// The neg or not of AValue of AType: an integer's two's complement or complement at its
+// width, a float's sign bit flipped (-(+0.0) is -0.0, a NaN keeps its payload)
+routine DoFoldNegate(const AKind: IrOp; const AType: IrType; const AValue: int64): int64;
+begin
+  if AType = IrType.Float32 then
+    return int64(uint64(AValue) xor ADAM_SCCP_SIGN32);
+  end;
+  if AType = IrType.Float64 then
+    return int64(uint64(AValue) xor ADAM_SCCP_SIGN64);
+  end;
+  if AKind = IrOp.BitNot then
+    return DoCanonical(AType, int64(~uint64(AValue)));
+  end;
+  return DoCanonical(AType, int64(uint64(0) - uint64(AValue)));
+end;
+
+// The shift AKind (shl, shr, sar) of AValue of AType by ACount as the hardware does it:
+// the count masked to 0..63 at 64 bits and to 0..31 below; shr brings zeros in above the
+// type's width, sar copies its top bit
+routine DoFoldShift(const AKind: IrOp; const AType: IrType; const AValue: int64;
+  const ACount: int64): int64;
+var
+  LWidth: int64;
+  LCount: uint64;
+  LBits: uint64;
+  LSigned: int64;
+begin
+  LWidth := DoWidthOf(AType);
+  LCount := uint64(ACount) & uint64(31);
+  if LWidth = 64 then
+    LCount := uint64(ACount) & uint64(63);
+  end;
+  if AKind = IrOp.Shl then
+    return DoCanonical(AType, int64(uint64(AValue) shl LCount));
+  end;
+  if AKind = IrOp.Shr then
+    LBits := uint64(ReadLowBits(AValue, LWidth, false));
+    return DoCanonical(AType, int64(LBits shr LCount));
+  end;
+  // sar: the value read signed at its width, shifted arithmetically
+  LSigned := ReadLowBits(AValue, LWidth, true);
+  return DoCanonical(AType, LSigned shr int64(LCount));
+end;
+
+// The division AKind (sdiv, udiv, srem, urem) of ALeft by ARight of AType into AResult;
+// false where the machine faults (a zero divisor, the lowest signed value by -1): those
+// are never folded, so the fault stays
+routine DoFoldDivide(const AKind: IrOp; const AType: IrType; const ALeft: int64;
+  const ARight: int64; var AResult: int64): bool;
+var
+  LLowest: int64;
+begin
+  if ARight = 0 then
+    return false;
+  end;
+  if (AKind = IrOp.SDiv) or (AKind = IrOp.SRem) then
+    LLowest := DoCanonical(AType, int64(uint64(1) shl uint64(DoWidthOf(AType) - 1)));
+    if (ARight = -1) and (ALeft = LLowest) then
+      return false;
+    end;
+    // Signed constants are sign-extended: int64's div / mod truncate as idiv does
+    if AKind = IrOp.SDiv then
+      AResult := DoCanonical(AType, ALeft div ARight);
+    else
+      AResult := DoCanonical(AType, ALeft mod ARight);
+    end;
+    return true;
+  end;
+  // Unsigned constants are zero-extended: uint64's div / mod are div's
+  if AKind = IrOp.UDiv then
+    AResult := DoCanonical(AType, int64(uint64(ALeft) div uint64(ARight)));
+  else
+    AResult := DoCanonical(AType, int64(uint64(ALeft) mod uint64(ARight)));
+  end;
+  return true;
+end;
+
+// The float ALeft AKind ARight (add, sub, mul, fdiv) of AType, done in its own type, into
+// AResult; false for a NaN result (its payload is the hardware's)
+routine DoFoldFloat(const AKind: IrOp; const AType: IrType; const ALeft: int64;
+  const ARight: int64; var AResult: int64): bool;
+var
+  LLeft32: float32;
+  LRight32: float32;
+  LValue32: float32;
+  LLeft64: float64;
+  LRight64: float64;
+  LValue64: float64;
+begin
+  if AType = IrType.Float32 then
+    LLeft32 := Float32FromBits(uint32(ALeft));
+    LRight32 := Float32FromBits(uint32(ARight));
+    LValue32 := LLeft32 + LRight32;
+    if AKind = IrOp.Sub then
+      LValue32 := LLeft32 - LRight32;
+    end;
+    if AKind = IrOp.Mul then
+      LValue32 := LLeft32 * LRight32;
+    end;
+    if AKind = IrOp.FDiv then
+      LValue32 := LLeft32 / LRight32;
+    end;
+    if LValue32 <> LValue32 then
+      return false;
+    end;
+    AResult := int64(Float32ToBits(LValue32));
+    return true;
+  end;
+  LLeft64 := Float64FromBits(uint64(ALeft));
+  LRight64 := Float64FromBits(uint64(ARight));
+  LValue64 := LLeft64 + LRight64;
+  if AKind = IrOp.Sub then
+    LValue64 := LLeft64 - LRight64;
+  end;
+  if AKind = IrOp.Mul then
+    LValue64 := LLeft64 * LRight64;
+  end;
+  if AKind = IrOp.FDiv then
+    LValue64 := LLeft64 / LRight64;
+  end;
+  if LValue64 <> LValue64 then
+    return false;
+  end;
+  AResult := int64(Float64ToBits(LValue64));
+  return true;
+end;
+
+// The truth of ALeft APredicate ARight for a signed order (slt, sle, sgt, sge)
+routine DoSignedTruth(const APredicate: IrPredicate; const ALeft: int64;
+  const ARight: int64): bool;
+begin
+  if APredicate = IrPredicate.SLess then
+    return ALeft < ARight;
+  end;
+  if APredicate = IrPredicate.SLessEqual then
+    return ALeft <= ARight;
+  end;
+  if APredicate = IrPredicate.SGreater then
+    return ALeft > ARight;
+  end;
+  return ALeft >= ARight;
+end;
+
+// The truth of ALeft APredicate ARight for equality or an unsigned order (eq, ne, ult,
+// ule, ugt, uge), on the operands' bits
+routine DoUnsignedTruth(const APredicate: IrPredicate; const ALeft: uint64;
+  const ARight: uint64): bool;
+begin
+  if APredicate = IrPredicate.Equal then
+    return ALeft = ARight;
+  end;
+  if APredicate = IrPredicate.NotEqual then
+    return ALeft <> ARight;
+  end;
+  if APredicate = IrPredicate.ULess then
+    return ALeft < ARight;
+  end;
+  if APredicate = IrPredicate.ULessEqual then
+    return ALeft <= ARight;
+  end;
+  if APredicate = IrPredicate.UGreater then
+    return ALeft > ARight;
+  end;
+  return ALeft >= ARight;
+end;
+
+// The truth of ALeft APredicate ARight for a float predicate (IrPredicate's rules: oeq and
+// the orders false with a NaN, une true), as float64 (a float32 widened exactly)
+routine DoFloatTruth(const APredicate: IrPredicate; const ALeft: float64;
+  const ARight: float64): bool;
+begin
+  if APredicate = IrPredicate.FEqual then
+    return ALeft = ARight;
+  end;
+  if APredicate = IrPredicate.FNotEqual then
+    return ALeft <> ARight;
+  end;
+  if APredicate = IrPredicate.FLess then
+    return ALeft < ARight;
+  end;
+  if APredicate = IrPredicate.FLessEqual then
+    return ALeft <= ARight;
+  end;
+  if APredicate = IrPredicate.FGreater then
+    return ALeft > ARight;
+  end;
+  return ALeft >= ARight;
+end;
+
+// The compare ALeft APredicate ARight, both of AType, as a bool's 0 / 1: a signed order
+// reads the operands signed at their width, equality and an unsigned order as their bits,
+// a float predicate as floats
+routine DoFoldCompare(const APredicate: IrPredicate; const AType: IrType; const ALeft: int64;
+  const ARight: int64): int64;
+var
+  LWidth: int64;
+  LTruth: bool;
+begin
+  LWidth := DoWidthOf(AType);
+  if IsFloatPredicate(APredicate) then
+    LTruth := DoFloatTruth(APredicate, DoFloatOf(AType, ALeft), DoFloatOf(AType, ARight));
+  else
+    if IsSignedPredicate(APredicate) then
+      LTruth := DoSignedTruth(APredicate, ReadLowBits(ALeft, LWidth, true),
+        ReadLowBits(ARight, LWidth, true));
+    else
+      LTruth := DoUnsignedTruth(APredicate, uint64(ReadLowBits(ALeft, LWidth, false)),
+        uint64(ReadLowBits(ARight, LWidth, false)));
+    end;
+  end;
+  if LTruth then
+    return 1;
+  end;
+  return 0;
+end;
+
+// The integer (or bool) AValue of AFrom as the float type ATo, rounded to nearest as the
+// machine converts it (cvtsi2ss / cvtsi2sd of the value; a uint64 by its own sequence,
+// the same one the compiler's own convert runs)
+routine DoIntToFloat(const AFrom: IrType; const ATo: IrType; const AValue: int64): int64;
+begin
+  if AFrom = IrType.UInt64 then
+    if ATo = IrType.Float32 then
+      return int64(Float32ToBits(float32(uint64(AValue))));
+    end;
+    return int64(Float64ToBits(float64(uint64(AValue))));
+  end;
+  if ATo = IrType.Float32 then
+    return int64(Float32ToBits(float32(AValue)));
+  end;
+  return int64(Float64ToBits(float64(AValue)));
+end;
+
+// The float AValue (no NaN) truncated toward zero to the integer type ATo into AResult;
+// false when the truncation does not fit ATo (the hardware's result there is left to it)
+routine DoFloatToInt(const ATo: IrType; const AValue: float64; var AResult: int64): bool;
+var
+  LHalf: float64;
+begin
+  // 2^(width - 1), exact
+  LHalf := float64(uint64(1) shl uint64(DoWidthOf(ATo) - 1));
+  if IsSignedType(ATo) then
+    // fits above the lowest value minus one and below 2^(width - 1) (at 64 bits the lowest
+    // value itself is left to the hardware: -2^63 - 1 rounds to -2^63)
+    if (AValue <= -LHalf - 1.0) or (AValue >= LHalf) then
+      return false;
+    end;
+    AResult := DoCanonical(ATo, int64(AValue));
+    return true;
+  end;
+  if (AValue <= -1.0) or (AValue >= LHalf * 2.0) then
+    return false;
+  end;
+  if ATo = IrType.UInt64 then
+    AResult := int64(uint64(AValue));
+    return true;
+  end;
+  AResult := DoCanonical(ATo, int64(AValue));
+  return true;
+end;
+
+// The convert of AValue from AFrom to ATo into AResult (see the header); false where the
+// result is not folded: a NaN, a float the target cannot hold
+routine DoFoldConvert(const AFrom: IrType; const ATo: IrType; const AValue: int64;
+  var AResult: int64): bool;
+var
+  LFloat: float64;
+begin
+  if (not IsFloatType(AFrom)) and (not IsFloatType(ATo)) then
+    AResult := DoCanonical(ATo, AValue);
+    return true;
+  end;
+  if not IsFloatType(AFrom) then
+    AResult := DoIntToFloat(AFrom, ATo, AValue);
+    return true;
+  end;
+  LFloat := DoFloatOf(AFrom, AValue);
+  if LFloat <> LFloat then
+    return false;
+  end;
+  if ATo = IrType.Float64 then
+    AResult := int64(Float64ToBits(LFloat));
+    return true;
+  end;
+  if ATo = IrType.Float32 then
+    if (LFloat > ADAM_SCCP_FLOAT32_MAX) or (LFloat < -ADAM_SCCP_FLOAT32_MAX) then
+      return false;
+    end;
+    AResult := int64(Float32ToBits(float32(LFloat)));
+    return true;
+  end;
+  return DoFloatToInt(ATo, LFloat, AResult);
+end;
+
+// True for the kinds whose value is folded from their operands' (see the header)
+routine DoIsFoldable(const AKind: IrOp): bool;
+begin
+  return (AKind = IrOp.Add) or (AKind = IrOp.Sub) or (AKind = IrOp.Mul) or
+    (AKind = IrOp.BitAnd) or (AKind = IrOp.BitOr) or (AKind = IrOp.BitXor) or
+    (AKind = IrOp.Neg) or (AKind = IrOp.BitNot) or (AKind = IrOp.Shl) or
+    (AKind = IrOp.Shr) or (AKind = IrOp.Sar) or (AKind = IrOp.SDiv) or
+    (AKind = IrOp.UDiv) or (AKind = IrOp.SRem) or (AKind = IrOp.URem) or
+    (AKind = IrOp.FDiv) or (AKind = IrOp.Compare) or (AKind = IrOp.Convert) or
+    (AKind = IrOp.Offset);
+end;
+
+type
+  // One function's propagation (see the header), run once
+  Propagator = object
+    hidden FModule: ref IrModule;
+    hidden FFunctionId: int64;
+    hidden FAnalysis: ref FunctionAnalysis;
+    hidden FCount: int64;
+    // Each value's lattice state (ADAM_SCCP_TOP when it has none yet) and its constant
+    // when known, by instruction id
+    hidden FState: ref Int64Map;
+    hidden FValue: ref Int64Map;
+    // Per block position: an edge runs into it; and the edges found to run (1), keyed by
+    // from * FCount + to
+    hidden FRunning: BoolArray;
+    hidden FEdges: ref Int64Map;
+    // The work: positions to visit whole (their first edge in), positions whose phis meet
+    // again (a later edge in), values whose users evaluate again
+    hidden FBlockWork: ref Int64List;
+    hidden FPhiWork: ref Int64List;
+    hidden FValueWork: ref Int64List;
+
+    init(const AModule: ref IrModule; const AFunction: int64;
+      const AAnalysis: ref FunctionAnalysis);
+    begin
+      self.FModule := AModule;
+      self.FFunctionId := AFunction;
+      self.FAnalysis := AAnalysis;
+      self.FCount := AAnalysis.BlockCount;
+      self.FState := ref Int64Map(ADAM_SCCP_TOP);
+      self.FValue := ref Int64Map(0);
+      self.FEdges := ref Int64Map(0);
+      self.FBlockWork := ref Int64List();
+      self.FPhiWork := ref Int64List();
+      self.FValueWork := ref Int64List();
+    end;
+
+    // True when the edge from position AFrom to position ATo is found to run
+    hidden const method DoRuns(const AFrom: int64; const ATo: int64): bool;
+    begin
+      return self.FEdges.Find(AFrom * self.FCount + ATo) <> 0;
+    end;
+
+    // The edge from position AFrom to position ATo found to run: its block is visited
+    // whole the first time an edge runs into it, its phis meet again on a later one
+    hidden method DoMarkEdge(const AFrom: int64; const ATo: int64);
+    begin
+      if self.DoRuns(AFrom, ATo) then
+        return;
+      end;
+      self.FEdges.Put(AFrom * self.FCount + ATo, 1);
+      if self.FRunning[ATo] then
+        self.FPhiWork.Add(ATo);
+        return;
+      end;
+      self.FRunning[ATo] := true;
+      self.FBlockWork.Add(ATo);
+    end;
+
+    // The state of the value AId: overdefined when it is no value of this function (a
+    // funclet's operand in its parent's frame, a slot)
+    hidden const method DoStateOf(const AId: int64): int64;
+    begin
+      if self.FAnalysis.PositionOf(self.FModule.InstrAt(AId).Block) = ADAM_OPT_NO_BLOCK then
+        return ADAM_SCCP_OVER;
+      end;
+      return self.FState.Find(AId);
+    end;
+
+    // The value AId lowered to AState (AValue its constant when known): a state only
+    // falls, and two different constants are overdefined; a change sends its users back
+    // to work
+    hidden method DoSet(const AId: int64; const AState: int64; const AValue: int64);
+    var
+      LOld: int64;
+      LNew: int64;
+      LUses: ref Int64List;
+      LI: int64;
+    begin
+      LOld := self.FState.Find(AId);
+      if (AState = ADAM_SCCP_TOP) or (LOld = ADAM_SCCP_OVER) then
+        return;
+      end;
+      LNew := AState;
+      if (LOld = ADAM_SCCP_KNOWN) and (AState = ADAM_SCCP_KNOWN) then
+        if self.FValue.Find(AId) = AValue then
+          return;
+        end;
+        LNew := ADAM_SCCP_OVER;
+      end;
+      self.FState.Put(AId, LNew);
+      self.FValue.Put(AId, AValue);
+      LUses := self.FAnalysis.UsesOf(AId);
+      for LI := 0 to LUses.Count - 1 do
+        self.FValueWork.Add(LUses[LI]);
+      end;
+    end;
+
+    // The phi AId at APosition: the meet of the operands whose edge runs (top while none
+    // is known, one constant while every known one agrees)
+    hidden method DoMeetPhi(const AId: int64; const APosition: int64);
+    var
+      LPhi: ref IrInstr;
+      LState: int64;
+      LValue: int64;
+      LFrom: int64;
+      LOperand: int64;
+      LOperandState: int64;
+      LK: int64;
+    begin
+      LPhi := self.FModule.InstrAt(AId);
+      LState := ADAM_SCCP_TOP;
+      LValue := 0;
+      for LK := 0 to LPhi.Operands.Count - 1 do
+        LFrom := self.FAnalysis.PositionOf(LPhi.Targets[LK]);
+        if (LFrom <> ADAM_OPT_NO_BLOCK) and self.DoRuns(LFrom, APosition) then
+          LOperand := LPhi.Operands[LK];
+          LOperandState := self.DoStateOf(LOperand);
+          if LOperandState = ADAM_SCCP_OVER then
+            self.DoSet(AId, ADAM_SCCP_OVER, 0);
+            return;
+          end;
+          if LOperandState = ADAM_SCCP_KNOWN then
+            if LState = ADAM_SCCP_TOP then
+              LState := ADAM_SCCP_KNOWN;
+              LValue := self.FValue.Find(LOperand);
+            else
+              if self.FValue.Find(LOperand) <> LValue then
+                self.DoSet(AId, ADAM_SCCP_OVER, 0);
+                return;
+              end;
+            end;
+          end;
+        end;
+      end;
+      self.DoSet(AId, LState, LValue);
+    end;
+
+    // The state of the foldable AInstr from its operands' (AValue its constant when
+    // known): overdefined when one is, top while one is, else folded (overdefined where
+    // the fold is refused, see the header)
+    hidden method DoFold(const AInstr: ref IrInstr; var AValue: int64): int64;
+    var
+      LState: int64;
+      LTop: bool;
+      LLeft: int64;
+      LRight: int64;
+      LType: IrType;
+      LFrom: IrType;
+      LKind: IrOp;
+      LK: int64;
+    begin
+      LTop := false;
+      for LK := 0 to AInstr.Operands.Count - 1 do
+        LState := self.DoStateOf(AInstr.Operands[LK]);
+        if LState = ADAM_SCCP_OVER then
+          return ADAM_SCCP_OVER;
+        end;
+        if LState = ADAM_SCCP_TOP then
+          LTop := true;
+        end;
+      end;
+      if LTop then
+        return ADAM_SCCP_TOP;
+      end;
+      LKind := AInstr.Kind;
+      LType := AInstr.ValueType;
+      LFrom := self.FModule.InstrAt(AInstr.Operands[0]).ValueType;
+      LLeft := self.FValue.Find(AInstr.Operands[0]);
+      LRight := 0;
+      if AInstr.Operands.Count > 1 then
+        LRight := self.FValue.Find(AInstr.Operands[1]);
+      end;
+      if LKind = IrOp.Compare then
+        AValue := DoFoldCompare(AInstr.Predicate, LFrom, LLeft, LRight);
+        return ADAM_SCCP_KNOWN;
+      end;
+      if LKind = IrOp.Convert then
+        if DoFoldConvert(LFrom, LType, LLeft, AValue) then
+          return ADAM_SCCP_KNOWN;
+        end;
+        return ADAM_SCCP_OVER;
+      end;
+      if (LKind = IrOp.Neg) or (LKind = IrOp.BitNot) then
+        AValue := DoFoldNegate(LKind, LType, LLeft);
+        return ADAM_SCCP_KNOWN;
+      end;
+      if (LKind = IrOp.Shl) or (LKind = IrOp.Shr) or (LKind = IrOp.Sar) then
+        AValue := DoFoldShift(LKind, LType, LLeft, LRight);
+        return ADAM_SCCP_KNOWN;
+      end;
+      if (LKind = IrOp.SDiv) or (LKind = IrOp.UDiv) or (LKind = IrOp.SRem) or
+        (LKind = IrOp.URem) then
+        if DoFoldDivide(LKind, LType, LLeft, LRight, AValue) then
+          return ADAM_SCCP_KNOWN;
+        end;
+        return ADAM_SCCP_OVER;
+      end;
+      if IsFloatType(LType) then
+        if DoFoldFloat(LKind, LType, LLeft, LRight, AValue) then
+          return ADAM_SCCP_KNOWN;
+        end;
+        return ADAM_SCCP_OVER;
+      end;
+      AValue := DoFoldInteger(LKind, LType, LLeft, LRight);
+      return ADAM_SCCP_KNOWN;
+    end;
+
+    // The branch AInstr at APosition: a known bool runs its taken edge, an overdefined one
+    // both, an unknown one none yet
+    hidden method DoBranch(const AInstr: ref IrInstr; const APosition: int64);
+    var
+      LState: int64;
+    begin
+      LState := self.DoStateOf(AInstr.Operands[0]);
+      if LState = ADAM_SCCP_TOP then
+        return;
+      end;
+      if LState = ADAM_SCCP_KNOWN then
+        if self.FValue.Find(AInstr.Operands[0]) <> 0 then
+          self.DoMarkEdge(APosition, self.FAnalysis.PositionOf(AInstr.Targets[0]));
+        else
+          self.DoMarkEdge(APosition, self.FAnalysis.PositionOf(AInstr.Targets[1]));
+        end;
+        return;
+      end;
+      self.DoMarkEdge(APosition, self.FAnalysis.PositionOf(AInstr.Targets[0]));
+      self.DoMarkEdge(APosition, self.FAnalysis.PositionOf(AInstr.Targets[1]));
+    end;
+
+    // The instruction AId evaluated when its block runs: a terminator marks the edges it
+    // runs, a phi meets, a constant is known, a foldable op folds, any other value is
+    // overdefined
+    hidden method DoEvaluate(const AId: int64);
+    var
+      LInstr: ref IrInstr;
+      LPosition: int64;
+      LState: int64;
+      LValue: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LPosition := self.FAnalysis.PositionOf(LInstr.Block);
+      if LPosition = ADAM_OPT_NO_BLOCK then
+        return;
+      end;
+      if not self.FRunning[LPosition] then
+        return;
+      end;
+      if LInstr.Kind = IrOp.Jump then
+        self.DoMarkEdge(LPosition, self.FAnalysis.PositionOf(LInstr.Targets[0]));
+        return;
+      end;
+      if LInstr.Kind = IrOp.Branch then
+        self.DoBranch(LInstr, LPosition);
+        return;
+      end;
+      if LInstr.Kind = IrOp.Phi then
+        self.DoMeetPhi(AId, LPosition);
+        return;
+      end;
+      if LInstr.Kind = IrOp.Constant then
+        self.DoSet(AId, ADAM_SCCP_KNOWN, DoCanonical(LInstr.ValueType, LInstr.Imm));
+        return;
+      end;
+      if DoIsFoldable(LInstr.Kind) then
+        LValue := 0;
+        LState := self.DoFold(LInstr, LValue);
+        self.DoSet(AId, LState, LValue);
+        return;
+      end;
+      if LInstr.ValueType <> IrType.Void then
+        self.DoSet(AId, ADAM_SCCP_OVER, 0);
+      end;
+    end;
+
+    // The block at APosition visited whole (its first edge in ran): every instruction
+    // evaluated, then its unwind edges run (a caught exception may leave any block of a
+    // catching scope)
+    hidden method DoVisitBlock(const APosition: int64);
+    var
+      LInstrs: ref Int64List;
+      LUnwind: ref Int64List;
+      LI: int64;
+    begin
+      LInstrs := self.FModule.BlockAt(self.FAnalysis.BlockAt(APosition)).Instrs;
+      for LI := 0 to LInstrs.Count - 1 do
+        self.DoEvaluate(LInstrs[LI]);
+      end;
+      LUnwind := self.FAnalysis.UnwindSuccsOf(APosition);
+      for LI := 0 to LUnwind.Count - 1 do
+        self.DoMarkEdge(APosition, LUnwind[LI]);
+      end;
+    end;
+
+    // The phis of the block at APosition met again (a later edge into it ran)
+    hidden method DoVisitPhis(const APosition: int64);
+    var
+      LInstrs: ref Int64List;
+      LI: int64;
+    begin
+      LInstrs := self.FModule.BlockAt(self.FAnalysis.BlockAt(APosition)).Instrs;
+      for LI := 0 to LInstrs.Count - 1 do
+        if self.FModule.InstrAt(LInstrs[LI]).Kind = IrOp.Phi then
+          self.DoMeetPhi(LInstrs[LI], APosition);
+        end;
+      end;
+    end;
+
+    // The solve (see the header): from the entry, the worklists run dry; then a running
+    // block whose branch is still unknown (a value nothing defines: never from a valid
+    // function) runs both its edges and the lists run again, until no edge is new
+    hidden method DoSolve();
+    var
+      LInstrs: ref Int64List;
+      LLast: ref IrInstr;
+      LMore: bool;
+      LI: int64;
+    begin
+      setlength(self.FRunning, self.FCount);
+      for LI := 0 to self.FCount - 1 do
+        self.FRunning[LI] := false;
+      end;
+      self.FRunning[0] := true;
+      self.FBlockWork.Add(0);
+      LMore := true;
+      while LMore do
+        while (self.FBlockWork.Count > 0) or (self.FPhiWork.Count > 0) or
+          (self.FValueWork.Count > 0) do
+          if self.FBlockWork.Count > 0 then
+            self.DoVisitBlock(self.FBlockWork.RemoveLast());
+          else
+            if self.FPhiWork.Count > 0 then
+              self.DoVisitPhis(self.FPhiWork.RemoveLast());
+            else
+              self.DoEvaluate(self.FValueWork.RemoveLast());
+            end;
+          end;
+        end;
+        for LI := 0 to self.FCount - 1 do
+          if self.FRunning[LI] then
+            LInstrs := self.FModule.BlockAt(self.FAnalysis.BlockAt(LI)).Instrs;
+            if LInstrs.Count > 0 then
+              LLast := self.FModule.InstrAt(LInstrs[LInstrs.Count - 1]);
+              if (LLast.Kind = IrOp.Branch) and
+                (self.DoStateOf(LLast.Operands[0]) = ADAM_SCCP_TOP) then
+                self.DoMarkEdge(LI, self.FAnalysis.PositionOf(LLast.Targets[0]));
+                self.DoMarkEdge(LI, self.FAnalysis.PositionOf(LLast.Targets[1]));
+              end;
+            end;
+          end;
+        end;
+        LMore := (self.FBlockWork.Count > 0) or (self.FPhiWork.Count > 0);
+      end;
+    end;
+
+    // The known value AId made a constant in its own place (its uses unchanged)
+    hidden method DoMakeConstant(const AId: int64);
+    var
+      LInstr: ref IrInstr;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LInstr.Kind := IrOp.Constant;
+      LInstr.Imm := self.FValue.Find(AId);
+      LInstr.Operands := ref Int64List();
+      LInstr.Targets := ref Int64List();
+      LInstr.Align := 0;
+      LInstr.Link := 0;
+      LInstr.Predicate := IrPredicate.Equal;
+    end;
+
+    // The phi AId at APosition without the operands whose edge never runs; true when one
+    // went
+    hidden method DoTrimPhi(const AId: int64; const APosition: int64): bool;
+    var
+      LPhi: ref IrInstr;
+      LOperands: ref Int64List;
+      LTargets: ref Int64List;
+      LFrom: int64;
+      LK: int64;
+    begin
+      LPhi := self.FModule.InstrAt(AId);
+      LOperands := ref Int64List();
+      LTargets := ref Int64List();
+      for LK := 0 to LPhi.Operands.Count - 1 do
+        LFrom := self.FAnalysis.PositionOf(LPhi.Targets[LK]);
+        if (LFrom <> ADAM_OPT_NO_BLOCK) and self.DoRuns(LFrom, APosition) then
+          LOperands.Add(LPhi.Operands[LK]);
+          LTargets.Add(LPhi.Targets[LK]);
+        end;
+      end;
+      if LOperands.Count = LPhi.Operands.Count then
+        return false;
+      end;
+      LPhi.Operands := LOperands;
+      LPhi.Targets := LTargets;
+      return true;
+    end;
+
+    // The branch AInstr on a known bool made a jump to its taken target
+    hidden method DoMakeJump(const AInstr: ref IrInstr);
+    var
+      LTaken: int64;
+    begin
+      LTaken := AInstr.Targets[1];
+      if self.FValue.Find(AInstr.Operands[0]) <> 0 then
+        LTaken := AInstr.Targets[0];
+      end;
+      AInstr.Kind := IrOp.Jump;
+      AInstr.Operands := ref Int64List();
+      AInstr.Targets := ref Int64List();
+      AInstr.Targets.Add(LTaken);
+    end;
+
+    // The block at APosition, which no edge runs into, emptied to its slots and a bare ret
+    // (see the header); true when it held anything else
+    hidden method DoEmpty(const APosition: int64): bool;
+    var
+      LFunction: ref IrFunction;
+      LBlock: ref IrBlock;
+      LKept: ref Int64List;
+      LKind: IrOp;
+      LBlockId: int64;
+      LZero: int64;
+      LRet: int64;
+      LEmpty: bool;
+      LI: int64;
+    begin
+      LBlockId := self.FAnalysis.BlockAt(APosition);
+      LBlock := self.FModule.BlockAt(LBlockId);
+      // Already empty: its slots, constants and a ret alone
+      LEmpty := true;
+      for LI := 0 to LBlock.Instrs.Count - 1 do
+        LKind := self.FModule.InstrAt(LBlock.Instrs[LI]).Kind;
+        if (LKind <> IrOp.Slot) and (LKind <> IrOp.Constant) and (LKind <> IrOp.Ret) then
+          LEmpty := false;
+        end;
+      end;
+      if LEmpty then
+        return false;
+      end;
+      LKept := ref Int64List();
+      for LI := 0 to LBlock.Instrs.Count - 1 do
+        if self.FModule.InstrAt(LBlock.Instrs[LI]).Kind = IrOp.Slot then
+          LKept.Add(LBlock.Instrs[LI]);
+        end;
+      end;
+      LFunction := self.FModule.FunctionAt(self.FFunctionId);
+      LRet := self.FModule.Emit(LBlockId, IrOp.Ret, IrType.Void, LFunction.Node);
+      if LFunction.Signature.ResultType <> IrType.Void then
+        LZero := self.FModule.Emit(LBlockId, IrOp.Constant, LFunction.Signature.ResultType,
+          LFunction.Node);
+        self.FModule.InstrAt(LRet).Operands.Add(LZero);
+        LKept.Add(LZero);
+      end;
+      LKept.Add(LRet);
+      LBlock.Instrs := LKept;
+      return true;
+    end;
+
+    // The function rewritten from the solve (see the header): each running block's known
+    // values made constants, its phis trimmed and kept first, a branch on a known bool made
+    // a jump; each block no edge runs into emptied. True when anything changed
+    hidden method DoRewrite(): bool;
+    var
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LPhis: ref Int64List;
+      LRest: ref Int64List;
+      LChanged: bool;
+      LId: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      LChanged := false;
+      for LI := 0 to self.FCount - 1 do
+        if not self.FRunning[LI] then
+          if self.DoEmpty(LI) then
+            LChanged := true;
+          end;
+          skip;
+        end;
+        LBlock := self.FModule.BlockAt(self.FAnalysis.BlockAt(LI));
+        LPhis := ref Int64List();
+        LRest := ref Int64List();
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LId := LBlock.Instrs[LK];
+          LInstr := self.FModule.InstrAt(LId);
+          if (LInstr.Kind <> IrOp.Constant) and (self.FState.Find(LId) = ADAM_SCCP_KNOWN) then
+            self.DoMakeConstant(LId);
+            LChanged := true;
+            LRest.Add(LId);
+            skip;
+          end;
+          if LInstr.Kind = IrOp.Phi then
+            if self.DoTrimPhi(LId, LI) then
+              LChanged := true;
+            end;
+            LPhis.Add(LId);
+            skip;
+          end;
+          if (LInstr.Kind = IrOp.Branch) and
+            (self.DoStateOf(LInstr.Operands[0]) = ADAM_SCCP_KNOWN) then
+            self.DoMakeJump(LInstr);
+            LChanged := true;
+          end;
+          LRest.Add(LId);
+        end;
+        // The phis that stay first, then the rest in their order (a folded phi among them)
+        for LK := 0 to LRest.Count - 1 do
+          LPhis.Add(LRest[LK]);
+        end;
+        LBlock.Instrs := LPhis;
+      end;
+      return LChanged;
+    end;
+
+    // The propagation (see the header); true when it changed the function
+    method Run(): bool;
+    begin
+      self.DoSolve();
+      return self.DoRewrite();
+    end;
+  end;
+
+// The pass sccp (see the header) over AModule's function AFunction, AAnalysis its facts
+// made just before; true when it changed the function
+public routine PropagateConstants(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LPropagator: ref Propagator;
+begin
+  LPropagator := ref Propagator(AModule, AFunction, AAnalysis);
+  return LPropagator.Run();
+end;
+
+end.
