@@ -13,8 +13,8 @@
   was not distributed with this file, You can obtain one
   at https://mozilla.org/MPL/2.0/.
 -------------------------------------------------------------------------------
-  Adam.Opt.Loops.adam - the loop passes (M6 O11 on): loop form, licm and
-  indvars
+  Adam.Opt.Loops.adam - the loop passes (M6 O11 on): loop form, licm,
+  indvars and loopshape
 
   FormLoops puts every loop it can shape in the form each loop pass starts
   from (every loop pass calls it first):
@@ -96,6 +96,38 @@
                plus the difference of their starts, exact as both wrap
                alike
   No block and no edge is added or removed: the loops keep their form.
+
+  ShapeLoops is loopshape (fast only: it trades size for speed), one shape
+  at a time, the facts and the loop form made again after each, at most
+  ADAM_LOOPS_MAX_SHAPES a function. It takes an innermost loop with a
+  preheader and one latch, every block reached, none a resume block, no
+  unwind edge out, no slot, parameter or varargs start in it, every block
+  ending in a jump or a branch, and every value it makes closed (a use
+  outside it is an exit phi's operand from a loop block): such a loop can
+  be copied, a copy's block beside its original in that block's scopes, its
+  values and blocks the copy's, the exits' phis given the copy's entries.
+  Each loop header tries each shape once, in this order:
+    unswitch   a branch of the loop on a condition made outside it: the
+               loop copied, the copy reading it false and the loop true,
+               the preheader's jump a branch on it between the two
+    full       the loop's one exiting block, passed every turn, ends in a
+               branch its turns decide: a constant, a header phi (its
+               preheader value, then its back edge value of the turn
+               before), adds and subs, wrapped as the machine does, and
+               their compares; the turns up to the one it leaves in laid
+               out in a row, each copy's branch a known bool (simplifycfg
+               folds them: the back edge goes, the loop is straight code)
+    rotate     a header that tests (a branch to a stay block entered from
+               it alone and out of the loop) copied before it: the copy is
+               the first test, the header the test at the end of each turn,
+               a header value used past it merged with its copy's by a phi
+               of the stay block (the new header)
+    partial    the body laid out up to ADAM_LOOPS_PARTIAL_COPIES times in a
+               row, each copy keeping its own exit tests: exact for any trip
+               count, with no remainder loop
+  A copy's header has the copy before it as its one predecessor: its phis
+  take one value, the back edge value of that copy; the loop's header takes
+  the last copy's. Every shape keeps what the program does at every turn.
 *******************************************************************************/
 
 module unit Adam.Opt.Loops;
@@ -132,6 +164,17 @@ const
   ADAM_LOOPS_EXIT_NONE: int64 = 0;
   ADAM_LOOPS_EXIT_VALUE: int64 = 1;
   ADAM_LOOPS_EXIT_CONSTANT: int64 = 2;
+  // loopshape's bounds (LoopShaper): the most turns a full unroll lays out and the
+  // instructions it may make (turns times the loop's size), a partial unroll's most copies
+  // and the instructions they may make, the largest header a rotation copies, the largest
+  // loop unswitching copies, and the most shapes one function takes
+  ADAM_LOOPS_FULL_TURNS: int64 = 16;
+  ADAM_LOOPS_FULL_BUDGET: int64 = 256;
+  ADAM_LOOPS_PARTIAL_COPIES: int64 = 4;
+  ADAM_LOOPS_PARTIAL_BUDGET: int64 = 64;
+  ADAM_LOOPS_ROTATE_SIZE: int64 = 16;
+  ADAM_LOOPS_UNSWITCH_SIZE: int64 = 64;
+  ADAM_LOOPS_MAX_SHAPES: int64 = 16;
   // Raised (an invariant broken): a block that ends in no terminator; a loop form that does
   // not settle
   ADAM_LOOPS_FAULT_NO_TERMINATOR: string = "Opt: loops found a block with no terminator: b";
@@ -312,6 +355,31 @@ begin
     return 0;
   end;
   return AModule.InstrAt(LInstrs[0]).Node;
+end;
+
+// A new instruction (AKind, AType, ANode) in the block ABlock (an id), just before its
+// terminator; returns its id
+routine DoEmitAtEnd(const AModule: ref IrModule; const ABlock: int64; const AKind: IrOp;
+  const AType: IrType; const ANode: int64): int64;
+var
+  LBlock: ref IrBlock;
+  LPlaced: ref Int64List;
+  LId: int64;
+  LCount: int64;
+  LI: int64;
+begin
+  LId := AModule.Emit(ABlock, AKind, AType, ANode);
+  // Emit put it last, after the terminator: the list made again with it before that
+  LBlock := AModule.BlockAt(ABlock);
+  LCount := LBlock.Instrs.Count;
+  LPlaced := ref Int64List();
+  for LI := 0 to LCount - 3 do
+    LPlaced.Add(LBlock.Instrs[LI]);
+  end;
+  LPlaced.Add(LId);
+  LPlaced.Add(LBlock.Instrs[LCount - 2]);
+  LBlock.Instrs := LPlaced;
+  return LId;
 end;
 
 // The edges from the blocks APreds (ids) to ATarget (a block id) moved to a new block that
@@ -1746,25 +1814,8 @@ type
     // terminator; returns its id
     hidden method DoEmitBefore(const ABlock: int64; const AKind: IrOp; const AType: IrType;
       const ANode: int64): int64;
-    var
-      LBlock: ref IrBlock;
-      LPlaced: ref Int64List;
-      LId: int64;
-      LCount: int64;
-      LI: int64;
     begin
-      LId := self.FModule.Emit(ABlock, AKind, AType, ANode);
-      // Emit put it last, after the terminator: the list made again with it before that
-      LBlock := self.FModule.BlockAt(ABlock);
-      LCount := LBlock.Instrs.Count;
-      LPlaced := ref Int64List();
-      for LI := 0 to LCount - 3 do
-        LPlaced.Add(LBlock.Instrs[LI]);
-      end;
-      LPlaced.Add(LId);
-      LPlaced.Add(LBlock.Instrs[LCount - 2]);
-      LBlock.Instrs := LPlaced;
-      return LId;
+      return DoEmitAtEnd(self.FModule, ABlock, AKind, AType, ANode);
     end;
 
     // A new instruction AKind of AType over ALeft and ARight in the block ABlock (an id),
@@ -2803,6 +2854,1007 @@ begin
   end;
   LSimplifier := ref InductionSimplifier(AModule, AFunction, LAnalysis);
   if LSimplifier.Run() then
+    LChanged := true;
+  end;
+  return LChanged;
+end;
+
+// The value AMap gives AValue; AValue itself when it gives none (a value from outside
+// what was copied)
+routine DoMappedOf(const AMap: ref Int64Map; const AValue: int64): int64;
+var
+  LMapped: int64;
+begin
+  LMapped := AMap.Find(AValue);
+  if LMapped = ADAM_LOOPS_NONE then
+    return AValue;
+  end;
+  return LMapped;
+end;
+
+// The terminator of the block ABlock (an id) made to go to ATo wherever it went to AFrom
+routine DoRetarget(const AModule: ref IrModule; const ABlock: int64; const AFrom: int64;
+  const ATo: int64);
+var
+  LTerm: ref IrInstr;
+  LE: int64;
+begin
+  LTerm := DoTerminatorOf(AModule, ABlock);
+  for LE := 0 to LTerm.Targets.Count - 1 do
+    if LTerm.Targets[LE] = AFrom then
+      LTerm.Targets.Put(LE, ATo);
+    end;
+  end;
+end;
+
+// The compare APredicate (no float one) of the constants ALeft and ARight of AType, as
+// the machine compares them: each read at the type's width, signed for a signed predicate
+routine DoComparedAs(const APredicate: IrPredicate; const AType: IrType; const ALeft: int64;
+  const ARight: int64): bool;
+var
+  LWidth: int64;
+  LSignedLeft: int64;
+  LSignedRight: int64;
+  LLeft: uint64;
+  LRight: uint64;
+begin
+  LWidth := IrTypeWidth(AType);
+  LSignedLeft := ReadLowBits(ALeft, LWidth, true);
+  LSignedRight := ReadLowBits(ARight, LWidth, true);
+  LLeft := uint64(ReadLowBits(ALeft, LWidth, false));
+  LRight := uint64(ReadLowBits(ARight, LWidth, false));
+  if APredicate = IrPredicate.Equal then
+    return LLeft = LRight;
+  end;
+  if APredicate = IrPredicate.NotEqual then
+    return LLeft <> LRight;
+  end;
+  if APredicate = IrPredicate.SLess then
+    return LSignedLeft < LSignedRight;
+  end;
+  if APredicate = IrPredicate.SLessEqual then
+    return LSignedLeft <= LSignedRight;
+  end;
+  if APredicate = IrPredicate.SGreater then
+    return LSignedLeft > LSignedRight;
+  end;
+  if APredicate = IrPredicate.SGreaterEqual then
+    return LSignedLeft >= LSignedRight;
+  end;
+  if APredicate = IrPredicate.ULess then
+    return LLeft < LRight;
+  end;
+  if APredicate = IrPredicate.ULessEqual then
+    return LLeft <= LRight;
+  end;
+  if APredicate = IrPredicate.UGreater then
+    return LLeft > LRight;
+  end;
+  return LLeft >= LRight;
+end;
+
+type
+  // loopshape over one function (see the header)
+  LoopShaper = object
+    hidden FModule: ref IrModule;
+    hidden FFunction: ref IrFunction;
+    hidden FFunctionId: int64;
+    hidden FAnalysis: ref FunctionAnalysis;
+    // The headers (block ids) each shape has tried, and how many shapes the function took
+    hidden FUnswitched: ref Int64List;
+    hidden FUnrolled: ref Int64List;
+    hidden FRotated: ref Int64List;
+    hidden FShapes: int64;
+    // The loop being worked (DoTake): its blocks (a mark per position, and the positions),
+    // its header, preheader and latch (positions, and ids: a shape's new blocks move the
+    // positions, never the ids) and how many instructions it has
+    hidden FIn: BoolArray;
+    hidden FBlocks: ref Int64List;
+    hidden FHeader: int64;
+    hidden FPreheader: int64;
+    hidden FLatch: int64;
+    hidden FHeaderId: int64;
+    hidden FPreheaderId: int64;
+    hidden FLatchId: int64;
+    hidden FSize: int64;
+
+    // loopshape over AModule's function AFunction, its facts AAnalysis (its loops in form)
+    init(const AModule: ref IrModule; const AFunction: int64;
+      const AAnalysis: ref FunctionAnalysis);
+    begin
+      self.FModule := AModule;
+      self.FFunction := AModule.FunctionAt(AFunction);
+      self.FFunctionId := AFunction;
+      self.FAnalysis := AAnalysis;
+      self.FUnswitched := ref Int64List();
+      self.FUnrolled := ref Int64List();
+      self.FRotated := ref Int64List();
+      self.FShapes := 0;
+      self.FBlocks := ref Int64List();
+      self.FHeader := ADAM_LOOPS_NONE;
+      self.FPreheader := ADAM_LOOPS_NONE;
+      self.FLatch := ADAM_LOOPS_NONE;
+      self.FHeaderId := ADAM_LOOPS_NONE;
+      self.FPreheaderId := ADAM_LOOPS_NONE;
+      self.FLatchId := ADAM_LOOPS_NONE;
+      self.FSize := 0;
+    end;
+
+    // True when the value AId is made in a block of the loop (read before a shape edits)
+    hidden const method DoInLoop(const AId: int64): bool;
+    var
+      LAt: int64;
+    begin
+      LAt := self.FAnalysis.PositionOf(self.FModule.InstrAt(AId).Block);
+      if LAt < 0 then
+        return false;
+      end;
+      return self.FIn[LAt];
+    end;
+
+    // True when every operand of the phi APhi that is AId arrives from a block of the loop
+    hidden const method DoFromLoop(const APhi: ref IrInstr; const AId: int64): bool;
+    var
+      LAt: int64;
+      LE: int64;
+    begin
+      for LE := 0 to APhi.Operands.Count - 1 do
+        if APhi.Operands[LE] <> AId then
+          skip;
+        end;
+        LAt := self.FAnalysis.PositionOf(APhi.Targets[LE]);
+        if (LAt < 0) or (not self.FIn[LAt]) then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    // The loop AIndex taken as the one worked when a shape can copy it (see the header):
+    // shapeable, with a preheader and one latch, innermost, every block reached, no
+    // resume block, no unwind edge out, no slot / parameter / varargs start in it, every
+    // block ending in a jump or a branch, every value it makes closed (a use outside it is
+    // an exit phi's operand from a loop block)
+    hidden method DoTake(const AIndex: int64): bool;
+    var
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LUser: ref IrInstr;
+      LPreds: ref Int64List;
+      LUses: ref Int64List;
+      LAt: int64;
+      LUserAt: int64;
+      LId: int64;
+      LCount: int64;
+      LI: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      if not DoShapeable(self.FFunction, self.FAnalysis, AIndex) then
+        return false;
+      end;
+      self.FIn := DoLoopSet(self.FAnalysis, self.FFunction.Blocks.Count, AIndex);
+      self.FBlocks := self.FAnalysis.LoopBlocks(AIndex);
+      self.FHeader := self.FAnalysis.LoopHeader(AIndex);
+      self.FPreheader := DoPreheaderOf(self.FModule, self.FFunction, self.FAnalysis, AIndex,
+        self.FIn);
+      if self.FPreheader = ADAM_LOOPS_NONE then
+        return false;
+      end;
+      // One latch: the header's one predecessor in the loop
+      LPreds := self.FAnalysis.PredsOf(self.FHeader);
+      LCount := 0;
+      for LI := 0 to LPreds.Count - 1 do
+        if self.FIn[LPreds[LI]] then
+          LCount := LCount + 1;
+          self.FLatch := LPreds[LI];
+        end;
+      end;
+      if LCount <> 1 then
+        return false;
+      end;
+      if DoUnwindExit(self.FAnalysis, AIndex, self.FIn) then
+        return false;
+      end;
+      self.FSize := 0;
+      for LI := 0 to self.FBlocks.Count - 1 do
+        LAt := self.FBlocks[LI];
+        if self.FAnalysis.LoopOf(LAt) <> AIndex then
+          return false;
+        end;
+        if (not self.FAnalysis.Reachable(LAt)) or DoIsResume(self.FFunction, LAt) then
+          return false;
+        end;
+        LBlock := self.FModule.BlockAt(self.FAnalysis.BlockAt(LAt));
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LId := LBlock.Instrs[LK];
+          LInstr := self.FModule.InstrAt(LId);
+          if (LInstr.Kind = IrOp.Slot) or (LInstr.Kind = IrOp.Parameter) or
+            (LInstr.Kind = IrOp.VarargsStart) then
+            return false;
+          end;
+          if IsTerminator(LInstr.Kind) and (LInstr.Kind <> IrOp.Jump) and
+            (LInstr.Kind <> IrOp.Branch) then
+            return false;
+          end;
+          self.FSize := self.FSize + 1;
+          LUses := self.FAnalysis.UsesOf(LId);
+          for LE := 0 to LUses.Count - 1 do
+            LUser := self.FModule.InstrAt(LUses[LE]);
+            LUserAt := self.FAnalysis.PositionOf(LUser.Block);
+            if LUserAt < 0 then
+              return false;
+            end;
+            if self.FIn[LUserAt] then
+              skip;
+            end;
+            if (LUser.Kind <> IrOp.Phi) or (not self.DoFromLoop(LUser, LId)) then
+              return false;
+            end;
+          end;
+        end;
+      end;
+      self.FHeaderId := self.FAnalysis.BlockAt(self.FHeader);
+      self.FPreheaderId := self.FAnalysis.BlockAt(self.FPreheader);
+      self.FLatchId := self.FAnalysis.BlockAt(self.FLatch);
+      return true;
+    end;
+
+    // The blocks outside the loop its blocks' terminators go to (ids, each once); read
+    // before a shape adds a block
+    hidden const method DoExits(): ref Int64List;
+    var
+      LExits: ref Int64List;
+      LTerm: ref IrInstr;
+      LTarget: int64;
+      LAt: int64;
+      LI: int64;
+      LE: int64;
+    begin
+      LExits := ref Int64List();
+      for LI := 0 to self.FBlocks.Count - 1 do
+        LTerm := DoTerminatorOf(self.FModule, self.FAnalysis.BlockAt(self.FBlocks[LI]));
+        for LE := 0 to LTerm.Targets.Count - 1 do
+          LTarget := LTerm.Targets[LE];
+          LAt := self.FAnalysis.PositionOf(LTarget);
+          if (LAt >= 0) and self.FIn[LAt] then
+            skip;
+          end;
+          if LExits.IndexOf(LTarget) < 0 then
+            LExits.Add(LTarget);
+          end;
+        end;
+      end;
+      return LExits;
+    end;
+
+    // One copy of the loop: a new block beside each of its blocks (in that block's
+    // scopes), each instruction copied with its operands and targets made the copy's (a
+    // value or a block from outside the loop kept); ABlocks and AValues take each block's
+    // and each value's id to its copy's. The exits' phis are the caller's (DoExitEntries)
+    hidden method DoCloneLoop(const ABlocks: ref Int64Map; const AValues: ref Int64Map);
+    var
+      LIds: ref Int64List;
+      LCopies: ref Int64List;
+      LSource: ref IrBlock;
+      LInstr: ref IrInstr;
+      LCopy: ref IrInstr;
+      LOld: int64;
+      LNew: int64;
+      LCopyId: int64;
+      LMapped: int64;
+      LI: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      // The ids first: each new block moves the positions after it
+      LIds := ref Int64List();
+      for LI := 0 to self.FBlocks.Count - 1 do
+        LIds.Add(self.FAnalysis.BlockAt(self.FBlocks[LI]));
+      end;
+      for LI := 0 to LIds.Count - 1 do
+        LOld := LIds[LI];
+        LNew := DoInsertBlock(self.FModule, self.FFunctionId,
+          self.FFunction.Blocks.IndexOf(LOld), false);
+        ABlocks.Put(LOld, LNew);
+      end;
+      // Every instruction copied as it is, then its operands and targets made the copy's
+      // (a phi's operand may come from a block later in the loop)
+      LCopies := ref Int64List();
+      for LI := 0 to LIds.Count - 1 do
+        LSource := self.FModule.BlockAt(LIds[LI]);
+        LNew := ABlocks.Find(LIds[LI]);
+        for LK := 0 to LSource.Instrs.Count - 1 do
+          LInstr := self.FModule.InstrAt(LSource.Instrs[LK]);
+          LCopyId := self.FModule.Emit(LNew, LInstr.Kind, LInstr.ValueType, LInstr.Node);
+          LCopy := self.FModule.InstrAt(LCopyId);
+          LCopy.Imm := LInstr.Imm;
+          LCopy.Align := LInstr.Align;
+          LCopy.Link := LInstr.Link;
+          LCopy.Predicate := LInstr.Predicate;
+          for LE := 0 to LInstr.Operands.Count - 1 do
+            LCopy.Operands.Add(LInstr.Operands[LE]);
+          end;
+          for LE := 0 to LInstr.Targets.Count - 1 do
+            LCopy.Targets.Add(LInstr.Targets[LE]);
+          end;
+          AValues.Put(LSource.Instrs[LK], LCopyId);
+          LCopies.Add(LCopyId);
+        end;
+      end;
+      for LI := 0 to LCopies.Count - 1 do
+        LCopy := self.FModule.InstrAt(LCopies[LI]);
+        for LE := 0 to LCopy.Operands.Count - 1 do
+          LMapped := AValues.Find(LCopy.Operands[LE]);
+          if LMapped <> ADAM_LOOPS_NONE then
+            LCopy.Operands.Put(LE, LMapped);
+          end;
+        end;
+        for LE := 0 to LCopy.Targets.Count - 1 do
+          LMapped := ABlocks.Find(LCopy.Targets[LE]);
+          if LMapped <> ADAM_LOOPS_NONE then
+            LCopy.Targets.Put(LE, LMapped);
+          end;
+        end;
+      end;
+    end;
+
+    // The phis of the exits AExits (ids) given a copy's entries (ABlocks, AValues as
+    // DoCloneLoop made them): an entry from a block of the loop gets one from that block's
+    // copy, with the copy's value (a value from outside the loop kept)
+    hidden method DoExitEntries(const AExits: ref Int64List; const ABlocks: ref Int64Map;
+      const AValues: ref Int64Map);
+    var
+      LInstrs: ref Int64List;
+      LPhi: ref IrInstr;
+      LFrom: int64;
+      LCount: int64;
+      LI: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      for LI := 0 to AExits.Count - 1 do
+        LInstrs := self.FModule.BlockAt(AExits[LI]).Instrs;
+        for LK := 0 to LInstrs.Count - 1 do
+          LPhi := self.FModule.InstrAt(LInstrs[LK]);
+          if LPhi.Kind <> IrOp.Phi then
+            skip;
+          end;
+          // Only the entries it had: one an earlier copy added comes from no original block
+          LCount := LPhi.Operands.Count;
+          for LE := 0 to LCount - 1 do
+            LFrom := ABlocks.Find(LPhi.Targets[LE]);
+            if LFrom = ADAM_LOOPS_NONE then
+              skip;
+            end;
+            LPhi.Operands.Add(DoMappedOf(AValues, LPhi.Operands[LE]));
+            LPhi.Targets.Add(LFrom);
+          end;
+        end;
+      end;
+    end;
+
+    // The phis of the block ABlock (an id) given an entry from AFrom for each one from the
+    // header: the value AMap gives (a value from outside the header kept)
+    hidden method DoHeaderEntries(const ABlock: int64; const AMap: ref Int64Map;
+      const AFrom: int64);
+    var
+      LInstrs: ref Int64List;
+      LPhi: ref IrInstr;
+      LCount: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      LInstrs := self.FModule.BlockAt(ABlock).Instrs;
+      for LK := 0 to LInstrs.Count - 1 do
+        LPhi := self.FModule.InstrAt(LInstrs[LK]);
+        if LPhi.Kind <> IrOp.Phi then
+          skip;
+        end;
+        LCount := LPhi.Operands.Count;
+        for LE := 0 to LCount - 1 do
+          if LPhi.Targets[LE] = self.FHeaderId then
+            LPhi.Operands.Add(DoMappedOf(AMap, LPhi.Operands[LE]));
+            LPhi.Targets.Add(AFrom);
+          end;
+        end;
+      end;
+    end;
+
+    // The branch ending the block ABlock (an id) made to read the bool constant ACondition
+    // (simplifycfg folds it)
+    hidden method DoSetCondition(const ABlock: int64; const ACondition: bool);
+    var
+      LTerm: ref IrInstr;
+      LConstant: int64;
+    begin
+      LTerm := DoTerminatorOf(self.FModule, ABlock);
+      LConstant := DoEmitAtEnd(self.FModule, ABlock, IrOp.Constant, IrType.Bool, LTerm.Node);
+      if ACondition then
+        self.FModule.InstrAt(LConstant).Imm := 1;
+      else
+        self.FModule.InstrAt(LConstant).Imm := 0;
+      end;
+      LTerm.Operands.Put(0, LConstant);
+    end;
+
+    // The loop's body laid out ACopies times in a row (see the header): copy k's latch
+    // runs into copy k + 1's header, the last one's back to the loop's header; a copy's
+    // header phis take the one value the copy before gave on its back edge, the header's
+    // the last copy's. With AKnown the branch ending the block AExiting (an id) reads
+    // AConditions[k] in copy k
+    hidden method DoUnroll(const ACopies: int64; const AKnown: bool; const AExiting: int64;
+      const AConditions: BoolArray);
+    var
+      LExits: ref Int64List;
+      LPhis: ref Int64List;
+      LBacks: ref Int64List;
+      LHeaderInstrs: ref Int64List;
+      LBlocks: ref Int64Map;
+      LValues: ref Int64Map;
+      LLast: ref Int64Map;
+      LPhi: ref IrInstr;
+      LCopyPhi: ref IrInstr;
+      LLastHeader: int64;
+      LLastLatch: int64;
+      LCopyHeader: int64;
+      LC: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      LExits := self.DoExits();
+      // The header's phis and each one's value on the back edge
+      LPhis := ref Int64List();
+      LBacks := ref Int64List();
+      LHeaderInstrs := self.FModule.BlockAt(self.FHeaderId).Instrs;
+      for LK := 0 to LHeaderInstrs.Count - 1 do
+        LPhi := self.FModule.InstrAt(LHeaderInstrs[LK]);
+        if LPhi.Kind <> IrOp.Phi then
+          skip;
+        end;
+        for LE := 0 to LPhi.Targets.Count - 1 do
+          if LPhi.Targets[LE] = self.FLatchId then
+            LPhis.Add(LHeaderInstrs[LK]);
+            LBacks.Add(LPhi.Operands[LE]);
+          end;
+        end;
+      end;
+      LLastHeader := self.FHeaderId;
+      LLastLatch := self.FLatchId;
+      LLast := ref Int64Map(ADAM_LOOPS_NONE);
+      for LC := 1 to ACopies - 1 do
+        LBlocks := ref Int64Map(ADAM_LOOPS_NONE);
+        LValues := ref Int64Map(ADAM_LOOPS_NONE);
+        self.DoCloneLoop(LBlocks, LValues);
+        self.DoExitEntries(LExits, LBlocks, LValues);
+        LCopyHeader := LBlocks.Find(self.FHeaderId);
+        // The copy before runs into this one
+        DoRetarget(self.FModule, LLastLatch, LLastHeader, LCopyHeader);
+        // This copy's header has one predecessor: each phi one entry, from it
+        for LK := 0 to LPhis.Count - 1 do
+          LCopyPhi := self.FModule.InstrAt(LValues.Find(LPhis[LK]));
+          LCopyPhi.Operands := ref Int64List();
+          LCopyPhi.Targets := ref Int64List();
+          LCopyPhi.Operands.Add(DoMappedOf(LLast, LBacks[LK]));
+          LCopyPhi.Targets.Add(LLastLatch);
+        end;
+        if AKnown then
+          self.DoSetCondition(LBlocks.Find(AExiting), AConditions[LC]);
+        end;
+        LLastHeader := LCopyHeader;
+        LLastLatch := LBlocks.Find(self.FLatchId);
+        LLast := LValues;
+      end;
+      // The last copy back to the header: its phis' back edge entry is that copy's
+      DoRetarget(self.FModule, LLastLatch, LLastHeader, self.FHeaderId);
+      for LK := 0 to LPhis.Count - 1 do
+        LPhi := self.FModule.InstrAt(LPhis[LK]);
+        for LE := 0 to LPhi.Targets.Count - 1 do
+          if LPhi.Targets[LE] = self.FLatchId then
+            LPhi.Operands.Put(LE, DoMappedOf(LLast, LBacks[LK]));
+            LPhi.Targets.Put(LE, LLastLatch);
+          end;
+        end;
+      end;
+      if AKnown then
+        self.DoSetCondition(AExiting, AConditions[0]);
+      end;
+    end;
+
+    // The value AId in the loop's turn ATurn (0: the first) into AValue: a constant, a
+    // header phi (its preheader value in the first turn, else its back edge value in the
+    // turn before), a one-value phi, an integer add or sub (wrapped at its type's width as
+    // the machine does); false for any other value, a value from outside the loop that is
+    // no constant, or a walk past ADAM_LOOPS_WALK_DEPTH steps in one turn
+    hidden method DoTurnValue(const AId: int64; const ATurn: int64; const ADepth: int64;
+      var AValue: int64): bool;
+    var
+      LInstr: ref IrInstr;
+      LLeft: int64;
+      LRight: int64;
+      LSeed: int64;
+      LBack: int64;
+      LE: int64;
+    begin
+      if ADepth > ADAM_LOOPS_WALK_DEPTH then
+        return false;
+      end;
+      LInstr := self.FModule.InstrAt(AId);
+      if LInstr.Kind = IrOp.Constant then
+        if not (IsIntegerType(LInstr.ValueType) or (LInstr.ValueType = IrType.Bool)) then
+          return false;
+        end;
+        AValue := LInstr.Imm;
+        return true;
+      end;
+      if not self.DoInLoop(AId) then
+        return false;
+      end;
+      if LInstr.Kind = IrOp.Phi then
+        if LInstr.Block = self.FHeaderId then
+          LSeed := ADAM_LOOPS_NONE;
+          LBack := ADAM_LOOPS_NONE;
+          for LE := 0 to LInstr.Targets.Count - 1 do
+            if LInstr.Targets[LE] = self.FPreheaderId then
+              LSeed := LInstr.Operands[LE];
+            end;
+            if LInstr.Targets[LE] = self.FLatchId then
+              LBack := LInstr.Operands[LE];
+            end;
+          end;
+          if (LSeed = ADAM_LOOPS_NONE) or (LBack = ADAM_LOOPS_NONE) then
+            return false;
+          end;
+          if ATurn = 0 then
+            return self.DoTurnValue(LSeed, 0, ADepth + 1, AValue);
+          end;
+          // The turn before, a walk of its own: the turns fall, so the walks end
+          return self.DoTurnValue(LBack, ATurn - 1, 0, AValue);
+        end;
+        if LInstr.Operands.Count = 1 then
+          return self.DoTurnValue(LInstr.Operands[0], ATurn, ADepth + 1, AValue);
+        end;
+        return false;
+      end;
+      if ((LInstr.Kind = IrOp.Add) or (LInstr.Kind = IrOp.Sub)) and
+        IsIntegerType(LInstr.ValueType) then
+        if not self.DoTurnValue(LInstr.Operands[0], ATurn, ADepth + 1, LLeft) then
+          return false;
+        end;
+        if not self.DoTurnValue(LInstr.Operands[1], ATurn, ADepth + 1, LRight) then
+          return false;
+        end;
+        // uint64 arithmetic wraps as the machine's does; the type's width then taken
+        if LInstr.Kind = IrOp.Sub then
+          AValue := IrCanonicalImm(LInstr.ValueType, int64(uint64(LLeft) - uint64(LRight)));
+        else
+          AValue := IrCanonicalImm(LInstr.ValueType, int64(uint64(LLeft) + uint64(LRight)));
+        end;
+        return true;
+      end;
+      return false;
+    end;
+
+    // The bool AId in the loop's turn ATurn into AValue: a bool constant, or a compare (no
+    // float one) of two integer or bool values DoTurnValue knows
+    hidden method DoTurnCondition(const AId: int64; const ATurn: int64;
+      var AValue: bool): bool;
+    var
+      LInstr: ref IrInstr;
+      LType: IrType;
+      LLeft: int64;
+      LRight: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      if LInstr.Kind = IrOp.Constant then
+        AValue := LInstr.Imm <> 0;
+        return true;
+      end;
+      if (LInstr.Kind <> IrOp.Compare) or IsFloatPredicate(LInstr.Predicate) then
+        return false;
+      end;
+      LType := self.FModule.InstrAt(LInstr.Operands[0]).ValueType;
+      if not (IsIntegerType(LType) or (LType = IrType.Bool)) then
+        return false;
+      end;
+      if not self.DoTurnValue(LInstr.Operands[0], ATurn, 0, LLeft) then
+        return false;
+      end;
+      if not self.DoTurnValue(LInstr.Operands[1], ATurn, 0, LRight) then
+        return false;
+      end;
+      AValue := DoComparedAs(LInstr.Predicate, LType, LLeft, LRight);
+      return true;
+    end;
+
+    // The loop fully unrolled (see the header) when its one exiting block, passed every
+    // turn, ends in a branch DoTurnCondition knows in every turn up to the one it leaves
+    // in, within ADAM_LOOPS_FULL_TURNS turns and ADAM_LOOPS_FULL_BUDGET instructions
+    hidden method DoFullUnroll(): bool;
+    var
+      LConditions: BoolArray;
+      LTerm: ref IrInstr;
+      LCondition: bool;
+      LStayOnTrue: bool;
+      LExiting: int64;
+      LExitingId: int64;
+      LTurns: int64;
+      LCount: int64;
+      LAt: int64;
+      LI: int64;
+      LE: int64;
+      LT: int64;
+    begin
+      // The one edge out of the loop
+      LCount := 0;
+      LExiting := ADAM_LOOPS_NONE;
+      for LI := 0 to self.FBlocks.Count - 1 do
+        LTerm := DoTerminatorOf(self.FModule, self.FAnalysis.BlockAt(self.FBlocks[LI]));
+        for LE := 0 to LTerm.Targets.Count - 1 do
+          LAt := self.FAnalysis.PositionOf(LTerm.Targets[LE]);
+          if (LAt < 0) or (not self.FIn[LAt]) then
+            LCount := LCount + 1;
+            LExiting := self.FBlocks[LI];
+          end;
+        end;
+      end;
+      if LCount <> 1 then
+        return false;
+      end;
+      // Every turn passes it: it dominates the latch
+      if not self.FAnalysis.Dominates(LExiting, self.FLatch) then
+        return false;
+      end;
+      LExitingId := self.FAnalysis.BlockAt(LExiting);
+      LTerm := DoTerminatorOf(self.FModule, LExitingId);
+      if LTerm.Kind <> IrOp.Branch then
+        return false;
+      end;
+      LAt := self.FAnalysis.PositionOf(LTerm.Targets[0]);
+      LStayOnTrue := (LAt >= 0) and self.FIn[LAt];
+      setlength(LConditions, ADAM_LOOPS_FULL_TURNS);
+      LTurns := 0;
+      for LT := 0 to ADAM_LOOPS_FULL_TURNS - 1 do
+        if not self.DoTurnCondition(LTerm.Operands[0], LT, LCondition) then
+          return false;
+        end;
+        LConditions[LT] := LCondition;
+        if LCondition <> LStayOnTrue then
+          LTurns := LT + 1;
+          leave;
+        end;
+      end;
+      if (LTurns = 0) or (LTurns * self.FSize > ADAM_LOOPS_FULL_BUDGET) then
+        return false;
+      end;
+      self.DoUnroll(LTurns, true, LExitingId, LConditions);
+      return true;
+    end;
+
+    // The loop partially unrolled (see the header): as many copies as fit
+    // ADAM_LOOPS_PARTIAL_BUDGET instructions, up to ADAM_LOOPS_PARTIAL_COPIES, each with
+    // its own exit tests (exact for any trip count, no remainder loop); false below two
+    hidden method DoPartialUnroll(): bool;
+    var
+      LNone: BoolArray;
+      LCopies: int64;
+    begin
+      LCopies := ADAM_LOOPS_PARTIAL_COPIES;
+      while (LCopies > 1) and (LCopies * self.FSize > ADAM_LOOPS_PARTIAL_BUDGET) do
+        LCopies := LCopies - 1;
+      end;
+      if LCopies < 2 then
+        return false;
+      end;
+      setlength(LNone, 0);
+      self.DoUnroll(LCopies, false, ADAM_LOOPS_NONE, LNone);
+      return true;
+    end;
+
+    // The loop rotated (see the header) when its header is a test: a branch with one edge
+    // to a stay block entered from it alone and one out of the loop, the header not the
+    // latch, at most ADAM_LOOPS_ROTATE_SIZE instructions; ARotated takes the stay block
+    // (an id), the new loop's header
+    hidden method DoRotate(var ARotated: int64): bool;
+    var
+      LInstrs: ref Int64List;
+      LValues: ref Int64List;
+      LUses: ref Int64List;
+      LOperands: ref Int64List;
+      LTargets: ref Int64List;
+      LMap: ref Int64Map;
+      LTerm: ref IrInstr;
+      LInstr: ref IrInstr;
+      LCopy: ref IrInstr;
+      LUser: ref IrInstr;
+      LMergePhi: ref IrInstr;
+      LStay: int64;
+      LExit: int64;
+      LStayAt: int64;
+      LExitAt: int64;
+      LFirst: int64;
+      LCopyId: int64;
+      LMerge: int64;
+      LCount: int64;
+      LId: int64;
+      LI: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      if self.FHeader = self.FLatch then
+        return false;
+      end;
+      LTerm := DoTerminatorOf(self.FModule, self.FHeaderId);
+      if LTerm.Kind <> IrOp.Branch then
+        return false;
+      end;
+      LStayAt := self.FAnalysis.PositionOf(LTerm.Targets[0]);
+      LExitAt := self.FAnalysis.PositionOf(LTerm.Targets[1]);
+      if (LStayAt < 0) or (LExitAt < 0) then
+        return false;
+      end;
+      if self.FIn[LStayAt] and (not self.FIn[LExitAt]) then
+        LStay := LTerm.Targets[0];
+        LExit := LTerm.Targets[1];
+      else
+        if self.FIn[LExitAt] and (not self.FIn[LStayAt]) then
+          LStay := LTerm.Targets[1];
+          LExit := LTerm.Targets[0];
+          LStayAt := LExitAt;
+        else
+          return false;
+        end;
+      end;
+      if self.FAnalysis.PredsOf(LStayAt).Count <> 1 then
+        return false;
+      end;
+      LInstrs := self.FModule.BlockAt(self.FHeaderId).Instrs;
+      LCount := 0;
+      for LK := 0 to LInstrs.Count - 1 do
+        if self.FModule.InstrAt(LInstrs[LK]).Kind <> IrOp.Phi then
+          LCount := LCount + 1;
+        end;
+      end;
+      if LCount > ADAM_LOOPS_ROTATE_SIZE then
+        return false;
+      end;
+      // The header's copy before it, in its scopes: its phis are their preheader values
+      LFirst := DoInsertBlock(self.FModule, self.FFunctionId, self.FHeader, true);
+      LMap := ref Int64Map(ADAM_LOOPS_NONE);
+      LValues := ref Int64List();
+      for LK := 0 to LInstrs.Count - 1 do
+        LId := LInstrs[LK];
+        LInstr := self.FModule.InstrAt(LId);
+        if LInstr.Kind = IrOp.Phi then
+          for LE := 0 to LInstr.Targets.Count - 1 do
+            if LInstr.Targets[LE] = self.FPreheaderId then
+              LMap.Put(LId, LInstr.Operands[LE]);
+            end;
+          end;
+          LValues.Add(LId);
+          skip;
+        end;
+        LCopyId := self.FModule.Emit(LFirst, LInstr.Kind, LInstr.ValueType, LInstr.Node);
+        LCopy := self.FModule.InstrAt(LCopyId);
+        LCopy.Imm := LInstr.Imm;
+        LCopy.Align := LInstr.Align;
+        LCopy.Link := LInstr.Link;
+        LCopy.Predicate := LInstr.Predicate;
+        // An operand is made before its use in the header: the map already has it
+        for LE := 0 to LInstr.Operands.Count - 1 do
+          LCopy.Operands.Add(DoMappedOf(LMap, LInstr.Operands[LE]));
+        end;
+        for LE := 0 to LInstr.Targets.Count - 1 do
+          LCopy.Targets.Add(LInstr.Targets[LE]);
+        end;
+        LMap.Put(LId, LCopyId);
+        if not IsTerminator(LInstr.Kind) then
+          LValues.Add(LId);
+        end;
+      end;
+      // The preheader runs into the copy; the header is entered from the latch alone
+      DoRetarget(self.FModule, self.FPreheaderId, self.FHeaderId, LFirst);
+      for LK := 0 to LInstrs.Count - 1 do
+        LInstr := self.FModule.InstrAt(LInstrs[LK]);
+        if LInstr.Kind <> IrOp.Phi then
+          skip;
+        end;
+        LOperands := ref Int64List();
+        LTargets := ref Int64List();
+        for LE := 0 to LInstr.Targets.Count - 1 do
+          if LInstr.Targets[LE] <> self.FPreheaderId then
+            LOperands.Add(LInstr.Operands[LE]);
+            LTargets.Add(LInstr.Targets[LE]);
+          end;
+        end;
+        LInstr.Operands := LOperands;
+        LInstr.Targets := LTargets;
+      end;
+      // The stay block's and the exit's phis take the copy's entries
+      self.DoHeaderEntries(LStay, LMap, LFirst);
+      self.DoHeaderEntries(LExit, LMap, LFirst);
+      // A header value used where the header no longer dominates (past the stay block, or
+      // a header phi's back edge entry): a phi of the stay block merges it with its copy
+      for LI := 0 to LValues.Count - 1 do
+        LId := LValues[LI];
+        LInstr := self.FModule.InstrAt(LId);
+        LUses := self.FAnalysis.UsesOf(LId);
+        LMerge := ADAM_LOOPS_NONE;
+        for LK := 0 to LUses.Count - 1 do
+          LUser := self.FModule.InstrAt(LUses[LK]);
+          if (LUser.Block = self.FHeaderId) and (LUser.Kind <> IrOp.Phi) then
+            skip;
+          end;
+          if (LUser.Block = LStay) and (LUser.Kind = IrOp.Phi) then
+            skip;
+          end;
+          for LE := 0 to LUser.Operands.Count - 1 do
+            if LUser.Operands[LE] <> LId then
+              skip;
+            end;
+            // An entry on an edge from the header itself keeps the header's value
+            if (LUser.Kind = IrOp.Phi) and (LUser.Targets[LE] = self.FHeaderId) then
+              skip;
+            end;
+            if LMerge = ADAM_LOOPS_NONE then
+              LMerge := DoNewPhi(self.FModule, LStay, LInstr.ValueType, LInstr.Node);
+              LMergePhi := self.FModule.InstrAt(LMerge);
+              LMergePhi.Operands.Add(DoMappedOf(LMap, LId));
+              LMergePhi.Targets.Add(LFirst);
+              LMergePhi.Operands.Add(LId);
+              LMergePhi.Targets.Add(self.FHeaderId);
+            end;
+            LUser.Operands.Put(LE, LMerge);
+          end;
+        end;
+      end;
+      ARotated := LStay;
+      return true;
+    end;
+
+    // The loop unswitched (see the header) on the first branch of it whose condition is
+    // made outside it (no constant), when it has at most ADAM_LOOPS_UNSWITCH_SIZE
+    // instructions: a copy where the condition is false, the loop's own where it is true,
+    // the preheader's jump a branch on it between their headers
+    hidden method DoUnswitch(): bool;
+    var
+      LExits: ref Int64List;
+      LBlocks: ref Int64Map;
+      LValues: ref Int64Map;
+      LTerm: ref IrInstr;
+      LPreTerm: ref IrInstr;
+      LCondition: int64;
+      LBranchBlock: int64;
+      LI: int64;
+    begin
+      if self.FSize > ADAM_LOOPS_UNSWITCH_SIZE then
+        return false;
+      end;
+      LBranchBlock := ADAM_LOOPS_NONE;
+      LCondition := ADAM_LOOPS_NONE;
+      for LI := 0 to self.FBlocks.Count - 1 do
+        LTerm := DoTerminatorOf(self.FModule, self.FAnalysis.BlockAt(self.FBlocks[LI]));
+        if LTerm.Kind <> IrOp.Branch then
+          skip;
+        end;
+        LCondition := LTerm.Operands[0];
+        if self.DoInLoop(LCondition) or
+          (self.FModule.InstrAt(LCondition).Kind = IrOp.Constant) then
+          skip;
+        end;
+        LBranchBlock := self.FAnalysis.BlockAt(self.FBlocks[LI]);
+        leave;
+      end;
+      if LBranchBlock = ADAM_LOOPS_NONE then
+        return false;
+      end;
+      LPreTerm := DoTerminatorOf(self.FModule, self.FPreheaderId);
+      if LPreTerm.Kind <> IrOp.Jump then
+        return false;
+      end;
+      LExits := self.DoExits();
+      LBlocks := ref Int64Map(ADAM_LOOPS_NONE);
+      LValues := ref Int64Map(ADAM_LOOPS_NONE);
+      self.DoCloneLoop(LBlocks, LValues);
+      self.DoExitEntries(LExits, LBlocks, LValues);
+      self.DoSetCondition(LBranchBlock, true);
+      self.DoSetCondition(LBlocks.Find(LBranchBlock), false);
+      // The condition made outside the loop dominates the preheader's end (the preheader
+      // is the header's one way in): it picks the loop
+      LPreTerm.Kind := IrOp.Branch;
+      LPreTerm.Operands.Add(LCondition);
+      LPreTerm.Targets.Add(LBlocks.Find(self.FHeaderId));
+      return true;
+    end;
+
+    // One shape for the first loop that takes one, in this order: unswitching, a full
+    // unroll, a rotation, a partial unroll; each tried once per loop header (a rotated
+    // loop's new header counts as rotated, a fully unrolled one as rotated too); false when
+    // no loop takes any
+    hidden method DoShapeOne(): bool;
+    var
+      LRotated: int64;
+      LHeader: int64;
+      LL: int64;
+    begin
+      for LL := 0 to self.FAnalysis.LoopCount() - 1 do
+        if not self.DoTake(LL) then
+          skip;
+        end;
+        LHeader := self.FHeaderId;
+        if self.FUnswitched.IndexOf(LHeader) < 0 then
+          self.FUnswitched.Add(LHeader);
+          if self.DoUnswitch() then
+            return true;
+          end;
+        end;
+        if self.FUnrolled.IndexOf(LHeader) < 0 then
+          if self.DoFullUnroll() then
+            self.FUnrolled.Add(LHeader);
+            self.FRotated.Add(LHeader);
+            return true;
+          end;
+        end;
+        if self.FRotated.IndexOf(LHeader) < 0 then
+          self.FRotated.Add(LHeader);
+          LRotated := ADAM_LOOPS_NONE;
+          if self.DoRotate(LRotated) then
+            self.FRotated.Add(LRotated);
+            return true;
+          end;
+        end;
+        if self.FUnrolled.IndexOf(LHeader) < 0 then
+          self.FUnrolled.Add(LHeader);
+          if self.DoPartialUnroll() then
+            return true;
+          end;
+        end;
+      end;
+      return false;
+    end;
+
+    // loopshape over the function, at most ADAM_LOOPS_MAX_SHAPES shapes, the facts and the
+    // loop form made again after each; true when anything changed
+    method Run(): bool;
+    var
+      LChanged: bool;
+    begin
+      LChanged := false;
+      while self.FShapes < ADAM_LOOPS_MAX_SHAPES do
+        if not self.DoShapeOne() then
+          leave;
+        end;
+        LChanged := true;
+        self.FShapes := self.FShapes + 1;
+        self.FAnalysis := ref FunctionAnalysis(self.FModule, self.FFunctionId);
+        if FormLoops(self.FModule, self.FFunctionId, self.FAnalysis) then
+          self.FAnalysis := ref FunctionAnalysis(self.FModule, self.FFunctionId);
+        end;
+      end;
+      return LChanged;
+    end;
+  end;
+
+// The pass loopshape (see the header) over AModule's function AFunction with its analysis
+// AAnalysis: the loop form first (FormLoops), then each innermost loop unswitched,
+// unrolled or rotated; true when it changed the function
+public routine ShapeLoops(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LAnalysis: ref FunctionAnalysis;
+  LShaper: ref LoopShaper;
+  LChanged: bool;
+begin
+  if AAnalysis.LoopCount() = 0 then
+    return false;
+  end;
+  LChanged := FormLoops(AModule, AFunction, AAnalysis);
+  LAnalysis := AAnalysis;
+  if LChanged then
+    LAnalysis := ref FunctionAnalysis(AModule, AFunction);
+  end;
+  LShaper := ref LoopShaper(AModule, AFunction, LAnalysis);
+  if LShaper.Run() then
     LChanged := true;
   end;
   return LChanged;
