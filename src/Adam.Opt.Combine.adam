@@ -1,0 +1,864 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Opt.Combine.adam - copy propagation and algebra (PLAN-ADAM M6 O8)
+
+  CombineInstructions rewrites one function's values into simpler ones that
+  compute exactly the same bits, in rounds over its blocks until a round
+  changes nothing. A value found equal to another one (a copy) is replaced:
+  every use takes the other value and the copy leaves its block; a value
+  found constant becomes a constant in its own place; a value with a cheaper
+  form is rewritten in its place (its uses unchanged), the few new values
+  that form needs put just before it in its block. Each instruction first
+  takes the values its operands stand for, so a copy found anywhere reaches
+  every use, phis' included, by the round that finds nothing more.
+
+  Copies: a phi whose operands all name one value (or the phi itself); an
+  operation that gives one of its operands back (below); a convert chain that
+  ends where it started.
+
+  Integers (any width):
+    x + 0, x - 0, x * 1, x | 0, x ^ 0, x & -1, x & x, x | x, x shifted by a
+    count the hardware masks to 0, udiv / sdiv by 1, offset p, 0: the operand
+    x - x, x ^ x, x * 0, x & 0, 0 shifted, urem / srem by 1: 0
+    x | -1: -1 (all ones at the width)
+    not not x, neg neg x (a float's neg too: the sign bit flipped twice)
+  Canonical form: a constant operand of add, mul, and, or, xor goes right, a
+  compare's constant goes right with the predicate swapped (slt <-> sgt ...).
+  Rewrites that make a new operation stay at 32 and 64 bits, the widths every
+  operation exists at (the divisions only there, IrModule's Verify):
+    x * 2^k -> x shl k; x * -1 -> neg x; x - C -> x + (-C); 0 - x -> neg x
+    (x + C1) + C2 -> x + (C1 + C2); x + neg y -> x - y; x - neg y -> x + y
+    x ^ -1 -> not x; udiv x, 2^k -> x shr k; urem x, 2^k -> x & (2^k - 1)
+    sdiv x, 2^k -> (x + ((x sar (w - 1)) shr (w - k))) sar k, srem x, 2^k
+    -> x - ((that same sum) & -2^k), for 1 <= k <= w - 2 (rounded toward zero
+    as idiv does; the lowest value never divides: it stays a division)
+    offset (offset p, C1), C2 -> offset p, C1 + C2
+  Compares: x against itself is known (an integer, bool or ptr; a float may be
+  a NaN, never); an unsigned x < 0 is false, x >= 0 true, x <= 0 is x = 0,
+  x > 0 is x <> 0; a bool b = true and b <> false are b, b = false and
+  b <> true the inverse of the compare b is (when it has one: a float order
+  has none, as a NaN is neither side).
+  Converts: a chain from A through B to C is one convert from A to C (none
+  when C is A) when B keeps every bit C takes: C no wider than B, or B wider
+  than A and A unsigned or B signed (its extension is A's); never when a
+  float is in the chain (each step rounds).
+
+  Nothing that may fault or that the program observes changes: a division
+  by zero or the lowest value by -1 stays, every load, store, call and
+  atomic is left as it is, and a slot is never replaced (a funclet reaches
+  its parent's slots alone, so no other function's operand changes). Blocks
+  and edges are never touched, so the scope ranges stay as they are.
+*******************************************************************************/
+
+module unit Adam.Opt.Combine;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Ssa, Adam.Opt.Analysis;
+
+const
+  // No value (a map's missing value, a unary rewrite's second operand), and a phi's many
+  // values
+  ADAM_COMBINE_NONE: int64 = -1;
+  ADAM_COMBINE_MANY: int64 = -2;
+  // Raised (an invariant broken): replaced values that name each other round a cycle
+  ADAM_COMBINE_FAULT_CYCLE: string = "Opt: combine found replaced values in a cycle at i";
+
+// The power k when AValue (a constant of the integer type AType, at its width) is 2^k,
+// else -1
+routine DoLog2(const AType: IrType; const AValue: int64): int64;
+var
+  LBits: uint64;
+  LWidth: int64;
+  LK: int64;
+begin
+  LWidth := IrTypeWidth(AType);
+  LBits := uint64(AValue);
+  if LWidth < 64 then
+    LBits := LBits & ((uint64(1) shl uint64(LWidth)) - uint64(1));
+  end;
+  if (LBits = uint64(0)) or ((LBits & (LBits - uint64(1))) <> uint64(0)) then
+    return -1;
+  end;
+  LK := 0;
+  while LBits > uint64(1) do
+    LBits := LBits shr uint64(1);
+    LK := LK + 1;
+  end;
+  return LK;
+end;
+
+// True when a rewrite that makes a new operation may work on AType: an integer of 32 or
+// 64 bits (see the header)
+routine DoRewritable(const AType: IrType): bool;
+begin
+  return IsIntegerType(AType) and (IrTypeWidth(AType) >= 32);
+end;
+
+// True for the ops whose two operands may change places: add, mul, and, or, xor
+routine DoCommutative(const AKind: IrOp): bool;
+begin
+  return (AKind = IrOp.Add) or (AKind = IrOp.Mul) or (AKind = IrOp.BitAnd) or
+    (AKind = IrOp.BitOr) or (AKind = IrOp.BitXor);
+end;
+
+// The predicate that holds of (b, a) when APredicate holds of (a, b)
+routine DoSwapped(const APredicate: IrPredicate): IrPredicate;
+begin
+  match APredicate of
+    IrPredicate.SLess: return IrPredicate.SGreater;
+    IrPredicate.SLessEqual: return IrPredicate.SGreaterEqual;
+    IrPredicate.SGreater: return IrPredicate.SLess;
+    IrPredicate.SGreaterEqual: return IrPredicate.SLessEqual;
+    IrPredicate.ULess: return IrPredicate.UGreater;
+    IrPredicate.ULessEqual: return IrPredicate.UGreaterEqual;
+    IrPredicate.UGreater: return IrPredicate.ULess;
+    IrPredicate.UGreaterEqual: return IrPredicate.ULessEqual;
+    IrPredicate.FLess: return IrPredicate.FGreater;
+    IrPredicate.FLessEqual: return IrPredicate.FGreaterEqual;
+    IrPredicate.FGreater: return IrPredicate.FLess;
+    IrPredicate.FGreaterEqual: return IrPredicate.FLessEqual;
+    // eq, ne, oeq, une hold both ways
+    IrPredicate.Equal, IrPredicate.NotEqual, IrPredicate.FEqual, IrPredicate.FNotEqual:
+      return APredicate;
+  end;
+  return APredicate;
+end;
+
+// True when APredicate has an inverse (true exactly when it is false), in AInverse: every
+// integer predicate, and oeq / une (a float order has none: a NaN makes both false)
+routine DoInverse(const APredicate: IrPredicate; var AInverse: IrPredicate): bool;
+begin
+  match APredicate of
+    IrPredicate.Equal: AInverse := IrPredicate.NotEqual;
+    IrPredicate.NotEqual: AInverse := IrPredicate.Equal;
+    IrPredicate.SLess: AInverse := IrPredicate.SGreaterEqual;
+    IrPredicate.SLessEqual: AInverse := IrPredicate.SGreater;
+    IrPredicate.SGreater: AInverse := IrPredicate.SLessEqual;
+    IrPredicate.SGreaterEqual: AInverse := IrPredicate.SLess;
+    IrPredicate.ULess: AInverse := IrPredicate.UGreaterEqual;
+    IrPredicate.ULessEqual: AInverse := IrPredicate.UGreater;
+    IrPredicate.UGreater: AInverse := IrPredicate.ULessEqual;
+    IrPredicate.UGreaterEqual: AInverse := IrPredicate.ULess;
+    IrPredicate.FEqual: AInverse := IrPredicate.FNotEqual;
+    IrPredicate.FNotEqual: AInverse := IrPredicate.FEqual;
+  else
+    return false;
+  end;
+  return true;
+end;
+
+// The truth of a compare of a value with itself under APredicate (an integer, bool or ptr
+// predicate): the ones that admit equality hold
+routine DoSelfTruth(const APredicate: IrPredicate): bool;
+begin
+  return (APredicate = IrPredicate.Equal) or (APredicate = IrPredicate.SLessEqual) or
+    (APredicate = IrPredicate.SGreaterEqual) or (APredicate = IrPredicate.ULessEqual) or
+    (APredicate = IrPredicate.UGreaterEqual);
+end;
+
+type
+  // One function's combining (see the header)
+  Combiner = object
+    hidden FModule: ref IrModule;
+    hidden FFunction: ref IrFunction;
+    // Each replaced value's replacement (a copy's value)
+    hidden FReplace: ref Int64Map;
+    // The instruction being combined: its block, its node (the new values' too) and the new
+    // values its rewrite made, which go just before it
+    hidden FBlock: int64;
+    hidden FNode: int64;
+    hidden FBefore: ref Int64List;
+
+    // The combining of AModule's function AFunction
+    init(const AModule: ref IrModule; const AFunction: int64);
+    begin
+      self.FModule := AModule;
+      self.FFunction := AModule.FunctionAt(AFunction);
+      self.FReplace := ref Int64Map(ADAM_COMBINE_NONE);
+      self.FBlock := 0;
+      self.FNode := 0;
+      self.FBefore := ref Int64List();
+    end;
+
+    // The value AId stands for: followed through the replaced values until one that stays
+    // (raised when they run round: a compiler bug)
+    hidden const method DoResolve(const AId: int64): int64;
+    var
+      LAt: int64;
+      LNext: int64;
+      LSteps: int64;
+    begin
+      LAt := AId;
+      LSteps := 0;
+      LNext := self.FReplace.Find(LAt);
+      while LNext <> ADAM_COMBINE_NONE do
+        LSteps := LSteps + 1;
+        if LSteps > self.FReplace.Count then
+          raise(ADAM_COMBINE_FAULT_CYCLE + IntToStr(AId));
+        end;
+        LAt := LNext;
+        LNext := self.FReplace.Find(LAt);
+      end;
+      return LAt;
+    end;
+
+    // True when AId is a constant
+    hidden const method DoIsConstant(const AId: int64): bool;
+    begin
+      return self.FModule.InstrAt(AId).Kind = IrOp.Constant;
+    end;
+
+    // The value of the constant AId, as its type holds it
+    hidden const method DoConstantOf(const AId: int64): int64;
+    var
+      LInstr: ref IrInstr;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      return IrCanonicalImm(LInstr.ValueType, LInstr.Imm);
+    end;
+
+    // True when AId is a constant of an integer, bool or ptr type holding AValue (cut to
+    // its width)
+    hidden const method DoIsValue(const AId: int64; const AValue: int64): bool;
+    var
+      LInstr: ref IrInstr;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      if (LInstr.Kind <> IrOp.Constant) or IsFloatType(LInstr.ValueType) then
+        return false;
+      end;
+      return IrCanonicalImm(LInstr.ValueType, LInstr.Imm) =
+        IrCanonicalImm(LInstr.ValueType, AValue);
+    end;
+
+    // True when AId is the op AKind (and so a value this function made)
+    hidden const method DoIsOp(const AId: int64; const AKind: IrOp): bool;
+    begin
+      return self.FModule.InstrAt(AId).Kind = AKind;
+    end;
+
+    // AId replaced by AValue (see the header); true
+    hidden method DoReplace(const AId: int64; const AValue: int64): bool;
+    begin
+      self.FReplace.Put(AId, AValue);
+      return true;
+    end;
+
+    // A new constant AValue of AType, put before the instruction being combined
+    hidden method DoNewConstant(const AType: IrType; const AValue: int64): int64;
+    var
+      LId: int64;
+    begin
+      LId := self.FModule.Emit(self.FBlock, IrOp.Constant, AType, self.FNode);
+      self.FModule.InstrAt(LId).Imm := IrCanonicalImm(AType, AValue);
+      self.FBefore.Add(LId);
+      return LId;
+    end;
+
+    // A new AKind of AType over ALeft and ARight (ADAM_COMBINE_NONE: none), put before the
+    // instruction being combined
+    hidden method DoNewOp(const AKind: IrOp; const AType: IrType; const ALeft: int64;
+      const ARight: int64): int64;
+    var
+      LId: int64;
+      LInstr: ref IrInstr;
+    begin
+      LId := self.FModule.Emit(self.FBlock, AKind, AType, self.FNode);
+      LInstr := self.FModule.InstrAt(LId);
+      LInstr.Operands.Add(ALeft);
+      if ARight <> ADAM_COMBINE_NONE then
+        LInstr.Operands.Add(ARight);
+      end;
+      self.FBefore.Add(LId);
+      return LId;
+    end;
+
+    // AInstr made the constant AValue in its own place (its type kept); true
+    hidden method DoMakeConstant(const AInstr: ref IrInstr; const AValue: int64): bool;
+    begin
+      AInstr.Kind := IrOp.Constant;
+      AInstr.Operands := ref Int64List();
+      AInstr.Imm := IrCanonicalImm(AInstr.ValueType, AValue);
+      return true;
+    end;
+
+    // AInstr rewritten in its own place as AKind over ALeft and ARight (ADAM_COMBINE_NONE:
+    // a unary op); its type kept; true
+    hidden method DoRewrite(const AInstr: ref IrInstr; const AKind: IrOp; const ALeft: int64;
+      const ARight: int64): bool;
+    begin
+      AInstr.Kind := AKind;
+      AInstr.Operands := ref Int64List();
+      AInstr.Operands.Add(ALeft);
+      if ARight <> ADAM_COMBINE_NONE then
+        AInstr.Operands.Add(ARight);
+      end;
+      return true;
+    end;
+
+    // The phi AId: one value among its operands (itself aside) is its copy
+    hidden method DoCombinePhi(const AId: int64): bool;
+    var
+      LInstr: ref IrInstr;
+      LValue: int64;
+      LOnly: int64;
+      LE: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LOnly := ADAM_COMBINE_NONE;
+      for LE := 0 to LInstr.Operands.Count - 1 do
+        LValue := LInstr.Operands[LE];
+        if LValue = AId then
+          skip;
+        end;
+        if LOnly = ADAM_COMBINE_NONE then
+          LOnly := LValue;
+        else
+          if LValue <> LOnly then
+            LOnly := ADAM_COMBINE_MANY;
+          end;
+        end;
+      end;
+      if LOnly < 0 then
+        return false;
+      end;
+      return self.DoReplace(AId, LOnly);
+    end;
+
+    // The neg or not AId: of the same op, the value inside
+    hidden method DoCombineUnary(const AId: int64): bool;
+    var
+      LInstr: ref IrInstr;
+      LInner: ref IrInstr;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LInner := self.FModule.InstrAt(LInstr.Operands[0]);
+      if LInner.Kind = LInstr.Kind then
+        return self.DoReplace(AId, self.DoResolve(LInner.Operands[0]));
+      end;
+      return false;
+    end;
+
+    // The add AId of an integer type (its constant already right)
+    hidden method DoCombineAdd(const AId: int64): bool;
+    var
+      LInstr: ref IrInstr;
+      LInner: ref IrInstr;
+      LLeft: int64;
+      LRight: int64;
+      LSum: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LLeft := LInstr.Operands[0];
+      LRight := LInstr.Operands[1];
+      if self.DoIsValue(LRight, 0) then
+        return self.DoReplace(AId, LLeft);
+      end;
+      if not DoRewritable(LInstr.ValueType) then
+        return false;
+      end;
+      // x + neg y and neg y + x: x - y
+      if self.DoIsOp(LRight, IrOp.Neg) then
+        return self.DoRewrite(LInstr, IrOp.Sub, LLeft,
+          self.DoResolve(self.FModule.InstrAt(LRight).Operands[0]));
+      end;
+      if self.DoIsOp(LLeft, IrOp.Neg) then
+        return self.DoRewrite(LInstr, IrOp.Sub, LRight,
+          self.DoResolve(self.FModule.InstrAt(LLeft).Operands[0]));
+      end;
+      // (x + C1) + C2: x + (C1 + C2), wrapped at the width
+      if self.DoIsConstant(LRight) and self.DoIsOp(LLeft, IrOp.Add) then
+        LInner := self.FModule.InstrAt(LLeft);
+        if self.DoIsConstant(LInner.Operands[1]) then
+          LSum := int64(uint64(self.DoConstantOf(LInner.Operands[1])) +
+            uint64(self.DoConstantOf(LRight)));
+          return self.DoRewrite(LInstr, IrOp.Add, self.DoResolve(LInner.Operands[0]),
+            self.DoNewConstant(LInstr.ValueType, LSum));
+        end;
+      end;
+      return false;
+    end;
+
+    // The sub AId of an integer type
+    hidden method DoCombineSub(const AId: int64): bool;
+    var
+      LInstr: ref IrInstr;
+      LLeft: int64;
+      LRight: int64;
+      LNegated: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LLeft := LInstr.Operands[0];
+      LRight := LInstr.Operands[1];
+      if self.DoIsValue(LRight, 0) then
+        return self.DoReplace(AId, LLeft);
+      end;
+      if LLeft = LRight then
+        return self.DoMakeConstant(LInstr, 0);
+      end;
+      if not DoRewritable(LInstr.ValueType) then
+        return false;
+      end;
+      // x - C: x + (-C), so the adds around it meet one form
+      if self.DoIsConstant(LRight) and (not self.DoIsConstant(LLeft)) then
+        LNegated := int64(uint64(0) - uint64(self.DoConstantOf(LRight)));
+        return self.DoRewrite(LInstr, IrOp.Add, LLeft,
+          self.DoNewConstant(LInstr.ValueType, LNegated));
+      end;
+      if self.DoIsValue(LLeft, 0) then
+        return self.DoRewrite(LInstr, IrOp.Neg, LRight, ADAM_COMBINE_NONE);
+      end;
+      // x - neg y: x + y
+      if self.DoIsOp(LRight, IrOp.Neg) then
+        return self.DoRewrite(LInstr, IrOp.Add, LLeft,
+          self.DoResolve(self.FModule.InstrAt(LRight).Operands[0]));
+      end;
+      return false;
+    end;
+
+    // The mul AId of an integer type (its constant already right)
+    hidden method DoCombineMul(const AId: int64): bool;
+    var
+      LInstr: ref IrInstr;
+      LLeft: int64;
+      LRight: int64;
+      LPower: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LLeft := LInstr.Operands[0];
+      LRight := LInstr.Operands[1];
+      if self.DoIsValue(LRight, 0) then
+        return self.DoMakeConstant(LInstr, 0);
+      end;
+      if self.DoIsValue(LRight, 1) then
+        return self.DoReplace(AId, LLeft);
+      end;
+      if (not DoRewritable(LInstr.ValueType)) or (not self.DoIsConstant(LRight)) then
+        return false;
+      end;
+      if self.DoIsValue(LRight, -1) then
+        return self.DoRewrite(LInstr, IrOp.Neg, LLeft, ADAM_COMBINE_NONE);
+      end;
+      // x * 2^k: x shl k (both wrap at the width alike)
+      LPower := DoLog2(LInstr.ValueType, self.DoConstantOf(LRight));
+      if LPower >= 1 then
+        return self.DoRewrite(LInstr, IrOp.Shl, LLeft,
+          self.DoNewConstant(LInstr.ValueType, LPower));
+      end;
+      return false;
+    end;
+
+    // The and, or or xor AId (its constant already right)
+    hidden method DoCombineBits(const AId: int64): bool;
+    var
+      LInstr: ref IrInstr;
+      LLeft: int64;
+      LRight: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LLeft := LInstr.Operands[0];
+      LRight := LInstr.Operands[1];
+      if LInstr.Kind = IrOp.BitAnd then
+        if self.DoIsValue(LRight, 0) then
+          return self.DoMakeConstant(LInstr, 0);
+        end;
+        if self.DoIsValue(LRight, -1) or (LLeft = LRight) then
+          return self.DoReplace(AId, LLeft);
+        end;
+        return false;
+      end;
+      if LInstr.Kind = IrOp.BitOr then
+        if self.DoIsValue(LRight, 0) or (LLeft = LRight) then
+          return self.DoReplace(AId, LLeft);
+        end;
+        if self.DoIsValue(LRight, -1) then
+          return self.DoMakeConstant(LInstr, -1);
+        end;
+        return false;
+      end;
+      // xor
+      if self.DoIsValue(LRight, 0) then
+        return self.DoReplace(AId, LLeft);
+      end;
+      if LLeft = LRight then
+        return self.DoMakeConstant(LInstr, 0);
+      end;
+      if DoRewritable(LInstr.ValueType) and self.DoIsValue(LRight, -1) then
+        return self.DoRewrite(LInstr, IrOp.BitNot, LLeft, ADAM_COMBINE_NONE);
+      end;
+      return false;
+    end;
+
+    // The shl, shr or sar AId: by a count the hardware masks to 0 (to 0..63 at 64 bits, to
+    // 0..31 below), its value; of 0, 0
+    hidden method DoCombineShift(const AId: int64): bool;
+    var
+      LInstr: ref IrInstr;
+      LMask: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      if self.DoIsValue(LInstr.Operands[0], 0) then
+        return self.DoMakeConstant(LInstr, 0);
+      end;
+      if not self.DoIsConstant(LInstr.Operands[1]) then
+        return false;
+      end;
+      LMask := 31;
+      if IrTypeWidth(LInstr.ValueType) = 64 then
+        LMask := 63;
+      end;
+      if (self.DoConstantOf(LInstr.Operands[1]) & LMask) = 0 then
+        return self.DoReplace(AId, LInstr.Operands[0]);
+      end;
+      return false;
+    end;
+
+    // The bias a signed division of ALeft by 2^APower rounds toward zero with (see the
+    // header): (x sar (w - 1)) shr (w - k), added to x; the sum, made before the
+    // instruction being combined
+    hidden method DoBiased(const AType: IrType; const ALeft: int64; const APower: int64): int64;
+    var
+      LWidth: int64;
+      LSign: int64;
+      LBias: int64;
+    begin
+      LWidth := IrTypeWidth(AType);
+      LSign := self.DoNewOp(IrOp.Sar, AType, ALeft, self.DoNewConstant(AType, LWidth - 1));
+      LBias := self.DoNewOp(IrOp.Shr, AType, LSign, self.DoNewConstant(AType, LWidth - APower));
+      return self.DoNewOp(IrOp.Add, AType, ALeft, LBias);
+    end;
+
+    // The sdiv, udiv, srem or urem AId (32 or 64 bits: Verify): by 1, by 2^k (see the
+    // header); a divisor of 0 or -1 never changes (the division faults where it did)
+    hidden method DoCombineDivide(const AId: int64): bool;
+    var
+      LInstr: ref IrInstr;
+      LType: IrType;
+      LLeft: int64;
+      LRight: int64;
+      LPower: int64;
+      LSum: int64;
+      LMask: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LType := LInstr.ValueType;
+      LLeft := LInstr.Operands[0];
+      LRight := LInstr.Operands[1];
+      if not self.DoIsConstant(LRight) then
+        return false;
+      end;
+      if self.DoIsValue(LRight, 1) then
+        if (LInstr.Kind = IrOp.SDiv) or (LInstr.Kind = IrOp.UDiv) then
+          return self.DoReplace(AId, LLeft);
+        end;
+        return self.DoMakeConstant(LInstr, 0);
+      end;
+      LPower := DoLog2(LType, self.DoConstantOf(LRight));
+      if LPower < 1 then
+        return false;
+      end;
+      if LInstr.Kind = IrOp.UDiv then
+        return self.DoRewrite(LInstr, IrOp.Shr, LLeft, self.DoNewConstant(LType, LPower));
+      end;
+      if LInstr.Kind = IrOp.URem then
+        LMask := int64((uint64(1) shl uint64(LPower)) - uint64(1));
+        return self.DoRewrite(LInstr, IrOp.BitAnd, LLeft, self.DoNewConstant(LType, LMask));
+      end;
+      // signed: 2^(w - 1) is the lowest value as a signed divisor, never rewritten
+      if LPower > IrTypeWidth(LType) - 2 then
+        return false;
+      end;
+      LSum := self.DoBiased(LType, LLeft, LPower);
+      if LInstr.Kind = IrOp.SDiv then
+        return self.DoRewrite(LInstr, IrOp.Sar, LSum, self.DoNewConstant(LType, LPower));
+      end;
+      // srem: x - (sum & -2^k)
+      LMask := int64(uint64(0) - (uint64(1) shl uint64(LPower)));
+      return self.DoRewrite(LInstr, IrOp.Sub, LLeft,
+        self.DoNewOp(IrOp.BitAnd, LType, LSum, self.DoNewConstant(LType, LMask)));
+    end;
+
+    // The offset AId: by 0, its ptr; of an offset by a constant, one offset by their sum
+    hidden method DoCombineOffset(const AId: int64): bool;
+    var
+      LInstr: ref IrInstr;
+      LInner: ref IrInstr;
+      LRight: int64;
+      LSum: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LRight := LInstr.Operands[1];
+      if self.DoIsValue(LRight, 0) then
+        return self.DoReplace(AId, LInstr.Operands[0]);
+      end;
+      if self.DoIsConstant(LRight) and self.DoIsOp(LInstr.Operands[0], IrOp.Offset) then
+        LInner := self.FModule.InstrAt(LInstr.Operands[0]);
+        if self.DoIsConstant(LInner.Operands[1]) then
+          LSum := int64(uint64(self.DoConstantOf(LInner.Operands[1])) +
+            uint64(self.DoConstantOf(LRight)));
+          return self.DoRewrite(LInstr, IrOp.Offset, self.DoResolve(LInner.Operands[0]),
+            self.DoNewConstant(IrType.Int64, LSum));
+        end;
+      end;
+      return false;
+    end;
+
+    // The compare AId (see the header): its constant right, then what is known of it
+    hidden method DoCombineCompare(const AId: int64): bool;
+    var
+      LInstr: ref IrInstr;
+      LInner: ref IrInstr;
+      LType: IrType;
+      LPredicate: IrPredicate;
+      LInverse: IrPredicate;
+      LLeft: int64;
+      LRight: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LLeft := LInstr.Operands[0];
+      LRight := LInstr.Operands[1];
+      LType := self.FModule.InstrAt(LLeft).ValueType;
+      if self.DoIsConstant(LLeft) and (not self.DoIsConstant(LRight)) then
+        LInstr.Predicate := DoSwapped(LInstr.Predicate);
+        return self.DoRewrite(LInstr, IrOp.Compare, LRight, LLeft);
+      end;
+      LPredicate := LInstr.Predicate;
+      if IsFloatType(LType) then
+        return false;
+      end;
+      if LLeft = LRight then
+        if DoSelfTruth(LPredicate) then
+          return self.DoMakeConstant(LInstr, 1);
+        end;
+        return self.DoMakeConstant(LInstr, 0);
+      end;
+      // An unsigned order against 0
+      if self.DoIsValue(LRight, 0) then
+        if LPredicate = IrPredicate.ULess then
+          return self.DoMakeConstant(LInstr, 0);
+        end;
+        if LPredicate = IrPredicate.UGreaterEqual then
+          return self.DoMakeConstant(LInstr, 1);
+        end;
+        if LPredicate = IrPredicate.ULessEqual then
+          LInstr.Predicate := IrPredicate.Equal;
+          return true;
+        end;
+        if LPredicate = IrPredicate.UGreater then
+          LInstr.Predicate := IrPredicate.NotEqual;
+          return true;
+        end;
+      end;
+      // A bool against a constant: itself, or the inverse of the compare it is
+      if (LType <> IrType.Bool) or (not self.DoIsConstant(LRight)) then
+        return false;
+      end;
+      if (LPredicate <> IrPredicate.Equal) and (LPredicate <> IrPredicate.NotEqual) then
+        return false;
+      end;
+      if (LPredicate = IrPredicate.Equal) = (self.DoConstantOf(LRight) <> 0) then
+        return self.DoReplace(AId, LLeft);
+      end;
+      if not self.DoIsOp(LLeft, IrOp.Compare) then
+        return false;
+      end;
+      LInner := self.FModule.InstrAt(LLeft);
+      if not DoInverse(LInner.Predicate, LInverse) then
+        return false;
+      end;
+      LInstr.Predicate := LInverse;
+      return self.DoRewrite(LInstr, IrOp.Compare, self.DoResolve(LInner.Operands[0]),
+        self.DoResolve(LInner.Operands[1]));
+    end;
+
+    // The convert AId of a convert (see the header): one convert, or none
+    hidden method DoCombineConvert(const AId: int64): bool;
+    var
+      LInstr: ref IrInstr;
+      LInner: ref IrInstr;
+      LFrom: IrType;
+      LVia: IrType;
+      LTo: IrType;
+      LValue: int64;
+      LDirect: bool;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      if not self.DoIsOp(LInstr.Operands[0], IrOp.Convert) then
+        return false;
+      end;
+      LInner := self.FModule.InstrAt(LInstr.Operands[0]);
+      LValue := self.DoResolve(LInner.Operands[0]);
+      LFrom := self.FModule.InstrAt(LValue).ValueType;
+      LVia := LInner.ValueType;
+      LTo := LInstr.ValueType;
+      if IsFloatType(LFrom) or IsFloatType(LVia) or IsFloatType(LTo) then
+        return false;
+      end;
+      // C no wider than B: the low bits of the low bits; B wider than A and extended as A
+      // is (A unsigned: B's top bit is 0; B signed: a sign extension of a sign extension)
+      LDirect := IrTypeWidth(LTo) <= IrTypeWidth(LVia);
+      if (not LDirect) and (IrTypeWidth(LVia) > IrTypeWidth(LFrom)) then
+        LDirect := (not IsSignedType(LFrom)) or IsSignedType(LVia);
+      end;
+      if not LDirect then
+        return false;
+      end;
+      if LFrom = LTo then
+        return self.DoReplace(AId, LValue);
+      end;
+      return self.DoRewrite(LInstr, IrOp.Convert, LValue, ADAM_COMBINE_NONE);
+    end;
+
+    // The instruction AId combined (see the header): its operands take the values they
+    // stand for, then its kind's rules; true when it changed (a replaced one is in
+    // FReplace)
+    hidden method DoCombine(const AId: int64): bool;
+    var
+      LInstr: ref IrInstr;
+      LKind: IrOp;
+      LChanged: bool;
+      LValue: int64;
+      LE: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LChanged := false;
+      for LE := 0 to LInstr.Operands.Count - 1 do
+        LValue := self.DoResolve(LInstr.Operands[LE]);
+        if LValue <> LInstr.Operands[LE] then
+          LInstr.Operands.Put(LE, LValue);
+          LChanged := true;
+        end;
+      end;
+      LKind := LInstr.Kind;
+      if LKind = IrOp.Phi then
+        return self.DoCombinePhi(AId) or LChanged;
+      end;
+      if (LKind = IrOp.Neg) or (LKind = IrOp.BitNot) then
+        return self.DoCombineUnary(AId) or LChanged;
+      end;
+      if LKind = IrOp.Convert then
+        return self.DoCombineConvert(AId) or LChanged;
+      end;
+      if LKind = IrOp.Compare then
+        return self.DoCombineCompare(AId) or LChanged;
+      end;
+      if LKind = IrOp.Offset then
+        return self.DoCombineOffset(AId) or LChanged;
+      end;
+      // The rest work on integers alone (a float add, sub, mul keeps its operands: x + 0.0
+      // is not x at -0.0, x * 1.0 quiets a NaN)
+      if not IsIntegerType(LInstr.ValueType) then
+        return LChanged;
+      end;
+      if DoCommutative(LKind) and self.DoIsConstant(LInstr.Operands[0]) and
+        (not self.DoIsConstant(LInstr.Operands[1])) then
+        LValue := LInstr.Operands[0];
+        LInstr.Operands.Put(0, LInstr.Operands[1]);
+        LInstr.Operands.Put(1, LValue);
+        LChanged := true;
+      end;
+      if LKind = IrOp.Add then
+        return self.DoCombineAdd(AId) or LChanged;
+      end;
+      if LKind = IrOp.Sub then
+        return self.DoCombineSub(AId) or LChanged;
+      end;
+      if LKind = IrOp.Mul then
+        return self.DoCombineMul(AId) or LChanged;
+      end;
+      if (LKind = IrOp.BitAnd) or (LKind = IrOp.BitOr) or (LKind = IrOp.BitXor) then
+        return self.DoCombineBits(AId) or LChanged;
+      end;
+      if (LKind = IrOp.Shl) or (LKind = IrOp.Shr) or (LKind = IrOp.Sar) then
+        return self.DoCombineShift(AId) or LChanged;
+      end;
+      if (LKind = IrOp.SDiv) or (LKind = IrOp.UDiv) or (LKind = IrOp.SRem) or
+        (LKind = IrOp.URem) then
+        return self.DoCombineDivide(AId) or LChanged;
+      end;
+      return LChanged;
+    end;
+
+    // One round over every block (see the header): each instruction combined, the new
+    // values its rewrite made put before it, a replaced one left out; true when anything
+    // changed
+    hidden method DoRound(): bool;
+    var
+      LBlocks: ref Int64List;
+      LBlock: ref IrBlock;
+      LOld: ref Int64List;
+      LNew: ref Int64List;
+      LChanged: bool;
+      LCount: int64;
+      LId: int64;
+      LI: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      LChanged := false;
+      LBlocks := self.FFunction.Blocks;
+      for LI := 0 to LBlocks.Count - 1 do
+        LBlock := self.FModule.BlockAt(LBlocks[LI]);
+        // Emit adds a new value at the end of LOld too: only its first LCount are walked
+        LOld := LBlock.Instrs;
+        LCount := LOld.Count;
+        LNew := ref Int64List();
+        for LK := 0 to LCount - 1 do
+          LId := LOld[LK];
+          self.FBlock := LBlocks[LI];
+          self.FNode := self.FModule.InstrAt(LId).Node;
+          self.FBefore := ref Int64List();
+          if self.DoCombine(LId) then
+            LChanged := true;
+          end;
+          if self.FReplace.Find(LId) <> ADAM_COMBINE_NONE then
+            skip;
+          end;
+          for LE := 0 to self.FBefore.Count - 1 do
+            LNew.Add(self.FBefore[LE]);
+          end;
+          LNew.Add(LId);
+        end;
+        LBlock.Instrs := LNew;
+      end;
+      return LChanged;
+    end;
+
+    // The combining (see the header); true when it changed the function
+    method Run(): bool;
+    var
+      LChanged: bool;
+    begin
+      LChanged := false;
+      while self.DoRound() do
+        LChanged := true;
+      end;
+      return LChanged;
+    end;
+  end;
+
+// The pass combine (see the header) over AModule's function AFunction (AAnalysis unused:
+// it changes no block or edge, and the values it reads it finds itself); true when it
+// changed the function
+public routine CombineInstructions(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LCombiner: ref Combiner;
+begin
+  LCombiner := ref Combiner(AModule, AFunction);
+  return LCombiner.Run();
+end;
+
+end.
