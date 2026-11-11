@@ -43,6 +43,11 @@ set BIN=%~dp0
 set OUT=%~dp0..\projects\adam\output
 set SNAP=%OUT%\snapshot
 set MAIN=..\projects\adam\src\adam.adam
+:: Every exe lands in <output>\bin\<triple>\<mode> (SU2.5): the compiler's own build
+:: (--adam-self-build) is a release one, a plain build a debug one
+set TRIPLE=x86_64-windows-gnu
+set REL=bin\%TRIPLE%\release
+set DBG=bin\%TRIPLE%\debug
 
 echo [0/5] snapshot: the build's inputs copied
 call :snap "%BIN%..\src" "%SNAP%\src"
@@ -60,28 +65,30 @@ if errorlevel 1 (echo BUILD FAILED - snapshot & exit /b 1)
 
 cd /d "%SNAP%\bin"
 
-:: Every exe lands in <output>\bin (SU1); the installed adam.exe may predate that and
-:: write stage A straight into its output folder, so the old copies go first and A is
-:: taken from whichever place the build wrote
+:: Stage A is a plain (debug) build: <output>\bin\<triple>\debug; the installed adam.exe
+:: may predate that and write it to <output>\bin (SU1), so the old copies go first and A
+:: is taken from whichever place the build wrote
 echo [1/5] stage A: adam.exe builds adam
-del /q "%OUT%\stageA\adam.exe" "%OUT%\stageA\bin\adam.exe" 2>nul
+del /q "%OUT%\stageA\%DBG%\adam.exe" "%OUT%\stageA\bin\adam.exe" 2>nul
 adam.exe build %MAIN% -o "%OUT%\stageA"
 if errorlevel 1 (echo BUILD FAILED - stage A & exit /b 1)
-if exist "%OUT%\stageA\bin\adam.exe" (copy /y "%OUT%\stageA\bin\adam.exe" adam-stageA.exe >nul) else (copy /y "%OUT%\stageA\adam.exe" adam-stageA.exe >nul)
+if exist "%OUT%\stageA\%DBG%\adam.exe" (copy /y "%OUT%\stageA\%DBG%\adam.exe" adam-stageA.exe >nul) else (copy /y "%OUT%\stageA\bin\adam.exe" adam-stageA.exe >nul)
+if errorlevel 1 (echo BUILD FAILED - stage A not found & exit /b 1)
 
 :: B and C are the compiler's own build (--adam-self-build: a release one, no leak tracker);
 :: A is built plainly, since the installed adam.exe may predate the switch
 echo [2/5] stage B: A builds adam
 adam-stageA.exe build %MAIN% -o "%OUT%\stageB" --adam-self-build
 if errorlevel 1 (echo BUILD FAILED - stage B & goto :failed)
-copy /y "%OUT%\stageB\bin\adam.exe" adam-stageB.exe >nul
+copy /y "%OUT%\stageB\%REL%\adam.exe" adam-stageB.exe >nul
+if errorlevel 1 (echo BUILD FAILED - stage B not found & goto :failed)
 
 echo [3/5] stage C: B builds adam
 adam-stageB.exe build %MAIN% -o "%OUT%\stageC" --adam-self-build
 if errorlevel 1 (echo BUILD FAILED - stage C & goto :failed)
 
 echo [4/5] B and C compared
-fc /b "%OUT%\stageB\bin\adam.exe" "%OUT%\stageC\bin\adam.exe" >nul
+fc /b "%OUT%\stageB\%REL%\adam.exe" "%OUT%\stageC\%REL%\adam.exe" >nul
 if errorlevel 1 (echo BUILD FAILED - stage B and stage C differ & goto :failed)
 
 echo [5/5] adamtest: B builds adamtest
@@ -89,9 +96,9 @@ adam-stageB.exe build ..\projects\adamtest\src\adamtest.adam -o "%BIN%..\project
 if errorlevel 1 (echo BUILD FAILED - adamtest & goto :failed)
 
 copy /y "%BIN%adam.exe" "%BIN%adam-prev.exe" >nul
-copy /y "%OUT%\stageB\bin\adam.exe" "%BIN%adam.exe" >nul
+copy /y "%OUT%\stageB\%REL%\adam.exe" "%BIN%adam.exe" >nul
 if errorlevel 1 (echo BUILD FAILED - adam.exe not installed & goto :failed)
-copy /y "%BIN%..\projects\adamtest\output\bin\adamtest.exe" "%BIN%adamtest.exe" >nul
+copy /y "%BIN%..\projects\adamtest\output\%DBG%\adamtest.exe" "%BIN%adamtest.exe" >nul
 if errorlevel 1 (echo BUILD FAILED - adamtest.exe not installed & goto :failed)
 del adam-stageA.exe adam-stageB.exe
 echo BUILD OK
