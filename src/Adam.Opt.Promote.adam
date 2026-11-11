@@ -13,8 +13,19 @@
   was not distributed with this file, You can obtain one
   at https://mozilla.org/MPL/2.0/.
 -------------------------------------------------------------------------------
-  Adam.Opt.Promote.adam - stack slots promoted to SSA values (M6 O3 mem2reg;
-  O4's SROA joins it here)
+  Adam.Opt.Promote.adam - stack slots promoted to SSA values (M6 O4 SROA,
+  O3 mem2reg)
+
+  SplitSlots (sroa, run before mem2reg) splits an aggregate slot (a record,
+  a static array) into one slot per field when every use is a whole load or
+  store at its address (the field at offset 0), a fill of all of it, or an
+  Offset by a constant whose every use is a whole load or store at it; the
+  fields (byte offset + IR type) must not overlap, and an offset taken with
+  two types keeps the slot whole. A fill becomes a zero stored into each
+  field (bytes no field covers are never read). Each field's slot is then
+  mem2reg's to promote. An index computed at run time (a static array's
+  element by a variable, or by a constant before the folding passes reduce
+  its arithmetic to one) is no constant Offset: the slot stays whole.
 
   PromoteSlots turns a function's slots into SSA values where nothing but a
   whole load or store at the slot's own address reaches them: Cytron, Ferrante,
@@ -623,6 +634,352 @@ var
 begin
   LPromoter := ref Promoter(AModule, AFunction, AAnalysis);
   return LPromoter.Run();
+end;
+
+// The bytes a value of AType takes in memory (0: void): fixed by the IR type itself, a ptr
+// 8 on every target Adam has (64-bit only, PROJECT.md AI.9)
+routine DoTypeBytes(const AType: IrType): int64;
+begin
+  match AType of
+    IrType.Void: return 0;
+    IrType.Bool: return 1;
+    IrType.Int8: return 1;
+    IrType.UInt8: return 1;
+    IrType.Int16: return 2;
+    IrType.UInt16: return 2;
+    IrType.Int32: return 4;
+    IrType.UInt32: return 4;
+    IrType.Float32: return 4;
+    IrType.Int64: return 8;
+    IrType.UInt64: return 8;
+    IrType.Float64: return 8;
+    IrType.Pointer: return 8;
+  end;
+  return 0;
+end;
+
+type
+  // One function's slot splitting (SROA, see the header), run once
+  Splitter = object
+    hidden FModule: ref IrModule;
+    hidden FFunctionId: int64;
+    hidden FAnalysis: ref FunctionAnalysis;
+    hidden FFirstNew: int64;
+    // The slot being looked at: its size, each field's byte offset, an access its type is
+    // read from, and (once split) its new slot
+    hidden FSize: int64;
+    hidden FOffsets: ref Int64List;
+    hidden FTypeFrom: ref Int64List;
+    hidden FFieldSlots: ref Int64List;
+    // The instructions taken out (1), the new slots (the entry's start), and each expanded
+    // fill's zeros and stores (FExpansions, by its index in FExpansionOf)
+    hidden FRemoved: ref Int64Map;
+    hidden FNewSlots: ref Int64List;
+    hidden FExpansionOf: ref Int64Map;
+    hidden FExpansions: PromoteLists;
+    hidden FExpansionCount: int64;
+
+    init(const AModule: ref IrModule; const AFunction: int64;
+      const AAnalysis: ref FunctionAnalysis);
+    begin
+      self.FModule := AModule;
+      self.FFunctionId := AFunction;
+      self.FAnalysis := AAnalysis;
+      self.FFirstNew := AModule.InstrCount;
+      self.FSize := 0;
+      self.FOffsets := ref Int64List();
+      self.FTypeFrom := ref Int64List();
+      self.FFieldSlots := ref Int64List();
+      self.FRemoved := ref Int64Map(0);
+      self.FNewSlots := ref Int64List();
+      self.FExpansionOf := ref Int64Map(-1);
+      self.FExpansionCount := 0;
+    end;
+
+    // The value type of the access AAccess (a load's own, a store's value's)
+    hidden const method DoAccessType(const AAccess: int64): IrType;
+    var
+      LInstr: ref IrInstr;
+    begin
+      LInstr := self.FModule.InstrAt(AAccess);
+      if LInstr.Kind = IrOp.Load then
+        return LInstr.ValueType;
+      end;
+      return self.FModule.InstrAt(LInstr.Operands[1]).ValueType;
+    end;
+
+    // True when the instruction AInstr is in a reachable block of this function (not a
+    // funclet's: its frame reaches the slot while it unwinds)
+    hidden const method DoOwnReached(const AInstr: ref IrInstr): bool;
+    begin
+      if self.FModule.BlockAt(AInstr.Block).Owner <> self.FFunctionId then
+        return false;
+      end;
+      return self.FAnalysis.Reachable(self.FAnalysis.PositionOf(AInstr.Block));
+    end;
+
+    // True when AUser is a whole load or store at the address AAddress (a store of the
+    // address itself is no access: it escapes)
+    hidden const method DoIsWholeAccess(const AUser: ref IrInstr; const AAddress: int64): bool;
+    begin
+      if (AUser.Kind = IrOp.Load) and (AUser.Operands[0] = AAddress) then
+        return true;
+      end;
+      return (AUser.Kind = IrOp.Store) and (AUser.Operands[0] = AAddress) and
+        (AUser.Operands[1] <> AAddress);
+    end;
+
+    // The access AAccess at byte AOffset taken as a field: the same field as one at its
+    // offset of its type, or a new one; false when it leaves the slot, overlaps another
+    // field, or meets one at its offset of another type
+    hidden method DoAddAccess(const AOffset: int64; const AAccess: int64): bool;
+    var
+      LType: IrType;
+      LBytes: int64;
+      LOther: int64;
+      LOtherBytes: int64;
+      LK: int64;
+    begin
+      LType := self.DoAccessType(AAccess);
+      LBytes := DoTypeBytes(LType);
+      if (LBytes = 0) or (AOffset < 0) or (AOffset + LBytes > self.FSize) then
+        return false;
+      end;
+      for LK := 0 to self.FOffsets.Count - 1 do
+        LOther := self.FOffsets[LK];
+        if LOther = AOffset then
+          return self.DoAccessType(self.FTypeFrom[LK]) = LType;
+        end;
+        LOtherBytes := DoTypeBytes(self.DoAccessType(self.FTypeFrom[LK]));
+        // Two byte ranges overlap when each starts before the other ends
+        if (AOffset < LOther + LOtherBytes) and (LOther < AOffset + LBytes) then
+          return false;
+        end;
+      end;
+      self.FOffsets.Add(AOffset);
+      self.FTypeFrom.Add(AAccess);
+      return true;
+    end;
+
+    // True when the slot ASlot can be split (see the header): every use a whole load or
+    // store at its address, a fill of all of it, or an Offset by a constant whose every use
+    // is a whole load or store at it; the fields made (FOffsets, FTypeFrom). Only a slot
+    // with an Offset or a fill is split: mem2reg takes the rest as it is
+    hidden method DoFields(const ASlot: int64): bool;
+    var
+      LUses: ref Int64List;
+      LInner: ref Int64List;
+      LUser: ref IrInstr;
+      LInnerUser: ref IrInstr;
+      LOffset: int64;
+      LSplit: bool;
+      LI: int64;
+      LK: int64;
+    begin
+      self.FSize := self.FModule.InstrAt(ASlot).Imm;
+      self.FOffsets := ref Int64List();
+      self.FTypeFrom := ref Int64List();
+      LUses := self.FAnalysis.UsesOf(ASlot);
+      LSplit := false;
+      for LI := 0 to LUses.Count - 1 do
+        LUser := self.FModule.InstrAt(LUses[LI]);
+        if not self.DoOwnReached(LUser) then
+          return false;
+        end;
+        if self.DoIsWholeAccess(LUser, ASlot) then
+          if not self.DoAddAccess(0, LUses[LI]) then
+            return false;
+          end;
+          skip;
+        end;
+        if (LUser.Kind = IrOp.Fill) and (LUser.Operands[0] = ASlot) and
+          (LUser.Imm = self.FSize) then
+          LSplit := true;
+          skip;
+        end;
+        if (LUser.Kind = IrOp.Offset) and (LUser.Operands[0] = ASlot) and
+          (self.FModule.InstrAt(LUser.Operands[1]).Kind = IrOp.Constant) then
+          LSplit := true;
+          LOffset := self.FModule.InstrAt(LUser.Operands[1]).Imm;
+          LInner := self.FAnalysis.UsesOf(LUses[LI]);
+          for LK := 0 to LInner.Count - 1 do
+            LInnerUser := self.FModule.InstrAt(LInner[LK]);
+            if not self.DoOwnReached(LInnerUser) then
+              return false;
+            end;
+            if not self.DoIsWholeAccess(LInnerUser, LUses[LI]) then
+              return false;
+            end;
+            if not self.DoAddAccess(LOffset, LInner[LK]) then
+              return false;
+            end;
+          end;
+          skip;
+        end;
+        return false;
+      end;
+      return LSplit and (self.FOffsets.Count > 0);
+    end;
+
+    // The new slot of the field at AOffset
+    hidden const method DoFieldSlot(const AOffset: int64): int64;
+    begin
+      return self.FFieldSlots[self.FOffsets.IndexOf(AOffset)];
+    end;
+
+    // The fill AFill's zeros and stores, one pair per field, kept for DoRebuild to put in
+    // its place
+    hidden method DoExpandFill(const AFill: int64);
+    var
+      LFill: ref IrInstr;
+      LList: ref Int64List;
+      LZero: int64;
+      LStore: int64;
+      LK: int64;
+    begin
+      LFill := self.FModule.InstrAt(AFill);
+      LList := ref Int64List();
+      for LK := 0 to self.FOffsets.Count - 1 do
+        LZero := self.FModule.Emit(LFill.Block, IrOp.Constant,
+          self.DoAccessType(self.FTypeFrom[LK]), LFill.Node);
+        LStore := self.FModule.Emit(LFill.Block, IrOp.Store, IrType.Void, LFill.Node);
+        self.FModule.InstrAt(LStore).Operands.Add(self.FFieldSlots[LK]);
+        self.FModule.InstrAt(LStore).Operands.Add(LZero);
+        LList.Add(LZero);
+        LList.Add(LStore);
+      end;
+      if self.FExpansionCount = len(self.FExpansions) then
+        setlength(self.FExpansions, self.FExpansionCount * 2 + 4);
+      end;
+      self.FExpansions[self.FExpansionCount] := LList;
+      self.FExpansionOf.Put(AFill, self.FExpansionCount);
+      self.FExpansionCount := self.FExpansionCount + 1;
+      self.FRemoved.Put(AFill, 1);
+    end;
+
+    // The slot ASlot split into its fields (DoFields made them): a new slot per field, each
+    // access pointed at its field's slot, its Offsets and fills taken out
+    hidden method DoSplit(const ASlot: int64);
+    var
+      LUses: ref Int64List;
+      LInner: ref Int64List;
+      LUser: ref IrInstr;
+      LNew: int64;
+      LBytes: int64;
+      LOffset: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      self.FFieldSlots := ref Int64List();
+      for LK := 0 to self.FOffsets.Count - 1 do
+        LBytes := DoTypeBytes(self.DoAccessType(self.FTypeFrom[LK]));
+        LNew := self.FModule.Emit(self.FAnalysis.BlockAt(0), IrOp.Slot, IrType.Pointer,
+          self.FModule.InstrAt(ASlot).Node);
+        // A field's slot is aligned to its size (every IR type's natural alignment)
+        self.FModule.InstrAt(LNew).Imm := LBytes;
+        self.FModule.InstrAt(LNew).Align := LBytes;
+        self.FFieldSlots.Add(LNew);
+        self.FNewSlots.Add(LNew);
+      end;
+      LUses := self.FAnalysis.UsesOf(ASlot);
+      for LI := 0 to LUses.Count - 1 do
+        LUser := self.FModule.InstrAt(LUses[LI]);
+        if (LUser.Kind = IrOp.Load) or (LUser.Kind = IrOp.Store) then
+          LUser.Operands.Put(0, self.DoFieldSlot(0));
+        end;
+        if LUser.Kind = IrOp.Fill then
+          self.DoExpandFill(LUses[LI]);
+        end;
+        if LUser.Kind = IrOp.Offset then
+          LOffset := self.FModule.InstrAt(LUser.Operands[1]).Imm;
+          LInner := self.FAnalysis.UsesOf(LUses[LI]);
+          for LK := 0 to LInner.Count - 1 do
+            self.FModule.InstrAt(LInner[LK]).Operands.Put(0, self.DoFieldSlot(LOffset));
+          end;
+          self.FRemoved.Put(LUses[LI], 1);
+        end;
+      end;
+      self.FRemoved.Put(ASlot, 1);
+    end;
+
+    // Each block's list made again: the new slots first in the entry, then the block's own
+    // instructions that stay, an expanded fill's zeros and stores in its place
+    hidden method DoRebuild();
+    var
+      LBlock: ref IrBlock;
+      LKept: ref Int64List;
+      LExpansion: ref Int64List;
+      LId: int64;
+      LAt: int64;
+      LI: int64;
+      LK: int64;
+      LJ: int64;
+    begin
+      for LI := 0 to self.FAnalysis.BlockCount - 1 do
+        LBlock := self.FModule.BlockAt(self.FAnalysis.BlockAt(LI));
+        LKept := ref Int64List();
+        if LI = 0 then
+          for LK := 0 to self.FNewSlots.Count - 1 do
+            LKept.Add(self.FNewSlots[LK]);
+          end;
+        end;
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LId := LBlock.Instrs[LK];
+          if LId < self.FFirstNew then
+            LAt := self.FExpansionOf.Find(LId);
+            if LAt >= 0 then
+              LExpansion := self.FExpansions[LAt];
+              for LJ := 0 to LExpansion.Count - 1 do
+                LKept.Add(LExpansion[LJ]);
+              end;
+            end;
+            if self.FRemoved.Find(LId) = 0 then
+              LKept.Add(LId);
+            end;
+          end;
+        end;
+        LBlock.Instrs := LKept;
+      end;
+    end;
+
+    // The splitting (see the header); true when a slot was split
+    method Run(): bool;
+    var
+      LBlock: ref IrBlock;
+      LChanged: bool;
+      LId: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      LChanged := false;
+      for LI := 0 to self.FAnalysis.BlockCount - 1 do
+        LBlock := self.FModule.BlockAt(self.FAnalysis.BlockAt(LI));
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LId := LBlock.Instrs[LK];
+          if (LId < self.FFirstNew) and (self.FModule.InstrAt(LId).Kind = IrOp.Slot) then
+            if self.DoFields(LId) then
+              self.DoSplit(LId);
+              LChanged := true;
+            end;
+          end;
+        end;
+      end;
+      if LChanged then
+        self.DoRebuild();
+      end;
+      return LChanged;
+    end;
+  end;
+
+// The pass sroa (see the header) over AModule's function AFunction, AAnalysis its facts
+// made just before; true when it split a slot
+public routine SplitSlots(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LSplitter: ref Splitter;
+begin
+  LSplitter := ref Splitter(AModule, AFunction, AAnalysis);
+  return LSplitter.Run();
 end;
 
 end.
