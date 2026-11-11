@@ -32,7 +32,7 @@
 :: and adamtest.exe here; the adam.exe they replace is kept as               ::
 :: adam-prev.exe (the last good compiler, to fall back to). Last, the new    ::
 :: adam.exe prebuilds the shared compiled-unit cache (res\acu here: every    ::
-:: std unit and the runtime, debug and release) for a release. Stage files   ::
+:: std unit and the runtime, at every level) for a release. Stage files      ::
 :: land in projects\*\output (ignored by git).                               ::
 ::                                                                           ::
 :: Usage:   build-adam.cmd                                                   ::
@@ -46,9 +46,9 @@ set OUT=%~dp0..\projects\adam\output
 set SNAP=%OUT%\snapshot
 set MAIN=..\projects\adam\src\adam.adam
 :: Every exe lands in <output>\bin\<triple>\<mode> (SU2.5): the compiler's own build
-:: (--adam-self-build) is a release one, a plain build a debug one
+:: (--adam-self-build) is a release one at safe (its default level), a plain build a debug one
 set TRIPLE=x86_64-windows-gnu
-set REL=bin\%TRIPLE%\release
+set REL=bin\%TRIPLE%\release_safe
 set DBG=bin\%TRIPLE%\debug
 
 echo [0/6] snapshot: the build's inputs copied
@@ -105,16 +105,19 @@ if errorlevel 1 (echo BUILD FAILED - adamtest.exe not installed & goto :failed)
 
 :: The shared compiled-unit cache (res\acu beside adam.exe) prebuilt for a release: the
 :: installed adam.exe builds a program importing every std unit (the runtime comes with
-:: it), debug and release (--adam-self-build), into its own stage folder
-echo [6/6] prebuild: the std and the runtime compiled into res\acu, debug and release
+:: it) at every optimization level (debug, then -opt safe / fast / small), into its own
+:: stage folder
+echo [6/6] prebuild: the std and the runtime compiled into res\acu, every level
 set PRE=%OUT%\prebuild
 if not exist "%PRE%" mkdir "%PRE%"
 call :prebuild_source "%PRE%\adam_prebuild.adam"
 if errorlevel 1 (echo BUILD FAILED - prebuild source & goto :failed)
 "%BIN%adam.exe" build "%PRE%\adam_prebuild.adam" -o "%PRE%"
 if errorlevel 1 (echo BUILD FAILED - prebuild debug & goto :failed)
-"%BIN%adam.exe" build "%PRE%\adam_prebuild.adam" -o "%PRE%" --adam-self-build
-if errorlevel 1 (echo BUILD FAILED - prebuild release & goto :failed)
+for %%l in (safe fast small) do (
+  "%BIN%adam.exe" build "%PRE%\adam_prebuild.adam" -o "%PRE%" -opt %%l
+  if errorlevel 1 (echo BUILD FAILED - prebuild %%l & goto :failed)
+)
 
 del adam-stageA.exe adam-stageB.exe
 echo BUILD OK
