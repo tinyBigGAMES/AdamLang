@@ -13,7 +13,8 @@
   was not distributed with this file, You can obtain one
   at https://mozilla.org/MPL/2.0/.
 -------------------------------------------------------------------------------
-  Adam.Opt.Loops.adam - the loop passes (M6 O11 on): loop form and licm
+  Adam.Opt.Loops.adam - the loop passes (M6 O11 on): loop form, licm and
+  indvars
 
   FormLoops puts every loop it can shape in the form each loop pass starts
   from (every loop pass calls it first):
@@ -63,6 +64,38 @@
   raise) never moves ahead of a side effect: branches and calls never
   move. A moved value still dominates its uses (the preheader dominates
   the loop); nothing moves out of a loop with no preheader.
+
+  SimplifyInductions is indvars, innermost loops first, over each loop
+  with a preheader and one latch. A basic induction variable is a header
+  phi that starts at a value from the preheader and steps by a constant
+  (an add or a sub of the phi) on the latch's edge. Its exit test is a
+  loop block's branch on a compare of the phi with an invariant limit, one
+  edge staying in the loop, the other leaving it, the block it stays to
+  entered from the test alone and dominating the latch: every next turn
+  passes the test. From a constant start and limit it knows the
+  variable's range, in the blocks the stay block dominates (the test held)
+  and in the whole loop (it never steps past its last value, so it never
+  wraps), and from them:
+    checks     a loop block's branch on a compare of values whose ranges
+               decide it (constants, the variables, converts, adds, subs,
+               multiplies and shifts by constants, ands with a constant,
+               none wrapping) gets that constant: an index check the range
+               proves can never fail goes once simplifycfg folds it (the
+               same behaviour at every level)
+    exits      on the test's exit edge a not-equal test's variable equals
+               its limit (a less / greater test's its last value, from
+               constants): the exit phis take that value for it
+    reduction  an address an invariant base moves by an affine count of a
+               variable (a multiple of it plus a constant, at 64 bits; a
+               narrower variable only widened within its range) with a
+               multiply or shift in it becomes a pointer phi of the
+               header: the first turn's address made in the preheader, a
+               step by the count's stride made in the latch
+    merging    a variable that steps by the same constant as another of
+               its type (the one the exit test reads is kept) is that one
+               plus the difference of their starts, exact as both wrap
+               alike
+  No block and no edge is added or removed: the loops keep their form.
 *******************************************************************************/
 
 module unit Adam.Opt.Loops;
@@ -84,6 +117,21 @@ const
   ADAM_LOOPS_BASE_OTHER: int64 = 3;
   // An access whose byte count is not known (an atomic's place)
   ADAM_LOOPS_ANY_SIZE: int64 = -1;
+  // indvars' bounds (InductionSimplifier): every range end it keeps (2^62), a factor or a
+  // range end a product may take (2^31), an affine count's scale or constant (2^30), the
+  // largest constant shift it reads as a multiply, how deep a range or affine walk goes,
+  // and how many addresses one loop has reduced
+  ADAM_LOOPS_RANGE_CAP: int64 = 4611686018427387904;
+  ADAM_LOOPS_PRODUCT_CAP: int64 = 2147483648;
+  ADAM_LOOPS_AFFINE_CAP: int64 = 1073741824;
+  ADAM_LOOPS_MAX_SHIFT: int64 = 30;
+  ADAM_LOOPS_WALK_DEPTH: int64 = 16;
+  ADAM_LOOPS_MAX_REDUCED: int64 = 8;
+  // What an induction variable is on its exit test's exit edge (InductionFact.ExitKind):
+  // not known, a value of the function, a constant
+  ADAM_LOOPS_EXIT_NONE: int64 = 0;
+  ADAM_LOOPS_EXIT_VALUE: int64 = 1;
+  ADAM_LOOPS_EXIT_CONSTANT: int64 = 2;
   // Raised (an invariant broken): a block that ends in no terminator; a loop form that does
   // not settle
   ADAM_LOOPS_FAULT_NO_TERMINATOR: string = "Opt: loops found a block with no terminator: b";
@@ -1364,6 +1412,1397 @@ begin
   end;
   LHoister := ref InvariantHoister(AModule, AFunction, LAnalysis);
   if LHoister.Run() then
+    LChanged := true;
+  end;
+  return LChanged;
+end;
+
+// True when AValue is within ACap of zero (either side)
+routine DoWithin(const AValue: int64; const ACap: int64): bool;
+begin
+  return (AValue <= ACap) and (AValue >= -ACap);
+end;
+
+// The lesser and the greater of two values
+routine DoLesser(const AValue: int64; const AOther: int64): int64;
+begin
+  if AOther < AValue then
+    return AOther;
+  end;
+  return AValue;
+end;
+
+routine DoGreater(const AValue: int64; const AOther: int64): int64;
+begin
+  if AOther > AValue then
+    return AOther;
+  end;
+  return AValue;
+end;
+
+// The lowest value of the integer type AType, held to the range cap
+routine DoTypeLow(const AType: IrType): int64;
+var
+  LWidth: int64;
+begin
+  if not IsSignedType(AType) then
+    return 0;
+  end;
+  LWidth := IrTypeWidth(AType);
+  if LWidth >= 64 then
+    return -ADAM_LOOPS_RANGE_CAP;
+  end;
+  return -int64(uint64(1) shl uint64(LWidth - 1));
+end;
+
+// The highest value of the integer type AType, held to the range cap
+routine DoTypeHigh(const AType: IrType): int64;
+var
+  LWidth: int64;
+begin
+  LWidth := IrTypeWidth(AType);
+  if IsSignedType(AType) then
+    if LWidth >= 64 then
+      return ADAM_LOOPS_RANGE_CAP;
+    end;
+    return int64(uint64(1) shl uint64(LWidth - 1)) - 1;
+  end;
+  if LWidth >= 63 then
+    return ADAM_LOOPS_RANGE_CAP;
+  end;
+  return int64(uint64(1) shl uint64(LWidth)) - 1;
+end;
+
+// The value of the integer constant AInstr (its canonical Imm read at its type) in AValue;
+// false for anything else or a value past the range cap (an unsigned one above 2^63 reads
+// negative)
+routine DoConstantValue(const AInstr: ref IrInstr; var AValue: int64): bool;
+begin
+  if (AInstr.Kind <> IrOp.Constant) or (not IsIntegerType(AInstr.ValueType)) then
+    return false;
+  end;
+  if (not IsSignedType(AInstr.ValueType)) and (AInstr.Imm < 0) then
+    return false;
+  end;
+  if not DoWithin(AInstr.Imm, ADAM_LOOPS_RANGE_CAP) then
+    return false;
+  end;
+  AValue := AInstr.Imm;
+  return true;
+end;
+
+// The signed step an add (or a sub when ASub) of the constant AImm makes on a value of the
+// integer type AType: a narrow unsigned constant's top half steps down; 0 when it is past
+// the affine cap (no induction variable)
+routine DoSignedStride(const AType: IrType; const AImm: int64; const ASub: bool): int64;
+var
+  LStride: int64;
+  LWidth: int64;
+begin
+  if not DoWithin(AImm, ADAM_LOOPS_RANGE_CAP) then
+    return 0;
+  end;
+  LStride := AImm;
+  LWidth := IrTypeWidth(AType);
+  if (not IsSignedType(AType)) and (LWidth < 64) then
+    if LStride >= int64(uint64(1) shl uint64(LWidth - 1)) then
+      LStride := LStride - int64(uint64(1) shl uint64(LWidth));
+    end;
+  end;
+  if ASub then
+    LStride := -LStride;
+  end;
+  if not DoWithin(LStride, ADAM_LOOPS_AFFINE_CAP) then
+    return 0;
+  end;
+  return LStride;
+end;
+
+// The predicate that holds of B and A when APredicate holds of A and B (operands swapped)
+routine DoSwapped(const APredicate: IrPredicate): IrPredicate;
+begin
+  if APredicate = IrPredicate.SLess then
+    return IrPredicate.SGreater;
+  end;
+  if APredicate = IrPredicate.SLessEqual then
+    return IrPredicate.SGreaterEqual;
+  end;
+  if APredicate = IrPredicate.SGreater then
+    return IrPredicate.SLess;
+  end;
+  if APredicate = IrPredicate.SGreaterEqual then
+    return IrPredicate.SLessEqual;
+  end;
+  if APredicate = IrPredicate.ULess then
+    return IrPredicate.UGreater;
+  end;
+  if APredicate = IrPredicate.ULessEqual then
+    return IrPredicate.UGreaterEqual;
+  end;
+  if APredicate = IrPredicate.UGreater then
+    return IrPredicate.ULess;
+  end;
+  if APredicate = IrPredicate.UGreaterEqual then
+    return IrPredicate.ULessEqual;
+  end;
+  return APredicate;
+end;
+
+// The integer predicate that holds exactly when APredicate does not (equal and the orders;
+// any other is given back as it is: indvars reads only integer compares)
+routine DoNegated(const APredicate: IrPredicate): IrPredicate;
+begin
+  if APredicate = IrPredicate.Equal then
+    return IrPredicate.NotEqual;
+  end;
+  if APredicate = IrPredicate.NotEqual then
+    return IrPredicate.Equal;
+  end;
+  if APredicate = IrPredicate.SLess then
+    return IrPredicate.SGreaterEqual;
+  end;
+  if APredicate = IrPredicate.SLessEqual then
+    return IrPredicate.SGreater;
+  end;
+  if APredicate = IrPredicate.SGreater then
+    return IrPredicate.SLessEqual;
+  end;
+  if APredicate = IrPredicate.SGreaterEqual then
+    return IrPredicate.SLess;
+  end;
+  if APredicate = IrPredicate.ULess then
+    return IrPredicate.UGreaterEqual;
+  end;
+  if APredicate = IrPredicate.ULessEqual then
+    return IrPredicate.UGreater;
+  end;
+  if APredicate = IrPredicate.UGreater then
+    return IrPredicate.ULessEqual;
+  end;
+  if APredicate = IrPredicate.UGreaterEqual then
+    return IrPredicate.ULess;
+  end;
+  return APredicate;
+end;
+
+// True when the ranges ALow..AHigh (the left operand) and AOtherLow..AOtherHigh (the
+// right) decide the integer compare APredicate, its value in AValue (an unsigned order is
+// read as the signed one: the caller passes ranges of values that are not negative)
+routine DoDecide(const APredicate: IrPredicate; const ALow: int64; const AHigh: int64;
+  const AOtherLow: int64; const AOtherHigh: int64; var AValue: bool): bool;
+var
+  LSame: bool;
+  LApart: bool;
+begin
+  if (APredicate = IrPredicate.SLess) or (APredicate = IrPredicate.ULess) then
+    if AHigh < AOtherLow then
+      AValue := true;
+      return true;
+    end;
+    if ALow >= AOtherHigh then
+      AValue := false;
+      return true;
+    end;
+    return false;
+  end;
+  if (APredicate = IrPredicate.SLessEqual) or (APredicate = IrPredicate.ULessEqual) then
+    if AHigh <= AOtherLow then
+      AValue := true;
+      return true;
+    end;
+    if ALow > AOtherHigh then
+      AValue := false;
+      return true;
+    end;
+    return false;
+  end;
+  if (APredicate = IrPredicate.SGreater) or (APredicate = IrPredicate.UGreater) then
+    if ALow > AOtherHigh then
+      AValue := true;
+      return true;
+    end;
+    if AHigh <= AOtherLow then
+      AValue := false;
+      return true;
+    end;
+    return false;
+  end;
+  if (APredicate = IrPredicate.SGreaterEqual) or (APredicate = IrPredicate.UGreaterEqual) then
+    if ALow >= AOtherHigh then
+      AValue := true;
+      return true;
+    end;
+    if AHigh < AOtherLow then
+      AValue := false;
+      return true;
+    end;
+    return false;
+  end;
+  if (APredicate <> IrPredicate.Equal) and (APredicate <> IrPredicate.NotEqual) then
+    return false;
+  end;
+  LSame := (ALow = AHigh) and (AOtherLow = AOtherHigh) and (ALow = AOtherLow);
+  LApart := (AHigh < AOtherLow) or (AOtherHigh < ALow);
+  if (not LSame) and (not LApart) then
+    return false;
+  end;
+  // Equal holds when both are the one same value, not when they are apart
+  AValue := LSame;
+  if APredicate = IrPredicate.NotEqual then
+    AValue := not LSame;
+  end;
+  return true;
+end;
+
+type
+  // What indvars knows of one basic induction variable of the loop it works on (see the
+  // header)
+  InductionFact = record
+    // The header phi, its value from the preheader and its signed step a turn
+    PhiId: int64;
+    Seed: int64;
+    Stride: int64;
+    // Its exit test (a loop block's position, ADAM_LOOPS_NONE: none found), the block the
+    // edge staying in the loop runs to (a position) and the value it is compared with
+    TestAt: int64;
+    StayAt: int64;
+    LimitValue: int64;
+    // Its range in every block of the loop, and in the blocks the stay block dominates
+    HasLoopRange: bool;
+    LoopLow: int64;
+    LoopHigh: int64;
+    HasStayRange: bool;
+    StayLow: int64;
+    StayHigh: int64;
+    // Its value on the test's exit edge (ADAM_LOOPS_EXIT_*): ExitValue is the value's id
+    // or the constant
+    ExitKind: int64;
+    ExitValue: int64;
+  end;
+
+  InductionFactArray = array of InductionFact;
+
+  // indvars over one function (see the header)
+  InductionSimplifier = object
+    hidden FModule: ref IrModule;
+    hidden FFunction: ref IrFunction;
+    hidden FFunctionId: int64;
+    hidden FAnalysis: ref FunctionAnalysis;
+    // The loop being worked: its number, its blocks, its header, preheader and latch (by
+    // position), and its induction variables' facts
+    hidden FLoop: int64;
+    hidden FIn: BoolArray;
+    hidden FHeader: int64;
+    hidden FPreheader: int64;
+    hidden FLatch: int64;
+    hidden FFacts: InductionFactArray;
+    hidden FFactCount: int64;
+    // How many ranges the current DoRange walks took from an induction variable
+    hidden FInductionHits: int64;
+
+    // indvars over AModule's function AFunction, its facts AAnalysis (it never changes a
+    // block or an edge, so the loops keep their numbers in every analysis made after)
+    init(const AModule: ref IrModule; const AFunction: int64;
+      const AAnalysis: ref FunctionAnalysis);
+    begin
+      self.FModule := AModule;
+      self.FFunction := AModule.FunctionAt(AFunction);
+      self.FFunctionId := AFunction;
+      self.FAnalysis := AAnalysis;
+      self.FLoop := ADAM_LOOPS_NONE;
+      self.FHeader := ADAM_LOOPS_NONE;
+      self.FPreheader := ADAM_LOOPS_NONE;
+      self.FLatch := ADAM_LOOPS_NONE;
+      self.FFactCount := 0;
+      self.FInductionHits := 0;
+    end;
+
+    // True when the value AId is made in a block of the loop
+    hidden const method DoInLoop(const AId: int64): bool;
+    var
+      LAt: int64;
+    begin
+      LAt := self.FAnalysis.PositionOf(self.FModule.InstrAt(AId).Block);
+      if LAt < 0 then
+        return false;
+      end;
+      return self.FIn[LAt];
+    end;
+
+    // The fact whose phi is AId (ADAM_LOOPS_NONE: no induction variable of the loop)
+    hidden const method DoFactOf(const AId: int64): int64;
+    var
+      LK: int64;
+    begin
+      for LK := 0 to self.FFactCount - 1 do
+        if self.FFacts[LK].PhiId = AId then
+          return LK;
+        end;
+      end;
+      return ADAM_LOOPS_NONE;
+    end;
+
+    // A new instruction (AKind, AType, ANode) in the block ABlock (an id), just before its
+    // terminator; returns its id
+    hidden method DoEmitBefore(const ABlock: int64; const AKind: IrOp; const AType: IrType;
+      const ANode: int64): int64;
+    var
+      LBlock: ref IrBlock;
+      LPlaced: ref Int64List;
+      LId: int64;
+      LCount: int64;
+      LI: int64;
+    begin
+      LId := self.FModule.Emit(ABlock, AKind, AType, ANode);
+      // Emit put it last, after the terminator: the list made again with it before that
+      LBlock := self.FModule.BlockAt(ABlock);
+      LCount := LBlock.Instrs.Count;
+      LPlaced := ref Int64List();
+      for LI := 0 to LCount - 3 do
+        LPlaced.Add(LBlock.Instrs[LI]);
+      end;
+      LPlaced.Add(LId);
+      LPlaced.Add(LBlock.Instrs[LCount - 2]);
+      LBlock.Instrs := LPlaced;
+      return LId;
+    end;
+
+    // A new instruction AKind of AType over ALeft and ARight in the block ABlock (an id),
+    // just before its terminator; returns its id
+    hidden method DoBinaryBefore(const ABlock: int64; const AKind: IrOp; const AType: IrType;
+      const ALeft: int64; const ARight: int64; const ANode: int64): int64;
+    var
+      LId: int64;
+    begin
+      LId := self.DoEmitBefore(ABlock, AKind, AType, ANode);
+      self.FModule.InstrAt(LId).Operands.Add(ALeft);
+      self.FModule.InstrAt(LId).Operands.Add(ARight);
+      return LId;
+    end;
+
+    // A convert of AValue to AType in the block ABlock (an id), just before its terminator
+    hidden method DoConvertBefore(const ABlock: int64; const AType: IrType; const AValue: int64;
+      const ANode: int64): int64;
+    var
+      LId: int64;
+    begin
+      LId := self.DoEmitBefore(ABlock, IrOp.Convert, AType, ANode);
+      self.FModule.InstrAt(LId).Operands.Add(AValue);
+      return LId;
+    end;
+
+    // An add of ALeft and ARight (of AType) in the header, after its phis; returns its id
+    hidden method DoAddAfterPhis(const AType: IrType; const ALeft: int64; const ARight: int64;
+      const ANode: int64): int64;
+    var
+      LBlock: ref IrBlock;
+      LPlaced: ref Int64List;
+      LPut: bool;
+      LHeader: int64;
+      LId: int64;
+      LCount: int64;
+      LI: int64;
+    begin
+      LHeader := self.FAnalysis.BlockAt(self.FHeader);
+      LId := self.FModule.Emit(LHeader, IrOp.Add, AType, ANode);
+      self.FModule.InstrAt(LId).Operands.Add(ALeft);
+      self.FModule.InstrAt(LId).Operands.Add(ARight);
+      // Emit put it last: the list made again with it at the first instruction no phi
+      LBlock := self.FModule.BlockAt(LHeader);
+      LCount := LBlock.Instrs.Count;
+      LPlaced := ref Int64List();
+      LPut := false;
+      for LI := 0 to LCount - 2 do
+        if (not LPut) and (self.FModule.InstrAt(LBlock.Instrs[LI]).Kind <> IrOp.Phi) then
+          LPlaced.Add(LId);
+          LPut := true;
+        end;
+        LPlaced.Add(LBlock.Instrs[LI]);
+      end;
+      if not LPut then
+        LPlaced.Add(LId);
+      end;
+      LBlock.Instrs := LPlaced;
+      return LId;
+    end;
+
+    // A constant AValue of AType in the preheader (it dominates the loop and its exits),
+    // at ANode; returns its id
+    hidden method DoConstant(const AType: IrType; const AValue: int64; const ANode: int64): int64;
+    var
+      LId: int64;
+    begin
+      LId := self.DoEmitBefore(self.FAnalysis.BlockAt(self.FPreheader), IrOp.Constant, AType,
+        ANode);
+      self.FModule.InstrAt(LId).Imm := IrCanonicalImm(AType, AValue);
+      return LId;
+    end;
+
+    // Every use of the value AOld made AValue (its users from the analysis: a use a pass
+    // step made since is kept, still the same value)
+    hidden method DoReplaceUses(const AOld: int64; const AValue: int64);
+    var
+      LUses: ref Int64List;
+      LUser: ref IrInstr;
+      LI: int64;
+      LE: int64;
+    begin
+      LUses := self.FAnalysis.UsesOf(AOld);
+      for LI := 0 to LUses.Count - 1 do
+        LUser := self.FModule.InstrAt(LUses[LI]);
+        for LE := 0 to LUser.Operands.Count - 1 do
+          if LUser.Operands[LE] = AOld then
+            LUser.Operands.Put(LE, AValue);
+          end;
+        end;
+      end;
+    end;
+
+    // The fact AIndex's loop-wide range ALow..AHigh (none when it is empty)
+    hidden method DoLoopRange(const AIndex: int64; const ALow: int64; const AHigh: int64);
+    begin
+      if ALow > AHigh then
+        return;
+      end;
+      self.FFacts[AIndex].HasLoopRange := true;
+      self.FFacts[AIndex].LoopLow := ALow;
+      self.FFacts[AIndex].LoopHigh := AHigh;
+    end;
+
+    // The fact AIndex's range ALow..AHigh where its test held (none when it is empty)
+    hidden method DoStayRange(const AIndex: int64; const ALow: int64; const AHigh: int64);
+    begin
+      if ALow > AHigh then
+        return;
+      end;
+      self.FFacts[AIndex].HasStayRange := true;
+      self.FFacts[AIndex].StayLow := ALow;
+      self.FFacts[AIndex].StayHigh := AHigh;
+    end;
+
+    // The fact AIndex's value on its test's exit edge: the constant AValue
+    hidden method DoExitConstant(const AIndex: int64; const AValue: int64);
+    begin
+      self.FFacts[AIndex].ExitKind := ADAM_LOOPS_EXIT_CONSTANT;
+      self.FFacts[AIndex].ExitValue := AValue;
+    end;
+
+    // The fact AIndex's ranges and exit value from its test, which stays in the loop while
+    // `variable APredicate limit` holds (see the header). Each range holds by induction:
+    // the variable starts inside it and the latch, reached only through the stay edge,
+    // steps it from a value the test let through to one still inside, never wrapping
+    hidden method DoSetRanges(const AIndex: int64; const APredicate: IrPredicate);
+    var
+      LType: IrType;
+      LSeed: int64;
+      LLimit: int64;
+      LStride: int64;
+      LLow: int64;
+      LHigh: int64;
+    begin
+      LType := self.FModule.InstrAt(self.FFacts[AIndex].PhiId).ValueType;
+      LStride := self.FFacts[AIndex].Stride;
+      // A not-equal test lets the loop go only when the variable is its limit
+      if APredicate = IrPredicate.NotEqual then
+        self.FFacts[AIndex].ExitKind := ADAM_LOOPS_EXIT_VALUE;
+        self.FFacts[AIndex].ExitValue := self.FFacts[AIndex].LimitValue;
+      end;
+      if not DoConstantValue(self.FModule.InstrAt(self.FFacts[AIndex].Seed), LSeed) then
+        return;
+      end;
+      if not DoConstantValue(self.FModule.InstrAt(self.FFacts[AIndex].LimitValue), LLimit) then
+        return;
+      end;
+      LLow := DoTypeLow(LType);
+      LHigh := DoTypeHigh(LType);
+      if APredicate = IrPredicate.NotEqual then
+        // By one toward the limit from a start not past it: it meets the limit
+        if (LStride = 1) and (LSeed <= LLimit) then
+          self.DoLoopRange(AIndex, LSeed, LLimit);
+          self.DoStayRange(AIndex, LSeed, LLimit - 1);
+        end;
+        if (LStride = -1) and (LSeed >= LLimit) then
+          self.DoLoopRange(AIndex, LLimit, LSeed);
+          self.DoStayRange(AIndex, LLimit + 1, LSeed);
+        end;
+        return;
+      end;
+      // A less / greater test: every range needs the step from the last value the test
+      // lets through to stay inside the type (else it wraps past the start)
+      if (LStride > 0) and
+        ((APredicate = IrPredicate.SLess) or (APredicate = IrPredicate.ULess)) then
+        if LLimit - 1 + LStride <= LHigh then
+          self.DoStayRange(AIndex, LSeed, LLimit - 1);
+          self.DoLoopRange(AIndex, LSeed, DoGreater(LSeed, LLimit - 1 + LStride));
+          if (LStride = 1) and (LSeed <= LLimit) then
+            self.DoExitConstant(AIndex, LLimit);
+          end;
+        end;
+        return;
+      end;
+      if (LStride > 0) and
+        ((APredicate = IrPredicate.SLessEqual) or (APredicate = IrPredicate.ULessEqual)) then
+        if LLimit + LStride <= LHigh then
+          self.DoStayRange(AIndex, LSeed, LLimit);
+          self.DoLoopRange(AIndex, LSeed, DoGreater(LSeed, LLimit + LStride));
+          if (LStride = 1) and (LSeed <= LLimit + 1) then
+            self.DoExitConstant(AIndex, LLimit + 1);
+          end;
+        end;
+        return;
+      end;
+      if (LStride < 0) and
+        ((APredicate = IrPredicate.SGreater) or (APredicate = IrPredicate.UGreater)) then
+        if LLimit + 1 + LStride >= LLow then
+          self.DoStayRange(AIndex, LLimit + 1, LSeed);
+          self.DoLoopRange(AIndex, DoLesser(LSeed, LLimit + 1 + LStride), LSeed);
+          if (LStride = -1) and (LSeed >= LLimit) then
+            self.DoExitConstant(AIndex, LLimit);
+          end;
+        end;
+        return;
+      end;
+      if (LStride < 0) and
+        ((APredicate = IrPredicate.SGreaterEqual) or (APredicate = IrPredicate.UGreaterEqual)) then
+        if LLimit + LStride >= LLow then
+          self.DoStayRange(AIndex, LLimit, LSeed);
+          self.DoLoopRange(AIndex, DoLesser(LSeed, LLimit + LStride), LSeed);
+          if (LStride = -1) and (LSeed >= LLimit - 1) then
+            self.DoExitConstant(AIndex, LLimit - 1);
+          end;
+        end;
+      end;
+    end;
+
+    // The exit test of the fact AIndex (see the header): the first loop block, by position,
+    // whose branch compares the phi with an invariant and has one edge in the loop, that
+    // edge's block entered from it alone and dominating the latch
+    hidden method DoFindTest(const AIndex: int64);
+    var
+      LBlocks: ref Int64List;
+      LPreds: ref Int64List;
+      LTerm: ref IrInstr;
+      LCondition: ref IrInstr;
+      LPhi: ref IrInstr;
+      LPredicate: IrPredicate;
+      LOther: int64;
+      LThen: int64;
+      LElse: int64;
+      LStay: int64;
+      LAt: int64;
+      LI: int64;
+    begin
+      LPhi := self.FModule.InstrAt(self.FFacts[AIndex].PhiId);
+      LBlocks := self.FAnalysis.LoopBlocks(self.FLoop);
+      for LI := 0 to LBlocks.Count - 1 do
+        LAt := LBlocks[LI];
+        LTerm := DoTerminatorOf(self.FModule, self.FAnalysis.BlockAt(LAt));
+        if LTerm.Kind <> IrOp.Branch then
+          skip;
+        end;
+        LCondition := self.FModule.InstrAt(LTerm.Operands[0]);
+        if LCondition.Kind <> IrOp.Compare then
+          skip;
+        end;
+        // Read as `phi LPredicate other`
+        if LCondition.Operands[0] = self.FFacts[AIndex].PhiId then
+          LOther := LCondition.Operands[1];
+          LPredicate := LCondition.Predicate;
+        else
+          if LCondition.Operands[1] <> self.FFacts[AIndex].PhiId then
+            skip;
+          end;
+          LOther := LCondition.Operands[0];
+          LPredicate := DoSwapped(LCondition.Predicate);
+        end;
+        if self.DoInLoop(LOther) and (self.FModule.InstrAt(LOther).Kind <> IrOp.Constant) then
+          skip;
+        end;
+        if IsSignedPredicate(LPredicate) and (not IsSignedType(LPhi.ValueType)) then
+          skip;
+        end;
+        if IsUnsignedPredicate(LPredicate) and IsSignedType(LPhi.ValueType) then
+          skip;
+        end;
+        LThen := self.FAnalysis.PositionOf(LTerm.Targets[0]);
+        LElse := self.FAnalysis.PositionOf(LTerm.Targets[1]);
+        if (LThen < 0) or (LElse < 0) then
+          skip;
+        end;
+        if self.FIn[LThen] = self.FIn[LElse] then
+          skip;
+        end;
+        // Read as the test that keeps the loop going
+        if self.FIn[LThen] then
+          LStay := LThen;
+        else
+          LStay := LElse;
+          LPredicate := DoNegated(LPredicate);
+        end;
+        LPreds := self.FAnalysis.PredsOf(LStay);
+        if (LPreds.Count <> 1) or (LPreds[0] <> LAt) then
+          skip;
+        end;
+        if not self.FAnalysis.Dominates(LStay, self.FLatch) then
+          skip;
+        end;
+        self.FFacts[AIndex].TestAt := LAt;
+        self.FFacts[AIndex].StayAt := LStay;
+        self.FFacts[AIndex].LimitValue := LOther;
+        self.DoSetRanges(AIndex, LPredicate);
+        return;
+      end;
+    end;
+
+    // The loop's basic induction variables (see the header), each with its exit test
+    hidden method DoFindInductions();
+    var
+      LHeader: ref IrBlock;
+      LPhi: ref IrInstr;
+      LNext: ref IrInstr;
+      LPreheader: int64;
+      LLatch: int64;
+      LPhiId: int64;
+      LSeed: int64;
+      LNextId: int64;
+      LStride: int64;
+      LAt: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      self.FFactCount := 0;
+      setlength(self.FFacts, 0);
+      LHeader := self.FModule.BlockAt(self.FAnalysis.BlockAt(self.FHeader));
+      LPreheader := self.FAnalysis.BlockAt(self.FPreheader);
+      LLatch := self.FAnalysis.BlockAt(self.FLatch);
+      for LK := 0 to LHeader.Instrs.Count - 1 do
+        LPhiId := LHeader.Instrs[LK];
+        LPhi := self.FModule.InstrAt(LPhiId);
+        if LPhi.Kind <> IrOp.Phi then
+          leave;
+        end;
+        if (not IsIntegerType(LPhi.ValueType)) or (LPhi.Operands.Count <> 2) then
+          skip;
+        end;
+        LSeed := ADAM_LOOPS_NONE;
+        LNextId := ADAM_LOOPS_NONE;
+        for LE := 0 to 1 do
+          if LPhi.Targets[LE] = LPreheader then
+            LSeed := LPhi.Operands[LE];
+          end;
+          if LPhi.Targets[LE] = LLatch then
+            LNextId := LPhi.Operands[LE];
+          end;
+        end;
+        if (LSeed = ADAM_LOOPS_NONE) or (LNextId = ADAM_LOOPS_NONE) then
+          skip;
+        end;
+        // The latch's value: the phi plus or less a constant
+        LNext := self.FModule.InstrAt(LNextId);
+        LStride := 0;
+        if (LNext.Kind = IrOp.Add) or (LNext.Kind = IrOp.Sub) then
+          if (LNext.Operands[0] = LPhiId) and
+            (self.FModule.InstrAt(LNext.Operands[1]).Kind = IrOp.Constant) then
+            LStride := DoSignedStride(LPhi.ValueType, self.FModule.InstrAt(LNext.Operands[1]).Imm,
+              LNext.Kind = IrOp.Sub);
+          end;
+          if (LNext.Kind = IrOp.Add) and (LNext.Operands[1] = LPhiId) and
+            (self.FModule.InstrAt(LNext.Operands[0]).Kind = IrOp.Constant) then
+            LStride := DoSignedStride(LPhi.ValueType, self.FModule.InstrAt(LNext.Operands[0]).Imm,
+              false);
+          end;
+        end;
+        if LStride = 0 then
+          skip;
+        end;
+        LAt := self.FFactCount;
+        setlength(self.FFacts, LAt + 1);
+        self.FFacts[LAt].PhiId := LPhiId;
+        self.FFacts[LAt].Seed := LSeed;
+        self.FFacts[LAt].Stride := LStride;
+        self.FFacts[LAt].TestAt := ADAM_LOOPS_NONE;
+        self.FFacts[LAt].StayAt := ADAM_LOOPS_NONE;
+        self.FFacts[LAt].LimitValue := ADAM_LOOPS_NONE;
+        self.FFacts[LAt].HasLoopRange := false;
+        self.FFacts[LAt].LoopLow := 0;
+        self.FFacts[LAt].LoopHigh := 0;
+        self.FFacts[LAt].HasStayRange := false;
+        self.FFacts[LAt].StayLow := 0;
+        self.FFacts[LAt].StayHigh := 0;
+        self.FFacts[LAt].ExitKind := ADAM_LOOPS_EXIT_NONE;
+        self.FFacts[LAt].ExitValue := 0;
+        self.FFactCount := LAt + 1;
+        self.DoFindTest(LAt);
+      end;
+    end;
+
+    // ALow..AHigh (ALowIn..AHighIn) when it is inside the integer type AType's values (the
+    // value computed never wrapped)
+    hidden const method DoKeep(const AType: IrType; const ALowIn: int64; const AHighIn: int64;
+      var ALow: int64; var AHigh: int64): bool;
+    begin
+      if (ALowIn < DoTypeLow(AType)) or (AHighIn > DoTypeHigh(AType)) then
+        return false;
+      end;
+      ALow := ALowIn;
+      AHigh := AHighIn;
+      return true;
+    end;
+
+    // The range of the value AId in the loop block at AAt (see the header's checks) in
+    // ALow..AHigh; false when it is not known
+    hidden method DoRange(const AId: int64; const AAt: int64; const ADepth: int64;
+      var ALow: int64; var AHigh: int64): bool;
+    var
+      LInstr: ref IrInstr;
+      LTerm: int64;
+      LLow: int64;
+      LHigh: int64;
+      LOtherLow: int64;
+      LOtherHigh: int64;
+      LFactor: int64;
+      LFact: int64;
+    begin
+      if ADepth > ADAM_LOOPS_WALK_DEPTH then
+        return false;
+      end;
+      LInstr := self.FModule.InstrAt(AId);
+      if not IsIntegerType(LInstr.ValueType) then
+        return false;
+      end;
+      if LInstr.Kind = IrOp.Constant then
+        if not DoConstantValue(LInstr, LLow) then
+          return false;
+        end;
+        ALow := LLow;
+        AHigh := LLow;
+        return true;
+      end;
+      if LInstr.Kind = IrOp.Phi then
+        LFact := self.DoFactOf(AId);
+        if LFact = ADAM_LOOPS_NONE then
+          return false;
+        end;
+        if self.FFacts[LFact].HasStayRange and
+          self.FAnalysis.Dominates(self.FFacts[LFact].StayAt, AAt) then
+          ALow := self.FFacts[LFact].StayLow;
+          AHigh := self.FFacts[LFact].StayHigh;
+          self.FInductionHits := self.FInductionHits + 1;
+          return true;
+        end;
+        if self.FFacts[LFact].HasLoopRange and self.FIn[AAt] then
+          ALow := self.FFacts[LFact].LoopLow;
+          AHigh := self.FFacts[LFact].LoopHigh;
+          self.FInductionHits := self.FInductionHits + 1;
+          return true;
+        end;
+        return false;
+      end;
+      if LInstr.Kind = IrOp.Convert then
+        if not IsIntegerType(self.FModule.InstrAt(LInstr.Operands[0]).ValueType) then
+          return false;
+        end;
+        if not self.DoRange(LInstr.Operands[0], AAt, ADepth + 1, LLow, LHigh) then
+          return false;
+        end;
+        // An integer that fits its new type keeps its value
+        return self.DoKeep(LInstr.ValueType, LLow, LHigh, ALow, AHigh);
+      end;
+      if (LInstr.Kind = IrOp.Add) or (LInstr.Kind = IrOp.Sub) then
+        if not self.DoRange(LInstr.Operands[0], AAt, ADepth + 1, LLow, LHigh) then
+          return false;
+        end;
+        if not self.DoRange(LInstr.Operands[1], AAt, ADepth + 1, LOtherLow, LOtherHigh) then
+          return false;
+        end;
+        // Every end is within 2^62: no sum or difference overflows
+        if LInstr.Kind = IrOp.Add then
+          return self.DoKeep(LInstr.ValueType, LLow + LOtherLow, LHigh + LOtherHigh, ALow,
+            AHigh);
+        end;
+        return self.DoKeep(LInstr.ValueType, LLow - LOtherHigh, LHigh - LOtherLow, ALow, AHigh);
+      end;
+      if (LInstr.Kind = IrOp.Mul) or (LInstr.Kind = IrOp.Shl) then
+        // A multiply by a constant on either side, a shift by a constant count
+        if DoConstantValue(self.FModule.InstrAt(LInstr.Operands[1]), LFactor) then
+          LTerm := LInstr.Operands[0];
+        else
+          if (LInstr.Kind = IrOp.Shl) or
+            (not DoConstantValue(self.FModule.InstrAt(LInstr.Operands[0]), LFactor)) then
+            return false;
+          end;
+          LTerm := LInstr.Operands[1];
+        end;
+        if LInstr.Kind = IrOp.Shl then
+          if (LFactor < 0) or (LFactor > ADAM_LOOPS_MAX_SHIFT) then
+            return false;
+          end;
+          LFactor := int64(uint64(1) shl uint64(LFactor));
+        end;
+        if not DoWithin(LFactor, ADAM_LOOPS_AFFINE_CAP) then
+          return false;
+        end;
+        if not self.DoRange(LTerm, AAt, ADepth + 1, LLow, LHigh) then
+          return false;
+        end;
+        if (not DoWithin(LLow, ADAM_LOOPS_PRODUCT_CAP)) or
+          (not DoWithin(LHigh, ADAM_LOOPS_PRODUCT_CAP)) then
+          return false;
+        end;
+        if LFactor < 0 then
+          return self.DoKeep(LInstr.ValueType, LHigh * LFactor, LLow * LFactor, ALow, AHigh);
+        end;
+        return self.DoKeep(LInstr.ValueType, LLow * LFactor, LHigh * LFactor, ALow, AHigh);
+      end;
+      if LInstr.Kind = IrOp.BitAnd then
+        // An and with a constant that is not negative is between 0 and that constant
+        if DoConstantValue(self.FModule.InstrAt(LInstr.Operands[1]), LFactor) or
+          DoConstantValue(self.FModule.InstrAt(LInstr.Operands[0]), LFactor) then
+          if LFactor >= 0 then
+            return self.DoKeep(LInstr.ValueType, 0, LFactor, ALow, AHigh);
+          end;
+        end;
+        return false;
+      end;
+      return false;
+    end;
+
+    // checks (see the header): true when a branch of the loop got a constant
+    hidden method DoFoldChecks(): bool;
+    var
+      LBlocks: ref Int64List;
+      LTerm: ref IrInstr;
+      LCondition: ref IrInstr;
+      LTruth: bool;
+      LChanged: bool;
+      LLow: int64;
+      LHigh: int64;
+      LOtherLow: int64;
+      LOtherHigh: int64;
+      LBlock: int64;
+      LConstant: int64;
+      LAt: int64;
+      LI: int64;
+    begin
+      LChanged := false;
+      LBlocks := self.FAnalysis.LoopBlocks(self.FLoop);
+      for LI := 0 to LBlocks.Count - 1 do
+        LAt := LBlocks[LI];
+        LBlock := self.FAnalysis.BlockAt(LAt);
+        LTerm := DoTerminatorOf(self.FModule, LBlock);
+        if LTerm.Kind <> IrOp.Branch then
+          skip;
+        end;
+        LCondition := self.FModule.InstrAt(LTerm.Operands[0]);
+        if LCondition.Kind <> IrOp.Compare then
+          skip;
+        end;
+        if not IsIntegerType(self.FModule.InstrAt(LCondition.Operands[0]).ValueType) then
+          skip;
+        end;
+        // Only a compare an induction variable's range decides (sccp has the rest)
+        self.FInductionHits := 0;
+        if not self.DoRange(LCondition.Operands[0], LAt, 0, LLow, LHigh) then
+          skip;
+        end;
+        if not self.DoRange(LCondition.Operands[1], LAt, 0, LOtherLow, LOtherHigh) then
+          skip;
+        end;
+        if self.FInductionHits = 0 then
+          skip;
+        end;
+        if IsUnsignedPredicate(LCondition.Predicate) and ((LLow < 0) or (LOtherLow < 0)) then
+          skip;
+        end;
+        if not DoDecide(LCondition.Predicate, LLow, LHigh, LOtherLow, LOtherHigh, LTruth) then
+          skip;
+        end;
+        // The branch reads a bool constant (0 / 1) instead: simplifycfg folds it
+        LConstant := self.DoEmitBefore(LBlock, IrOp.Constant, IrType.Bool, LCondition.Node);
+        if LTruth then
+          self.FModule.InstrAt(LConstant).Imm := 1;
+        else
+          self.FModule.InstrAt(LConstant).Imm := 0;
+        end;
+        LTerm.Operands.Put(0, LConstant);
+        LChanged := true;
+      end;
+      return LChanged;
+    end;
+
+    // exits (see the header): true when an exit phi took a variable's exit value
+    hidden method DoExitValues(): bool;
+    var
+      LTerm: ref IrInstr;
+      LExit: ref IrBlock;
+      LPhi: ref IrInstr;
+      LChanged: bool;
+      LTest: int64;
+      LExitId: int64;
+      LValue: int64;
+      LK: int64;
+      LI: int64;
+      LE: int64;
+    begin
+      LChanged := false;
+      for LK := 0 to self.FFactCount - 1 do
+        if self.FFacts[LK].ExitKind = ADAM_LOOPS_EXIT_NONE then
+          skip;
+        end;
+        LTest := self.FAnalysis.BlockAt(self.FFacts[LK].TestAt);
+        LTerm := DoTerminatorOf(self.FModule, LTest);
+        LExitId := LTerm.Targets[0];
+        if self.FIn[self.FAnalysis.PositionOf(LExitId)] then
+          LExitId := LTerm.Targets[1];
+        end;
+        LExit := self.FModule.BlockAt(LExitId);
+        LValue := ADAM_LOOPS_NONE;
+        for LI := 0 to LExit.Instrs.Count - 1 do
+          LPhi := self.FModule.InstrAt(LExit.Instrs[LI]);
+          if LPhi.Kind <> IrOp.Phi then
+            leave;
+          end;
+          for LE := 0 to LPhi.Targets.Count - 1 do
+            if (LPhi.Targets[LE] <> LTest) or (LPhi.Operands[LE] <> self.FFacts[LK].PhiId) then
+              skip;
+            end;
+            if LValue = ADAM_LOOPS_NONE then
+              if self.FFacts[LK].ExitKind = ADAM_LOOPS_EXIT_VALUE then
+                LValue := self.FFacts[LK].ExitValue;
+              else
+                LValue := self.DoConstant(self.FModule.InstrAt(self.FFacts[LK].PhiId).ValueType,
+                  self.FFacts[LK].ExitValue, LPhi.Node);
+              end;
+            end;
+            LPhi.Operands.Put(LE, LValue);
+            LChanged := true;
+          end;
+        end;
+      end;
+      return LChanged;
+    end;
+
+    // The value AId as AScale * variable + AOffset over the fact AFact (ADAM_LOOPS_NONE:
+    // no variable, a constant), at 64 bits (see the header's reduction); AMultiplies set
+    // when a multiply or a shift was read. False when it is no such count
+    hidden method DoAffine(const AId: int64; const ADepth: int64; var AFact: int64;
+      var AScale: int64; var AOffset: int64; var AMultiplies: bool): bool;
+    var
+      LInstr: ref IrInstr;
+      LSource: ref IrInstr;
+      LTerm: int64;
+      LFact: int64;
+      LScale: int64;
+      LOffset: int64;
+      LOtherFact: int64;
+      LOtherScale: int64;
+      LOtherOffset: int64;
+      LFactor: int64;
+      LValue: int64;
+    begin
+      if ADepth > ADAM_LOOPS_WALK_DEPTH then
+        return false;
+      end;
+      LInstr := self.FModule.InstrAt(AId);
+      if (not IsIntegerType(LInstr.ValueType)) or (IrTypeWidth(LInstr.ValueType) <> 64) then
+        return false;
+      end;
+      if LInstr.Kind = IrOp.Constant then
+        if not DoConstantValue(LInstr, LValue) then
+          return false;
+        end;
+        if not DoWithin(LValue, ADAM_LOOPS_AFFINE_CAP) then
+          return false;
+        end;
+        AFact := ADAM_LOOPS_NONE;
+        AScale := 0;
+        AOffset := LValue;
+        return true;
+      end;
+      if LInstr.Kind = IrOp.Phi then
+        LFact := self.DoFactOf(AId);
+        if LFact = ADAM_LOOPS_NONE then
+          return false;
+        end;
+        AFact := LFact;
+        AScale := 1;
+        AOffset := 0;
+        return true;
+      end;
+      if LInstr.Kind = IrOp.Convert then
+        LSource := self.FModule.InstrAt(LInstr.Operands[0]);
+        if not IsIntegerType(LSource.ValueType) then
+          return false;
+        end;
+        if IrTypeWidth(LSource.ValueType) = 64 then
+          // int64 and uint64 are the same bits
+          return self.DoAffine(LInstr.Operands[0], ADepth + 1, AFact, AScale, AOffset,
+            AMultiplies);
+        end;
+        // A narrower variable widened: its own value while it stays in its range (it
+        // never wraps) and the widening keeps its sign
+        if LSource.Kind <> IrOp.Phi then
+          return false;
+        end;
+        LFact := self.DoFactOf(LInstr.Operands[0]);
+        if LFact = ADAM_LOOPS_NONE then
+          return false;
+        end;
+        if not self.FFacts[LFact].HasLoopRange then
+          return false;
+        end;
+        if IsSignedType(LSource.ValueType) and (not IsSignedType(LInstr.ValueType)) and
+          (self.FFacts[LFact].LoopLow < 0) then
+          return false;
+        end;
+        AFact := LFact;
+        AScale := 1;
+        AOffset := 0;
+        return true;
+      end;
+      if (LInstr.Kind = IrOp.Add) or (LInstr.Kind = IrOp.Sub) then
+        if not self.DoAffine(LInstr.Operands[0], ADepth + 1, LFact, LScale, LOffset,
+          AMultiplies) then
+          return false;
+        end;
+        if not self.DoAffine(LInstr.Operands[1], ADepth + 1, LOtherFact, LOtherScale,
+          LOtherOffset, AMultiplies) then
+          return false;
+        end;
+        if (LFact <> ADAM_LOOPS_NONE) and (LOtherFact <> ADAM_LOOPS_NONE) and
+          (LFact <> LOtherFact) then
+          return false;
+        end;
+        if LFact = ADAM_LOOPS_NONE then
+          LFact := LOtherFact;
+        end;
+        if LInstr.Kind = IrOp.Sub then
+          LOtherScale := -LOtherScale;
+          LOtherOffset := -LOtherOffset;
+        end;
+        AFact := LFact;
+        AScale := LScale + LOtherScale;
+        AOffset := LOffset + LOtherOffset;
+        return DoWithin(AScale, ADAM_LOOPS_AFFINE_CAP) and
+          DoWithin(AOffset, ADAM_LOOPS_AFFINE_CAP);
+      end;
+      if (LInstr.Kind = IrOp.Mul) or (LInstr.Kind = IrOp.Shl) then
+        if DoConstantValue(self.FModule.InstrAt(LInstr.Operands[1]), LFactor) then
+          LTerm := LInstr.Operands[0];
+        else
+          if (LInstr.Kind = IrOp.Shl) or
+            (not DoConstantValue(self.FModule.InstrAt(LInstr.Operands[0]), LFactor)) then
+            return false;
+          end;
+          LTerm := LInstr.Operands[1];
+        end;
+        if LInstr.Kind = IrOp.Shl then
+          if (LFactor < 0) or (LFactor > ADAM_LOOPS_MAX_SHIFT) then
+            return false;
+          end;
+          LFactor := int64(uint64(1) shl uint64(LFactor));
+        end;
+        if not DoWithin(LFactor, ADAM_LOOPS_AFFINE_CAP) then
+          return false;
+        end;
+        if not self.DoAffine(LTerm, ADepth + 1, LFact, LScale, LOffset, AMultiplies) then
+          return false;
+        end;
+        // Both within 2^30: no product overflows
+        AFact := LFact;
+        AScale := LScale * LFactor;
+        AOffset := LOffset * LFactor;
+        AMultiplies := true;
+        return DoWithin(AScale, ADAM_LOOPS_AFFINE_CAP) and
+          DoWithin(AOffset, ADAM_LOOPS_AFFINE_CAP);
+      end;
+      if LInstr.Kind = IrOp.Neg then
+        if not self.DoAffine(LInstr.Operands[0], ADepth + 1, LFact, LScale, LOffset,
+          AMultiplies) then
+          return false;
+        end;
+        AFact := LFact;
+        AScale := -LScale;
+        AOffset := -LOffset;
+        return true;
+      end;
+      return false;
+    end;
+
+    // reduction (see the header): true when an address became a pointer phi
+    hidden method DoReduce(): bool;
+    var
+      LBlocks: ref Int64List;
+      LCurrent: ref Int64List;
+      LInstrs: ref Int64List;
+      LInstr: ref IrInstr;
+      LSeed: ref IrInstr;
+      LMultiplies: bool;
+      LFact: int64;
+      LScale: int64;
+      LOffset: int64;
+      LSeedValue: int64;
+      LFactor: int64;
+      LBytes: int64;
+      LStart: int64;
+      LStep: int64;
+      LPhi: int64;
+      LNext: int64;
+      LPreheader: int64;
+      LLatch: int64;
+      LHeader: int64;
+      LNode: int64;
+      LReduced: int64;
+      LId: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      LReduced := 0;
+      LPreheader := self.FAnalysis.BlockAt(self.FPreheader);
+      LLatch := self.FAnalysis.BlockAt(self.FLatch);
+      LHeader := self.FAnalysis.BlockAt(self.FHeader);
+      LBlocks := self.FAnalysis.LoopBlocks(self.FLoop);
+      for LI := 0 to LBlocks.Count - 1 do
+        // The block's instructions as they are now (the header and the latch get new ones)
+        LCurrent := self.FModule.BlockAt(self.FAnalysis.BlockAt(LBlocks[LI])).Instrs;
+        LInstrs := ref Int64List();
+        for LK := 0 to LCurrent.Count - 1 do
+          LInstrs.Add(LCurrent[LK]);
+        end;
+        for LK := 0 to LInstrs.Count - 1 do
+          LId := LInstrs[LK];
+          LInstr := self.FModule.InstrAt(LId);
+          if LInstr.Kind <> IrOp.Offset then
+            skip;
+          end;
+          if self.DoInLoop(LInstr.Operands[0]) then
+            skip;
+          end;
+          LFact := ADAM_LOOPS_NONE;
+          LScale := 0;
+          LOffset := 0;
+          LMultiplies := false;
+          if not self.DoAffine(LInstr.Operands[1], 0, LFact, LScale, LOffset, LMultiplies) then
+            skip;
+          end;
+          if (LFact = ADAM_LOOPS_NONE) or (LScale = 0) or (not LMultiplies) then
+            skip;
+          end;
+          LNode := LInstr.Node;
+          LSeed := self.FModule.InstrAt(self.FFacts[LFact].Seed);
+          // The first turn's count: folded from a known start, else made in the preheader
+          if DoConstantValue(LSeed, LSeedValue) and
+            DoWithin(LSeedValue, ADAM_LOOPS_PRODUCT_CAP) then
+            LBytes := self.DoConstant(IrType.Int64, LScale * LSeedValue + LOffset, LNode);
+          else
+            // A narrower variable has a constant start (its range is known)
+            if IrTypeWidth(LSeed.ValueType) <> 64 then
+              skip;
+            end;
+            LBytes := self.FFacts[LFact].Seed;
+            if LSeed.ValueType <> IrType.Int64 then
+              LBytes := self.DoConvertBefore(LPreheader, IrType.Int64, LBytes, LNode);
+            end;
+            if LScale <> 1 then
+              LFactor := self.DoConstant(IrType.Int64, LScale, LNode);
+              LBytes := self.DoBinaryBefore(LPreheader, IrOp.Mul, IrType.Int64, LBytes, LFactor,
+                LNode);
+            end;
+            if LOffset <> 0 then
+              LFactor := self.DoConstant(IrType.Int64, LOffset, LNode);
+              LBytes := self.DoBinaryBefore(LPreheader, IrOp.Add, IrType.Int64, LBytes, LFactor,
+                LNode);
+            end;
+          end;
+          LStart := self.DoBinaryBefore(LPreheader, IrOp.Offset, IrType.Pointer,
+            LInstr.Operands[0], LBytes, LNode);
+          // Each turn moves it by the scale times the stride (both within 2^30)
+          LStep := self.DoConstant(IrType.Int64, LScale * self.FFacts[LFact].Stride, LNode);
+          LPhi := DoNewPhi(self.FModule, LHeader, IrType.Pointer, LNode);
+          LNext := self.DoBinaryBefore(LLatch, IrOp.Offset, IrType.Pointer, LPhi, LStep, LNode);
+          self.FModule.InstrAt(LPhi).Operands.Add(LStart);
+          self.FModule.InstrAt(LPhi).Targets.Add(LPreheader);
+          self.FModule.InstrAt(LPhi).Operands.Add(LNext);
+          self.FModule.InstrAt(LPhi).Targets.Add(LLatch);
+          self.DoReplaceUses(LId, LPhi);
+          LReduced := LReduced + 1;
+          if LReduced >= ADAM_LOOPS_MAX_REDUCED then
+            return true;
+          end;
+        end;
+      end;
+      return LReduced > 0;
+    end;
+
+    // The variable the fact AIndex merges into (see the header's merging): the first of
+    // its type and stride with an exit test, else the first of them (AIndex itself: kept)
+    hidden const method DoKeptInduction(const AIndex: int64): int64;
+    var
+      LType: IrType;
+      LFirst: int64;
+      LJ: int64;
+    begin
+      LType := self.FModule.InstrAt(self.FFacts[AIndex].PhiId).ValueType;
+      LFirst := ADAM_LOOPS_NONE;
+      for LJ := 0 to self.FFactCount - 1 do
+        if (self.FModule.InstrAt(self.FFacts[LJ].PhiId).ValueType <> LType) or
+          (self.FFacts[LJ].Stride <> self.FFacts[AIndex].Stride) then
+          skip;
+        end;
+        if self.FFacts[LJ].TestAt <> ADAM_LOOPS_NONE then
+          return LJ;
+        end;
+        if LFirst = ADAM_LOOPS_NONE then
+          LFirst := LJ;
+        end;
+      end;
+      return LFirst;
+    end;
+
+    // merging (see the header): true when a variable became another plus a difference
+    hidden method DoMergeInductions(): bool;
+    var
+      LPhi: ref IrInstr;
+      LType: IrType;
+      LChanged: bool;
+      LKeep: int64;
+      LSeed: int64;
+      LOtherSeed: int64;
+      LDelta: int64;
+      LValue: int64;
+      LPreheader: int64;
+      LK: int64;
+    begin
+      LChanged := false;
+      LPreheader := self.FAnalysis.BlockAt(self.FPreheader);
+      for LK := 0 to self.FFactCount - 1 do
+        LKeep := self.DoKeptInduction(LK);
+        if LKeep = LK then
+          skip;
+        end;
+        LPhi := self.FModule.InstrAt(self.FFacts[LK].PhiId);
+        LType := LPhi.ValueType;
+        if DoConstantValue(self.FModule.InstrAt(self.FFacts[LK].Seed), LOtherSeed) and
+          DoConstantValue(self.FModule.InstrAt(self.FFacts[LKeep].Seed), LSeed) and
+          DoWithin(LOtherSeed, ADAM_LOOPS_PRODUCT_CAP) and
+          DoWithin(LSeed, ADAM_LOOPS_PRODUCT_CAP) then
+          if LOtherSeed = LSeed then
+            LValue := self.FFacts[LKeep].PhiId;
+          else
+            LDelta := self.DoConstant(LType, LOtherSeed - LSeed, LPhi.Node);
+            LValue := self.DoAddAfterPhis(LType, self.FFacts[LKeep].PhiId, LDelta, LPhi.Node);
+          end;
+        else
+          LDelta := self.DoBinaryBefore(LPreheader, IrOp.Sub, LType, self.FFacts[LK].Seed,
+            self.FFacts[LKeep].Seed, LPhi.Node);
+          LValue := self.DoAddAfterPhis(LType, self.FFacts[LKeep].PhiId, LDelta, LPhi.Node);
+        end;
+        self.DoReplaceUses(self.FFacts[LK].PhiId, LValue);
+        LChanged := true;
+      end;
+      return LChanged;
+    end;
+
+    // indvars over the loop AIndex (see the header); true when it changed anything
+    hidden method DoSimplifyLoop(const AIndex: int64): bool;
+    var
+      LPreds: ref Int64List;
+      LChanged: bool;
+      LLatch: int64;
+      LI: int64;
+    begin
+      if not DoShapeable(self.FFunction, self.FAnalysis, AIndex) then
+        return false;
+      end;
+      self.FLoop := AIndex;
+      self.FIn := DoLoopSet(self.FAnalysis, self.FFunction.Blocks.Count, AIndex);
+      self.FPreheader := DoPreheaderOf(self.FModule, self.FFunction, self.FAnalysis, AIndex,
+        self.FIn);
+      if self.FPreheader = ADAM_LOOPS_NONE then
+        return false;
+      end;
+      self.FHeader := self.FAnalysis.LoopHeader(AIndex);
+      // One latch: the header's one predecessor in the loop
+      LPreds := self.FAnalysis.PredsOf(self.FHeader);
+      LLatch := ADAM_LOOPS_NONE;
+      for LI := 0 to LPreds.Count - 1 do
+        if self.FIn[LPreds[LI]] then
+          if LLatch <> ADAM_LOOPS_NONE then
+            return false;
+          end;
+          LLatch := LPreds[LI];
+        end;
+      end;
+      if LLatch = ADAM_LOOPS_NONE then
+        return false;
+      end;
+      self.FLatch := LLatch;
+      self.DoFindInductions();
+      if self.FFactCount = 0 then
+        return false;
+      end;
+      // In this order, all from the one analysis: the checks and exits read the ranges
+      // before merging changes the variables' uses
+      LChanged := false;
+      if self.DoFoldChecks() then
+        LChanged := true;
+      end;
+      if self.DoExitValues() then
+        LChanged := true;
+      end;
+      if self.DoReduce() then
+        LChanged := true;
+      end;
+      if self.DoMergeInductions() then
+        LChanged := true;
+      end;
+      return LChanged;
+    end;
+
+    // indvars over every loop, innermost first, the facts made again after a loop that
+    // changed (its use lists); true when anything changed
+    method Run(): bool;
+    var
+      LChanged: bool;
+      LD: int64;
+      LL: int64;
+    begin
+      LChanged := false;
+      for LD := DoMaxDepth(self.FAnalysis) downto 1 do
+        for LL := 0 to self.FAnalysis.LoopCount() - 1 do
+          if self.FAnalysis.LoopDepth(LL) <> LD then
+            skip;
+          end;
+          if self.DoSimplifyLoop(LL) then
+            LChanged := true;
+            self.FAnalysis := ref FunctionAnalysis(self.FModule, self.FFunctionId);
+          end;
+        end;
+      end;
+      return LChanged;
+    end;
+  end;
+
+// The pass indvars (see the header) over AModule's function AFunction with its analysis
+// AAnalysis: the loop form first (FormLoops), then each loop's induction variables
+// simplified; true when it changed the function
+public routine SimplifyInductions(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LAnalysis: ref FunctionAnalysis;
+  LSimplifier: ref InductionSimplifier;
+  LChanged: bool;
+begin
+  if AAnalysis.LoopCount() = 0 then
+    return false;
+  end;
+  LChanged := FormLoops(AModule, AFunction, AAnalysis);
+  LAnalysis := AAnalysis;
+  if LChanged then
+    LAnalysis := ref FunctionAnalysis(AModule, AFunction);
+  end;
+  LSimplifier := ref InductionSimplifier(AModule, AFunction, LAnalysis);
+  if LSimplifier.Run() then
     LChanged := true;
   end;
   return LChanged;
