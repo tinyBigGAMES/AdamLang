@@ -30,7 +30,9 @@
 :: code generation has settled), else nothing is installed. Then B builds    ::
 :: adamtest (projects\adamtest), and B and that adamtest replace adam.exe    ::
 :: and adamtest.exe here; the adam.exe they replace is kept as               ::
-:: adam-prev.exe (the last good compiler, to fall back to). Stage files      ::
+:: adam-prev.exe (the last good compiler, to fall back to). Last, the new    ::
+:: adam.exe prebuilds the shared compiled-unit cache (res\acu here: every    ::
+:: std unit and the runtime, debug and release) for a release. Stage files   ::
 :: land in projects\*\output (ignored by git).                               ::
 ::                                                                           ::
 :: Usage:   build-adam.cmd                                                   ::
@@ -49,7 +51,7 @@ set TRIPLE=x86_64-windows-gnu
 set REL=bin\%TRIPLE%\release
 set DBG=bin\%TRIPLE%\debug
 
-echo [0/5] snapshot: the build's inputs copied
+echo [0/6] snapshot: the build's inputs copied
 call :snap "%BIN%..\src" "%SNAP%\src"
 if errorlevel 1 (echo BUILD FAILED - snapshot & exit /b 1)
 call :snap "%BIN%..\projects\adam" "%SNAP%\projects\adam" /XD output
@@ -68,7 +70,7 @@ cd /d "%SNAP%\bin"
 :: Stage A is a plain (debug) build: <output>\bin\<triple>\debug; the installed adam.exe
 :: may predate that and write it to <output>\bin (SU1), so the old copies go first and A
 :: is taken from whichever place the build wrote
-echo [1/5] stage A: adam.exe builds adam
+echo [1/6] stage A: adam.exe builds adam
 del /q "%OUT%\stageA\%DBG%\adam.exe" "%OUT%\stageA\bin\adam.exe" 2>nul
 adam.exe build %MAIN% -o "%OUT%\stageA"
 if errorlevel 1 (echo BUILD FAILED - stage A & exit /b 1)
@@ -77,21 +79,21 @@ if errorlevel 1 (echo BUILD FAILED - stage A not found & exit /b 1)
 
 :: B and C are the compiler's own build (--adam-self-build: a release one, no leak tracker);
 :: A is built plainly, since the installed adam.exe may predate the switch
-echo [2/5] stage B: A builds adam
+echo [2/6] stage B: A builds adam
 adam-stageA.exe build %MAIN% -o "%OUT%\stageB" --adam-self-build
 if errorlevel 1 (echo BUILD FAILED - stage B & goto :failed)
 copy /y "%OUT%\stageB\%REL%\adam.exe" adam-stageB.exe >nul
 if errorlevel 1 (echo BUILD FAILED - stage B not found & goto :failed)
 
-echo [3/5] stage C: B builds adam
+echo [3/6] stage C: B builds adam
 adam-stageB.exe build %MAIN% -o "%OUT%\stageC" --adam-self-build
 if errorlevel 1 (echo BUILD FAILED - stage C & goto :failed)
 
-echo [4/5] B and C compared
+echo [4/6] B and C compared
 fc /b "%OUT%\stageB\%REL%\adam.exe" "%OUT%\stageC\%REL%\adam.exe" >nul
 if errorlevel 1 (echo BUILD FAILED - stage B and stage C differ & goto :failed)
 
-echo [5/5] adamtest: B builds adamtest
+echo [5/6] adamtest: B builds adamtest
 adam-stageB.exe build ..\projects\adamtest\src\adamtest.adam -o "%BIN%..\projects\adamtest\output"
 if errorlevel 1 (echo BUILD FAILED - adamtest & goto :failed)
 
@@ -100,6 +102,20 @@ copy /y "%OUT%\stageB\%REL%\adam.exe" "%BIN%adam.exe" >nul
 if errorlevel 1 (echo BUILD FAILED - adam.exe not installed & goto :failed)
 copy /y "%BIN%..\projects\adamtest\output\%DBG%\adamtest.exe" "%BIN%adamtest.exe" >nul
 if errorlevel 1 (echo BUILD FAILED - adamtest.exe not installed & goto :failed)
+
+:: The shared compiled-unit cache (res\acu beside adam.exe) prebuilt for a release: the
+:: installed adam.exe builds a program importing every std unit (the runtime comes with
+:: it), debug and release (--adam-self-build), into its own stage folder
+echo [6/6] prebuild: the std and the runtime compiled into res\acu, debug and release
+set PRE=%OUT%\prebuild
+if not exist "%PRE%" mkdir "%PRE%"
+call :prebuild_source "%PRE%\adam_prebuild.adam"
+if errorlevel 1 (echo BUILD FAILED - prebuild source & goto :failed)
+"%BIN%adam.exe" build "%PRE%\adam_prebuild.adam" -o "%PRE%"
+if errorlevel 1 (echo BUILD FAILED - prebuild debug & goto :failed)
+"%BIN%adam.exe" build "%PRE%\adam_prebuild.adam" -o "%PRE%" --adam-self-build
+if errorlevel 1 (echo BUILD FAILED - prebuild release & goto :failed)
+
 del adam-stageA.exe adam-stageB.exe
 echo BUILD OK
 exit /b 0
@@ -107,6 +123,27 @@ exit /b 0
 :failed
 del adam-stageA.exe adam-stageB.exe 2>nul
 exit /b 1
+
+:: Writes %1, the prebuild's program: one import clause naming every std unit
+:: (res\libs\std\*.adam, each name its file's without .adam) and an empty body
+:prebuild_source
+setlocal enabledelayedexpansion
+set UNITS=
+for %%f in ("%BIN%res\libs\std\*.adam") do (
+  if defined UNITS (set "UNITS=!UNITS!, %%~nf") else (set "UNITS=%%~nf")
+)
+if not defined UNITS (endlocal & exit /b 1)
+> %1 (
+  echo module exe adam_prebuild;
+  echo.
+  echo import !UNITS!;
+  echo.
+  echo begin
+  echo end.
+)
+if errorlevel 1 (endlocal & exit /b 1)
+endlocal
+exit /b 0
 
 :: Mirrors folder %1 into %2 (the snapshot is this script's own scratch);
 :: %3 %4 pass robocopy an exclusion. robocopy's exit codes below 8 are success.
