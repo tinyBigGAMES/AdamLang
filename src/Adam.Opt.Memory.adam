@@ -1,0 +1,1122 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Opt.Memory.adam - memory: small copies and fills as scalar moves,
+  store-load forwarding, dead store elimination (PLAN-ADAM M6 O10)
+
+  OptimizeMemory runs four steps over one function.
+
+  Scalar moves: a Copy or a Fill of 1 to ADAM_MEM_SCALAR_MAX bytes whose
+  pointers are not a slot's (a slot's aggregate is sroa's to split) becomes
+  integer moves of 8, 4, 2 and 1 bytes at constant Offsets: a load and a
+  store per piece for a copy (a copy's two sides never overlap in part, so
+  piece by piece is exact), a store of a zero per piece for a fill.
+
+  Tracked slots: a slot every use of which (through constant Offsets of it,
+  chains followed) is a load's or a store's address, a copy's either side
+  or a fill's place, each access inside the slot, in a reachable block of
+  this function, is tracked: nothing else can reach its bytes, so a call, an
+  atomic or a store through any other address never touches them. A slot a
+  funclet uses is never tracked (a finally runs in the frame while it
+  unwinds), nor one whose address is stored, compared, passed or moved by a
+  computed count. Every other address is untracked memory, and any write
+  through one, any call and any atomic may write any untracked byte.
+
+  Forwarding: the blocks in reverse postorder, each holding the facts known
+  at that point: (place, bytes, value) where place is a tracked slot's
+  bytes or an untracked address; a store's value, a load's result, or zero
+  for a fill's bytes. A block whose one predecessor reaches it over a normal
+  edge starts with what that block ended with (it dominates it, nothing
+  runs between), any other block with none. A load of bytes a fact holds
+  with a value of the load's type takes that value; a load inside a fill's
+  zero takes a zero of its type, put where the load was; either way the
+  load goes. A write drops every fact it may overlap: a tracked slot's
+  bytes that overlap it, or for an untracked write every untracked fact.
+
+  Dead stores: liveness of the tracked slots over the blocks, unwind edges
+  included (a slot read anywhere a path reaches is live; a raise that
+  leaves the function ends every slot), then each block walked backward
+  with the bytes of each slot (of up to ADAM_MEM_MASK_MAX bytes) known to be
+  written again before anything reads them. A store, a fill, or a copy
+  between two tracked slots, into a slot not live after it or into bytes
+  all written again first goes. In a block of a catching scope every point
+  that may raise forgets those bytes (the resume block may read them). An
+  untracked store goes only when the next instruction that is not quiet (no
+  memory effect, never faults) is a store of the same type through the very
+  same address: nothing between could read or see it.
+
+  Blocks and edges are never changed, so the analysis stays true for the
+  whole pass and the scope ranges as they are.
+*******************************************************************************/
+
+module unit Adam.Opt.Memory;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Ssa, Adam.Opt.Analysis;
+
+const
+  // No value (a map's missing value)
+  ADAM_MEM_NONE: int64 = -1;
+  // A fact's slot index for untracked memory
+  ADAM_MEM_UNTRACKED: int64 = -1;
+  // A fact's value for zero bytes (a fill)
+  ADAM_MEM_ZERO: int64 = -1;
+  // The largest copy or fill made scalar moves
+  ADAM_MEM_SCALAR_MAX: int64 = 16;
+  // The largest slot whose bytes the dead store walk follows one by one
+  ADAM_MEM_MASK_MAX: int64 = 64;
+  // Bits in a liveness word
+  ADAM_MEM_WORD_BITS: int64 = 64;
+  // Raised (an invariant broken): replaced values that name each other round a cycle
+  ADAM_MEM_FAULT_CYCLE: string = "Opt: memory found replaced values in a cycle at i";
+
+// The bytes a value of AType takes in memory
+routine DoBytesOf(const AType: IrType): int64;
+begin
+  return IrTypeWidth(AType) div 8;
+end;
+
+// The largest move (8, 4, 2 or 1 bytes) that fits in ARemaining bytes
+routine DoMoveBytes(const ARemaining: int64): int64;
+begin
+  if ARemaining >= 8 then
+    return 8;
+  end;
+  if ARemaining >= 4 then
+    return 4;
+  end;
+  if ARemaining >= 2 then
+    return 2;
+  end;
+  return 1;
+end;
+
+// The integer type of a move of ABytes bytes (1, 2, 4 or 8)
+routine DoMoveType(const ABytes: int64): IrType;
+begin
+  if ABytes = 8 then
+    return IrType.Int64;
+  end;
+  if ABytes = 4 then
+    return IrType.Int32;
+  end;
+  if ABytes = 2 then
+    return IrType.Int16;
+  end;
+  return IrType.Int8;
+end;
+
+// True for the ops with no memory effect that never fault (see the header): an untracked
+// store's overwrite looks past them, and they never raise
+routine DoQuiet(const AKind: IrOp): bool;
+begin
+  return (AKind = IrOp.Constant) or (AKind = IrOp.Parameter) or (AKind = IrOp.Slot) or
+    (AKind = IrOp.Phi) or (AKind = IrOp.Add) or (AKind = IrOp.Sub) or
+    (AKind = IrOp.Mul) or (AKind = IrOp.BitAnd) or (AKind = IrOp.BitOr) or
+    (AKind = IrOp.BitXor) or (AKind = IrOp.Neg) or (AKind = IrOp.BitNot) or
+    (AKind = IrOp.Shl) or (AKind = IrOp.Shr) or (AKind = IrOp.Sar) or
+    (AKind = IrOp.FDiv) or (AKind = IrOp.Compare) or (AKind = IrOp.Offset) or
+    (AKind = IrOp.Convert) or (AKind = IrOp.Address) or (AKind = IrOp.CodeAddress) or
+    (AKind = IrOp.ImportAddress) or (AKind = IrOp.ThreadAddress) or
+    (AKind = IrOp.VarargsStart);
+end;
+
+// True for the ops that may write untracked memory besides stores, copies and fills: any
+// call and any atomic
+routine DoWritesUntracked(const AKind: IrOp): bool;
+begin
+  return (AKind = IrOp.Call) or (AKind = IrOp.CallExternal) or
+    (AKind = IrOp.CallIndirect) or IsAtomicOp(AKind);
+end;
+
+// The bits of the bytes ALo up to (not with) AHi of a slot, byte k at bit k
+routine DoMask(const ALo: int64; const AHi: int64): uint64;
+var
+  LMask: uint64;
+  LB: int64;
+begin
+  LMask := uint64(0);
+  for LB := ALo to AHi - 1 do
+    LMask := LMask | (uint64(1) shl uint64(LB));
+  end;
+  return LMask;
+end;
+
+type
+  // The facts known at one point of the forwarding walk (see the header): fact k is the
+  // bytes Los[k] up to His[k] of the tracked slot Slots[k] (ADAM_MEM_UNTRACKED: at the
+  // address Bases[k]) holding Values[k] (ADAM_MEM_ZERO: zero)
+  MemState = object
+    Slots: ref Int64List;
+    Bases: ref Int64List;
+    Los: ref Int64List;
+    His: ref Int64List;
+    Values: ref Int64List;
+
+    // No fact
+    init();
+    begin
+      self.Slots := ref Int64List();
+      self.Bases := ref Int64List();
+      self.Los := ref Int64List();
+      self.His := ref Int64List();
+      self.Values := ref Int64List();
+    end;
+
+    // A fact added
+    method AddFact(const ASlot: int64; const ABase: int64; const ALo: int64;
+      const AHi: int64; const AValue: int64);
+    begin
+      self.Slots.Add(ASlot);
+      self.Bases.Add(ABase);
+      self.Los.Add(ALo);
+      self.His.Add(AHi);
+      self.Values.Add(AValue);
+    end;
+
+    // A copy of these facts
+    const method Clone(): ref MemState;
+    var
+      LCopy: ref MemState;
+      LI: int64;
+    begin
+      LCopy := ref MemState();
+      for LI := 0 to self.Slots.Count - 1 do
+        LCopy.AddFact(self.Slots[LI], self.Bases[LI], self.Los[LI], self.His[LI],
+          self.Values[LI]);
+      end;
+      return LCopy;
+    end;
+
+    // Every fact a write of the bytes ALo up to AHi of the tracked slot ASlot may overlap
+    // dropped; ASlot ADAM_MEM_UNTRACKED: every untracked fact dropped
+    method Kill(const ASlot: int64; const ALo: int64; const AHi: int64);
+    var
+      LKept: ref MemState;
+      LDrop: bool;
+      LI: int64;
+    begin
+      LKept := ref MemState();
+      for LI := 0 to self.Slots.Count - 1 do
+        LDrop := false;
+        if self.Slots[LI] = ASlot then
+          if ASlot = ADAM_MEM_UNTRACKED then
+            LDrop := true;
+          else
+            LDrop := (self.Los[LI] < AHi) and (ALo < self.His[LI]);
+          end;
+        end;
+        if not LDrop then
+          LKept.AddFact(self.Slots[LI], self.Bases[LI], self.Los[LI], self.His[LI],
+            self.Values[LI]);
+        end;
+      end;
+      self.Slots := LKept.Slots;
+      self.Bases := LKept.Bases;
+      self.Los := LKept.Los;
+      self.His := LKept.His;
+      self.Values := LKept.Values;
+    end;
+  end;
+
+  MemStateArray = array of ref MemState;
+
+  // One function's memory pass (see the header)
+  MemoryPass = object
+    hidden FModule: ref IrModule;
+    hidden FFunction: ref IrFunction;
+    hidden FFunctionId: int64;
+    hidden FAnalysis: ref FunctionAnalysis;
+    // Each pointer rooted at a slot: the slot's index and the byte offset into it
+    hidden FRoot: ref Int64Map;
+    hidden FOffset: ref Int64Map;
+    // Each slot by index: its instruction, its size, whether it escapes (not tracked)
+    hidden FSlotIds: ref Int64List;
+    hidden FSlotSizes: ref Int64List;
+    hidden FEscaped: array of bool;
+    // Each forwarded load's value, each instruction that goes, and each zero put where a
+    // load was (the load's id to the zero's, and the zeros themselves)
+    hidden FReplace: ref Int64Map;
+    hidden FRemoved: ref Int64Map;
+    hidden FZeroAt: ref Int64Map;
+    hidden FZeros: ref Int64Map;
+    // The facts each block ended with in the forwarding walk, and whether it was walked
+    hidden FEnd: MemStateArray;
+    hidden FWalked: array of bool;
+    // The tracked slots' liveness: per block position, a word array of live-in bits
+    hidden FWords: int64;
+    hidden FLiveIn: array of uint64;
+    hidden FGen: array of uint64;
+    // The dead store walk's point now: the live bits, and each slot's bytes written again
+    // before anything reads them
+    hidden FLive: array of uint64;
+    hidden FCovered: array of uint64;
+    hidden FChanged: bool;
+
+    // The pass over AModule's function AFunction with its analysis AAnalysis
+    init(const AModule: ref IrModule; const AFunction: int64;
+      const AAnalysis: ref FunctionAnalysis);
+    begin
+      self.FModule := AModule;
+      self.FFunction := AModule.FunctionAt(AFunction);
+      self.FFunctionId := AFunction;
+      self.FAnalysis := AAnalysis;
+      self.FRoot := ref Int64Map(ADAM_MEM_NONE);
+      self.FOffset := ref Int64Map(ADAM_MEM_NONE);
+      self.FSlotIds := ref Int64List();
+      self.FSlotSizes := ref Int64List();
+      self.FReplace := ref Int64Map(ADAM_MEM_NONE);
+      self.FRemoved := ref Int64Map(ADAM_MEM_NONE);
+      self.FZeroAt := ref Int64Map(ADAM_MEM_NONE);
+      self.FZeros := ref Int64Map(ADAM_MEM_NONE);
+      setlength(self.FEnd, AAnalysis.BlockCount);
+      setlength(self.FWalked, AAnalysis.BlockCount);
+      self.FWords := 0;
+      self.FChanged := false;
+    end;
+
+    // True when AId is a constant
+    hidden const method DoIsConstant(const AId: int64): bool;
+    begin
+      return self.FModule.InstrAt(AId).Kind = IrOp.Constant;
+    end;
+
+    // The value AId stands for: followed through the forwarded loads until one that stays
+    // (raised when they run round: a compiler bug)
+    hidden const method DoResolve(const AId: int64): int64;
+    var
+      LAt: int64;
+      LNext: int64;
+      LSteps: int64;
+    begin
+      LAt := AId;
+      LSteps := 0;
+      LNext := self.FReplace.Find(LAt);
+      while LNext <> ADAM_MEM_NONE do
+        LSteps := LSteps + 1;
+        if LSteps > self.FReplace.Count then
+          raise(ADAM_MEM_FAULT_CYCLE + IntToStr(AId));
+        end;
+        LAt := LNext;
+        LNext := self.FReplace.Find(LAt);
+      end;
+      return LAt;
+    end;
+
+    // The tracked slot the pointer APointer reaches (its index), else ADAM_MEM_UNTRACKED
+    hidden const method DoTracked(const APointer: int64): int64;
+    var
+      LSlot: int64;
+    begin
+      LSlot := self.FRoot.Find(APointer);
+      if LSlot = ADAM_MEM_NONE then
+        return ADAM_MEM_UNTRACKED;
+      end;
+      if self.FEscaped[LSlot] then
+        return ADAM_MEM_UNTRACKED;
+      end;
+      return LSlot;
+    end;
+
+    // Every slot of the function given an index, and every constant Offset of a pointer
+    // rooted at one rooted there too, chains followed (rounds until none is added)
+    hidden method DoRoots();
+    var
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LId: int64;
+      LBase: int64;
+      LGrew: bool;
+      LI: int64;
+      LK: int64;
+    begin
+      for LI := 0 to self.FFunction.Blocks.Count - 1 do
+        LBlock := self.FModule.BlockAt(self.FFunction.Blocks[LI]);
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LId := LBlock.Instrs[LK];
+          LInstr := self.FModule.InstrAt(LId);
+          if LInstr.Kind = IrOp.Slot then
+            self.FRoot.Put(LId, self.FSlotIds.Count);
+            self.FOffset.Put(LId, 0);
+            self.FSlotIds.Add(LId);
+            self.FSlotSizes.Add(LInstr.Imm);
+          end;
+        end;
+      end;
+      setlength(self.FEscaped, self.FSlotIds.Count);
+      for LI := 0 to self.FSlotIds.Count - 1 do
+        self.FEscaped[LI] := false;
+      end;
+      if self.FSlotIds.Count = 0 then
+        return;
+      end;
+      LGrew := true;
+      while LGrew do
+        LGrew := false;
+        for LI := 0 to self.FFunction.Blocks.Count - 1 do
+          LBlock := self.FModule.BlockAt(self.FFunction.Blocks[LI]);
+          for LK := 0 to LBlock.Instrs.Count - 1 do
+            LId := LBlock.Instrs[LK];
+            LInstr := self.FModule.InstrAt(LId);
+            if (LInstr.Kind <> IrOp.Offset) or (self.FRoot.Find(LId) <> ADAM_MEM_NONE) then
+              skip;
+            end;
+            LBase := LInstr.Operands[0];
+            if (self.FRoot.Find(LBase) = ADAM_MEM_NONE) or
+              (not self.DoIsConstant(LInstr.Operands[1])) then
+              skip;
+            end;
+            self.FRoot.Put(LId, self.FRoot.Find(LBase));
+            self.FOffset.Put(LId, self.FOffset.Find(LBase) +
+              self.FModule.InstrAt(LInstr.Operands[1]).Imm);
+            LGrew := true;
+          end;
+        end;
+      end;
+    end;
+
+    // The pointer APointer moved by AAt bytes: itself at 0, else a new constant and Offset
+    // (emitted in ABlock at ANode, added to ANew in order)
+    hidden method DoPointerAt(const APointer: int64; const AAt: int64; const ABlock: int64;
+      const ANode: int64; const ANew: ref Int64List): int64;
+    var
+      LCount: int64;
+      LOffset: int64;
+    begin
+      if AAt = 0 then
+        return APointer;
+      end;
+      LCount := self.FModule.Emit(ABlock, IrOp.Constant, IrType.Int64, ANode);
+      self.FModule.InstrAt(LCount).Imm := AAt;
+      LOffset := self.FModule.Emit(ABlock, IrOp.Offset, IrType.Pointer, ANode);
+      self.FModule.InstrAt(LOffset).Operands.Add(APointer);
+      self.FModule.InstrAt(LOffset).Operands.Add(LCount);
+      ANew.Add(LCount);
+      ANew.Add(LOffset);
+      return LOffset;
+    end;
+
+    // The copy or fill AId (block ABlock) as scalar moves added to ANew in its place (see
+    // the header)
+    hidden method DoExpand(const AId: int64; const ABlock: int64; const ANew: ref Int64List);
+    var
+      LInstr: ref IrInstr;
+      LKind: IrOp;
+      LNode: int64;
+      LTotal: int64;
+      LDest: int64;
+      LSource: int64;
+      LAt: int64;
+      LBytes: int64;
+      LType: IrType;
+      LTo: int64;
+      LFrom: int64;
+      LValue: int64;
+      LStore: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LKind := LInstr.Kind;
+      LNode := LInstr.Node;
+      LTotal := LInstr.Imm;
+      LDest := LInstr.Operands[0];
+      LSource := ADAM_MEM_NONE;
+      if LKind = IrOp.Copy then
+        LSource := LInstr.Operands[1];
+      end;
+      LAt := 0;
+      while LAt < LTotal do
+        LBytes := DoMoveBytes(LTotal - LAt);
+        LType := DoMoveType(LBytes);
+        LTo := self.DoPointerAt(LDest, LAt, ABlock, LNode, ANew);
+        if LKind = IrOp.Copy then
+          LFrom := self.DoPointerAt(LSource, LAt, ABlock, LNode, ANew);
+          LValue := self.FModule.Emit(ABlock, IrOp.Load, LType, LNode);
+          self.FModule.InstrAt(LValue).Operands.Add(LFrom);
+        else
+          LValue := self.FModule.Emit(ABlock, IrOp.Constant, LType, LNode);
+          self.FModule.InstrAt(LValue).Imm := 0;
+        end;
+        ANew.Add(LValue);
+        LStore := self.FModule.Emit(ABlock, IrOp.Store, IrType.Void, LNode);
+        self.FModule.InstrAt(LStore).Operands.Add(LTo);
+        self.FModule.InstrAt(LStore).Operands.Add(LValue);
+        ANew.Add(LStore);
+        LAt := LAt + LBytes;
+      end;
+    end;
+
+    // Every small copy and fill whose pointers are not a slot's made scalar moves (see the
+    // header); a block that had one rebuilt
+    hidden method DoScalarize();
+    var
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LOriginal: ref Int64List;
+      LNew: ref Int64List;
+      LExpanded: bool;
+      LSmall: bool;
+      LBlockId: int64;
+      LId: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      for LI := 0 to self.FFunction.Blocks.Count - 1 do
+        LBlockId := self.FFunction.Blocks[LI];
+        LBlock := self.FModule.BlockAt(LBlockId);
+        // Emit adds to the block's own list: its instructions as they were, kept apart
+        LOriginal := ref Int64List();
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LOriginal.Add(LBlock.Instrs[LK]);
+        end;
+        LNew := ref Int64List();
+        LExpanded := false;
+        for LK := 0 to LOriginal.Count - 1 do
+          LId := LOriginal[LK];
+          LInstr := self.FModule.InstrAt(LId);
+          LSmall := false;
+          if ((LInstr.Kind = IrOp.Copy) or (LInstr.Kind = IrOp.Fill)) and
+            (LInstr.Imm >= 1) and (LInstr.Imm <= ADAM_MEM_SCALAR_MAX) and
+            (self.FRoot.Find(LInstr.Operands[0]) = ADAM_MEM_NONE) then
+            LSmall := (LInstr.Kind = IrOp.Fill) or
+              (self.FRoot.Find(LInstr.Operands[1]) = ADAM_MEM_NONE);
+          end;
+          if LSmall then
+            self.DoExpand(LId, LBlockId, LNew);
+            LExpanded := true;
+          else
+            LNew.Add(LId);
+          end;
+        end;
+        if LExpanded then
+          LBlock.Instrs := LNew;
+          self.FChanged := true;
+        end;
+      end;
+    end;
+
+    // True when operand AOperand (the pointer APointer, rooted at a slot) of the
+    // instruction AId keeps the slot tracked (see the header)
+    hidden const method DoUseOk(const AId: int64; const AOperand: int64;
+      const APointer: int64): bool;
+    var
+      LInstr: ref IrInstr;
+      LKind: IrOp;
+      LAt: int64;
+      LSize: int64;
+      LMoved: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LKind := LInstr.Kind;
+      LAt := self.FOffset.Find(APointer);
+      LSize := self.FSlotSizes[self.FRoot.Find(APointer)];
+      if (LAt < 0) or (LAt > LSize) then
+        return false;
+      end;
+      if LKind = IrOp.Load then
+        return (AOperand = 0) and (LAt + DoBytesOf(LInstr.ValueType) <= LSize);
+      end;
+      if LKind = IrOp.Store then
+        return (AOperand = 0) and (LInstr.Operands[1] <> APointer) and
+          (LAt + DoBytesOf(self.FModule.InstrAt(LInstr.Operands[1]).ValueType) <= LSize);
+      end;
+      if LKind = IrOp.Fill then
+        return (AOperand = 0) and (LAt + LInstr.Imm <= LSize);
+      end;
+      if LKind = IrOp.Copy then
+        return (AOperand <= 1) and (LAt + LInstr.Imm <= LSize);
+      end;
+      if LKind = IrOp.Offset then
+        if (AOperand <> 0) or (self.FRoot.Find(AId) = ADAM_MEM_NONE) then
+          return false;
+        end;
+        LMoved := self.FOffset.Find(AId);
+        return (LMoved >= 0) and (LMoved <= LSize);
+      end;
+      return false;
+    end;
+
+    // Every slot a use does not keep tracked marked escaped: any use in a block no path
+    // reaches, any use of a funclet's, any use DoUseOk refuses (see the header)
+    hidden method DoEscapes();
+    var
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LFunclet: ref IrFunction;
+      LReached: bool;
+      LSlot: int64;
+      LId: int64;
+      LF: int64;
+      LI: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      for LI := 0 to self.FFunction.Blocks.Count - 1 do
+        LBlock := self.FModule.BlockAt(self.FFunction.Blocks[LI]);
+        LReached := self.FAnalysis.Reachable(self.FAnalysis.PositionOf(self.FFunction.Blocks[LI]));
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LId := LBlock.Instrs[LK];
+          LInstr := self.FModule.InstrAt(LId);
+          for LE := 0 to LInstr.Operands.Count - 1 do
+            LSlot := self.FRoot.Find(LInstr.Operands[LE]);
+            if LSlot = ADAM_MEM_NONE then
+              skip;
+            end;
+            if (not LReached) or (not self.DoUseOk(LId, LE, LInstr.Operands[LE])) then
+              self.FEscaped[LSlot] := true;
+            end;
+          end;
+        end;
+      end;
+      // A funclet's use: its frame reaches the slot while it unwinds
+      for LF := 1 to self.FModule.FunctionCount - 1 do
+        LFunclet := self.FModule.FunctionAt(LF);
+        if LFunclet.Parent <> self.FFunctionId then
+          skip;
+        end;
+        for LI := 0 to LFunclet.Blocks.Count - 1 do
+          LBlock := self.FModule.BlockAt(LFunclet.Blocks[LI]);
+          for LK := 0 to LBlock.Instrs.Count - 1 do
+            LInstr := self.FModule.InstrAt(LBlock.Instrs[LK]);
+            for LE := 0 to LInstr.Operands.Count - 1 do
+              LSlot := self.FRoot.Find(LInstr.Operands[LE]);
+              if LSlot <> ADAM_MEM_NONE then
+                self.FEscaped[LSlot] := true;
+              end;
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // The value a fact of AState holds for the bytes ALo up to AHi of the place (ASlot, or
+    // ABase when untracked) with the type AType, the newest first; else ADAM_MEM_NONE
+    hidden const method DoFind(const AState: ref MemState; const ASlot: int64;
+      const ABase: int64; const ALo: int64; const AHi: int64; const AType: IrType): int64;
+    var
+      LValue: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      for LK := 0 to AState.Slots.Count - 1 do
+        LI := AState.Slots.Count - 1 - LK;
+        LValue := AState.Values[LI];
+        if (AState.Slots[LI] <> ASlot) or (LValue = ADAM_MEM_ZERO) then
+          skip;
+        end;
+        if (ASlot = ADAM_MEM_UNTRACKED) and (AState.Bases[LI] <> ABase) then
+          skip;
+        end;
+        if (AState.Los[LI] = ALo) and (AState.His[LI] = AHi) and
+          (self.FModule.InstrAt(LValue).ValueType = AType) then
+          return LValue;
+        end;
+      end;
+      return ADAM_MEM_NONE;
+    end;
+
+    // True when a fact of AState holds zero over the bytes ALo up to AHi of the place
+    // (ASlot, or ABase when untracked)
+    hidden const method DoZeroed(const AState: ref MemState; const ASlot: int64;
+      const ABase: int64; const ALo: int64; const AHi: int64): bool;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to AState.Slots.Count - 1 do
+        if (AState.Slots[LI] <> ASlot) or (AState.Values[LI] <> ADAM_MEM_ZERO) then
+          skip;
+        end;
+        if (ASlot = ADAM_MEM_UNTRACKED) and (AState.Bases[LI] <> ABase) then
+          skip;
+        end;
+        if (AState.Los[LI] <= ALo) and (AHi <= AState.His[LI]) then
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // The place the pointer APointer names for a fact: its tracked slot (ASlot) and byte
+    // offset (the result), or for untracked memory ADAM_MEM_UNTRACKED and offset 0
+    hidden const method DoPlaceOffset(const APointer: int64): int64;
+    begin
+      if self.DoTracked(APointer) = ADAM_MEM_UNTRACKED then
+        return 0;
+      end;
+      return self.FOffset.Find(APointer);
+    end;
+
+    // The load AId (block ABlock) forwarded from AState's facts, else its value added as
+    // one (see the header)
+    hidden method DoForwardLoad(const AId: int64; const ABlock: int64;
+      const AState: ref MemState);
+    var
+      LInstr: ref IrInstr;
+      LPointer: int64;
+      LSlot: int64;
+      LLo: int64;
+      LHi: int64;
+      LFound: int64;
+      LZero: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LPointer := LInstr.Operands[0];
+      LSlot := self.DoTracked(LPointer);
+      LLo := self.DoPlaceOffset(LPointer);
+      LHi := LLo + DoBytesOf(LInstr.ValueType);
+      LFound := self.DoFind(AState, LSlot, LPointer, LLo, LHi, LInstr.ValueType);
+      if LFound <> ADAM_MEM_NONE then
+        self.FReplace.Put(AId, LFound);
+        self.FRemoved.Put(AId, 1);
+        self.FChanged := true;
+        return;
+      end;
+      if self.DoZeroed(AState, LSlot, LPointer, LLo, LHi) then
+        // Emit puts the zero last in the block: the sweep puts it where the load was
+        LZero := self.FModule.Emit(ABlock, IrOp.Constant, LInstr.ValueType, LInstr.Node);
+        self.FModule.InstrAt(LZero).Imm := 0;
+        self.FZeroAt.Put(AId, LZero);
+        self.FZeros.Put(LZero, 1);
+        self.FReplace.Put(AId, LZero);
+        self.FRemoved.Put(AId, 1);
+        self.FChanged := true;
+        return;
+      end;
+      AState.AddFact(LSlot, LPointer, LLo, LHi, AId);
+    end;
+
+    // The instruction AId (block ABlock) through the forwarding walk: its operands
+    // resolved, a load forwarded, a write's facts dropped and its own added
+    hidden method DoForwardInstr(const AId: int64; const ABlock: int64;
+      const AState: ref MemState);
+    var
+      LInstr: ref IrInstr;
+      LKind: IrOp;
+      LPointer: int64;
+      LSlot: int64;
+      LLo: int64;
+      LHi: int64;
+      LValue: int64;
+      LE: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      for LE := 0 to LInstr.Operands.Count - 1 do
+        LValue := self.DoResolve(LInstr.Operands[LE]);
+        if LValue <> LInstr.Operands[LE] then
+          LInstr.Operands.Put(LE, LValue);
+          self.FChanged := true;
+        end;
+      end;
+      LKind := LInstr.Kind;
+      if LKind = IrOp.Load then
+        self.DoForwardLoad(AId, ABlock, AState);
+        return;
+      end;
+      if (LKind = IrOp.Store) or (LKind = IrOp.Fill) or (LKind = IrOp.Copy) then
+        LPointer := LInstr.Operands[0];
+        LSlot := self.DoTracked(LPointer);
+        LLo := self.DoPlaceOffset(LPointer);
+        if LKind = IrOp.Store then
+          LHi := LLo + DoBytesOf(self.FModule.InstrAt(LInstr.Operands[1]).ValueType);
+        else
+          LHi := LLo + LInstr.Imm;
+        end;
+        AState.Kill(LSlot, LLo, LHi);
+        if LKind = IrOp.Store then
+          AState.AddFact(LSlot, LPointer, LLo, LHi, LInstr.Operands[1]);
+        end;
+        if LKind = IrOp.Fill then
+          AState.AddFact(LSlot, LPointer, LLo, LHi, ADAM_MEM_ZERO);
+        end;
+        return;
+      end;
+      if DoWritesUntracked(LKind) then
+        AState.Kill(ADAM_MEM_UNTRACKED, 0, 0);
+      end;
+    end;
+
+    // The facts the block at APosition starts with (see the header)
+    hidden const method DoEntryState(const APosition: int64): ref MemState;
+    var
+      LPreds: ref Int64List;
+      LPred: int64;
+    begin
+      LPreds := self.FAnalysis.PredsOf(APosition);
+      if LPreds.Count = 1 then
+        LPred := LPreds[0];
+        if (LPred <> APosition) and self.FWalked[LPred] and
+          (self.FAnalysis.UnwindSuccsOf(LPred).IndexOf(APosition) < 0) then
+          return self.FEnd[LPred].Clone();
+        end;
+      end;
+      return ref MemState();
+    end;
+
+    // The forwarding walk (see the header): every reached block in reverse postorder
+    hidden method DoForward();
+    var
+      LRpo: ref Int64List;
+      LState: ref MemState;
+      LInstrs: ref Int64List;
+      LBlockId: int64;
+      LPosition: int64;
+      LCount: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      LRpo := self.FAnalysis.Rpo();
+      for LI := 0 to LRpo.Count - 1 do
+        LPosition := LRpo[LI];
+        if not self.FAnalysis.Reachable(LPosition) then
+          skip;
+        end;
+        LState := self.DoEntryState(LPosition);
+        LBlockId := self.FAnalysis.BlockAt(LPosition);
+        LInstrs := self.FModule.BlockAt(LBlockId).Instrs;
+        // A zero put for a load goes last in the list: only what was there is walked
+        LCount := LInstrs.Count;
+        for LK := 0 to LCount - 1 do
+          self.DoForwardInstr(LInstrs[LK], LBlockId, LState);
+        end;
+        self.FEnd[LPosition] := LState;
+        self.FWalked[LPosition] := true;
+      end;
+    end;
+
+    // The slot a read of the pointer APointer reaches when it is tracked and the read
+    // stays (a forwarded load does not read), else ADAM_MEM_UNTRACKED
+    hidden const method DoReadSlot(const AId: int64; const APointer: int64): int64;
+    begin
+      if self.FRemoved.Find(AId) <> ADAM_MEM_NONE then
+        return ADAM_MEM_UNTRACKED;
+      end;
+      return self.DoTracked(APointer);
+    end;
+
+    // The tracked slots' liveness over the blocks (see the header): each reached block's
+    // reads (its gen), then live-in = gen + the live-in of every successor, to a fixed point
+    hidden method DoLiveness();
+    var
+      LRpo: ref Int64List;
+      LSuccs: ref Int64List;
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LGrew: bool;
+      LWord: uint64;
+      LSlot: int64;
+      LPosition: int64;
+      LId: int64;
+      LI: int64;
+      LK: int64;
+      LW: int64;
+      LS: int64;
+    begin
+      self.FWords := (self.FSlotIds.Count + ADAM_MEM_WORD_BITS - 1) div ADAM_MEM_WORD_BITS;
+      setlength(self.FLiveIn, self.FAnalysis.BlockCount * self.FWords);
+      setlength(self.FGen, self.FAnalysis.BlockCount * self.FWords);
+      for LI := 0 to len(self.FLiveIn) - 1 do
+        self.FLiveIn[LI] := uint64(0);
+        self.FGen[LI] := uint64(0);
+      end;
+      LRpo := self.FAnalysis.Rpo();
+      for LI := 0 to LRpo.Count - 1 do
+        LPosition := LRpo[LI];
+        LBlock := self.FModule.BlockAt(self.FAnalysis.BlockAt(LPosition));
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LId := LBlock.Instrs[LK];
+          LInstr := self.FModule.InstrAt(LId);
+          LSlot := ADAM_MEM_UNTRACKED;
+          if LInstr.Kind = IrOp.Load then
+            LSlot := self.DoReadSlot(LId, LInstr.Operands[0]);
+          end;
+          if LInstr.Kind = IrOp.Copy then
+            LSlot := self.DoReadSlot(LId, LInstr.Operands[1]);
+          end;
+          if LSlot <> ADAM_MEM_UNTRACKED then
+            LW := LPosition * self.FWords + LSlot div ADAM_MEM_WORD_BITS;
+            self.FGen[LW] := self.FGen[LW] |
+              (uint64(1) shl uint64(LSlot mod ADAM_MEM_WORD_BITS));
+          end;
+        end;
+      end;
+      // Postorder (the reverse of the reverse postorder) reaches a fixed point fastest
+      LGrew := true;
+      while LGrew do
+        LGrew := false;
+        for LI := 0 to LRpo.Count - 1 do
+          LPosition := LRpo[LRpo.Count - 1 - LI];
+          LSuccs := self.FAnalysis.SuccsOf(LPosition);
+          for LW := 0 to self.FWords - 1 do
+            LWord := self.FGen[LPosition * self.FWords + LW];
+            for LS := 0 to LSuccs.Count - 1 do
+              LWord := LWord | self.FLiveIn[LSuccs[LS] * self.FWords + LW];
+            end;
+            if LWord <> self.FLiveIn[LPosition * self.FWords + LW] then
+              self.FLiveIn[LPosition * self.FWords + LW] := LWord;
+              LGrew := true;
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // True when a write of the bytes ALo up to AHi of the tracked slot ASlot is dead at the
+    // walk's point: the slot is not live, or every one of those bytes is written again first
+    hidden const method DoDeadWrite(const ASlot: int64; const ALo: int64;
+      const AHi: int64): bool;
+    var
+      LWord: uint64;
+      LMask: uint64;
+    begin
+      LWord := self.FLive[ASlot div ADAM_MEM_WORD_BITS];
+      if (LWord & (uint64(1) shl uint64(ASlot mod ADAM_MEM_WORD_BITS))) = uint64(0) then
+        return true;
+      end;
+      if self.FSlotSizes[ASlot] > ADAM_MEM_MASK_MAX then
+        return false;
+      end;
+      LMask := DoMask(ALo, AHi);
+      return (self.FCovered[ASlot] & LMask) = LMask;
+    end;
+
+    // Every covered byte forgotten (a point that may raise inside a catching scope)
+    hidden method DoForget();
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FCovered) - 1 do
+        self.FCovered[LI] := uint64(0);
+      end;
+    end;
+
+    // The block at APosition walked backward (see the header): every dead tracked write
+    // and every untracked store the same store overwrites past quiet ops goes
+    hidden method DoDeadInBlock(const APosition: int64);
+    var
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LSuccs: ref Int64List;
+      LKind: IrOp;
+      LCatching: bool;
+      LPendingAddress: int64;
+      LPendingType: IrType;
+      LValueType: IrType;
+      LMask: uint64;
+      LDest: int64;
+      LSource: int64;
+      LLo: int64;
+      LHi: int64;
+      LId: int64;
+      LW: int64;
+      LS: int64;
+      LK: int64;
+      LI: int64;
+    begin
+      LBlock := self.FModule.BlockAt(self.FAnalysis.BlockAt(APosition));
+      LSuccs := self.FAnalysis.SuccsOf(APosition);
+      setlength(self.FLive, self.FWords);
+      for LW := 0 to self.FWords - 1 do
+        self.FLive[LW] := uint64(0);
+        for LS := 0 to LSuccs.Count - 1 do
+          self.FLive[LW] := self.FLive[LW] | self.FLiveIn[LSuccs[LS] * self.FWords + LW];
+        end;
+      end;
+      setlength(self.FCovered, self.FSlotIds.Count);
+      for LI := 0 to self.FSlotIds.Count - 1 do
+        self.FCovered[LI] := uint64(0);
+      end;
+      LCatching := self.FAnalysis.UnwindSuccsOf(APosition).Count > 0;
+      LPendingAddress := ADAM_MEM_NONE;
+      LPendingType := IrType.Void;
+      for LK := 0 to LBlock.Instrs.Count - 1 do
+        LId := LBlock.Instrs[LBlock.Instrs.Count - 1 - LK];
+        if self.FRemoved.Find(LId) <> ADAM_MEM_NONE then
+          skip;
+        end;
+        LInstr := self.FModule.InstrAt(LId);
+        LKind := LInstr.Kind;
+        LDest := ADAM_MEM_UNTRACKED;
+        LSource := ADAM_MEM_UNTRACKED;
+        if (LKind = IrOp.Store) or (LKind = IrOp.Fill) or (LKind = IrOp.Copy) then
+          LDest := self.DoTracked(LInstr.Operands[0]);
+        end;
+        if (LKind = IrOp.Load) or (LKind = IrOp.Copy) then
+          LSource := self.DoTracked(LInstr.Operands[LInstr.Operands.Count - 1]);
+        end;
+        // The write first (it happens after the read): dead, or its bytes covered
+        if LDest <> ADAM_MEM_UNTRACKED then
+          LLo := self.FOffset.Find(LInstr.Operands[0]);
+          if LKind = IrOp.Store then
+            LHi := LLo + DoBytesOf(self.FModule.InstrAt(LInstr.Operands[1]).ValueType);
+          else
+            LHi := LLo + LInstr.Imm;
+          end;
+          if self.DoDeadWrite(LDest, LLo, LHi) and
+            ((LKind <> IrOp.Copy) or (LSource <> ADAM_MEM_UNTRACKED)) then
+            self.FRemoved.Put(LId, 1);
+            self.FChanged := true;
+            skip;
+          end;
+          if self.FSlotSizes[LDest] <= ADAM_MEM_MASK_MAX then
+            self.FCovered[LDest] := self.FCovered[LDest] | DoMask(LLo, LHi);
+          end;
+        end;
+        // The read: the slot live, its bytes no longer covered
+        if LSource <> ADAM_MEM_UNTRACKED then
+          LLo := self.FOffset.Find(LInstr.Operands[LInstr.Operands.Count - 1]);
+          if LKind = IrOp.Load then
+            LHi := LLo + DoBytesOf(LInstr.ValueType);
+          else
+            LHi := LLo + LInstr.Imm;
+          end;
+          LW := LSource div ADAM_MEM_WORD_BITS;
+          self.FLive[LW] := self.FLive[LW] |
+            (uint64(1) shl uint64(LSource mod ADAM_MEM_WORD_BITS));
+          if self.FSlotSizes[LSource] <= ADAM_MEM_MASK_MAX then
+            LMask := DoMask(LLo, LHi);
+            self.FCovered[LSource] := self.FCovered[LSource] -
+              (self.FCovered[LSource] & LMask);
+          end;
+        end;
+        // Every op reaching only tracked slots is quiet; an untracked store is overwritten
+        // or becomes the one pending; anything else may read, write or raise
+        if (LKind = IrOp.Store) and (LDest = ADAM_MEM_UNTRACKED) then
+          LValueType := self.FModule.InstrAt(LInstr.Operands[1]).ValueType;
+          if (LPendingAddress = LInstr.Operands[0]) and (LPendingType = LValueType) then
+            self.FRemoved.Put(LId, 1);
+            self.FChanged := true;
+            skip;
+          end;
+          LPendingAddress := LInstr.Operands[0];
+          LPendingType := LValueType;
+          if LCatching then
+            self.DoForget();
+          end;
+          skip;
+        end;
+        if ((LKind = IrOp.Store) or (LKind = IrOp.Fill)) and (LDest <> ADAM_MEM_UNTRACKED) then
+          skip;
+        end;
+        if (LKind = IrOp.Load) and (LSource <> ADAM_MEM_UNTRACKED) then
+          skip;
+        end;
+        if (LKind = IrOp.Copy) and (LDest <> ADAM_MEM_UNTRACKED) and
+          (LSource <> ADAM_MEM_UNTRACKED) then
+          skip;
+        end;
+        if DoQuiet(LKind) then
+          skip;
+        end;
+        LPendingAddress := ADAM_MEM_NONE;
+        if LCatching then
+          self.DoForget();
+        end;
+      end;
+    end;
+
+    // Dead store elimination (see the header): liveness, then every reached block walked
+    hidden method DoDeadStores();
+    var
+      LRpo: ref Int64List;
+      LI: int64;
+    begin
+      self.DoLiveness();
+      LRpo := self.FAnalysis.Rpo();
+      for LI := 0 to LRpo.Count - 1 do
+        if self.FAnalysis.Reachable(LRpo[LI]) then
+          self.DoDeadInBlock(LRpo[LI]);
+        end;
+      end;
+    end;
+
+    // The instruction lists of AFunction rebuilt: what goes left out (a forwarded load's
+    // zero put in its place), every operand resolved
+    hidden method DoSweepFunction(const AFunction: ref IrFunction);
+    var
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LNew: ref Int64List;
+      LZero: int64;
+      LId: int64;
+      LI: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      for LI := 0 to AFunction.Blocks.Count - 1 do
+        LBlock := self.FModule.BlockAt(AFunction.Blocks[LI]);
+        LNew := ref Int64List();
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LId := LBlock.Instrs[LK];
+          if self.FZeros.Find(LId) <> ADAM_MEM_NONE then
+            skip;
+          end;
+          if self.FRemoved.Find(LId) <> ADAM_MEM_NONE then
+            LZero := self.FZeroAt.Find(LId);
+            if LZero <> ADAM_MEM_NONE then
+              LNew.Add(LZero);
+            end;
+            skip;
+          end;
+          LInstr := self.FModule.InstrAt(LId);
+          for LE := 0 to LInstr.Operands.Count - 1 do
+            LInstr.Operands.Put(LE, self.DoResolve(LInstr.Operands[LE]));
+          end;
+          LNew.Add(LId);
+        end;
+        LBlock.Instrs := LNew;
+      end;
+    end;
+
+    // The function and its funclets swept (a funclet may name a forwarded load)
+    hidden method DoSweep();
+    var
+      LF: int64;
+    begin
+      self.DoSweepFunction(self.FFunction);
+      for LF := 1 to self.FModule.FunctionCount - 1 do
+        if self.FModule.FunctionAt(LF).Parent = self.FFunctionId then
+          self.DoSweepFunction(self.FModule.FunctionAt(LF));
+        end;
+      end;
+    end;
+
+    // The pass (see the header); true when it changed the function
+    method Run(): bool;
+    begin
+      if (self.FAnalysis.BlockCount = 0) or (not self.FAnalysis.Reachable(0)) then
+        return false;
+      end;
+      self.DoRoots();
+      self.DoScalarize();
+      self.DoEscapes();
+      self.DoForward();
+      self.DoDeadStores();
+      if self.FChanged then
+        self.DoSweep();
+      end;
+      return self.FChanged;
+    end;
+  end;
+
+// The pass memory (see the header) over AModule's function AFunction with its analysis
+// AAnalysis (blocks and edges it never changes); true when it changed the function
+public routine OptimizeMemory(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LPass: ref MemoryPass;
+begin
+  LPass := ref MemoryPass(AModule, AFunction, AAnalysis);
+  return LPass.Run();
+end;
+
+end.
