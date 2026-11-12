@@ -46,9 +46,11 @@ set OUT=%~dp0..\projects\adam\output
 set SNAP=%OUT%\snapshot
 set MAIN=..\projects\adam\src\adam.adam
 :: Every exe lands in <output>\bin\<triple>\<mode> (SU2.5): the compiler's own build
-:: (--adam-self-build) is a release one at safe (its default level), a plain build a debug one
+:: (--adam-self-build) is a release one at fast (-opt fast; the switch alone means safe), a
+:: plain build a debug one
 set TRIPLE=x86_64-windows-gnu
-set REL=bin\%TRIPLE%\release_safe
+set SELFOPT=fast
+set REL=bin\%TRIPLE%\release_%SELFOPT%
 set DBG=bin\%TRIPLE%\debug
 
 echo [0/6] snapshot: the build's inputs copied
@@ -80,13 +82,13 @@ if errorlevel 1 (echo BUILD FAILED - stage A not found & exit /b 1)
 :: B and C are the compiler's own build (--adam-self-build: a release one, no leak tracker);
 :: A is built plainly, since the installed adam.exe may predate the switch
 echo [2/6] stage B: A builds adam
-adam-stageA.exe build %MAIN% -o "%OUT%\stageB" --adam-self-build
+adam-stageA.exe build %MAIN% -o "%OUT%\stageB" --adam-self-build -opt %SELFOPT%
 if errorlevel 1 (echo BUILD FAILED - stage B & goto :failed)
 copy /y "%OUT%\stageB\%REL%\adam.exe" adam-stageB.exe >nul
 if errorlevel 1 (echo BUILD FAILED - stage B not found & goto :failed)
 
 echo [3/6] stage C: B builds adam
-adam-stageB.exe build %MAIN% -o "%OUT%\stageC" --adam-self-build
+adam-stageB.exe build %MAIN% -o "%OUT%\stageC" --adam-self-build -opt %SELFOPT%
 if errorlevel 1 (echo BUILD FAILED - stage C & goto :failed)
 
 echo [4/6] B and C compared
