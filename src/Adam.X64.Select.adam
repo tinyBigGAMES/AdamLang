@@ -18,9 +18,32 @@
   SelectFunction  one SSA function (Adam.Backend.Ssa) -> its machine code
                   (Adam.X64.Machine) over virtual registers. Every SSA value
                   gets one virtual register of its type's class (general,
-                  or vector for the floats); a slot gets one only when it is
-                  used as a value (the address a load or a store goes
-                  through is folded into the memory operand instead).
+                  or vector for the floats), except the ones every user
+                  folds (below): a constant, slot, data address, offset,
+                  shift, multiply or compare some selected instruction
+                  reads as a register gets one, the others make no code.
+
+  Folding (PLAN-ADAM M6 O19), the same at every level, each exact to the
+  machine. An address (a load's, a store's, an atomic's, an offset's own
+  lea) is an AddressPlan: a base (a register value, a slot, a funclet's
+  parent slot, a data blob rip-relative) plus an index times 1, 2, 4 or 8
+  (an offset by `shl k` (k <= 3) or `mul` 1 / 2 / 4 / 8 folds its scale)
+  plus a displacement (constant offsets, below 2^30), through chains of
+  offsets. A constant right operand that fits the instruction is its
+  immediate (add, sub, and, or, xor, imul, cmp, a shift's count, a store's
+  value, a call's argument, a ret's value, a phi's edge copy); 0 compared is
+  test, 0 moved into a register is xor (zero, where no flags are live); a
+  multiply by 3, 5 or 9 is a lea, by 2^k a shl; a division or remainder by
+  a constant other than 0, 1, -1 and the least value (unsigned: 2 up to
+  2^(W-1) - 1) is a multiply by its magic number (Hacker's Delight 10-1 /
+  10-2, Granlund-Montgomery) and shifts. A compare a branch of its block
+  alone reads is fused into that branch: cmp / test / ucomis and the jcc of
+  its condition (a float's = and <> keep their setcc pair). At fast a
+  diamond or triangle whose arms are bare jumps into a join of 1 to
+  ADAM_X64_SELECT_CMOV_PHIS integer phis (no arm a scope's first, last or
+  target block) is no jump: the false values moved into temporaries, the
+  flags, a cmov of each true value (a setcc for a 1 / 0 pair), the phis
+  given them, a jump to the join; its arms make no machine block.
 
   Calls and the function's own parameters and result follow the ABI part's
   CallLayout (Adam.Backend.Parts): registers are named as the ABI names them
@@ -51,8 +74,8 @@
 
 module unit Adam.X64.Select;
 
-import System.SysUtils, Adam.Core.Containers, Adam.Backend.Ssa, Adam.Backend.Parts,
-  Adam.X64.Registers, Adam.X64.Machine;
+import System.SysUtils, Adam.Core.Common, Adam.Core.Containers, Adam.Backend.Ssa,
+  Adam.Backend.Parts, Adam.X64.Registers, Adam.X64.Machine;
 
 public const
   // Raised (an invariant broken) by an SSA function selection cannot take
@@ -92,6 +115,15 @@ public const
   // value travels there for every atomic, and a cas's new value in rcx)
   ADAM_X64_SELECT_ATOMIC_VALUE: string = "rax";
   ADAM_X64_SELECT_ATOMIC_NEW: string = "rcx";
+  // The largest displacement an address plan folds (2^30: room left for the frame offset
+  // a slot adds before the encoder's 32-bit field), and how many offsets deep it looks
+  ADAM_X64_SELECT_DISP_LIMIT: int64 = 0x40000000;
+  ADAM_X64_SELECT_PLAN_DEPTH: int64 = 8;
+  // The most phis a cmov diamond selects (each a mov and a cmov in the branch's block)
+  ADAM_X64_SELECT_CMOV_PHIS: int64 = 4;
+  // A 4-byte / 8-byte integer's least value (a signed division by it stays a division)
+  ADAM_X64_SELECT_LEAST32: int64 = -0x80000000;
+  ADAM_X64_SELECT_LEAST64: int64 = -0x7FFFFFFFFFFFFFFF - 1;
 
 // The bytes of a value of AType; raises for void (AInstr: the instruction it is the type of)
 routine DoWidth(const AType: IrType; const AInstr: int64): int64;
@@ -172,7 +204,223 @@ begin
   return RegClass.General;
 end;
 
+// True when AValue fits the immediate of an AWidth-byte operation as the encoder takes it:
+// 1 and 2 bytes signed or unsigned, 4 bytes int32 or uint32, 8 bytes int32 (sign-extended)
+routine DoImmFits(const AValue: int64; const AWidth: int64): bool;
+begin
+  if AWidth = 1 then
+    return (AValue >= -128) and (AValue <= 255);
+  end;
+  if AWidth = 2 then
+    return (AValue >= -32768) and (AValue <= 65535);
+  end;
+  if AWidth = 4 then
+    return (AValue >= ADAM_X64_SELECT_LEAST32) and (AValue <= 0xFFFFFFFF);
+  end;
+  return (AValue >= ADAM_X64_SELECT_LEAST32) and (AValue <= 0x7FFFFFFF);
+end;
+
+// The condition that holds exactly when ACond does not (the encoding pairs them)
+routine DoInvert(const ACond: X64Cond): X64Cond;
+begin
+  match ACond of
+    X64Cond.Overflow: return X64Cond.NoOverflow;
+    X64Cond.NoOverflow: return X64Cond.Overflow;
+    X64Cond.Below: return X64Cond.AboveOrEqual;
+    X64Cond.AboveOrEqual: return X64Cond.Below;
+    X64Cond.Equal: return X64Cond.NotEqual;
+    X64Cond.NotEqual: return X64Cond.Equal;
+    X64Cond.BelowOrEqual: return X64Cond.Above;
+    X64Cond.Above: return X64Cond.BelowOrEqual;
+    X64Cond.Sign: return X64Cond.NoSign;
+    X64Cond.NoSign: return X64Cond.Sign;
+    X64Cond.Parity: return X64Cond.NoParity;
+    X64Cond.NoParity: return X64Cond.Parity;
+    X64Cond.Less: return X64Cond.GreaterOrEqual;
+    X64Cond.GreaterOrEqual: return X64Cond.Less;
+    X64Cond.LessOrEqual: return X64Cond.Greater;
+    X64Cond.Greater: return X64Cond.LessOrEqual;
+  end;
+  return X64Cond.Equal;
+end;
+
+// True for the ops selection may fold into their users and make no code for (see the
+// header): constants, slots, data addresses, offsets, shifts and multiplies (an address's
+// index), compares (a branch's flags); each is pure, so one no user reads is dropped
+routine DoIsFoldable(const AOp: IrOp): bool;
+begin
+  return (AOp = IrOp.Constant) or (AOp = IrOp.Slot) or (AOp = IrOp.Address) or
+    (AOp = IrOp.Offset) or (AOp = IrOp.Shl) or (AOp = IrOp.Mul) or (AOp = IrOp.Compare);
+end;
+
+// The magic number and shift of a signed ABits-bit division by AD, 2 <= |AD| < 2^(ABits -
+// 1) (Hacker's Delight 10-1): AMagic the multiplier as a signed ABits-bit value; the
+// quotient is the high half of n * AMagic, plus n when AD > 0 > AMagic, minus n when AD <
+// 0 < AMagic, shifted right arithmetically by AShift, plus 1 when that is negative. The
+// arithmetic is unsigned and never leaves 64 bits (|nc| and |d| below 2^(ABits - 1))
+routine DoSignedMagic(const AD: int64; const ABits: int64; var AMagic: int64;
+  var AShift: int64);
+var
+  LTwo: uint64;
+  LAd: uint64;
+  LT: uint64;
+  LAnc: uint64;
+  LQ1: uint64;
+  LR1: uint64;
+  LQ2: uint64;
+  LR2: uint64;
+  LDelta: uint64;
+  LP: int64;
+begin
+  LTwo := uint64(1) shl uint64(ABits - 1);
+  if AD < 0 then
+    LAd := uint64(0 - AD);
+  else
+    LAd := uint64(AD);
+  end;
+  // t = 2^(W-1) + (d < 0), |nc| = t - 1 - t mod |d|
+  LT := LTwo;
+  if AD < 0 then
+    LT := LT + 1;
+  end;
+  LAnc := LT - 1 - LT mod LAd;
+  LP := ABits - 1;
+  LQ1 := LTwo div LAnc;
+  LR1 := LTwo - LQ1 * LAnc;
+  LQ2 := LTwo div LAd;
+  LR2 := LTwo - LQ2 * LAd;
+  // p up until 2^p / |nc| reaches |d| - 2^p mod |d|: q1 = 2^p / |nc|, q2 = 2^p / |d|
+  while true do
+    LP := LP + 1;
+    LQ1 := LQ1 * 2;
+    LR1 := LR1 * 2;
+    if LR1 >= LAnc then
+      LQ1 := LQ1 + 1;
+      LR1 := LR1 - LAnc;
+    end;
+    LQ2 := LQ2 * 2;
+    LR2 := LR2 * 2;
+    if LR2 >= LAd then
+      LQ2 := LQ2 + 1;
+      LR2 := LR2 - LAd;
+    end;
+    LDelta := LAd - LR2;
+    if not ((LQ1 < LDelta) or ((LQ1 = LDelta) and (LR1 = 0))) then
+      leave;
+    end;
+  end;
+  AMagic := ReadLowBits(int64(LQ2 + 1), ABits, true);
+  if AD < 0 then
+    AMagic := ReadLowBits(0 - AMagic, ABits, true);
+  end;
+  AShift := LP - ABits;
+end;
+
+// The magic number and shift of an unsigned ABits-bit division by AD, 2 <= AD < 2^(ABits
+// - 1) (Hacker's Delight 10-2): with AAdd false the quotient is the high half of n * AMagic
+// shifted right by AShift; with AAdd true it is ((n - hi) shr 1 + hi) shr (AShift - 1).
+// AMagic holds the ABits-bit multiplier's bits; every step wraps at ABits bits (LMask)
+routine DoUnsignedMagic(const AD: uint64; const ABits: int64; var AMagic: int64;
+  var AShift: int64; var AAdd: bool);
+var
+  LTwo: uint64;
+  LMask: uint64;
+  LNc: uint64;
+  LQ1: uint64;
+  LR1: uint64;
+  LQ2: uint64;
+  LR2: uint64;
+  LDelta: uint64;
+  LP: int64;
+begin
+  LTwo := uint64(1) shl uint64(ABits - 1);
+  LMask := LTwo + (LTwo - 1);
+  AAdd := false;
+  // nc = 2^W - 1 - (2^W - d) mod d
+  LNc := LMask - ((LMask - AD + 1) mod AD);
+  LP := ABits - 1;
+  LQ1 := LTwo div LNc;
+  LR1 := LTwo - LQ1 * LNc;
+  LQ2 := (LTwo - 1) div AD;
+  LR2 := (LTwo - 1) - LQ2 * AD;
+  while true do
+    LP := LP + 1;
+    if LR1 >= LNc - LR1 then
+      LQ1 := (LQ1 * 2 + 1) & LMask;
+      LR1 := (LR1 * 2 - LNc) & LMask;
+    else
+      LQ1 := (LQ1 * 2) & LMask;
+      LR1 := (LR1 * 2) & LMask;
+    end;
+    if LR2 + 1 >= AD - LR2 then
+      if LQ2 >= LTwo - 1 then
+        AAdd := true;
+      end;
+      LQ2 := (LQ2 * 2 + 1) & LMask;
+      LR2 := (LR2 * 2 + 1 - AD) & LMask;
+    else
+      if LQ2 >= LTwo then
+        AAdd := true;
+      end;
+      LQ2 := (LQ2 * 2) & LMask;
+      LR2 := (LR2 * 2 + 1) & LMask;
+    end;
+    LDelta := AD - 1 - LR2;
+    if not ((LP < 2 * ABits) and ((LQ1 < LDelta) or ((LQ1 = LDelta) and (LR1 = 0)))) then
+      leave;
+    end;
+  end;
+  AMagic := int64((LQ2 + 1) & LMask);
+  AShift := LP - ABits;
+end;
+
 type
+  // Where an address plan's base is (see the header): an SSA value in its register, a
+  // slot of the function, a funclet's parent slot (off its frame base), a data blob
+  // (rip-relative: no index)
+  PlanBase = choices(Value, Slot, Parent, Blob);
+
+  // How a multiply is selected (Selector.DoMulForm): imul by a register, imul by an
+  // immediate, lea of x + x * (c - 1) for c 3 / 5 / 9, shl for c 2^k
+  MulForm = choices(Register, Immediate, Lea, Shift);
+
+  // One address as a memory place (see the header): Base the SSA id of the value, slot,
+  // parent slot or data address; Index the SSA id of the index value (-1: none) times
+  // Scale; Disp the displacement
+  AddressPlan = object
+    BaseKind: PlanBase;
+    Base: int64;
+    Index: int64;
+    Scale: int64;
+    Disp: int64;
+
+    init(const ABaseKind: PlanBase; const ABase: int64);
+    begin
+      self.BaseKind := ABaseKind;
+      self.Base := ABase;
+      self.Index := -1;
+      self.Scale := 0;
+      self.Disp := 0;
+    end;
+
+    // ADisp added to the displacement
+    method AddDisp(const ADisp: int64);
+    begin
+      self.Disp := self.Disp + ADisp;
+    end;
+
+    // The index AIndex times AScale; a data blob's base becomes its address in a register
+    // (rip-relative memory takes no index)
+    method SetIndex(const AIndex: int64; const AScale: int64);
+    begin
+      if self.BaseKind = PlanBase.Blob then
+        self.BaseKind := PlanBase.Value;
+      end;
+      self.Index := AIndex;
+      self.Scale := AScale;
+    end;
+  end;
+
   // One function's selection (see the header; per SSA id maps are System.SysUtils'
   // Int64Array / BoolArray)
   Selector = object
@@ -186,8 +434,8 @@ type
     hidden FOwnVarargs: ref VarargsLayout;
     hidden FVolatile: ref Int64List;
     // SSA instruction id -> its virtual register (-1: none), its slot (-1: no slot), and
-    // whether some instruction uses it as a value (1; 0: not, or only as a load's or store's
-    // address). Maps sized to the function (DoClearMaps), never to the module
+    // whether some selected instruction reads it as a register (1; 0: not, or only folded:
+    // DoMarkReads). Maps sized to the function (DoClearMaps), never to the module
     hidden FVRegOf: ref Int64Map;
     hidden FSlotOf: ref Int64Map;
     hidden FUsedAsValue: ref Int64Map;
@@ -207,6 +455,20 @@ type
     // True from a tail call's jump to the IR ret after it: the jump has left the function,
     // the ret makes nothing (DoTailJump, DoRet)
     hidden FTailDone: bool;
+    // SSA id -> how many operand references name it, and the last instruction naming it
+    // (DoScan); a compare fused into its branch (1); an SSA block -> how many jump and branch
+    // edges reach it
+    hidden FUseCount: ref Int64Map;
+    hidden FUserOf: ref Int64Map;
+    hidden FFused: ref Int64Map;
+    hidden FPredCount: ref Int64Map;
+    // The cmov diamonds (see the header): an arm block that makes no machine block (1); a
+    // branch's block -> its join, and the blocks the join's phis name for the true and the
+    // false edge (the arm, or the branch's block itself for a triangle's direct edge)
+    hidden FAbsorbed: ref Int64Map;
+    hidden FDiamondJoin: ref Int64Map;
+    hidden FDiamondTrue: ref Int64Map;
+    hidden FDiamondFalse: ref Int64Map;
 
     init(const AModule: ref IrModule; const AAbi: ref AbiPart; const AParent: ref FunctionCode);
     begin
@@ -295,22 +557,217 @@ type
       self.DoEmitPair(X64Op.Mov, DoWidth(AType, AInstr), ADest, ASource, ANode);
     end;
 
-    // The memory a load or a store at SSA address AAddress goes through: its slot, a
-    // funclet's parent slot from its frame base, else the address held in its register
-    hidden method DoAddressOf(const AAddress: int64): ref MachineOperand;
+    // True when AId is an instruction of this function of kind AKind
+    hidden const method DoIsOwnKind(const AId: int64; const AKind: IrOp): bool;
+    begin
+      if not self.FModule.IsInstr(AId) then
+        return false;
+      end;
+      if self.FModule.InstrAt(AId).Kind <> AKind then
+        return false;
+      end;
+      return self.FModule.BlockAt(self.FModule.InstrAt(AId).Block).Owner = self.FFunctionId;
+    end;
+
+    // True when AId is a constant of this function a general register can hold (not a
+    // float): what an immediate is made of
+    hidden const method DoIsImmConstant(const AId: int64): bool;
+    begin
+      return self.DoIsOwnKind(AId, IrOp.Constant) and
+        not DoIsVector(self.FModule.InstrAt(AId).ValueType);
+    end;
+
+    // True when operand AIndex of AInstr is an integer constant an AWidth-byte operation
+    // takes as its immediate
+    hidden const method DoImmAt(const AInstr: ref IrInstr; const AIndex: int64;
+      const AWidth: int64): bool;
+    begin
+      if not self.DoIsImmConstant(AInstr.Operands[AIndex]) then
+        return false;
+      end;
+      return DoImmFits(self.FModule.InstrAt(AInstr.Operands[AIndex]).Imm, AWidth);
+    end;
+
+    // True when the store AInstr writes a constant value as an immediate (a float's bits
+    // too: mov of 4 or 8 bytes)
+    hidden const method DoStoreImm(const AInstr: ref IrInstr): bool;
     var
-      LReg: ref MachineOperand;
+      LValue: ref IrInstr;
+    begin
+      if not self.DoIsOwnKind(AInstr.Operands[1], IrOp.Constant) then
+        return false;
+      end;
+      LValue := self.FModule.InstrAt(AInstr.Operands[1]);
+      return DoImmFits(LValue.Imm, DoWidth(LValue.ValueType, AInstr.Operands[1]));
+    end;
+
+    // True when the call argument AId goes into its place as an immediate (an integer
+    // constant fitting its own width: a register takes any, a stack place a sign-extended
+    // 32-bit one)
+    hidden const method DoArgImm(const AId: int64): bool;
+    begin
+      if not self.DoIsImmConstant(AId) then
+        return false;
+      end;
+      return DoImmFits(self.FModule.InstrAt(AId).Imm,
+        DoWidth(self.FModule.InstrAt(AId).ValueType, AId));
+    end;
+
+    // The plan of address AAddress taken whole: its slot, a funclet's parent slot, a data
+    // blob of this function's, else the value in its register
+    hidden const method DoLeafPlan(const AAddress: int64): ref AddressPlan;
     begin
       if self.FModule.IsInstr(AAddress) then
         if self.FSlotOf.Find(AAddress) >= 0 then
-          return SlotMemory(self.FSlotOf.Find(AAddress), 0);
+          return ref AddressPlan(PlanBase.Slot, AAddress);
         end;
         if self.FParentAt.Find(AAddress) >= 0 then
-          return RegisterMemory(self.FFrameBase, true, self.FParentAt.Find(AAddress));
+          return ref AddressPlan(PlanBase.Parent, AAddress);
+        end;
+        if self.DoIsOwnKind(AAddress, IrOp.Address) then
+          return ref AddressPlan(PlanBase.Blob, AAddress);
         end;
       end;
-      LReg := self.DoVReg(AAddress);
-      return RegisterMemory(LReg.Reg, true, 0);
+      return ref AddressPlan(PlanBase.Value, AAddress);
+    end;
+
+    // The index APart (an offset's int64 byte count) makes: a shl of a 64-bit value by 0..3
+    // or a mul of one by 1 / 2 / 4 / 8 is that value times the scale (both wrap at 64 bits,
+    // as the address computation does), anything else itself times 1
+    hidden const method DoIndexOf(const APart: int64; var AIndex: int64; var AScale: int64);
+    var
+      LPart: ref IrInstr;
+      LFactor: int64;
+    begin
+      AIndex := APart;
+      AScale := 1;
+      if not (self.DoIsOwnKind(APart, IrOp.Shl) or self.DoIsOwnKind(APart, IrOp.Mul)) then
+        return;
+      end;
+      LPart := self.FModule.InstrAt(APart);
+      if not self.DoIsOwnKind(LPart.Operands[1], IrOp.Constant) then
+        return;
+      end;
+      if DoIsVector(LPart.ValueType) or
+        (DoWidth(self.FModule.InstrAt(LPart.Operands[0]).ValueType, LPart.Operands[0]) <> 8) then
+        return;
+      end;
+      LFactor := self.FModule.InstrAt(LPart.Operands[1]).Imm;
+      if LPart.Kind = IrOp.Shl then
+        if (LFactor < 0) or (LFactor > 3) then
+          return;
+        end;
+        LFactor := 1 shl LFactor;
+      end;
+      if (LFactor = 1) or (LFactor = 2) or (LFactor = 4) or (LFactor = 8) then
+        AIndex := LPart.Operands[0];
+        AScale := LFactor;
+      end;
+    end;
+
+    // APart (an offset's byte count) added to APlan: a constant to the displacement while
+    // it stays below ADAM_X64_SELECT_DISP_LIMIT, else an index while it has none; false
+    // when it takes neither (APlan unchanged)
+    hidden const method DoAddPart(const APlan: ref AddressPlan; const APart: int64): bool;
+    var
+      LImm: int64;
+      LIndex: int64;
+      LScale: int64;
+    begin
+      if self.DoIsOwnKind(APart, IrOp.Constant) then
+        LImm := self.FModule.InstrAt(APart).Imm;
+        if (LImm > -ADAM_X64_SELECT_DISP_LIMIT) and (LImm < ADAM_X64_SELECT_DISP_LIMIT) and
+          (APlan.Disp + LImm > -ADAM_X64_SELECT_DISP_LIMIT) and
+          (APlan.Disp + LImm < ADAM_X64_SELECT_DISP_LIMIT) then
+          APlan.AddDisp(LImm);
+          return true;
+        end;
+      end;
+      if APlan.Index >= 0 then
+        return false;
+      end;
+      self.DoIndexOf(APart, LIndex, LScale);
+      APlan.SetIndex(LIndex, LScale);
+      return true;
+    end;
+
+    // The plan of the offset AId (see the header): its base's plan (an own offset's, at
+    // most ADAM_X64_SELECT_PLAN_DEPTH deep, else the base whole) with its byte count added;
+    // when the base's plan takes no more, the base whole with it
+    hidden const method DoPlanOffset(const AId: int64; const ADepth: int64): ref AddressPlan;
+    var
+      LInstr: ref IrInstr;
+      LPlan: ref AddressPlan;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      if (ADepth < ADAM_X64_SELECT_PLAN_DEPTH) and
+        self.DoIsOwnKind(LInstr.Operands[0], IrOp.Offset) then
+        LPlan := self.DoPlanOffset(LInstr.Operands[0], ADepth + 1);
+      else
+        LPlan := self.DoLeafPlan(LInstr.Operands[0]);
+      end;
+      if self.DoAddPart(LPlan, LInstr.Operands[1]) then
+        return LPlan;
+      end;
+      // A leaf has no index yet: this always takes it
+      LPlan := self.DoLeafPlan(LInstr.Operands[0]);
+      self.DoAddPart(LPlan, LInstr.Operands[1]);
+      return LPlan;
+    end;
+
+    // The plan of address AAddress: an own offset's, else the address whole
+    hidden const method DoPlanOf(const AAddress: int64): ref AddressPlan;
+    begin
+      if self.DoIsOwnKind(AAddress, IrOp.Offset) then
+        return self.DoPlanOffset(AAddress, 0);
+      end;
+      return self.DoLeafPlan(AAddress);
+    end;
+
+    // The values APlan reads as registers (its value base, its index) added to AList
+    hidden const method DoPlanReads(const APlan: ref AddressPlan; const AList: ref Int64List);
+    begin
+      if APlan.BaseKind = PlanBase.Value then
+        AList.Add(APlan.Base);
+      end;
+      if APlan.Index >= 0 then
+        AList.Add(APlan.Index);
+      end;
+    end;
+
+    // APlan as a memory operand: a slot, a funclet's parent slot off its frame base, a data
+    // blob rip-relative, or the base value's register, each at its displacement, with its
+    // index register times its scale
+    hidden method DoMemoryOf(const APlan: ref AddressPlan): ref MachineOperand;
+    var
+      LMemory: ref MachineOperand;
+    begin
+      if APlan.BaseKind = PlanBase.Slot then
+        LMemory := SlotMemory(self.FSlotOf.Find(APlan.Base), APlan.Disp);
+      else
+        if APlan.BaseKind = PlanBase.Parent then
+          LMemory := RegisterMemory(self.FFrameBase, true,
+            self.FParentAt.Find(APlan.Base) + APlan.Disp);
+        else
+          if APlan.BaseKind = PlanBase.Blob then
+            LMemory := RipMemory(SymbolClass.Data,
+              self.FModule.DataAt(self.FModule.InstrAt(APlan.Base).Link).Symbol, "");
+            LMemory.Disp := APlan.Disp;
+          else
+            LMemory := RegisterMemory(self.DoVReg(APlan.Base).Reg, true, APlan.Disp);
+          end;
+        end;
+      end;
+      if APlan.Index >= 0 then
+        return IndexedMemory(LMemory, self.DoVReg(APlan.Index).Reg, true, APlan.Scale);
+      end;
+      return LMemory;
+    end;
+
+    // The memory a load, a store or an atomic at SSA address AAddress goes through: its plan
+    hidden method DoAddressOf(const AAddress: int64): ref MachineOperand;
+    begin
+      return self.DoMemoryOf(self.DoPlanOf(AAddress));
     end;
 
     // AOperand recorded once as a parent slot of a funclet (FParentAt, FParentSlots) when it
@@ -338,7 +795,9 @@ type
       self.FParentSlots.Add(AOperand);
     end;
 
-    // Every slot of the function in SSA order, and which instructions are used as values
+    // Every slot of the function in SSA order, each value's references and last user, each
+    // block's jump and branch edges; then the compares fused into their branch, at fast the
+    // cmov diamonds, and which values selected instructions read as registers (DoMarkReads)
     hidden method DoScan();
     var
       LBlocks: ref Int64List;
@@ -361,20 +820,503 @@ type
           for LK := 0 to LInstr.Operands.Count - 1 do
             LOperand := LInstr.Operands[LK];
             self.DoParentSlot(LOperand);
-            // A load's, a store's or an atomic's address (operand 0) is folded, not a value
-            // (DoAddressOf reaches a slot as memory)
-            if ((LInstr.Kind <> IrOp.Load) and (LInstr.Kind <> IrOp.Store) and
-              (not IsAtomicOp(LInstr.Kind))) or (LK <> 0) then
-              if self.FModule.IsInstr(LOperand) then
-                self.FUsedAsValue.Put(LOperand, 1);
-              end;
+            self.FUseCount.Put(LOperand, self.FUseCount.Find(LOperand) + 1);
+            self.FUserOf.Put(LOperand, LInstrs[LJ]);
+          end;
+          if (LInstr.Kind = IrOp.Jump) or (LInstr.Kind = IrOp.Branch) then
+            for LK := 0 to LInstr.Targets.Count - 1 do
+              self.FPredCount.Put(LInstr.Targets[LK], self.FPredCount.Find(LInstr.Targets[LK]) + 1);
             end;
+          end;
+        end;
+      end;
+      self.DoFindFused();
+      if self.FModule.Level = OptLevel.Fast then
+        self.DoFindDiamonds();
+      end;
+      self.DoMarkReads();
+    end;
+
+    // True when the compare AInstr can set the flags a jcc reads by itself: an integer one,
+    // or a float order (a float's = and <> need two conditions: DoFloatCompare)
+    hidden const method DoFusable(const AInstr: ref IrInstr): bool;
+    var
+      LPredicate: IrPredicate;
+    begin
+      if not DoIsVector(self.FModule.InstrAt(AInstr.Operands[0]).ValueType) then
+        return true;
+      end;
+      LPredicate := AInstr.Predicate;
+      return (LPredicate = IrPredicate.FLess) or (LPredicate = IrPredicate.FLessEqual) or
+        (LPredicate = IrPredicate.FGreater) or (LPredicate = IrPredicate.FGreaterEqual);
+    end;
+
+    // The compares fused into their branch (FFused, see the header): read once, by the
+    // branch ending their own block, as its condition
+    hidden method DoFindFused();
+    var
+      LBlocks: ref Int64List;
+      LInstrs: ref Int64List;
+      LInstr: ref IrInstr;
+      LUser: ref IrInstr;
+      LI: int64;
+      LJ: int64;
+    begin
+      LBlocks := self.FFunction.Blocks;
+      for LI := 0 to LBlocks.Count - 1 do
+        LInstrs := self.FModule.BlockAt(LBlocks[LI]).Instrs;
+        for LJ := 0 to LInstrs.Count - 1 do
+          LInstr := self.FModule.InstrAt(LInstrs[LJ]);
+          if (LInstr.Kind <> IrOp.Compare) or (self.FUseCount.Find(LInstrs[LJ]) <> 1) then
+            skip;
+          end;
+          LUser := self.FModule.InstrAt(self.FUserOf.Find(LInstrs[LJ]));
+          if (LUser.Kind = IrOp.Branch) and (LUser.Block = LInstr.Block) and
+            (LUser.Operands[0] = LInstrs[LJ]) and self.DoFusable(LInstr) then
+            self.FFused.Put(LInstrs[LJ], 1);
           end;
         end;
       end;
     end;
 
-    // A virtual register for every value of the function (a slot only when used as one)
+    // True when SSA block ABlock is a scope's first, last or target block (its machine
+    // block must exist: Adam.X64.Arch's DoScopesOf)
+    hidden const method DoIsScopeEdge(const ABlock: int64): bool;
+    var
+      LPosition: int64;
+      LI: int64;
+    begin
+      LPosition := self.FFunction.Blocks.IndexOf(ABlock);
+      for LI := 0 to self.FFunction.ScopeCount() - 1 do
+        if (self.FFunction.ScopeFirst(LI) = LPosition) or
+          (self.FFunction.ScopeLast(LI) = LPosition) or
+          (self.FFunction.ScopeTarget(LI) = LPosition) then
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // True when SSA block ABlock can be a cmov diamond's arm: not the entry, no scope edge,
+    // reached by one edge, its one instruction a jump
+    hidden const method DoIsArm(const ABlock: int64): bool;
+    var
+      LInstrs: ref Int64List;
+    begin
+      if (ABlock = self.FFunction.Blocks[0]) or self.DoIsScopeEdge(ABlock) or
+        (self.FPredCount.Find(ABlock) <> 1) or (self.FAbsorbed.Find(ABlock) = 1) then
+        return false;
+      end;
+      LInstrs := self.FModule.BlockAt(ABlock).Instrs;
+      return (LInstrs.Count = 1) and (self.FModule.InstrAt(LInstrs[0]).Kind = IrOp.Jump);
+    end;
+
+    // The block the arm ABlock jumps to
+    hidden const method DoArmTarget(const ABlock: int64): int64;
+    begin
+      return self.FModule.InstrAt(self.FModule.BlockAt(ABlock).Instrs[0]).Targets[0];
+    end;
+
+    // The phis SSA block ABlock starts with
+    hidden const method DoPhisOf(const ABlock: int64): ref Int64List;
+    var
+      LInstrs: ref Int64List;
+      LPhis: ref Int64List;
+      LJ: int64;
+    begin
+      LInstrs := self.FModule.BlockAt(ABlock).Instrs;
+      LPhis := ref Int64List();
+      for LJ := 0 to LInstrs.Count - 1 do
+        if self.FModule.InstrAt(LInstrs[LJ]).Kind = IrOp.Phi then
+          LPhis.Add(LInstrs[LJ]);
+        end;
+      end;
+      return LPhis;
+    end;
+
+    // The operand of APhi on the edge from AFrom
+    hidden const method DoPhiValue(const APhi: int64; const AFrom: int64): int64;
+    var
+      LPhi: ref IrInstr;
+    begin
+      LPhi := self.FModule.InstrAt(APhi);
+      return LPhi.Operands[LPhi.Targets.IndexOf(AFrom)];
+    end;
+
+    // True when AJoin can be a cmov diamond's join for the edges from ATrue and AFalse: 1
+    // to ADAM_X64_SELECT_CMOV_PHIS phis, each an integer naming both edges
+    hidden const method DoIsJoin(const AJoin: int64; const ATrue: int64; const AFalse: int64): bool;
+    var
+      LPhis: ref Int64List;
+      LPhi: ref IrInstr;
+      LJ: int64;
+    begin
+      LPhis := self.DoPhisOf(AJoin);
+      if (LPhis.Count = 0) or (LPhis.Count > ADAM_X64_SELECT_CMOV_PHIS) then
+        return false;
+      end;
+      for LJ := 0 to LPhis.Count - 1 do
+        LPhi := self.FModule.InstrAt(LPhis[LJ]);
+        if DoIsVector(LPhi.ValueType) or (LPhi.Targets.IndexOf(ATrue) < 0) or
+          (LPhi.Targets.IndexOf(AFalse) < 0) then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    // The cmov diamonds of the function (fast; see the header): a branch's block whose two
+    // targets are arms jumping to one join (a diamond), or one target the join and the
+    // other an arm jumping to it (a triangle)
+    hidden method DoFindDiamonds();
+    var
+      LBlocks: ref Int64List;
+      LInstrs: ref Int64List;
+      LBranch: ref IrInstr;
+      LBlock: int64;
+      LTrue: int64;
+      LFalse: int64;
+      LJoin: int64;
+      LTrueFrom: int64;
+      LFalseFrom: int64;
+      LI: int64;
+    begin
+      LBlocks := self.FFunction.Blocks;
+      for LI := 0 to LBlocks.Count - 1 do
+        LBlock := LBlocks[LI];
+        LInstrs := self.FModule.BlockAt(LBlock).Instrs;
+        if LInstrs.Count = 0 then
+          skip;
+        end;
+        LBranch := self.FModule.InstrAt(LInstrs[LInstrs.Count - 1]);
+        if (LBranch.Kind <> IrOp.Branch) or (LBranch.Targets[0] = LBranch.Targets[1]) then
+          skip;
+        end;
+        LTrue := LBranch.Targets[0];
+        LFalse := LBranch.Targets[1];
+        LJoin := -1;
+        LTrueFrom := LTrue;
+        LFalseFrom := LFalse;
+        if self.DoIsArm(LTrue) and self.DoIsArm(LFalse) and
+          (self.DoArmTarget(LTrue) = self.DoArmTarget(LFalse)) then
+          LJoin := self.DoArmTarget(LTrue);
+        else
+          if self.DoIsArm(LFalse) and (self.DoArmTarget(LFalse) = LTrue) then
+            LJoin := LTrue;
+            LTrueFrom := LBlock;
+          else
+            if self.DoIsArm(LTrue) and (self.DoArmTarget(LTrue) = LFalse) then
+              LJoin := LFalse;
+              LFalseFrom := LBlock;
+            end;
+          end;
+        end;
+        if (LJoin < 0) or (LJoin = LBlock) then
+          skip;
+        end;
+        if not self.DoIsJoin(LJoin, LTrueFrom, LFalseFrom) then
+          skip;
+        end;
+        self.FDiamondJoin.Put(LBlock, LJoin);
+        self.FDiamondTrue.Put(LBlock, LTrueFrom);
+        self.FDiamondFalse.Put(LBlock, LFalseFrom);
+        if LTrueFrom <> LBlock then
+          self.FAbsorbed.Put(LTrueFrom, 1);
+        end;
+        if LFalseFrom <> LBlock then
+          self.FAbsorbed.Put(LFalseFrom, 1);
+        end;
+      end;
+    end;
+
+    // How a diamond's phi with ATrue on its true edge and AFalse on its false edge is set:
+    // 0 a cmov, 1 a setcc of the condition (1 / 0), 2 a setcc of its inverse (0 / 1)
+    hidden const method DoSetForm(const ATrue: int64; const AFalse: int64): int64;
+    var
+      LTrue: int64;
+      LFalse: int64;
+    begin
+      if not (self.DoIsImmConstant(ATrue) and self.DoIsImmConstant(AFalse)) then
+        return 0;
+      end;
+      LTrue := self.FModule.InstrAt(ATrue).Imm;
+      LFalse := self.FModule.InstrAt(AFalse).Imm;
+      if (LTrue = 1) and (LFalse = 0) then
+        return 1;
+      end;
+      if (LTrue = 0) and (LFalse = 1) then
+        return 2;
+      end;
+      return 0;
+    end;
+
+    // True when operand AK of the phi APhi is not copied on its edge as a register: an
+    // integer constant (an immediate there), or an edge a cmov diamond selects (DoDiamond)
+    hidden const method DoPhiSkips(const APhi: ref IrInstr; const AK: int64): bool;
+    var
+      LFrom: int64;
+    begin
+      if self.DoIsImmConstant(APhi.Operands[AK]) then
+        return true;
+      end;
+      LFrom := APhi.Targets[AK];
+      return (self.FAbsorbed.Find(LFrom) = 1) or (self.FDiamondJoin.Find(LFrom) = APhi.Block);
+    end;
+
+    // How the multiply AInstr is selected (MulForm): an integer one by a constant 3 / 5 / 9
+    // a lea, by 2^k a shl, by one fitting imul's immediate (at 4 bytes for a 1-byte one)
+    // that; anything else imul by a register
+    hidden const method DoMulForm(const AInstr: ref IrInstr): MulForm;
+    var
+      LFactor: int64;
+      LWidth: int64;
+    begin
+      if DoIsVector(AInstr.ValueType) or not self.DoIsImmConstant(AInstr.Operands[1]) then
+        return MulForm.Register;
+      end;
+      LFactor := self.FModule.InstrAt(AInstr.Operands[1]).Imm;
+      if (LFactor = 3) or (LFactor = 5) or (LFactor = 9) then
+        return MulForm.Lea;
+      end;
+      if (LFactor > 1) and ((LFactor & (LFactor - 1)) = 0) then
+        return MulForm.Shift;
+      end;
+      LWidth := DoWidth(AInstr.ValueType, AInstr.Operands[1]);
+      if DoImmFits(LFactor, DoPickWidth(LWidth = 1, 4, LWidth)) then
+        return MulForm.Immediate;
+      end;
+      return MulForm.Register;
+    end;
+
+    // True when the division or remainder AInstr goes by its constant divisor's magic number
+    // (see the header): 4 or 8 bytes; signed by anything but 0, 1, -1 and the least value
+    // (a fault, itself, the MIN div -1 fault, a quotient of 0 or 1), unsigned by 2 up to
+    // 2^(W-1) - 1 (the canonical constant: a uint32's zero-extended, a uint64's bits)
+    hidden const method DoMagicFits(const AInstr: ref IrInstr): bool;
+    var
+      LDivisor: int64;
+      LWidth: int64;
+    begin
+      if not self.DoIsImmConstant(AInstr.Operands[1]) then
+        return false;
+      end;
+      LDivisor := self.FModule.InstrAt(AInstr.Operands[1]).Imm;
+      LWidth := DoWidth(AInstr.ValueType, AInstr.Operands[1]);
+      if (LWidth <> 4) and (LWidth <> 8) then
+        return false;
+      end;
+      if (AInstr.Kind = IrOp.SDiv) or (AInstr.Kind = IrOp.SRem) then
+        return (LDivisor <> 0) and (LDivisor <> 1) and (LDivisor <> -1) and
+          (LDivisor <> DoPickWidth(LWidth = 4, ADAM_X64_SELECT_LEAST32, ADAM_X64_SELECT_LEAST64));
+      end;
+      if LWidth = 4 then
+        return (LDivisor >= 2) and (LDivisor < 0x80000000);
+      end;
+      return LDivisor >= 2;
+    end;
+
+    // The values the compare AInstr reads as registers (its flags: DoCompareFlags) added to
+    // AList
+    hidden const method DoCompareReads(const AInstr: ref IrInstr; const AList: ref Int64List);
+    var
+      LType: IrType;
+    begin
+      AList.Add(AInstr.Operands[0]);
+      LType := self.FModule.InstrAt(AInstr.Operands[0]).ValueType;
+      if DoIsVector(LType) or not self.DoImmAt(AInstr, 1, DoWidth(LType, AInstr.Operands[0])) then
+        AList.Add(AInstr.Operands[1]);
+      end;
+    end;
+
+    // The values the branch AInstr reads as registers added to AList: its fused compare's
+    // operands or its bool, and a cmov diamond's values (not a setcc pair's constants)
+    hidden const method DoBranchReads(const AInstr: ref IrInstr; const AList: ref Int64List);
+    var
+      LPhis: ref Int64List;
+      LTrue: int64;
+      LFalse: int64;
+      LJoin: int64;
+      LJ: int64;
+    begin
+      if self.FFused.Find(AInstr.Operands[0]) = 1 then
+        self.DoCompareReads(self.FModule.InstrAt(AInstr.Operands[0]), AList);
+      else
+        AList.Add(AInstr.Operands[0]);
+      end;
+      LJoin := self.FDiamondJoin.Find(AInstr.Block);
+      if LJoin < 0 then
+        return;
+      end;
+      LPhis := self.DoPhisOf(LJoin);
+      for LJ := 0 to LPhis.Count - 1 do
+        LTrue := self.DoPhiValue(LPhis[LJ], self.FDiamondTrue.Find(AInstr.Block));
+        LFalse := self.DoPhiValue(LPhis[LJ], self.FDiamondFalse.Find(AInstr.Block));
+        if self.DoSetForm(LTrue, LFalse) = 0 then
+          AList.Add(LTrue);
+          AList.Add(LFalse);
+        end;
+      end;
+    end;
+
+    // The values instruction AId reads as registers once selected, added to AList (what its
+    // selection below names by DoVReg: folded operands, immediates and plan parts not)
+    hidden const method DoReadsOf(const AId: int64; const AList: ref Int64List);
+    var
+      LInstr: ref IrInstr;
+      LKind: IrOp;
+      LFirst: int64;
+      LK: int64;
+    begin
+      LInstr := self.FModule.InstrAt(AId);
+      LKind := LInstr.Kind;
+      if LKind = IrOp.Load then
+        self.DoPlanReads(self.DoPlanOf(LInstr.Operands[0]), AList);
+        return;
+      end;
+      if LKind = IrOp.Store then
+        self.DoPlanReads(self.DoPlanOf(LInstr.Operands[0]), AList);
+        if not self.DoStoreImm(LInstr) then
+          AList.Add(LInstr.Operands[1]);
+        end;
+        return;
+      end;
+      if IsAtomicOp(LKind) then
+        self.DoPlanReads(self.DoPlanOf(LInstr.Operands[0]), AList);
+        for LK := 1 to LInstr.Operands.Count - 1 do
+          AList.Add(LInstr.Operands[LK]);
+        end;
+        return;
+      end;
+      if LKind = IrOp.Offset then
+        self.DoPlanReads(self.DoPlanOffset(AId, 0), AList);
+        return;
+      end;
+      if (LKind = IrOp.Add) or (LKind = IrOp.Sub) or (LKind = IrOp.BitAnd) or
+        (LKind = IrOp.BitOr) or (LKind = IrOp.BitXor) then
+        AList.Add(LInstr.Operands[0]);
+        if DoIsVector(LInstr.ValueType) or
+          not self.DoImmAt(LInstr, 1, DoWidth(LInstr.ValueType, AId)) then
+          AList.Add(LInstr.Operands[1]);
+        end;
+        return;
+      end;
+      if LKind = IrOp.Mul then
+        AList.Add(LInstr.Operands[0]);
+        if self.DoMulForm(LInstr) = MulForm.Register then
+          AList.Add(LInstr.Operands[1]);
+        end;
+        return;
+      end;
+      if (LKind = IrOp.Shl) or (LKind = IrOp.Shr) or (LKind = IrOp.Sar) then
+        AList.Add(LInstr.Operands[0]);
+        if not self.DoIsImmConstant(LInstr.Operands[1]) then
+          AList.Add(LInstr.Operands[1]);
+        end;
+        return;
+      end;
+      if (LKind = IrOp.SDiv) or (LKind = IrOp.UDiv) or (LKind = IrOp.SRem) or
+        (LKind = IrOp.URem) then
+        AList.Add(LInstr.Operands[0]);
+        if not self.DoMagicFits(LInstr) then
+          AList.Add(LInstr.Operands[1]);
+        end;
+        return;
+      end;
+      if LKind = IrOp.Compare then
+        self.DoCompareReads(LInstr, AList);
+        return;
+      end;
+      if LKind = IrOp.Branch then
+        self.DoBranchReads(LInstr, AList);
+        return;
+      end;
+      if LKind = IrOp.Phi then
+        for LK := 0 to LInstr.Operands.Count - 1 do
+          if not self.DoPhiSkips(LInstr, LK) then
+            AList.Add(LInstr.Operands[LK]);
+          end;
+        end;
+        return;
+      end;
+      if LKind = IrOp.Ret then
+        if (LInstr.Operands.Count > 0) and not self.DoIsImmConstant(LInstr.Operands[0]) then
+          AList.Add(LInstr.Operands[0]);
+        end;
+        return;
+      end;
+      if (LKind = IrOp.Call) or (LKind = IrOp.CallExternal) or (LKind = IrOp.CallIndirect) then
+        LFirst := 0;
+        if LKind = IrOp.CallIndirect then
+          // A calli's target
+          AList.Add(LInstr.Operands[0]);
+          LFirst := 1;
+        end;
+        for LK := LFirst to LInstr.Operands.Count - 1 do
+          if not self.DoArgImm(LInstr.Operands[LK]) then
+            AList.Add(LInstr.Operands[LK]);
+          end;
+        end;
+        return;
+      end;
+      for LK := 0 to LInstr.Operands.Count - 1 do
+        AList.Add(LInstr.Operands[LK]);
+      end;
+    end;
+
+    // Which values selected instructions read as registers (FUsedAsValue), to a fixed point:
+    // every instruction that is not foldable is selected; a foldable one is once one of
+    // them reads it (its own reads then count too); one nothing reads makes no code
+    hidden method DoMarkReads();
+    var
+      LBlocks: ref Int64List;
+      LInstrs: ref Int64List;
+      LWork: ref Int64List;
+      LReads: ref Int64List;
+      LValue: int64;
+      LI: int64;
+      LJ: int64;
+      LK: int64;
+    begin
+      LWork := ref Int64List();
+      LBlocks := self.FFunction.Blocks;
+      for LI := 0 to LBlocks.Count - 1 do
+        if self.FAbsorbed.Find(LBlocks[LI]) = 1 then
+          skip;
+        end;
+        LInstrs := self.FModule.BlockAt(LBlocks[LI]).Instrs;
+        for LJ := 0 to LInstrs.Count - 1 do
+          if not DoIsFoldable(self.FModule.InstrAt(LInstrs[LJ]).Kind) then
+            LWork.Add(LInstrs[LJ]);
+          end;
+        end;
+      end;
+      LK := 0;
+      while LK < LWork.Count do
+        LReads := ref Int64List();
+        self.DoReadsOf(LWork[LK], LReads);
+        LK := LK + 1;
+        for LI := 0 to LReads.Count - 1 do
+          LValue := LReads[LI];
+          if (not self.FModule.IsInstr(LValue)) or (self.FUsedAsValue.Find(LValue) = 1) then
+            skip;
+          end;
+          self.FUsedAsValue.Put(LValue, 1);
+          if DoIsFoldable(self.FModule.InstrAt(LValue).Kind) and
+            (self.FModule.BlockAt(self.FModule.InstrAt(LValue).Block).Owner = self.FFunctionId) then
+            LWork.Add(LValue);
+          end;
+        end;
+      end;
+    end;
+
+    // True when instruction AId makes no code: foldable and read by nothing selected
+    hidden const method DoIsFolded(const AId: int64): bool;
+    begin
+      return DoIsFoldable(self.FModule.InstrAt(AId).Kind) and (self.FUsedAsValue.Find(AId) <> 1);
+    end;
+
+    // A virtual register for every value of the function a selected instruction reads or
+    // that is selected itself (see the header: a folded one gets none)
     hidden method DoAssign();
     var
       LBlocks: ref Int64List;
@@ -388,10 +1330,8 @@ type
         LInstrs := self.FModule.BlockAt(LBlocks[LI]).Instrs;
         for LJ := 0 to LInstrs.Count - 1 do
           LInstr := self.FModule.InstrAt(LInstrs[LJ]);
-          if LInstr.ValueType <> IrType.Void then
-            if (LInstr.Kind <> IrOp.Slot) or (self.FUsedAsValue.Find(LInstrs[LJ]) = 1) then
-              self.FVRegOf.Put(LInstrs[LJ], self.FMachine.NewVReg(DoClassOf(LInstr.ValueType)));
-            end;
+          if (LInstr.ValueType <> IrType.Void) and not self.DoIsFolded(LInstrs[LJ]) then
+            self.FVRegOf.Put(LInstrs[LJ], self.FMachine.NewVReg(DoClassOf(LInstr.ValueType)));
           end;
         end;
       end;
@@ -479,7 +1419,23 @@ type
       end;
     end;
 
-    // A constant: its value moved in; a float's bits go through a general register
+    // AValue into the register ADest at AWidth bytes: 0 by zero (xor: where selection puts
+    // a value in, no flags are live), anything else by a mov of the immediate
+    hidden method DoLoadImm(const AWidth: int64; const ADest: ref MachineOperand;
+      const AValue: int64; const ANode: int64);
+    var
+      LZero: ref MachineInstr;
+    begin
+      if AValue = 0 then
+        LZero := self.DoEmit(X64Op.Zero, 0, ANode);
+        LZero.AddOperand(ADest);
+        return;
+      end;
+      self.DoEmitPair(X64Op.Mov, AWidth, ADest, ImmediateOperand(AValue), ANode);
+    end;
+
+    // A constant some selected instruction reads as a register: its value moved in (0 by
+    // zero); a float's bits go through a general register
     hidden method DoConstant(const AId: int64; const AInstr: ref IrInstr);
     var
       LWidth: int64;
@@ -487,8 +1443,7 @@ type
     begin
       LWidth := DoWidth(AInstr.ValueType, AId);
       if not DoIsVector(AInstr.ValueType) then
-        self.DoEmitPair(X64Op.Mov, LWidth, self.DoVReg(AId), ImmediateOperand(AInstr.Imm),
-          AInstr.Node);
+        self.DoLoadImm(LWidth, self.DoVReg(AId), AInstr.Imm, AInstr.Node);
         return;
       end;
       LBits := self.FMachine.NewVReg(RegClass.General);
@@ -613,12 +1568,23 @@ type
       self.DoEmitPair(X64Op.XorPS, 0, self.DoVReg(AId), VirtualOperand(LMask), AInstr.Node);
     end;
 
-    // add / sub: the left operand moved into the result, the right one added or subtracted;
-    // an offset is an add at the ptr's width (its byte count is an int64, the same width); a
-    // float's goes to DoFloatArith
+    // Operand AIndex of AInstr as an AWidth-byte op's source: its immediate when it is an
+    // integer constant the op takes (DoImmAt), else its register
+    hidden method DoRightOf(const AInstr: ref IrInstr; const AIndex: int64;
+      const AWidth: int64): ref MachineOperand;
+    begin
+      if self.DoImmAt(AInstr, AIndex, AWidth) then
+        return ImmediateOperand(self.FModule.InstrAt(AInstr.Operands[AIndex]).Imm);
+      end;
+      return self.DoVReg(AInstr.Operands[AIndex]);
+    end;
+
+    // add / sub: the left operand moved into the result, the right one (an immediate when
+    // it fits) added or subtracted; a float's goes to DoFloatArith
     hidden method DoArithmetic(const AId: int64; const AInstr: ref IrInstr);
     var
       LOp: X64Op;
+      LWidth: int64;
     begin
       if DoIsVector(AInstr.ValueType) then
         self.DoFloatArith(AId, AInstr);
@@ -628,15 +1594,67 @@ type
       if AInstr.Kind = IrOp.Sub then
         LOp := X64Op.Sub;
       end;
+      LWidth := DoWidth(AInstr.ValueType, AId);
       self.DoCopy(AInstr.ValueType, self.DoVReg(AId), self.DoVReg(AInstr.Operands[0]), AId,
         AInstr.Node);
-      self.DoEmitPair(LOp, DoWidth(AInstr.ValueType, AId), self.DoVReg(AId),
-        self.DoVReg(AInstr.Operands[1]), AInstr.Node);
+      self.DoEmitPair(LOp, LWidth, self.DoVReg(AId), self.DoRightOf(AInstr, 1, LWidth),
+        AInstr.Node);
     end;
 
-    // mul / and / or / xor: the left operand moved into the result, the right one combined
-    // into it (imul, and, or, xor); imul has no 1-byte form, so a 1-byte mul runs at 4 bytes
-    // (the product's low byte is the same); a float's mul goes to DoFloatArith
+    // An offset some selected instruction reads as a register: lea of its plan (see the
+    // header), base + index * scale + displacement in one instruction
+    hidden method DoOffset(const AId: int64; const AInstr: ref IrInstr);
+    begin
+      self.DoEmitPair(X64Op.Lea, DoWidth(IrType.Pointer, AId), self.DoVReg(AId),
+        self.DoMemoryOf(self.DoPlanOffset(AId, 0)), AInstr.Node);
+    end;
+
+    // An integer mul by its form (DoMulForm): lea of x + x * 2 / 4 / 8 (at 4 bytes for a
+    // 1-byte one: lea has no 1-byte form, the low byte is the same), shl by k for 2^k, imul
+    // by the immediate or the register (imul has no 1-byte form: a 1-byte mul runs at 4
+    // bytes, the product's low byte the same)
+    hidden method DoMultiply(const AId: int64; const AInstr: ref IrInstr);
+    var
+      LForm: MulForm;
+      LWidth: int64;
+      LFactor: int64;
+      LShift: int64;
+      LLeft: int64;
+    begin
+      LForm := self.DoMulForm(AInstr);
+      LWidth := DoWidth(AInstr.ValueType, AId);
+      if LForm = MulForm.Lea then
+        LFactor := self.FModule.InstrAt(AInstr.Operands[1]).Imm;
+        LLeft := self.DoVReg(AInstr.Operands[0]).Reg;
+        self.DoEmitPair(X64Op.Lea, DoPickWidth(LWidth = 1, 4, LWidth), self.DoVReg(AId),
+          IndexedMemory(RegisterMemory(LLeft, true, 0), LLeft, true, LFactor - 1), AInstr.Node);
+        return;
+      end;
+      self.DoCopy(AInstr.ValueType, self.DoVReg(AId), self.DoVReg(AInstr.Operands[0]), AId,
+        AInstr.Node);
+      if LForm = MulForm.Shift then
+        LFactor := self.FModule.InstrAt(AInstr.Operands[1]).Imm;
+        LShift := 0;
+        while LFactor > 1 do
+          LFactor := LFactor shr 1;
+          LShift := LShift + 1;
+        end;
+        self.DoEmitPair(X64Op.Shl, LWidth, self.DoVReg(AId), ImmediateOperand(LShift), AInstr.Node);
+        return;
+      end;
+      LWidth := DoPickWidth(LWidth = 1, 4, LWidth);
+      if LForm = MulForm.Immediate then
+        self.DoEmitPair(X64Op.IMul, LWidth, self.DoVReg(AId),
+          ImmediateOperand(self.FModule.InstrAt(AInstr.Operands[1]).Imm), AInstr.Node);
+        return;
+      end;
+      self.DoEmitPair(X64Op.IMul, LWidth, self.DoVReg(AId), self.DoVReg(AInstr.Operands[1]),
+        AInstr.Node);
+    end;
+
+    // mul / and / or / xor: and / or / xor the left operand moved into the result, the right
+    // one (an immediate when it fits) combined into it; an integer mul goes to DoMultiply, a
+    // float's mul to DoFloatArith
     hidden method DoCombine(const AId: int64; const AInstr: ref IrInstr);
     var
       LOp: X64Op;
@@ -646,29 +1664,29 @@ type
         self.DoFloatArith(AId, AInstr);
         return;
       end;
-      LOp := X64Op.IMul;
+      if AInstr.Kind = IrOp.Mul then
+        self.DoMultiply(AId, AInstr);
+        return;
+      end;
+      LOp := X64Op.BitXor;
       if AInstr.Kind = IrOp.BitAnd then
         LOp := X64Op.BitAnd;
       end;
       if AInstr.Kind = IrOp.BitOr then
         LOp := X64Op.BitOr;
       end;
-      if AInstr.Kind = IrOp.BitXor then
-        LOp := X64Op.BitXor;
-      end;
       LWidth := DoWidth(AInstr.ValueType, AId);
-      if (LOp = X64Op.IMul) and (LWidth = 1) then
-        LWidth := 4;
-      end;
       self.DoCopy(AInstr.ValueType, self.DoVReg(AId), self.DoVReg(AInstr.Operands[0]), AId,
         AInstr.Node);
-      self.DoEmitPair(LOp, LWidth, self.DoVReg(AId), self.DoVReg(AInstr.Operands[1]), AInstr.Node);
+      self.DoEmitPair(LOp, LWidth, self.DoVReg(AId), self.DoRightOf(AInstr, 1, LWidth),
+        AInstr.Node);
     end;
 
-    // shl / shr / sar: the left operand moved into the result, the count into rcx (the
-    // hardware reads cl and masks it to the width, as clang's code relies on; the count
-    // moves at its own width), then the shift; rcx stays live from its mov to the shift, so
-    // allocation gives neither a scratch there
+    // shl / shr / sar: the left operand moved into the result, then the shift by an
+    // immediate count (a constant's low byte: the hardware masks it as it masks cl) or by
+    // rcx: the count moved into rcx (the hardware reads cl and masks it to the width, as
+    // clang's code relies on; the count moves at its own width); rcx stays live from its
+    // mov to the shift, so allocation gives neither a scratch there
     hidden method DoShift(const AId: int64; const AInstr: ref IrInstr);
     var
       LOp: X64Op;
@@ -684,11 +1702,114 @@ type
       end;
       self.DoCopy(AInstr.ValueType, self.DoVReg(AId), self.DoVReg(AInstr.Operands[0]), AId,
         AInstr.Node);
+      if self.DoIsImmConstant(AInstr.Operands[1]) then
+        self.DoEmitPair(LOp, DoWidth(AInstr.ValueType, AId), self.DoVReg(AId),
+          ImmediateOperand(self.FModule.InstrAt(AInstr.Operands[1]).Imm & 0xFF), AInstr.Node);
+        return;
+      end;
       LCountId := AInstr.Operands[1];
       LCount := PhysicalOperand(self.DoPhysical(ADAM_X64_SELECT_SHIFT_COUNT));
       self.DoCopy(self.FModule.InstrAt(LCountId).ValueType, LCount, self.DoVReg(LCountId),
         LCountId, AInstr.Node);
       self.DoEmitPair(LOp, DoWidth(AInstr.ValueType, AId), self.DoVReg(AId), LCount, AInstr.Node);
+    end;
+
+    // A shift AOp of the AWidth-byte register ADest by the immediate ACount (none for 0)
+    hidden method DoShiftBy(const AOp: X64Op; const AWidth: int64; const ADest: ref MachineOperand;
+      const ACount: int64; const ANode: int64);
+    begin
+      if ACount > 0 then
+        self.DoEmitPair(AOp, AWidth, ADest, ImmediateOperand(ACount), ANode);
+      end;
+    end;
+
+    // A division or remainder by a constant through its magic number (DoSignedMagic /
+    // DoUnsignedMagic, see their notes): the magic into rax, imul / mul wide by the dividend
+    // (rax its implicit use, rax and rdx its implicit defs, so allocation gives neither as a
+    // scratch from the mov to the high half's copy), the high half copied out of rdx into a
+    // fresh register and corrected there into the quotient; a remainder is the dividend
+    // minus the quotient times the divisor (imul's immediate when it fits, else a register:
+    // the low bits are the same signed or unsigned). Exact for every dividend, no fault
+    hidden method DoMagicDivide(const AId: int64; const AInstr: ref IrInstr);
+    var
+      LSigned: bool;
+      LAdd: bool;
+      LWidth: int64;
+      LBits: int64;
+      LDivisor: int64;
+      LMagic: int64;
+      LShift: int64;
+      LRax: int64;
+      LRdx: int64;
+      LDividend: ref MachineOperand;
+      LQuotient: ref MachineOperand;
+      LTemp: ref MachineOperand;
+      LFactor: ref MachineOperand;
+      LWide: ref MachineInstr;
+      LNode: int64;
+    begin
+      LNode := AInstr.Node;
+      LSigned := (AInstr.Kind = IrOp.SDiv) or (AInstr.Kind = IrOp.SRem);
+      LWidth := DoWidth(AInstr.ValueType, AId);
+      LBits := LWidth * 8;
+      LDivisor := self.FModule.InstrAt(AInstr.Operands[1]).Imm;
+      LRax := self.DoPhysical(ADAM_X64_SELECT_DIVIDEND);
+      LRdx := self.DoPhysical(ADAM_X64_SELECT_REMAINDER);
+      LDividend := self.DoVReg(AInstr.Operands[0]);
+      LQuotient := VirtualOperand(self.FMachine.NewVReg(RegClass.General));
+      LAdd := false;
+      if LSigned then
+        DoSignedMagic(LDivisor, LBits, LMagic, LShift);
+      else
+        DoUnsignedMagic(uint64(LDivisor), LBits, LMagic, LShift, LAdd);
+      end;
+      self.DoEmitPair(X64Op.Mov, LWidth, PhysicalOperand(LRax), ImmediateOperand(LMagic), LNode);
+      LWide := self.DoEmit(DoPickOp(LSigned, X64Op.IMulWide, X64Op.MulWide), LWidth, LNode);
+      LWide.AddOperand(LDividend);
+      LWide.ImplicitUses.Add(LRax);
+      LWide.ImplicitDefs.Add(LRax);
+      LWide.ImplicitDefs.Add(LRdx);
+      self.DoEmitPair(X64Op.Mov, LWidth, LQuotient, PhysicalOperand(LRdx), LNode);
+      if LSigned then
+        // q = hi (+ n when d > 0 > M, - n when d < 0 < M) sar s, plus 1 when negative
+        if (LDivisor > 0) and (LMagic < 0) then
+          self.DoEmitPair(X64Op.Add, LWidth, LQuotient, LDividend, LNode);
+        end;
+        if (LDivisor < 0) and (LMagic > 0) then
+          self.DoEmitPair(X64Op.Sub, LWidth, LQuotient, LDividend, LNode);
+        end;
+        self.DoShiftBy(X64Op.Sar, LWidth, LQuotient, LShift, LNode);
+        LTemp := VirtualOperand(self.FMachine.NewVReg(RegClass.General));
+        self.DoEmitPair(X64Op.Mov, LWidth, LTemp, LQuotient, LNode);
+        self.DoShiftBy(X64Op.Shr, LWidth, LTemp, LBits - 1, LNode);
+        self.DoEmitPair(X64Op.Add, LWidth, LQuotient, LTemp, LNode);
+      else
+        if LAdd then
+          // q = ((n - hi) shr 1 + hi) shr (s - 1)
+          LTemp := VirtualOperand(self.FMachine.NewVReg(RegClass.General));
+          self.DoEmitPair(X64Op.Mov, LWidth, LTemp, LDividend, LNode);
+          self.DoEmitPair(X64Op.Sub, LWidth, LTemp, LQuotient, LNode);
+          self.DoShiftBy(X64Op.Shr, LWidth, LTemp, 1, LNode);
+          self.DoEmitPair(X64Op.Add, LWidth, LTemp, LQuotient, LNode);
+          self.DoShiftBy(X64Op.Shr, LWidth, LTemp, LShift - 1, LNode);
+          LQuotient := LTemp;
+        else
+          self.DoShiftBy(X64Op.Shr, LWidth, LQuotient, LShift, LNode);
+        end;
+      end;
+      if (AInstr.Kind = IrOp.SDiv) or (AInstr.Kind = IrOp.UDiv) then
+        self.DoEmitPair(X64Op.Mov, LWidth, self.DoVReg(AId), LQuotient, LNode);
+        return;
+      end;
+      if DoImmFits(LDivisor, LWidth) then
+        LFactor := ImmediateOperand(LDivisor);
+      else
+        LFactor := VirtualOperand(self.FMachine.NewVReg(RegClass.General));
+        self.DoEmitPair(X64Op.Mov, LWidth, LFactor, ImmediateOperand(LDivisor), LNode);
+      end;
+      self.DoEmitPair(X64Op.IMul, LWidth, LQuotient, LFactor, LNode);
+      self.DoEmitPair(X64Op.Mov, LWidth, self.DoVReg(AId), LDividend, LNode);
+      self.DoEmitPair(X64Op.Sub, LWidth, self.DoVReg(AId), LQuotient, LNode);
     end;
 
     // sdiv / udiv / srem / urem (32 or 64 bits, Ssa's rule): the dividend moved into rax,
@@ -697,7 +1818,8 @@ type
     // div by the divisor, then the quotient (rax) or the remainder (rdx) moved into the
     // result. rax and rdx are the cqo's and the division's implicit registers, so allocation
     // gives neither as a scratch from the dividend's mov to the result's. A zero divisor and
-    // MIN div -1 fault as the hardware does (DESIGN sec 6: clang's code, no check)
+    // MIN div -1 fault as the hardware does (DESIGN sec 6: clang's code, no check). A
+    // constant divisor DoMagicFits takes goes to DoMagicDivide
     hidden method DoDivide(const AId: int64; const AInstr: ref IrInstr);
     var
       LSigned: bool;
@@ -707,6 +1829,10 @@ type
       LOp: X64Op;
       LInstr: ref MachineInstr;
     begin
+      if self.DoMagicFits(AInstr) then
+        self.DoMagicDivide(AId, AInstr);
+        return;
+      end;
       LSigned := (AInstr.Kind = IrOp.SDiv) or (AInstr.Kind = IrOp.SRem);
       LWidth := DoWidth(AInstr.ValueType, AId);
       LRax := self.DoPhysical(ADAM_X64_SELECT_DIVIDEND);
@@ -1142,25 +2268,51 @@ type
       self.DoEmitPair(X64Op.MovZX8, 4, self.DoVReg(AId), self.DoVReg(AId), AInstr.Node);
     end;
 
-    // cmp: the two operands compared at their width, setcc of the predicate's condition into
-    // the result's low byte, then movzx of that byte into the result at 4 bytes, so the whole
-    // register is defined (a bool is read at its 1 byte, but a register written in part
-    // keeps a dependency on its old value)
-    hidden method DoCompare(const AId: int64; const AInstr: ref IrInstr);
+    // The flags of the compare AInstr, at ANode, and the condition its predicate holds on
+    // (DoCondOf): an integer one's operands compared at their width (test of the left with
+    // itself against 0: the same flags as cmp with 0; cmp with the right's immediate when
+    // it fits), a float order's by ucomiss / ucomisd (the operands swapped for < and <=:
+    // DoFloatCompare's rule)
+    hidden method DoCompareFlags(const AInstr: ref IrInstr; const ANode: int64): X64Cond;
     var
       LLeft: int64;
-      LSet: ref MachineInstr;
+      LRight: int64;
+      LType: IrType;
+      LWidth: int64;
     begin
       LLeft := AInstr.Operands[0];
-      if DoIsVector(self.FModule.InstrAt(LLeft).ValueType) then
+      LRight := AInstr.Operands[1];
+      LType := self.FModule.InstrAt(LLeft).ValueType;
+      if DoIsVector(LType) then
+        if (AInstr.Predicate = IrPredicate.FLess) or (AInstr.Predicate = IrPredicate.FLessEqual) then
+          LLeft := AInstr.Operands[1];
+          LRight := AInstr.Operands[0];
+        end;
+        self.DoEmitPair(DoPickOp(LType = IrType.Float32, X64Op.UComiSS, X64Op.UComiSD), 0,
+          self.DoVReg(LLeft), self.DoVReg(LRight), ANode);
+        return DoCondOf(AInstr.Predicate);
+      end;
+      LWidth := DoWidth(LType, LLeft);
+      if self.DoImmAt(AInstr, 1, LWidth) and (self.FModule.InstrAt(LRight).Imm = 0) then
+        self.DoEmitPair(X64Op.Test, LWidth, self.DoVReg(LLeft), self.DoVReg(LLeft), ANode);
+      else
+        self.DoEmitPair(X64Op.Cmp, LWidth, self.DoVReg(LLeft), self.DoRightOf(AInstr, 1, LWidth),
+          ANode);
+      end;
+      return DoCondOf(AInstr.Predicate);
+    end;
+
+    // cmp: the flags (DoCompareFlags), setcc of the predicate's condition into the result's
+    // low byte, then movzx of that byte into the result at 4 bytes, so the whole register is
+    // defined (a bool is read at its 1 byte, but a register written in part keeps a
+    // dependency on its old value); a float's is DoFloatCompare's
+    hidden method DoCompare(const AId: int64; const AInstr: ref IrInstr);
+    begin
+      if DoIsVector(self.FModule.InstrAt(AInstr.Operands[0]).ValueType) then
         self.DoFloatCompare(AId, AInstr);
         return;
       end;
-      self.DoEmitPair(X64Op.Cmp, DoWidth(self.FModule.InstrAt(LLeft).ValueType, LLeft),
-        self.DoVReg(LLeft), self.DoVReg(AInstr.Operands[1]), AInstr.Node);
-      LSet := self.DoEmit(X64Op.SetCC, 0, AInstr.Node);
-      LSet.Cond := DoCondOf(AInstr.Predicate);
-      LSet.AddOperand(self.DoVReg(AId));
+      self.DoSetCond(self.DoCompareFlags(AInstr, AInstr.Node), self.DoVReg(AId), AInstr.Node);
       self.DoEmitPair(X64Op.MovZX8, 4, self.DoVReg(AId), self.DoVReg(AId), AInstr.Node);
     end;
 
@@ -1263,9 +2415,11 @@ type
       LPlace: ref Location;
       LCall: ref MachineInstr;
       LUses: ref Int64List;
+      LStack: ref MachineOperand;
       LTail: bool;
       LReg: int64;
       LShadow: int64;
+      LArg: int64;
       LI: int64;
     begin
       LInstr := self.FModule.InstrAt(AId);
@@ -1285,11 +2439,17 @@ type
         LPlace := LLayout.ArgAt(LI);
         if LPlace.Kind = LocationKind.Stack then
           if LTail then
-            self.DoCopy(LSignature.ParamTypes[LI], IncomingMemory(LPlace.EntryOffset),
-              self.DoVReg(LInstr.Operands[AFirst + LI]), AId, LInstr.Node);
+            LStack := IncomingMemory(LPlace.EntryOffset);
           else
-            self.DoCopy(LSignature.ParamTypes[LI], OutgoingMemory(LPlace.CallOffset),
-              self.DoVReg(LInstr.Operands[AFirst + LI]), AId, LInstr.Node);
+            LStack := OutgoingMemory(LPlace.CallOffset);
+          end;
+          LArg := LInstr.Operands[AFirst + LI];
+          if self.DoArgImm(LArg) then
+            // A constant argument stored as the immediate (DoArgImm: it fits)
+            self.DoEmitPair(X64Op.Mov, DoWidth(self.FModule.InstrAt(LArg).ValueType, LArg),
+              LStack, ImmediateOperand(self.FModule.InstrAt(LArg).Imm), LInstr.Node);
+          else
+            self.DoCopy(LSignature.ParamTypes[LI], LStack, self.DoVReg(LArg), AId, LInstr.Node);
           end;
         end;
       end;
@@ -1298,8 +2458,14 @@ type
         LPlace := LLayout.ArgAt(LI);
         if LPlace.Kind = LocationKind.Register then
           LReg := self.DoPhysical(LPlace.RegisterName);
-          self.DoCopy(LSignature.ParamTypes[LI], PhysicalOperand(LReg),
-            self.DoVReg(LInstr.Operands[AFirst + LI]), AId, LInstr.Node);
+          LArg := LInstr.Operands[AFirst + LI];
+          if self.DoArgImm(LArg) then
+            self.DoLoadImm(DoWidth(self.FModule.InstrAt(LArg).ValueType, LArg),
+              PhysicalOperand(LReg), self.FModule.InstrAt(LArg).Imm, LInstr.Node);
+          else
+            self.DoCopy(LSignature.ParamTypes[LI], PhysicalOperand(LReg), self.DoVReg(LArg), AId,
+              LInstr.Node);
+          end;
           LUses.Add(LReg);
           // A float's bits into its slot's integer register too (a variadic call)
           if LPlace.ShadowName <> "" then
@@ -1393,8 +2559,14 @@ type
       LReg := -1;
       if AInstr.Operands.Count > 0 then
         LReg := self.DoPhysical(self.FOwnLayout.ResultAt.RegisterName);
-        self.DoCopy(self.FFunction.Signature.ResultType, PhysicalOperand(LReg),
-          self.DoVReg(AInstr.Operands[0]), AId, AInstr.Node);
+        if self.DoIsImmConstant(AInstr.Operands[0]) then
+          // A constant result moved in as the immediate (a register takes any)
+          self.DoLoadImm(DoWidth(self.FFunction.Signature.ResultType, AId), PhysicalOperand(LReg),
+            self.FModule.InstrAt(AInstr.Operands[0]).Imm, AInstr.Node);
+        else
+          self.DoCopy(self.FFunction.Signature.ResultType, PhysicalOperand(LReg),
+            self.DoVReg(AInstr.Operands[0]), AId, AInstr.Node);
+        end;
       end;
       if self.FFunction.ScopeCount() > 0 then
         self.DoEmit(X64Op.Nop, 0, AInstr.Node);
@@ -1446,8 +2618,14 @@ type
           raise(ADAM_X64_SELECT_FAULT_PHI_EDGE + IntToStr(AFrom) + " at i" + IntToStr(LPhis[LJ]));
         end;
         LTemps[LJ] := self.FMachine.NewVReg(DoClassOf(LPhi.ValueType));
-        self.DoCopy(LPhi.ValueType, VirtualOperand(LTemps[LJ]), self.DoVReg(LPhi.Operands[LK]),
-          LPhis[LJ], LPhi.Node);
+        if self.DoIsImmConstant(LPhi.Operands[LK]) then
+          // An integer constant moved in as the immediate (no flags are live on an edge)
+          self.DoLoadImm(DoWidth(LPhi.ValueType, LPhis[LJ]), VirtualOperand(LTemps[LJ]),
+            self.FModule.InstrAt(LPhi.Operands[LK]).Imm, LPhi.Node);
+        else
+          self.DoCopy(LPhi.ValueType, VirtualOperand(LTemps[LJ]), self.DoVReg(LPhi.Operands[LK]),
+            LPhis[LJ], LPhi.Node);
+        end;
       end;
       for LJ := 0 to LPhis.Count - 1 do
         LPhi := self.FModule.InstrAt(LPhis[LJ]);
@@ -1488,32 +2666,118 @@ type
       return LEdge;
     end;
 
-    // branch: the bool tested, a jump on non-zero to the then target, a jump to the else one
+    // The flags of the branch condition ACond, at ANode, and the condition a jcc to its true
+    // target takes: a fused compare's own (DoCompareFlags), else the bool tested (non-zero)
+    hidden method DoFlagsOf(const ACond: int64; const ANode: int64): X64Cond;
+    var
+      LWidth: int64;
+    begin
+      if self.FFused.Find(ACond) = 1 then
+        return self.DoCompareFlags(self.FModule.InstrAt(ACond), ANode);
+      end;
+      LWidth := DoWidth(self.FModule.InstrAt(ACond).ValueType, ACond);
+      self.DoEmitPair(X64Op.Test, LWidth, self.DoVReg(ACond), self.DoVReg(ACond), ANode);
+      return X64Cond.NotEqual;
+    end;
+
+    // branch: the flags (DoFlagsOf), a jcc to the then target, a jump to the else one; a
+    // cmov diamond's is DoDiamond's
     hidden method DoBranch(const AInstr: ref IrInstr);
     var
       LThen: int64;
       LElse: int64;
-      LWidth: int64;
       LJump: ref MachineInstr;
+      LCond: X64Cond;
     begin
+      if self.FDiamondJoin.Find(AInstr.Block) >= 0 then
+        self.DoDiamond(AInstr);
+        return;
+      end;
       LThen := self.DoBranchTarget(AInstr.Targets[0], AInstr.Node);
       LElse := self.DoBranchTarget(AInstr.Targets[1], AInstr.Node);
-      LWidth := DoWidth(self.FModule.InstrAt(AInstr.Operands[0]).ValueType, AInstr.Operands[0]);
-      self.DoEmitPair(X64Op.Test, LWidth, self.DoVReg(AInstr.Operands[0]),
-        self.DoVReg(AInstr.Operands[0]), AInstr.Node);
+      LCond := self.DoFlagsOf(AInstr.Operands[0], AInstr.Node);
       LJump := self.DoEmit(X64Op.Jcc, 0, AInstr.Node);
-      LJump.Cond := X64Cond.NotEqual;
+      LJump.Cond := LCond;
       LJump.AddOperand(BlockOperand(LThen));
       LJump := self.DoEmit(X64Op.Jmp, 0, AInstr.Node);
       LJump.AddOperand(BlockOperand(LElse));
     end;
 
+    // A cmov diamond's branch (see the header): each join phi's false value moved into a
+    // temporary of its own (4 bytes for a narrower one: cmov has no 1-byte form, the low
+    // bytes are the same), the flags, a cmov of its true value (a 1 / 0 pair: a setcc of
+    // the condition or its inverse, then movzx), then each phi given its temporary (all
+    // temporaries first: a phi may be another's value), a jump to the join. Nothing between
+    // the flags and the last cmov changes them
+    hidden method DoDiamond(const AInstr: ref IrInstr);
+    var
+      LPhis: ref Int64List;
+      LPhi: ref IrInstr;
+      LTemps: Int64Array;
+      LTrues: Int64Array;
+      LForms: Int64Array;
+      LJoin: int64;
+      LFalse: int64;
+      LWidth: int64;
+      LCond: X64Cond;
+      LMove: ref MachineInstr;
+      LJ: int64;
+    begin
+      LJoin := self.FDiamondJoin.Find(AInstr.Block);
+      LPhis := self.DoPhisOf(LJoin);
+      setlength(LTemps, LPhis.Count);
+      setlength(LTrues, LPhis.Count);
+      setlength(LForms, LPhis.Count);
+      for LJ := 0 to LPhis.Count - 1 do
+        LPhi := self.FModule.InstrAt(LPhis[LJ]);
+        LTrues[LJ] := self.DoPhiValue(LPhis[LJ], self.FDiamondTrue.Find(AInstr.Block));
+        LFalse := self.DoPhiValue(LPhis[LJ], self.FDiamondFalse.Find(AInstr.Block));
+        LForms[LJ] := self.DoSetForm(LTrues[LJ], LFalse);
+        LTemps[LJ] := self.FMachine.NewVReg(RegClass.General);
+        if LForms[LJ] = 0 then
+          LWidth := DoWidth(LPhi.ValueType, LPhis[LJ]);
+          self.DoEmitPair(X64Op.Mov, DoPickWidth(LWidth < 4, 4, LWidth), VirtualOperand(LTemps[LJ]),
+            self.DoVReg(LFalse), AInstr.Node);
+        end;
+      end;
+      LCond := self.DoFlagsOf(AInstr.Operands[0], AInstr.Node);
+      for LJ := 0 to LPhis.Count - 1 do
+        LPhi := self.FModule.InstrAt(LPhis[LJ]);
+        if LForms[LJ] = 0 then
+          LWidth := DoWidth(LPhi.ValueType, LPhis[LJ]);
+          LMove := self.DoEmit(X64Op.CMov, DoPickWidth(LWidth < 4, 4, LWidth), AInstr.Node);
+          LMove.Cond := LCond;
+          LMove.AddOperand(VirtualOperand(LTemps[LJ]));
+          LMove.AddOperand(self.DoVReg(LTrues[LJ]));
+        else
+          if LForms[LJ] = 1 then
+            self.DoSetCond(LCond, VirtualOperand(LTemps[LJ]), AInstr.Node);
+          else
+            self.DoSetCond(DoInvert(LCond), VirtualOperand(LTemps[LJ]), AInstr.Node);
+          end;
+          self.DoEmitPair(X64Op.MovZX8, 4, VirtualOperand(LTemps[LJ]), VirtualOperand(LTemps[LJ]),
+            AInstr.Node);
+        end;
+      end;
+      for LJ := 0 to LPhis.Count - 1 do
+        LPhi := self.FModule.InstrAt(LPhis[LJ]);
+        self.DoCopy(LPhi.ValueType, self.DoVReg(LPhis[LJ]), VirtualOperand(LTemps[LJ]), LPhis[LJ],
+          AInstr.Node);
+      end;
+      self.DoJumpMachine(self.DoMachineBlock(LJoin), AInstr.Node);
+    end;
+
     // One SSA instruction into the current machine block. A parameter was copied at the
-    // entry (DoParameters); a phi's value arrives by its edges' copies (DoEdgeCopies)
+    // entry (DoParameters); a phi's value arrives by its edges' copies (DoEdgeCopies); a
+    // folded instruction (DoIsFolded) makes nothing
     hidden method DoInstr(const AId: int64);
     var
       LInstr: ref IrInstr;
+      LValue: ref IrInstr;
     begin
+      if self.DoIsFolded(AId) then
+        return;
+      end;
       LInstr := self.FModule.InstrAt(AId);
       match LInstr.Kind of
         IrOp.Constant: self.DoConstant(AId, LInstr);
@@ -1526,9 +2790,17 @@ type
           self.DoCopy(LInstr.ValueType, self.DoVReg(AId), self.DoAddressOf(LInstr.Operands[0]),
             AId, LInstr.Node);
         IrOp.Store:
-          self.DoCopy(self.FModule.InstrAt(LInstr.Operands[1]).ValueType,
-            self.DoAddressOf(LInstr.Operands[0]), self.DoVReg(LInstr.Operands[1]), AId, LInstr.Node);
-        IrOp.Add, IrOp.Sub, IrOp.Offset: self.DoArithmetic(AId, LInstr);
+          LValue := self.FModule.InstrAt(LInstr.Operands[1]);
+          if self.DoStoreImm(LInstr) then
+            // A constant stored as the immediate (a float's bits too)
+            self.DoEmitPair(X64Op.Mov, DoWidth(LValue.ValueType, AId),
+              self.DoAddressOf(LInstr.Operands[0]), ImmediateOperand(LValue.Imm), LInstr.Node);
+          else
+            self.DoCopy(LValue.ValueType, self.DoAddressOf(LInstr.Operands[0]),
+              self.DoVReg(LInstr.Operands[1]), AId, LInstr.Node);
+          end;
+        IrOp.Add, IrOp.Sub: self.DoArithmetic(AId, LInstr);
+        IrOp.Offset: self.DoOffset(AId, LInstr);
         IrOp.Address:
           self.DoEmitPair(X64Op.Lea, DoWidth(IrType.Pointer, AId), self.DoVReg(AId),
             RipMemory(SymbolClass.Data, self.FModule.DataAt(LInstr.Link).Symbol, ""), LInstr.Node);
@@ -1565,6 +2837,14 @@ type
       self.FUsedAsValue := ref Int64Map(0);
       self.FParentAt := ref Int64Map(-1);
       self.FBlockOf := ref Int64Map(-1);
+      self.FUseCount := ref Int64Map(0);
+      self.FUserOf := ref Int64Map(-1);
+      self.FFused := ref Int64Map(0);
+      self.FPredCount := ref Int64Map(0);
+      self.FAbsorbed := ref Int64Map(0);
+      self.FDiamondJoin := ref Int64Map(-1);
+      self.FDiamondTrue := ref Int64Map(-1);
+      self.FDiamondFalse := ref Int64Map(-1);
     end;
 
     // The machine code of SSA function AFunction (see the header)
@@ -1601,13 +2881,19 @@ type
       self.DoClearMaps();
       self.DoScan();
       self.DoAssign();
+      // A cmov diamond's arm makes no machine block (its branch jumps past it)
       for LI := 0 to LBlocks.Count - 1 do
-        self.FBlockOf.Put(LBlocks[LI], self.FMachine.AddBlock(LBlocks[LI]));
+        if self.FAbsorbed.Find(LBlocks[LI]) <> 1 then
+          self.FBlockOf.Put(LBlocks[LI], self.FMachine.AddBlock(LBlocks[LI]));
+        end;
       end;
       self.FSource := LBlocks[0];
       self.FCurrent := self.FBlockOf.Find(LBlocks[0]);
       self.DoParameters();
       for LI := 0 to LBlocks.Count - 1 do
+        if self.FAbsorbed.Find(LBlocks[LI]) = 1 then
+          skip;
+        end;
         self.FSource := LBlocks[LI];
         self.FCurrent := self.FBlockOf.Find(LBlocks[LI]);
         LInstrs := self.FModule.BlockAt(LBlocks[LI]).Instrs;

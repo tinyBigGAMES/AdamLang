@@ -30,7 +30,8 @@
             [base+disp32] mod 10; rsp / r12 as a base need the SIB byte 24
             (no index); rbp / r13 with no displacement take a zero disp8 (mod
             00 there means rip); [rip+symbol] is mod 00 rm 101 and a disp32
-            the relocation fills
+            the relocation fills; [base+index*scale+disp] is rm 100 and a
+            SIB byte (scale, index, base; REX.X the index's high bit)
   jumps     jcc 0F 80+cc rel32 and jmp E9 rel32 to a block of the function
             (always rel32: debug code is not relaxed), patched once every
             block is placed
@@ -290,6 +291,31 @@ type
         end;
         self.DoCheckRegister(AOperand.Reg);
       end;
+      if AOperand.Scale > 0 then
+        self.DoCheckIndex(AOperand);
+      end;
+    end;
+
+    // The index of memory AOperand is one a SIB byte takes: over a register base, a
+    // physical general register other than rsp (SIB index 100 means none), times 1, 2, 4
+    // or 8
+    hidden method DoCheckIndex(const AOperand: ref MachineOperand);
+    begin
+      if AOperand.Base <> MemoryBase.Register then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText + " (an index off no register base)");
+      end;
+      if AOperand.IndexVirtual then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_VIRTUAL, "v" + IntToStr(AOperand.IndexReg));
+      end;
+      self.DoCheckRegister(AOperand.IndexReg);
+      if self.DoGeneral(AOperand.IndexReg) = 4 then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText + " (rsp as an index)");
+      end;
+      if (AOperand.Scale <> 1) and (AOperand.Scale <> 2) and (AOperand.Scale <> 4) and
+        (AOperand.Scale <> 8) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText + " (scale " +
+          IntToStr(AOperand.Scale) + ")");
+      end;
     end;
 
     // General register AReg's encoding number (0..15); a vector register is the class fault
@@ -463,6 +489,10 @@ type
       if LRm >= 8 then
         LRex := LRex + 1;
       end;
+      // An index register's high bit is REX.X
+      if self.DoIsMemory(ARm) and (ARm.Scale > 0) and (self.DoGeneral(ARm.IndexReg) >= 8) then
+        LRex := LRex + 2;
+      end;
       LForce := false;
       if AByteReg and (not ADigit) and (AReg >= 4) and (AReg <= 7) then
         LForce := true;
@@ -564,9 +594,17 @@ type
       if ARm.DispSymbol <> "" then
         LMod := 2;
       end;
-      self.DoByte(LMod * 64 + AReg3 * 8 + LBase);
-      if LBase = 4 then
-        self.DoByte(0x24);
+      if ARm.Scale > 0 then
+        // rm 100 and a SIB byte: scale, index, base (an index of 100 would mean none: rsp
+        // is never one, DoCheckIndex)
+        self.DoByte(LMod * 64 + AReg3 * 8 + 4);
+        self.DoByte(self.DoScaleBits(ARm.Scale) * 64 + (self.DoGeneral(ARm.IndexReg) & 7) * 8 +
+          LBase);
+      else
+        self.DoByte(LMod * 64 + AReg3 * 8 + LBase);
+        if LBase = 4 then
+          self.DoByte(0x24);
+        end;
       end;
       if LMod = 1 then
         self.DoImm(ARm.Disp, 1);
@@ -581,6 +619,21 @@ type
       if LMod = 2 then
         self.DoImm(ARm.Disp, 4);
       end;
+    end;
+
+    // A SIB byte's scale field for AScale (1, 2, 4, 8: 0..3; DoCheckIndex checked it)
+    hidden const method DoScaleBits(const AScale: int64): int64;
+    begin
+      if AScale = 2 then
+        return 1;
+      end;
+      if AScale = 4 then
+        return 2;
+      end;
+      if AScale = 8 then
+        return 3;
+      end;
+      return 0;
     end;
 
     // The SectionSet symbol AOperand names: an import's (its library and name), else the
@@ -886,8 +939,10 @@ type
       self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
     end;
 
-    // shl / shr / sar: register or memory by cl (D3 /4, /5, /7; D2 for 1 byte); the count
-    // operand must be rcx (encoding number 1: the SDM has no other register count)
+    // shl / shr / sar: register or memory by cl (D3 /4, /5, /7; D2 for 1 byte) or by an
+    // immediate count (C1 /4, /5, /7 ib; C0 for 1 byte: its low byte, which the hardware
+    // masks as it masks cl); a register count must be rcx (encoding number 1: the SDM has no
+    // other register count)
     hidden method DoShift(const AInstr: ref MachineInstr);
     var
       LDst: ref MachineOperand;
@@ -900,11 +955,11 @@ type
       LDst := AInstr.OperandAt(0);
       LCount := AInstr.OperandAt(1);
       if not (self.DoIsRegister(LDst) or self.DoIsMemory(LDst)) or
-        (not self.DoIsRegister(LCount)) then
+        not (self.DoIsRegister(LCount) or self.DoIsImmediate(LCount)) then
         self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
         return;
       end;
-      if self.DoGeneral(LCount.Reg) <> 1 then
+      if self.DoIsRegister(LCount) and (self.DoGeneral(LCount.Reg) <> 1) then
         self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
         return;
       end;
@@ -916,6 +971,12 @@ type
         LDigit := 7;
       end;
       LByte := AInstr.Width = 1;
+      if self.DoIsImmediate(LCount) then
+        self.DoEncode(self.DoSizePrefix(AInstr.Width), AInstr.Width = 8, false,
+          self.DoPick(LByte, 0xC0, 0xC1), LDigit, true, LDst, false, LByte, 1);
+        self.DoImm(LCount.Imm & 0xFF, 1);
+        return;
+      end;
       self.DoEncode(self.DoSizePrefix(AInstr.Width), AInstr.Width = 8, false,
         self.DoPick(LByte, 0xD2, 0xD3), LDigit, true, LDst, false, LByte, 0);
     end;
@@ -1310,6 +1371,58 @@ type
       self.DoByte(0x0B);
     end;
 
+    // cmovcc: a register from a register or memory when the condition holds (0F 40+cc /r;
+    // 66 for 2 bytes, REX.W for 8; no 1-byte form)
+    hidden method DoCMov(const AInstr: ref MachineInstr);
+    var
+      LDst: ref MachineOperand;
+      LSrc: ref MachineOperand;
+    begin
+      self.DoNeed(AInstr, 2);
+      self.DoCheckWidth(AInstr);
+      LDst := AInstr.OperandAt(0);
+      LSrc := AInstr.OperandAt(1);
+      if (AInstr.Width = 1) or (not self.DoIsRegister(LDst)) or
+        not (self.DoIsRegister(LSrc) or self.DoIsMemory(LSrc)) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+        return;
+      end;
+      self.DoEncode(self.DoSizePrefix(AInstr.Width), AInstr.Width = 8, true,
+        0x40 + self.DoCondCode(AInstr.Cond), self.DoGeneral(LDst.Reg), false, LSrc, false, false,
+        0);
+    end;
+
+    // imul / mul of rax by a register or memory into rdx:rax (F7 /5, F7 /4; REX.W at 8 bytes)
+    hidden method DoWideMul(const AInstr: ref MachineInstr);
+    var
+      LFactor: ref MachineOperand;
+    begin
+      self.DoNeed(AInstr, 1);
+      self.DoCheckWide(AInstr);
+      LFactor := AInstr.OperandAt(0);
+      if not (self.DoIsRegister(LFactor) or self.DoIsMemory(LFactor)) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+        return;
+      end;
+      self.DoEncode(0, AInstr.Width = 8, false, 0xF7,
+        self.DoPick(AInstr.Op = X64Op.IMulWide, 5, 4), true, LFactor, false, false, 0);
+    end;
+
+    // zero: xor r32, r32 of one general register with itself (31 /r; a 32-bit write zeroes
+    // the whole register)
+    hidden method DoZero(const AInstr: ref MachineInstr);
+    var
+      LReg: ref MachineOperand;
+    begin
+      self.DoNeed(AInstr, 1);
+      LReg := AInstr.OperandAt(0);
+      if not self.DoIsRegister(LReg) then
+        self.DoFault(ADAM_X64_ENCODE_FAULT_FORM, self.FOpText);
+        return;
+      end;
+      self.DoEncode(0, false, false, 0x31, self.DoGeneral(LReg.Reg), false, LReg, false, false, 0);
+    end;
+
     // push / pop of a general register, always 8 bytes in 64-bit mode (50+rd, 58+rd; REX.B
     // for r8..r15, no REX.W)
     hidden method DoPushPop(const AInstr: ref MachineInstr);
@@ -1391,6 +1504,9 @@ type
         X64Op.Ret: self.DoRet(AInstr);
         X64Op.Nop: self.DoNop(AInstr);
         X64Op.Ud2: self.DoUd2(AInstr);
+        X64Op.CMov: self.DoCMov(AInstr);
+        X64Op.IMulWide, X64Op.MulWide: self.DoWideMul(AInstr);
+        X64Op.Zero: self.DoZero(AInstr);
         X64Op.TailJmp: self.DoTailJmp(AInstr);
         X64Op.Push, X64Op.Pop: self.DoPushPop(AInstr);
         X64Op.RepMovsb, X64Op.RepStosb: self.DoRepString(AInstr);

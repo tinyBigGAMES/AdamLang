@@ -24,8 +24,10 @@
   MachineOperand  one operand: a virtual or physical register, an
                   immediate, a memory place, a symbol (a call's target) or
                   a block (a jump's target). A memory place is a base plus
-                  a displacement; the base is a register, a stack slot of
-                  the function, the incoming argument area (offsets from
+                  a displacement (a register or slot base also plus an
+                  index register times 1, 2, 4 or 8); the base is a
+                  register, a stack slot of the function, the incoming
+                  argument area (offsets from
                   the stack pointer at the function's first instruction),
                   the outgoing argument area (offsets from the stack
                   pointer at a call) or a symbol, rip-relative. Slots and
@@ -103,12 +105,22 @@ public type
   // TailJmp is a tail call (Adam.Opt.Tail): like a ret it ends the function, the allocator
   // putting the epilogue before it; its one operand is a code symbol, an import's memory or
   // a physical register (never a virtual one: the frame its spill would live in is gone),
-  // the arguments' registers its ImplicitUses
+  // the arguments' registers its ImplicitUses.
+  // CMov moves its second operand (a register or memory) into its first (a register, 2, 4
+  // or 8 bytes) when its condition holds, else leaves the first as it was (it reads both;
+  // a 4-byte cmov zeroes the top half either way). IMulWide / MulWide multiply rax by their
+  // one operand (signed / unsigned, 4 or 8 bytes) into rdx:rax, the product's high half in
+  // rdx (rax its ImplicitUses, rax and rdx its ImplicitDefs: a division by a constant's
+  // magic number). Zero writes 0 into its one general register (xor r32, r32: the whole
+  // register, no read of its old value) and changes the flags, so selection makes it only
+  // where no flags are live. Shl / Shr / Sar also shift by an immediate count (the
+  // hardware masks it as it masks cl)
   X64Op = choices(Mov, MovD, MovQ, MovSS, MovSD, Lea, Add, Sub, AddSS, AddSD, SubSS, SubSD,
     MulSS, MulSD, DivSS, DivSD, XorPS, UComiSS, UComiSD, CvtSI2SS, CvtSI2SD, CvtTSS2SI,
     CvtTSD2SI, CvtSS2SD, CvtSD2SS, Test, Jcc, Jmp, Call, Ret, MovSX8, MovSX16, MovSXD, MovZX8,
     MovZX16, IMul, BitAnd, BitOr, BitXor, Neg, BitNot, Shl, Shr, Sar, Cqo, IDiv, UDiv, Cmp,
-    SetCC, Push, Pop, RepMovsb, RepStosb, LockXadd, Xchg, LockCmpxchg, Nop, Ud2, TailJmp);
+    SetCC, Push, Pop, RepMovsb, RepStosb, LockXadd, Xchg, LockCmpxchg, Nop, Ud2, TailJmp,
+    CMov, IMulWide, MulWide, Zero);
 
   // A condition Jcc and SetCC test, in the encoding's order (the low nibble of 0F 80..8F and
   // of 0F 90..9F)
@@ -188,6 +200,10 @@ begin
     X64Op.Nop: return "nop";
     X64Op.Ud2: return "ud2";
     X64Op.TailJmp: return "jmp";
+    X64Op.CMov: return "cmov";
+    X64Op.IMulWide: return "imul wide";
+    X64Op.MulWide: return "mul wide";
+    X64Op.Zero: return "zero";
   end;
   return "";
 end;
@@ -300,13 +316,21 @@ begin
   return (AOp = X64Op.LockXadd) or (AOp = X64Op.Xchg) or (AOp = X64Op.LockCmpxchg);
 end;
 
+// True for the widening multiplies: imul / mul of rax by their one operand into rdx:rax
+// (they only read it, like a division)
+public routine X64OpIsWideMul(const AOp: X64Op): bool;
+begin
+  return (AOp = X64Op.IMulWide) or (AOp = X64Op.MulWide);
+end;
+
 // True for the ops whose operation size varies (Dump prints it after the mnemonic; SetCC
-// always writes 1 byte)
+// always writes 1 byte, Zero always 4)
 public routine X64OpHasWidth(const AOp: X64Op): bool;
 begin
   return (AOp = X64Op.Mov) or (AOp = X64Op.Lea) or (AOp = X64Op.Test) or X64OpIsExtend(AOp) or
     X64OpIsCombine(AOp) or X64OpIsUnary(AOp) or (AOp = X64Op.Cqo) or X64OpIsDivide(AOp) or
-    (AOp = X64Op.Cmp) or X64OpIsIntConvert(AOp) or X64OpIsAtomic(AOp);
+    (AOp = X64Op.Cmp) or X64OpIsIntConvert(AOp) or X64OpIsAtomic(AOp) or (AOp = X64Op.CMov) or
+    X64OpIsWideMul(AOp);
 end;
 
 public type
@@ -340,6 +364,11 @@ public type
     // Memory with a Register base: a symbol whose section offset (SecRel32) is added to
     // Disp ("" for none): a thread-local variable's place in its thread's copy
     DispSymbol: string;
+    // Memory with a Register or Slot base: an index register times Scale (1, 2, 4 or 8)
+    // added too (Scale 0: no index); IndexVirtual true when IndexReg is a virtual register
+    IndexReg: int64;
+    IndexVirtual: bool;
+    Scale: int64;
 
     init(const AKind: OperandKind);
     begin
@@ -357,6 +386,9 @@ public type
       self.Block := 0;
       self.Segment := "";
       self.DispSymbol := "";
+      self.IndexReg := 0;
+      self.IndexVirtual := false;
+      self.Scale := 0;
     end;
   end;
 
@@ -435,6 +467,24 @@ begin
   return LOperand;
 end;
 
+// AMemory (a Register or Slot base) with the index register AReg (virtual when AVirtual)
+// times AScale (1, 2, 4 or 8) added, as a new operand
+public routine IndexedMemory(const AMemory: ref MachineOperand; const AReg: int64;
+  const AVirtual: bool; const AScale: int64): ref MachineOperand;
+var
+  LOperand: ref MachineOperand;
+begin
+  LOperand := DoMemory(AMemory.Base, AMemory.Disp);
+  LOperand.Reg := AMemory.Reg;
+  LOperand.BaseVirtual := AMemory.BaseVirtual;
+  LOperand.SlotIndex := AMemory.SlotIndex;
+  LOperand.DispSymbol := AMemory.DispSymbol;
+  LOperand.IndexReg := AReg;
+  LOperand.IndexVirtual := AVirtual;
+  LOperand.Scale := AScale;
+  return LOperand;
+end;
+
 // The memory at ADisp in slot ASlot
 public routine SlotMemory(const ASlot: int64; const ADisp: int64): ref MachineOperand;
 var
@@ -509,7 +559,7 @@ public type
     Op: X64Op;
     // The operation size in bytes (the ops X64OpHasWidth names; 0 for the others)
     Width: int64;
-    // Jcc / SetCC: the condition it jumps on / sets from
+    // Jcc / SetCC / CMov: the condition it jumps on / sets from / moves on
     Cond: X64Cond;
     hidden FOperands: array of ref MachineOperand;
     hidden FCount: int64;
@@ -808,6 +858,14 @@ public type
           end;
         MemoryBase.Segment: LBase := AOperand.Segment + ":";
       end;
+      if AOperand.Scale > 0 then
+        if AOperand.IndexVirtual then
+          LBase := LBase + "+" + self.DoVRegText(AOperand.IndexReg);
+        else
+          LBase := LBase + "+" + ARegisters.Text(AOperand.IndexReg);
+        end;
+        LBase := LBase + "*" + IntToStr(AOperand.Scale);
+      end;
       if AOperand.DispSymbol <> "" then
         LBase := LBase + "+secrel " + AOperand.DispSymbol;
       end;
@@ -871,7 +929,11 @@ public type
         if AInstr.Op = X64Op.SetCC then
           LText := X64SetText(AInstr.Cond);
         else
-          LText := X64OpText(AInstr.Op);
+          if AInstr.Op = X64Op.CMov then
+            LText := X64OpText(AInstr.Op) + X64CondName(AInstr.Cond);
+          else
+            LText := X64OpText(AInstr.Op);
+          end;
         end;
       end;
       if X64OpHasWidth(AInstr.Op) then
