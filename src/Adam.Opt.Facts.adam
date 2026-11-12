@@ -1,0 +1,353 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Opt.Facts.adam - routine facts inferred from the IR (PLAN-ADAM M6 O14)
+
+  Adam has no pure / readonly / nothrow directive: what a routine does is
+  read from its IR, once per routine and kept (RoutineFacts, one per pass
+  run). A routine is judged when it is a function with code (a declared
+  one by its body copy, IrFunction.InlineBody: another unit's routine
+  lowered here for the inliner), no funclet, no scope, not variadic;
+  anything else holds none of the facts. A routine being judged holds none
+  of them inside itself (a recursive call fails the fact).
+
+    pure      a result, and every instruction a value op (IsValueOp), a
+              constant, a parameter, ret / jump / branch / phi, a call of a
+              pure routine, a slot, or a load / store whose address is one
+              of its own slots (a slot used any other way fails): its result
+              depends on its arguments alone and it writes nothing the
+              caller sees (gvn numbers its calls, licm moves them when it
+              also ends quietly)
+    readonly  as pure, but a load may read any address (a threadstatic's
+              too) and a call may be of a readonly routine, the result may
+              be void: it writes nothing the caller sees, so a call of it
+              is no write (gvn numbers it by the memory generation)
+    nothrow   it ends quietly: no loop (its blocks reach no block twice on
+              a path), every instruction a value op but a division that may
+              fault (an integer sdiv / udiv / srem / urem whose divisor is
+              not a constant other than zero, and -1 for a signed one), a
+              constant, a parameter, ret / jump / branch / phi, a slot, a
+              load / store whose address is one of its own slots, a call of
+              a nothrow routine: it returns, never raises, never faults, so
+              a call of it whose result nothing uses may go (adce)
+*******************************************************************************/
+
+module unit Adam.Opt.Facts;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Ssa;
+
+const
+  // A fact's state for a routine (a map's missing value: not judged yet): it does not
+  // hold, it holds, it is being judged
+  ADAM_FACTS_UNKNOWN: int64 = -1;
+  ADAM_FACTS_FAILS: int64 = 0;
+  ADAM_FACTS_HOLDS: int64 = 1;
+  ADAM_FACTS_JUDGING: int64 = 2;
+  // The facts (DoJudge's AFact): pure, readonly, nothrow
+  ADAM_FACTS_PURE: int64 = 0;
+  ADAM_FACTS_READONLY: int64 = 1;
+  ADAM_FACTS_NOTHROW: int64 = 2;
+  // A block's mark in the loop search (DoAcyclicFrom): not reached, on the path, done
+  ADAM_FACTS_UNSEEN: int64 = 0;
+  ADAM_FACTS_ON_PATH: int64 = 1;
+  ADAM_FACTS_DONE: int64 = 2;
+
+// True for the ops whose value is computed from their operands alone, writing nothing:
+// integer and float arithmetic, bits, shifts, divisions, compares, offsets, converts and
+// the address ops (gvn numbers exactly these)
+public routine IsValueOp(const AKind: IrOp): bool;
+begin
+  return (AKind = IrOp.Add) or (AKind = IrOp.Sub) or (AKind = IrOp.Mul) or
+    (AKind = IrOp.BitAnd) or (AKind = IrOp.BitOr) or (AKind = IrOp.BitXor) or
+    (AKind = IrOp.Neg) or (AKind = IrOp.BitNot) or (AKind = IrOp.Shl) or
+    (AKind = IrOp.Shr) or (AKind = IrOp.Sar) or (AKind = IrOp.SDiv) or
+    (AKind = IrOp.UDiv) or (AKind = IrOp.SRem) or (AKind = IrOp.URem) or
+    (AKind = IrOp.FDiv) or (AKind = IrOp.Compare) or (AKind = IrOp.Offset) or
+    (AKind = IrOp.Convert) or (AKind = IrOp.Address) or (AKind = IrOp.CodeAddress) or
+    (AKind = IrOp.ImportAddress);
+end;
+
+// True for the integer divisions (sdiv, udiv, srem, urem): they fault on a zero divisor,
+// a signed one also on the lowest value by -1
+routine DoIsDivision(const AKind: IrOp): bool;
+begin
+  return (AKind = IrOp.SDiv) or (AKind = IrOp.UDiv) or (AKind = IrOp.SRem) or
+    (AKind = IrOp.URem);
+end;
+
+// True for the ops that only steer control: ret, jump, branch, phi
+routine DoIsFlow(const AKind: IrOp): bool;
+begin
+  return (AKind = IrOp.Ret) or (AKind = IrOp.Jump) or (AKind = IrOp.Branch) or
+    (AKind = IrOp.Phi);
+end;
+
+public type
+  // The facts of a module's routines, each judged on first ask and kept (see the header)
+  RoutineFacts = object
+    hidden FModule: ref IrModule;
+    hidden FPure: ref Int64Map;
+    hidden FReadOnly: ref Int64Map;
+    hidden FNoThrow: ref Int64Map;
+
+    // The facts of AModule's routines, none judged yet
+    init(const AModule: ref IrModule);
+    begin
+      self.FModule := AModule;
+      self.FPure := ref Int64Map(ADAM_FACTS_UNKNOWN);
+      self.FReadOnly := ref Int64Map(ADAM_FACTS_UNKNOWN);
+      self.FNoThrow := ref Int64Map(ADAM_FACTS_UNKNOWN);
+    end;
+
+    // The function whose code stands for AFunction (its body copy when it is declared);
+    // 0 when AFunction is no routine the facts judge (see the header)
+    hidden const method DoCodeOf(const AFunction: int64): int64;
+    var
+      LCode: int64;
+      LFunction: ref IrFunction;
+    begin
+      if not self.FModule.IsFunction(AFunction) then
+        return 0;
+      end;
+      LCode := AFunction;
+      if self.FModule.FunctionAt(AFunction).Declared then
+        LCode := self.FModule.FunctionAt(AFunction).InlineBody;
+        if LCode = 0 then
+          return 0;
+        end;
+      end;
+      LFunction := self.FModule.FunctionAt(LCode);
+      if LFunction.Declared or (LFunction.Parent <> 0) or (LFunction.ScopeCount() > 0) or
+        LFunction.Signature.Variadic then
+        return 0;
+      end;
+      return LCode;
+    end;
+
+    // The slots of the function AFunction, as a set (each slot's id holds 1)
+    hidden const method DoSlotsOf(const AFunction: ref IrFunction): ref Int64Map;
+    var
+      LSlots: ref Int64Map;
+      LBlock: ref IrBlock;
+      LId: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      LSlots := ref Int64Map(0);
+      for LI := 0 to AFunction.Blocks.Count - 1 do
+        LBlock := self.FModule.BlockAt(AFunction.Blocks[LI]);
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LId := LBlock.Instrs[LK];
+          if self.FModule.InstrAt(LId).Kind = IrOp.Slot then
+            LSlots.Put(LId, 1);
+          end;
+        end;
+      end;
+      return LSlots;
+    end;
+
+    // True when the division AInstr cannot fault: its divisor a constant other than zero
+    // (and other than -1 when it is signed)
+    hidden const method DoQuietDivision(const AInstr: ref IrInstr): bool;
+    var
+      LDivisor: ref IrInstr;
+      LType: IrType;
+    begin
+      LDivisor := self.FModule.InstrAt(AInstr.Operands[1]);
+      if LDivisor.Kind <> IrOp.Constant then
+        return false;
+      end;
+      LType := AInstr.ValueType;
+      if IrCanonicalImm(LType, LDivisor.Imm) = 0 then
+        return false;
+      end;
+      if (AInstr.Kind = IrOp.SDiv) or (AInstr.Kind = IrOp.SRem) then
+        if IrCanonicalImm(LType, LDivisor.Imm) = IrCanonicalImm(LType, -1) then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    // True when no path from the block ABlock (an id) reaches a block twice (no loop),
+    // AMarks each block's mark (ADAM_FACTS_UNSEEN ..)
+    hidden const method DoAcyclicFrom(const ABlock: int64; const AMarks: ref Int64Map): bool;
+    var
+      LInstrs: ref Int64List;
+      LLast: ref IrInstr;
+      LMark: int64;
+      LT: int64;
+    begin
+      LMark := AMarks.Find(ABlock);
+      if LMark = ADAM_FACTS_DONE then
+        return true;
+      end;
+      if LMark = ADAM_FACTS_ON_PATH then
+        return false;
+      end;
+      AMarks.Put(ABlock, ADAM_FACTS_ON_PATH);
+      LInstrs := self.FModule.BlockAt(ABlock).Instrs;
+      if LInstrs.Count > 0 then
+        LLast := self.FModule.InstrAt(LInstrs[LInstrs.Count - 1]);
+        if (LLast.Kind = IrOp.Jump) or (LLast.Kind = IrOp.Branch) then
+          for LT := 0 to LLast.Targets.Count - 1 do
+            if not self.DoAcyclicFrom(LLast.Targets[LT], AMarks) then
+              return false;
+            end;
+          end;
+        end;
+      end;
+      AMarks.Put(ABlock, ADAM_FACTS_DONE);
+      return true;
+    end;
+
+    // True when the instruction AInstr keeps to the fact AFact (ADAM_FACTS_PURE ..) in a
+    // function with the slots ASlots (see the header)
+    hidden method DoInstrKeeps(const AInstr: ref IrInstr; const AFact: int64;
+      const ASlots: ref Int64Map): bool;
+    var
+      LKind: IrOp;
+      LE: int64;
+      LOwnSlot: bool;
+    begin
+      LKind := AInstr.Kind;
+      // a slot is only ever a load's or a store's address
+      for LE := 0 to AInstr.Operands.Count - 1 do
+        if ASlots.Find(AInstr.Operands[LE]) <> 0 then
+          if not (((LKind = IrOp.Load) or (LKind = IrOp.Store)) and (LE = 0)) then
+            return false;
+          end;
+        end;
+      end;
+      if (LKind = IrOp.Constant) or (LKind = IrOp.Parameter) or (LKind = IrOp.Slot) or
+        DoIsFlow(LKind) then
+        return true;
+      end;
+      if IsValueOp(LKind) then
+        if (AFact = ADAM_FACTS_NOTHROW) and DoIsDivision(LKind) then
+          return self.DoQuietDivision(AInstr);
+        end;
+        return true;
+      end;
+      if (LKind = IrOp.Load) or (LKind = IrOp.Store) then
+        LOwnSlot := ASlots.Find(AInstr.Operands[0]) <> 0;
+        if LOwnSlot then
+          return true;
+        end;
+        // readonly reads any address; nothing else leaves its own slots
+        return (AFact = ADAM_FACTS_READONLY) and (LKind = IrOp.Load);
+      end;
+      if LKind = IrOp.ThreadAddress then
+        return AFact = ADAM_FACTS_READONLY;
+      end;
+      if LKind = IrOp.Call then
+        if AFact = ADAM_FACTS_PURE then
+          return self.IsPure(AInstr.Link);
+        end;
+        if AFact = ADAM_FACTS_READONLY then
+          return self.IsReadOnly(AInstr.Link);
+        end;
+        return self.IsNoThrow(AInstr.Link);
+      end;
+      return false;
+    end;
+
+    // True when the code ACode (DoCodeOf) keeps to the fact AFact in every instruction,
+    // and for nothrow has no loop
+    hidden method DoScan(const ACode: int64; const AFact: int64): bool;
+    var
+      LFunction: ref IrFunction;
+      LSlots: ref Int64Map;
+      LBlock: ref IrBlock;
+      LI: int64;
+      LK: int64;
+    begin
+      LFunction := self.FModule.FunctionAt(ACode);
+      if LFunction.Blocks.Count = 0 then
+        return false;
+      end;
+      if AFact = ADAM_FACTS_NOTHROW then
+        if not self.DoAcyclicFrom(LFunction.Blocks[0], ref Int64Map(ADAM_FACTS_UNSEEN)) then
+          return false;
+        end;
+      end;
+      LSlots := self.DoSlotsOf(LFunction);
+      for LI := 0 to LFunction.Blocks.Count - 1 do
+        LBlock := self.FModule.BlockAt(LFunction.Blocks[LI]);
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          if not self.DoInstrKeeps(self.FModule.InstrAt(LBlock.Instrs[LK]), AFact, LSlots) then
+            return false;
+          end;
+        end;
+      end;
+      return true;
+    end;
+
+    // True when the fact AFact holds for AFunction, its state kept in AStates (see the
+    // header: a routine being judged holds it not)
+    hidden method DoJudge(const AFunction: int64; const AFact: int64;
+      const AStates: ref Int64Map): bool;
+    var
+      LState: int64;
+      LCode: int64;
+      LHolds: bool;
+    begin
+      LState := AStates.Find(AFunction);
+      if LState <> ADAM_FACTS_UNKNOWN then
+        return LState = ADAM_FACTS_HOLDS;
+      end;
+      LCode := self.DoCodeOf(AFunction);
+      LHolds := LCode <> 0;
+      if LHolds and (AFact = ADAM_FACTS_PURE) then
+        LHolds := self.FModule.FunctionAt(LCode).Signature.ResultType <> IrType.Void;
+      end;
+      if not LHolds then
+        AStates.Put(AFunction, ADAM_FACTS_FAILS);
+        return false;
+      end;
+      AStates.Put(AFunction, ADAM_FACTS_JUDGING);
+      LHolds := self.DoScan(LCode, AFact);
+      if LHolds then
+        AStates.Put(AFunction, ADAM_FACTS_HOLDS);
+      else
+        AStates.Put(AFunction, ADAM_FACTS_FAILS);
+      end;
+      return LHolds;
+    end;
+
+    // True when the routine AFunction (a function id) is pure (see the header)
+    method IsPure(const AFunction: int64): bool;
+    begin
+      return self.DoJudge(AFunction, ADAM_FACTS_PURE, self.FPure);
+    end;
+
+    // True when the routine AFunction writes nothing its caller sees (see the header)
+    method IsReadOnly(const AFunction: int64): bool;
+    begin
+      if self.IsPure(AFunction) then
+        return true;
+      end;
+      return self.DoJudge(AFunction, ADAM_FACTS_READONLY, self.FReadOnly);
+    end;
+
+    // True when the routine AFunction ends quietly: returns, never raises, never faults,
+    // never loops (see the header)
+    method IsNoThrow(const AFunction: int64): bool;
+    begin
+      return self.DoJudge(AFunction, ADAM_FACTS_NOTHROW, self.FNoThrow);
+    end;
+  end;
+
+end.

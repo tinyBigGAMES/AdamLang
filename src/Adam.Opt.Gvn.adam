@@ -40,14 +40,11 @@
   have written between them; an unwind edge means a funclet ran). So a load
   is replaced only by one with no write on any path between them.
 
-  Calls: a call of a routine this module defines that is pure is numbered
-  by its routine and arguments and writes nothing. Pure is found from the
-  callee's IR (Adam has no pure directive): not declared, no funclet, no
-  scope, not variadic, a result, and every instruction a numbered op, a
-  constant, a parameter, ret / jump / branch / phi, a call of a pure routine
-  (one being looked at is not), a slot, or a load / store whose address is
-  one of its own slots (a slot used any other way, a load or store through
-  any other address, any other op: not pure).
+  Calls: a call of a pure routine (Adam.Opt.Facts, from the callee's IR or
+  its body copy) is numbered by its routine and arguments and writes
+  nothing; a call of a readonly one is numbered by its routine, arguments
+  and the memory generation, like a load, and writes nothing either; any
+  other call may write.
 
   Checks: entering a block whose one predecessor (its immediate dominator,
   over a normal edge) ends in a branch with two targets, the branch's
@@ -62,17 +59,14 @@
 
 module unit Adam.Opt.Gvn;
 
-import System.SysUtils, Adam.Core.Containers, Adam.Backend.Ssa, Adam.Opt.Analysis;
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Ssa, Adam.Opt.Analysis,
+  Adam.Opt.Facts;
 
 const
   // No value (a map's missing value), and a key whose scope the walk has left (a
   // StringIdMap holds no 0)
   ADAM_GVN_NONE: int64 = -1;
   ADAM_GVN_GONE: int64 = -1;
-  // A routine's purity: pure, not pure, being found (a call of it inside is not pure)
-  ADAM_GVN_PURE: int64 = 1;
-  ADAM_GVN_IMPURE: int64 = 0;
-  ADAM_GVN_FINDING: int64 = 2;
   // The undo arrays' first growth
   ADAM_GVN_FIRST_UNDO: int64 = 16;
   // Raised (an invariant broken): replaced values that name each other round a cycle
@@ -81,18 +75,11 @@ const
 // True for the ops numbered by their operands alone (see the header)
 routine DoNumbered(const AKind: IrOp): bool;
 begin
-  return (AKind = IrOp.Add) or (AKind = IrOp.Sub) or (AKind = IrOp.Mul) or
-    (AKind = IrOp.BitAnd) or (AKind = IrOp.BitOr) or (AKind = IrOp.BitXor) or
-    (AKind = IrOp.Neg) or (AKind = IrOp.BitNot) or (AKind = IrOp.Shl) or
-    (AKind = IrOp.Shr) or (AKind = IrOp.Sar) or (AKind = IrOp.SDiv) or
-    (AKind = IrOp.UDiv) or (AKind = IrOp.SRem) or (AKind = IrOp.URem) or
-    (AKind = IrOp.FDiv) or (AKind = IrOp.Compare) or (AKind = IrOp.Offset) or
-    (AKind = IrOp.Convert) or (AKind = IrOp.Address) or (AKind = IrOp.CodeAddress) or
-    (AKind = IrOp.ImportAddress);
+  return IsValueOp(AKind);
 end;
 
 // True for the ops that may write memory: a new generation (see the header); a call of a
-// routine of this module is judged by its purity at the call
+// routine of this module is judged by its facts at the call (Adam.Opt.Facts)
 routine DoWrites(const AKind: IrOp): bool;
 begin
   return (AKind = IrOp.Store) or (AKind = IrOp.Copy) or (AKind = IrOp.Fill) or
@@ -143,8 +130,8 @@ type
     // Where each block's entries start in the two undo logs
     hidden FMarkKeys: array of int64;
     hidden FMarkFacts: array of int64;
-    // Each routine's purity found so far (see the header)
-    hidden FPurity: ref Int64Map;
+    // The module's routine facts (pure, readonly: see the header)
+    hidden FRoutines: ref RoutineFacts;
     hidden FChanged: bool;
 
     // The numbering of AModule's function AFunction over its analysis AAnalysis
@@ -165,7 +152,7 @@ type
       setlength(self.FGenEnd, AAnalysis.BlockCount);
       setlength(self.FMarkKeys, AAnalysis.BlockCount);
       setlength(self.FMarkFacts, AAnalysis.BlockCount);
-      self.FPurity := ref Int64Map(ADAM_GVN_NONE);
+      self.FRoutines := ref RoutineFacts(AModule);
       self.FChanged := false;
     end;
 
@@ -332,94 +319,6 @@ type
       return LKey;
     end;
 
-    // True when every instruction of AFunction keeps to a pure routine's (see the header)
-    hidden method DoScanPure(const AFunction: ref IrFunction): bool;
-    var
-      LSlots: ref Int64Map;
-      LBlock: ref IrBlock;
-      LInstr: ref IrInstr;
-      LKind: IrOp;
-      LId: int64;
-      LI: int64;
-      LK: int64;
-      LE: int64;
-    begin
-      LSlots := ref Int64Map(ADAM_GVN_NONE);
-      for LI := 0 to AFunction.Blocks.Count - 1 do
-        LBlock := self.FModule.BlockAt(AFunction.Blocks[LI]);
-        for LK := 0 to LBlock.Instrs.Count - 1 do
-          LId := LBlock.Instrs[LK];
-          if self.FModule.InstrAt(LId).Kind = IrOp.Slot then
-            LSlots.Put(LId, 1);
-          end;
-        end;
-      end;
-      for LI := 0 to AFunction.Blocks.Count - 1 do
-        LBlock := self.FModule.BlockAt(AFunction.Blocks[LI]);
-        for LK := 0 to LBlock.Instrs.Count - 1 do
-          LInstr := self.FModule.InstrAt(LBlock.Instrs[LK]);
-          LKind := LInstr.Kind;
-          // A slot is only ever a load's or a store's address
-          for LE := 0 to LInstr.Operands.Count - 1 do
-            if LSlots.Find(LInstr.Operands[LE]) <> ADAM_GVN_NONE then
-              if not (((LKind = IrOp.Load) or (LKind = IrOp.Store)) and (LE = 0)) then
-                return false;
-              end;
-            end;
-          end;
-          if (LKind = IrOp.Load) or (LKind = IrOp.Store) then
-            if LSlots.Find(LInstr.Operands[0]) = ADAM_GVN_NONE then
-              return false;
-            end;
-            skip;
-          end;
-          if LKind = IrOp.Call then
-            if not self.DoIsPure(LInstr.Link) then
-              return false;
-            end;
-            skip;
-          end;
-          if not (DoNumbered(LKind) or (LKind = IrOp.Constant) or
-            (LKind = IrOp.Parameter) or (LKind = IrOp.Slot) or (LKind = IrOp.Ret) or
-            (LKind = IrOp.Jump) or (LKind = IrOp.Branch) or (LKind = IrOp.Phi)) then
-            return false;
-          end;
-        end;
-      end;
-      return true;
-    end;
-
-    // True when the routine AFunction is pure (see the header); found once, kept
-    hidden method DoIsPure(const AFunction: int64): bool;
-    var
-      LFunction: ref IrFunction;
-      LState: int64;
-      LPure: bool;
-    begin
-      LState := self.FPurity.Find(AFunction);
-      if LState <> ADAM_GVN_NONE then
-        return LState = ADAM_GVN_PURE;
-      end;
-      if not self.FModule.IsFunction(AFunction) then
-        return false;
-      end;
-      LFunction := self.FModule.FunctionAt(AFunction);
-      if LFunction.Declared or (LFunction.Parent <> 0) or (LFunction.ScopeCount() > 0) or
-        LFunction.Signature.Variadic or
-        (LFunction.Signature.ResultType = IrType.Void) then
-        self.FPurity.Put(AFunction, ADAM_GVN_IMPURE);
-        return false;
-      end;
-      self.FPurity.Put(AFunction, ADAM_GVN_FINDING);
-      LPure := self.DoScanPure(LFunction);
-      if LPure then
-        self.FPurity.Put(AFunction, ADAM_GVN_PURE);
-      else
-        self.FPurity.Put(AFunction, ADAM_GVN_IMPURE);
-      end;
-      return LPure;
-    end;
-
     // The branch AInstr (block ABlock): its condition known in the scope -> that bool
     // constant, put just before it, is its condition (see the header)
     hidden method DoBranch(const AInstr: ref IrInstr; const ABlock: int64);
@@ -479,11 +378,18 @@ type
         return;
       end;
       if LKind = IrOp.Call then
-        if (LInstr.ValueType <> IrType.Void) and self.DoIsPure(LInstr.Link) then
+        if (LInstr.ValueType <> IrType.Void) and self.FRoutines.IsPure(LInstr.Link) then
           self.DoNumber(AId, self.DoCallKey(LInstr));
-        else
-          self.DoNewGen();
+          return;
         end;
+        // a readonly call writes nothing: numbered with the memory it reads, as a load
+        if self.FRoutines.IsReadOnly(LInstr.Link) then
+          if LInstr.ValueType <> IrType.Void then
+            self.DoNumber(AId, self.DoCallKey(LInstr) + " g" + IntToStr(self.FGen));
+          end;
+          return;
+        end;
+        self.DoNewGen();
         return;
       end;
       if DoWrites(LKind) then

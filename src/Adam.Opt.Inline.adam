@@ -1,0 +1,758 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Opt.Inline.adam - inlining (PLAN-ADAM M6 O14)
+
+  InlineSafe / InlineFast / InlineSmall are the pass inline at each level:
+  every direct call the function had when the pass began whose callee has
+  code here and is worth it goes, the callee's blocks copied in its place.
+  A callee has code here when it is a function of this unit, or another
+  unit's routine whose body Lowering copied into this unit
+  (IrFunction.InlineBody: AA.3, the callee lowered from the AST at the
+  call's unit). OptimizeModule (Adam.Opt.Pipeline) runs every callee
+  before its callers, so what is copied is already optimized; what a copy
+  calls stays a call in this run.
+
+  Not inlined: a call in a funclet, a call of the function itself, a
+  funclet, a variadic callee or one using its varargs, a callee whose
+  funclet has scopes of its own. The cost model counts the callee's
+  instructions (parameters not counted): safe takes up to
+  ADAM_INLINE_SAFE_SIZE, fast up to ADAM_INLINE_FAST_SIZE, small only a
+  callee no larger than its call (its work, with no slot, phi, jump or ret,
+  at most its arguments plus ADAM_INLINE_SMALL_EXTRA); no caller grows past
+  its cap, and at most ADAM_INLINE_MAX_SITES calls go per run.
+
+  One call: its block is split at the call, the instructions after it
+  moved to a new tail block; the callee's blocks are copied right after
+  the call's block and the tail right after them, so they take every scope
+  the call's block is in (a scope around the call's block grows by them,
+  one after it moves on); the callee's own scopes come first (innermost),
+  moved to the copies' positions, a catching one's resume target too. A
+  copy's parameter is the call's argument, a slot goes to the caller's
+  entry with the others (a slot is frame memory either way), a ret jumps to
+  the tail; the call's value is the one ret's value or a phi of every
+  ret's at the tail (no ret: the callee never returns, the tail is left
+  unreached with a zero for the call's uses, simplifycfg drops it). A
+  funclet of the callee a scope runs is copied too, its parent the caller,
+  its operands the caller's copies of the callee's slots, its frame
+  parameter its own. The successors' phis take the tail for the call's
+  block. Nodes stay the callee's (its lines and sites).
+*******************************************************************************/
+
+module unit Adam.Opt.Inline;
+
+import System.SysUtils, Adam.Core.Common, Adam.Core.Containers, Adam.Backend.Ssa,
+  Adam.Opt.Analysis;
+
+const
+  // The cost model (see the header): the largest callee safe and fast inline, what small
+  // allows beyond a call's arguments, the largest a caller grows (fast's own cap), the
+  // most calls one run inlines
+  ADAM_INLINE_SAFE_SIZE: int64 = 32;
+  ADAM_INLINE_FAST_SIZE: int64 = 96;
+  ADAM_INLINE_SMALL_EXTRA: int64 = 1;
+  ADAM_INLINE_CALLER_CAP: int64 = 4096;
+  ADAM_INLINE_FAST_CALLER_CAP: int64 = 8192;
+  ADAM_INLINE_MAX_SITES: int64 = 64;
+  // What a copied funclet's symbol adds to its new parent's (its function id follows;
+  // internal)
+  ADAM_INLINE_FUNCLET_SYMBOL: string = "$inl";
+  // No value (a map's missing value)
+  ADAM_INLINE_NONE: int64 = -1;
+  // Raised (an invariant broken): a callee operand with no value in the caller; a call
+  // whose block is no longer the caller's
+  ADAM_INLINE_FAULT_NO_VALUE: string = "Opt: inline found a callee operand it made no value for: i";
+  ADAM_INLINE_FAULT_NO_BLOCK: string = "Opt: inline lost the block of the call i";
+
+// How many instructions AFunction has, its parameters not counted
+routine DoSizeOf(const AModule: ref IrModule; const AFunction: ref IrFunction): int64;
+var
+  LBlock: ref IrBlock;
+  LSize: int64;
+  LI: int64;
+  LK: int64;
+begin
+  LSize := 0;
+  for LI := 0 to AFunction.Blocks.Count - 1 do
+    LBlock := AModule.BlockAt(AFunction.Blocks[LI]);
+    for LK := 0 to LBlock.Instrs.Count - 1 do
+      if AModule.InstrAt(LBlock.Instrs[LK]).Kind <> IrOp.Parameter then
+        LSize := LSize + 1;
+      end;
+    end;
+  end;
+  return LSize;
+end;
+
+// How much work AFunction does once inlined: its instructions but parameters, slots,
+// phis, jumps and rets (small's measure)
+routine DoWorkOf(const AModule: ref IrModule; const AFunction: ref IrFunction): int64;
+var
+  LBlock: ref IrBlock;
+  LKind: IrOp;
+  LWork: int64;
+  LI: int64;
+  LK: int64;
+begin
+  LWork := 0;
+  for LI := 0 to AFunction.Blocks.Count - 1 do
+    LBlock := AModule.BlockAt(AFunction.Blocks[LI]);
+    for LK := 0 to LBlock.Instrs.Count - 1 do
+      LKind := AModule.InstrAt(LBlock.Instrs[LK]).Kind;
+      if (LKind <> IrOp.Parameter) and (LKind <> IrOp.Slot) and (LKind <> IrOp.Phi) and
+        (LKind <> IrOp.Jump) and (LKind <> IrOp.Ret) then
+        LWork := LWork + 1;
+      end;
+    end;
+  end;
+  return LWork;
+end;
+
+// True when AFunction has an instruction of the kind AKind
+routine DoHasOp(const AModule: ref IrModule; const AFunction: ref IrFunction;
+  const AKind: IrOp): bool;
+var
+  LBlock: ref IrBlock;
+  LI: int64;
+  LK: int64;
+begin
+  for LI := 0 to AFunction.Blocks.Count - 1 do
+    LBlock := AModule.BlockAt(AFunction.Blocks[LI]);
+    for LK := 0 to LBlock.Instrs.Count - 1 do
+      if AModule.InstrAt(LBlock.Instrs[LK]).Kind = AKind then
+        return true;
+      end;
+    end;
+  end;
+  return false;
+end;
+
+type
+  // One function's inlining at one level (see the header)
+  Inliner = object
+    hidden FModule: ref IrModule;
+    hidden FFunctionId: int64;
+    hidden FFunction: ref IrFunction;
+    hidden FLevel: OptLevel;
+    // The caller's size now, and its cap
+    hidden FSize: int64;
+    hidden FCap: int64;
+    // One inline's maps: each callee value's value in the caller, each callee block's
+    // copy; the copies in the callee's block order, and the tail
+    hidden FValues: ref Int64Map;
+    hidden FBlockMap: ref Int64Map;
+    hidden FClones: ref Int64List;
+    hidden FTail: int64;
+    hidden FChanged: bool;
+
+    // The inlining of AModule's function AFunction at ALevel
+    init(const AModule: ref IrModule; const AFunction: int64; const ALevel: OptLevel);
+    begin
+      self.FModule := AModule;
+      self.FFunctionId := AFunction;
+      self.FFunction := AModule.FunctionAt(AFunction);
+      self.FLevel := ALevel;
+      self.FSize := DoSizeOf(AModule, self.FFunction);
+      self.FCap := ADAM_INLINE_CALLER_CAP;
+      if ALevel = OptLevel.Fast then
+        self.FCap := ADAM_INLINE_FAST_CALLER_CAP;
+      end;
+      self.FValues := ref Int64Map(ADAM_INLINE_NONE);
+      self.FBlockMap := ref Int64Map(ADAM_INLINE_NONE);
+      self.FClones := ref Int64List();
+      self.FTail := 0;
+      self.FChanged := false;
+    end;
+
+    // The function whose code a call of ACallee copies: ACallee, or its body copy when it
+    // is declared; 0 when it has none
+    hidden const method DoCodeOf(const ACallee: int64): int64;
+    var
+      LCode: int64;
+    begin
+      if not self.FModule.IsFunction(ACallee) then
+        return 0;
+      end;
+      LCode := ACallee;
+      if self.FModule.FunctionAt(ACallee).Declared then
+        LCode := self.FModule.FunctionAt(ACallee).InlineBody;
+        if LCode = 0 then
+          return 0;
+        end;
+      end;
+      if self.FModule.FunctionAt(LCode).Declared or
+        (self.FModule.FunctionAt(LCode).Blocks.Count = 0) then
+        return 0;
+      end;
+      return LCode;
+    end;
+
+    // True when the code ACode may be copied into this function (see the header)
+    hidden const method DoLegal(const ACode: int64): bool;
+    var
+      LCode: ref IrFunction;
+      LHandler: int64;
+      LK: int64;
+    begin
+      if ACode = self.FFunctionId then
+        return false;
+      end;
+      LCode := self.FModule.FunctionAt(ACode);
+      if (LCode.Parent <> 0) or LCode.Signature.Variadic then
+        return false;
+      end;
+      if DoHasOp(self.FModule, LCode, IrOp.VarargsStart) then
+        return false;
+      end;
+      for LK := 0 to LCode.ScopeCount() - 1 do
+        LHandler := LCode.ScopeHandler(LK);
+        if self.FModule.IsFunction(LHandler) then
+          if self.FModule.FunctionAt(LHandler).Parent = ACode then
+            if self.FModule.FunctionAt(LHandler).ScopeCount() > 0 then
+              return false;
+            end;
+          end;
+        end;
+      end;
+      return true;
+    end;
+
+    // True when the cost model takes the code ACode at a call with AArgs arguments (see
+    // the header)
+    hidden const method DoWorth(const ACode: int64; const AArgs: int64): bool;
+    var
+      LCode: ref IrFunction;
+      LSize: int64;
+    begin
+      LCode := self.FModule.FunctionAt(ACode);
+      LSize := DoSizeOf(self.FModule, LCode);
+      if self.FSize + LSize > self.FCap then
+        return false;
+      end;
+      if self.FLevel = OptLevel.Fast then
+        return LSize <= ADAM_INLINE_FAST_SIZE;
+      end;
+      if self.FLevel = OptLevel.Small then
+        return DoWorkOf(self.FModule, LCode) <= AArgs + ADAM_INLINE_SMALL_EXTRA;
+      end;
+      return LSize <= ADAM_INLINE_SAFE_SIZE;
+    end;
+
+    // The position of the block ABlock (an id) in this function (raised when it is not
+    // one of its blocks: a compiler bug)
+    hidden const method DoPositionOf(const ABlock: int64; const ACall: int64): int64;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to self.FFunction.Blocks.Count - 1 do
+        if self.FFunction.Blocks[LI] = ABlock then
+          return LI;
+        end;
+      end;
+      raise(ADAM_INLINE_FAULT_NO_BLOCK + IntToStr(ACall));
+    end;
+
+    // The copies of ACode's blocks and the tail made, put right after the block at AAt
+    // (their scopes come once the body is copied, DoPlaceScopes)
+    hidden method DoPlaceBlocks(const AAt: int64; const ACode: ref IrFunction);
+    var
+      LOld: ref Int64List;
+      LNew: ref Int64List;
+      LOwnCount: int64;
+      LBlock: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      LOwnCount := self.FFunction.Blocks.Count;
+      self.FClones := ref Int64List();
+      for LI := 0 to ACode.Blocks.Count - 1 do
+        LBlock := self.FModule.AddBlock(self.FFunctionId);
+        self.FClones.Add(LBlock);
+        self.FBlockMap.Put(ACode.Blocks[LI], LBlock);
+      end;
+      self.FTail := self.FModule.AddBlock(self.FFunctionId);
+      // AddBlock put them last: the list made again with them after AAt
+      LOld := self.FFunction.Blocks;
+      LNew := ref Int64List();
+      for LI := 0 to LOwnCount - 1 do
+        LNew.Add(LOld[LI]);
+        if LI = AAt then
+          for LK := 0 to self.FClones.Count - 1 do
+            LNew.Add(self.FClones[LK]);
+          end;
+          LNew.Add(self.FTail);
+        end;
+      end;
+      self.FFunction.Blocks := LNew;
+    end;
+
+    // The scopes once ACode's copies sit right after the block at AAt (DoPlaceBlocks):
+    // ACode's first (the innermost), moved to the copies' positions, each funclet copied
+    // (DoHandlerOf, over the slots the body's copy made); then this function's, a scope
+    // round the block at AAt grown by the copies and the tail, one after it moved on
+    hidden method DoPlaceScopes(const AAt: int64; const ACode: ref IrFunction);
+    var
+      LFirsts: Int64Array;
+      LLasts: Int64Array;
+      LHandlers: Int64Array;
+      LTargets: Int64Array;
+      LScopes: int64;
+      LAdded: int64;
+      LFrom: int64;
+      LTo: int64;
+      LTarget: int64;
+      LK: int64;
+    begin
+      LAdded := ACode.Blocks.Count + 1;
+      // The scopes read out, then added again: the callee's first (the innermost)
+      LScopes := self.FFunction.ScopeCount();
+      setlength(LFirsts, LScopes);
+      setlength(LLasts, LScopes);
+      setlength(LHandlers, LScopes);
+      setlength(LTargets, LScopes);
+      for LK := 0 to LScopes - 1 do
+        LFirsts[LK] := self.FFunction.ScopeFirst(LK);
+        LLasts[LK] := self.FFunction.ScopeLast(LK);
+        LHandlers[LK] := self.FFunction.ScopeHandler(LK);
+        LTargets[LK] := self.FFunction.ScopeTarget(LK);
+      end;
+      self.FFunction.ClearScopes();
+      for LK := 0 to ACode.ScopeCount() - 1 do
+        LTarget := ACode.ScopeTarget(LK);
+        if LTarget >= 0 then
+          LTarget := LTarget + AAt + 1;
+        end;
+        self.FFunction.AddScope(ACode.ScopeFirst(LK) + AAt + 1, ACode.ScopeLast(LK) + AAt + 1,
+          self.DoHandlerOf(ACode.ScopeHandler(LK), ACode), LTarget);
+      end;
+      for LK := 0 to LScopes - 1 do
+        LFrom := LFirsts[LK];
+        LTo := LLasts[LK];
+        if LFrom > AAt then
+          LFrom := LFrom + LAdded;
+        end;
+        // a scope the call's block is in takes the copies and the tail; one after it moves
+        if LTo >= AAt then
+          LTo := LTo + LAdded;
+        end;
+        LTarget := LTargets[LK];
+        if LTarget > AAt then
+          LTarget := LTarget + LAdded;
+        end;
+        self.FFunction.AddScope(LFrom, LTo, LHandlers[LK], LTarget);
+      end;
+    end;
+
+    // The handler a copied scope of ACode runs: a funclet of ACode copied for this function
+    // (DoCopyFunclet), any other (a filter) as it is
+    hidden method DoHandlerOf(const AHandler: int64; const ACode: ref IrFunction): int64;
+    begin
+      if not self.FModule.IsFunction(AHandler) then
+        return AHandler;
+      end;
+      if self.FModule.FunctionAt(AHandler).Parent = 0 then
+        return AHandler;
+      end;
+      return self.DoCopyFunclet(AHandler);
+    end;
+
+    // The value the callee's operand AId has in the caller (raised when none: a bug)
+    hidden const method DoValueOf(const AId: int64): int64;
+    var
+      LValue: int64;
+    begin
+      LValue := self.FValues.Find(AId);
+      if LValue = ADAM_INLINE_NONE then
+        raise(ADAM_INLINE_FAULT_NO_VALUE + IntToStr(AId));
+      end;
+      return LValue;
+    end;
+
+    // A copy of the instruction ASource in the block ABlock (an id): its kind, type,
+    // node and fields, no operands or targets yet (DoFillCopy); returns its id
+    hidden method DoCopyInstr(const ASource: ref IrInstr; const ABlock: int64): int64;
+    var
+      LId: int64;
+      LCopy: ref IrInstr;
+    begin
+      LId := self.FModule.Emit(ABlock, ASource.Kind, ASource.ValueType, ASource.Node);
+      LCopy := self.FModule.InstrAt(LId);
+      LCopy.Imm := ASource.Imm;
+      LCopy.Align := ASource.Align;
+      LCopy.Link := ASource.Link;
+      LCopy.Predicate := ASource.Predicate;
+      return LId;
+    end;
+
+    // The copy ACopy given the operands and targets of ASource, each mapped
+    hidden method DoFillCopy(const ASource: ref IrInstr; const ACopy: int64);
+    var
+      LCopy: ref IrInstr;
+      LTarget: int64;
+      LE: int64;
+    begin
+      LCopy := self.FModule.InstrAt(ACopy);
+      for LE := 0 to ASource.Operands.Count - 1 do
+        LCopy.Operands.Add(self.DoValueOf(ASource.Operands[LE]));
+      end;
+      for LE := 0 to ASource.Targets.Count - 1 do
+        LTarget := self.FBlockMap.Find(ASource.Targets[LE]);
+        if LTarget = ADAM_INLINE_NONE then
+          raise(ADAM_INLINE_FAULT_NO_VALUE + IntToStr(ASource.Targets[LE]));
+        end;
+        LCopy.Targets.Add(LTarget);
+      end;
+    end;
+
+    // The funclet AFunclet (the callee's) copied for this function: its parent this
+    // function, its blocks copied (its frame parameter its own, the callee's slots it
+    // reaches the caller's copies of them, DoCopyBody's map); returns its id
+    hidden method DoCopyFunclet(const AFunclet: int64): int64;
+    var
+      LSource: ref IrFunction;
+      LCopy: ref IrFunction;
+      LId: int64;
+      LBlock: int64;
+      LI: int64;
+      LK: int64;
+      LSourceBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LCopies: ref Int64List;
+      LPairs: ref Int64List;
+    begin
+      LSource := self.FModule.FunctionAt(AFunclet);
+      // The id AddFunction hands out next, so the symbol is the function's own
+      LId := self.FModule.AddFunction(self.FFunction.Symbol + ADAM_INLINE_FUNCLET_SYMBOL +
+        IntToStr(self.FModule.FunctionCount), IrType.Void, LSource.Node);
+      LCopy := self.FModule.FunctionAt(LId);
+      LCopy.Internal := true;
+      LCopy.Parent := self.FFunctionId;
+      LCopy.Signature.AddParam(IrType.UInt8);
+      LCopy.Signature.AddParam(IrType.Pointer);
+      // Its blocks first (a jump may run ahead), then each instruction, then their operands
+      LCopies := ref Int64List();
+      for LI := 0 to LSource.Blocks.Count - 1 do
+        LBlock := self.FModule.AddBlock(LId);
+        LCopies.Add(LBlock);
+        self.FBlockMap.Put(LSource.Blocks[LI], LBlock);
+      end;
+      LPairs := ref Int64List();
+      for LI := 0 to LSource.Blocks.Count - 1 do
+        LSourceBlock := self.FModule.BlockAt(LSource.Blocks[LI]);
+        for LK := 0 to LSourceBlock.Instrs.Count - 1 do
+          LInstr := self.FModule.InstrAt(LSourceBlock.Instrs[LK]);
+          LBlock := self.DoCopyInstr(LInstr, LCopies[LI]);
+          self.FValues.Put(LSourceBlock.Instrs[LK], LBlock);
+          LPairs.Add(LSourceBlock.Instrs[LK]);
+          LPairs.Add(LBlock);
+        end;
+      end;
+      LI := 0;
+      while LI < LPairs.Count do
+        self.DoFillCopy(self.FModule.InstrAt(LPairs[LI]), LPairs[LI + 1]);
+        LI := LI + 2;
+      end;
+      LCopy.FrameValue := self.DoValueOf(LSource.FrameValue);
+      return LId;
+    end;
+
+    // The slot ASlot (an id, in the caller's entry block) moved to the end of the entry's
+    // leading parameters and slots, where the caller's own are
+    hidden method DoPlaceSlot(const ASlot: int64);
+    var
+      LEntry: ref IrBlock;
+      LPlaced: ref Int64List;
+      LKind: IrOp;
+      LAt: int64;
+      LI: int64;
+    begin
+      LEntry := self.FModule.BlockAt(self.FFunction.Blocks[0]);
+      // Emit put it last: the list made again with it after the leading run
+      LAt := 0;
+      while LAt < LEntry.Instrs.Count - 1 do
+        LKind := self.FModule.InstrAt(LEntry.Instrs[LAt]).Kind;
+        if (LKind <> IrOp.Parameter) and (LKind <> IrOp.Slot) then
+          leave;
+        end;
+        LAt := LAt + 1;
+      end;
+      LPlaced := ref Int64List();
+      for LI := 0 to LEntry.Instrs.Count - 2 do
+        if LI = LAt then
+          LPlaced.Add(ASlot);
+        end;
+        LPlaced.Add(LEntry.Instrs[LI]);
+      end;
+      if LAt >= LEntry.Instrs.Count - 1 then
+        LPlaced.Add(ASlot);
+      end;
+      LEntry.Instrs := LPlaced;
+    end;
+
+    // Every use of the value AFrom in this function made AInto
+    hidden method DoReplaceUses(const AFrom: int64; const AInto: int64);
+    var
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LI: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      for LI := 0 to self.FFunction.Blocks.Count - 1 do
+        LBlock := self.FModule.BlockAt(self.FFunction.Blocks[LI]);
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          LInstr := self.FModule.InstrAt(LBlock.Instrs[LK]);
+          for LE := 0 to LInstr.Operands.Count - 1 do
+            if LInstr.Operands[LE] = AFrom then
+              LInstr.Operands.Put(LE, AInto);
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // The phis of the successors of the tail (its terminator's targets) take the tail
+    // where they took the call's block ABlock (an id)
+    hidden method DoRetargetPhis(const ABlock: int64);
+    var
+      LInstrs: ref Int64List;
+      LLast: ref IrInstr;
+      LSuccessor: ref IrBlock;
+      LPhi: ref IrInstr;
+      LT: int64;
+      LK: int64;
+      LE: int64;
+    begin
+      LInstrs := self.FModule.BlockAt(self.FTail).Instrs;
+      if LInstrs.Count = 0 then
+        return;
+      end;
+      LLast := self.FModule.InstrAt(LInstrs[LInstrs.Count - 1]);
+      for LT := 0 to LLast.Targets.Count - 1 do
+        LSuccessor := self.FModule.BlockAt(LLast.Targets[LT]);
+        for LK := 0 to LSuccessor.Instrs.Count - 1 do
+          LPhi := self.FModule.InstrAt(LSuccessor.Instrs[LK]);
+          if LPhi.Kind <> IrOp.Phi then
+            leave;
+          end;
+          for LE := 0 to LPhi.Targets.Count - 1 do
+            if LPhi.Targets[LE] = ABlock then
+              LPhi.Targets.Put(LE, self.FTail);
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // The call ACall (an id) of the code ACode inlined (see the header)
+    hidden method DoInline(const ACall: int64; const ACode: int64);
+    var
+      LCall: ref IrInstr;
+      LCode: ref IrFunction;
+      LBlockId: int64;
+      LBlock: ref IrBlock;
+      LKept: ref Int64List;
+      LTailInstrs: ref Int64List;
+      LSourceBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LPairs: ref Int64List;
+      LRetValues: ref Int64List;
+      LRetBlocks: ref Int64List;
+      LAt: int64;
+      LIndex: int64;
+      LId: int64;
+      LJump: int64;
+      LResult: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      LCall := self.FModule.InstrAt(ACall);
+      LCode := self.FModule.FunctionAt(ACode);
+      LBlockId := LCall.Block;
+      LAt := self.DoPositionOf(LBlockId, ACall);
+      self.FValues := ref Int64Map(ADAM_INLINE_NONE);
+      self.FBlockMap := ref Int64Map(ADAM_INLINE_NONE);
+      self.DoPlaceBlocks(LAt, LCode);
+      // The call's block split: what follows the call goes to the tail
+      LBlock := self.FModule.BlockAt(LBlockId);
+      LIndex := 0;
+      while LBlock.Instrs[LIndex] <> ACall do
+        LIndex := LIndex + 1;
+      end;
+      LKept := ref Int64List();
+      LTailInstrs := ref Int64List();
+      for LI := 0 to LBlock.Instrs.Count - 1 do
+        if LI < LIndex then
+          LKept.Add(LBlock.Instrs[LI]);
+        end;
+        if LI > LIndex then
+          LTailInstrs.Add(LBlock.Instrs[LI]);
+          self.FModule.InstrAt(LBlock.Instrs[LI]).Block := self.FTail;
+        end;
+      end;
+      LBlock.Instrs := LKept;
+      self.FModule.BlockAt(self.FTail).Instrs := LTailInstrs;
+      // The parameters are the arguments; every other instruction copied, its operands
+      // once all are (a phi or a loop may name one ahead)
+      LPairs := ref Int64List();
+      LRetValues := ref Int64List();
+      LRetBlocks := ref Int64List();
+      for LI := 0 to LCode.Blocks.Count - 1 do
+        LSourceBlock := self.FModule.BlockAt(LCode.Blocks[LI]);
+        for LK := 0 to LSourceBlock.Instrs.Count - 1 do
+          LInstr := self.FModule.InstrAt(LSourceBlock.Instrs[LK]);
+          if LInstr.Kind = IrOp.Parameter then
+            self.FValues.Put(LSourceBlock.Instrs[LK], LCall.Operands[LInstr.Imm]);
+            skip;
+          end;
+          if LInstr.Kind = IrOp.Ret then
+            LJump := self.FModule.Emit(self.FClones[LI], IrOp.Jump, IrType.Void, LInstr.Node);
+            self.FModule.InstrAt(LJump).Targets.Add(self.FTail);
+            if LInstr.Operands.Count > 0 then
+              LRetValues.Add(LInstr.Operands[0]);
+              LRetBlocks.Add(self.FClones[LI]);
+            end;
+            skip;
+          end;
+          if LInstr.Kind = IrOp.Slot then
+            LId := self.DoCopyInstr(LInstr, self.FFunction.Blocks[0]);
+            self.DoPlaceSlot(LId);
+          else
+            LId := self.DoCopyInstr(LInstr, self.FClones[LI]);
+          end;
+          self.FValues.Put(LSourceBlock.Instrs[LK], LId);
+          LPairs.Add(LSourceBlock.Instrs[LK]);
+          LPairs.Add(LId);
+        end;
+      end;
+      LI := 0;
+      while LI < LPairs.Count do
+        self.DoFillCopy(self.FModule.InstrAt(LPairs[LI]), LPairs[LI + 1]);
+        LI := LI + 2;
+      end;
+      self.DoPlaceScopes(LAt, LCode);
+      // The call's block runs into the copy of the entry
+      LJump := self.FModule.Emit(LBlockId, IrOp.Jump, IrType.Void, LCall.Node);
+      self.FModule.InstrAt(LJump).Targets.Add(self.FClones[0]);
+      self.DoRetargetPhis(LBlockId);
+      // The call's value: the one ret's, a phi of every ret's, or a zero when none returns
+      if LCall.ValueType <> IrType.Void then
+        if LRetValues.Count = 1 then
+          LResult := self.DoValueOf(LRetValues[0]);
+        else
+          LResult := self.FModule.Emit(self.FTail, IrOp.Phi, LCall.ValueType, LCall.Node);
+          for LI := 0 to LRetValues.Count - 1 do
+            self.FModule.InstrAt(LResult).Operands.Add(self.DoValueOf(LRetValues[LI]));
+            self.FModule.InstrAt(LResult).Targets.Add(LRetBlocks[LI]);
+          end;
+          if LRetValues.Count = 0 then
+            self.FModule.InstrAt(LResult).Kind := IrOp.Constant;
+            self.FModule.InstrAt(LResult).Imm := 0;
+          end;
+          // Emit put it last: it goes first in the tail
+          LTailInstrs := self.FModule.BlockAt(self.FTail).Instrs;
+          LKept := ref Int64List();
+          LKept.Add(LResult);
+          for LI := 0 to LTailInstrs.Count - 2 do
+            LKept.Add(LTailInstrs[LI]);
+          end;
+          self.FModule.BlockAt(self.FTail).Instrs := LKept;
+        end;
+        self.DoReplaceUses(ACall, LResult);
+      end;
+      self.FSize := self.FSize + DoSizeOf(self.FModule, LCode);
+      self.FChanged := true;
+    end;
+
+    // Every direct call the function has now, in block order, then each worth it
+    // inlined (see the header); true when one was
+    method Run(): bool;
+    var
+      LCalls: ref Int64List;
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LCode: int64;
+      LDone: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      if self.FFunction.Parent <> 0 then
+        return false;
+      end;
+      LCalls := ref Int64List();
+      for LI := 0 to self.FFunction.Blocks.Count - 1 do
+        LBlock := self.FModule.BlockAt(self.FFunction.Blocks[LI]);
+        for LK := 0 to LBlock.Instrs.Count - 1 do
+          if self.FModule.InstrAt(LBlock.Instrs[LK]).Kind = IrOp.Call then
+            LCalls.Add(LBlock.Instrs[LK]);
+          end;
+        end;
+      end;
+      LDone := 0;
+      for LI := 0 to LCalls.Count - 1 do
+        if LDone >= ADAM_INLINE_MAX_SITES then
+          leave;
+        end;
+        LInstr := self.FModule.InstrAt(LCalls[LI]);
+        LCode := self.DoCodeOf(LInstr.Link);
+        if LCode = 0 then
+          skip;
+        end;
+        if not self.DoLegal(LCode) then
+          skip;
+        end;
+        if not self.DoWorth(LCode, LInstr.Operands.Count) then
+          skip;
+        end;
+        self.DoInline(LCalls[LI], LCode);
+        LDone := LDone + 1;
+      end;
+      return self.FChanged;
+    end;
+  end;
+
+// The pass inline (see the header) over AModule's function AFunction at ALevel; true when
+// it changed the function
+routine DoInlineAt(const AModule: ref IrModule; const AFunction: int64;
+  const ALevel: OptLevel): bool;
+var
+  LInliner: ref Inliner;
+begin
+  LInliner := ref Inliner(AModule, AFunction, ALevel);
+  return LInliner.Run();
+end;
+
+// The pass inline at safe (see the header); AAnalysis unread (it makes its own blocks)
+public routine InlineSafe(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+begin
+  return DoInlineAt(AModule, AFunction, OptLevel.Safe);
+end;
+
+// The pass inline at fast: the larger budget (see the header)
+public routine InlineFast(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+begin
+  return DoInlineAt(AModule, AFunction, OptLevel.Fast);
+end;
+
+// The pass inline at small: only a callee no larger than its call (see the header)
+public routine InlineSmall(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+begin
+  return DoInlineAt(AModule, AFunction, OptLevel.Small);
+end;
+
+end.

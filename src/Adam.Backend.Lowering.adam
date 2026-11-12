@@ -365,6 +365,10 @@ public const
   ADAM_LOWERING_FINALLY_SYMBOL: string = "$finally";
   // A function's cleanup funclet's symbol: the function's and this (DoCleanupFunclet)
   ADAM_LOWERING_CLEANUP_SYMBOL: string = "$cleanup";
+  // A body copy's symbol: its declared function's and this (DoInlineCopy; internal), and
+  // the most nodes a routine's subtree may have to be copied (DoCopyable)
+  ADAM_LOWERING_INLINE_SYMBOL: string = "$inline";
+  ADAM_LOWERING_COPY_NODES: int64 = 160;
   // A waiting jump's target when it is a return (DoPadJump): no block, the return's tail
   // after its last pad (DoPadReturn)
   ADAM_LOWERING_RETURN_PAD: int64 = -1;
@@ -571,6 +575,9 @@ public type
     // True while another unit's declarations are given their declared functions and
     // blobs (Run): nothing of them is lowered or reported here
     hidden FDeclaring: bool;
+    // Each declared function another unit's routine became, its routine (DoRegister): the
+    // ones a release build may copy the body of (DoInlineCopies)
+    hidden FDeclaredRoutines: ref Int64Map;
     // True when the program has an entry to run a unit's initializers and sections (its
     // exe module's block, with the runtime's exit: DoFindEntry)
     hidden FHasEntry: bool;
@@ -713,6 +720,7 @@ public type
       setlength(self.FExitOf, ATree.Count);
       setlength(self.FNextOf, ATree.Count);
       self.FRoutines := ref Int64List();
+      self.FDeclaredRoutines := ref Int64Map(0);
       self.FFunction := 0;
       self.FBlock := 0;
       self.FEntryModule := 0;
@@ -1141,6 +1149,7 @@ public type
       // another unit's routine: its code is that unit's object's, a call refers to it
       if self.FDeclaring then
         self.FModule.FunctionAt(LFunction).Declared := true;
+        self.FDeclaredRoutines.Put(LFunction, ARoutine);
         return;
       end;
       self.FRoutines.Add(ARoutine);
@@ -13958,6 +13967,167 @@ public type
       end;
     end;
 
+    // True when the subtree of ANode holds no more nodes than ACap still allows (each node
+    // takes one; the count stops once it is past)
+    hidden const method DoSubtreeWithin(const ANode: int64; var ACap: int64): bool;
+    var
+      LI: int64;
+    begin
+      ACap := ACap - 1;
+      if ACap < 0 then
+        return false;
+      end;
+      for LI := 0 to self.FTree.ChildCount(ANode) - 1 do
+        if not self.DoSubtreeWithin(self.FTree.ChildAt(ANode, LI), ACap) then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    // True when ARoutine (another unit's routine, a declared function) may get a body copy
+    // (DoInlineCopy): it has a body of its own (not a bound accessor), no generic part, and
+    // a subtree of at most ADAM_LOWERING_COPY_NODES nodes (a larger one is never small
+    // enough for the inliner's budgets, so its lowering would be wasted)
+    hidden method DoCopyable(const ARoutine: int64): bool;
+    var
+      LCap: int64;
+    begin
+      if ARoutine = 0 then
+        return false;
+      end;
+      if self.FTree.FirstOf(ARoutine, NodeRole.Body) = 0 then
+        return false;
+      end;
+      if self.FTree.CountOf(ARoutine, NodeRole.GenericParam) > 0 then
+        return false;
+      end;
+      if self.DoIsAccessor(ARoutine) and self.DoIsBound(ARoutine) then
+        return false;
+      end;
+      LCap := ADAM_LOWERING_COPY_NODES;
+      return self.DoSubtreeWithin(ARoutine, LCap);
+    end;
+
+    // True when a function from AFirst on (a body copy and the funclets lowered with it)
+    // reaches another unit's internal function or blob: a symbol only that unit's object
+    // has, which no other object can link to
+    hidden const method DoReachesInternal(const AFirst: int64): bool;
+    var
+      LFunction: ref IrFunction;
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LLink: int64;
+      LF: int64;
+      LB: int64;
+      LK: int64;
+    begin
+      for LF := AFirst to self.FModule.FunctionCount - 1 do
+        LFunction := self.FModule.FunctionAt(LF);
+        for LB := 0 to LFunction.Blocks.Count - 1 do
+          LBlock := self.FModule.BlockAt(LFunction.Blocks[LB]);
+          for LK := 0 to LBlock.Instrs.Count - 1 do
+            LInstr := self.FModule.InstrAt(LBlock.Instrs[LK]);
+            LLink := LInstr.Link;
+            if (LInstr.Kind = IrOp.Call) or (LInstr.Kind = IrOp.CodeAddress) then
+              if self.FModule.FunctionAt(LLink).Declared and
+                self.FModule.FunctionAt(LLink).Internal then
+                return true;
+              end;
+            end;
+            if (LInstr.Kind = IrOp.Address) or (LInstr.Kind = IrOp.ThreadAddress) then
+              if self.FModule.DataAt(LLink).Declared and self.FModule.DataAt(LLink).Internal then
+                return true;
+              end;
+            end;
+          end;
+        end;
+      end;
+      return false;
+    end;
+
+    // The body of AFunction's routine (another unit's, DoCopyable) lowered here as a copy:
+    // a new internal function (ADAM_LOWERING_INLINE_SYMBOL), AFunction's InlineBody, which
+    // only the inliner reads (Adam.Opt.Inline: AA.3, the callee lowered from the AST at the
+    // call's unit); a call of the routine inside it stays a call of AFunction. A copy that
+    // reaches another unit's internal symbol (DoReachesInternal) is dropped with its
+    // funclets: declared, no blocks, no scopes (nothing refers to them, nothing is made)
+    hidden method DoInlineCopy(const AFunction: int64);
+    var
+      LRoutine: int64;
+      LCopy: int64;
+      LDeclared: ref IrFunction;
+      LFunction: ref IrFunction;
+      LF: int64;
+    begin
+      LRoutine := self.FDeclaredRoutines.Find(AFunction);
+      if not self.DoCopyable(LRoutine) then
+        return;
+      end;
+      LDeclared := self.FModule.FunctionAt(AFunction);
+      LCopy := self.FModule.AddFunction(LDeclared.Symbol + ADAM_LOWERING_INLINE_SYMBOL,
+        LDeclared.Signature.ResultType, LRoutine);
+      LFunction := self.FModule.FunctionAt(LCopy);
+      LFunction.Internal := true;
+      LFunction.NoReturn := LDeclared.NoReturn;
+      self.DoFillSignature(LRoutine, LFunction.Signature);
+      // the body lowered into the copy, then the routine's function the declared one again
+      self.FFunctionOf[LRoutine] := LCopy;
+      self.DoBody(LRoutine);
+      self.DoCleanupScopes(LRoutine, self.DoLastBlock());
+      self.FFunctionOf[LRoutine] := AFunction;
+      if self.DoReachesInternal(LCopy) then
+        for LF := LCopy to self.FModule.FunctionCount - 1 do
+          LFunction := self.FModule.FunctionAt(LF);
+          LFunction.Declared := true;
+          LFunction.Blocks := ref Int64List();
+          LFunction.ClearScopes();
+        end;
+        return;
+      end;
+      LDeclared.InlineBody := LCopy;
+    end;
+
+    // A release build's body copies (DoInlineCopy) of every other unit's routine a function
+    // of this unit calls directly, once each, in the order of the first call; the copies'
+    // own calls are not followed (a copy is inlined once: what it calls stays a call)
+    hidden method DoInlineCopies();
+    var
+      LQueue: ref Int64List;
+      LQueued: ref Int64Map;
+      LFunction: ref IrFunction;
+      LBlock: ref IrBlock;
+      LInstr: ref IrInstr;
+      LOwn: int64;
+      LF: int64;
+      LB: int64;
+      LK: int64;
+    begin
+      LQueue := ref Int64List();
+      LQueued := ref Int64Map(0);
+      LOwn := self.FModule.FunctionCount;
+      for LF := 1 to LOwn - 1 do
+        LFunction := self.FModule.FunctionAt(LF);
+        if LFunction.Declared then
+          skip;
+        end;
+        for LB := 0 to LFunction.Blocks.Count - 1 do
+          LBlock := self.FModule.BlockAt(LFunction.Blocks[LB]);
+          for LK := 0 to LBlock.Instrs.Count - 1 do
+            LInstr := self.FModule.InstrAt(LBlock.Instrs[LK]);
+            if (LInstr.Kind = IrOp.Call) and (LQueued.Find(LInstr.Link) = 0) and
+              (self.FDeclaredRoutines.Find(LInstr.Link) <> 0) then
+              LQueued.Put(LInstr.Link, 1);
+              LQueue.Add(LInstr.Link);
+            end;
+          end;
+        end;
+      end;
+      for LF := 0 to LQueue.Count - 1 do
+        self.DoInlineCopy(LQueue[LF]);
+      end;
+    end;
+
     // Every module's routines and variables given their functions and blobs, the unit's
     // own, every other one's declared (DoModule under FDeclaring); the entry found; then
     // for the parts: the @linklibrary names of every module and the entry's body; for a
@@ -14017,6 +14187,11 @@ public type
       // the task entries first: an end function one of them asks for is lowered after
       self.DoTaskBodies();
       self.DoEndBodies();
+      // a release build: the body copies of the other units' routines it calls, for the
+      // inliner (Adam.Opt.Inline)
+      if not self.FTree.IsDebugBuild() then
+        self.DoInlineCopies();
+      end;
       // every function lowered: the sites take their ids in source order (M3.12b)
       if self.DoSitesOn() then
         self.DoNumberSites();

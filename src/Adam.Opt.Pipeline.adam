@@ -16,15 +16,18 @@
   Adam.Opt.Pipeline.adam - the optimizer's pass list per level (M6)
 
   Every lowered module goes through OptimizeModule before it is generated:
-  each defined function, each pass of the build's level in order, a fresh
+  each defined function, a function's callees before it (a declared callee
+  by its body copy), each pass of the build's level in order, a fresh
   FunctionAnalysis (Adam.Opt.Analysis) made for every pass that runs. The
   passes are target-neutral, over the SSA IR alone; machine passes stay in
   the arch part (PROJECT.md AT.2).
 
   PassesOf is the one list: debug runs none (DESIGN sec 5: its locals stay in
   slots; unused routines and data still go at link time), safe, fast and
-  small take each pass as its atom adds it (PLAN-ADAM M6 O3 on): sroa then
-  mem2reg (Adam.Opt.Promote) first, so every later pass sees values, not
+  small take each pass as its atom adds it (PLAN-ADAM M6 O3 on): inline
+  (Adam.Opt.Inline) first, each level its own cost model, copying the
+  callees the order has already optimized into their calls; then sroa then
+  mem2reg (Adam.Opt.Promote), so every later pass sees values, not
   slots; then sccp (Adam.Opt.Sccp); then simplifycfg (Adam.Opt.Cfg) drops
   the blocks sccp found nothing runs into and merges what is left straight;
   then memory (Adam.Opt.Memory) makes small copies and fills scalar moves,
@@ -67,9 +70,9 @@
 
 module unit Adam.Opt.Pipeline;
 
-import System.SysUtils, Adam.Core.Common, Adam.Backend.Ssa, Adam.Opt.Analysis,
-  Adam.Opt.Promote, Adam.Opt.Sccp, Adam.Opt.Memory, Adam.Opt.Combine, Adam.Opt.Gvn,
-  Adam.Opt.Loops, Adam.Opt.Dce, Adam.Opt.Cfg;
+import System.SysUtils, Adam.Core.Common, Adam.Core.Containers, Adam.Backend.Ssa,
+  Adam.Opt.Analysis, Adam.Opt.Promote, Adam.Opt.Sccp, Adam.Opt.Memory, Adam.Opt.Combine,
+  Adam.Opt.Gvn, Adam.Opt.Loops, Adam.Opt.Dce, Adam.Opt.Cfg, Adam.Opt.Inline;
 
 public const
   // Raised (an invariant broken) by a pass that left the IR malformed
@@ -114,41 +117,53 @@ begin
   // preheaders and exits licm made straight, adce drops the values none of them left a
   // use for, and simplifycfg last the blocks its jumps skip
   if ALevel = OptLevel.Fast then
-    setlength(LPasses, 17);
+    setlength(LPasses, 18);
   else
-    setlength(LPasses, 14);
+    setlength(LPasses, 15);
   end;
-  LPasses[0].PassName := "sroa";
-  LPasses[0].Run := SplitSlots;
-  LPasses[1].PassName := "mem2reg";
-  LPasses[1].Run := PromoteSlots;
-  LPasses[2].PassName := "sccp";
-  LPasses[2].Run := PropagateConstants;
-  LPasses[3].PassName := "simplifycfg";
-  LPasses[3].Run := SimplifyControlFlow;
-  LPasses[4].PassName := "memory";
-  LPasses[4].Run := OptimizeMemory;
-  LPasses[5].PassName := "sroa";
-  LPasses[5].Run := SplitSlots;
-  LPasses[6].PassName := "mem2reg";
-  LPasses[6].Run := PromoteSlots;
-  LPasses[7].PassName := "combine";
-  LPasses[7].Run := CombineInstructions;
-  LPasses[8].PassName := "gvn";
-  LPasses[8].Run := NumberValues;
-  LPasses[9].PassName := "licm";
-  LPasses[9].Run := HoistInvariants;
-  LPasses[10].PassName := "indvars";
-  LPasses[10].Run := SimplifyInductions;
-  LAt := 11;
+  // inline first: its callees ran through the list before it (OptimizeModule's order),
+  // and every pass after it sees the copies with the caller's arguments
+  LPasses[0].PassName := "inline";
   if ALevel = OptLevel.Fast then
-    LPasses[11].PassName := "loopshape";
-    LPasses[11].Run := ShapeLoops;
-    LPasses[12].PassName := "sccp";
-    LPasses[12].Run := PropagateConstants;
-    LPasses[13].PassName := "combine";
-    LPasses[13].Run := CombineInstructions;
-    LAt := 14;
+    LPasses[0].Run := InlineFast;
+  else
+    if ALevel = OptLevel.Small then
+      LPasses[0].Run := InlineSmall;
+    else
+      LPasses[0].Run := InlineSafe;
+    end;
+  end;
+  LPasses[1].PassName := "sroa";
+  LPasses[1].Run := SplitSlots;
+  LPasses[2].PassName := "mem2reg";
+  LPasses[2].Run := PromoteSlots;
+  LPasses[3].PassName := "sccp";
+  LPasses[3].Run := PropagateConstants;
+  LPasses[4].PassName := "simplifycfg";
+  LPasses[4].Run := SimplifyControlFlow;
+  LPasses[5].PassName := "memory";
+  LPasses[5].Run := OptimizeMemory;
+  LPasses[6].PassName := "sroa";
+  LPasses[6].Run := SplitSlots;
+  LPasses[7].PassName := "mem2reg";
+  LPasses[7].Run := PromoteSlots;
+  LPasses[8].PassName := "combine";
+  LPasses[8].Run := CombineInstructions;
+  LPasses[9].PassName := "gvn";
+  LPasses[9].Run := NumberValues;
+  LPasses[10].PassName := "licm";
+  LPasses[10].Run := HoistInvariants;
+  LPasses[11].PassName := "indvars";
+  LPasses[11].Run := SimplifyInductions;
+  LAt := 12;
+  if ALevel = OptLevel.Fast then
+    LPasses[12].PassName := "loopshape";
+    LPasses[12].Run := ShapeLoops;
+    LPasses[13].PassName := "sccp";
+    LPasses[13].Run := PropagateConstants;
+    LPasses[14].PassName := "combine";
+    LPasses[14].Run := CombineInstructions;
+    LAt := 15;
   end;
   LPasses[LAt].PassName := "simplifycfg";
   LPasses[LAt].Run := SimplifyControlFlow;
@@ -174,13 +189,55 @@ begin
   end;
 end;
 
+// The function AFunction and every function it calls directly (a declared one by its
+// body copy), callees first, added to AOrder once each (AVisited: already added or on
+// the way), in the order of the calls
+routine DoCalleesFirst(const AModule: ref IrModule; const AFunction: int64;
+  const AOrder: ref Int64List; var AVisited: BoolArray);
+var
+  LFunction: ref IrFunction;
+  LBlock: ref IrBlock;
+  LInstr: ref IrInstr;
+  LCallee: int64;
+  LB: int64;
+  LK: int64;
+begin
+  if AVisited[AFunction] then
+    return;
+  end;
+  AVisited[AFunction] := true;
+  LFunction := AModule.FunctionAt(AFunction);
+  for LB := 0 to LFunction.Blocks.Count - 1 do
+    LBlock := AModule.BlockAt(LFunction.Blocks[LB]);
+    for LK := 0 to LBlock.Instrs.Count - 1 do
+      LInstr := AModule.InstrAt(LBlock.Instrs[LK]);
+      if (LInstr.Kind = IrOp.Call) and AModule.IsFunction(LInstr.Link) then
+        LCallee := LInstr.Link;
+        if AModule.FunctionAt(LCallee).Declared then
+          LCallee := AModule.FunctionAt(LCallee).InlineBody;
+        end;
+        if LCallee <> 0 then
+          DoCalleesFirst(AModule, LCallee, AOrder, AVisited);
+        end;
+      end;
+    end;
+  end;
+  if not LFunction.Declared then
+    AOrder.Add(AFunction);
+  end;
+end;
+
 // AModule optimized at ALevel: every defined function through every pass PassesOf names,
-// in order (see the header)
+// in order (see the header), a function's callees before it (the inliner copies them
+// optimized); a cycle of calls is entered at its lowest id
 public routine OptimizeModule(const AModule: ref IrModule; const ALevel: OptLevel);
 var
   LPasses: OptPassArray;
   LAnalysis: ref FunctionAnalysis;
+  LOrder: ref Int64List;
+  LVisited: BoolArray;
   LChanged: bool;
+  LO: int64;
   LF: int64;
   LI: int64;
 begin
@@ -188,7 +245,13 @@ begin
   if len(LPasses) = 0 then
     return;
   end;
+  LOrder := ref Int64List();
+  setlength(LVisited, AModule.FunctionCount);
   for LF := 1 to AModule.FunctionCount - 1 do
+    DoCalleesFirst(AModule, LF, LOrder, LVisited);
+  end;
+  for LO := 0 to LOrder.Count - 1 do
+    LF := LOrder[LO];
     if not AModule.FunctionAt(LF).Declared then
       for LI := 0 to len(LPasses) - 1 do
         LAnalysis := ref FunctionAnalysis(AModule, LF);
