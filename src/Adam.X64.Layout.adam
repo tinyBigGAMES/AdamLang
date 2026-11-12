@@ -20,8 +20,12 @@
                   (Adam.X64.Encode), at every level, in this order:
 
   moves           a move of a register into itself goes (mov.8 r, r; movss
-                  / movsd / movaps x, x; a mov.4 r, r stays: it zeroes the
-                  top half); of two moves in a row of one kind (mov.8, or
+                  / movsd / movaps x, x; a mov.4 r, r zeroes the top half,
+                  so it goes only when the last write of r before it in
+                  its block already did (a 4-byte write or zero), or when
+                  after it, in its block, r is read through its low 4
+                  bytes only until something writes all of r); of two
+                  moves in a row of one kind (mov.8, or
                   movsd) where the second undoes the first (a, b then b, a;
                   a store of a register into a place then its reload from
                   there, or the load then the store back) the second goes,
@@ -43,8 +47,14 @@
                   the header. A function with a block that does not end in
                   a jmp, ret, tail call or ud2 (it falls through) keeps its
                   order.
+  threading       with placement, when every block is closed: a jmp / jcc
+                  to a trampoline (a block that is one jmp) names where
+                  the chain of trampolines lands; a trampoline (not the
+                  entry) nothing names any more is emptied (control never
+                  reaches it: it encodes to nothing)
   jumps           in the final order, a jmp to the next block goes, and jcc
-                  c A; jmp B with A the next block becomes jcc !c B
+                  c A; jmp B with A the next block becomes jcc !c B (the
+                  next block: the next one holding an instruction)
   alignment       at fast (AAlignLoops) a loop header (a block jumped to
                   from itself or a block after it, the entry aside) starts
                   at an ADAM_X64_LAYOUT_LOOP_ALIGN boundary
@@ -139,6 +149,157 @@ begin
   return false;
 end;
 
+// True for a mov.4 of a register into itself (no prologue, no implicit register): it only
+// zeroes the register's top half
+routine DoIsZeroingSelfMove(const AInstr: ref MachineInstr): bool;
+begin
+  if AInstr.Prologue or (AInstr.ImplicitUses.Count > 0) or (AInstr.ImplicitDefs.Count > 0) or
+    (AInstr.OperandCount <> 2) or (AInstr.Op <> X64Op.Mov) or (AInstr.Width <> 4) then
+    return false;
+  end;
+  return DoIsRegister(AInstr.OperandAt(0)) and DoIsRegister(AInstr.OperandAt(1)) and
+    (AInstr.OperandAt(0).Reg = AInstr.OperandAt(1).Reg);
+end;
+
+// True for the 4-byte ops whose implicit registers they write as 4-byte values: the wide
+// multiplies and divisions (edx:eax), cdq (edx), xchg / lock xadd (the register). Lock
+// cmpxchg is not one: a cmpxchg that stores leaves rax unwritten
+routine DoWritesImplicit32(const AOp: X64Op): bool;
+begin
+  return (AOp = X64Op.IMulWide) or (AOp = X64Op.MulWide) or (AOp = X64Op.IDiv) or
+    (AOp = X64Op.UDiv) or (AOp = X64Op.Cqo) or (AOp = X64Op.Xchg) or (AOp = X64Op.LockXadd);
+end;
+
+// True when AInstr writes physical register AReg: as its first operand, or implicitly
+routine DoWritesRegister(const AInstr: ref MachineInstr; const AReg: int64): bool;
+begin
+  if (AInstr.OperandCount > 0) and X64OperandWrites(AInstr, 0) and
+    DoIsRegister(AInstr.OperandAt(0)) and (AInstr.OperandAt(0).Reg = AReg) then
+    return true;
+  end;
+  return AInstr.ImplicitDefs.IndexOf(AReg) >= 0;
+end;
+
+// True when AInstr's write of physical register AReg zeroes its top half: a general
+// register written by a 4-byte op (x86_64 zero-extends every 32-bit write: mov, lea, the
+// arithmetic, shifts, cmov, movzx / movsx, movd, cvt*2si) or by zero (xor r32, r32), or a
+// 4-byte op's implicit 32-bit write (DoWritesImplicit32)
+routine DoZeroesTop(const AInstr: ref MachineInstr; const AReg: int64): bool;
+begin
+  if (AInstr.OperandCount > 0) and X64OperandWrites(AInstr, 0) and
+    DoIsRegister(AInstr.OperandAt(0)) and (AInstr.OperandAt(0).Reg = AReg) then
+    return (AInstr.Op = X64Op.Zero) or (AInstr.Width = 4);
+  end;
+  return (AInstr.Width = 4) and DoWritesImplicit32(AInstr.Op) and
+    (AInstr.ImplicitDefs.IndexOf(AReg) >= 0);
+end;
+
+// True when the mov.4 r, r at AIndex of ABlock (DoIsZeroingSelfMove) changes nothing: the
+// last instruction before it in the block that writes r already zeroed r's top half (none
+// in the block: what a predecessor left is not known, so it stays)
+routine DoTopAlreadyZero(const ABlock: ref MachineBlock; const AIndex: int64): bool;
+var
+  LReg: int64;
+  LI: int64;
+begin
+  LReg := ABlock.InstrAt(AIndex).OperandAt(0).Reg;
+  LI := AIndex - 1;
+  while LI >= 0 do
+    if DoWritesRegister(ABlock.InstrAt(LI), LReg) then
+      return DoZeroesTop(ABlock.InstrAt(LI), LReg);
+    end;
+    LI := LI - 1;
+  end;
+  return false;
+end;
+
+// True when memory operand AOperand addresses through physical register AReg (its base or
+// its index)
+routine DoAddressesWith(const AOperand: ref MachineOperand; const AReg: int64): bool;
+begin
+  if AOperand.Kind <> OperandKind.Memory then
+    return false;
+  end;
+  if (AOperand.Base = MemoryBase.Register) and not AOperand.BaseVirtual and
+    (AOperand.Reg = AReg) then
+    return true;
+  end;
+  return (AOperand.Scale > 0) and not AOperand.IndexVirtual and (AOperand.IndexReg = AReg);
+end;
+
+// True when AInstr reads physical register AReg; ALowOnly set to whether every read takes
+// only its low 4 bytes: a register operand of a 1, 2 or 4-byte op, an address of a lea of
+// 4 bytes or less (its low bits come from the low bits alone), an implicit read of a
+// 4-byte wide multiply / division / cdq, or a shift's count (cl)
+routine DoReadsRegister(const AInstr: ref MachineInstr; const AReg: int64;
+  var ALowOnly: bool): bool;
+var
+  LOperand: ref MachineOperand;
+  LReads: bool;
+  LK: int64;
+begin
+  LReads := false;
+  ALowOnly := true;
+  for LK := 0 to AInstr.OperandCount - 1 do
+    LOperand := AInstr.OperandAt(LK);
+    if DoIsRegister(LOperand) and (LOperand.Reg = AReg) and X64OperandReads(AInstr, LK) then
+      LReads := true;
+      if (AInstr.Width < 1) or (AInstr.Width > 4) then
+        ALowOnly := false;
+      end;
+    end;
+    if DoAddressesWith(LOperand, AReg) then
+      LReads := true;
+      if (AInstr.Op <> X64Op.Lea) or (AInstr.Width > 4) then
+        ALowOnly := false;
+      end;
+    end;
+  end;
+  if AInstr.ImplicitUses.IndexOf(AReg) >= 0 then
+    LReads := true;
+    if not (((AInstr.Width = 4) and DoWritesImplicit32(AInstr.Op)) or
+      (AInstr.Op = X64Op.Shl) or (AInstr.Op = X64Op.Shr) or (AInstr.Op = X64Op.Sar)) then
+      ALowOnly := false;
+    end;
+  end;
+  return LReads;
+end;
+
+// True when the mov.4 r, r at AIndex of ABlock (DoIsZeroingSelfMove) is dead the other
+// way: after it, in its block, r is read only through its low 4 bytes (DoReadsRegister)
+// until an instruction writes all of r (a 4 or 8-byte write, zero, or an implicit write
+// such as a call's clobber); a 1 or 2-byte write keeps the top, and the block's end
+// (r may be live out) keeps the move
+routine DoTopNeverRead(const ABlock: ref MachineBlock; const AIndex: int64): bool;
+var
+  LInstr: ref MachineInstr;
+  LReg: int64;
+  LLowOnly: bool;
+  LI: int64;
+begin
+  LReg := ABlock.InstrAt(AIndex).OperandAt(0).Reg;
+  for LI := AIndex + 1 to ABlock.InstrCount - 1 do
+    LInstr := ABlock.InstrAt(LI);
+    if DoReadsRegister(LInstr, LReg, LLowOnly) and not LLowOnly then
+      return false;
+    end;
+    if DoWritesRegister(LInstr, LReg) then
+      if (LInstr.OperandCount > 0) and X64OperandWrites(LInstr, 0) and
+        DoIsRegister(LInstr.OperandAt(0)) and (LInstr.OperandAt(0).Reg = LReg) then
+        return (LInstr.Op = X64Op.Zero) or (LInstr.Width >= 4);
+      end;
+      // An implicit write: a call's clobber, or a 4 / 8-byte one (a wide multiply's /
+      // division's rdx:rax, xchg / xadd's register); lock cmpxchg writes rax only when the
+      // compare fails, a 1 or 2-byte xchg / xadd only the low bytes
+      if LInstr.Op = X64Op.LockCmpxchg then
+        return false;
+      end;
+      return (LInstr.Op = X64Op.Call) or (LInstr.Width >= 4);
+    end;
+  end;
+  return false;
+end;
+
 // The moves of every block cleaned (see the header)
 routine DoMoves(const AMachine: ref MachineFunction);
 var
@@ -150,7 +311,9 @@ begin
     LBlock := AMachine.BlockAt(LB);
     LI := 0;
     while LI < LBlock.InstrCount do
-      if DoIsSelfMove(LBlock.InstrAt(LI)) then
+      if DoIsSelfMove(LBlock.InstrAt(LI)) or
+        (DoIsZeroingSelfMove(LBlock.InstrAt(LI)) and
+        (DoTopAlreadyZero(LBlock, LI) or DoTopNeverRead(LBlock, LI))) then
         LBlock.RemoveAt(LI);
       else
         if (LI > 0) and DoUndoes(LBlock.InstrAt(LI - 1), LBlock.InstrAt(LI)) then
@@ -430,11 +593,119 @@ begin
   return ACond;
 end;
 
-// True for a jump (jmp or jcc) to block ABlock
-routine DoJumpsTo(const AInstr: ref MachineInstr; const ABlock: int64): bool;
+// True for a jump (jmp or jcc) whose one operand is a block
+routine DoIsBlockJump(const AInstr: ref MachineInstr): bool;
 begin
   return ((AInstr.Op = X64Op.Jmp) or (AInstr.Op = X64Op.Jcc)) and (AInstr.OperandCount = 1) and
-    (AInstr.OperandAt(0).Kind = OperandKind.BlockRef) and (AInstr.OperandAt(0).Block = ABlock);
+    (AInstr.OperandAt(0).Kind = OperandKind.BlockRef);
+end;
+
+// True for a block that is one jmp to a block and nothing else (a trampoline)
+routine DoIsTrampoline(const ABlock: ref MachineBlock): bool;
+begin
+  return (ABlock.InstrCount = 1) and (ABlock.InstrAt(0).Op = X64Op.Jmp) and
+    DoIsBlockJump(ABlock.InstrAt(0));
+end;
+
+// Where a jump to block ABlock lands in the end: through every trampoline in a row; a
+// chain that comes back round (a jmp to itself, trampolines naming each other) lands on
+// ABlock itself
+routine DoLanding(const AMachine: ref MachineFunction; const ABlock: int64): int64;
+var
+  LAt: int64;
+  LSteps: int64;
+begin
+  LAt := ABlock;
+  LSteps := 0;
+  while DoIsTrampoline(AMachine.BlockAt(LAt)) do
+    LAt := AMachine.BlockAt(LAt).InstrAt(0).OperandAt(0).Block;
+    LSteps := LSteps + 1;
+    if (LAt = ABlock) or (LSteps > AMachine.BlockCount) then
+      return ABlock;
+    end;
+  end;
+  return LAt;
+end;
+
+// The jumps threaded (see the header): every jmp / jcc to a trampoline names where the
+// chain lands; a trampoline (not the entry) no operand names any more is emptied. Only
+// when every block is closed: then no block falls into another, and an emptied block is
+// one control never reaches
+routine DoThread(const AMachine: ref MachineFunction);
+var
+  LBlock: ref MachineBlock;
+  LInstr: ref MachineInstr;
+  LLandings: array of int64;
+  LNamed: array of int64;
+  LTarget: int64;
+  LB: int64;
+  LI: int64;
+  LK: int64;
+begin
+  if not DoAllClosed(AMachine) then
+    return;
+  end;
+  // Every block's landing first, over the jumps as they stand
+  setlength(LLandings, AMachine.BlockCount);
+  for LB := 0 to AMachine.BlockCount - 1 do
+    LLandings[LB] := DoLanding(AMachine, LB);
+  end;
+  setlength(LNamed, AMachine.BlockCount);
+  for LB := 0 to AMachine.BlockCount - 1 do
+    LNamed[LB] := 0;
+  end;
+  for LB := 0 to AMachine.BlockCount - 1 do
+    LBlock := AMachine.BlockAt(LB);
+    for LI := 0 to LBlock.InstrCount - 1 do
+      LInstr := LBlock.InstrAt(LI);
+      if DoIsBlockJump(LInstr) then
+        LTarget := LLandings[LInstr.OperandAt(0).Block];
+        if LTarget <> LInstr.OperandAt(0).Block then
+          LInstr.SetOperand(0, BlockOperand(LTarget));
+        end;
+      end;
+      // Every block operand counts as naming its block, a jump's or not
+      for LK := 0 to LInstr.OperandCount - 1 do
+        if LInstr.OperandAt(LK).Kind = OperandKind.BlockRef then
+          LNamed[LInstr.OperandAt(LK).Block] := LNamed[LInstr.OperandAt(LK).Block] + 1;
+        end;
+      end;
+    end;
+  end;
+  for LB := 1 to AMachine.BlockCount - 1 do
+    LBlock := AMachine.BlockAt(LB);
+    if DoIsTrampoline(LBlock) and (LNamed[LB] = 0) then
+      LBlock.RemoveAt(0);
+    end;
+  end;
+end;
+
+// The first block from ABlock on that holds an instruction (where control falling into
+// ABlock ends up: an empty block encodes to nothing); the block count past the last
+routine DoFilledFrom(const AMachine: ref MachineFunction; const ABlock: int64): int64;
+var
+  LB: int64;
+begin
+  LB := ABlock;
+  while (LB < AMachine.BlockCount) and (AMachine.BlockAt(LB).InstrCount = 0) do
+    LB := LB + 1;
+  end;
+  return LB;
+end;
+
+// True for a jump (jmp or jcc) that lands where falling out of block ABlock lands: its
+// block, or the next filled one (DoFilledFrom), is the one after ABlock's
+routine DoJumpsToNext(const AMachine: ref MachineFunction; const AInstr: ref MachineInstr;
+  const ABlock: int64): bool;
+var
+  LNext: int64;
+begin
+  if not DoIsBlockJump(AInstr) then
+    return false;
+  end;
+  LNext := DoFilledFrom(AMachine, ABlock + 1);
+  return (LNext < AMachine.BlockCount) and
+    (DoFilledFrom(AMachine, AInstr.OperandAt(0).Block) = LNext);
 end;
 
 // The jumps to the next block taken out (see the header)
@@ -451,13 +722,12 @@ begin
     LCount := LBlock.InstrCount;
     if LCount > 0 then
       LLast := LBlock.InstrAt(LCount - 1);
-      if DoJumpsTo(LLast, LB + 1) and (LLast.Op = X64Op.Jmp) then
+      if DoJumpsToNext(AMachine, LLast, LB) and (LLast.Op = X64Op.Jmp) then
         LBlock.RemoveAt(LCount - 1);
       else
-        if (LCount > 1) and (LLast.Op = X64Op.Jmp) and (LLast.OperandCount = 1) and
-          (LLast.OperandAt(0).Kind = OperandKind.BlockRef) then
+        if (LCount > 1) and (LLast.Op = X64Op.Jmp) and DoIsBlockJump(LLast) then
           LPrev := LBlock.InstrAt(LCount - 2);
-          if DoJumpsTo(LPrev, LB + 1) and (LPrev.Op = X64Op.Jcc) then
+          if DoJumpsToNext(AMachine, LPrev, LB) and (LPrev.Op = X64Op.Jcc) then
             // jcc c next; jmp B -> jcc !c B, falling into next
             LPrev.Cond := DoInverse(LPrev.Cond);
             LPrev.SetOperand(0, BlockOperand(LLast.OperandAt(0).Block));
@@ -502,6 +772,7 @@ begin
   DoMoves(AMachine);
   if not AKeepOrder then
     DoPlace(AMachine);
+    DoThread(AMachine);
   end;
   DoJumps(AMachine);
   if AAlignLoops then

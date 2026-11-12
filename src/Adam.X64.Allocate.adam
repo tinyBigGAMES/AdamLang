@@ -44,8 +44,11 @@
   keeps those lifetimes inside a block); one that is raises.
 
   The walk takes the intervals by start. Free (no active interval holds the
-  register, no inactive or fixed one meets the current before then): the hint
-  (where the value a copy moves it from or to is), then a volatile register,
+  register, no inactive or fixed one meets the current before then): the
+  first free hint (the register its value is in just before it, its physical
+  one, then where the value a copy moves into it is and where the value it is
+  copied into is; a join's value, written by more than one copy, tries the
+  copy out first), then a volatile register,
   then a callee-saved one already saved, then a fresh callee-saved one, which
   is priced: taken only by an interval of ADAM_X64_ALLOC_SAVE_USES uses or
   more (below that the store and reload around a call cost what the push and
@@ -127,6 +130,9 @@ public const
   // The uses an interval needs to be given a callee-saved register the function does not
   // save yet (see the header)
   ADAM_X64_ALLOC_SAVE_USES: int64 = 3;
+  // The copies a hint is followed through to a value that already has its place (a
+  // parallel copy's temporaries put one between a phi's value and the copy that reads it)
+  ADAM_X64_ALLOC_HINT_HOPS: int64 = 4;
   // A position past every instruction: no use, no meeting
   ADAM_X64_ALLOC_NEVER: int64 = 4611686018427387904;
   // A value's place beside a physical register (0 or more): its spill slot, or nowhere
@@ -471,8 +477,9 @@ type
     hidden FEntryLive: BoolArray;
     hidden FFixedWritten: BoolArray;
     // The intervals; per virtual register its root interval (-1: none), its parts by start,
-    // its hints (a physical register, or a virtual one at a copy's position) and its spill
-    // slot (-1: none yet)
+    // its hints (a physical register; the virtual one copied into it at a copy's read
+    // position; the virtual one it is copied into at that copy's write position), how many
+    // copies write it (a join's value has one per edge) and its spill slot (-1: none yet)
     hidden FIntervals: IntervalArray;
     hidden FIntervalCount: int64;
     hidden FRootOf: Int64Array;
@@ -480,6 +487,9 @@ type
     hidden FHintReg: Int64Array;
     hidden FHintVReg: Int64Array;
     hidden FHintAt: Int64Array;
+    hidden FHintOut: Int64Array;
+    hidden FHintOutAt: Int64Array;
+    hidden FCopiesIn: Int64Array;
     hidden FSlotOf: Int64Array;
     // The walk: the intervals still to take (a heap by start), the active and the inactive
     // ones, the current position and the steps taken
@@ -1099,8 +1109,9 @@ type
     end;
 
     // The hints a copy AInstr (number AG) gives: a register copied into a virtual one, a
-    // virtual one copied into a register, a virtual one copied from another (the first copy
-    // found, scanning backward, holds)
+    // virtual one copied into a register, a virtual one copied from another and the other
+    // way round: the source told where its copy goes (the first copy found, scanning
+    // backward, holds); every copy into a virtual register counted (FCopiesIn)
     hidden method DoHints(const AInstr: ref MachineInstr; const AG: int64);
     var
       LDest: ref MachineOperand;
@@ -1115,12 +1126,18 @@ type
       LSource := AInstr.OperandAt(1);
       if (LDest.Kind = OperandKind.VirtualReg) and not self.FResident[LDest.Reg] then
         LV := LDest.Reg;
+        self.FCopiesIn[LV] := self.FCopiesIn[LV] + 1;
         if (LSource.Kind = OperandKind.PhysicalReg) and (self.FHintReg[LV] < 0) then
           self.FHintReg[LV] := LSource.Reg;
         end;
         if (LSource.Kind = OperandKind.VirtualReg) and (self.FHintVReg[LV] < 0) then
           self.FHintVReg[LV] := LSource.Reg;
           self.FHintAt[LV] := 2 * AG;
+        end;
+        if (LSource.Kind = OperandKind.VirtualReg) and not self.FResident[LSource.Reg] and
+          (self.FHintOut[LSource.Reg] < 0) then
+          self.FHintOut[LSource.Reg] := LV;
+          self.FHintOutAt[LSource.Reg] := 2 * AG + 1;
         end;
       end;
       if (LDest.Kind = OperandKind.PhysicalReg) and (LSource.Kind = OperandKind.VirtualReg) and
@@ -1157,6 +1174,9 @@ type
       setlength(self.FHintReg, LCount);
       setlength(self.FHintVReg, LCount);
       setlength(self.FHintAt, LCount);
+      setlength(self.FHintOut, LCount);
+      setlength(self.FHintOutAt, LCount);
+      setlength(self.FCopiesIn, LCount);
       setlength(self.FSlotOf, LCount);
       for LV := 0 to LCount - 1 do
         self.FRootOf[LV] := -1;
@@ -1164,6 +1184,9 @@ type
         self.FHintReg[LV] := -1;
         self.FHintVReg[LV] := -1;
         self.FHintAt[LV] := -1;
+        self.FHintOut[LV] := -1;
+        self.FHintOutAt[LV] := -1;
+        self.FCopiesIn[LV] := 0;
         self.FSlotOf[LV] := -1;
       end;
       for LN := self.FOrder.Count - 1 downto 0 do
@@ -1471,30 +1494,77 @@ type
       return ADAM_X64_ALLOC_NOWHERE;
     end;
 
-    // The register interval AId would best take (-1: none): the one its value is in just
-    // before it, its physical hint, else where its hint value is at the copy
-    hidden method DoHintOf(const AId: int64): int64;
+    // The register virtual register AHint (a copy hint; -1: none) is in at APos, added to
+    // AList when it is known; one not placed yet gives its physical hint, else passes the
+    // hint on along its own copy, the way AOut says (true: the copy it goes into,
+    // FHintOut; false: the copy it comes from, FHintVReg), up to ADAM_X64_ALLOC_HINT_HOPS
+    // copies; one in its slot ends the chain
+    hidden method DoAddHintPlace(const AList: ref Int64List; const AHint: int64;
+      const APos: int64; const AOut: bool);
     var
+      LHint: int64;
+      LPos: int64;
+      LPlace: int64;
+      LHop: int64;
+    begin
+      LHint := AHint;
+      LPos := APos;
+      LHop := 0;
+      while (LHint >= 0) and (LHop < ADAM_X64_ALLOC_HINT_HOPS) do
+        LPlace := self.DoLocation(LHint, LPos);
+        if LPlace >= 0 then
+          AList.Add(LPlace);
+          return;
+        end;
+        if LPlace <> ADAM_X64_ALLOC_NOWHERE then
+          return;
+        end;
+        // Not placed yet but bound for a register (a copy into an argument's, say): there
+        if self.FHintReg[LHint] >= 0 then
+          AList.Add(self.FHintReg[LHint]);
+          return;
+        end;
+        if AOut then
+          LPos := self.FHintOutAt[LHint];
+          LHint := self.FHintOut[LHint];
+        else
+          LPos := self.FHintAt[LHint];
+          LHint := self.FHintVReg[LHint];
+        end;
+        LHop := LHop + 1;
+      end;
+    end;
+
+    // The registers interval AId would best take, best first: the one its value is in
+    // just before it, its physical hint, then where the value copied into it is (at that
+    // copy) and where the value it is copied into is (at that copy). A join's value (more
+    // than one copy writes it: a phi with its edges) takes the copy out first: its copies in
+    // come from registers that differ edge by edge, its one copy out is coalesced whole
+    hidden method DoHintsOf(const AId: int64): ref Int64List;
+    var
+      LHints: ref Int64List;
       LInterval: ref LiveInterval;
       LPlace: int64;
       LV: int64;
     begin
+      LHints := ref Int64List();
       LInterval := self.FIntervals[AId];
       LV := LInterval.VReg;
       LPlace := self.DoLocation(LV, LInterval.Start() - 1);
       if LPlace >= 0 then
-        return LPlace;
+        LHints.Add(LPlace);
       end;
       if self.FHintReg[LV] >= 0 then
-        return self.FHintReg[LV];
+        LHints.Add(self.FHintReg[LV]);
       end;
-      if self.FHintVReg[LV] >= 0 then
-        LPlace := self.DoLocation(self.FHintVReg[LV], self.FHintAt[LV]);
-        if LPlace >= 0 then
-          return LPlace;
-        end;
+      if self.FCopiesIn[LV] > 1 then
+        self.DoAddHintPlace(LHints, self.FHintOut[LV], self.FHintOutAt[LV], true);
+        self.DoAddHintPlace(LHints, self.FHintVReg[LV], self.FHintAt[LV], false);
+      else
+        self.DoAddHintPlace(LHints, self.FHintVReg[LV], self.FHintAt[LV], false);
+        self.DoAddHintPlace(LHints, self.FHintOut[LV], self.FHintOutAt[LV], true);
       end;
-      return -1;
+      return LHints;
     end;
 
     // The first position register AReg's fixed intervals meet interval AInterval (the
@@ -1696,6 +1766,7 @@ type
       LCands: ref Int64List;
       LFree: Int64Array;
       LAllowFresh: bool;
+      LHints: ref Int64List;
       LPos: int64;
       LEnd: int64;
       LHint: int64;
@@ -1732,10 +1803,14 @@ type
         end;
       end;
       LAllowFresh := LInterval.Uses.Count >= ADAM_X64_ALLOC_SAVE_USES;
-      LHint := self.DoHintOf(AId);
-      if (LHint >= 0) and (LCands.IndexOf(LHint) >= 0) and (LFree[LHint] >= LEnd) then
-        self.DoGive(AId, LHint);
-        return true;
+      // The first hint that is a candidate and free for the whole interval
+      LHints := self.DoHintsOf(AId);
+      for LI := 0 to LHints.Count - 1 do
+        LHint := LHints[LI];
+        if (LCands.IndexOf(LHint) >= 0) and (LFree[LHint] >= LEnd) then
+          self.DoGive(AId, LHint);
+          return true;
+        end;
       end;
       LPick := self.DoWhole(LCands, LFree, LEnd, LAllowFresh);
       if LPick < 0 then
