@@ -1,0 +1,521 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Opt.Tail.adam - tail calls (M6 O15): tailrec and tailcall
+
+  A tail site is a call that is the last thing its path does: right before
+  its block's ret of the call's value (or a ret of no value), or before a
+  jump to a return block (phis, then a ret whose value is the call's along
+  that edge) that has another way in (one reached from the site alone the
+  cfg pass has merged into it already).
+
+  tailrec (EliminateTailRecursion, after the first sccp, the simplifycfg
+  after it dropping a return block it leaves unreached): a function that
+  calls itself at a tail site loops instead. The entry keeps its
+  parameters and slots and jumps to a new header block holding the rest of
+  the entry's code; the header starts with one phi per parameter the entry
+  has (the parameter from the entry, each site's argument from its block)
+  and every other use of a parameter reads its phi; each site's call and
+  return become a jump to the header (its edge to a return block dropped
+  from that block's phis). Only where the turns can share one frame: no
+  funclet, no scope (a guard's finally or a managed local's cleanup runs
+  after the call), not variadic, and no slot whose address escapes (each
+  recursion had slots of its own, the loop has one set).
+
+  tailcall (MarkTailCalls, after adce, the last simplifycfg after it): a
+  tail site's call of another routine (a function, an external, a routine
+  value) in a block no scope holds (nothing pending after it), in a
+  function that is no funclet and not variadic, with no slot whose address
+  escapes (the callee runs after the frame is gone), is marked
+  IrInstr.Tail; a site before a jump to a return block gets the return
+  copied into its own block first (the edge dropped from the return
+  block's phis). The target's parts make a marked call a jump when their
+  ABI allows it (Adam.X64.Select: the callee's stack arguments fit in the
+  caller's incoming area), else it stays a call. A call of the function
+  itself is never marked: tailrec's, or a jump into its own code.
+
+  A slot's address escapes when the slot, or an Offset from one, is used
+  other than as the address a load, store, copy, fill or atomic op reaches,
+  an Offset's base or a compare's operand (a funclet's uses of its
+  parent's slots counted too).
+*******************************************************************************/
+
+module unit Adam.Opt.Tail;
+
+import Adam.Core.Containers, Adam.Backend.Ssa, Adam.Opt.Analysis;
+
+type
+  // One tail site (see the header): the block ending in it, its call, and the return
+  // block its jump goes to (-1: the ret is the block's own)
+  TailSite = record
+    Block: int64;
+    Call: int64;
+    Exit: int64;
+  end;
+
+  TailSiteArray = array of TailSite;
+
+// True when every instruction of block AExit but its last is a phi and the last a ret
+routine DoIsReturnBlock(const AModule: ref IrModule; const AExit: int64): bool;
+var
+  LInstrs: ref Int64List;
+  LI: int64;
+begin
+  LInstrs := AModule.BlockAt(AExit).Instrs;
+  if LInstrs.Count = 0 then
+    return false;
+  end;
+  for LI := 0 to LInstrs.Count - 2 do
+    if AModule.InstrAt(LInstrs[LI]).Kind <> IrOp.Phi then
+      return false;
+    end;
+  end;
+  return AModule.InstrAt(LInstrs[LInstrs.Count - 1]).Kind = IrOp.Ret;
+end;
+
+// True when the ret ARet returns the value of the call ACall along the edge from block
+// AFrom: no value (the function returns none), ACall itself, or a phi of the ret's block
+// whose entry from AFrom is ACall
+routine DoReturnsCall(const AModule: ref IrModule; const ARet: ref IrInstr;
+  const ACall: int64; const AFrom: int64): bool;
+var
+  LValue: ref IrInstr;
+  LAt: int64;
+begin
+  if ARet.Operands.Count = 0 then
+    return true;
+  end;
+  if ARet.Operands[0] = ACall then
+    return true;
+  end;
+  LValue := AModule.InstrAt(ARet.Operands[0]);
+  if (LValue.Kind <> IrOp.Phi) or (LValue.Block <> ARet.Block) then
+    return false;
+  end;
+  LAt := LValue.Targets.IndexOf(AFrom);
+  if LAt < 0 then
+    return false;
+  end;
+  return LValue.Operands[LAt] = ACall;
+end;
+
+// True when block ABlock ends in a tail site (see the header), ASite set to it
+routine DoFindSite(const AModule: ref IrModule; const ABlock: int64; var ASite: TailSite): bool;
+var
+  LInstrs: ref Int64List;
+  LExitInstrs: ref Int64List;
+  LLast: ref IrInstr;
+  LCall: int64;
+  LExit: int64;
+begin
+  LInstrs := AModule.BlockAt(ABlock).Instrs;
+  if LInstrs.Count < 2 then
+    return false;
+  end;
+  LCall := LInstrs[LInstrs.Count - 2];
+  if not IsCallOp(AModule.InstrAt(LCall).Kind) then
+    return false;
+  end;
+  LLast := AModule.InstrAt(LInstrs[LInstrs.Count - 1]);
+  ASite.Block := ABlock;
+  ASite.Call := LCall;
+  ASite.Exit := -1;
+  if LLast.Kind = IrOp.Ret then
+    return DoReturnsCall(AModule, LLast, LCall, ABlock);
+  end;
+  if LLast.Kind <> IrOp.Jump then
+    return false;
+  end;
+  LExit := LLast.Targets[0];
+  if LExit = ABlock then
+    return false;
+  end;
+  if not DoIsReturnBlock(AModule, LExit) then
+    return false;
+  end;
+  if AModule.PredsOf(LExit).Count < 2 then
+    return false;
+  end;
+  LExitInstrs := AModule.BlockAt(LExit).Instrs;
+  ASite.Exit := LExit;
+  return DoReturnsCall(AModule, AModule.InstrAt(LExitInstrs[LExitInstrs.Count - 1]), LCall,
+    ABlock);
+end;
+
+// Every phi of block AExit with its entry from block AFrom dropped (that edge is gone)
+routine DoDropEdge(const AModule: ref IrModule; const AExit: int64; const AFrom: int64);
+var
+  LInstrs: ref Int64List;
+  LOperands: ref Int64List;
+  LTargets: ref Int64List;
+  LPhi: ref IrInstr;
+  LI: int64;
+  LK: int64;
+begin
+  LInstrs := AModule.BlockAt(AExit).Instrs;
+  for LI := 0 to LInstrs.Count - 1 do
+    LPhi := AModule.InstrAt(LInstrs[LI]);
+    if LPhi.Kind = IrOp.Phi then
+      LOperands := ref Int64List();
+      LTargets := ref Int64List();
+      for LK := 0 to LPhi.Targets.Count - 1 do
+        if LPhi.Targets[LK] <> AFrom then
+          LOperands.Add(LPhi.Operands[LK]);
+          LTargets.Add(LPhi.Targets[LK]);
+        end;
+      end;
+      LPhi.Operands := LOperands;
+      LPhi.Targets := LTargets;
+    end;
+  end;
+end;
+
+// Every phi of block ABlock with an entry from block AOld: from block ANew instead
+routine DoRetargetPhis(const AModule: ref IrModule; const ABlock: int64; const AOld: int64;
+  const ANew: int64);
+var
+  LInstrs: ref Int64List;
+  LPhi: ref IrInstr;
+  LI: int64;
+  LK: int64;
+begin
+  LInstrs := AModule.BlockAt(ABlock).Instrs;
+  for LI := 0 to LInstrs.Count - 1 do
+    LPhi := AModule.InstrAt(LInstrs[LI]);
+    if LPhi.Kind = IrOp.Phi then
+      for LK := 0 to LPhi.Targets.Count - 1 do
+        if LPhi.Targets[LK] = AOld then
+          LPhi.Targets.Put(LK, ANew);
+        end;
+      end;
+    end;
+  end;
+end;
+
+// True when the block at position APosition of AFunction's blocks is in one of its scopes
+routine DoInScope(const AFunction: ref IrFunction; const APosition: int64): bool;
+var
+  LS: int64;
+begin
+  for LS := 0 to AFunction.ScopeCount() - 1 do
+    if (AFunction.ScopeFirst(LS) <= APosition) and (APosition <= AFunction.ScopeLast(LS)) then
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+// True when operand AIndex of an instruction of kind AKind only reaches the memory at the
+// address it is (see the header): a load's, store's, fill's, Offset's or atomic op's
+// operand 0, a copy's 0 or 1, either of a compare's
+routine DoIsAddressUse(const AKind: IrOp; const AIndex: int64): bool;
+begin
+  if (AKind = IrOp.Load) or (AKind = IrOp.Store) or (AKind = IrOp.Fill) or
+    (AKind = IrOp.Offset) or IsAtomicOp(AKind) then
+    return AIndex = 0;
+  end;
+  if AKind = IrOp.Copy then
+    return AIndex <= 1;
+  end;
+  return AKind = IrOp.Compare;
+end;
+
+// The function AFunction and its funclets (a scope's handler whose Parent it is)
+routine DoWithFunclets(const AModule: ref IrModule; const AFunction: int64): ref Int64List;
+var
+  LFunctions: ref Int64List;
+  LFunction: ref IrFunction;
+  LHandler: int64;
+  LS: int64;
+begin
+  LFunctions := ref Int64List();
+  LFunctions.Add(AFunction);
+  LFunction := AModule.FunctionAt(AFunction);
+  for LS := 0 to LFunction.ScopeCount() - 1 do
+    LHandler := LFunction.ScopeHandler(LS);
+    if AModule.IsFunction(LHandler) then
+      if (AModule.FunctionAt(LHandler).Parent = AFunction) and
+        (LFunctions.IndexOf(LHandler) < 0) then
+        LFunctions.Add(LHandler);
+      end;
+    end;
+  end;
+  return LFunctions;
+end;
+
+// True when an address of a slot of AFunction (or of one of its funclets) escapes (see
+// the header)
+routine DoSlotsEscape(const AModule: ref IrModule; const AFunction: int64): bool;
+var
+  LFunctions: ref Int64List;
+  LDerived: ref Int64Map;
+  LBlocks: ref Int64List;
+  LInstrs: ref Int64List;
+  LInstr: ref IrInstr;
+  LChanged: bool;
+  LId: int64;
+  LF: int64;
+  LB: int64;
+  LI: int64;
+  LK: int64;
+begin
+  LFunctions := DoWithFunclets(AModule, AFunction);
+  // The slots, then every Offset from one, to a fixed point (an Offset may come before
+  // its base in block order)
+  LDerived := ref Int64Map(0);
+  LChanged := true;
+  while LChanged do
+    LChanged := false;
+    for LF := 0 to LFunctions.Count - 1 do
+      LBlocks := AModule.FunctionAt(LFunctions[LF]).Blocks;
+      for LB := 0 to LBlocks.Count - 1 do
+        LInstrs := AModule.BlockAt(LBlocks[LB]).Instrs;
+        for LI := 0 to LInstrs.Count - 1 do
+          LId := LInstrs[LI];
+          LInstr := AModule.InstrAt(LId);
+          if LDerived.Find(LId) = 0 then
+            if LInstr.Kind = IrOp.Slot then
+              LDerived.Put(LId, 1);
+              LChanged := true;
+            else
+              if (LInstr.Kind = IrOp.Offset) and (LDerived.Find(LInstr.Operands[0]) = 1) then
+                LDerived.Put(LId, 1);
+                LChanged := true;
+              end;
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
+  // Every use of one of them
+  for LF := 0 to LFunctions.Count - 1 do
+    LBlocks := AModule.FunctionAt(LFunctions[LF]).Blocks;
+    for LB := 0 to LBlocks.Count - 1 do
+      LInstrs := AModule.BlockAt(LBlocks[LB]).Instrs;
+      for LI := 0 to LInstrs.Count - 1 do
+        LInstr := AModule.InstrAt(LInstrs[LI]);
+        for LK := 0 to LInstr.Operands.Count - 1 do
+          if LDerived.Find(LInstr.Operands[LK]) = 1 then
+            if not DoIsAddressUse(LInstr.Kind, LK) then
+              return true;
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
+  return false;
+end;
+
+// The pass tailrec (see the header); AAnalysis unread (it makes a block of its own)
+public routine EliminateTailRecursion(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LFunction: ref IrFunction;
+  LSites: TailSiteArray;
+  LSite: TailSite;
+  LBlocks: ref Int64List;
+  LInstrs: ref Int64List;
+  LEntryInstrs: ref Int64List;
+  LHeaderInstrs: ref Int64List;
+  LKept: ref Int64List;
+  LPhis: ref Int64List;
+  LPhiOf: ref Int64Map;
+  LInstr: ref IrInstr;
+  LCall: ref IrInstr;
+  LPhi: ref IrInstr;
+  LTerm: ref IrInstr;
+  LCount: int64;
+  LEntry: int64;
+  LHeader: int64;
+  LFrom: int64;
+  LPhiId: int64;
+  LId: int64;
+  LB: int64;
+  LI: int64;
+  LK: int64;
+  LP: int64;
+begin
+  LFunction := AModule.FunctionAt(AFunction);
+  if (LFunction.Parent <> 0) or (LFunction.ScopeCount() > 0) or
+    LFunction.Signature.Variadic then
+    return false;
+  end;
+  // The sites: tail calls of the function itself
+  LBlocks := LFunction.Blocks;
+  LCount := 0;
+  for LB := 0 to LBlocks.Count - 1 do
+    if DoFindSite(AModule, LBlocks[LB], LSite) then
+      LCall := AModule.InstrAt(LSite.Call);
+      if (LCall.Kind = IrOp.Call) and (LCall.Link = AFunction) and
+        (LCall.Operands.Count = LFunction.Signature.ParamCount) then
+        setlength(LSites, LCount + 1);
+        LSites[LCount] := LSite;
+        LCount := LCount + 1;
+      end;
+    end;
+  end;
+  if LCount = 0 then
+    return false;
+  end;
+  if DoSlotsEscape(AModule, AFunction) then
+    return false;
+  end;
+  LEntry := LBlocks[0];
+  LHeader := AModule.AddBlock(AFunction);
+  // The header's phis first: one per parameter the entry has, its first entry the
+  // parameter itself, from the entry (LPhis: the phi by parameter index, -1: none)
+  LPhiOf := ref Int64Map(-1);
+  LPhis := ref Int64List();
+  for LP := 0 to LFunction.Signature.ParamCount - 1 do
+    LPhis.Add(-1);
+  end;
+  LEntryInstrs := AModule.BlockAt(LEntry).Instrs;
+  for LI := 0 to LEntryInstrs.Count - 1 do
+    LInstr := AModule.InstrAt(LEntryInstrs[LI]);
+    if LInstr.Kind = IrOp.Parameter then
+      LPhiId := AModule.Emit(LHeader, IrOp.Phi, LInstr.ValueType, LInstr.Node);
+      LPhi := AModule.InstrAt(LPhiId);
+      LPhi.Operands.Add(LEntryInstrs[LI]);
+      LPhi.Targets.Add(LEntry);
+      LPhiOf.Put(LEntryInstrs[LI], LPhiId);
+      LPhis.Put(LInstr.Imm, LPhiId);
+    end;
+  end;
+  // The entry's other instructions move to the header after the phis (the entry keeps its
+  // parameters and slots), and the entry jumps there
+  LKept := ref Int64List();
+  LHeaderInstrs := AModule.BlockAt(LHeader).Instrs;
+  for LI := 0 to LEntryInstrs.Count - 1 do
+    LId := LEntryInstrs[LI];
+    LInstr := AModule.InstrAt(LId);
+    if (LInstr.Kind = IrOp.Parameter) or (LInstr.Kind = IrOp.Slot) then
+      LKept.Add(LId);
+    else
+      LHeaderInstrs.Add(LId);
+      LInstr.Block := LHeader;
+    end;
+  end;
+  AModule.BlockAt(LEntry).Instrs := LKept;
+  LId := AModule.Emit(LEntry, IrOp.Jump, IrType.Void, LFunction.Node);
+  AModule.InstrAt(LId).Targets.Add(LHeader);
+  // The moved terminator's successors had the entry as their predecessor: the header now
+  LTerm := AModule.InstrAt(LHeaderInstrs[LHeaderInstrs.Count - 1]);
+  for LK := 0 to LTerm.Targets.Count - 1 do
+    DoRetargetPhis(AModule, LTerm.Targets[LK], LEntry, LHeader);
+  end;
+  // Every use of a parameter but its phi's own entry reads the phi
+  for LB := 0 to LBlocks.Count - 1 do
+    LInstrs := AModule.BlockAt(LBlocks[LB]).Instrs;
+    for LI := 0 to LInstrs.Count - 1 do
+      if LPhis.IndexOf(LInstrs[LI]) < 0 then
+        LInstr := AModule.InstrAt(LInstrs[LI]);
+        for LK := 0 to LInstr.Operands.Count - 1 do
+          LPhiId := LPhiOf.Find(LInstr.Operands[LK]);
+          if LPhiId >= 0 then
+            LInstr.Operands.Put(LK, LPhiId);
+          end;
+        end;
+      end;
+    end;
+  end;
+  // Each site: its arguments into the phis (an argument already reads the phis, the turn's
+  // values), its call and return a jump to the header
+  for LI := 0 to LCount - 1 do
+    LSite := LSites[LI];
+    LFrom := LSite.Block;
+    if LFrom = LEntry then
+      LFrom := LHeader;
+    end;
+    LCall := AModule.InstrAt(LSite.Call);
+    for LP := 0 to LPhis.Count - 1 do
+      if LPhis[LP] >= 0 then
+        LPhi := AModule.InstrAt(LPhis[LP]);
+        LPhi.Operands.Add(LCall.Operands[LP]);
+        LPhi.Targets.Add(LFrom);
+      end;
+    end;
+    LInstrs := AModule.BlockAt(LFrom).Instrs;
+    LInstrs.RemoveLast();
+    LInstrs.RemoveLast();
+    if LSite.Exit >= 0 then
+      DoDropEdge(AModule, LSite.Exit, LFrom);
+    end;
+    LId := AModule.Emit(LFrom, IrOp.Jump, IrType.Void, LCall.Node);
+    AModule.InstrAt(LId).Targets.Add(LHeader);
+  end;
+  return true;
+end;
+
+// The pass tailcall (see the header); AAnalysis unread
+public routine MarkTailCalls(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LFunction: ref IrFunction;
+  LSites: TailSiteArray;
+  LSite: TailSite;
+  LExitInstrs: ref Int64List;
+  LCall: ref IrInstr;
+  LRet: ref IrInstr;
+  LCount: int64;
+  LId: int64;
+  LB: int64;
+  LI: int64;
+begin
+  LFunction := AModule.FunctionAt(AFunction);
+  if (LFunction.Parent <> 0) or LFunction.Signature.Variadic then
+    return false;
+  end;
+  // The sites: tail calls of another routine, in blocks no scope holds
+  LCount := 0;
+  for LB := 0 to LFunction.Blocks.Count - 1 do
+    if not DoInScope(LFunction, LB) then
+      if DoFindSite(AModule, LFunction.Blocks[LB], LSite) then
+        LCall := AModule.InstrAt(LSite.Call);
+        if (LCall.Kind <> IrOp.Call) or (LCall.Link <> AFunction) then
+          setlength(LSites, LCount + 1);
+          LSites[LCount] := LSite;
+          LCount := LCount + 1;
+        end;
+      end;
+    end;
+  end;
+  if LCount = 0 then
+    return false;
+  end;
+  if DoSlotsEscape(AModule, AFunction) then
+    return false;
+  end;
+  for LI := 0 to LCount - 1 do
+    LSite := LSites[LI];
+    // A jump to a return block: the return copied in (the ret of the call's value, or of
+    // none), the edge dropped from the return block's phis
+    if LSite.Exit >= 0 then
+      LExitInstrs := AModule.BlockAt(LSite.Exit).Instrs;
+      LRet := AModule.InstrAt(LExitInstrs[LExitInstrs.Count - 1]);
+      AModule.BlockAt(LSite.Block).Instrs.RemoveLast();
+      DoDropEdge(AModule, LSite.Exit, LSite.Block);
+      LId := AModule.Emit(LSite.Block, IrOp.Ret, IrType.Void, LRet.Node);
+      if LRet.Operands.Count > 0 then
+        AModule.InstrAt(LId).Operands.Add(LSite.Call);
+      end;
+    end;
+    AModule.InstrAt(LSite.Call).Tail := true;
+  end;
+  return true;
+end;
+
+end.

@@ -204,6 +204,9 @@ type
     hidden FParentAt: ref Int64Map;
     hidden FParentSlots: ref Int64List;
     hidden FFrameBase: int64;
+    // True from a tail call's jump to the IR ret after it: the jump has left the function,
+    // the ret makes nothing (DoTailJump, DoRet)
+    hidden FTailDone: bool;
 
     init(const AModule: ref IrModule; const AAbi: ref AbiPart; const AParent: ref FunctionCode);
     begin
@@ -216,6 +219,7 @@ type
       self.FParent := AParent;
       self.FParentSlots := ref Int64List();
       self.FFrameBase := -1;
+      self.FTailDone := false;
     end;
 
     // The arch's number of the register the ABI names AName; raises for a name it lacks
@@ -1184,10 +1188,72 @@ type
       return LSite;
     end;
 
+    // True when the call AInstr, laid out as ALayout, leaves as a jump: marked a tail call
+    // (Adam.Opt.Tail), in a function that is no funclet and not variadic (its incoming area
+    // holds its own variadic arguments), the callee's stack arguments fitting in this
+    // function's own incoming area (they are written there: the callee finds them at the
+    // entry offsets this function found its own at)
+    hidden method DoTailFits(const AInstr: ref IrInstr; const ALayout: ref CallLayout): bool;
+    begin
+      if not AInstr.Tail then
+        return false;
+      end;
+      if (self.FFunction.Parent <> 0) or (self.FOwnVarargs <> nil) then
+        return false;
+      end;
+      return ALayout.OutgoingBytes <= self.FOwnLayout.OutgoingBytes;
+    end;
+
+    // A general register the ABI calls volatile and no argument of the tail call takes
+    // (AUses: the arguments' registers), the last such in its list; raises for none
+    hidden method DoTailRegister(const AUses: ref Int64List): int64;
+    var
+      LReg: int64;
+      LI: int64;
+    begin
+      for LI := self.FVolatile.Count - 1 downto 0 do
+        LReg := self.FVolatile[LI];
+        if (LReg < ADAM_X64_FIRST_XMM) and (AUses.IndexOf(LReg) < 0) then
+          return LReg;
+        end;
+      end;
+      raise(ADAM_X64_SELECT_FAULT_NO_REGISTER + "a tail call's target'");
+    end;
+
+    // A tail call's jump to ATarget, the arguments already in their places (AUses: their
+    // registers): a target in a virtual register (calli) moved first into a volatile
+    // general register no argument takes (its spill's frame is released before the jump);
+    // in a function with scopes a nop first (DoRet's rule); then the jump, which the
+    // allocator puts the epilogue before, as before a ret; the IR ret after it makes nothing
+    hidden method DoTailJump(const AInstr: ref IrInstr; const ATarget: ref MachineOperand;
+      const AUses: ref Int64List);
+    var
+      LTarget: ref MachineOperand;
+      LJump: ref MachineInstr;
+      LReg: int64;
+    begin
+      LTarget := ATarget;
+      if ATarget.Kind = OperandKind.VirtualReg then
+        LReg := self.DoTailRegister(AUses);
+        self.DoEmitPair(X64Op.Mov, DoWidth(IrType.Pointer, 0), PhysicalOperand(LReg), ATarget,
+          AInstr.Node);
+        LTarget := PhysicalOperand(LReg);
+      end;
+      if self.FFunction.ScopeCount() > 0 then
+        self.DoEmit(X64Op.Nop, 0, AInstr.Node);
+      end;
+      LJump := self.DoEmit(X64Op.TailJmp, 0, AInstr.Node);
+      LJump.AddOperand(LTarget);
+      LJump.ImplicitUses := AUses;
+      self.FTailDone := true;
+    end;
+
     // A call to a routine of ASignature at ATarget, its arguments the IR operands from AFirst
     // on (a calli's operand 0 is its target): the arguments into their places (the stack
     // ones first; a register one's shadow too: movq of a float's bits), the call, the result
-    // out of its register
+    // out of its register. A tail call the ABI allows (DoTailFits) puts its stack arguments
+    // in this function's incoming area instead and jumps (DoTailJump): no outgoing area, no
+    // result to take
     hidden method DoCall(const AId: int64; const AFullSignature: ref IrSignature;
       const ATarget: ref MachineOperand; const AFirst: int64);
     var
@@ -1197,6 +1263,7 @@ type
       LPlace: ref Location;
       LCall: ref MachineInstr;
       LUses: ref Int64List;
+      LTail: bool;
       LReg: int64;
       LShadow: int64;
       LI: int64;
@@ -1207,15 +1274,23 @@ type
         raise(ADAM_X64_SELECT_FAULT_ARGS + IntToStr(AId));
       end;
       LLayout := self.FAbi.LayoutCall(LSignature);
-      if LLayout.OutgoingBytes > self.FMachine.OutgoingBytes then
-        self.FMachine.OutgoingBytes := LLayout.OutgoingBytes;
+      LTail := self.DoTailFits(LInstr, LLayout);
+      if not LTail then
+        if LLayout.OutgoingBytes > self.FMachine.OutgoingBytes then
+          self.FMachine.OutgoingBytes := LLayout.OutgoingBytes;
+        end;
+        self.FMachine.MakesCalls := true;
       end;
-      self.FMachine.MakesCalls := true;
       for LI := 0 to LLayout.ArgCount - 1 do
         LPlace := LLayout.ArgAt(LI);
         if LPlace.Kind = LocationKind.Stack then
-          self.DoCopy(LSignature.ParamTypes[LI], OutgoingMemory(LPlace.CallOffset),
-            self.DoVReg(LInstr.Operands[AFirst + LI]), AId, LInstr.Node);
+          if LTail then
+            self.DoCopy(LSignature.ParamTypes[LI], IncomingMemory(LPlace.EntryOffset),
+              self.DoVReg(LInstr.Operands[AFirst + LI]), AId, LInstr.Node);
+          else
+            self.DoCopy(LSignature.ParamTypes[LI], OutgoingMemory(LPlace.CallOffset),
+              self.DoVReg(LInstr.Operands[AFirst + LI]), AId, LInstr.Node);
+          end;
         end;
       end;
       LUses := ref Int64List();
@@ -1234,6 +1309,10 @@ type
             LUses.Add(LShadow);
           end;
         end;
+      end;
+      if LTail then
+        self.DoTailJump(LInstr, ATarget, LUses);
+        return;
       end;
       LCall := self.DoEmit(X64Op.Call, 0, LInstr.Node);
       LCall.AddOperand(ATarget);
@@ -1300,12 +1379,17 @@ type
     // scopes (a frame handler), a nop first: the OS's unwinder takes a frame whose return
     // address points at an epilogue (the allocator puts it before the ret) as already leaving
     // and never calls its handler, so a call ending the function's code must return to
-    // something else (MSVC's and LLVM's call / nop rule)
+    // something else (MSVC's and LLVM's call / nop rule). After a tail call's jump
+    // (FTailDone) nothing: the jump has left the function
     hidden method DoRet(const AId: int64; const AInstr: ref IrInstr);
     var
       LRet: ref MachineInstr;
       LReg: int64;
     begin
+      if self.FTailDone then
+        self.FTailDone := false;
+        return;
+      end;
       LReg := -1;
       if AInstr.Operands.Count > 0 then
         LReg := self.DoPhysical(self.FOwnLayout.ResultAt.RegisterName);
