@@ -51,9 +51,14 @@ const
   ADAM_ERR_ACU_003: string = "AU0003";   // a compiled unit uses a unit that is not loaded
   // Raised (an invariant broken): the tree handed out another id than the slice index names
   ADAM_ACU_READER_FAULT_ID: string = "Acu.Reader: a node did not get its slice id: #";
-  // A u32 at or past this is a negative int32 (two's complement)
-  ADAM_ACU_INT32_SIGN: int64 = 2147483648;
-  ADAM_ACU_INT32_RANGE: int64 = 4294967296;
+
+// ACount bytes of ABytes at AAt copied to ADest in one block; through a const parameter, so
+// the payload a cursor shares with its caller is read where it is, never made its own copy
+routine DoCopyOut(const ADest: ptr to uint8; const ABytes: ByteArray; const AAt: int64;
+  const ACount: int64);
+begin
+  CopyBytes(ADest, addr of ABytes[AAt], ACount);
+end;
 
 type
   // The payload's bytes read in order; reading past the end reads 0 and marks it Short
@@ -72,6 +77,12 @@ type
     // True once a read ran past the end
     property Short: bool read FShort;
 
+    // How many bytes are left to read
+    const method Remaining(): int64;
+    begin
+      return len(self.FBytes) - self.FAt;
+    end;
+
     hidden method DoGet(const ACount: int64): uint64;
     var
       LValue: uint64;
@@ -85,15 +96,19 @@ type
       return LValue;
     end;
 
-    // One byte, or 2, 4, 8 little-endian bytes
+    // One byte, or 2, 4, 8 little-endian bytes (a byte read straight: the records' most
+    // read field, a reference's kind and every bool)
     method Get8(): uint64;
+    var
+      LValue: uint64;
     begin
-      return self.DoGet(1);
-    end;
-
-    method Get16(): uint64;
-    begin
-      return self.DoGet(2);
+      if self.FShort or (self.FAt >= len(self.FBytes)) then
+        self.FShort := true;
+        return 0;
+      end;
+      LValue := uint64(self.FBytes[self.FAt]);
+      self.FAt := self.FAt + 1;
+      return LValue;
     end;
 
     method Get32(): uint64;
@@ -106,39 +121,64 @@ type
       return self.DoGet(8);
     end;
 
-    // A u32 as the int32 the writer put (its two's complement read back)
-    method GetInt32(): int32;
-    var
-      LValue: int64;
-    begin
-      LValue := int64(self.DoGet(4));
-      if LValue >= ADAM_ACU_INT32_SIGN then
-        LValue := LValue - ADAM_ACU_INT32_RANGE;
-      end;
-      return int32(LValue);
-    end;
-
     method GetBool(): bool;
     begin
-      return self.DoGet(1) <> 0;
+      return self.Get8() <> 0;
     end;
 
-    // An inline text: its byte count (u32), then its bytes
+    // A var (Adam.Acu.Format's header): 7 bits a byte, the lowest first, while the top bit
+    // is set; one of more than 10 bytes is damaged (read as Short)
+    method GetVar(): uint64;
+    var
+      LValue: uint64;
+      LByte: uint64;
+      LShift: uint64;
+    begin
+      LValue := 0;
+      LShift := 0;
+      while true do
+        if self.FShort or (self.FAt >= len(self.FBytes)) or (LShift > uint64(63)) then
+          self.FShort := true;
+          return 0;
+        end;
+        LByte := uint64(self.FBytes[self.FAt]);
+        self.FAt := self.FAt + 1;
+        LValue := LValue | ((LByte & ADAM_ACU_VAR_BITS) shl LShift);
+        if (LByte & ADAM_ACU_VAR_MORE) = 0 then
+          return LValue;
+        end;
+        LShift := LShift + uint64(7);
+      end;
+    end;
+
+    // A signed var: its zigzag undone (2n -> n, 2n + 1 -> -n - 1)
+    method GetSigned(): int64;
+    var
+      LValue: uint64;
+    begin
+      LValue := self.GetVar();
+      if (LValue & uint64(1)) <> 0 then
+        return -int64(LValue shr uint64(1)) - 1;
+      end;
+      return int64(LValue shr uint64(1));
+    end;
+
+    // An inline text: its byte count (var), then its bytes, copied in one block
     method GetText(): string;
     var
       LCount: int64;
       LText: string;
-      LI: int64;
     begin
-      LCount := int64(self.DoGet(4));
-      if self.FShort or (self.FAt + LCount > len(self.FBytes)) then
+      LCount := int64(self.GetVar());
+      if self.FShort or (LCount < 0) or (self.FAt + LCount > len(self.FBytes)) then
         self.FShort := true;
         return "";
       end;
-      setlength(LText, LCount);
-      for LI := 0 to LCount - 1 do
-        LText[LI] := char(self.FBytes[self.FAt + LI]);
+      if LCount = 0 then
+        return "";
       end;
+      setlength(LText, LCount);
+      DoCopyOut(ptr to uint8(ptr(addr of LText[0])), self.FBytes, self.FAt, LCount);
       self.FAt := self.FAt + LCount;
       return LText;
     end;
@@ -293,8 +333,8 @@ type
     var
       LId: int64;
     begin
-      LId := int64(self.FCursor.Get32());
-      if LId >= len(self.FPool) then
+      LId := int64(self.FCursor.GetVar());
+      if (LId < 0) or (LId >= len(self.FPool)) then
         self.DoDamaged(ADAM_MSG_ACU_REASON_STRING);
         return "";
       end;
@@ -412,7 +452,7 @@ type
         return 0;
       end;
       if LKind = AcuRefKind.Local then
-        LIndex := int64(self.FCursor.Get32());
+        LIndex := int64(self.FCursor.GetVar());
         if (LIndex < 1) or (LIndex > self.FCount) then
           self.DoDamaged(ADAM_MSG_ACU_REASON_LOCAL);
           return 0;
@@ -420,8 +460,8 @@ type
         return self.FBase + LIndex - 1;
       end;
       if LKind = AcuRefKind.Fixed then
-        LIndex := int64(self.FCursor.Get8());
-        if LIndex > ADAM_AST_DERIVED then
+        LIndex := int64(self.FCursor.GetVar());
+        if (LIndex < 0) or (LIndex > ADAM_AST_DERIVED) then
           self.DoDamaged(ADAM_MSG_ACU_REASON_LOCAL);
           return 0;
         end;
@@ -513,26 +553,26 @@ type
       LCount: int64;
       LI: int64;
     begin
-      LCount := int64(self.FCursor.Get32());
+      LCount := int64(self.FCursor.GetVar());
       setlength(LWide, 0);
       for LI := 0 to LCount - 1 do
         if self.FCursor.Short then
           leave;
         end;
         setlength(LWide, LI + 1);
-        LWide[LI] := wchar(uint16(self.FCursor.Get16()));
+        LWide[LI] := wchar(uint16(self.FCursor.GetVar()));
       end;
       return LWide;
     end;
 
-    // A node's flags from their mask (the writer's DoPutFlags)
+    // A node's flags from their mask (the writer's DoFlagsMask)
     hidden method DoGetFlags(): NodeFlags;
     var
       LMask: uint64;
       LFlags: NodeFlags;
       LFlag: NodeFlag;
     begin
-      LMask := self.FCursor.Get64();
+      LMask := self.FCursor.GetVar();
       LFlags := [];
       // NodeFlag's first value to the last one a compiled unit keeps (the writer's bound)
       for LFlag := NodeFlag.Public to NodeFlag.NoReturn do
@@ -550,14 +590,14 @@ type
     begin
       LSpec := DefaultFormatSpec();
       LSpec.Fill := self.DoGetString();
-      LSpec.Align := FormatAlign(int32(self.FCursor.Get8()));
-      LSpec.Sign := FormatSign(int32(self.FCursor.Get8()));
+      LSpec.Align := FormatAlign(int32(self.FCursor.GetVar()));
+      LSpec.Sign := FormatSign(int32(self.FCursor.GetVar()));
       LSpec.Alternate := self.FCursor.GetBool();
       LSpec.ZeroPad := self.FCursor.GetBool();
-      LSpec.Width := self.FCursor.GetInt32();
-      LSpec.WidthArgument := self.FCursor.GetInt32();
-      LSpec.Precision := self.FCursor.GetInt32();
-      LSpec.PrecisionArgument := self.FCursor.GetInt32();
+      LSpec.Width := int32(self.FCursor.GetSigned());
+      LSpec.WidthArgument := int32(self.FCursor.GetSigned());
+      LSpec.Precision := int32(self.FCursor.GetSigned());
+      LSpec.PrecisionArgument := int32(self.FCursor.GetSigned());
       LSpec.Localized := self.FCursor.GetBool();
       LSpec.ClearBrackets := self.FCursor.GetBool();
       LSpec.Presentation := self.DoGetString();
@@ -573,7 +613,7 @@ type
       LI: int64;
       LJ: int64;
     begin
-      LCount := int64(self.FCursor.Get32());
+      LCount := int64(self.FCursor.GetVar());
       setlength(LPlan.Items, 0);
       for LI := 0 to LCount - 1 do
         if self.FCursor.Short then
@@ -581,8 +621,8 @@ type
         end;
         setlength(LPlan.Items, LI + 1);
         LPlan.Items[LI].Text := self.DoGetString();
-        LPlan.Items[LI].Argument := self.FCursor.GetInt32();
-        LSpecs := int64(self.FCursor.Get32());
+        LPlan.Items[LI].Argument := int32(self.FCursor.GetSigned());
+        LSpecs := int64(self.FCursor.GetVar());
         setlength(LPlan.Items[LI].Specs, 0);
         for LJ := 0 to LSpecs - 1 do
           if self.FCursor.Short then
@@ -597,8 +637,15 @@ type
       return LPlan;
     end;
 
+    // True when AField's bit is set in AMask
+    hidden const method DoHas(const AMask: uint64; const AField: AcuField): bool;
+    begin
+      return (AMask & AcuFieldBit(AField)) <> 0;
+    end;
+
     // The slice node AIndex (1 .. FCount) from its record (the writer's DoPutNode), added to
-    // the tree; its parent and role kept for the attach
+    // the tree; its parent and role kept for the attach. A field its mask leaves out keeps
+    // the value the tree's Add gave it (a new node's)
     hidden method DoGetNode(const AIndex: int64);
     var
       LKind: NodeKind;
@@ -611,15 +658,16 @@ type
       LEnd: int64;
       LId: int64;
       LNode: ref Node;
+      LMask: uint64;
     begin
-      LKind := NodeKind(int32(self.FCursor.Get16()));
+      LKind := NodeKind(int32(self.FCursor.GetVar()));
       LParent := self.DoGetRef();
-      LRole := NodeRole(int32(self.FCursor.Get16()));
+      LRole := NodeRole(int32(self.FCursor.GetVar()));
       LFile := self.DoGetString();
-      LLine := self.FCursor.GetInt32();
-      LColumn := self.FCursor.GetInt32();
-      LStart := int64(self.FCursor.Get64());
-      LEnd := int64(self.FCursor.Get64());
+      LLine := int32(self.FCursor.GetSigned());
+      LColumn := int32(self.FCursor.GetSigned());
+      LStart := self.FCursor.GetSigned();
+      LEnd := self.FCursor.GetSigned();
       LId := self.FTree.Add(LKind, PlaceAt(LFile, LLine, LColumn), LStart, LEnd);
       if LId <> self.FBase + AIndex - 1 then
         raise(ADAM_ACU_READER_FAULT_ID + IntToStr(LId));
@@ -628,39 +676,100 @@ type
       self.FRoles[AIndex - 1] := LRole;
 
       LNode := self.FTree[LId];
-      LNode.Text := self.DoGetString();
-      LNode.Decoded := self.DoGetString();
-      LNode.DecodedWide := self.DoGetWide();
-      LNode.NarrowFault := self.DoGetFault();
-      LNode.WideFault := self.DoGetFault();
-      LNode.ResolvedPath := self.DoGetString();
-      LNode.Op := OperatorKind(int32(self.FCursor.Get16()));
-      LNode.Flags := self.DoGetFlags();
-      LNode.Module := ModuleKind(int32(self.FCursor.Get8()));
-      LNode.IntValue := self.FCursor.Get64();
-      LNode.Suffix := self.DoGetString();
-
-      LNode.ResolvedDecl := self.DoGetRef();
-      LNode.ResolvedUnit := self.DoGetRef();
-      LNode.ResolvedJump := self.DoGetRef();
-      LNode.ResolvedType := self.DoGetRef();
-      LNode.ResolvedConvert := self.DoGetRef();
-      LNode.ResolvedEmbed := self.DoGetRef();
-      LNode.ResolvedCallee := self.DoGetRef();
-      LNode.ResolvedConst.Kind := ConstKind(int32(self.FCursor.Get8()));
-      LNode.ResolvedConst.Bits := self.FCursor.Get64();
-      LNode.ResolvedConst.Float := Float64FromBits(self.FCursor.Get64());
-      LNode.ResolvedConst.Text := self.DoGetString();
-      LNode.ResolvedLinkage := Linkage(int32(self.FCursor.Get8()));
-      LNode.ResolvedSymbol := self.DoGetString();
-      LNode.ResolvedSize := int64(self.FCursor.Get64());
-      LNode.ResolvedAlign := int64(self.FCursor.Get64());
-      LNode.ResolvedOffset := int64(self.FCursor.Get64());
-      LNode.ResolvedBitOffset := self.FCursor.GetInt32();
-      LNode.ResolvedBitWidth := self.FCursor.GetInt32();
-      LNode.ResolvedSlot := self.FCursor.GetInt32();
-      LNode.ResolvedInstance := self.DoGetRef();
-      if self.FCursor.GetBool() then
+      LMask := self.FCursor.GetVar();
+      // AcuField's last value is the mask's highest bit: one above it is no field
+      if LMask >= (AcuFieldBit(AcuField.ResolvedFormat) shl uint64(1)) then
+        self.DoDamaged(ADAM_MSG_ACU_REASON_FIELD);
+        return;
+      end;
+      if self.DoHas(LMask, AcuField.Text) then
+        LNode.Text := self.DoGetString();
+      end;
+      if self.DoHas(LMask, AcuField.Decoded) then
+        LNode.Decoded := self.DoGetString();
+      end;
+      if self.DoHas(LMask, AcuField.DecodedWide) then
+        LNode.DecodedWide := self.DoGetWide();
+      end;
+      if self.DoHas(LMask, AcuField.NarrowFault) then
+        LNode.NarrowFault := self.DoGetFault();
+      end;
+      if self.DoHas(LMask, AcuField.WideFault) then
+        LNode.WideFault := self.DoGetFault();
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedPath) then
+        LNode.ResolvedPath := self.DoGetString();
+      end;
+      if self.DoHas(LMask, AcuField.Op) then
+        LNode.Op := OperatorKind(int32(self.FCursor.GetVar()));
+      end;
+      if self.DoHas(LMask, AcuField.Flags) then
+        LNode.Flags := self.DoGetFlags();
+      end;
+      if self.DoHas(LMask, AcuField.Module) then
+        LNode.Module := ModuleKind(int32(self.FCursor.GetVar()));
+      end;
+      if self.DoHas(LMask, AcuField.IntValue) then
+        LNode.IntValue := self.FCursor.GetVar();
+      end;
+      if self.DoHas(LMask, AcuField.Suffix) then
+        LNode.Suffix := self.DoGetString();
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedDecl) then
+        LNode.ResolvedDecl := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedUnit) then
+        LNode.ResolvedUnit := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedJump) then
+        LNode.ResolvedJump := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedType) then
+        LNode.ResolvedType := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedConvert) then
+        LNode.ResolvedConvert := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedEmbed) then
+        LNode.ResolvedEmbed := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedCallee) then
+        LNode.ResolvedCallee := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedConst) then
+        LNode.ResolvedConst.Kind := ConstKind(int32(self.FCursor.GetVar()));
+        LNode.ResolvedConst.Bits := self.FCursor.GetVar();
+        LNode.ResolvedConst.Float := Float64FromBits(self.FCursor.Get64());
+        LNode.ResolvedConst.Text := self.DoGetString();
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedLinkage) then
+        LNode.ResolvedLinkage := Linkage(int32(self.FCursor.GetVar()));
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedSymbol) then
+        LNode.ResolvedSymbol := self.DoGetString();
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedSize) then
+        LNode.ResolvedSize := self.FCursor.GetSigned();
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedAlign) then
+        LNode.ResolvedAlign := self.FCursor.GetSigned();
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedOffset) then
+        LNode.ResolvedOffset := self.FCursor.GetSigned();
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedBitOffset) then
+        LNode.ResolvedBitOffset := int32(self.FCursor.GetSigned());
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedBitWidth) then
+        LNode.ResolvedBitWidth := int32(self.FCursor.GetSigned());
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedSlot) then
+        LNode.ResolvedSlot := int32(self.FCursor.GetSigned());
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedInstance) then
+        LNode.ResolvedInstance := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, AcuField.ResolvedFormat) then
         self.FTree.SetFormat(LId, self.DoGetFormat());
       end;
     end;
@@ -706,15 +815,21 @@ type
       end;
       self.FLabel := LHeader.UnitName;
       LCount := int64(self.FCursor.Get32());
+      // Every text is at least its one-byte count: a count past the bytes left is damaged
+      if LCount > self.FCursor.Remaining() then
+        self.DoDamaged(ADAM_MSG_ACU_REASON_SHORT);
+        return 0;
+      end;
+      setlength(self.FPool, LCount + 1);
       for LI := 0 to LCount - 1 do
         if self.FCursor.Short then
           leave;
         end;
-        setlength(self.FPool, LI + 2);
         self.FPool[LI + 1] := self.FCursor.GetText();
       end;
       self.FCount := int64(self.FCursor.Get32());
-      if self.FCursor.Short then
+      // A record is several bytes: a count past the bytes left is damaged
+      if self.FCursor.Short or (self.FCount > self.FCursor.Remaining()) then
         self.DoDamaged(ADAM_MSG_ACU_REASON_SHORT);
         return 0;
       end;
@@ -722,7 +837,8 @@ type
       setlength(self.FParents, self.FCount);
       setlength(self.FRoles, self.FCount);
       for LI := 1 to self.FCount do
-        if self.FCursor.Short then
+        // A damaged record (told) leaves the rest unread: its bytes say nothing more
+        if self.FCursor.Short or self.FDamaged then
           leave;
         end;
         self.DoGetNode(LI);

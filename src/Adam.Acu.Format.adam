@@ -20,27 +20,33 @@
   sections, its import list; SU2.4b), merged into a build as it is when the
   unit is current, and one Info section (SectionKind.Info: kept by no
   linker) holding the payload Adam.Acu.Writer makes and Adam.Acu.Reader
-  reads. The payload, every number little-endian:
+  reads. The payload, every fixed-width number little-endian, every other
+  number a var (LEB128: 7 bits a byte, the lowest first, the top bit set on
+  every byte but the last) or, when it can be negative, a signed var (the
+  var of its zigzag: 2n for n >= 0, -2n - 1 for n < 0):
 
     magic         ADAM_ACU_MAGIC's 8 bytes, then the format version (u32)
     header        AcuHeader's fields in their order: a text is its byte
-                  count (u32) and its bytes; a number 8 bytes; Imports its
+                  count (var) and its bytes; a number 8 bytes; Imports its
                   count (u32), then each name followed by that unit's
                   interface hash (u64) as the unit was compiled against it.
                   Readable alone: the currency check (SU2.3) reads no
                   further
     strings       the pool: its count (u32), then each text; a text field
-                  below is its pool id (u32), 0 for ""
+                  below is its pool id (var), 0 for ""
     nodes         their count (u32), then each node's record (the writer's
-                  DoPutNode); a node is its slice index 1 .. count, in tree
-                  order (a parent before its children, children in order)
+                  DoPutNode: its kind, parent, role and place, then a mask
+                  (var, AcuField's bits) of the fields that differ from a
+                  new node's, then only those, in Node's order); a node is
+                  its slice index 1 .. count, in tree order (a parent before
+                  its children, children in order)
     runtime       1 when the unit is the runtime (the tree's RuntimeRoutines,
                   VarKind and AllocSite follow as references), else 0
 
   A reference (a link field, a node's parent) is its AcuRefKind (u8) and:
     None          nothing (0: no node)
-    Local         the slice index (u32) of a node the payload holds
-    Fixed         the fixed id (u8: the program, the system scope, the
+    Local         the slice index (var) of a node the payload holds
+    Fixed         the fixed id (var: the program, the system scope, the
                   derived types)
     System        the system scope's node by AcuPathOf below the system scope
     Foreign       another unit's node: the unit's name and AcuPathOf below
@@ -74,8 +80,12 @@ public const
   // The payload's first 8 bytes, then ADAM_ACU_FORMAT_VERSION (a change to the layout above
   // moves the version: an .acu of another version is never read, only rewritten)
   ADAM_ACU_MAGIC: string = "ADAM.ACU";
-  // (4: the object holds the unit's code, SU2.4b)
-  ADAM_ACU_FORMAT_VERSION: int64 = 4;
+  // (4: the object holds the unit's code, SU2.4b; 5: var numbers and a node's field mask,
+  // SU2.8d)
+  ADAM_ACU_FORMAT_VERSION: int64 = 5;
+  // A var's 7 value bits a byte, and the bit that says another byte follows
+  ADAM_ACU_VAR_BITS: uint64 = 127;
+  ADAM_ACU_VAR_MORE: uint64 = 128;
   // Between the predefined symbols a header's Defines joins
   ADAM_ACU_DEFINE_SEPARATOR: string = ",";
   // AcuPathOf's spelling: between segments, before a child index, before an overload's number
@@ -88,6 +98,15 @@ public const
 public type
   // What a reference in the payload is (see the header)
   AcuRefKind = choices(None, Local, Fixed, System, Foreign);
+
+  // A node record's fields after its place, in Node's order: bit n of the record's mask
+  // (AcuFieldBit) is set when the field numbered n differs from a new node's and is written
+  // (a value appended here is appended to both sides; the mask holds up to 64)
+  AcuField = choices(Text, Decoded, DecodedWide, NarrowFault, WideFault, ResolvedPath, Op,
+    Flags, Module, IntValue, Suffix, ResolvedDecl, ResolvedUnit, ResolvedJump, ResolvedType,
+    ResolvedConvert, ResolvedEmbed, ResolvedCallee, ResolvedConst, ResolvedLinkage,
+    ResolvedSymbol, ResolvedSize, ResolvedAlign, ResolvedOffset, ResolvedBitOffset,
+    ResolvedBitWidth, ResolvedSlot, ResolvedInstance, ResolvedFormat);
 
   // Interface hashes, one per name of a list beside them
   AcuHashArray = array of uint64;
@@ -183,15 +202,47 @@ public type
       end;
     end;
 
-    // Appends a text inline: its byte count (u32), then its bytes
+    // Appends AValue as a var (see the header): one byte below 128, at most 10
+    method PutVar(const AValue: uint64);
+    var
+      LRest: uint64;
+    begin
+      LRest := AValue;
+      while LRest > ADAM_ACU_VAR_BITS do
+        self.DoPut((LRest & ADAM_ACU_VAR_BITS) | ADAM_ACU_VAR_MORE, 1);
+        LRest := LRest shr uint64(7);
+      end;
+      self.DoPut(LRest, 1);
+    end;
+
+    // Appends AValue as a signed var: the var of its zigzag (see the header), so a small
+    // negative number (-1: unset) is one byte too
+    method PutSigned(const AValue: int64);
+    begin
+      if AValue < 0 then
+        // -(AValue + 1) holds for the least int64 too
+        self.PutVar((uint64(-(AValue + 1)) shl uint64(1)) | uint64(1));
+      else
+        self.PutVar(uint64(AValue) shl uint64(1));
+      end;
+    end;
+
+    // Appends a text inline: its byte count (var), then its bytes in one block
     method PutText(const AText: string);
     var
-      LI: int64;
+      LCount: int64;
     begin
-      self.DoPut(uint64(len(AText)), 4);
-      for LI := 0 to len(AText) - 1 do
-        self.DoPut(uint64(uint8(AText[LI])), 1);
+      LCount := len(AText);
+      self.PutVar(uint64(LCount));
+      if LCount = 0 then
+        return;
       end;
+      if self.FCount + LCount > len(self.FBytes) then
+        setlength(self.FBytes, len(self.FBytes) * 2 + LCount);
+      end;
+      CopyBytes(addr of self.FBytes[self.FCount], ptr to const uint8(ptr(addr of AText[0])),
+        LCount);
+      self.FCount := self.FCount + LCount;
     end;
 
     // Appends every byte another buffer holds
@@ -249,6 +300,12 @@ end;
 public routine AcuFileName(const AUnitName: string): string;
 begin
   return AUnitName + ADAM_ACU_EXTENSION;
+end;
+
+// AField's bit in a node record's mask (see AcuField)
+public routine AcuFieldBit(const AField: AcuField): uint64;
+begin
+  return uint64(1) shl uint64(int32(AField));
 end;
 
 // True for the kinds AcuPathOf names by their text: every declaration a scope or an
