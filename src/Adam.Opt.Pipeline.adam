@@ -68,7 +68,15 @@
   a tail call (a jump when the target's ABI allows), copying its return
   into its block; then simplifycfg again drops the blocks adce's jumps
   skip (and a return block tailcall left unreached), folds the branches
-  on compares combine found known, and merges the chains they leave. A
+  on compares combine found known, and merges the chains they leave.
+  Once every function is through the list, the interprocedural rounds
+  (Adam.Opt.Ipo) change what one function alone cannot: at small equal
+  bodies merged, a constant every call passes made the parameter's value,
+  a parameter nothing uses and a result no call uses dropped from the
+  signature and its calls, and every internal function nothing reaches
+  removed; each function a round changed then runs CleanupPassesOf's
+  passes (sccp, simplifycfg, combine, adce, simplifycfg), a few rounds at
+  most, and a last removal drops what they left unreferenced. A
   pass that leaves the IR malformed is a compiler bug: the compiler's own
   debug build verifies the function (and its funclets) after every pass that
   changed it and raises, naming the pass and the function; that check costs
@@ -81,11 +89,15 @@ module unit Adam.Opt.Pipeline;
 
 import System.SysUtils, Adam.Core.Common, Adam.Core.Containers, Adam.Backend.Ssa,
   Adam.Opt.Analysis, Adam.Opt.Promote, Adam.Opt.Sccp, Adam.Opt.Memory, Adam.Opt.Combine,
-  Adam.Opt.Gvn, Adam.Opt.Loops, Adam.Opt.Dce, Adam.Opt.Cfg, Adam.Opt.Inline, Adam.Opt.Tail;
+  Adam.Opt.Gvn, Adam.Opt.Loops, Adam.Opt.Dce, Adam.Opt.Cfg, Adam.Opt.Inline, Adam.Opt.Tail,
+  Adam.Opt.Ipo;
 
 public const
   // Raised (an invariant broken) by a pass that left the IR malformed
   ADAM_OPT_FAULT_PASS: string = "Opt: the IR is malformed after the pass ";
+  // The most interprocedural rounds (Adam.Opt.Ipo) one module takes, each followed by the
+  // cleanup passes over the functions it changed
+  ADAM_OPT_IPO_ROUNDS: int64 = 3;
 
 public type
   // One pass over one function of a module, its facts made for it just before; true when
@@ -205,6 +217,27 @@ begin
   return LPasses;
 end;
 
+// The passes run again over each function an interprocedural round changed (Adam.Opt.Ipo):
+// sccp folds the constants a parameter became, simplifycfg drops what they decide, combine
+// and adce drop what a call no longer passes or a ret no longer returns, simplifycfg last
+public routine CleanupPassesOf(): OptPassArray;
+var
+  LPasses: OptPassArray;
+begin
+  setlength(LPasses, 5);
+  LPasses[0].PassName := "sccp";
+  LPasses[0].Run := PropagateConstants;
+  LPasses[1].PassName := "simplifycfg";
+  LPasses[1].Run := SimplifyControlFlow;
+  LPasses[2].PassName := "combine";
+  LPasses[2].Run := CombineInstructions;
+  LPasses[3].PassName := "adce";
+  LPasses[3].Run := RemoveDeadCode;
+  LPasses[4].PassName := "simplifycfg";
+  LPasses[4].Run := SimplifyControlFlow;
+  return LPasses;
+end;
+
 // The compiler's own debug build: the function AFunction (and its funclets) verified after
 // the pass APass changed it, a malformed IR raised with the pass's name, the function and
 // every problem
@@ -216,6 +249,20 @@ begin
   LProblems := AModule.VerifyFunction(AFunction);
   if len(LProblems) > 0 then
     raise(ADAM_OPT_FAULT_PASS + APass.PassName + " in f" + IntToStr(AFunction) + ": " +
+      JoinStrings(LProblems, "; "));
+  end;
+end;
+
+// The compiler's own debug build: the function AFunction an interprocedural round
+// changed (Adam.Opt.Ipo: its signature, its calls' operands or types) verified, a
+// malformed IR raised as DoVerifyAfter's under the name "ipo"
+routine DoVerifyIpo(const AModule: ref IrModule; const AFunction: int64);
+var
+  LProblems: StringArray;
+begin
+  LProblems := AModule.VerifyFunction(AFunction);
+  if len(LProblems) > 0 then
+    raise(ADAM_OPT_FAULT_PASS + "ipo in f" + IntToStr(AFunction) + ": " +
       JoinStrings(LProblems, "; "));
   end;
 end;
@@ -267,19 +314,42 @@ begin
   end;
 end;
 
+// The defined function AFunction through every pass of APasses in order, a fresh analysis
+// made for each (the compiler's own debug build verifying after a pass that changed it)
+routine DoRunPasses(const AModule: ref IrModule; const APasses: OptPassArray;
+  const AFunction: int64);
+var
+  LAnalysis: ref FunctionAnalysis;
+  LChanged: bool;
+  LI: int64;
+begin
+  for LI := 0 to len(APasses) - 1 do
+    LAnalysis := ref FunctionAnalysis(AModule, AFunction);
+    LChanged := APasses[LI].Run(AModule, AFunction, LAnalysis);
+@ifdef DEBUG
+    if LChanged then
+      DoVerifyAfter(AModule, APasses[LI], AFunction);
+    end;
+@endif
+  end;
+end;
+
 // AModule optimized at ALevel: every defined function through every pass PassesOf names,
 // in order (see the header), a function's callees before it (the inliner copies them
-// optimized); a cycle of calls is entered at its lowest id
+// optimized); a cycle of calls is entered at its lowest id. Then the interprocedural
+// rounds (Adam.Opt.Ipo), each function a round changed through CleanupPassesOf's passes,
+// until a round changes none or ADAM_OPT_IPO_ROUNDS ran; the last removal then drops what
+// the cleanup left unreferenced
 public routine OptimizeModule(const AModule: ref IrModule; const ALevel: OptLevel);
 var
   LPasses: OptPassArray;
-  LAnalysis: ref FunctionAnalysis;
+  LCleanup: OptPassArray;
   LOrder: ref Int64List;
+  LTouched: ref Int64List;
   LVisited: BoolArray;
-  LChanged: bool;
+  LRound: int64;
   LO: int64;
   LF: int64;
-  LI: int64;
 begin
   LPasses := PassesOf(ALevel);
   if len(LPasses) = 0 then
@@ -293,17 +363,23 @@ begin
   for LO := 0 to LOrder.Count - 1 do
     LF := LOrder[LO];
     if not AModule.FunctionAt(LF).Declared then
-      for LI := 0 to len(LPasses) - 1 do
-        LAnalysis := ref FunctionAnalysis(AModule, LF);
-        LChanged := LPasses[LI].Run(AModule, LF, LAnalysis);
-@ifdef DEBUG
-        if LChanged then
-          DoVerifyAfter(AModule, LPasses[LI], LF);
-        end;
-@endif
-      end;
+      DoRunPasses(AModule, LPasses, LF);
     end;
   end;
+  LCleanup := CleanupPassesOf();
+  for LRound := 1 to ADAM_OPT_IPO_ROUNDS do
+    LTouched := OptimizeInterprocedural(AModule, ALevel);
+    if LTouched.Count = 0 then
+      leave;
+    end;
+    for LO := 0 to LTouched.Count - 1 do
+@ifdef DEBUG
+      DoVerifyIpo(AModule, LTouched[LO]);
+@endif
+      DoRunPasses(AModule, LCleanup, LTouched[LO]);
+    end;
+  end;
+  DropUnreferenced(AModule);
 end;
 
 end.
