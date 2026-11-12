@@ -91,10 +91,7 @@ const
   ADAM_WINDOWS_SW_HIDE: uint16 = 0;
   ADAM_WINDOWS_NORMAL_PRIORITY_CLASS: uint32 = 0x20;
   ADAM_WINDOWS_GENERIC_READ: uint32 = 0x80000000;
-  ADAM_WINDOWS_GENERIC_WRITE: uint32 = 0x40000000;
-  ADAM_WINDOWS_FILE_SHARE_READ: uint32 = 0x1;
   ADAM_WINDOWS_FILE_SHARE_READ_WRITE: uint32 = 0x3;
-  ADAM_WINDOWS_CREATE_ALWAYS: uint32 = 2;
   ADAM_WINDOWS_OPEN_EXISTING: uint32 = 3;
   ADAM_WINDOWS_INFINITE: uint32 = 0xFFFFFFFF;
   ADAM_WINDOWS_ERROR_FILE_NOT_FOUND: uint32 = 2;
@@ -173,7 +170,7 @@ type
     ThreadId: uint32;
   end;
 
-  // One ReadFile's or WriteFile's worth of bytes
+  // One ReadFile's (a child process's pipe) or BCryptGenRandom's worth of bytes
   ByteBuffer = array[0..4095] of uint8;
 
 routine clink GetLastError(): uint32; external "kernel32";
@@ -226,8 +223,6 @@ routine clink CreateProcessW(var AApplication: WideBuffer; var ACommandLine: Wid
   var AInfo: ProcessInformation): int32; external "kernel32";
 routine clink ReadFile(AFile: uint64; var ABuffer: ByteBuffer; AToRead: uint32; var ARead: uint32;
   AOverlapped: ptr): int32; external "kernel32";
-routine clink WriteFile(AFile: uint64; var ABuffer: ByteBuffer; AToWrite: uint32;
-  var AWritten: uint32; AOverlapped: ptr): int32; external "kernel32";
 routine clink WaitForSingleObject(AHandle: uint64; AMilliseconds: uint32): uint32;
   external "kernel32";
 routine clink GetExitCodeProcess(AProcess: uint64; var AExitCode: uint32): int32;
@@ -1069,48 +1064,108 @@ begin
     ADAM_WINDOWS_ATTRIBUTE_NORMAL, 0);
 end;
 
+// The whole-file routines below (ReadAllText .. WriteAllText) name no OS: they open, size,
+// read and write through System.Runtime's file handles (its platform unit holds the OS
+// calls), so they hold as they are on every target. A file is sized first and read straight
+// into its one block (no chunk buffer, no byte-by-byte copy), as Delphi's TFile.ReadAllBytes
+// and TFileStream.ReadBuffer do
+
+// The file APath (ResolvePath's prefixes taken) opened as AHandle in AMode (System.Runtime's
+// ADAM_FILE_*); false (AHandle 0) when it resolves to "" or cannot be opened so
+routine DoOpenHandle(const APath: string; const AMode: int32; var AHandle: uint64): bool;
+var
+  LPath: string;
+  LText: ptr to char;
+  LOpened: bool;
+begin
+  AHandle := 0;
+  LPath := ResolvePath(APath);
+  if LPath = "" then
+    return false;
+  end;
+  LText := StringToC(LPath);
+  if LText = nil then
+    return false;
+  end;
+  LOpened := OpenFileHandle(LText, AMode, AHandle);
+  freemem(LText);
+  return LOpened;
+end;
+
+// Up to ACount bytes of the open file AHandle read into ABuffer, a short read read again:
+// the bytes read (fewer than ACount when the file ends first), -1 when a read fails
+routine DoReadInto(const AHandle: uint64; const ABuffer: ptr; const ACount: int64): int64;
+var
+  LDone: int64;
+  LGot: int64;
+begin
+  LDone := 0;
+  while LDone < ACount do
+    LGot := ReadFileHandle(AHandle, ptr(uint64(ABuffer) + uint64(LDone)), ACount - LDone);
+    if LGot < 0 then
+      return -1;
+    end;
+    // A file's end is a read that succeeds with no bytes (it shrank since it was sized)
+    if LGot = 0 then
+      leave;
+    end;
+    LDone := LDone + LGot;
+  end;
+  return LDone;
+end;
+
+// ACount bytes at ABuffer written to the open file AHandle, a short write written again;
+// false when a write fails or writes nothing
+routine DoWriteFrom(const AHandle: uint64; const ABuffer: ptr; const ACount: int64): bool;
+var
+  LDone: int64;
+  LPut: int64;
+begin
+  LDone := 0;
+  while LDone < ACount do
+    LPut := WriteFileHandle(AHandle, ptr(uint64(ABuffer) + uint64(LDone)), ACount - LDone);
+    if LPut <= 0 then
+      return false;
+    end;
+    LDone := LDone + LPut;
+  end;
+  return true;
+end;
+
 // Reads a whole file into AText, its bytes as they are (no newline or code page conversion).
 // False when it is a folder, is missing, or cannot be opened or read (AText then "")
 public routine ReadAllText(const APath: string; var AText: string): bool;
 var
   LFile: uint64;
-  LBuffer: ByteBuffer;
-  LCount: uint32;
-  LOld: int64;
-  LI: int64;
-  LOk: bool;
+  LText: string;
+  LSize: int64;
+  LCount: int64;
 begin
   AText := "";
-  LFile := DoOpenFile(APath, ADAM_WINDOWS_GENERIC_READ, ADAM_WINDOWS_FILE_SHARE_READ_WRITE,
-    ADAM_WINDOWS_OPEN_EXISTING);
-  if LFile = ADAM_WINDOWS_INVALID_HANDLE then
+  if not DoOpenHandle(APath, ADAM_FILE_READ, LFile) then
     return false;
   end;
-  LOk := true;
+  LText := "";
+  LSize := 0;
+  LCount := 0;
   guard
-    while true do
-      LCount := 0;
-      if ReadFile(LFile, LBuffer, ADAM_WINDOWS_IO_SIZE, LCount, nil) = 0 then
-        LOk := false;
-        leave;
-      end;
-      // A file's end is a read that succeeds with no bytes
-      if LCount = 0 then
-        leave;
-      end;
-      LOld := len(AText);
-      setlength(AText, LOld + int64(LCount));
-      for LI := 0 to int64(LCount) - 1 do
-        AText[LOld + LI] := char(LBuffer[LI]);
-      end;
+    LSize := FileHandleSize(LFile);
+    if LSize > 0 then
+      // Sized from empty: a block of its own, read into in place
+      setlength(LText, LSize);
+      LCount := DoReadInto(LFile, ptr(addr of LText[0]), LSize);
     end;
   finally
-    CloseHandle(LFile);
+    CloseFileHandle(LFile);
   end;
-  if not LOk then
-    AText := "";
+  if (LSize < 0) or (LCount < 0) then
+    return false;
   end;
-  return LOk;
+  if LCount < LSize then
+    setlength(LText, LCount);
+  end;
+  AText := LText;
+  return true;
 end;
 
 // Reads a whole file into ABytes, its bytes as they are. False when it is a folder, is missing,
@@ -1118,54 +1173,34 @@ end;
 public routine ReadAllBytes(const APath: string; var ABytes: ByteArray): bool;
 var
   LFile: uint64;
-  LBuffer: ByteBuffer;
-  LRead: uint32;
+  LBytes: ByteArray;
+  LSize: int64;
   LCount: int64;
-  LCapacity: int64;
-  LI: int64;
-  LOk: bool;
 begin
   setlength(ABytes, 0);
-  LFile := DoOpenFile(APath, ADAM_WINDOWS_GENERIC_READ, ADAM_WINDOWS_FILE_SHARE_READ_WRITE,
-    ADAM_WINDOWS_OPEN_EXISTING);
-  if LFile = ADAM_WINDOWS_INVALID_HANDLE then
+  if not DoOpenHandle(APath, ADAM_FILE_READ, LFile) then
     return false;
   end;
-  LOk := true;
+  setlength(LBytes, 0);
+  LSize := 0;
   LCount := 0;
-  LCapacity := 0;
   guard
-    while true do
-      LRead := 0;
-      if ReadFile(LFile, LBuffer, ADAM_WINDOWS_IO_SIZE, LRead, nil) = 0 then
-        LOk := false;
-        leave;
-      end;
-      // A file's end is a read that succeeds with no bytes
-      if LRead = 0 then
-        leave;
-      end;
-      // The array doubles when a chunk does not fit, so a big file is not copied per chunk
-      if LCount + int64(LRead) > LCapacity then
-        LCapacity := LCapacity * 2;
-        if LCapacity < LCount + int64(LRead) then
-          LCapacity := LCount + int64(ADAM_WINDOWS_IO_SIZE);
-        end;
-        setlength(ABytes, LCapacity);
-      end;
-      for LI := 0 to int64(LRead) - 1 do
-        ABytes[LCount + LI] := LBuffer[LI];
-      end;
-      LCount := LCount + int64(LRead);
+    LSize := FileHandleSize(LFile);
+    if LSize > 0 then
+      // Sized from empty: a block of its own, read into in place
+      setlength(LBytes, LSize);
+      LCount := DoReadInto(LFile, ptr(addr of LBytes[0]), LSize);
     end;
   finally
-    CloseHandle(LFile);
+    CloseFileHandle(LFile);
   end;
-  if not LOk then
-    setlength(ABytes, 0);
+  if (LSize < 0) or (LCount < 0) then
     return false;
   end;
-  setlength(ABytes, LCount);
+  if LCount < LSize then
+    setlength(LBytes, LCount);
+  end;
+  ABytes := LBytes;
   return true;
 end;
 
@@ -1175,59 +1210,41 @@ end;
 public routine WriteAllBytes(const APath: string; const ABytes: ByteArray): bool;
 var
   LFile: uint64;
-  LBuffer: ByteBuffer;
-  LFrom: int64;
-  LCount: int64;
-  LWritten: uint32;
-  LI: int64;
   LOk: bool;
 begin
-  LFile := DoOpenFile(APath, ADAM_WINDOWS_GENERIC_WRITE, ADAM_WINDOWS_FILE_SHARE_READ,
-    ADAM_WINDOWS_CREATE_ALWAYS);
-  if LFile = ADAM_WINDOWS_INVALID_HANDLE then
+  if not DoOpenHandle(APath, ADAM_FILE_WRITE, LFile) then
     return false;
   end;
   LOk := true;
   guard
-    LFrom := 0;
-    while LFrom < len(ABytes) do
-      // The next chunk, at most one buffer
-      LCount := len(ABytes) - LFrom;
-      if LCount > int64(ADAM_WINDOWS_IO_SIZE) then
-        LCount := int64(ADAM_WINDOWS_IO_SIZE);
-      end;
-      for LI := 0 to LCount - 1 do
-        LBuffer[LI] := ABytes[LFrom + LI];
-      end;
-      LWritten := 0;
-      if WriteFile(LFile, LBuffer, uint32(LCount), LWritten, nil) = 0 then
-        LOk := false;
-        leave;
-      end;
-      if int64(LWritten) <> LCount then
-        LOk := false;
-        leave;
-      end;
-      LFrom := LFrom + LCount;
+    if len(ABytes) > 0 then
+      LOk := DoWriteFrom(LFile, ptr(addr of ABytes[0]), len(ABytes));
     end;
   finally
-    CloseHandle(LFile);
+    CloseFileHandle(LFile);
   end;
   return LOk;
 end;
 
 // Writes AText as the whole file, its bytes as they are (no BOM; line ends as the caller wrote
-// them), through WriteAllBytes: the same replacing, the same failures
+// them), straight from AText: the same replacing, the same failures as WriteAllBytes
 public routine WriteAllText(const APath: string; const AText: string): bool;
 var
-  LBytes: ByteArray;
-  LI: int64;
+  LFile: uint64;
+  LOk: bool;
 begin
-  setlength(LBytes, len(AText));
-  for LI := 0 to len(AText) - 1 do
-    LBytes[LI] := uint8(AText[LI]);
+  if not DoOpenHandle(APath, ADAM_FILE_WRITE, LFile) then
+    return false;
   end;
-  return WriteAllBytes(APath, LBytes);
+  LOk := true;
+  guard
+    if len(AText) > 0 then
+      LOk := DoWriteFrom(LFile, ptr(addr of AText[0]), len(AText));
+    end;
+  finally
+    CloseFileHandle(LFile);
+  end;
+  return LOk;
 end;
 
 // ACount bytes from the system's secure random generator (BCryptGenRandom, the system-preferred
