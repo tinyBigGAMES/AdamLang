@@ -38,6 +38,11 @@
                     UWOP_ALLOC_LARGE (1) info 0, the next slot N / 8;
                     512K..4G-8 UWOP_ALLOC_LARGE info 1, the next two slots N
                     (its low half first)
+  save vector X     a callee-saved vector register stored whole after the
+                    allocation (x64: movaps [rsp + d], X; d the frame's
+                    VectorBase + 16 * k): UWOP_SAVE_XMM128 (8), info X's
+                    number (0 xmm0 .. 15 xmm15), the next slot d / 16; past
+                    65535 * 16 UWOP_SAVE_XMM128_FAR (9), the next two slots d
   frame R           a realigned frame's last step (x64: mov R, rsp after the
                     allocation; R one of the saves): UWOP_SET_FPREG (3),
                     info 0, and UNWIND_INFO's frame register R with offset
@@ -51,8 +56,8 @@
                     ($unwind$<function>, defined where it starts)
 
   The code slots run in the reverse of the prologue (the unwinder undoes the
-  last step first): a frame register's, the allocation's, then each save's,
-  last pushed first.
+  last step first): a frame register's, each vector save's (the last first),
+  the allocation's, then each save's, last pushed first.
 
   A function that saves nothing, reserves nothing and calls nothing (a bare
   leaf: no frame) gets neither: the unwinder takes [rsp] as its return
@@ -110,6 +115,15 @@ public const
   ADAM_WIN64_UWOP_ALLOC_LARGE: int64 = 1;
   ADAM_WIN64_UWOP_ALLOC_SMALL: int64 = 2;
   ADAM_WIN64_UWOP_SET_FPREG: int64 = 3;
+  ADAM_WIN64_UWOP_SAVE_XMM128: int64 = 8;
+  ADAM_WIN64_UWOP_SAVE_XMM128_FAR: int64 = 9;
+  // The vector registers by their unwind numbers (UWOP_SAVE_XMM128's info: 0 xmm0 .. 15
+  // xmm15), a saved one's bytes (an offset of one is a multiple of them), and the largest
+  // offset the scaled form's one slot takes (65535 * 16)
+  ADAM_WIN64_UNWIND_VECTORS: string =
+    "xmm0 xmm1 xmm2 xmm3 xmm4 xmm5 xmm6 xmm7 xmm8 xmm9 xmm10 xmm11 xmm12 xmm13 xmm14 xmm15";
+  ADAM_WIN64_UNWIND_VECTOR_BYTES: int64 = 16;
+  ADAM_WIN64_UNWIND_VECTOR_SCALED_MAX: int64 = 1048560;
   // UNWIND_INFO's flags of a frame whose handler runs as an exception is dispatched (looking
   // for a scope that catches it) and as an unwind leaves it, and the scale that puts the
   // flags in bits 3-7 of the first byte (flags * 8)
@@ -136,6 +150,8 @@ public const
   ADAM_WIN64_UNWIND_FAULT_LEAF: string = "Win64 unwind: a call with no frame: ";
   ADAM_WIN64_UNWIND_FAULT_PROLOGUE: string =
     "Win64 unwind: a prologue other than the frame's saves then one allocation of its bytes: ";
+  ADAM_WIN64_UNWIND_FAULT_VECTOR: string =
+    "Win64 unwind: a vector save not the frame's, not a vector register or not 16-aligned: ";
   ADAM_WIN64_UNWIND_FAULT_FRAME: string =
     "Win64 unwind: a realigned frame whose last step is not its saved frame register: ";
   ADAM_WIN64_UNWIND_FAULT_LONG: string = "Win64 unwind: a prologue over 255 bytes or past the code: ";
@@ -175,8 +191,10 @@ type
     hidden FResult: ref UnwindEntry;
     // The code slots, each a USHORT's value, in array order
     hidden FCodes: ref Int64List;
-    // The general registers by their unwind numbers (ADAM_WIN64_UNWIND_REGISTERS)
+    // The general registers by their unwind numbers (ADAM_WIN64_UNWIND_REGISTERS), and the
+    // vector ones (ADAM_WIN64_UNWIND_VECTORS)
     hidden FRegisters: StringArray;
+    hidden FVectors: StringArray;
 
     init(const ACode: ref FunctionCode; const ASections: ref SectionSet);
     begin
@@ -185,17 +203,19 @@ type
       self.FResult := ref UnwindEntry();
       self.FCodes := ref Int64List();
       self.FRegisters := SplitString(ADAM_WIN64_UNWIND_REGISTERS, " ");
+      self.FVectors := SplitString(ADAM_WIN64_UNWIND_VECTORS, " ");
     end;
 
     // Checks the function, then (it has a frame: saves or an allocation) writes its
     // UNWIND_INFO and its RUNTIME_FUNCTION; returns what was written. The codes go in the
     // reverse of the prologue's order (the unwinder undoes the last step first): a realigned
-    // frame's frame register, the allocation, then each save from the last pushed to the
-    // first
+    // frame's frame register, the vector saves from the last to the first, the allocation,
+    // then each save from the last pushed to the first
     method Run(): ref UnwindEntry;
     var
       LFrame: ref FrameLayout;
       LStep: ref PrologueStep;
+      LFirstVector: int64;
       LI: int64;
     begin
       self.DoCheck();
@@ -210,6 +230,13 @@ type
       if LFrame.Realign > 0 then
         // The frame register's step is the prologue's last (DoCheckPrologue)
         self.DoCode(self.FResult.PrologueSize, ADAM_WIN64_UWOP_SET_FPREG, 0);
+      end;
+      // The vector saves follow the allocation's step (DoCheckPrologue)
+      LFirstVector := LFrame.SavedCount + 1;
+      for LI := LFrame.VectorCount - 1 downto 0 do
+        LStep := self.FCode.StepAt(LFirstVector + LI);
+        self.DoVectorCodes(LStep.EndsAt, IndexStr(LStep.RegisterName, self.FVectors),
+          LStep.Bytes);
       end;
       if LFrame.AllocBytes > 0 then
         self.DoAllocCodes(self.FCode.StepAt(LFrame.SavedCount).EndsAt, LFrame.AllocBytes);
@@ -310,9 +337,24 @@ type
       if AFrame.Realign > 0 then
         LFrameSteps := 1;
       end;
-      if self.FCode.StepCount <> AFrame.SavedCount + LAllocSteps + LFrameSteps then
+      if self.FCode.StepCount <> AFrame.SavedCount + LAllocSteps + AFrame.VectorCount +
+        LFrameSteps then
         self.DoFault(ADAM_WIN64_UNWIND_FAULT_PROLOGUE, IntToStr(self.FCode.StepCount) +
-          " steps, " + IntToStr(AFrame.SavedCount) + " saved");
+          " steps, " + IntToStr(AFrame.SavedCount) + " saved, " +
+          IntToStr(AFrame.VectorCount) + " vectors");
+      end;
+      // Vector saves are stores into the reserved bytes: none without them
+      if (AFrame.VectorCount > 0) and (LAllocSteps = 0) then
+        self.DoFault(ADAM_WIN64_UNWIND_FAULT_VECTOR, "no allocation");
+      end;
+      for LI := 0 to AFrame.VectorCount - 1 do
+        LStep := self.FCode.StepAt(AFrame.SavedCount + LAllocSteps + LI);
+        if (LStep.Action <> PrologueAction.SaveVector) or
+          (IndexStr(LStep.RegisterName, self.FVectors) < 0) or
+          (LStep.Bytes <> AFrame.VectorBase + LI * ADAM_WIN64_UNWIND_VECTOR_BYTES) or
+          ((LStep.Bytes mod ADAM_WIN64_UNWIND_VECTOR_BYTES) <> 0) then
+          self.DoFault(ADAM_WIN64_UNWIND_FAULT_VECTOR, LStep.Text());
+        end;
       end;
       for LI := 0 to AFrame.SavedCount - 1 do
         LStep := self.FCode.StepAt(LI);
@@ -383,6 +425,22 @@ type
     hidden method DoCode(const AOffset: int64; const AOp: int64; const AInfo: int64);
     begin
       self.FCodes.Add(AOffset + ((AOp + (AInfo * 16)) * 256));
+    end;
+
+    // The slots of the save of vector register ANumber (its unwind number) at AAt (from the
+    // stack pointer after the allocation, a multiple of 16) ending at AOffset: up to
+    // 65535 * 16 UWOP_SAVE_XMM128, info ANumber, the next slot AAt / 16; past it
+    // UWOP_SAVE_XMM128_FAR, the next two slots AAt (its low half first)
+    hidden method DoVectorCodes(const AOffset: int64; const ANumber: int64; const AAt: int64);
+    begin
+      if AAt <= ADAM_WIN64_UNWIND_VECTOR_SCALED_MAX then
+        self.DoCode(AOffset, ADAM_WIN64_UWOP_SAVE_XMM128, ANumber);
+        self.FCodes.Add(AAt div ADAM_WIN64_UNWIND_VECTOR_BYTES);
+        return;
+      end;
+      self.DoCode(AOffset, ADAM_WIN64_UWOP_SAVE_XMM128_FAR, ANumber);
+      self.FCodes.Add(AAt mod 65536);
+      self.FCodes.Add(AAt div 65536);
     end;
 
     // The slots of a stack allocation of ABytes ending at AOffset, by the shortest form

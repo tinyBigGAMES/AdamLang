@@ -1,0 +1,512 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.X64.Layout.adam - machine cleanup and block layout (PLAN-ADAM M6 O20)
+
+  LayoutFunction  one allocated MachineFunction (Adam.X64.Allocate) cleaned
+                  and laid out in place, before it is encoded
+                  (Adam.X64.Encode), at every level, in this order:
+
+  moves           a move of a register into itself goes (mov.8 r, r; movss
+                  / movsd / movaps x, x; a mov.4 r, r stays: it zeroes the
+                  top half); of two moves in a row of one kind (mov.8, or
+                  movsd) where the second undoes the first (a, b then b, a;
+                  a store of a register into a place then its reload from
+                  there, or the load then the store back) the second goes,
+                  unless the register is the place's base. Prologue
+                  instructions and instructions with implicit registers
+                  stay.
+  placement       unless AKeepOrder (a function with scopes: their byte
+                  ranges take its machine blocks in their SSA order,
+                  Adam.X64.Arch), the blocks are put in a reverse postorder
+                  from the entry. Its walk takes a block's successors that
+                  leave a loop the block is in, and the ones ending in ud2
+                  (a raise path: a noreturn call), before the others, so a
+                  loop's body follows its header and the path out comes
+                  after it. Then the blocks ending in ud2 go last (the
+                  entry stays first), and the blocks the walk does not
+                  reach after them, in their order. A loop is the blocks
+                  that reach a back edge's source (a jump to a block the
+                  first walk still has open) without passing its target,
+                  the header. A function with a block that does not end in
+                  a jmp, ret, tail call or ud2 (it falls through) keeps its
+                  order.
+  jumps           in the final order, a jmp to the next block goes, and jcc
+                  c A; jmp B with A the next block becomes jcc !c B
+  alignment       at fast (AAlignLoops) a loop header (a block jumped to
+                  from itself or a block after it, the entry aside) starts
+                  at an ADAM_X64_LAYOUT_LOOP_ALIGN boundary
+                  (MachineBlock.Align: the encoder pads with nops)
+*******************************************************************************/
+
+module unit Adam.X64.Layout;
+
+import System.SysUtils, Adam.Core.Containers, Adam.X64.Machine;
+
+public const
+  // A loop header's alignment at fast (one instruction fetch block)
+  ADAM_X64_LAYOUT_LOOP_ALIGN: int64 = 16;
+
+type
+  // One list per block (successors, predecessors, loops)
+  BlockLists = array of ref Int64List;
+
+// True for a physical register operand
+routine DoIsRegister(const AOperand: ref MachineOperand): bool;
+begin
+  return AOperand.Kind = OperandKind.PhysicalReg;
+end;
+
+// True for a memory operand off a physical register alone (no index, symbol or segment)
+routine DoIsPlainMemory(const AOperand: ref MachineOperand): bool;
+begin
+  return (AOperand.Kind = OperandKind.Memory) and (AOperand.Base = MemoryBase.Register) and
+    not AOperand.BaseVirtual and (AOperand.Scale = 0) and (AOperand.DispSymbol = "") and
+    (AOperand.Segment = "");
+end;
+
+// True when AA and AB are one plain memory place (DoIsPlainMemory)
+routine DoSamePlace(const AA: ref MachineOperand; const AB: ref MachineOperand): bool;
+begin
+  return DoIsPlainMemory(AA) and DoIsPlainMemory(AB) and (AA.Reg = AB.Reg) and
+    (AA.Disp = AB.Disp);
+end;
+
+// True for an instruction cleanup may take out: no prologue instruction, no implicit
+// register, two operands
+routine DoIsPlainMove(const AInstr: ref MachineInstr): bool;
+begin
+  if AInstr.Prologue or (AInstr.ImplicitUses.Count > 0) or (AInstr.ImplicitDefs.Count > 0) or
+    (AInstr.OperandCount <> 2) then
+    return false;
+  end;
+  return ((AInstr.Op = X64Op.Mov) and (AInstr.Width = 8)) or (AInstr.Op = X64Op.MovSD) or
+    (AInstr.Op = X64Op.MovSS) or (AInstr.Op = X64Op.MovAps);
+end;
+
+// True for a move of a register into itself (see the header)
+routine DoIsSelfMove(const AInstr: ref MachineInstr): bool;
+begin
+  if not DoIsPlainMove(AInstr) then
+    return false;
+  end;
+  return DoIsRegister(AInstr.OperandAt(0)) and DoIsRegister(AInstr.OperandAt(1)) and
+    (AInstr.OperandAt(0).Reg = AInstr.OperandAt(1).Reg);
+end;
+
+// True when AB, right after AA, moves back what AA moved (see the header)
+routine DoUndoes(const AA: ref MachineInstr; const AB: ref MachineInstr): bool;
+var
+  LADst: ref MachineOperand;
+  LASrc: ref MachineOperand;
+  LBDst: ref MachineOperand;
+  LBSrc: ref MachineOperand;
+begin
+  if not DoIsPlainMove(AA) or not DoIsPlainMove(AB) or (AA.Op <> AB.Op) or
+    (AA.Width <> AB.Width) or ((AA.Op <> X64Op.Mov) and (AA.Op <> X64Op.MovSD)) then
+    return false;
+  end;
+  LADst := AA.OperandAt(0);
+  LASrc := AA.OperandAt(1);
+  LBDst := AB.OperandAt(0);
+  LBSrc := AB.OperandAt(1);
+  if DoIsRegister(LADst) and DoIsRegister(LASrc) and DoIsRegister(LBDst) and
+    DoIsRegister(LBSrc) then
+    return (LADst.Reg = LBSrc.Reg) and (LASrc.Reg = LBDst.Reg);
+  end;
+  // A store then its reload: the register still holds what the place holds
+  if DoIsPlainMemory(LADst) and DoIsRegister(LASrc) and DoIsRegister(LBDst) and
+    DoSamePlace(LADst, LBSrc) then
+    return (LASrc.Reg = LBDst.Reg) and (LASrc.Reg <> LADst.Reg);
+  end;
+  // A load then its store back: the place still holds what the register holds
+  if DoIsRegister(LADst) and DoIsPlainMemory(LASrc) and DoSamePlace(LASrc, LBDst) and
+    DoIsRegister(LBSrc) then
+    return (LADst.Reg = LBSrc.Reg) and (LADst.Reg <> LASrc.Reg);
+  end;
+  return false;
+end;
+
+// The moves of every block cleaned (see the header)
+routine DoMoves(const AMachine: ref MachineFunction);
+var
+  LBlock: ref MachineBlock;
+  LB: int64;
+  LI: int64;
+begin
+  for LB := 0 to AMachine.BlockCount - 1 do
+    LBlock := AMachine.BlockAt(LB);
+    LI := 0;
+    while LI < LBlock.InstrCount do
+      if DoIsSelfMove(LBlock.InstrAt(LI)) then
+        LBlock.RemoveAt(LI);
+      else
+        if (LI > 0) and DoUndoes(LBlock.InstrAt(LI - 1), LBlock.InstrAt(LI)) then
+          LBlock.RemoveAt(LI);
+        else
+          LI := LI + 1;
+        end;
+      end;
+    end;
+  end;
+end;
+
+// True for a block whose last instruction is ud2 (a raise path)
+routine DoIsCold(const ABlock: ref MachineBlock): bool;
+begin
+  return (ABlock.InstrCount > 0) and (ABlock.InstrAt(ABlock.InstrCount - 1).Op = X64Op.Ud2);
+end;
+
+// True when every block ends in an instruction that closes it (nothing falls through)
+routine DoAllClosed(const AMachine: ref MachineFunction): bool;
+var
+  LBlock: ref MachineBlock;
+  LB: int64;
+begin
+  for LB := 0 to AMachine.BlockCount - 1 do
+    LBlock := AMachine.BlockAt(LB);
+    if (LBlock.InstrCount = 0) or not X64OpCloses(LBlock.InstrAt(LBlock.InstrCount - 1).Op) then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// Each block's successors: the blocks its jumps name, in the order they name them
+routine DoSuccessors(const AMachine: ref MachineFunction): BlockLists;
+var
+  LSuccs: BlockLists;
+  LBlock: ref MachineBlock;
+  LInstr: ref MachineInstr;
+  LB: int64;
+  LI: int64;
+  LK: int64;
+begin
+  setlength(LSuccs, AMachine.BlockCount);
+  for LB := 0 to AMachine.BlockCount - 1 do
+    LSuccs[LB] := ref Int64List();
+    LBlock := AMachine.BlockAt(LB);
+    for LI := 0 to LBlock.InstrCount - 1 do
+      LInstr := LBlock.InstrAt(LI);
+      for LK := 0 to LInstr.OperandCount - 1 do
+        if (LInstr.OperandAt(LK).Kind = OperandKind.BlockRef) and
+          (LSuccs[LB].IndexOf(LInstr.OperandAt(LK).Block) < 0) then
+          LSuccs[LB].Add(LInstr.OperandAt(LK).Block);
+        end;
+      end;
+    end;
+  end;
+  return LSuccs;
+end;
+
+// A depth-first walk from the entry over ASuccs (each block's successors in the order the
+// walk takes them): the blocks in postorder into APost, and every back edge (to a block the
+// walk still has open) into ABackFrom / ABackTo
+routine DoWalk(const ASuccs: BlockLists; const ACount: int64; const APost: ref Int64List;
+  const ABackFrom: ref Int64List; const ABackTo: ref Int64List);
+var
+  LState: Int64Array;
+  LStack: Int64Array;
+  LNext: Int64Array;
+  LDepth: int64;
+  LTop: int64;
+  LS: int64;
+  LB: int64;
+begin
+  // 0: not seen, 1: open (on the walk's stack), 2: done
+  setlength(LState, ACount);
+  setlength(LStack, ACount);
+  setlength(LNext, ACount);
+  for LB := 0 to ACount - 1 do
+    LState[LB] := 0;
+  end;
+  LStack[0] := 0;
+  LNext[0] := 0;
+  LDepth := 1;
+  LState[0] := 1;
+  while LDepth > 0 do
+    LTop := LStack[LDepth - 1];
+    if LNext[LDepth - 1] < ASuccs[LTop].Count then
+      LS := ASuccs[LTop].Items[LNext[LDepth - 1]];
+      LNext[LDepth - 1] := LNext[LDepth - 1] + 1;
+      if LState[LS] = 0 then
+        LState[LS] := 1;
+        LStack[LDepth] := LS;
+        LNext[LDepth] := 0;
+        LDepth := LDepth + 1;
+      else
+        if LState[LS] = 1 then
+          ABackFrom.Add(LTop);
+          ABackTo.Add(LS);
+        end;
+      end;
+    else
+      LState[LTop] := 2;
+      APost.Add(LTop);
+      LDepth := LDepth - 1;
+    end;
+  end;
+end;
+
+// Each block's loops (the headers of the loops it is in), from the back edges ABackFrom /
+// ABackTo: a loop is its header and the blocks that reach the back edge's source without
+// passing the header (over APreds)
+routine DoLoops(const APreds: BlockLists; const ACount: int64; const ABackFrom: ref Int64List;
+  const ABackTo: ref Int64List): BlockLists;
+var
+  LLoops: BlockLists;
+  LWork: ref Int64List;
+  LHead: int64;
+  LB: int64;
+  LP: int64;
+  LE: int64;
+  LK: int64;
+begin
+  setlength(LLoops, ACount);
+  for LB := 0 to ACount - 1 do
+    LLoops[LB] := ref Int64List();
+  end;
+  for LE := 0 to ABackFrom.Count - 1 do
+    LHead := ABackTo.Items[LE];
+    if LLoops[LHead].IndexOf(LHead) < 0 then
+      LLoops[LHead].Add(LHead);
+    end;
+    LWork := ref Int64List();
+    if LLoops[ABackFrom.Items[LE]].IndexOf(LHead) < 0 then
+      LLoops[ABackFrom.Items[LE]].Add(LHead);
+      LWork.Add(ABackFrom.Items[LE]);
+    end;
+    // A worklist read from the front as it grows: each block entered once
+    LK := 0;
+    while LK < LWork.Count do
+      LB := LWork.Items[LK];
+      LK := LK + 1;
+      for LP := 0 to APreds[LB].Count - 1 do
+        if LLoops[APreds[LB].Items[LP]].IndexOf(LHead) < 0 then
+          LLoops[APreds[LB].Items[LP]].Add(LHead);
+          LWork.Add(APreds[LB].Items[LP]);
+        end;
+      end;
+    end;
+  end;
+  return LLoops;
+end;
+
+// True when going from block AFrom to block ATo leaves a loop AFrom is in (ALoops)
+routine DoLeaves(const ALoops: BlockLists; const AFrom: int64; const ATo: int64): bool;
+var
+  LI: int64;
+begin
+  for LI := 0 to ALoops[AFrom].Count - 1 do
+    if ALoops[ATo].IndexOf(ALoops[AFrom].Items[LI]) < 0 then
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+// The blocks placed (see the header)
+routine DoPlace(const AMachine: ref MachineFunction);
+var
+  LCount: int64;
+  LSuccs: BlockLists;
+  LPreds: BlockLists;
+  LLoops: BlockLists;
+  LOrdered: BlockLists;
+  LPost: ref Int64List;
+  LBackFrom: ref Int64List;
+  LBackTo: ref Int64List;
+  LOrder: ref Int64List;
+  LPlaced: BoolArray;
+  LS: int64;
+  LB: int64;
+  LI: int64;
+begin
+  LCount := AMachine.BlockCount;
+  if (LCount < 3) or not DoAllClosed(AMachine) then
+    return;
+  end;
+  LSuccs := DoSuccessors(AMachine);
+  setlength(LPreds, LCount);
+  for LB := 0 to LCount - 1 do
+    LPreds[LB] := ref Int64List();
+  end;
+  for LB := 0 to LCount - 1 do
+    for LI := 0 to LSuccs[LB].Count - 1 do
+      LPreds[LSuccs[LB].Items[LI]].Add(LB);
+    end;
+  end;
+  // The first walk finds the back edges, so the loops
+  LPost := ref Int64List();
+  LBackFrom := ref Int64List();
+  LBackTo := ref Int64List();
+  DoWalk(LSuccs, LCount, LPost, LBackFrom, LBackTo);
+  LLoops := DoLoops(LPreds, LCount, LBackFrom, LBackTo);
+  // The second walk takes the successors that leave a loop or raise first: the ones taken
+  // first end up last in reverse postorder
+  setlength(LOrdered, LCount);
+  for LB := 0 to LCount - 1 do
+    LOrdered[LB] := ref Int64List();
+    for LI := 0 to LSuccs[LB].Count - 1 do
+      LS := LSuccs[LB].Items[LI];
+      if DoIsCold(AMachine.BlockAt(LS)) or DoLeaves(LLoops, LB, LS) then
+        LOrdered[LB].Add(LS);
+      end;
+    end;
+    for LI := 0 to LSuccs[LB].Count - 1 do
+      LS := LSuccs[LB].Items[LI];
+      if not DoIsCold(AMachine.BlockAt(LS)) and not DoLeaves(LLoops, LB, LS) then
+        LOrdered[LB].Add(LS);
+      end;
+    end;
+  end;
+  LPost := ref Int64List();
+  LBackFrom := ref Int64List();
+  LBackTo := ref Int64List();
+  DoWalk(LOrdered, LCount, LPost, LBackFrom, LBackTo);
+  // Reverse postorder, the raise paths after the rest (the entry first, whatever it ends
+  // in), then the blocks the walk did not reach
+  setlength(LPlaced, LCount);
+  for LB := 0 to LCount - 1 do
+    LPlaced[LB] := false;
+  end;
+  LOrder := ref Int64List();
+  for LI := LPost.Count - 1 downto 0 do
+    LB := LPost.Items[LI];
+    if (LB = 0) or not DoIsCold(AMachine.BlockAt(LB)) then
+      LOrder.Add(LB);
+      LPlaced[LB] := true;
+    end;
+  end;
+  for LI := LPost.Count - 1 downto 0 do
+    LB := LPost.Items[LI];
+    if not LPlaced[LB] then
+      LOrder.Add(LB);
+      LPlaced[LB] := true;
+    end;
+  end;
+  for LB := 0 to LCount - 1 do
+    if not LPlaced[LB] then
+      LOrder.Add(LB);
+      LPlaced[LB] := true;
+    end;
+  end;
+  AMachine.ReorderBlocks(LOrder);
+end;
+
+// The condition that holds exactly when ACond does not
+routine DoInverse(const ACond: X64Cond): X64Cond;
+begin
+  match ACond of
+    X64Cond.Overflow: return X64Cond.NoOverflow;
+    X64Cond.NoOverflow: return X64Cond.Overflow;
+    X64Cond.Below: return X64Cond.AboveOrEqual;
+    X64Cond.AboveOrEqual: return X64Cond.Below;
+    X64Cond.Equal: return X64Cond.NotEqual;
+    X64Cond.NotEqual: return X64Cond.Equal;
+    X64Cond.BelowOrEqual: return X64Cond.Above;
+    X64Cond.Above: return X64Cond.BelowOrEqual;
+    X64Cond.Sign: return X64Cond.NoSign;
+    X64Cond.NoSign: return X64Cond.Sign;
+    X64Cond.Parity: return X64Cond.NoParity;
+    X64Cond.NoParity: return X64Cond.Parity;
+    X64Cond.Less: return X64Cond.GreaterOrEqual;
+    X64Cond.GreaterOrEqual: return X64Cond.Less;
+    X64Cond.LessOrEqual: return X64Cond.Greater;
+    X64Cond.Greater: return X64Cond.LessOrEqual;
+  end;
+  return ACond;
+end;
+
+// True for a jump (jmp or jcc) to block ABlock
+routine DoJumpsTo(const AInstr: ref MachineInstr; const ABlock: int64): bool;
+begin
+  return ((AInstr.Op = X64Op.Jmp) or (AInstr.Op = X64Op.Jcc)) and (AInstr.OperandCount = 1) and
+    (AInstr.OperandAt(0).Kind = OperandKind.BlockRef) and (AInstr.OperandAt(0).Block = ABlock);
+end;
+
+// The jumps to the next block taken out (see the header)
+routine DoJumps(const AMachine: ref MachineFunction);
+var
+  LBlock: ref MachineBlock;
+  LLast: ref MachineInstr;
+  LPrev: ref MachineInstr;
+  LCount: int64;
+  LB: int64;
+begin
+  for LB := 0 to AMachine.BlockCount - 2 do
+    LBlock := AMachine.BlockAt(LB);
+    LCount := LBlock.InstrCount;
+    if LCount > 0 then
+      LLast := LBlock.InstrAt(LCount - 1);
+      if DoJumpsTo(LLast, LB + 1) and (LLast.Op = X64Op.Jmp) then
+        LBlock.RemoveAt(LCount - 1);
+      else
+        if (LCount > 1) and (LLast.Op = X64Op.Jmp) and (LLast.OperandCount = 1) and
+          (LLast.OperandAt(0).Kind = OperandKind.BlockRef) then
+          LPrev := LBlock.InstrAt(LCount - 2);
+          if DoJumpsTo(LPrev, LB + 1) and (LPrev.Op = X64Op.Jcc) then
+            // jcc c next; jmp B -> jcc !c B, falling into next
+            LPrev.Cond := DoInverse(LPrev.Cond);
+            LPrev.SetOperand(0, BlockOperand(LLast.OperandAt(0).Block));
+            LBlock.RemoveAt(LCount - 1);
+          end;
+        end;
+      end;
+    end;
+  end;
+end;
+
+// Every loop header aligned (see the header)
+routine DoAlignLoops(const AMachine: ref MachineFunction);
+var
+  LBlock: ref MachineBlock;
+  LInstr: ref MachineInstr;
+  LTarget: int64;
+  LB: int64;
+  LI: int64;
+  LK: int64;
+begin
+  for LB := 0 to AMachine.BlockCount - 1 do
+    LBlock := AMachine.BlockAt(LB);
+    for LI := 0 to LBlock.InstrCount - 1 do
+      LInstr := LBlock.InstrAt(LI);
+      for LK := 0 to LInstr.OperandCount - 1 do
+        if LInstr.OperandAt(LK).Kind = OperandKind.BlockRef then
+          LTarget := LInstr.OperandAt(LK).Block;
+          if (LTarget > 0) and (LTarget <= LB) then
+            AMachine.BlockAt(LTarget).Align := ADAM_X64_LAYOUT_LOOP_ALIGN;
+          end;
+        end;
+      end;
+    end;
+  end;
+end;
+
+// AMachine (allocated, not yet encoded) cleaned and laid out in place (see the header)
+public routine LayoutFunction(const AMachine: ref MachineFunction; const AKeepOrder: bool;
+  const AAlignLoops: bool);
+begin
+  DoMoves(AMachine);
+  if not AKeepOrder then
+    DoPlace(AMachine);
+  end;
+  DoJumps(AMachine);
+  if AAlignLoops then
+    DoAlignLoops(AMachine);
+  end;
+end;
+
+end.

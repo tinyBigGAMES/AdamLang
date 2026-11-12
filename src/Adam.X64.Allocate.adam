@@ -57,8 +57,8 @@
   waits in its slot up to that use. A part holding no use stays in the slot.
   Splits fall between instructions (an operand read and written keeps one
   place), never between a block's closing jumps. Vector registers come from
-  the ABI's volatile set only (the prologue's pushes save general registers):
-  a float live across a call is kept in its slot around it.
+  the ABI's volatile set first, then its callee-saved set (a float live
+  across a call stays in a callee-saved one, saved by the prologue).
 
   A virtual register has at most one spill slot (8 bytes, after the
   function's own slots), made the first time a part of it is in memory.
@@ -87,8 +87,10 @@
   A callee-saved register an interval is given or selection writes (rdi / rsi
   of a rep movsb, as an operand or an implicit register) is saved: the
   prologue pushes each, in the ABI's order, before it reserves the frame, and
-  each ret pops them in reverse after the release (a callee-saved vector
-  register selection writes raises: push saves general registers only).
+  each ret pops them in reverse after the release. A callee-saved vector
+  register is saved whole (movaps) into the frame's vector area
+  (FrameLayout.VectorBase) right after the reservation, each a prologue step
+  (the unwinder restores it), and restored before each ret's release.
 
   The frame comes from the ABI part's frame rule (LayoutFrame): the locals
   are the slots in order, each at its alignment; the outgoing area is the
@@ -120,6 +122,8 @@ import System.SysUtils, Adam.Core.Containers, Adam.Backend.Parts, Adam.X64.Regis
 public const
   // A spill slot's size and alignment: one general register, or a float64 in a vector one
   ADAM_X64_ALLOC_SPILL_BYTES: int64 = 8;
+  // A saved callee-saved vector register's place in the frame: the whole xmm register
+  ADAM_X64_ALLOC_VECTOR_SAVE_BYTES: int64 = 16;
   // The uses an interval needs to be given a callee-saved register the function does not
   // save yet (see the header)
   ADAM_X64_ALLOC_SAVE_USES: int64 = 3;
@@ -141,8 +145,6 @@ public const
   ADAM_X64_ALLOC_FAULT_WALK: string = "X64 allocate: the walk does not end: ";
   ADAM_X64_ALLOC_FAULT_INNER_JUMP: string = "X64 allocate: a jump before the end of m";
   ADAM_X64_ALLOC_FAULT_LIVE_IN: string = "X64 allocate: a register live into m";
-  ADAM_X64_ALLOC_FAULT_SAVED_VECTOR: string =
-    "X64 allocate: a callee-saved vector register written (push saves general ones only): ";
   ADAM_X64_ALLOC_FAULT_FRAME_REGISTER: string =
     "X64 allocate: the ABI's frame register is not a callee-saved general register: ";
   ADAM_X64_ALLOC_FAULT_REALIGN: string =
@@ -170,12 +172,6 @@ begin
     (AOp = X64Op.MovSD) or (AOp = X64Op.Lea) or X64OpIsCombine(AOp) or X64OpIsUnary(AOp) or
     X64OpIsScalarArith(AOp) or X64OpIsExtend(AOp) or (AOp = X64Op.SetCC) or (AOp = X64Op.Pop) or
     X64OpIsFloatConvert(AOp) or (AOp = X64Op.CMov) or (AOp = X64Op.Zero);
-end;
-
-// True for the ops that close a block: a jump, a ret, a tail call's jump, ud2
-routine DoCloses(const AOp: X64Op): bool;
-begin
-  return (AOp = X64Op.Jmp) or (AOp = X64Op.Ret) or (AOp = X64Op.TailJmp) or (AOp = X64Op.Ud2);
 end;
 
 // True for a jump to a block (jmp, jcc)
@@ -473,16 +469,19 @@ type
     hidden FFrameReg: int64;
     // The registers an interval may be given, by class, in the order they are preferred
     // (general: the ABI's volatile ones then its callee-saved ones, the stack pointer and a
-    // realigned frame's register left out; vector: the volatile ones)
+    // realigned frame's register left out; vector: the volatile ones then the callee-saved)
     hidden FGeneral: ref Int64List;
     hidden FVector: ref Int64List;
     // Per physical register: volatile, callee-saved, saved by the function so far
     hidden FIsVolatile: BoolArray;
     hidden FIsCallee: BoolArray;
     hidden FSavedNow: BoolArray;
-    // The callee-saved registers the function writes, in the ABI's order: the prologue
-    // pushes them in this order, each ret pops them in the reverse
+    // The callee-saved general registers the function writes, in the ABI's order: the
+    // prologue pushes them in this order, each ret pops them in the reverse
     hidden FSaved: ref Int64List;
+    // The callee-saved vector registers it writes, in the ABI's order: the prologue stores
+    // the k-th at the frame's VectorBase + 16 * k, each ret reloads it from there
+    hidden FSavedVector: ref Int64List;
     // The blocks selection made (the edge blocks of the resolution come after them), each
     // one's successors (in the order its jumps name them) and how many predecessors it has
     hidden FBlockCount: int64;
@@ -558,6 +557,7 @@ type
       self.FGeneral := ref Int64List();
       self.FVector := ref Int64List();
       self.FSaved := ref Int64List();
+      self.FSavedVector := ref Int64List();
       self.FBlockCount := 0;
       self.FOrder := ref Int64List();
       self.FInstrCount := 0;
@@ -619,13 +619,17 @@ type
           end;
         end;
       end;
+      // The callee-saved ones after the volatile ones (the walk tries them in this order)
       LNames := self.FAbi.CalleeSaved();
       for LI := 0 to len(LNames) - 1 do
         LNumber := self.DoPhysical(LNames[LI]);
         self.FIsCallee[LNumber] := true;
-        if (LNumber < ADAM_X64_FIRST_XMM) and (LNumber <> self.FStack) and
-          (LNumber <> self.FFrameReg) then
-          self.FGeneral.Add(LNumber);
+        if LNumber >= ADAM_X64_FIRST_XMM then
+          self.FVector.Add(LNumber);
+        else
+          if (LNumber <> self.FStack) and (LNumber <> self.FFrameReg) then
+            self.FGeneral.Add(LNumber);
+          end;
         end;
       end;
     end;
@@ -709,7 +713,7 @@ type
       for LB := 0 to self.FFunction.BlockCount - 1 do
         LBlock := self.FFunction.BlockAt(LB);
         LCount := LBlock.InstrCount;
-        if (LCount = 0) or not DoCloses(LBlock.InstrAt(LCount - 1).Op) then
+        if (LCount = 0) or not X64OpCloses(LBlock.InstrAt(LCount - 1).Op) then
           LNode := self.FFunction.Node;
           if LCount > 0 then
             LNode := LBlock.InstrAt(LCount - 1).Node;
@@ -2152,8 +2156,8 @@ type
     end;
 
     // The callee-saved registers an interval was given or selection writes, and a realigned
-    // frame's frame register, into FSaved in the ABI's order; raises for a vector one (no
-    // push saves it) and for a frame register the ABI does not call saved
+    // frame's frame register, into FSaved (general) and FSavedVector (vector) in the ABI's
+    // order; raises for a frame register the ABI does not call saved
     hidden method DoSavedRegisters();
     var
       LWritten: BoolArray;
@@ -2183,10 +2187,10 @@ type
         LNumber := self.DoPhysical(LCalleeSaved[LI]);
         if (LNumber <> self.FStack) and LWritten[LNumber] then
           if LNumber >= ADAM_X64_FIRST_XMM then
-            raise(ADAM_X64_ALLOC_FAULT_SAVED_VECTOR + LCalleeSaved[LI] + " in " +
-              self.FFunction.Symbol);
+            self.FSavedVector.Add(LNumber);
+          else
+            self.FSaved.Add(LNumber);
           end;
-          self.FSaved.Add(LNumber);
         end;
       end;
       if (self.FFrameReg >= 0) and (self.FSaved.IndexOf(self.FFrameReg) < 0) then
@@ -2219,7 +2223,8 @@ type
       if self.FFunction.MakesCalls then
         LOutgoing := self.FFunction.OutgoingBytes;
       end;
-      self.FFrame := self.FAbi.LayoutFrame(LPos, LAlign, LOutgoing, self.FSaved.Count);
+      self.FFrame := self.FAbi.LayoutFrame(LPos, LAlign, LOutgoing, self.FSaved.Count,
+        self.FSavedVector.Count);
       // The ABI realigns exactly when DoFrameRegister reserved its frame register
       if (self.FFrame.Realign > 0) <> (self.FFrameReg >= 0) then
         raise(ADAM_X64_ALLOC_FAULT_REALIGN + self.FFunction.Symbol);
@@ -2456,6 +2461,11 @@ type
         if self.FFrame.AllocBytes > 0 then
           self.DoStackAdjust(LBlock, X64Op.Sub, true, self.FFunction.Node);
         end;
+        // The vector saves off the stack pointer after the reservation (before a realigned
+        // frame's frame register takes it: still the same value then)
+        for LR := 0 to self.FSavedVector.Count - 1 do
+          self.DoVectorMove(LBlock, LR, self.FStack, true, self.FFunction.Node);
+        end;
         if self.FFrameReg >= 0 then
           self.DoRealign(LBlock, self.FFunction.Node);
         end;
@@ -2474,7 +2484,15 @@ type
         if (LOld[LI].Op = X64Op.Ret) or (LOld[LI].Op = X64Op.TailJmp) then
           // The epilogue: the prologue undone in reverse (a realigned frame releases off its
           // frame register, the one release form unwind data allows with one); a tail call's
-          // jump leaves through it as a ret does
+          // jump leaves through it as a ret does. The vector saves come back first (off the
+          // frame register in a realigned frame: the stack pointer was rounded)
+          for LR := self.FSavedVector.Count - 1 downto 0 do
+            if self.FFrameReg >= 0 then
+              self.DoVectorMove(LBlock, LR, self.FFrameReg, false, LOld[LI].Node);
+            else
+              self.DoVectorMove(LBlock, LR, self.FStack, false, LOld[LI].Node);
+            end;
+          end;
           if self.FFrameReg >= 0 then
             self.DoRelease(LBlock, LOld[LI].Node);
           end;
@@ -2512,6 +2530,29 @@ type
       LInstr := ref MachineInstr(AOp, 0, ANode);
       LInstr.AddOperand(PhysicalOperand(AReg));
       LInstr.Prologue := APrologue;
+      ABlock.AddInstr(LInstr);
+    end;
+
+    // The save (in the prologue: movaps [base + VectorBase + 16 * AK], xmm) or the restore
+    // (before a ret: movaps xmm, [base + ...]) of the AK-th saved vector register, off ABase
+    // (the stack pointer, or a realigned frame's frame register), at the end of ABlock
+    hidden method DoVectorMove(const ABlock: ref MachineBlock; const AK: int64;
+      const ABase: int64; const ASave: bool; const ANode: int64);
+    var
+      LInstr: ref MachineInstr;
+      LPlace: ref MachineOperand;
+    begin
+      LPlace := RegisterMemory(ABase, false, self.FFrame.VectorBase +
+        AK * ADAM_X64_ALLOC_VECTOR_SAVE_BYTES);
+      LInstr := ref MachineInstr(X64Op.MovAps, 0, ANode);
+      if ASave then
+        LInstr.AddOperand(LPlace);
+        LInstr.AddOperand(PhysicalOperand(self.FSavedVector[AK]));
+      else
+        LInstr.AddOperand(PhysicalOperand(self.FSavedVector[AK]));
+        LInstr.AddOperand(LPlace);
+      end;
+      LInstr.Prologue := ASave;
       ABlock.AddInstr(LInstr);
     end;
 

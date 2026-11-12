@@ -60,6 +60,8 @@ public const
   ADAM_X64_MACHINE_FAULT_NO_OPERAND: string = "X64 machine: no operand ";
   ADAM_X64_MACHINE_FAULT_NO_VREG: string = "X64 machine: no virtual register ";
   ADAM_X64_MACHINE_FAULT_NO_SLOT: string = "X64 machine: no slot ";
+  // A block order that is no permutation of the blocks with the entry first
+  ADAM_X64_MACHINE_FAULT_ORDER: string = "X64 machine: a bad block order: ";
   // A slot the frame cannot hold: a size or an alignment that is no power of two
   ADAM_X64_MACHINE_FAULT_SLOT: string = "X64 machine: a bad slot: ";
 
@@ -114,13 +116,16 @@ public type
   // magic number). Zero writes 0 into its one general register (xor r32, r32: the whole
   // register, no read of its old value) and changes the flags, so selection makes it only
   // where no flags are live. Shl / Shr / Sar also shift by an immediate count (the
-  // hardware masks it as it masks cl)
+  // hardware masks it as it masks cl).
+  // MovAps moves a whole vector register (16 bytes) to or from 16-aligned memory: only the
+  // prologue's saves and the epilogue's restores of the callee-saved vector registers
+  // (Adam.X64.Allocate) make it, over physical registers
   X64Op = choices(Mov, MovD, MovQ, MovSS, MovSD, Lea, Add, Sub, AddSS, AddSD, SubSS, SubSD,
     MulSS, MulSD, DivSS, DivSD, XorPS, UComiSS, UComiSD, CvtSI2SS, CvtSI2SD, CvtTSS2SI,
     CvtTSD2SI, CvtSS2SD, CvtSD2SS, Test, Jcc, Jmp, Call, Ret, MovSX8, MovSX16, MovSXD, MovZX8,
     MovZX16, IMul, BitAnd, BitOr, BitXor, Neg, BitNot, Shl, Shr, Sar, Cqo, IDiv, UDiv, Cmp,
     SetCC, Push, Pop, RepMovsb, RepStosb, LockXadd, Xchg, LockCmpxchg, Nop, Ud2, TailJmp,
-    CMov, IMulWide, MulWide, Zero);
+    CMov, IMulWide, MulWide, Zero, MovAps);
 
   // A condition Jcc and SetCC test, in the encoding's order (the low nibble of 0F 80..8F and
   // of 0F 90..9F)
@@ -204,6 +209,7 @@ begin
     X64Op.IMulWide: return "imul wide";
     X64Op.MulWide: return "mul wide";
     X64Op.Zero: return "zero";
+    X64Op.MovAps: return "movaps";
   end;
   return "";
 end;
@@ -331,6 +337,12 @@ begin
     X64OpIsCombine(AOp) or X64OpIsUnary(AOp) or (AOp = X64Op.Cqo) or X64OpIsDivide(AOp) or
     (AOp = X64Op.Cmp) or X64OpIsIntConvert(AOp) or X64OpIsAtomic(AOp) or (AOp = X64Op.CMov) or
     X64OpIsWideMul(AOp);
+end;
+
+// True for the ops that close a block: a jump, a ret, a tail call's jump, ud2
+public routine X64OpCloses(const AOp: X64Op): bool;
+begin
+  return (AOp = X64Op.Jmp) or (AOp = X64Op.Ret) or (AOp = X64Op.TailJmp) or (AOp = X64Op.Ud2);
 end;
 
 public type
@@ -603,6 +615,16 @@ public type
       self.FOperands[self.FCount] := AOperand;
       self.FCount := self.FCount + 1;
     end;
+
+    // Operand AIndex replaced by AOperand (layout retargets a jump, Adam.X64.Layout);
+    // raises outside the operands
+    method SetOperand(const AIndex: int64; const AOperand: ref MachineOperand);
+    begin
+      if (AIndex < 0) or (AIndex >= self.FCount) then
+        raise(ADAM_X64_MACHINE_FAULT_NO_OPERAND + IntToStr(AIndex));
+      end;
+      self.FOperands[AIndex] := AOperand;
+    end;
   end;
 
   // Instructions in order (see the header)
@@ -612,6 +634,9 @@ public type
     // An edge block: the SSA edge it sits on, from and to (0 otherwise)
     EdgeFrom: int64;
     EdgeTo: int64;
+    // The alignment the block starts at (0: none): the encoder pads the code before it with
+    // nops (a loop header at fast, Adam.X64.Layout)
+    Align: int64;
     hidden FInstrs: array of ref MachineInstr;
     hidden FCount: int64;
 
@@ -620,6 +645,7 @@ public type
       self.Source := ASource;
       self.EdgeFrom := 0;
       self.EdgeTo := 0;
+      self.Align := 0;
       self.FCount := 0;
     end;
 
@@ -649,6 +675,22 @@ public type
     begin
       setlength(self.FInstrs, 0);
       self.FCount := 0;
+    end;
+
+    // Instruction AIndex taken out, the ones after it moved up (layout's cleanup,
+    // Adam.X64.Layout); raises outside the block
+    method RemoveAt(const AIndex: int64);
+    var
+      LI: int64;
+    begin
+      if (AIndex < 0) or (AIndex >= self.FCount) then
+        raise(ADAM_X64_MACHINE_FAULT_NO_INSTR + IntToStr(AIndex));
+      end;
+      for LI := AIndex to self.FCount - 2 do
+        self.FInstrs[LI] := self.FInstrs[LI + 1];
+      end;
+      self.FCount := self.FCount - 1;
+      self.FInstrs[self.FCount] := nil;
     end;
   end;
 
@@ -712,6 +754,57 @@ public type
         raise(ADAM_X64_MACHINE_FAULT_NO_BLOCK + IntToStr(AIndex));
       end;
       return self.FBlocks[AIndex];
+    end;
+
+    // The blocks put in AOrder (a permutation of the block indices, the entry block first:
+    // AOrder[k] is the block placed k-th), every jump's target block renumbered with them
+    // (layout's block placement, Adam.X64.Layout); raises for an order that is no such
+    // permutation
+    method ReorderBlocks(const AOrder: ref Int64List);
+    var
+      LBlocks: array of ref MachineBlock;
+      LNewOf: array of int64;
+      LBlock: ref MachineBlock;
+      LInstr: ref MachineInstr;
+      LOperand: ref MachineOperand;
+      LB: int64;
+      LI: int64;
+      LK: int64;
+      LO: int64;
+    begin
+      if (AOrder.Count <> self.FBlockCount) or (self.FBlockCount = 0) or
+        (AOrder.Items[0] <> 0) then
+        raise(ADAM_X64_MACHINE_FAULT_ORDER + self.Symbol);
+      end;
+      setlength(LNewOf, self.FBlockCount);
+      for LB := 0 to self.FBlockCount - 1 do
+        LNewOf[LB] := -1;
+      end;
+      for LK := 0 to self.FBlockCount - 1 do
+        LB := AOrder.Items[LK];
+        if (LB < 0) or (LB >= self.FBlockCount) or (LNewOf[LB] >= 0) then
+          raise(ADAM_X64_MACHINE_FAULT_ORDER + self.Symbol);
+        end;
+        LNewOf[LB] := LK;
+      end;
+      setlength(LBlocks, self.FBlockCount);
+      for LK := 0 to self.FBlockCount - 1 do
+        LBlocks[LK] := self.FBlocks[AOrder.Items[LK]];
+      end;
+      for LK := 0 to self.FBlockCount - 1 do
+        self.FBlocks[LK] := LBlocks[LK];
+        LBlock := LBlocks[LK];
+        for LI := 0 to LBlock.InstrCount - 1 do
+          LInstr := LBlock.InstrAt(LI);
+          for LO := 0 to LInstr.OperandCount - 1 do
+            LOperand := LInstr.OperandAt(LO);
+            if LOperand.Kind = OperandKind.BlockRef then
+              // A new operand: an operand object may be shared, never renumbered twice
+              LInstr.SetOperand(LO, BlockOperand(LNewOf[LOperand.Block]));
+            end;
+          end;
+        end;
+      end;
     end;
 
     // A new virtual register of AClass; returns its number
@@ -964,6 +1057,10 @@ public type
       if LBlock.Source = 0 then
         return "m" + IntToStr(AIndex) + " edge b" + IntToStr(LBlock.EdgeFrom) + " -> b" +
           IntToStr(LBlock.EdgeTo) + ":";
+      end;
+      if LBlock.Align > 0 then
+        return "m" + IntToStr(AIndex) + " from b" + IntToStr(LBlock.Source) + " align " +
+          IntToStr(LBlock.Align) + ":";
       end;
       return "m" + IntToStr(AIndex) + " from b" + IntToStr(LBlock.Source) + ":";
     end;
