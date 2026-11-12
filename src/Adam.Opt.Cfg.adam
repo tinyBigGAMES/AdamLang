@@ -13,7 +13,8 @@
   was not distributed with this file, You can obtain one
   at https://mozilla.org/MPL/2.0/.
 -------------------------------------------------------------------------------
-  Adam.Opt.Cfg.adam - control flow simplification (PLAN-ADAM M6 O7)
+  Adam.Opt.Cfg.adam - control flow simplification (PLAN-ADAM M6 O7), jump
+  threading and tail merging (O16)
 
   SimplifyControlFlow reshapes one function's blocks, in rounds until a round
   changes nothing; each step makes its own graph of the blocks as they stand
@@ -51,6 +52,40 @@
   list (the module keeps them unused); a moved instruction takes its new
   block. Phis are only ever this function's: a funclet uses its parent's
   slots alone, so no other function's operand changes.
+
+  ThreadJumps (jumpthread, every release level, after the simplifycfg that
+  follows the loop passes) moves edges, it copies no code: a block B that
+  is only phis, at most one compare and a branch deciding on one of its phis
+  (the phi itself, or the phi against a constant), whose values are used in
+  B alone or by its targets' phis on the edges from B, is no loop header,
+  no resume target and not the entry; a predecessor P whose value of that
+  phi is a constant knows the arm B takes (the compare folded exact to the
+  machine: IrFoldCompare, sccp's own), so P jumps straight to that arm T:
+  T's phis take from P what they took from B (a phi of B: its value from
+  P), B's phis lose P's values. Skipped when P already runs into T (two
+  edges to one phi), when T is B or a resume target. A block a round
+  changed (P, T) waits for the next round, made over a fresh analysis
+  (ADAM_CFG_THREAD_ROUNDS at most). A loop header never threads, so no
+  edge enters a loop past its header (the graph stays reducible). B, left
+  with fewer predecessors (or none), is the last simplifycfg's to drop.
+
+  MergeTails (tailmerge, small only, after adce, before tailcall marks a
+  call) cross-jumps equal tails: blocks ending in terminators of one shape
+  (kind, operand count, targets; none targeting either block) are compared
+  from their ends, instruction by instruction (kind, type, immediates,
+  link, predicate, targets; an operand the same value from outside both
+  blocks, or the instructions at the same distance inside the tail; no
+  phi or entry value in a tail); the tail's successors' phis must take the
+  same value from both. A tail of ADAM_CFG_TAIL_LENGTH instructions merges
+  into a block that is wholly that tail (no phis, not the entry, no resume
+  target), else of ADAM_CFG_TAIL_SPLIT_LENGTH into a new block after the
+  kept one (IrModule.InsertBlock: its scopes, every later position moved)
+  that takes its tail, the kept block jumping to it; the other block keeps
+  what came before its tail and jumps there too, the successors' phis
+  dropping its entries. Both blocks are in the same scopes (a tail that may
+  raise unwinds to the same place). Each terminator shape keeps up to
+  ADAM_CFG_TAIL_CANDIDATES blocks to compare against; rounds until one
+  merges nothing.
 *******************************************************************************/
 
 module unit Adam.Opt.Cfg;
@@ -61,6 +96,14 @@ const
   // No block / no instruction (a map's missing value), and a block id's mark in a set
   ADAM_CFG_NONE: int64 = -1;
   ADAM_CFG_GONE: int64 = 1;
+  // jumpthread: its rounds at most (each over a fresh analysis)
+  ADAM_CFG_THREAD_ROUNDS: int64 = 8;
+  // tailmerge: the shortest tail worth a jump into a block that is wholly it, the
+  // shortest worth a new block (its own jump more), and the blocks each terminator shape
+  // keeps to compare against
+  ADAM_CFG_TAIL_LENGTH: int64 = 2;
+  ADAM_CFG_TAIL_SPLIT_LENGTH: int64 = 3;
+  ADAM_CFG_TAIL_CANDIDATES: int64 = 16;
   // Raised (an invariant broken): a terminator target no block of the function, a kept
   // scope whose resume block went, a merged block's phi without exactly one value, a chain
   // of one-value phis that runs round to itself
@@ -76,6 +119,7 @@ type
   // One function's control flow simplification (see the header)
   ControlFlowSimplifier = object
     hidden FModule: ref IrModule;
+    hidden FFunctionId: int64;
     hidden FFunction: ref IrFunction;
     // The graph of the blocks as they stand (DoGraph): how many, each block id's
     // position, each position's predecessors (each once, in block order; a catching
@@ -91,6 +135,7 @@ type
     init(const AModule: ref IrModule; const AFunction: int64);
     begin
       self.FModule := AModule;
+      self.FFunctionId := AFunction;
       self.FFunction := AModule.FunctionAt(AFunction);
       self.FCount := 0;
       self.FPositionOf := ref Int64Map(ADAM_CFG_NONE);
@@ -778,6 +823,696 @@ type
       return LChanged;
     end;
 
+    // jumpthread: true when the block at position APosition heads a loop of AAnalysis
+    hidden const method DoIsLoopHeader(const AAnalysis: ref FunctionAnalysis;
+      const APosition: int64): bool;
+    var
+      LK: int64;
+    begin
+      for LK := 0 to AAnalysis.LoopCount() - 1 do
+        if AAnalysis.LoopHeader(LK) = APosition then
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // jumpthread: true when every use AAnalysis knows of the value AValue (an instruction
+    // of the block ABlock, an id) is in ABlock, or is a phi of one of the blocks ATargets
+    // (ids) taking it on the edge from ABlock
+    hidden const method DoUsedOnlyThere(const AAnalysis: ref FunctionAnalysis;
+      const AValue: int64; const ABlock: int64; const ATargets: ref Int64List): bool;
+    var
+      LUses: ref Int64List;
+      LUse: ref IrInstr;
+      LK: int64;
+      LE: int64;
+    begin
+      LUses := AAnalysis.UsesOf(AValue);
+      for LK := 0 to LUses.Count - 1 do
+        LUse := self.FModule.InstrAt(LUses[LK]);
+        if LUse.Block = ABlock then
+          skip;
+        end;
+        if (LUse.Kind <> IrOp.Phi) or (ATargets.IndexOf(LUse.Block) < 0) then
+          return false;
+        end;
+        for LE := 0 to LUse.Operands.Count - 1 do
+          if (LUse.Operands[LE] = AValue) and (LUse.Targets[LE] <> ABlock) then
+            return false;
+          end;
+        end;
+      end;
+      return true;
+    end;
+
+    // jumpthread: true when the value AValue is a phi of the block ABlock (an id)
+    hidden const method DoIsPhiOf(const AValue: int64; const ABlock: int64): bool;
+    var
+      LInstr: ref IrInstr;
+    begin
+      LInstr := self.FModule.InstrAt(AValue);
+      return (LInstr.Kind = IrOp.Phi) and (LInstr.Block = ABlock);
+    end;
+
+    // jumpthread: true when the block at position APosition has the shape it threads (see
+    // the header): APhi the phi its branch decides on, ACompare the compare of it with a
+    // constant the branch reads (ADAM_CFG_NONE: the branch reads the phi itself)
+    hidden const method DoThreadShape(const AAnalysis: ref FunctionAnalysis;
+      const APosition: int64; var APhi: int64; var ACompare: int64): bool;
+    var
+      LInstrs: ref Int64List;
+      LBranch: ref IrInstr;
+      LCondition: ref IrInstr;
+      LUses: ref Int64List;
+      LBlockId: int64;
+      LTerm: int64;
+      LOthers: int64;
+      LK: int64;
+    begin
+      APhi := ADAM_CFG_NONE;
+      ACompare := ADAM_CFG_NONE;
+      LBlockId := self.FFunction.Blocks[APosition];
+      LTerm := self.DoTerminatorOf(LBlockId);
+      if LTerm = ADAM_CFG_NONE then
+        return false;
+      end;
+      LBranch := self.FModule.InstrAt(LTerm);
+      if (LBranch.Kind <> IrOp.Branch) or (LBranch.Targets[0] = LBranch.Targets[1]) then
+        return false;
+      end;
+      // Phis, then at most one other instruction (the compare) before the branch
+      LInstrs := self.FModule.BlockAt(LBlockId).Instrs;
+      LOthers := 0;
+      for LK := 0 to LInstrs.Count - 2 do
+        if self.FModule.InstrAt(LInstrs[LK]).Kind <> IrOp.Phi then
+          LOthers := LOthers + 1;
+        end;
+      end;
+      LCondition := self.FModule.InstrAt(LBranch.Operands[0]);
+      if LCondition.Block <> LBlockId then
+        return false;
+      end;
+      if LCondition.Kind = IrOp.Phi then
+        if LOthers <> 0 then
+          return false;
+        end;
+        APhi := LBranch.Operands[0];
+      else
+        if (LCondition.Kind <> IrOp.Compare) or (LOthers <> 1) then
+          return false;
+        end;
+        // One side a phi of this block, the other a constant
+        if self.DoIsPhiOf(LCondition.Operands[0], LBlockId) and
+          (self.FModule.InstrAt(LCondition.Operands[1]).Kind = IrOp.Constant) then
+          APhi := LCondition.Operands[0];
+        else
+          if self.DoIsPhiOf(LCondition.Operands[1], LBlockId) and
+            (self.FModule.InstrAt(LCondition.Operands[0]).Kind = IrOp.Constant) then
+            APhi := LCondition.Operands[1];
+          else
+            return false;
+          end;
+        end;
+        ACompare := LBranch.Operands[0];
+        // The compare read by the branch alone
+        LUses := AAnalysis.UsesOf(ACompare);
+        for LK := 0 to LUses.Count - 1 do
+          if self.FModule.InstrAt(LUses[LK]).Block <> LBlockId then
+            return false;
+          end;
+        end;
+      end;
+      // Every phi used in the block, or by its targets' phis on the edges from it
+      for LK := 0 to LInstrs.Count - 2 do
+        if self.FModule.InstrAt(LInstrs[LK]).Kind = IrOp.Phi then
+          if not self.DoUsedOnlyThere(AAnalysis, LInstrs[LK], LBlockId, LBranch.Targets) then
+            return false;
+          end;
+        end;
+      end;
+      return true;
+    end;
+
+    // jumpthread: the arm (a block id) ABranch takes when its block is entered from the
+    // block APred (an id), APhi and ACompare as DoThreadShape gave them; ADAM_CFG_NONE when
+    // the phi's value on that edge is no constant
+    hidden const method DoThreadTarget(const ABranch: ref IrInstr; const APhi: int64;
+      const ACompare: int64; const APred: int64): int64;
+    var
+      LPhi: ref IrInstr;
+      LValue: ref IrInstr;
+      LCompare: ref IrInstr;
+      LEntry: int64;
+      LTruth: int64;
+    begin
+      LPhi := self.FModule.InstrAt(APhi);
+      LEntry := LPhi.Targets.IndexOf(APred);
+      if LEntry < 0 then
+        return ADAM_CFG_NONE;
+      end;
+      LValue := self.FModule.InstrAt(LPhi.Operands[LEntry]);
+      if LValue.Kind <> IrOp.Constant then
+        return ADAM_CFG_NONE;
+      end;
+      if ACompare = ADAM_CFG_NONE then
+        // A bool constant is 0 / 1
+        LTruth := LValue.Imm;
+      else
+        LCompare := self.FModule.InstrAt(ACompare);
+        if LCompare.Operands[0] = APhi then
+          LTruth := IrFoldCompare(LCompare.Predicate, LPhi.ValueType, LValue.Imm,
+            self.FModule.InstrAt(LCompare.Operands[1]).Imm);
+        else
+          LTruth := IrFoldCompare(LCompare.Predicate, LPhi.ValueType,
+            self.FModule.InstrAt(LCompare.Operands[0]).Imm, LValue.Imm);
+        end;
+      end;
+      if LTruth <> 0 then
+        return ABranch.Targets[0];
+      end;
+      return ABranch.Targets[1];
+    end;
+
+    // jumpthread: the edge from the block APred to the block ABlock (ids) moved to ATarget,
+    // the arm ABlock's branch takes on it: APred's terminator goes to ATarget, ATarget's
+    // phis take from APred what they took from ABlock (a phi of ABlock: its value from
+    // APred), ABlock's phis lose APred's values
+    hidden method DoThreadEdge(const APred: int64; const ABlock: int64; const ATarget: int64);
+    var
+      LTerminator: ref IrInstr;
+      LInstrs: ref Int64List;
+      LPhi: ref IrInstr;
+      LSource: ref IrInstr;
+      LGone: ref Int64Map;
+      LValue: int64;
+      LEntry: int64;
+      LK: int64;
+    begin
+      LTerminator := self.FModule.InstrAt(self.DoTerminatorOf(APred));
+      for LK := 0 to LTerminator.Targets.Count - 1 do
+        if LTerminator.Targets[LK] = ABlock then
+          LTerminator.Targets.Put(LK, ATarget);
+        end;
+      end;
+      // ATarget's phis first: they read ABlock's phis' values from APred
+      LInstrs := self.FModule.BlockAt(ATarget).Instrs;
+      for LK := 0 to LInstrs.Count - 1 do
+        LPhi := self.FModule.InstrAt(LInstrs[LK]);
+        if LPhi.Kind <> IrOp.Phi then
+          skip;
+        end;
+        LEntry := LPhi.Targets.IndexOf(ABlock);
+        if LEntry < 0 then
+          skip;
+        end;
+        LValue := LPhi.Operands[LEntry];
+        LSource := self.FModule.InstrAt(LValue);
+        if (LSource.Kind = IrOp.Phi) and (LSource.Block = ABlock) then
+          LValue := LSource.Operands[LSource.Targets.IndexOf(APred)];
+        end;
+        LPhi.Operands.Add(LValue);
+        LPhi.Targets.Add(APred);
+      end;
+      LGone := ref Int64Map(ADAM_CFG_NONE);
+      LGone.Put(APred, ADAM_CFG_GONE);
+      self.DoTrimPhis(ABlock, LGone);
+    end;
+
+    // jumpthread: one round over the graph as it stands and AAnalysis made over it (see
+    // the header); true when an edge moved
+    hidden method DoThreadRound(const AAnalysis: ref FunctionAnalysis): bool;
+    var
+      LBlocks: ref Int64List;
+      LTouched: BoolArray;
+      LPreds: ref Int64List;
+      LBranch: ref IrInstr;
+      LPredTerm: ref IrInstr;
+      LChanged: bool;
+      LBlockId: int64;
+      LPredId: int64;
+      LPhi: int64;
+      LCompare: int64;
+      LPredEnd: int64;
+      LTo: int64;
+      LToAt: int64;
+      LPred: int64;
+      LB: int64;
+      LK: int64;
+    begin
+      self.DoGraph();
+      LBlocks := self.FFunction.Blocks;
+      setlength(LTouched, self.FCount);
+      for LB := 0 to self.FCount - 1 do
+        LTouched[LB] := false;
+      end;
+      LChanged := false;
+      // The entry (position 0) is never threaded through
+      for LB := 1 to self.FCount - 1 do
+        if (not self.FReached[LB]) or self.FResume[LB] or LTouched[LB] then
+          skip;
+        end;
+        if self.DoIsLoopHeader(AAnalysis, LB) then
+          skip;
+        end;
+        if not self.DoThreadShape(AAnalysis, LB, LPhi, LCompare) then
+          skip;
+        end;
+        LBlockId := LBlocks[LB];
+        LBranch := self.FModule.InstrAt(self.DoTerminatorOf(LBlockId));
+        LPreds := self.FPreds[LB];
+        for LK := 0 to LPreds.Count - 1 do
+          LPred := LPreds[LK];
+          if (LPred = LB) or (not self.FReached[LPred]) or LTouched[LPred] then
+            skip;
+          end;
+          LPredId := LBlocks[LPred];
+          LPredEnd := self.DoTerminatorOf(LPredId);
+          if LPredEnd = ADAM_CFG_NONE then
+            skip;
+          end;
+          LPredTerm := self.FModule.InstrAt(LPredEnd);
+          if LPredTerm.Targets.IndexOf(LBlockId) < 0 then
+            skip;
+          end;
+          LTo := self.DoThreadTarget(LBranch, LPhi, LCompare, LPredId);
+          if (LTo = ADAM_CFG_NONE) or (LTo = LBlockId) then
+            skip;
+          end;
+          LToAt := self.FPositionOf.Find(LTo);
+          // Two edges from one block into a phi's block cannot carry two values
+          if self.FResume[LToAt] or (LPredTerm.Targets.IndexOf(LTo) >= 0) then
+            skip;
+          end;
+          self.DoThreadEdge(LPredId, LBlockId, LTo);
+          LTouched[LPred] := true;
+          LTouched[LToAt] := true;
+          LTouched[LB] := true;
+          LChanged := true;
+        end;
+      end;
+      return LChanged;
+    end;
+
+    // jumpthread (see the header): rounds until one moves no edge, the first over
+    // AAnalysis, each later one over a fresh analysis; true when it changed the function
+    method RunThreading(const AAnalysis: ref FunctionAnalysis): bool;
+    var
+      LAnalysis: ref FunctionAnalysis;
+      LChanged: bool;
+      LRound: int64;
+    begin
+      LChanged := false;
+      LAnalysis := AAnalysis;
+      for LRound := 1 to ADAM_CFG_THREAD_ROUNDS do
+        if LRound > 1 then
+          LAnalysis := ref FunctionAnalysis(self.FModule, self.FFunctionId);
+        end;
+        if not self.DoThreadRound(LAnalysis) then
+          leave;
+        end;
+        LChanged := true;
+      end;
+      return LChanged;
+    end;
+
+    // tailmerge: true for the kinds a tail never holds (a block's head: its phis; the
+    // entry's own values)
+    hidden const method DoTailBarrier(const AKind: IrOp): bool;
+    begin
+      return (AKind = IrOp.Phi) or (AKind = IrOp.Slot) or (AKind = IrOp.Parameter) or
+        (AKind = IrOp.VarargsStart);
+    end;
+
+    // tailmerge: true when the instructions AOne and AOther do the same, their operands
+    // aside (the caller pairs those): kind, type, immediates, link, predicate, tail mark,
+    // operand count, targets
+    hidden const method DoSameShape(const AOne: ref IrInstr; const AOther: ref IrInstr): bool;
+    var
+      LK: int64;
+    begin
+      if (AOne.Kind <> AOther.Kind) or (AOne.ValueType <> AOther.ValueType) or
+        (AOne.Imm <> AOther.Imm) or (AOne.Align <> AOther.Align) or
+        (AOne.Link <> AOther.Link) or (AOne.Predicate <> AOther.Predicate) or
+        (AOne.Tail <> AOther.Tail) then
+        return false;
+      end;
+      if (AOne.Operands.Count <> AOther.Operands.Count) or
+        (AOne.Targets.Count <> AOther.Targets.Count) then
+        return false;
+      end;
+      for LK := 0 to AOne.Targets.Count - 1 do
+        if AOne.Targets[LK] <> AOther.Targets[LK] then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    // tailmerge: each instruction of the block ABlock (an id) mapped to its distance from
+    // the block's end (its terminator 0)
+    hidden const method DoDistances(const ABlock: int64): ref Int64Map;
+    var
+      LInstrs: ref Int64List;
+      LMap: ref Int64Map;
+      LK: int64;
+    begin
+      LInstrs := self.FModule.BlockAt(ABlock).Instrs;
+      LMap := ref Int64Map(ADAM_CFG_NONE);
+      for LK := 0 to LInstrs.Count - 1 do
+        LMap.Put(LInstrs[LK], LInstrs.Count - 1 - LK);
+      end;
+      return LMap;
+    end;
+
+    // tailmerge: true when the operands AOne (of the block AOneAt measures) and AOther (of
+    // the block AOtherAt measures) are one value in a tail of ALength: the same value from
+    // outside both blocks, or the instructions at the same distance inside the tail
+    hidden const method DoSameOperand(const AOne: int64; const AOther: int64;
+      const AOneAt: ref Int64Map; const AOtherAt: ref Int64Map; const ALength: int64): bool;
+    var
+      LOne: int64;
+      LOther: int64;
+    begin
+      LOne := AOneAt.Find(AOne);
+      LOther := AOtherAt.Find(AOther);
+      if (LOne = ADAM_CFG_NONE) and (LOther = ADAM_CFG_NONE) then
+        return AOne = AOther;
+      end;
+      return (LOne = LOther) and (LOne < ALength);
+    end;
+
+    // tailmerge: the first distance (from the end) below ALength whose instructions of the
+    // blocks AOne and AOther (ids) have an operand pair that is not one value in a tail of
+    // ALength; ALength when every pair is
+    hidden const method DoFirstBroken(const AOne: int64; const AOther: int64;
+      const AOneAt: ref Int64Map; const AOtherAt: ref Int64Map; const ALength: int64): int64;
+    var
+      LOneInstrs: ref Int64List;
+      LOtherInstrs: ref Int64List;
+      LOne: ref IrInstr;
+      LOther: ref IrInstr;
+      LI: int64;
+      LK: int64;
+    begin
+      LOneInstrs := self.FModule.BlockAt(AOne).Instrs;
+      LOtherInstrs := self.FModule.BlockAt(AOther).Instrs;
+      for LI := 0 to ALength - 1 do
+        LOne := self.FModule.InstrAt(LOneInstrs[LOneInstrs.Count - 1 - LI]);
+        LOther := self.FModule.InstrAt(LOtherInstrs[LOtherInstrs.Count - 1 - LI]);
+        for LK := 0 to LOne.Operands.Count - 1 do
+          if not self.DoSameOperand(LOne.Operands[LK], LOther.Operands[LK], AOneAt, AOtherAt,
+            ALength) then
+            return LI;
+          end;
+        end;
+      end;
+      return ALength;
+    end;
+
+    // tailmerge: the length of the tail the blocks AOne and AOther (ids, terminators of one
+    // shape) share (see the header); 0 when their successors' phis take different values
+    // from them
+    hidden const method DoCommonTail(const AOne: int64; const AOther: int64): int64;
+    var
+      LOneInstrs: ref Int64List;
+      LOtherInstrs: ref Int64List;
+      LOneAt: ref Int64Map;
+      LOtherAt: ref Int64Map;
+      LOne: ref IrInstr;
+      LOther: ref IrInstr;
+      LEnd: ref IrInstr;
+      LTargetInstrs: ref Int64List;
+      LPhi: ref IrInstr;
+      LLength: int64;
+      LMost: int64;
+      LBroken: int64;
+      LGoing: bool;
+      LK: int64;
+      LE: int64;
+    begin
+      LOneInstrs := self.FModule.BlockAt(AOne).Instrs;
+      LOtherInstrs := self.FModule.BlockAt(AOther).Instrs;
+      LOneAt := self.DoDistances(AOne);
+      LOtherAt := self.DoDistances(AOther);
+      LMost := LOneInstrs.Count;
+      if LOtherInstrs.Count < LMost then
+        LMost := LOtherInstrs.Count;
+      end;
+      // The longest run of same-shaped instructions from the ends, operands paired as
+      // they would be in a tail of the most both blocks could share
+      LLength := 0;
+      LGoing := true;
+      while LGoing and (LLength < LMost) do
+        LOne := self.FModule.InstrAt(LOneInstrs[LOneInstrs.Count - 1 - LLength]);
+        LOther := self.FModule.InstrAt(LOtherInstrs[LOtherInstrs.Count - 1 - LLength]);
+        if self.DoTailBarrier(LOne.Kind) or self.DoTailBarrier(LOther.Kind) or
+          (not self.DoSameShape(LOne, LOther)) then
+          LGoing := false;
+        else
+          for LK := 0 to LOne.Operands.Count - 1 do
+            if not self.DoSameOperand(LOne.Operands[LK], LOther.Operands[LK], LOneAt,
+              LOtherAt, LMost) then
+              LGoing := false;
+            end;
+          end;
+          if LGoing then
+            LLength := LLength + 1;
+          end;
+        end;
+      end;
+      // Shortened until no operand inside it reaches an instruction outside it
+      LBroken := self.DoFirstBroken(AOne, AOther, LOneAt, LOtherAt, LLength);
+      while LBroken < LLength do
+        LLength := LBroken;
+        LBroken := self.DoFirstBroken(AOne, AOther, LOneAt, LOtherAt, LLength);
+      end;
+      if LLength = 0 then
+        return 0;
+      end;
+      // The successors' phis take one value from both
+      LEnd := self.FModule.InstrAt(LOneInstrs[LOneInstrs.Count - 1]);
+      for LK := 0 to LEnd.Targets.Count - 1 do
+        LTargetInstrs := self.FModule.BlockAt(LEnd.Targets[LK]).Instrs;
+        for LE := 0 to LTargetInstrs.Count - 1 do
+          LPhi := self.FModule.InstrAt(LTargetInstrs[LE]);
+          if LPhi.Kind <> IrOp.Phi then
+            skip;
+          end;
+          if not self.DoSameOperand(LPhi.Operands[LPhi.Targets.IndexOf(AOne)],
+            LPhi.Operands[LPhi.Targets.IndexOf(AOther)], LOneAt, LOtherAt, LLength) then
+            return 0;
+          end;
+        end;
+      end;
+      return LLength;
+    end;
+
+    // tailmerge: the shape key of the terminator ATerminator (kind, operand count, targets)
+    hidden const method DoTailKey(const ATerminator: ref IrInstr): string;
+    var
+      LKey: string;
+      LK: int64;
+    begin
+      LKey := IrOpText(ATerminator.Kind) + " " + IntToStr(ATerminator.Operands.Count);
+      for LK := 0 to ATerminator.Targets.Count - 1 do
+        LKey := LKey + " b" + IntToStr(ATerminator.Targets[LK]);
+      end;
+      return LKey;
+    end;
+
+    // tailmerge: each block id of the function mapped to its position as it stands
+    hidden const method DoPositionMap(): ref Int64Map;
+    var
+      LMap: ref Int64Map;
+      LI: int64;
+    begin
+      LMap := ref Int64Map(ADAM_CFG_NONE);
+      for LI := 0 to self.FFunction.Blocks.Count - 1 do
+        LMap.Put(self.FFunction.Blocks[LI], LI);
+      end;
+      return LMap;
+    end;
+
+    // tailmerge: the last ALength instructions of the block ADup traded for a jump to the
+    // block holding AKeep's same tail (ids): AKeep itself, or when ASplit a new block after
+    // it (at AKeepAt) taking its tail, AKeep jumping to it and the tail's successors' phis
+    // taking from it what they took from AKeep; the successors' phis lose ADup's entries;
+    // returns the tail's block
+    hidden method DoMergeTail(const ADup: int64; const AKeep: int64; const ALength: int64;
+      const AKeepAt: int64; const ASplit: bool): int64;
+    var
+      LKeep: ref IrBlock;
+      LDup: ref IrBlock;
+      LTail: ref IrBlock;
+      LEnd: ref IrInstr;
+      LKept: ref Int64List;
+      LGone: ref Int64Map;
+      LTailId: int64;
+      LCut: int64;
+      LNode: int64;
+      LJump: int64;
+      LId: int64;
+      LK: int64;
+    begin
+      LKeep := self.FModule.BlockAt(AKeep);
+      LDup := self.FModule.BlockAt(ADup);
+      LEnd := self.FModule.InstrAt(LKeep.Instrs[LKeep.Instrs.Count - 1]);
+      LTailId := AKeep;
+      if ASplit then
+        LTailId := self.FModule.InsertBlock(self.FFunctionId, AKeepAt, false);
+        LTail := self.FModule.BlockAt(LTailId);
+        LCut := LKeep.Instrs.Count - ALength;
+        LKept := ref Int64List();
+        for LK := 0 to LCut - 1 do
+          LKept.Add(LKeep.Instrs[LK]);
+        end;
+        for LK := LCut to LKeep.Instrs.Count - 1 do
+          LId := LKeep.Instrs[LK];
+          self.FModule.InstrAt(LId).Block := LTailId;
+          LTail.Instrs.Add(LId);
+        end;
+        LKeep.Instrs := LKept;
+        LNode := self.FModule.InstrAt(LTail.Instrs[0]).Node;
+        LJump := self.FModule.Emit(AKeep, IrOp.Jump, IrType.Void, LNode);
+        self.FModule.InstrAt(LJump).Targets.Add(LTailId);
+        for LK := 0 to LEnd.Targets.Count - 1 do
+          self.DoRenamePhiSource(LEnd.Targets[LK], AKeep, LTailId);
+        end;
+      end;
+      // The other block keeps what came before its tail, then jumps to the tail's block
+      LCut := LDup.Instrs.Count - ALength;
+      LNode := self.FModule.InstrAt(LDup.Instrs[LCut]).Node;
+      LKept := ref Int64List();
+      for LK := 0 to LCut - 1 do
+        LKept.Add(LDup.Instrs[LK]);
+      end;
+      LDup.Instrs := LKept;
+      LJump := self.FModule.Emit(ADup, IrOp.Jump, IrType.Void, LNode);
+      self.FModule.InstrAt(LJump).Targets.Add(LTailId);
+      LGone := ref Int64Map(ADAM_CFG_NONE);
+      LGone.Put(ADup, ADAM_CFG_GONE);
+      for LK := 0 to LEnd.Targets.Count - 1 do
+        self.DoTrimPhis(LEnd.Targets[LK], LGone);
+      end;
+      return LTailId;
+    end;
+
+    // tailmerge: one round over the blocks as they stand (see the header); true when a
+    // tail merged
+    hidden method DoTailRound(): bool;
+    var
+      LBlocks: ref Int64List;
+      LBucketOf: ref StringIdMap;
+      LBuckets: BlockPositionLists;
+      LCandidates: ref Int64List;
+      LPosition: ref Int64Map;
+      LResumes: ref Int64Map;
+      LTerminator: ref IrInstr;
+      LChanged: bool;
+      LMerged: bool;
+      LSplit: bool;
+      LKey: string;
+      LEntry: int64;
+      LBucket: int64;
+      LBucketCount: int64;
+      LId: int64;
+      LKeep: int64;
+      LTerm: int64;
+      LLength: int64;
+      LNeed: int64;
+      LTail: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      self.DoGraph();
+      // The list as the round began: a new block replaces the function's list, this one
+      // stays the round's order
+      LBlocks := self.FFunction.Blocks;
+      LEntry := LBlocks[0];
+      LResumes := ref Int64Map(ADAM_CFG_NONE);
+      for LI := 0 to self.FCount - 1 do
+        if self.FResume[LI] then
+          LResumes.Put(LBlocks[LI], ADAM_CFG_GONE);
+        end;
+      end;
+      LPosition := self.DoPositionMap();
+      LBucketOf := ref StringIdMap();
+      setlength(LBuckets, self.FCount);
+      LBucketCount := 0;
+      LChanged := false;
+      for LI := 0 to self.FCount - 1 do
+        LId := LBlocks[LI];
+        if not self.FReached[LI] then
+          skip;
+        end;
+        LTerm := self.DoTerminatorOf(LId);
+        if LTerm = ADAM_CFG_NONE then
+          skip;
+        end;
+        LTerminator := self.FModule.InstrAt(LTerm);
+        if LTerminator.Targets.IndexOf(LId) >= 0 then
+          skip;
+        end;
+        LKey := self.DoTailKey(LTerminator);
+        LBucket := LBucketOf.Find(LKey);
+        if LBucket = 0 then
+          LBuckets[LBucketCount] := ref Int64List();
+          LBucketCount := LBucketCount + 1;
+          LBucket := LBucketCount;
+          LBucketOf.Put(LKey, LBucket);
+        end;
+        LCandidates := LBuckets[LBucket - 1];
+        LMerged := false;
+        for LK := 0 to LCandidates.Count - 1 do
+          LKeep := LCandidates[LK];
+          if LTerminator.Targets.IndexOf(LKeep) >= 0 then
+            skip;
+          end;
+          if not self.DoSameScopes(LPosition.Find(LId), LPosition.Find(LKeep)) then
+            skip;
+          end;
+          LLength := self.DoCommonTail(LId, LKeep);
+          // A block wholly the tail takes the jump itself, unless a jump may not enter it
+          LSplit := (LLength < self.FModule.BlockAt(LKeep).Instrs.Count) or (LKeep = LEntry) or
+            (LResumes.Find(LKeep) = ADAM_CFG_GONE);
+          LNeed := ADAM_CFG_TAIL_LENGTH;
+          if LSplit then
+            LNeed := ADAM_CFG_TAIL_SPLIT_LENGTH;
+          end;
+          if LLength < LNeed then
+            skip;
+          end;
+          LTail := self.DoMergeTail(LId, LKeep, LLength, LPosition.Find(LKeep), LSplit);
+          if LSplit then
+            // The new block moved every later position, and it holds the tail now
+            LPosition := self.DoPositionMap();
+            LCandidates.Put(LK, LTail);
+          end;
+          LMerged := true;
+          LChanged := true;
+          leave;
+        end;
+        if (not LMerged) and (LCandidates.Count < ADAM_CFG_TAIL_CANDIDATES) then
+          LCandidates.Add(LId);
+        end;
+      end;
+      return LChanged;
+    end;
+
+    // tailmerge (see the header): rounds until one merges nothing; true when it changed
+    // the function
+    method RunTailMerge(): bool;
+    var
+      LChanged: bool;
+    begin
+      LChanged := false;
+      while self.DoTailRound() do
+        LChanged := true;
+      end;
+      return LChanged;
+    end;
+
     // The simplification (see the header): rounds until one changes nothing; true when
     // it changed the function
     method Run(): bool;
@@ -821,6 +1556,28 @@ var
 begin
   LSimplifier := ref ControlFlowSimplifier(AModule, AFunction);
   return LSimplifier.Run();
+end;
+
+// The pass jumpthread (see the header) over AModule's function AFunction; AAnalysis is
+// its first round's facts (each later round makes its own)
+public routine ThreadJumps(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LSimplifier: ref ControlFlowSimplifier;
+begin
+  LSimplifier := ref ControlFlowSimplifier(AModule, AFunction);
+  return LSimplifier.RunThreading(AAnalysis);
+end;
+
+// The pass tailmerge (see the header) over AModule's function AFunction; AAnalysis is not
+// read (each round makes its own graph of the blocks as they stand)
+public routine MergeTails(const AModule: ref IrModule; const AFunction: int64;
+  const AAnalysis: ref FunctionAnalysis): bool;
+var
+  LSimplifier: ref ControlFlowSimplifier;
+begin
+  LSimplifier := ref ControlFlowSimplifier(AModule, AFunction);
+  return LSimplifier.RunTailMerge();
 end;
 
 end.
