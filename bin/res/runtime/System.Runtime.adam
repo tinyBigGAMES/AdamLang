@@ -1626,10 +1626,13 @@ end;
 
 forward routine ArrRelease(const AArray: ptr; const AElement: ptr to int64);
 forward routine RefRelease(const ABlock: ptr);
+forward routine WeakAddRef(const ABlock: ptr);
+forward routine WeakRelease(const ABlock: ptr);
 
 // The managed values of the value at AAddress released, as its type's managed map AMap
 // places them (see the layout above): a text by StrRelease, a ref by RefRelease (element
-// word 1), a dynamic array by ArrRelease with its element map
+// word 1), a weak by WeakRelease (word 2), a dynamic array by ArrRelease with its element
+// map
 routine ManagedRelease(const AAddress: ptr; const AMap: ptr to int64);
 var
   LBytes: ptr to uint8;
@@ -1651,7 +1654,11 @@ begin
         if LWord = 1 then
           RefRelease(LValue);
         else
-          ArrRelease(LValue, ElementMapAt(AMap, LWord));
+          if LWord = 2 then
+            WeakRelease(LValue);
+          else
+            ArrRelease(LValue, ElementMapAt(AMap, LWord));
+          end;
         end;
       end;
       LAt := LAt + AMap[3 + LRun * 4];
@@ -1691,19 +1698,26 @@ begin
 end;
 
 // One more holder of each managed value of the value at AAddress, as the managed map AMap
-// places them (texts and dynamic arrays count their holders alike: StrAddRef)
+// places them (texts, refs and dynamic arrays count their holders alike: StrAddRef; a weak
+// by WeakAddRef, element word 2)
 routine ManagedAddRef(const AAddress: ptr; const AMap: ptr to int64);
 var
   LBytes: ptr to uint8;
   LRun: int64;
   LAt: int64;
+  LWeak: bool;
   LI: int64;
 begin
   LBytes := ptr to uint8(AAddress);
   for LRun := 0 to AMap[0] - 1 do
     LAt := AMap[1 + LRun * 4];
+    LWeak := AMap[4 + LRun * 4] = 2;
     for LI := 0 to AMap[2 + LRun * 4] - 1 do
-      StrAddRef((ptr to ptr(addr of LBytes[LAt]))^);
+      if LWeak then
+        WeakAddRef((ptr to ptr(addr of LBytes[LAt]))^);
+      else
+        StrAddRef((ptr to ptr(addr of LBytes[LAt]))^);
+      end;
       LAt := LAt + AMap[3 + LRun * 4];
     end;
   end;
@@ -1722,13 +1736,18 @@ begin
 end;
 
 // A ref value is nil or the address of its block: the ref count (int64), the weak count
-// (int64, 0 until weak exists), its type's REF DESCRIPTOR (ptr), then the object, 24 bytes
-// in, zeroed when the block is made and then built by one of its inits. A REF DESCRIPTOR
-// is written by the compiler per object type: the object's size in bytes (int64), its done
-// (a routine on self; nil when the type declares none), then the type's managed map.
-// StrAddRef counts a holder of a ref as of a text; the compiler calls RefNew, RefRelease
-// and RefAssign (AST RuntimeRoutine). In a managed map a run of refs has the element word
-// 1 (an element map's offset never is: the runs come before it)
+// (int64), its type's REF DESCRIPTOR (ptr), then the object, 24 bytes in, zeroed when the
+// block is made and then built by one of its inits. A REF DESCRIPTOR is written by the
+// compiler per object type: the object's size in bytes (int64), its done (a routine on
+// self; nil when the type declares none), then the type's managed map. StrAddRef counts a
+// holder of a ref as of a text; the compiler calls RefNew, RefRelease and RefAssign (AST
+// RuntimeRoutine). In a managed map a run of refs has the element word 1, a run of weaks 2
+// (an element map's offset never is either: the runs come before it).
+// A weak value (BNF sec 4 owner type) is nil or the address of a ref block it watches: the
+// weak count holds one for each weak and one for all the refs together (RefNew's 1, given
+// back by the release that ends the object), so the block is freed by whichever comes
+// last, the object's end or the last weak's release; the object is alive while its ref
+// count is above 0 (WeakAlive), and lock(W) adds a ref only while it is (WeakLock)
 type
   TRefDone = routine(const ASelf: ptr);
 
@@ -1738,7 +1757,8 @@ type
   end;
 
 // A new ref block for the object type whose ref descriptor ADescriptor is: its ref count
-// 1, its object's bytes zeroed for the caller to build
+// 1, its weak count 1 (the refs' own: see the layout above), its object's bytes zeroed for
+// the caller to build
 routine RefNew(const ADescriptor: ptr): ptr;
 var
   LDescriptor: ptr to TRefDescriptor;
@@ -1753,13 +1773,15 @@ begin
   ZeroBytes(LBlock, LSize);
   LHeader := ptr to int64(LBlock);
   LHeader[0] := 1;
+  LHeader[1] := 1;
   LSlots := ptr to ptr(LBlock);
   LSlots[2] := ADescriptor;
   return LBlock;
 end;
 
 // One holder less of the ref ABlock: when it was the last, its object ended (its done,
-// then its managed values: the descriptor's map) and its block freed; nil does nothing
+// then its managed values: the descriptor's map) and the refs' weak count given back
+// (WeakRelease: the block freed unless a weak still watches it); nil does nothing
 routine RefRelease(const ABlock: ptr);
 var
   LHeader: ptr to int64;
@@ -1788,7 +1810,7 @@ begin
     LDone(LObject);
   end;
   ManagedRelease(LObject, ptr to int64(addr of LWords[2]));
-  FreeMem(ABlock);
+  WeakRelease(ABlock);
 end;
 
 // The ref ABlock stored into the ref variable at ASlot: a holder added to ABlock before
@@ -1801,6 +1823,83 @@ begin
   LOld := ASlot^;
   ASlot^ := ABlock;
   RefRelease(LOld);
+end;
+
+// One more weak watching the ref block ABlock (BNF sec 4 weak T); nil does nothing
+routine WeakAddRef(const ABlock: ptr);
+var
+  LHeader: ptr to int64;
+begin
+  if ABlock = nil then
+    return;
+  end;
+  LHeader := ptr to int64(ABlock);
+  atomicadd(LHeader[1], 1);
+end;
+
+// One weak less watching the ref block ABlock (or the refs' own count, from RefRelease):
+// the block freed when it was the last (its object ended already: the refs' count goes
+// only after the end); nil does nothing. The holder whose atomicadd took the count from 1
+// to 0 frees it, on whichever thread it is
+routine WeakRelease(const ABlock: ptr);
+var
+  LHeader: ptr to int64;
+begin
+  if ABlock = nil then
+    return;
+  end;
+  LHeader := ptr to int64(ABlock);
+  if atomicadd(LHeader[1], -1) = 1 then
+    FreeMem(ABlock);
+  end;
+end;
+
+// The ref block ABlock stored into the weak variable at ASlot: a weak added to ABlock
+// before the old value's is released, so storing a variable's own value keeps it
+routine WeakAssign(const ASlot: ptr to ptr; const ABlock: ptr);
+var
+  LOld: ptr;
+begin
+  WeakAddRef(ABlock);
+  LOld := ASlot^;
+  ASlot^ := ABlock;
+  WeakRelease(LOld);
+end;
+
+// alive(W) (BNF sec 7): true while the object the weak ABlock watches still exists (its
+// ref count above 0); nil is never alive
+routine WeakAlive(const ABlock: ptr): bool;
+var
+  LHeader: ptr to int64;
+begin
+  if ABlock = nil then
+    return false;
+  end;
+  LHeader := ptr to int64(ABlock);
+  return atomicload(LHeader[0]) > 0;
+end;
+
+// lock(W) (BNF sec 7): a ref holding the object the weak ABlock watches (its block, one
+// more ref holder the caller owns), nil once the object is gone. The count only grows from
+// a value above 0 (atomiccas), so a release on another thread that takes it to 0 is never
+// undone
+routine WeakLock(const ABlock: ptr): ptr;
+var
+  LHeader: ptr to int64;
+  LCount: int64;
+begin
+  if ABlock = nil then
+    return nil;
+  end;
+  LHeader := ptr to int64(ABlock);
+  LCount := atomicload(LHeader[0]);
+  while LCount > 0 do
+    if atomiccas(LHeader[0], LCount, LCount + 1) then
+      return ABlock;
+    end;
+    LCount := atomicload(LHeader[0]);
+  end;
+  return nil;
 end;
 
 // What an abstract method's vtable slot holds: a call that reaches it (only an abstract
