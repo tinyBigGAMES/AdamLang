@@ -72,10 +72,10 @@
 
 module unit Adam.Compiler.Semantics;
 
-import System.SysUtils, System.IO, Adam.Core.Common, Adam.Core.Messages, Adam.Target,
-  Adam.Compiler.SourceText, Adam.Compiler.Diagnostics, Adam.Compiler.Literals, Adam.Compiler.AST,
-  Adam.Compiler.Scopes, Adam.Compiler.Types, Adam.Compiler.Layout, Adam.Compiler.Folding,
-  Adam.Compiler.Formats;
+import System.SysUtils, System.IO, Adam.Core.Common, Adam.Core.Containers, Adam.Core.Messages,
+  Adam.Target, Adam.Compiler.SourceText, Adam.Compiler.Diagnostics, Adam.Compiler.Literals,
+  Adam.Compiler.AST, Adam.Compiler.Scopes, Adam.Compiler.Types, Adam.Compiler.Layout,
+  Adam.Compiler.Folding, Adam.Compiler.Formats;
 
 public const
   // The runtime unit's routines Semantics writes into the AST (DESIGN sec 8): the text
@@ -3363,28 +3363,87 @@ public type
       end;
     end;
 
-    // The member the access AId on ABase reaches through an embed (EmbedMemberOf), the
-    // embed into AId's ResolvedEmbed; 0 when no embed holds the name; -1 (SM0370
-    // reported) when two embeds of one level hold it
+    // The member the access AId on ABase reaches through its embeds (EmbedMemberOf, BNF
+    // sec 4), the path written into the AST: its outermost embed into AId's ResolvedEmbed,
+    // each embed past it an EmbedStep child of AId (its ResolvedDecl the embed, outermost
+    // first). A hidden embed on the path is reached where a hidden field is (SM0019). 0 when
+    // no embed holds the name; -1 (SM0370 reported) when two paths of one depth reach it
     hidden method DoEmbedMember(const AId: int64; const AOperand: int64; const ABase: int64): int64;
     var
       LMember: int64;
-      LEmbed: int64;
-      LSecond: int64;
+      LPath: NodeList;
+      LSecond: NodeList;
+      LStep: int64;
+      LI: int64;
       LName: string;
+      LFirst: string;
     begin
       LName := self.FTree[AId].Text;
-      if not EmbedMemberOf(self.FTree, ABase, LName, LMember, LEmbed, LSecond) then
+      if not EmbedMemberOf(self.FTree, ABase, LName, LMember, LPath, LSecond) then
         return 0;
       end;
-      if LSecond <> 0 then
+      if LSecond.Count <> 0 then
+        LFirst := self.DoEmbedPathText(LPath);
         self.DoError(AId, ADAM_ERR_SEMANTICS_370, ADAM_MSG_SEMANTICS_EMBED_SHARED,
-          NoArgs().Str(LName).Str(self.FTree[LEmbed].Text).Str(self.FTree[LSecond].Text).Str(
-          self.DoExprText(AOperand)).Str(self.FTree[LEmbed].Text).Str(LName));
+          NoArgs().Str(LName).Str(LFirst).Str(self.DoEmbedPathText(LSecond)).Str(
+          self.DoExprText(AOperand)).Str(LFirst).Str(LName));
         return -1;
       end;
-      self.FTree[AId].ResolvedEmbed := LEmbed;
+      self.FTree[AId].ResolvedEmbed := LPath.Items[0];
+      // A second visit of AId finds its steps written already
+      if self.FTree.CountOf(AId, NodeRole.EmbedStep) = 0 then
+        for LI := 1 to LPath.Count - 1 do
+          LStep := self.FTree.AddChild(AId, NodeRole.EmbedStep, NodeKind.EmbedStep,
+            self.FTree[AId].Place, self.FTree[AId].StartOffset, self.FTree[AId].EndOffset);
+          self.FTree[LStep].ResolvedDecl := LPath.Items[LI];
+        end;
+      end;
+      // The outermost embed is reached through the operand, each next one through the
+      // embed before it
+      if self.FTree[LPath.Items[0]].HasFlag(NodeFlag.Hidden) then
+        self.DoHiddenReach(AId, AOperand, LPath.Items[0]);
+      end;
+      for LI := 1 to LPath.Count - 1 do
+        if self.FTree[LPath.Items[LI]].HasFlag(NodeFlag.Hidden) then
+          self.DoHiddenReachIn(AId, LPath.Items[LI], false, self.DoEmbedTypeOf(LPath.Items[LI - 1]));
+        end;
+      end;
       return LMember;
+    end;
+
+    // The embeds of an embed path (EmbedMemberOf), joined as source names them: "A.B"
+    hidden const method DoEmbedPathText(const APath: NodeList): string;
+    var
+      LText: TextBuilder;
+      LI: int64;
+    begin
+      for LI := 0 to APath.Count - 1 do
+        if LI > 0 then
+          LText.Add(".");
+        end;
+        LText.Add(self.FTree[APath.Items[LI]].Text);
+      end;
+      return LText.Text();
+    end;
+
+    // The canonical type the embed AEmbed holds (the record, overlay or object its members
+    // are laid out in)
+    hidden const method DoEmbedTypeOf(const AEmbed: int64): int64;
+    begin
+      return CanonicalOf(self.FTree, self.FTree.FirstOf(AEmbed, NodeRole.TypeOf));
+    end;
+
+    // The innermost embed the member access AId reaches its member through: its last
+    // EmbedStep's, else its ResolvedEmbed (0: AId reaches its member directly)
+    hidden const method DoInnermostEmbed(const AId: int64): int64;
+    var
+      LCount: int64;
+    begin
+      LCount := self.FTree.CountOf(AId, NodeRole.EmbedStep);
+      if LCount > 0 then
+        return self.FTree[self.FTree.NthOf(AId, NodeRole.EmbedStep, LCount - 1)].ResolvedDecl;
+      end;
+      return self.FTree[AId].ResolvedEmbed;
     end;
 
     // The declared type whose body declares the member AMember (an anonymous part's
@@ -3429,11 +3488,44 @@ public type
     // or a descendant of it (SM0019, through)
     hidden method DoHiddenReach(const AId: int64; const AOperand: int64; const AMember: int64);
     var
-      LLevel: int64;
-      LOwner: int64;
       LHeld: int64;
       LClass: TypeClass;
       LKind: NodeKind;
+      LInner: int64;
+    begin
+      // A member reached through embeds is reached through the innermost one (X.M of an
+      // embed's M is X.E.M, BNF sec 4); the embeds on the path are checked on their own
+      // (DoEmbedMember)
+      LInner := 0;
+      if (self.FTree[AId].Kind = NodeKind.MemberExpression) and (self.FTree[AId].ResolvedDecl = AMember) then
+        LInner := self.DoInnermostEmbed(AId);
+      end;
+      if LInner <> 0 then
+        self.DoHiddenReachIn(AId, AMember, false, self.DoEmbedTypeOf(LInner));
+        return;
+      end;
+      LKind := self.FTree[self.DoSkipParens(AOperand)].Kind;
+      if (LKind = NodeKind.SelfExpression) or (LKind = NodeKind.ParentExpression) then
+        self.DoHiddenReachIn(AId, AMember, true, 0);
+        return;
+      end;
+      LHeld := self.DoTypeOf(AOperand);
+      LClass := self.DoClass(LHeld);
+      if IsPointerClass(LClass) or (LClass = TypeClass.OwnType) or (LClass = TypeClass.RefType) then
+        LHeld := TargetOf(self.FTree, LHeld);
+      end;
+      self.DoHiddenReachIn(AId, AMember, false, LHeld);
+    end;
+
+    // DoHiddenReach's rule for the hidden member AMember reached by AId: from a method of
+    // its declaring type or of a descendant (SM0019 outside), and there through self or
+    // parent (AThroughSelf) or a value of the type AHeld that is that method's own type or
+    // a descendant of it (SM0019 through)
+    hidden method DoHiddenReachIn(const AId: int64; const AMember: int64; const AThroughSelf: bool;
+      const AHeld: int64);
+    var
+      LLevel: int64;
+      LOwner: int64;
       LName: string;
     begin
       LName := self.FTree[AMember].Text;
@@ -3447,16 +3539,10 @@ public type
           NoArgs().Str(LName).Str(self.DoText(LLevel)).Str(self.DoText(LLevel)));
         return;
       end;
-      LKind := self.FTree[self.DoSkipParens(AOperand)].Kind;
-      if (LKind = NodeKind.SelfExpression) or (LKind = NodeKind.ParentExpression) then
+      if AThroughSelf then
         return;
       end;
-      LHeld := self.DoTypeOf(AOperand);
-      LClass := self.DoClass(LHeld);
-      if IsPointerClass(LClass) or (LClass = TypeClass.OwnType) or (LClass = TypeClass.RefType) then
-        LHeld := TargetOf(self.FTree, LHeld);
-      end;
-      if (LHeld = LOwner) or IsBaseOf(self.FTree, LOwner, LHeld) then
+      if (AHeld = LOwner) or IsBaseOf(self.FTree, LOwner, AHeld) then
         return;
       end;
       self.DoError(AId, ADAM_ERR_SEMANTICS_019, ADAM_MSG_SEMANTICS_HIDDEN_THROUGH,
