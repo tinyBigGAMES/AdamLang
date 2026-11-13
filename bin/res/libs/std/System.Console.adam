@@ -1,0 +1,1452 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.Console.adam - the program's console: `import System.Console;` adds
+  text and VT escape sequences on standard output and the keyboard on
+  standard input (PaskalCPP's Console unit, rewritten in Adam).
+
+  Console writes to the program's standard output, the stream print and
+  println write to: text (WriteText), the cursor (0-based positions, moves,
+  save / restore, hide / show), clearing, scrolling, inserting / deleting
+  lines, bold and colours (the 16 standard ones, the 256-colour palette or
+  any 24-bit Rgb), the title and the terminal's size; text padded / aligned
+  by display columns (wide characters count 2, combining marks 0: the width
+  print's own specs use, System.Runtime.Unicode), rules, a progress bar and a
+  spinner; it reads a key, waits for one or for Enter, and pauses before a
+  console that closes with the program. Formatted text is print / println's
+  job (`println("{} of {}", 3, 10);` then ResetFormat() after colours).
+  Text is always written; escape sequences only on a terminal by default (a
+  file or a pipe gets the text alone; SetEscapeMode changes that). The Csi
+  consts and routines give the sequences to a program that writes them
+  itself.
+
+  Target-neutral: the OS calls are in one platform unit per target, picked by
+  the triple (System.Console.Win64 for x86_64-windows-gnu), each with the
+  same ConsolePlatform* routines.
+*******************************************************************************/
+
+module unit System.Console;
+
+import System.SysUtils, System.Runtime, System.Runtime.Unicode
+@ifdef TARGET_X86_64_WINDOWS_GNU
+  , System.Console.Win64
+@endif
+  ;
+
+const
+  // The size GetTerminalWidth / GetTerminalHeight give when standard output is no terminal
+  ADAM_CONSOLE_DEFAULT_COLUMNS: int32 = 80;
+  ADAM_CONSOLE_DEFAULT_ROWS: int32 = 25;
+  // GTerminal's states: not asked yet, a terminal that takes escapes, a terminal that takes
+  // none, no terminal
+  ADAM_CONSOLE_UNKNOWN: int32 = 0;
+  ADAM_CONSOLE_ESCAPES: int32 = 1;
+  ADAM_CONSOLE_PLAIN: int32 = 2;
+  ADAM_CONSOLE_NONE: int32 = 3;
+
+var
+  // The escape mode as its choice number (EscapeMode: 0 Auto, 1 On, 2 Off); atomic: a mode
+  // set on one thread holds for a write on another
+  GEscapeMode: int32;
+  // What standard output is (ADAM_CONSOLE_*), decided once on first ask: it does not change
+  // kind while a program runs
+  GTerminal: int32;
+
+// What standard output is (see GTerminal): asked of the platform once, a console made to
+// take UTF-8 and VT sequences on that first ask; every thread sees the one answer
+routine DoTerminal(): int32;
+var
+  LState: int32;
+begin
+  LState := atomicload(GTerminal);
+  if LState <> ADAM_CONSOLE_UNKNOWN then
+    return LState;
+  end;
+  LState := ADAM_CONSOLE_NONE;
+  if ConsolePlatformIsTerminal() then
+    LState := ADAM_CONSOLE_PLAIN;
+    if ConsolePlatformEnableEscapes() then
+      LState := ADAM_CONSOLE_ESCAPES;
+    end;
+  end;
+  // The first answer stands (another thread may have asked at the same time)
+  atomiccas(GTerminal, ADAM_CONSOLE_UNKNOWN, LState);
+  return atomicload(GTerminal);
+end;
+
+// Bytes to standard output, the stream print writes to; a terminal gets them at once (a
+// cursor move must show before a key wait)
+routine DoWrite(const AText: string);
+begin
+  if len(AText) > 0 then
+    print("{}", AText);
+  end;
+  if DoTerminal() <> ADAM_CONSOLE_NONE then
+    FlushOutput();
+  end;
+end;
+
+// A window title's bytes without C0 controls and DEL (they would end or break the OSC);
+// UTF-8 bytes stay
+routine DoTitleText(const ATitle: string): string;
+var
+  LTitle: string;
+  LAt: int64;
+  LI: int64;
+  LByte: uint8;
+begin
+  LTitle := "";
+  setlength(LTitle, len(ATitle));
+  LAt := 0;
+  for LI := 0 to len(ATitle) - 1 do
+    LByte := uint8(ATitle[LI]);
+    if (LByte >= 0x20) and (LByte <> 0x7F) then
+      LTitle[LAt] := ATitle[LI];
+      LAt := LAt + 1;
+    end;
+  end;
+  setlength(LTitle, LAt);
+  return LTitle;
+end;
+
+// Display columns of one code point: 0 for a control character, a combining mark, a
+// zero-width joiner or a variation selector (System.Runtime.Unicode's cluster properties
+// Control / CR / LF / Extend / ZWJ), else libc++'s estimated width (1 or 2), the one print's
+// width specs use
+routine DoCodeColumns(const ACode: uint32): int64;
+var
+  LProperty: int64;
+begin
+  if (ACode < 0x20) or ((ACode >= 0x7F) and (ACode < 0xA0)) then
+    return 0;
+  end;
+  LProperty := GraphemeProperty(ACode);
+  if (LProperty = ADAM_UNICODE_GCB_CONTROL) or (LProperty = ADAM_UNICODE_GCB_CR) or
+    (LProperty = ADAM_UNICODE_GCB_LF) or (LProperty = ADAM_UNICODE_GCB_EXTEND) or
+    (LProperty = ADAM_UNICODE_GCB_ZWJ) then
+    return 0;
+  end;
+  return EstimatedWidth(ACode);
+end;
+
+// Display columns of UTF-8 text (see DisplayWidth): a byte that is not UTF-8 is one column
+// (DecodeUtf8Char's U+FFFD), the decode going on with the next byte
+routine DoColumns(const AText: string): int64;
+var
+  LColumns: int64;
+  LIndex: int64;
+begin
+  LColumns := 0;
+  LIndex := 0;
+  while LIndex < len(AText) do
+    LColumns := LColumns + DoCodeColumns(DecodeUtf8Char(AText, LIndex));
+  end;
+  return LColumns;
+end;
+
+// AColumns columns of APad: whole copies, a column left over (a wide pad character) as a
+// space; an empty or zero-width pad counts as a space. Built in one block of its final size
+routine DoFill(const APad: string; const AColumns: int64): string;
+var
+  LPad: string;
+  LPadWidth: int64;
+  LCopies: int64;
+  LLeft: int64;
+  LFill: string;
+  LAt: int64;
+  LI: int64;
+  LJ: int64;
+begin
+  LFill := "";
+  if AColumns <= 0 then
+    return LFill;
+  end;
+  LPad := APad;
+  LPadWidth := DoColumns(LPad);
+  if LPadWidth = 0 then
+    LPad := " ";
+    LPadWidth := 1;
+  end;
+  LCopies := AColumns div LPadWidth;
+  LLeft := AColumns mod LPadWidth;
+  setlength(LFill, LCopies * len(LPad) + LLeft);
+  LAt := 0;
+  for LI := 1 to LCopies do
+    for LJ := 0 to len(LPad) - 1 do
+      LFill[LAt] := LPad[LJ];
+      LAt := LAt + 1;
+    end;
+  end;
+  for LI := 1 to LLeft do
+    LFill[LAt] := ' ';
+    LAt := LAt + 1;
+  end;
+  return LFill;
+end;
+
+// floor(ADone * AScale / ATotal) exactly, for 0 <= ADone <= ATotal, ATotal > 0, AScale >= 0,
+// with no overflow: long multiplication bit by bit, the remainder kept below ATotal in
+// uint64 (100% only when ADone = ATotal)
+routine DoScaledFloor(const ADone: int64; const AScale: int64; const ATotal: int64): int64;
+var
+  LDone: uint64;
+  LTotal: uint64;
+  LQuotient: uint64;
+  LRemainder: uint64;
+  LBit: int64;
+begin
+  LDone := uint64(ADone);
+  LTotal := uint64(ATotal);
+  LQuotient := 0;
+  LRemainder := 0;
+  for LBit := 62 downto 0 do
+    // Shift left: LRemainder < LTotal < 2^63, so twice it fits
+    LQuotient := LQuotient shl 1;
+    LRemainder := LRemainder shl 1;
+    if LRemainder >= LTotal then
+      LRemainder := LRemainder - LTotal;
+      LQuotient := LQuotient + 1;
+    end;
+    if ((uint64(AScale) shr uint64(LBit)) & 1) <> 0 then
+      // LRemainder < LTotal and LDone <= LTotal: the sum fits, at most two totals over
+      LRemainder := LRemainder + LDone;
+      while LRemainder >= LTotal do
+        LRemainder := LRemainder - LTotal;
+        LQuotient := LQuotient + 1;
+      end;
+    end;
+  end;
+  return int64(LQuotient);
+end;
+
+// The same bytes, ASCII letters compared without case
+routine DoSameAsciiText(const ALeft: string; const ARight: string): bool;
+begin
+  if len(ALeft) <> len(ARight) then
+    return false;
+  end;
+  return LowerCase(ALeft) = LowerCase(ARight);
+end;
+
+
+// The terminal's visible columns / lines (the platform's); 80 x 25 when standard output is no
+// terminal
+routine DoWidth(): int32;
+var
+  LColumns: int32;
+begin
+  LColumns := ConsolePlatformWidth();
+  if LColumns <= 0 then
+    return ADAM_CONSOLE_DEFAULT_COLUMNS;
+  end;
+  return LColumns;
+end;
+
+routine DoHeight(): int32;
+var
+  LRows: int32;
+begin
+  LRows := ConsolePlatformHeight();
+  if LRows <= 0 then
+    return ADAM_CONSOLE_DEFAULT_ROWS;
+  end;
+  return LRows;
+end;
+
+// The keyboard waits (see WaitForAnyKey, ReadKey, ReadLn): what print wrote is shown first, so
+// a prompt is on the screen before the wait
+routine DoWaitKey();
+begin
+  FlushOutput();
+  ConsolePlatformWaitKey();
+end;
+
+routine DoReadKey(): string;
+begin
+  FlushOutput();
+  return ConsolePlatformReadKey();
+end;
+
+routine DoReadLine(var ALine: string): bool;
+begin
+  FlushOutput();
+  return ConsolePlatformReadLine(ALine);
+end;
+
+// One line from standard input, its line break left out; "" at its end
+routine DoReadLineText(): string;
+var
+  LLine: string;
+begin
+  LLine := "";
+  DoReadLine(LLine);
+  return LLine;
+end;
+
+public type
+  // The 16 standard terminal colours, in their SGR order (`int32(TextColor.Red)`
+  // is 1): foreground 30-37 / 90-97, background 40-47 / 100-107.
+  TextColor = choices(Black, Red, Green, Yellow, Blue, Magenta, Cyan, White, BrightBlack,
+    BrightRed, BrightGreen, BrightYellow, BrightBlue, BrightMagenta, BrightCyan, BrightWhite);
+
+  // When escape sequences are written: Auto while standard output is a
+  // terminal (the default), On always, Off never. (Not Always / Never: X11's
+  // X.h defines Always.)
+  EscapeMode = choices(Auto, On, Off);
+
+  // Where a text sits inside a padded width.
+  TextAlign = choices(Left, Center, Right);
+
+  // A 24-bit colour (SGR 38;2 / 48;2): red, green and blue, 0-255 each.
+  // Example: `LGold: Rgb(255, 215, 0);`
+  Rgb = object
+    // The red component, 0 .. 255
+    R: uint8;
+    // The green component, 0 .. 255
+    G: uint8;
+    // The blue component, 0 .. 255
+    B: uint8;
+    // Black (0, 0, 0).
+    init();
+    begin
+      self.R := 0;
+      self.G := 0;
+      self.B := 0;
+    end;
+    // The colour (AR, AG, AB).
+    // AR: red, 0-255
+    // AG: green, 0-255
+    // AB: blue, 0-255
+    init(const AR: uint8; const AG: uint8; const AB: uint8);
+    begin
+      self.R := AR;
+      self.G := AG;
+      self.B := AB;
+    end;
+  end;
+
+public const
+  // The escape character (ESC, 0x1B), the start of every sequence.
+  CsiEsc: string = "\x1b";
+  // A carriage return: the cursor to the start of its line.
+  CsiCr: string = "\r";
+  // A line feed, the line break WriteLn writes.
+  CsiLf: string = "\n";
+  // A carriage return and a line feed.
+  CsiCrLf: string = "\r\n";
+  // Saves the cursor's position (CSI s).
+  CsiSaveCursorPosition: string = "\x1b[s";
+  // Puts the cursor back where CsiSaveCursorPosition saved it (CSI u).
+  CsiRestoreCursorPosition: string = "\x1b[u";
+  // Shows the cursor.
+  CsiShowCursor: string = "\x1b[?25h";
+  // Hides the cursor.
+  CsiHideCursor: string = "\x1b[?25l";
+  // A blinking cursor.
+  CsiBlinkCursor: string = "\x1b[?12h";
+  // A steady (not blinking) cursor.
+  CsiSteadyCursor: string = "\x1b[?12l";
+  // Clears the visible screen (the cursor stays).
+  CsiClearScreen: string = "\x1b[2J";
+  // Clears the scrollback above the screen.
+  CsiClearScrollback: string = "\x1b[3J";
+  // Clears the cursor's line (the cursor stays).
+  CsiClearLine: string = "\x1b[2K";
+  // Clears from the cursor to the end of its line.
+  CsiClearToEndOfLine: string = "\x1b[0K";
+  // Bold text.
+  CsiBold: string = "\x1b[1m";
+  // Dim text.
+  CsiDim: string = "\x1b[2m";
+  // Italic text.
+  CsiItalic: string = "\x1b[3m";
+  // Underlined text.
+  CsiUnderline: string = "\x1b[4m";
+  // Blinking text.
+  CsiBlink: string = "\x1b[5m";
+  // Foreground and background swapped.
+  CsiInvertColors: string = "\x1b[7m";
+  // Struck-through text.
+  CsiStrike: string = "\x1b[9m";
+  // Ends CsiInvertColors.
+  CsiNormalColors: string = "\x1b[27m";
+  // Framed text.
+  CsiFramed: string = "\x1b[51m";
+  // Encircled text.
+  CsiEncircled: string = "\x1b[52m";
+  // Resets bold, the colours and every other attribute.
+  CsiResetFormat: string = "\x1b[0m";
+  // The default foreground colour.
+  CsiResetForeground: string = "\x1b[39m";
+  // The default background colour.
+  CsiResetBackground: string = "\x1b[49m";
+  // Black foreground (SGR 30).
+  CsiFgBlack: string = "\x1b[30m";
+  // Red foreground (SGR 31).
+  CsiFgRed: string = "\x1b[31m";
+  // Green foreground (SGR 32).
+  CsiFgGreen: string = "\x1b[32m";
+  // Yellow foreground (SGR 33).
+  CsiFgYellow: string = "\x1b[33m";
+  // Blue foreground (SGR 34).
+  CsiFgBlue: string = "\x1b[34m";
+  // Magenta foreground (SGR 35).
+  CsiFgMagenta: string = "\x1b[35m";
+  // Cyan foreground (SGR 36).
+  CsiFgCyan: string = "\x1b[36m";
+  // White foreground (SGR 37).
+  CsiFgWhite: string = "\x1b[37m";
+  // Black background (SGR 40).
+  CsiBgBlack: string = "\x1b[40m";
+  // Red background (SGR 41).
+  CsiBgRed: string = "\x1b[41m";
+  // Green background (SGR 42).
+  CsiBgGreen: string = "\x1b[42m";
+  // Yellow background (SGR 43).
+  CsiBgYellow: string = "\x1b[43m";
+  // Blue background (SGR 44).
+  CsiBgBlue: string = "\x1b[44m";
+  // Magenta background (SGR 45).
+  CsiBgMagenta: string = "\x1b[45m";
+  // Cyan background (SGR 46).
+  CsiBgCyan: string = "\x1b[46m";
+  // White background (SGR 47).
+  CsiBgWhite: string = "\x1b[47m";
+  // Bright black (grey) foreground (SGR 90).
+  CsiFgBrightBlack: string = "\x1b[90m";
+  // Bright red foreground (SGR 91).
+  CsiFgBrightRed: string = "\x1b[91m";
+  // Bright green foreground (SGR 92).
+  CsiFgBrightGreen: string = "\x1b[92m";
+  // Bright yellow foreground (SGR 93).
+  CsiFgBrightYellow: string = "\x1b[93m";
+  // Bright blue foreground (SGR 94).
+  CsiFgBrightBlue: string = "\x1b[94m";
+  // Bright magenta foreground (SGR 95).
+  CsiFgBrightMagenta: string = "\x1b[95m";
+  // Bright cyan foreground (SGR 96).
+  CsiFgBrightCyan: string = "\x1b[96m";
+  // Bright white foreground (SGR 97).
+  CsiFgBrightWhite: string = "\x1b[97m";
+  // Bright black (grey) background (SGR 100).
+  CsiBgBrightBlack: string = "\x1b[100m";
+  // Bright red background (SGR 101).
+  CsiBgBrightRed: string = "\x1b[101m";
+  // Bright green background (SGR 102).
+  CsiBgBrightGreen: string = "\x1b[102m";
+  // Bright yellow background (SGR 103).
+  CsiBgBrightYellow: string = "\x1b[103m";
+  // Bright blue background (SGR 104).
+  CsiBgBrightBlue: string = "\x1b[104m";
+  // Bright magenta background (SGR 105).
+  CsiBgBrightMagenta: string = "\x1b[105m";
+  // Bright cyan background (SGR 106).
+  CsiBgBrightCyan: string = "\x1b[106m";
+  // Bright white background (SGR 107).
+  CsiBgBrightWhite: string = "\x1b[107m";
+  // A dark grey background: 256-colour palette entry 238.
+  CsiBgDarkGrey: string = "\x1b[48;5;238m";
+  // What ReadKey gives for Enter, on every target.
+  KeyEnter: string = "\r";
+  // What ReadKey gives for Escape, on every target.
+  KeyEscape: string = "\x1b";
+  // What ReadKey gives for Backspace, on every target.
+  KeyBackspace: string = "\x08";
+
+// "<ESC>[<count><final>"; empty for a count <= 0 (a CSI count of 0 means 1)
+routine CsiCount(const ACount: int32; const AFinal: string): string;
+begin
+  if ACount <= 0 then
+    return "";
+  end;
+  return FormatStr("\x1b[{}{}", ACount, AFinal);
+end;
+
+// SGR for a standard colour: index 0-7 from ANormalBase, 8-15 from
+// ABrightBase; a value outside the choices gives nothing
+routine SgrStandard(const AColor: TextColor; const ANormalBase: int32; const ABrightBase: int32): string;
+var
+  LIndex: int32;
+begin
+  LIndex := int32(AColor);
+  if (LIndex < 0) or (LIndex > 15) then
+    return "";
+  end;
+  if LIndex < 8 then
+    return FormatStr("\x1b[{}m", ANormalBase + LIndex);
+  end;
+  return FormatStr("\x1b[{}m", ABrightBase + LIndex - 8);
+end;
+
+// SGR 38;2 / 48;2 for a 24-bit colour
+routine SgrRgb(const AColor: Rgb; const ASelector: int32): string;
+begin
+  return FormatStr("\x1b[{};2;{};{};{}m", ASelector, int32(AColor.R), int32(AColor.G), int32(AColor.B));
+end;
+
+// The sequence that puts the cursor at column AX, line AY (0-based, (0, 0)
+// the top left; a position below 0 counts as 0).
+// AX: the column
+// AY: the line
+// Returns the sequence (CSI is 1-based, row first: (4, 2) is `ESC[3;5H`)
+public routine CsiCursorPosition(const AX: int32; const AY: int32): string;
+var
+  LX: int32;
+  LY: int32;
+begin
+  LX := AX;
+  if LX < 0 then
+    LX := 0;
+  end;
+  LY := AY;
+  if LY < 0 then
+    LY := 0;
+  end;
+  return FormatStr("\x1b[{};{}H", LY + 1, LX + 1);
+end;
+
+// The sequence that puts the cursor at column AX of its line (0-based; below
+// 0 counts as 0).
+// AX: the column
+// Returns the sequence
+public routine CsiCursorColumn(const AX: int32): string;
+var
+  LX: int32;
+begin
+  LX := AX;
+  if LX < 0 then
+    LX := 0;
+  end;
+  return FormatStr("\x1b[{}G", LX + 1);
+end;
+
+// The sequence that moves the cursor up ALines lines.
+// ALines: how far; <= 0 gives ""
+// Returns the sequence
+public routine CsiCursorUp(const ALines: int32): string;
+begin
+  return CsiCount(ALines, "A");
+end;
+
+// The sequence that moves the cursor down ALines lines.
+// ALines: how far; <= 0 gives ""
+// Returns the sequence
+public routine CsiCursorDown(const ALines: int32): string;
+begin
+  return CsiCount(ALines, "B");
+end;
+
+// The sequence that moves the cursor right AColumns columns.
+// AColumns: how far; <= 0 gives ""
+// Returns the sequence
+public routine CsiCursorForward(const AColumns: int32): string;
+begin
+  return CsiCount(AColumns, "C");
+end;
+
+// The sequence that moves the cursor left AColumns columns.
+// AColumns: how far; <= 0 gives ""
+// Returns the sequence
+public routine CsiCursorBack(const AColumns: int32): string;
+begin
+  return CsiCount(AColumns, "D");
+end;
+
+// The sequence that scrolls the screen up ALines lines.
+// ALines: how far; <= 0 gives ""
+// Returns the sequence
+public routine CsiScrollUp(const ALines: int32): string;
+begin
+  return CsiCount(ALines, "S");
+end;
+
+// The sequence that scrolls the screen down ALines lines.
+// ALines: how far; <= 0 gives ""
+// Returns the sequence
+public routine CsiScrollDown(const ALines: int32): string;
+begin
+  return CsiCount(ALines, "T");
+end;
+
+// The sequence that inserts ALines blank lines at the cursor.
+// ALines: how many; <= 0 gives ""
+// Returns the sequence
+public routine CsiInsertLines(const ALines: int32): string;
+begin
+  return CsiCount(ALines, "L");
+end;
+
+// The sequence that deletes ALines lines at the cursor.
+// ALines: how many; <= 0 gives ""
+// Returns the sequence
+public routine CsiDeleteLines(const ALines: int32): string;
+begin
+  return CsiCount(ALines, "M");
+end;
+
+// The sequence that inserts ACount blanks at the cursor.
+// ACount: how many; <= 0 gives ""
+// Returns the sequence
+public routine CsiInsertChars(const ACount: int32): string;
+begin
+  return CsiCount(ACount, "@");
+end;
+
+// The sequence that deletes ACount characters at the cursor.
+// ACount: how many; <= 0 gives ""
+// Returns the sequence
+public routine CsiDeleteChars(const ACount: int32): string;
+begin
+  return CsiCount(ACount, "P");
+end;
+
+// The sequence that blanks ACount characters at the cursor.
+// ACount: how many; <= 0 gives ""
+// Returns the sequence
+public routine CsiEraseChars(const ACount: int32): string;
+begin
+  return CsiCount(ACount, "X");
+end;
+
+// The foreground sequence of a 256-colour palette entry.
+// AIndex: the entry, 0-255; another value gives ""
+// Returns the sequence (`ESC[38;5;<index>m`)
+public routine CsiForeground256(const AIndex: int32): string;
+begin
+  if (AIndex < 0) or (AIndex > 255) then
+    return "";
+  end;
+  return FormatStr("\x1b[38;5;{}m", AIndex);
+end;
+
+// The background sequence of a 256-colour palette entry.
+// AIndex: the entry, 0-255; another value gives ""
+// Returns the sequence (`ESC[48;5;<index>m`)
+public routine CsiBackground256(const AIndex: int32): string;
+begin
+  if (AIndex < 0) or (AIndex > 255) then
+    return "";
+  end;
+  return FormatStr("\x1b[48;5;{}m", AIndex);
+end;
+
+// The foreground sequence of a standard colour.
+// AColor: the colour; a value outside TextColor gives ""
+// Returns the sequence (SGR 30-37 / 90-97)
+public routine CsiForeground(const AColor: TextColor): string;
+begin
+  return SgrStandard(AColor, 30, 90);
+end;
+
+// The background sequence of a standard colour.
+// AColor: the colour; a value outside TextColor gives ""
+// Returns the sequence (SGR 40-47 / 100-107)
+public routine CsiBackground(const AColor: TextColor): string;
+begin
+  return SgrStandard(AColor, 40, 100);
+end;
+
+// The foreground sequence of a 24-bit colour.
+// AColor: the colour
+// Returns the sequence (`ESC[38;2;<r>;<g>;<b>m`)
+public routine CsiForeground(const AColor: Rgb): string;
+begin
+  return SgrRgb(AColor, 38);
+end;
+
+// The background sequence of a 24-bit colour.
+// AColor: the colour
+// Returns the sequence (`ESC[48;2;<r>;<g>;<b>m`)
+public routine CsiBackground(const AColor: Rgb): string;
+begin
+  return SgrRgb(AColor, 48);
+end;
+
+// The sequence that sets the window title (OSC 0, ended by BEL); C0 control
+// characters and DEL in the title are left out, UTF-8 text stays.
+// ATitle: the title
+// Returns the sequence
+public routine CsiTitle(const ATitle: string): string;
+begin
+  return FormatStr("\x1b]0;{}\x07", DoTitleText(ATitle));
+end;
+
+// Sets when escape sequences are written (Auto by default).
+// AMode: the new mode
+public routine SetEscapeMode(const AMode: EscapeMode);
+begin
+  atomicstore(GEscapeMode, int32(AMode));
+end;
+
+// The escape mode now.
+// Returns the mode SetEscapeMode set last (Auto at start)
+public routine GetEscapeMode(): EscapeMode;
+begin
+  return EscapeMode(atomicload(GEscapeMode));
+end;
+
+// Whether standard output is a terminal (a console on Windows), decided once.
+// Returns true for a terminal, false for a file or a pipe
+public routine IsTerminal(): bool;
+begin
+  return (DoTerminal() <> ADAM_CONSOLE_NONE);
+end;
+
+// Whether the escape mode writes escape sequences now: On yes, Off no, Auto
+// while standard output is a terminal.
+// Returns true when WriteEscape writes
+public routine EscapesEnabled(): bool;
+var
+  LMode: EscapeMode;
+begin
+  LMode := GetEscapeMode();
+  if LMode = EscapeMode.On then
+    return true;
+  end;
+  if LMode = EscapeMode.Off then
+    return false;
+  end;
+  return DoTerminal() = ADAM_CONSOLE_ESCAPES;
+end;
+
+// Writes text to standard output, always (the bytes as given). A terminal
+// gets them at once.
+// AText: the text
+public routine WriteText(const AText: string);
+begin
+  DoWrite(AText);
+end;
+
+// Writes an escape sequence to standard output while EscapesEnabled, else
+// nothing.
+// ASequence: the sequence
+public routine WriteEscape(const ASequence: string);
+begin
+  if EscapesEnabled() then
+    DoWrite(ASequence);
+  end;
+end;
+
+// Puts the cursor at column AX, line AY (0-based; below 0 counts as 0).
+// AX: the column
+// AY: the line
+public routine SetCursorPosition(const AX: int32; const AY: int32);
+begin
+  WriteEscape(CsiCursorPosition(AX, AY));
+end;
+
+// Puts the cursor at column AX of its line (0-based).
+// AX: the column
+public routine SetCursorColumn(const AX: int32);
+begin
+  WriteEscape(CsiCursorColumn(AX));
+end;
+
+// Moves the cursor up one line.
+public routine MoveCursorUp();
+begin
+  WriteEscape(CsiCursorUp(1));
+end;
+
+// Moves the cursor up ALines lines (<= 0: not at all).
+// ALines: how far
+public routine MoveCursorUp(const ALines: int32);
+begin
+  WriteEscape(CsiCursorUp(ALines));
+end;
+
+// Moves the cursor down one line.
+public routine MoveCursorDown();
+begin
+  WriteEscape(CsiCursorDown(1));
+end;
+
+// Moves the cursor down ALines lines (<= 0: not at all).
+// ALines: how far
+public routine MoveCursorDown(const ALines: int32);
+begin
+  WriteEscape(CsiCursorDown(ALines));
+end;
+
+// Moves the cursor right one column.
+public routine MoveCursorForward();
+begin
+  WriteEscape(CsiCursorForward(1));
+end;
+
+// Moves the cursor right AColumns columns (<= 0: not at all).
+// AColumns: how far
+public routine MoveCursorForward(const AColumns: int32);
+begin
+  WriteEscape(CsiCursorForward(AColumns));
+end;
+
+// Moves the cursor left one column.
+public routine MoveCursorBack();
+begin
+  WriteEscape(CsiCursorBack(1));
+end;
+
+// Moves the cursor left AColumns columns (<= 0: not at all).
+// AColumns: how far
+public routine MoveCursorBack(const AColumns: int32);
+begin
+  WriteEscape(CsiCursorBack(AColumns));
+end;
+
+// Saves the cursor's position.
+public routine SaveCursorPosition();
+begin
+  WriteEscape(CsiSaveCursorPosition);
+end;
+
+// Puts the cursor back where SaveCursorPosition saved it.
+public routine RestoreCursorPosition();
+begin
+  WriteEscape(CsiRestoreCursorPosition);
+end;
+
+// Hides the cursor.
+public routine HideCursor();
+begin
+  WriteEscape(CsiHideCursor);
+end;
+
+// Shows the cursor.
+public routine ShowCursor();
+begin
+  WriteEscape(CsiShowCursor);
+end;
+
+// Clears the screen and its scrollback and puts the cursor at the top left.
+public routine ClearScreen();
+begin
+  WriteEscape(CsiClearScreen);
+  WriteEscape(CsiClearScrollback);
+  WriteEscape(CsiCursorPosition(0, 0));
+end;
+
+// Clears the cursor's line; the cursor stays where it is.
+public routine ClearLine();
+begin
+  WriteEscape(CsiClearLine);
+end;
+
+// Clears the cursor's line; AToLineStart also puts the cursor at its start
+// (a carriage return, a cursor move: a file or a pipe does not get it).
+// AToLineStart: true to move the cursor to the line's start
+public routine ClearLine(const AToLineStart: bool);
+begin
+  WriteEscape(CsiClearLine);
+  if AToLineStart then
+    WriteEscape(CsiCr);
+  end;
+end;
+
+// Clears from the cursor to the end of its line.
+public routine ClearToEndOfLine();
+begin
+  WriteEscape(CsiClearToEndOfLine);
+end;
+
+// Inserts one blank line at the cursor.
+public routine InsertLines();
+begin
+  WriteEscape(CsiInsertLines(1));
+end;
+
+// Inserts ALines blank lines at the cursor (<= 0: none).
+// ALines: how many
+public routine InsertLines(const ALines: int32);
+begin
+  WriteEscape(CsiInsertLines(ALines));
+end;
+
+// Deletes the cursor's line.
+public routine DeleteLines();
+begin
+  WriteEscape(CsiDeleteLines(1));
+end;
+
+// Deletes ALines lines at the cursor (<= 0: none).
+// ALines: how many
+public routine DeleteLines(const ALines: int32);
+begin
+  WriteEscape(CsiDeleteLines(ALines));
+end;
+
+// Scrolls the screen up one line.
+public routine ScrollUp();
+begin
+  WriteEscape(CsiScrollUp(1));
+end;
+
+// Scrolls the screen up ALines lines (<= 0: not at all).
+// ALines: how far
+public routine ScrollUp(const ALines: int32);
+begin
+  WriteEscape(CsiScrollUp(ALines));
+end;
+
+// Scrolls the screen down one line.
+public routine ScrollDown();
+begin
+  WriteEscape(CsiScrollDown(1));
+end;
+
+// Scrolls the screen down ALines lines (<= 0: not at all).
+// ALines: how far
+public routine ScrollDown(const ALines: int32);
+begin
+  WriteEscape(CsiScrollDown(ALines));
+end;
+
+// Inserts one blank at the cursor.
+public routine InsertChars();
+begin
+  WriteEscape(CsiInsertChars(1));
+end;
+
+// Inserts ACount blanks at the cursor (<= 0: none).
+// ACount: how many
+public routine InsertChars(const ACount: int32);
+begin
+  WriteEscape(CsiInsertChars(ACount));
+end;
+
+// Deletes the character at the cursor.
+public routine DeleteChars();
+begin
+  WriteEscape(CsiDeleteChars(1));
+end;
+
+// Deletes ACount characters at the cursor (<= 0: none).
+// ACount: how many
+public routine DeleteChars(const ACount: int32);
+begin
+  WriteEscape(CsiDeleteChars(ACount));
+end;
+
+// Blanks the character at the cursor.
+public routine EraseChars();
+begin
+  WriteEscape(CsiEraseChars(1));
+end;
+
+// Blanks ACount characters at the cursor (<= 0: none).
+// ACount: how many
+public routine EraseChars(const ACount: int32);
+begin
+  WriteEscape(CsiEraseChars(ACount));
+end;
+
+// Bold text from here (until ResetFormat or the next Write's reset).
+public routine SetBold();
+begin
+  WriteEscape(CsiBold);
+end;
+
+// Resets bold, the colours and every other attribute.
+public routine ResetFormat();
+begin
+  WriteEscape(CsiResetFormat);
+end;
+
+// The text colour from here, a standard colour.
+// AColor: the colour
+public routine SetForegroundColor(const AColor: TextColor);
+begin
+  WriteEscape(CsiForeground(AColor));
+end;
+
+// The text colour from here, a 24-bit colour.
+// AColor: the colour
+public routine SetForegroundColor(const AColor: Rgb);
+begin
+  WriteEscape(CsiForeground(AColor));
+end;
+
+// The background colour from here, a standard colour.
+// AColor: the colour
+public routine SetBackgroundColor(const AColor: TextColor);
+begin
+  WriteEscape(CsiBackground(AColor));
+end;
+
+// The background colour from here, a 24-bit colour.
+// AColor: the colour
+public routine SetBackgroundColor(const AColor: Rgb);
+begin
+  WriteEscape(CsiBackground(AColor));
+end;
+
+// The standard colour with the number AIndex, held to 0-15 (below 0 is
+// Black, past 15 BrightWhite): a loop's counter picks colours in turn.
+// AIndex: the colour's number (TextColor's order)
+// Returns the colour
+// Example: `SetForegroundColor(TextColorAt(LIndex mod 16));`
+public routine TextColorAt(const AIndex: int32): TextColor;
+var
+  LIndex: int32;
+begin
+  LIndex := AIndex;
+  if LIndex < 0 then
+    LIndex := 0;
+  end;
+  if LIndex > 15 then
+    LIndex := 15;
+  end;
+  return TextColor(LIndex);
+end;
+
+// The terminal's visible width in columns; 80 when standard output is not
+// a terminal.
+// Returns the width
+public routine GetTerminalWidth(): int32;
+begin
+  return DoWidth();
+end;
+
+// The terminal's visible height in lines; 25 when standard output is not a
+// terminal.
+// Returns the height
+public routine GetTerminalHeight(): int32;
+begin
+  return DoHeight();
+end;
+
+// The columns a text takes in a terminal: UTF-8 code points count 1, East
+// Asian wide / fullwidth characters and emoji 2, combining marks,
+// zero-width characters and control characters 0; a byte that is not
+// UTF-8 counts 1.
+// AText: UTF-8 text
+// Returns the columns
+// Example: `DisplayWidth("日本語")` is 6
+public routine DisplayWidth(const AText: string): int64;
+begin
+  return DoColumns(AText);
+end;
+
+// The text padded with spaces after it to AWidth columns; a text at least
+// that wide is returned as it is.
+// AText: the text
+// AWidth: the columns to fill
+// Returns the padded text
+public routine PadText(const AText: string; const AWidth: int32): string;
+begin
+  return AText + DoFill(" ", int64(AWidth) - DisplayWidth(AText));
+end;
+
+// The text padded with APad after it to AWidth columns; see PadText(AText,
+// AWidth, APad, AAlign).
+// AText: the text
+// AWidth: the columns to fill
+// APad: the pad character
+// Returns the padded text
+public routine PadText(const AText: string; const AWidth: int32; const APad: string): string;
+begin
+  return AText + DoFill(APad, int64(AWidth) - DisplayWidth(AText));
+end;
+
+// The text padded with APad to AWidth columns, placed by AAlign (Center:
+// the odd column on the right). APad is one character; a wide one fills
+// two columns, a column left over is a space; an empty pad is a space. A
+// text at least AWidth wide is returned as it is.
+// AText: the text
+// AWidth: the columns to fill
+// APad: the pad character
+// AAlign: where the text sits
+// Returns the padded text
+// Example: `PadText("ab", 7, ".", TextAlign.Center)` is "..ab..."
+public routine PadText(const AText: string; const AWidth: int32; const APad: string; const AAlign: TextAlign): string;
+var
+  LPadTotal: int64;
+  LPadLeft: int64;
+begin
+  LPadTotal := int64(AWidth) - DisplayWidth(AText);
+  if LPadTotal <= 0 then
+    return AText;
+  end;
+  if AAlign = TextAlign.Right then
+    return DoFill(APad, LPadTotal) + AText;
+  end;
+  if AAlign = TextAlign.Center then
+    LPadLeft := LPadTotal div 2;
+    return DoFill(APad, LPadLeft) + AText + DoFill(APad, LPadTotal - LPadLeft);
+  end;
+  return AText + DoFill(APad, LPadTotal);
+end;
+
+// AWidth columns of AChar, filled as PadText fills.
+// AChar: the character
+// AWidth: the columns; <= 0 gives ""
+// Returns the rule
+public routine RuleText(const AChar: string; const AWidth: int32): string;
+begin
+  return DoFill(AChar, int64(AWidth));
+end;
+
+// A progress bar, "[====    ]  50%": ACurrent of ATotal, held to 0..ATotal,
+// floored (full and 100% only at the end); ATotal <= 0 counts as nothing
+// done.
+// ACurrent: the work done
+// ATotal: all the work
+// AWidth: the bar's columns between the brackets (below 0 counts as 0)
+// Returns the bar text
+public routine ProgressBarText(const ACurrent: int64; const ATotal: int64; const AWidth: int32): string;
+var
+  LWidth: int64;
+  LDone: int64;
+  LFilled: int64;
+  LPercent: int64;
+begin
+  LWidth := int64(AWidth);
+  if LWidth < 0 then
+    LWidth := 0;
+  end;
+  LFilled := 0;
+  LPercent := 0;
+  if ATotal > 0 then
+    LDone := ACurrent;
+    if LDone < 0 then
+      LDone := 0;
+    end;
+    if LDone > ATotal then
+      LDone := ATotal;
+    end;
+    LFilled := DoScaledFloor(LDone, LWidth, ATotal);
+    LPercent := DoScaledFloor(LDone, 100, ATotal);
+  end;
+  return FormatStr("[{}{}] {:3}%", DoFill("=", LFilled), DoFill(" ", LWidth - LFilled), LPercent);
+end;
+
+// The spinner's character for a frame: | / - \ in turn, any frame
+// (negative ones too).
+// AFrame: the frame number
+// Returns the character
+public routine SpinnerFrame(const AFrame: int32): string;
+var
+  LIndex: int32;
+begin
+  // a remainder 0..3 for a negative frame too
+  LIndex := ((AFrame mod 4) + 4) mod 4;
+  if LIndex = 0 then
+    return "|";
+  end;
+  if LIndex = 1 then
+    return "/";
+  end;
+  if LIndex = 2 then
+    return "-";
+  end;
+  return "\\";
+end;
+
+// A line of "-" as wide as the terminal, then a line break.
+public routine HorizontalRule();
+begin
+  WriteText(RuleText("-", GetTerminalWidth()));
+  WriteText(CsiLf);
+end;
+
+// A line of AChar as wide as the terminal, then a line break.
+// AChar: the character
+public routine HorizontalRule(const AChar: string);
+begin
+  WriteText(RuleText(AChar, GetTerminalWidth()));
+  WriteText(CsiLf);
+end;
+
+// A line of AChar AWidth columns wide (<= 0: the terminal's width), then a
+// line break.
+// AChar: the character
+// AWidth: the columns
+public routine HorizontalRule(const AChar: string; const AWidth: int32);
+var
+  LWidth: int32;
+begin
+  LWidth := AWidth;
+  if LWidth <= 0 then
+    LWidth := GetTerminalWidth();
+  end;
+  WriteText(RuleText(AChar, LWidth));
+  WriteText(CsiLf);
+end;
+
+// Writes PadText(AText, AWidth).
+// AText: the text
+// AWidth: the columns to fill
+public routine WritePadded(const AText: string; const AWidth: int32);
+begin
+  WriteText(PadText(AText, AWidth));
+end;
+
+// Writes PadText(AText, AWidth, APad).
+// AText: the text
+// AWidth: the columns to fill
+// APad: the pad character
+public routine WritePadded(const AText: string; const AWidth: int32; const APad: string);
+begin
+  WriteText(PadText(AText, AWidth, APad));
+end;
+
+// Writes PadText(AText, AWidth, APad, AAlign).
+// AText: the text
+// AWidth: the columns to fill
+// APad: the pad character
+// AAlign: where the text sits
+public routine WritePadded(const AText: string; const AWidth: int32; const APad: string; const AAlign: TextAlign);
+begin
+  WriteText(PadText(AText, AWidth, APad, AAlign));
+end;
+
+// A carriage return, then ProgressBarText 40 columns wide in green: called
+// again, it redraws the line.
+// ACurrent: the work done
+// ATotal: all the work
+public routine ProgressBar(const ACurrent: int64; const ATotal: int64);
+begin
+  WriteText(CsiCr);
+  WriteEscape(CsiForeground(TextColor.Green));
+  WriteText(ProgressBarText(ACurrent, ATotal, 40));
+  WriteEscape(CsiResetFormat);
+end;
+
+// A carriage return, then ProgressBarText AWidth columns wide in green.
+// ACurrent: the work done
+// ATotal: all the work
+// AWidth: the bar's columns
+public routine ProgressBar(const ACurrent: int64; const ATotal: int64; const AWidth: int32);
+begin
+  WriteText(CsiCr);
+  WriteEscape(CsiForeground(TextColor.Green));
+  WriteText(ProgressBarText(ACurrent, ATotal, AWidth));
+  WriteEscape(CsiResetFormat);
+end;
+
+// A carriage return, then ProgressBarText in a standard colour.
+// ACurrent: the work done
+// ATotal: all the work
+// AWidth: the bar's columns
+// AColor: the bar's colour
+public routine ProgressBar(const ACurrent: int64; const ATotal: int64; const AWidth: int32; const AColor: TextColor);
+begin
+  WriteText(CsiCr);
+  WriteEscape(CsiForeground(AColor));
+  WriteText(ProgressBarText(ACurrent, ATotal, AWidth));
+  WriteEscape(CsiResetFormat);
+end;
+
+// A carriage return, then ProgressBarText in a 24-bit colour.
+// ACurrent: the work done
+// ATotal: all the work
+// AWidth: the bar's columns
+// AColor: the bar's colour
+public routine ProgressBar(const ACurrent: int64; const ATotal: int64; const AWidth: int32; const AColor: Rgb);
+begin
+  WriteText(CsiCr);
+  WriteEscape(CsiForeground(AColor));
+  WriteText(ProgressBarText(ACurrent, ATotal, AWidth));
+  WriteEscape(CsiResetFormat);
+end;
+
+// Waits for a key press on the console's keyboard (a modifier key alone
+// does not count); returns at once when standard input is not a console /
+// terminal.
+public routine WaitForAnyKey();
+begin
+  DoWaitKey();
+end;
+
+// Whether a key press waits to be read (it is left there); other input
+// events in front of it are taken off the queue.
+// Returns true when a key waits
+public routine AnyKeyPressed(): bool;
+begin
+  return ConsolePlatformKeyWaiting();
+end;
+
+// Writes the message in the colour on a new line and waits for a key.
+// Without AForce it pauses only when the program's console closes with it:
+// on Windows a console no other process shares (the program was started
+// from Explorer), never on Linux (a terminal outlives the program). Keys
+// typed before are dropped first; no keyboard = no pause.
+// AForce: true to pause always
+// AColor: the message's colour
+// AMessage: the message; "" gives "Press any key to continue... "
+public routine Pause(const AForce: bool; const AColor: TextColor; const AMessage: string);
+var
+  LKeyboard: bool;
+  LCloses: bool;
+begin
+  LKeyboard := ConsolePlatformKeyboard();
+  if not LKeyboard then
+    return;
+  end;
+  LCloses := ConsolePlatformClosesWithProgram();
+  if (not AForce) and (not LCloses) then
+    return;
+  end;
+  ConsolePlatformDropKeys();
+  WriteText(CsiLf);
+  WriteEscape(CsiForeground(AColor));
+  if len(AMessage) = 0 then
+    WriteText("Press any key to continue... ");
+  else
+    WriteText(AMessage);
+  end;
+  WriteEscape(CsiResetFormat);
+  WaitForAnyKey();
+  WriteText(CsiLf);
+end;
+
+// Pause(false, TextColor.White, "Press any key to continue... ").
+public routine Pause();
+begin
+  Pause(false, TextColor.White, "");
+end;
+
+// Pause(AForce, TextColor.White, "Press any key to continue... ").
+// AForce: true to pause always
+public routine Pause(const AForce: bool);
+begin
+  Pause(AForce, TextColor.White, "");
+end;
+
+// Pause(AForce, AColor, "Press any key to continue... ").
+// AForce: true to pause always
+// AColor: the message's colour
+public routine Pause(const AForce: bool; const AColor: TextColor);
+begin
+  Pause(AForce, AColor, "");
+end;
+
+// Sets the console window's title: on Windows through the console API, on
+// Linux as CsiTitle (written while EscapesEnabled).
+// ATitle: the title (UTF-8)
+public routine SetTitle(const ATitle: string);
+var
+  LDone: bool;
+begin
+  LDone := ConsolePlatformSetTitle(ATitle);
+  if not LDone then
+    WriteEscape(CsiTitle(ATitle));
+  end;
+end;
+
+// Waits for a key that types a character and returns it as UTF-8 text, the
+// same on both targets: Enter KeyEnter, Backspace KeyBackspace, Escape
+// KeyEscape; keys that type nothing (an arrow, a modifier alone) are
+// skipped.
+// Returns the key's text; "" when standard input is not a console /
+//   terminal
+public routine ReadKey(): string;
+begin
+  return DoReadKey();
+end;
+
+// Reads one line from standard input into ALine, without its line break, as
+// UTF-8 text on both targets (a Windows console reads as UTF-16 and is
+// converted). Standard output is flushed first, so a prompt written with
+// WriteText shows before the read waits.
+// ALine: receives the line; "" for an empty line and at the end of
+//   input
+// Returns true when a line was read; false at the end of input (nothing
+//   left to read, a closed pipe, or Ctrl+Z then Enter in a Windows console)
+// Example: `while ReadLn(LLine) do println("you typed {}", LLine); end;`
+public routine ReadLn(var ALine: string): bool;
+begin
+  return DoReadLine(ALine);
+end;
+
+// Whether a ReadKey result is Enter.
+// AKey: a ReadKey result
+// Returns true for Enter
+// Example: `if IsEnterKey(ReadKey()) then ... end;`
+public routine IsEnterKey(const AKey: string): bool;
+begin
+  return AKey = KeyEnter;
+end;
+
+// Whether a ReadKey result is Escape.
+// AKey: a ReadKey result
+// Returns true for Escape
+public routine IsEscapeKey(const AKey: string): bool;
+begin
+  return AKey = KeyEscape;
+end;
+
+// Waits until ReadKey gives AKey; returns at once with no keyboard (ReadKey
+// gives "").
+// AKey: the key's text (KeyEnter, KeyEscape, "q" ...)
+public routine WaitForKey(const AKey: string);
+var
+  LKey: string;
+begin
+  repeat
+    LKey := ReadKey();
+  until (len(LKey) = 0) or (LKey = AKey);
+end;
+
+// Waits until ReadKey gives Enter; returns at once with no keyboard.
+public routine WaitForKey();
+begin
+  WaitForKey(KeyEnter);
+end;
+
+// Writes the message on a new line, reads a line from standard input and
+// tells whether it equals AQuitWord, ASCII letters compared without case.
+// AMessage: the message; "" gives "Press ENTER to continue..."
+// AQuitWord: the word that answers true; "" never does
+// Returns true when the line is AQuitWord
+// Example: `if WaitForEnter("Again? (q quits) ", "q") then ... end;`
+public routine WaitForEnter(const AMessage: string; const AQuitWord: string): bool;
+var
+  LLine: string;
+begin
+  WriteText(CsiLf);
+  if len(AMessage) = 0 then
+    WriteText("Press ENTER to continue...");
+  else
+    WriteText(AMessage);
+  end;
+  WriteEscape(CsiResetFormat);
+  LLine := DoReadLineText();
+  WriteText(CsiLf);
+  if len(AQuitWord) = 0 then
+    return false;
+  end;
+  return DoSameAsciiText(LLine, AQuitWord);
+end;
+
+// WaitForEnter("Press ENTER to continue...", "").
+// Returns false
+public routine WaitForEnter(): bool;
+begin
+  return WaitForEnter("", "");
+end;
+
+// WaitForEnter(AMessage, "").
+// AMessage: the message; "" gives "Press ENTER to continue..."
+// Returns false
+public routine WaitForEnter(const AMessage: string): bool;
+begin
+  return WaitForEnter(AMessage, "");
+end;
+
+end.

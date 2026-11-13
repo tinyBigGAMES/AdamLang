@@ -1,0 +1,515 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.Console.Win64.adam - System.Console's platform unit for
+  x86_64-windows-gnu: the console calls over the Win32 API (kernel32).
+
+  System.Console imports exactly one platform unit, picked by the target
+  triple; each one has the same ConsolePlatform* routines, so the console
+  unit itself names no OS (a linux64 target adds System.Console.Linux64 over
+  isatty / ioctl / termios / poll). Text is UTF-8 on the Adam side; the
+  console's own input is read as UTF-16 (ReadConsoleInputW / ReadConsoleW),
+  so typed text keeps every character; a standard input that is a file or a
+  pipe is read as its bytes. Nothing here writes to standard output.
+*******************************************************************************/
+
+module unit System.Console.Win64;
+
+import System.SysUtils, System.Windows;
+
+const
+  ADAM_CONSOLE_INVALID_HANDLE: uint64 = 0xFFFFFFFFFFFFFFFF;
+  // GetStdHandle's standard input (DWORD)-10 and output (DWORD)-11
+  ADAM_CONSOLE_STD_INPUT: uint32 = 0xFFFFFFF6;
+  ADAM_CONSOLE_STD_OUTPUT: uint32 = 0xFFFFFFF5;
+  // SetConsoleMode's ENABLE_VIRTUAL_TERMINAL_PROCESSING (an output handle's mode)
+  ADAM_CONSOLE_VT_PROCESSING: uint32 = 0x0004;
+  // UTF-8's code page (SetConsoleOutputCP)
+  ADAM_CONSOLE_CP_UTF8: uint32 = 65001;
+  // INPUT_RECORD's EventType for a key
+  ADAM_CONSOLE_KEY_EVENT: uint16 = 0x0001;
+  // The UTF-16 units one ReadConsoleW call reads at most
+  ADAM_CONSOLE_READ_UNITS: uint32 = 256;
+  // The bytes one ReadFile of a redirected standard input reads at most
+  ADAM_CONSOLE_READ_BYTES: uint32 = 4096;
+  // Ctrl+Z: a console line holding it alone is the console's end of input
+  ADAM_CONSOLE_CTRL_Z: uint16 = 0x1A;
+
+type
+  // KEY_EVENT_RECORD inside INPUT_RECORD (the union's key member; every other event kind
+  // fits in the same 16 bytes)
+  ConsoleInputRecord = record
+    EventType: uint16;
+    Reserved: uint16;
+    KeyDown: int32;
+    RepeatCount: uint16;
+    VirtualKeyCode: uint16;
+    VirtualScanCode: uint16;
+    UnicodeChar: uint16;
+    ControlKeyState: uint32;
+  end;
+
+  // CONSOLE_SCREEN_BUFFER_INFO
+  ConsoleScreenInfo = record
+    SizeX: int16;
+    SizeY: int16;
+    CursorX: int16;
+    CursorY: int16;
+    Attributes: uint16;
+    WindowLeft: int16;
+    WindowTop: int16;
+    WindowRight: int16;
+    WindowBottom: int16;
+    MaximumX: int16;
+    MaximumY: int16;
+  end;
+
+  // The UTF-16 units of one ReadConsoleW
+  ConsoleReadUnits = array[0..255] of uint16;
+  // The bytes of one ReadFile of a redirected standard input
+  ConsoleReadBytes = array[0..4095] of uint8;
+  // GetConsoleProcessList's list: two entries are enough to tell "this process alone"
+  ConsoleProcessList = array[0..1] of uint32;
+
+  // A WideBuffer on the heap (a title's UTF-16): its 64 KB kept off the stack frame
+  ConsoleWideBox = final object
+    Data: WideBuffer;
+  end;
+
+routine clink GetStdHandle(AStdHandle: uint32): uint64; external "kernel32";
+routine clink GetConsoleMode(AConsole: uint64; var AMode: uint32): int32; external "kernel32";
+routine clink SetConsoleMode(AConsole: uint64; AMode: uint32): int32; external "kernel32";
+routine clink SetConsoleOutputCP(ACodePage: uint32): int32; external "kernel32";
+routine clink GetConsoleScreenBufferInfo(AConsole: uint64; var AInfo: ConsoleScreenInfo): int32;
+  external "kernel32";
+routine clink FlushConsoleInputBuffer(AConsole: uint64): int32; external "kernel32";
+routine clink GetConsoleProcessList(var AList: ConsoleProcessList; ACount: uint32): uint32;
+  external "kernel32";
+routine clink ReadConsoleInputW(AConsole: uint64; var ARecord: ConsoleInputRecord;
+  ALength: uint32; var ARead: uint32): int32; external "kernel32";
+routine clink PeekConsoleInputW(AConsole: uint64; var ARecord: ConsoleInputRecord;
+  ALength: uint32; var ARead: uint32): int32; external "kernel32";
+routine clink GetNumberOfConsoleInputEvents(AConsole: uint64; var ACount: uint32): int32;
+  external "kernel32";
+routine clink ReadConsoleW(AConsole: uint64; var ABuffer: ConsoleReadUnits; AToRead: uint32;
+  var ARead: uint32; AControl: ptr): int32; external "kernel32";
+routine clink ReadFile(AFile: uint64; var ABuffer: ConsoleReadBytes; AToRead: uint32;
+  var ARead: uint32; AOverlapped: ptr): int32; external "kernel32";
+routine clink SetConsoleTitleW(var ATitle: WideBuffer): int32; external "kernel32";
+
+var
+  // A redirected standard input's bytes read but not yet taken by a line (ConsolePlatformReadLine)
+  GInBytes: ConsoleReadBytes;
+  GInCount: int64;
+  GInAt: int64;
+
+// The standard handle AWhich when it is a console (GetConsoleMode takes it), else 0
+routine DoConsoleHandle(const AWhich: uint32): uint64;
+var
+  LHandle: uint64;
+  LMode: uint32;
+begin
+  LHandle := GetStdHandle(AWhich);
+  if (LHandle = 0) or (LHandle = ADAM_CONSOLE_INVALID_HANDLE) then
+    return 0;
+  end;
+  // GetConsoleMode fails on anything that is not a console: a pipe, a file, NUL
+  LMode := 0;
+  if GetConsoleMode(LHandle, LMode) = 0 then
+    return 0;
+  end;
+  return LHandle;
+end;
+
+// The screen buffer facts of a console standard output; false when it is none
+routine DoScreenInfo(var AInfo: ConsoleScreenInfo): bool;
+var
+  LOut: uint64;
+begin
+  LOut := DoConsoleHandle(ADAM_CONSOLE_STD_OUTPUT);
+  if LOut = 0 then
+    return false;
+  end;
+  return GetConsoleScreenBufferInfo(LOut, AInfo) <> 0;
+end;
+
+// True for a virtual key that is a modifier or a lock alone (shift, control, alt, the
+// Windows keys, caps / num / scroll lock): VK_SHIFT .. VK_MENU, VK_CAPITAL, VK_LWIN / VK_RWIN,
+// VK_NUMLOCK / VK_SCROLL, VK_LSHIFT .. VK_RMENU
+routine DoIsModifierKey(const AKey: uint16): bool;
+begin
+  if (AKey >= 0x10) and (AKey <= 0x12) then
+    return true;
+  end;
+  if (AKey = 0x14) or (AKey = 0x5B) or (AKey = 0x5C) or (AKey = 0x90) or (AKey = 0x91) then
+    return true;
+  end;
+  return (AKey >= 0xA0) and (AKey <= 0xA5);
+end;
+
+// A key going down that is not a modifier alone
+routine DoIsKeyPress(const ARecord: ConsoleInputRecord): bool;
+begin
+  return (ARecord.EventType = ADAM_CONSOLE_KEY_EVENT) and (ARecord.KeyDown <> 0) and
+    not DoIsModifierKey(ARecord.VirtualKeyCode);
+end;
+
+// ACode written into AText at AAt as UTF-8, AAt past it; AText grows (doubling) when the
+// room EncodeUtf8Char needs is not there
+routine DoPutCode(var AText: string; var AAt: int64; const ACode: uint32);
+var
+  LSize: int64;
+begin
+  if AAt + 4 > len(AText) then
+    LSize := len(AText) * 2;
+    if LSize < 64 then
+      LSize := 64;
+    end;
+    setlength(AText, LSize);
+  end;
+  EncodeUtf8Char(AText, AAt, ACode);
+end;
+
+// True when standard output is a console (a pipe, a file or NUL is not)
+public routine ConsolePlatformIsTerminal(): bool;
+begin
+  return DoConsoleHandle(ADAM_CONSOLE_STD_OUTPUT) <> 0;
+end;
+
+// A console standard output made to take UTF-8 text and VT sequences: true when it does;
+// false when standard output is no console or the console takes no VT sequences
+public routine ConsolePlatformEnableEscapes(): bool;
+var
+  LOut: uint64;
+  LMode: uint32;
+begin
+  LOut := DoConsoleHandle(ADAM_CONSOLE_STD_OUTPUT);
+  if LOut = 0 then
+    return false;
+  end;
+  SetConsoleOutputCP(ADAM_CONSOLE_CP_UTF8);
+  LMode := 0;
+  GetConsoleMode(LOut, LMode);
+  if (LMode & ADAM_CONSOLE_VT_PROCESSING) <> 0 then
+    return true;
+  end;
+  return SetConsoleMode(LOut, LMode | ADAM_CONSOLE_VT_PROCESSING) <> 0;
+end;
+
+// The console window's visible columns; 0 when standard output is no console
+public routine ConsolePlatformWidth(): int32;
+var
+  LInfo: ConsoleScreenInfo;
+begin
+  if not DoScreenInfo(LInfo) then
+    return 0;
+  end;
+  return int32(LInfo.WindowRight) - int32(LInfo.WindowLeft) + 1;
+end;
+
+// The console window's visible lines; 0 when standard output is no console
+public routine ConsolePlatformHeight(): int32;
+var
+  LInfo: ConsoleScreenInfo;
+begin
+  if not DoScreenInfo(LInfo) then
+    return 0;
+  end;
+  return int32(LInfo.WindowBottom) - int32(LInfo.WindowTop) + 1;
+end;
+
+// True when standard input is a console (a keyboard to read)
+public routine ConsolePlatformKeyboard(): bool;
+begin
+  return DoConsoleHandle(ADAM_CONSOLE_STD_INPUT) <> 0;
+end;
+
+// The keys typed so far dropped
+public routine ConsolePlatformDropKeys();
+var
+  LIn: uint64;
+begin
+  LIn := DoConsoleHandle(ADAM_CONSOLE_STD_INPUT);
+  if LIn <> 0 then
+    FlushConsoleInputBuffer(LIn);
+  end;
+end;
+
+// True when the console belongs to this program alone and closes when it ends (no other
+// process shares it: a program started from Explorer)
+public routine ConsolePlatformClosesWithProgram(): bool;
+var
+  LList: ConsoleProcessList;
+begin
+  LList[0] := 0;
+  LList[1] := 0;
+  return GetConsoleProcessList(LList, 2) = 1;
+end;
+
+// Waits for a key press on a console standard input (a modifier alone, a release, the mouse
+// or a resize do not count); returns at once when standard input is no console
+public routine ConsolePlatformWaitKey();
+var
+  LIn: uint64;
+  LOldMode: uint32;
+  LRecord: ConsoleInputRecord;
+  LRead: uint32;
+begin
+  LIn := DoConsoleHandle(ADAM_CONSOLE_STD_INPUT);
+  if LIn = 0 then
+    return;
+  end;
+  LOldMode := 0;
+  GetConsoleMode(LIn, LOldMode);
+  SetConsoleMode(LIn, 0);
+  LRead := 0;
+  // A failed read ends the wait (no record to look at)
+  while (ReadConsoleInputW(LIn, LRecord, 1, LRead) <> 0) and (LRead = 1) do
+    if DoIsKeyPress(LRecord) then
+      leave;
+    end;
+  end;
+  SetConsoleMode(LIn, LOldMode);
+end;
+
+// True while a key press waits to be read; the events before it that are no key press leave
+// the queue, the key press itself stays. False when standard input is no console
+public routine ConsolePlatformKeyWaiting(): bool;
+var
+  LIn: uint64;
+  LCount: uint32;
+  LRecord: ConsoleInputRecord;
+  LRead: uint32;
+begin
+  LIn := DoConsoleHandle(ADAM_CONSOLE_STD_INPUT);
+  if LIn = 0 then
+    return false;
+  end;
+  LCount := 0;
+  while (GetNumberOfConsoleInputEvents(LIn, LCount) <> 0) and (LCount > 0) do
+    LRead := 0;
+    if (PeekConsoleInputW(LIn, LRecord, 1, LRead) = 0) or (LRead = 0) then
+      return false;
+    end;
+    if DoIsKeyPress(LRecord) then
+      return true;
+    end;
+    // Not a key press: only this event leaves the queue
+    if ReadConsoleInputW(LIn, LRecord, 1, LRead) = 0 then
+      return false;
+    end;
+  end;
+  return false;
+end;
+
+// The next typed character as UTF-8 text (a character outside the BMP from its surrogate
+// pair); a key that types nothing (an arrow, a modifier) is passed over. "" when standard
+// input is no console or a read fails
+public routine ConsolePlatformReadKey(): string;
+var
+  LIn: uint64;
+  LOldMode: uint32;
+  LRecord: ConsoleInputRecord;
+  LRead: uint32;
+  LHigh: uint32;
+  LUnit: uint32;
+  LKey: string;
+  LAt: int64;
+begin
+  LIn := DoConsoleHandle(ADAM_CONSOLE_STD_INPUT);
+  if LIn = 0 then
+    return "";
+  end;
+  LOldMode := 0;
+  GetConsoleMode(LIn, LOldMode);
+  SetConsoleMode(LIn, 0);
+  LKey := "";
+  LAt := 0;
+  LHigh := 0;
+  LRead := 0;
+  // A failed read ends the wait with no key
+  while (ReadConsoleInputW(LIn, LRecord, 1, LRead) <> 0) and (LRead = 1) do
+    if (LRecord.EventType = ADAM_CONSOLE_KEY_EVENT) and (LRecord.KeyDown <> 0) and
+      (LRecord.UnicodeChar <> 0) then
+      LUnit := uint32(LRecord.UnicodeChar);
+      if (LUnit >= 0xD800) and (LUnit <= 0xDBFF) then
+        // The first half of a character outside the BMP: its second comes next
+        LHigh := LUnit;
+      else
+        if (LUnit >= 0xDC00) and (LUnit <= 0xDFFF) then
+          if LHigh <> 0 then
+            DoPutCode(LKey, LAt, 0x10000 + ((LHigh - 0xD800) shl 10) + (LUnit - 0xDC00));
+            leave;
+          end;
+        else
+          DoPutCode(LKey, LAt, LUnit);
+          leave;
+        end;
+      end;
+    end;
+  end;
+  SetConsoleMode(LIn, LOldMode);
+  setlength(LKey, LAt);
+  return LKey;
+end;
+
+// One line from a console standard input as UTF-8 (read as UTF-16, a surrogate pair kept
+// whole across reads, a lone surrogate U+FFFD), its line break left out. False at the end of
+// input (nothing read, or a line that is Ctrl+Z alone), ALine then ""
+routine DoReadConsoleLine(const AIn: uint64; var ALine: string): bool;
+var
+  LUnits: ConsoleReadUnits;
+  LRead: uint32;
+  LI: int64;
+  LUnit: uint32;
+  LHigh: uint32;
+  LAt: int64;
+  LBreak: bool;
+  LEnded: bool;
+  LCount: int64;
+  LCtrlZ: bool;
+begin
+  ALine := "";
+  LAt := 0;
+  LBreak := false;
+  LEnded := false;
+  LCount := 0;
+  LCtrlZ := false;
+  LHigh := 0;
+  LRead := 0;
+  while (not LBreak) and (ReadConsoleW(AIn, LUnits, ADAM_CONSOLE_READ_UNITS, LRead, nil) <> 0) and
+    (LRead > 0) do
+    for LI := 0 to int64(LRead) - 1 do
+      LUnit := uint32(LUnits[LI]);
+      if LUnit = 0x0A then
+        LBreak := true;
+        leave;
+      end;
+      // Past a CR the line's text has ended: only its LF is waited for
+      if LUnit = 0x0D then
+        LEnded := true;
+      end;
+      if not LEnded then
+        LCount := LCount + 1;
+        LCtrlZ := (LCount = 1) and (LUnit = uint32(ADAM_CONSOLE_CTRL_Z));
+        if (LUnit >= 0xDC00) and (LUnit <= 0xDFFF) and (LHigh <> 0) then
+          DoPutCode(ALine, LAt, 0x10000 + ((LHigh - 0xD800) shl 10) + (LUnit - 0xDC00));
+          LHigh := 0;
+        else
+          if LHigh <> 0 then
+            DoPutCode(ALine, LAt, ADAM_SYSUTILS_REPLACEMENT);
+            LHigh := 0;
+          end;
+          if (LUnit >= 0xD800) and (LUnit <= 0xDBFF) then
+            LHigh := LUnit;
+          else
+            if (LUnit >= 0xDC00) and (LUnit <= 0xDFFF) then
+              DoPutCode(ALine, LAt, ADAM_SYSUTILS_REPLACEMENT);
+            else
+              DoPutCode(ALine, LAt, LUnit);
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
+  if LHigh <> 0 then
+    DoPutCode(ALine, LAt, ADAM_SYSUTILS_REPLACEMENT);
+  end;
+  setlength(ALine, LAt);
+  // Ctrl+Z then Enter is the console's end of input
+  if LCtrlZ and (LCount = 1) then
+    ALine := "";
+    return false;
+  end;
+  return LBreak or (LAt > 0);
+end;
+
+// The next byte of a redirected standard input into AByte; false at its end
+routine DoReadInputByte(var AByte: uint8): bool;
+var
+  LIn: uint64;
+  LRead: uint32;
+begin
+  if GInAt >= GInCount then
+    LIn := GetStdHandle(ADAM_CONSOLE_STD_INPUT);
+    if (LIn = 0) or (LIn = ADAM_CONSOLE_INVALID_HANDLE) then
+      return false;
+    end;
+    LRead := 0;
+    if (ReadFile(LIn, GInBytes, ADAM_CONSOLE_READ_BYTES, LRead, nil) = 0) or (LRead = 0) then
+      return false;
+    end;
+    GInCount := int64(LRead);
+    GInAt := 0;
+  end;
+  AByte := GInBytes[GInAt];
+  GInAt := GInAt + 1;
+  return true;
+end;
+
+// One line from standard input into ALine, its line break (LF, or CR LF) left out. A console
+// is read as UTF-16, anything else as its bytes. False at the end of input, ALine then ""; a
+// last line with no line break is still a line
+public routine ConsolePlatformReadLine(var ALine: string): bool;
+var
+  LIn: uint64;
+  LByte: uint8;
+  LAt: int64;
+begin
+  LIn := DoConsoleHandle(ADAM_CONSOLE_STD_INPUT);
+  if LIn <> 0 then
+    return DoReadConsoleLine(LIn, ALine);
+  end;
+  ALine := "";
+  LAt := 0;
+  if not DoReadInputByte(LByte) then
+    return false;
+  end;
+  while LByte <> 0x0A do
+    if LAt >= len(ALine) then
+      setlength(ALine, len(ALine) * 2 + 64);
+    end;
+    ALine[LAt] := char(LByte);
+    LAt := LAt + 1;
+    if not DoReadInputByte(LByte) then
+      leave;
+    end;
+  end;
+  if (LAt > 0) and (ALine[LAt - 1] = char(0x0D)) then
+    LAt := LAt - 1;
+  end;
+  setlength(ALine, LAt);
+  return true;
+end;
+
+// The console window's title set through the OS: true (Windows' console API holds the title,
+// no escape sequence is needed); false when the title does not fit Win32's limit
+public routine ConsolePlatformSetTitle(const ATitle: string): bool;
+var
+  LBox: own ConsoleWideBox;
+begin
+  LBox := own ConsoleWideBox();
+  if not Utf8ToWide(ATitle, LBox.Data) then
+    return false;
+  end;
+  SetConsoleTitleW(LBox.Data);
+  return true;
+end;
+
+end.
