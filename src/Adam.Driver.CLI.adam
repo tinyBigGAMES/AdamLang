@@ -65,10 +65,16 @@
   the folder it landed in, on adam's own console (System.Windows'
   RunAttached), adam's exit code then the program's.
 
-  On a console that takes VT sequences (System.Windows' EnableConsoleColor)
+  On a console that takes VT sequences (System.Console's EscapesEnabled)
   the banner, the help (HelpOut) and every report's severity word
   (Diagnostics.SetColor) are in color; piped or redirected, every line is
   plain text, byte for byte what the rows compare.
+
+  A build never looks hung (CliPhases): on such a console the running
+  phase's line is drawn in place and redrawn as each step starts (the unit
+  and its step: `Lowering 12/68 Adam.Opt.Gvn: optimize ... 23s`) and each
+  second by a ticker task, then overwritten by the phase's final line;
+  piped, redirected or under --quiet only the final lines print.
 
   A command line mistake is one Error with no place (CL codes, texts in
   Adam.Core.Messages) ending in the help to see, reported into the compile's
@@ -80,7 +86,8 @@
 
 module unit Adam.Driver.CLI;
 
-import System.SysUtils, System.Windows, System.Runtime, System.CustomIO, Adam.Core.Common,
+import System.SysUtils, System.Windows, System.Runtime, System.CustomIO, System.Console,
+  Adam.Core.Common,
   Adam.Core.Messages, Adam.Target, Adam.Target.Registry, Adam.Compiler.SourceText,
   Adam.Compiler.Diagnostics, Adam.Acu.Format, Adam.Driver.Project, Adam.Driver.Compiler;
 
@@ -1222,17 +1229,55 @@ begin
   return IntToStr(AMilliseconds div 1000) + "." + LFraction;
 end;
 
+var
+  // Set as the process ends (DoLiveQuit, an exit handler): a ticker still running stops at its
+  // next wake and draws nothing more, so an exit (Halt) never waits on it
+  GLiveQuit: int32;
+
+// The exit handler CliPhases registers when it draws live: the ticker's stop at any exit
+routine DoLiveQuit();
+begin
+  atomicstore(GLiveQuit, 1);
+end;
+
 type
   // The phase lines: one line per phase as it ends, printed into an output with the time
-  // since the phase before it ended (the first: since the listener was made)
+  // since the phase before it ended (the first: since the listener was made). On a console
+  // that takes VT sequences (Live) the running phase's line is drawn in place too: its text
+  // (the phase, the unit and step it is at) and its whole seconds, redrawn as each step
+  // starts and each second (Tick, a ticker task's), overwritten by the final line. Every
+  // write to the screen is made holding FLine, so the ticker and the compile never mix
   CliPhases = object(PhaseListener)
     hidden FOut: ref HelpOut;
     hidden FLast: int64;
+    hidden FLive: bool;
+    hidden FLine: mutex;
+    // The running phase's live text ("" while none runs), whether a live line is on the
+    // screen, and whether the compile is over (Finish: nothing is drawn after it)
+    hidden FText: string;
+    hidden FShown: bool;
+    hidden FDone: bool;
+    // Held by the compile while it runs (DoCompileLive): the ticker sleeps on it and stops
+    // once it is free
+    Hold: mutex;
 
     init(const AOut: ref HelpOut);
     begin
       self.FOut := AOut;
       self.FLast := TickCountMs();
+      self.FLive := EscapesEnabled();
+      self.FText := "";
+      self.FShown := false;
+      self.FDone := false;
+      if self.FLive then
+        AtExit(DoLiveQuit);
+      end;
+    end;
+
+    // True when the running phase is drawn in place (a console that takes VT sequences)
+    const method Live(): bool;
+    begin
+      return self.FLive;
     end;
 
     // The phase line's arguments before its seconds, filled into its template
@@ -1256,18 +1301,228 @@ type
         .Fill(ADAM_MSG_CLI_PHASE_LINK);
     end;
 
+    // The running phase's own word (Parsing, Analyzing ...)
+    hidden const method DoLiveWord(const APhase: BuildPhase): string;
+    begin
+      if APhase = BuildPhase.Parse then
+        return ADAM_MSG_CLI_LIVE_PARSE;
+      end;
+      if APhase = BuildPhase.Analyze then
+        return ADAM_MSG_CLI_LIVE_ANALYZE;
+      end;
+      if APhase = BuildPhase.Lower then
+        return ADAM_MSG_CLI_LIVE_LOWER;
+      end;
+      if APhase = BuildPhase.Generate then
+        return ADAM_MSG_CLI_LIVE_GENERATE;
+      end;
+      return ADAM_MSG_CLI_LIVE_LINK;
+    end;
+
+    // A unit step's own word (lower, optimize, generate, write)
+    hidden const method DoStepWord(const AStep: BuildStep): string;
+    begin
+      if AStep = BuildStep.Lower then
+        return ADAM_MSG_CLI_STEP_LOWER;
+      end;
+      if AStep = BuildStep.Optimize then
+        return ADAM_MSG_CLI_STEP_OPTIMIZE;
+      end;
+      if AStep = BuildStep.Generate then
+        return ADAM_MSG_CLI_STEP_GENERATE;
+      end;
+      return ADAM_MSG_CLI_STEP_WRITE;
+    end;
+
+    // AText cut to the terminal's width less one column (by display columns), so the live
+    // line never wraps: a wrapped line is not redrawn in place
+    hidden const method DoFit(const AText: string): string;
+    var
+      LLimit: int64;
+      LColumns: int64;
+      LIndex: int64;
+      LStart: int64;
+    begin
+      LLimit := int64(GetTerminalWidth()) - 1;
+      if DisplayWidth(AText) <= LLimit then
+        return AText;
+      end;
+      LColumns := 0;
+      LIndex := 0;
+      while LIndex < len(AText) do
+        LStart := LIndex;
+        DecodeUtf8Char(AText, LIndex);
+        LColumns := LColumns + DisplayWidth(Substring(AText, LStart, LIndex - LStart));
+        if LColumns > LLimit then
+          return Substring(AText, 0, LStart);
+        end;
+      end;
+      return AText;
+    end;
+
+    // The live line drawn again (its text and the whole seconds since its phase started) in
+    // place of the one on the screen; held FLine is the caller's
+    hidden method DoDraw();
+    var
+      LSeconds: int64;
+    begin
+      if (self.FText = "") or self.FDone or (atomicload(GLiveQuit) <> 0) then
+        return;
+      end;
+      LSeconds := (TickCountMs() - self.FLast) div 1000;
+      WriteText(CsiCr + CsiClearLine +
+        self.DoFit(NoArgs().Str(self.FText).Int(LSeconds).Fill(ADAM_MSG_CLI_LIVE_LINE)));
+      self.FShown := true;
+    end;
+
+    // The live line on the screen (if any) erased, the cursor at its start; held FLine is the
+    // caller's
+    hidden method DoErase();
+    begin
+      if self.FShown then
+        WriteText(CsiCr + CsiClearLine);
+        self.FShown := false;
+      end;
+    end;
+
+    // The live text set to AText and drawn
+    hidden method DoShow(const AText: string);
+    begin
+      lock (self.FLine) do
+        self.FText := AText;
+        self.DoDraw();
+      end;
+    end;
+
+    override method PhaseStarted(const APhase: BuildPhase);
+    begin
+      if self.FLive then
+        self.DoShow(self.DoLiveWord(APhase));
+      end;
+    end;
+
+    override method StepStarted(const APhase: BuildPhase; const AStep: BuildStep;
+      const ADone: int64; const ATotal: int64; const AUnit: string);
+    var
+      LWord: string;
+    begin
+      if not self.FLive then
+        return;
+      end;
+      LWord := self.DoLiveWord(APhase);
+      if AStep = BuildStep.Program then
+        self.DoShow(NoArgs().Str(LWord).Fill(ADAM_MSG_CLI_LIVE_PROGRAM));
+        return;
+      end;
+      if AStep = BuildStep.Merge then
+        self.DoShow(NoArgs().Str(LWord).Int(ADone).Int(ATotal).Str(AUnit)
+          .Fill(ADAM_MSG_CLI_LIVE_MERGE));
+        return;
+      end;
+      // A unit compiled during Parse (a stale import) is not counted among the build's units
+      if ATotal = 0 then
+        self.DoShow(NoArgs().Str(LWord).Str(AUnit).Str(self.DoStepWord(AStep))
+          .Fill(ADAM_MSG_CLI_LIVE_IMPORT));
+        return;
+      end;
+      self.DoShow(NoArgs().Str(LWord).Int(ADone).Int(ATotal).Str(AUnit)
+        .Str(self.DoStepWord(AStep)).Fill(ADAM_MSG_CLI_LIVE_UNIT));
+    end;
+
     override method PhaseEnded(const APhase: BuildPhase; const AFirst: int64;
       const ASecond: int64; const AText: string);
     var
       LNow: int64;
     begin
-      LNow := TickCountMs();
-      self.FOut.Line(self.DoText(APhase, AFirst, ASecond, AText, DoSeconds(LNow - self.FLast)));
-      // Seen as the phase ends even when stdout is a file or a pipe (a build's log)
-      FlushOutput();
-      self.FLast := LNow;
+      lock (self.FLine) do
+        LNow := TickCountMs();
+        self.DoErase();
+        self.FText := "";
+        self.FOut.Line(self.DoText(APhase, AFirst, ASecond, AText, DoSeconds(LNow - self.FLast)));
+        // Seen as the phase ends even when stdout is a file or a pipe (a build's log)
+        FlushOutput();
+        self.FLast := LNow;
+      end;
+    end;
+
+    // The ticker's one wait (its task, DoTick): sleeps until the running phase's next whole
+    // second, or until Hold is free (the compile is over); redraws the live line on waking
+    // while the compile runs. False once the ticker is to stop
+    method Tick(): bool;
+    var
+      LWait: int64;
+      LGo: bool;
+    begin
+      if atomicload(GLiveQuit) <> 0 then
+        return false;
+      end;
+      lock (self.FLine) do
+        LWait := 1000 - ((TickCountMs() - self.FLast) mod 1000);
+      end;
+      LGo := true;
+      trylock (self.Hold) wait LWait do
+        LGo := false;
+      else
+        lock (self.FLine) do
+          self.DoDraw();
+        end;
+      end;
+      return LGo and (atomicload(GLiveQuit) = 0);
+    end;
+
+    // The compile is over: a live line still on the screen (a phase an error ended) erased,
+    // nothing drawn after this
+    method Finish();
+    begin
+      lock (self.FLine) do
+        self.DoErase();
+        self.FText := "";
+        self.FDone := true;
+      end;
     end;
   end;
+
+// The ticker task of a live CliPhases: one Tick after another until it says stop
+routine DoTick(const APhases: ref CliPhases);
+begin
+  while APhases.Tick() do
+  end;
+end;
+
+// The compile ARequest asks for: AMain checked (ACheck) or built into ARequest.Output
+routine DoCompile(const ACompiler: ref Compiler; const ACheck: bool; const APath: string;
+  const AOutput: string);
+begin
+  if ACheck then
+    ACompiler.Check(APath);
+  else
+    ACompiler.Build(APath, AOutput);
+  end;
+end;
+
+// The compile as DoCompile runs it, with the live phase line when APhases draws one (not nil
+// and Live): the compile holds APhases.Hold while it runs, a ticker task redraws the line
+// each second meanwhile and stops once Hold is free; the live line is erased at the end on
+// every way out (Finish), before any report prints
+routine DoCompileLive(const APhases: ref CliPhases; const ACompiler: ref Compiler;
+  const ACheck: bool; const APath: string; const AOutput: string);
+var
+  LTicker: task;
+begin
+  if (APhases = nil) or not APhases.Live() then
+    DoCompile(ACompiler, ACheck, APath, AOutput);
+    return;
+  end;
+  lock (APhases.Hold) do
+    LTicker := async DoTick(APhases);
+    guard
+      DoCompile(ACompiler, ACheck, APath, AOutput);
+    finally
+      APhases.Finish();
+    end;
+  end;
+  await LTicker;
+end;
 
 // -r: the exe the build wrote (ACompiler.ExePath), run in the folder it landed in with
 // ARequest.RunArgs on adam's own stdin / stdout / stderr; adam's lines are flushed first, so a
@@ -1574,12 +1829,13 @@ begin
   end;
   // A line per phase as it ends (not under --quiet); made here so the first phase's time
   // starts with the compile
+  LPhases := nil;
   if not ARequest.Quiet then
     LPhases := ref CliPhases(AOut);
     ACompiler.SetListener(LPhases);
   end;
   if LSpec.Id = CliCommand.Check then
-    ACompiler.Check(ARequest.Positional);
+    DoCompileLive(LPhases, ACompiler, true, ARequest.Positional, "");
     ACompiler.PrintReports();
     return ACompiler.ExitCode();
   end;
@@ -1588,7 +1844,7 @@ begin
   if LCode <> ADAM_DRIVER_EXIT_OK then
     return LCode;
   end;
-  ACompiler.Build(LMain, ARequest.Output);
+  DoCompileLive(LPhases, ACompiler, false, LMain, ARequest.Output);
   ACompiler.PrintReports();
   // The status line: a build that wrote its exe says so, the main module (as given, or the
   // project's) and the exe as written, with the time it took (not under --quiet)
@@ -1617,7 +1873,7 @@ begin
   SetHeapReport(false);
   // Color only on a console that takes VT sequences; piped or redirected, every line is
   // plain (what a file, another program and adamtest read)
-  LColor := EnableConsoleColor();
+  LColor := EscapesEnabled();
   LOut := ref HelpOut(LColor);
   LCompiler := ref Compiler();
   LCompiler.Reports.SetColor(LColor);
