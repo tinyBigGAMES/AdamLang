@@ -433,6 +433,7 @@ public const
   ADAM_LOWERING_PAD_VALUE_BYTES: int64 = 8;
   // The directive that adds a library to the build (BNF sec 2), recorded on the IR module
   ADAM_LOWERING_DIRECTIVE_LINK: string = "@linklibrary";
+  ADAM_LOWERING_DIRECTIVE_MESSAGE: string = "@message";
 
   // Raised when a typed ptr's target or a static array's element has no size (Layout gave
   // none: a broken invariant, never a program's fault)
@@ -599,6 +600,10 @@ public type
   // element at the same index (DoCopyValue)
   ElementWalk = choices(Built, Ended, Copied);
 
+  // The form an assignment used as a value is read back in (DoAssignedValue): a scalar, a
+  // managed value's block, an aggregate's address
+  AssignedForm = choices(Scalar, Managed, Aggregate);
+
   // A place as SU2.8 e4 compares it (DoPlacePath): the fields, embeds and module variables
   // its storage lies in (Decls, Count of them), its root and the root's declaration
   // (Root: 0 for None, Receiver and Unknown)
@@ -665,6 +670,12 @@ public type
     hidden FNextOf: array of int64;
     // The routines given a function, in AST order (their bodies are lowered after)
     hidden FRoutines: ref Int64List;
+    // While an assignment used as a value is lowered (DoAssignedValue): by node id under its
+    // target (FPinRoot), the address each place there got (the target's own included) and
+    // the value each expression strictly below the target got, so reading the target back
+    // makes none of them again (nil: no such assignment)
+    hidden FPinned: ref Int64Map;
+    hidden FPinRoot: int64;
     // Where code goes now: the function, its current block
     hidden FFunction: int64;
     hidden FBlock: int64;
@@ -923,6 +934,8 @@ public type
       setlength(self.FExitOf, ATree.Count);
       setlength(self.FNextOf, ATree.Count);
       self.FRoutines := ref Int64List();
+      self.FPinned := nil;
+      self.FPinRoot := 0;
       self.FDeclaredRoutines := ref Int64Map(0);
       self.FFunction := 0;
       self.FBlock := 0;
@@ -4751,7 +4764,8 @@ public type
     // The address an aggregate value AId (DoIsAggregate) is copied from: the place it names
     // (through parentheses), a record literal's slot (DoRecordLiteral), a set literal's
     // read-only bytes (DoSetLiteral), a set operation's slot (DoSetOperation), a call's
-    // result slot (DoCallResult); 0 after LW0001 for any other aggregate value
+    // result slot (DoCallResult), an assignment's target (DoAssignedValue); 0 after LW0001
+    // for any other aggregate value
     hidden method DoAggregateSource(const AId: int64): int64;
     var
       LAt: int64;
@@ -4762,6 +4776,10 @@ public type
       end;
       if self.DoIsPackAccess(LAt) then
         return self.DoPackSourceAddress(LAt);
+      end;
+      // an assignment's value: its target after the write
+      if self.FTree[LAt].Kind = NodeKind.AssignExpression then
+        return self.DoAssignedValue(LAt, AssignedForm.Aggregate);
       end;
       if ((self.FTree[LAt].Kind = NodeKind.CallExpression) and (not self.DoIsCastCall(LAt))) or
         (OperatorCallOf(self.FTree, LAt) <> 0) then
@@ -4838,8 +4856,50 @@ public type
     // dynamic array on the way to it (an element of one, a field of such an element, an
     // element of an element) is made its holder's alone first (ArrUnique: copy on write).
     // The form passes through parentheses, an indexed array and a record whose field is
-    // named; whatever is read on the way (an index, a deref's or a `->` operand) is read
+    // named; whatever is read on the way (an index, a deref's or a `->` operand) is read.
+    // Under the target of an assignment used as a value each place's address is made once
+    // (FPinned, DoAssignedValue)
     hidden method DoAddressFor(const AId: int64; const AWrite: bool): int64;
+    var
+      LAddress: int64;
+    begin
+      if (self.FPinned = nil) or not self.DoIsPinned(AId, false) then
+        return self.DoAddressMade(AId, AWrite);
+      end;
+      LAddress := self.FPinned.Find(AId);
+      if LAddress >= 0 then
+        return LAddress;
+      end;
+      LAddress := self.DoAddressMade(AId, AWrite);
+      if LAddress <> 0 then
+        self.FPinned.Put(AId, LAddress);
+      end;
+      return LAddress;
+    end;
+
+    // True when AId is the target of the assignment being lowered as a value (FPinRoot) or
+    // under it; AStrict: strictly under it
+    hidden const method DoIsPinned(const AId: int64; const AStrict: bool): bool;
+    var
+      LAt: int64;
+    begin
+      LAt := AId;
+      if AStrict then
+        if LAt = self.FPinRoot then
+          return false;
+        end;
+      end;
+      while LAt <> 0 do
+        if LAt = self.FPinRoot then
+          return true;
+        end;
+        LAt := self.FTree.ParentOf(LAt);
+      end;
+      return false;
+    end;
+
+    // DoAddressFor's address of the place AId, made
+    hidden method DoAddressMade(const AId: int64; const AWrite: bool): int64;
     var
       LKind: NodeKind;
       LDecl: int64;
@@ -8002,6 +8062,11 @@ public type
       end;
       if self.FTree[AId].Kind = NodeKind.ParenExpression then
         return self.DoManagedValue(self.FTree.FirstOf(AId, NodeRole.Operand));
+      end;
+      // an assignment's value: its target's block after the write (borrowed: the target
+      // keeps its reference)
+      if self.FTree[AId].Kind = NodeKind.AssignExpression then
+        return self.DoAssignedValue(AId, AssignedForm.Managed);
       end;
       // nil: no block (a ref's, an empty text's or array's)
       if (self.FTree[AId].Kind = NodeKind.NilLiteral) or (self.FTree[AId].ResolvedConst.Kind = ConstKind.Nil) then
@@ -16391,6 +16456,9 @@ public type
       if LKind = NodeKind.ParenExpression then
         return self.DoValue(self.FTree.FirstOf(AId, NodeRole.Operand));
       end;
+      if LKind = NodeKind.AssignExpression then
+        return self.DoAssignedValue(AId, AssignedForm.Scalar);
+      end;
       if LKind = NodeKind.AwaitExpression then
         return self.DoAwaitValue(AId);
       end;
@@ -16547,6 +16615,26 @@ public type
     // by DoFloatConstant, any other (DoIsFolded) read at its own type), converted to the type
     // it is used as; 0 after LW0001
     hidden method DoValue(const AId: int64): int64;
+    var
+      LValue: int64;
+    begin
+      // under the target of an assignment used as a value, each value is made once
+      if (self.FPinned <> nil) and self.DoIsPinned(AId, true) then
+        LValue := self.FPinned.Find(AId);
+        if LValue >= 0 then
+          return LValue;
+        end;
+        LValue := self.DoMadeValue(AId);
+        if LValue <> 0 then
+          self.FPinned.Put(AId, LValue);
+        end;
+        return LValue;
+      end;
+      return self.DoMadeValue(AId);
+    end;
+
+    // DoValue's value of the expression AId, made
+    hidden method DoMadeValue(const AId: int64): int64;
     var
       LType: IrType;
       LValue: int64;
@@ -16784,6 +16872,42 @@ public type
         end;
       end;
       self.DoWriteAt(LMember, LAddress, LValue, AId);
+    end;
+
+    // The assignment AId used as a value (BNF sec 6: assignment is an expression; its value
+    // is its target's after the write, as C++'s is, so `LA := LB := 4` sets both): the
+    // assignment lowered (DoAssign) with every place under its target and every value
+    // strictly below it made once (FPinned), then the target read back from them in AForm:
+    // a scalar's value, a managed value's block (borrowed) or an aggregate's address; an
+    // assignment in its source pins its own target meanwhile. 0 after LW0001
+    hidden method DoAssignedValue(const AId: int64; const AForm: AssignedForm): int64;
+    var
+      LSavedPins: ref Int64Map;
+      LSavedRoot: int64;
+      LTarget: int64;
+      LValue: int64;
+    begin
+      LTarget := self.FTree.FirstOf(AId, NodeRole.Target);
+      LSavedPins := self.FPinned;
+      LSavedRoot := self.FPinRoot;
+      self.FPinned := ref Int64Map(-1);
+      self.FPinRoot := LTarget;
+      self.DoAssign(AId);
+      LValue := 0;
+      if not self.DoEnded() then
+        if AForm = AssignedForm.Scalar then
+          LValue := self.DoValue(LTarget);
+        else
+          if AForm = AssignedForm.Managed then
+            LValue := self.DoManagedValue(LTarget);
+          else
+            LValue := self.DoAggregateSource(LTarget);
+          end;
+        end;
+      end;
+      self.FPinned := LSavedPins;
+      self.FPinRoot := LSavedRoot;
+      return LValue;
     end;
 
     // True when the assignment target AId (past its parens) is a property bound to its
@@ -17049,6 +17173,10 @@ public type
       // a type block among statements runs nothing: its TypeInfo and member functions are
       // made with the module's (DoLocalTypes)
       if LKind = NodeKind.TypeDecl then
+        return;
+      end;
+      // an @message among statements runs nothing: Semantics reported it (BNF sec 2 / 5)
+      if (LKind = NodeKind.Directive) and (self.FTree[AId].Text = ADAM_LOWERING_DIRECTIVE_MESSAGE) then
         return;
       end;
       if self.DoFlow(AId) then
@@ -19861,9 +19989,10 @@ public type
       self.DoRegisterSection(self.FUnit, NodeRole.Finalize, ADAM_LOWERING_FINALIZE_SYMBOL);
     end;
 
-    // The body of the section ASection (one with a function, DoRegisterSection): its
-    // statements, then its return unless the last block ended already (a `return;` in it
-    // leaves the section: DoReturn)
+    // The body of the section ASection (one with a function, DoRegisterSection), a routine
+    // body (BNF sec 1): its own locals' slots and initializers as a routine's (DoLocalSlots,
+    // DoLocalInits), its statements, then its return unless the last block ended already
+    // (a `return;` in it leaves the section: DoReturn)
     hidden method DoSectionBody(const ASection: int64);
     var
       LBody: int64;
@@ -19872,7 +20001,10 @@ public type
       self.FBlock := self.FModule.AddBlock(self.FFunction);
       self.DoStartManaged();
       LBody := self.FTree.FirstOf(ASection, NodeRole.Body);
-      self.DoCodeTemporaries(LBody);
+      // the temporaries of its locals' initializers too, before the first branch
+      self.DoCodeTemporaries(ASection);
+      self.DoLocalSlots(ASection);
+      self.DoLocalInits(ASection);
       self.DoStatements(LBody, NodeRole.Statement);
       if not self.DoEnded() then
         self.DoReleaseManaged(LBody);
