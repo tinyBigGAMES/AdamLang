@@ -17,7 +17,7 @@
 </p>
 
 > [!WARNING]
-> **Adam is a work in progress.** The language, the compiler and the standard library are under active construction and change from one commit to the next. There is no documentation yet and no release is supported. Try it, follow along, and report what you find, but do not build anything you depend on with it yet.
+> **Adam is a work in progress.** We are actively working on the language, the compiler and the standard library, leading toward a first release. Until then things change from one commit to the next, and the documentation is still to come.
 
 # Adam
 
