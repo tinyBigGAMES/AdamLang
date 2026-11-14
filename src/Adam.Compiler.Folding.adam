@@ -41,9 +41,10 @@ import System.SysUtils, Adam.Core.Messages, Adam.Target, Adam.Compiler.SourceTex
   Adam.Compiler.Diagnostics, Adam.Compiler.AST, Adam.Compiler.Types, Adam.Compiler.Layout;
 
 public const
+  ADAM_ERR_FOLDING_200: string = "SM0200";   // a float constant cast to a type that does not hold it
   ADAM_ERR_FOLDING_202: string = "SM0202";   // a choice value that is no constant
   ADAM_ERR_FOLDING_256: string = "SM0256";   // a constant that overflows its type
-  ADAM_ERR_FOLDING_257: string = "SM0257";   // div / mod / '/' by zero
+  ADAM_ERR_FOLDING_257: string = "SM0257";   // integer div / mod by zero ('/' on floats folds IEEE's)
   ADAM_ERR_FOLDING_258: string = "SM0258";   // the lowest value div / mod -1
   ADAM_ERR_FOLDING_259: string = "SM0259";   // a shift count outside 0..bits-1
 
@@ -52,6 +53,10 @@ public const
   ADAM_FOLDING_FLOAT32_MAX: float64 = 3.4028234663852886e38;
   ADAM_FOLDING_FLOAT32_HALF: float64 = 3.4028235677973366e38;
   ADAM_FOLDING_FLOAT64_MAX: float64 = 1.7976931348623157e308;
+  // A char's range (C's char: signed 8 bits, -128..127) and a wchar's top (16 unsigned bits)
+  ADAM_FOLDING_CHAR_LOW: uint64 = 128;
+  ADAM_FOLDING_CHAR_HIGH: uint64 = 127;
+  ADAM_FOLDING_WCHAR_HIGH: uint64 = 65535;
 
 type
   // An integer constant as a sign and a magnitude (the lowest int64 too): the fold
@@ -93,6 +98,24 @@ begin
     return -AValue;
   end;
   return AValue;
+end;
+
+// The one NaN a float constant holds: the positive quiet one (BNF sec 6)
+routine DoNan(): float64;
+var
+  LBits: FoldBits;
+begin
+  LBits.Bits := 0x7FF8000000000000;
+  return LBits.Value;
+end;
+
+// True when AValue's sign bit is set (-0.0 and -inf too)
+routine DoSignBit(const AValue: float64): bool;
+var
+  LBits: FoldBits;
+begin
+  LBits.Value := AValue;
+  return (LBits.Bits shr 63) <> 0;
 end;
 
 // inf, or -inf when ANegative
@@ -524,6 +547,56 @@ public type
       self.DoSet(AId, LConst);
     end;
 
+    // SM0200 at the cast AId: the float constant AValue (a NaN, an infinity, or a value
+    // whose integer part is out of range) does not fit the integer, char or wchar AType,
+    // named with its range (BNF sec 6: "nan does not fit in 'int32' (-2147483648..2147483647)")
+    hidden method DoFloatNotFit(const AId: int64; const AValue: float64; const AType: int64);
+    var
+      LLow: string;
+      LHigh: string;
+    begin
+      LLow := "0";
+      LHigh := "";
+      if self.DoClass(AType) = TypeClass.Char then
+        LLow := "-" + UIntToStr(ADAM_FOLDING_CHAR_LOW);
+        LHigh := UIntToStr(ADAM_FOLDING_CHAR_HIGH);
+      else
+        if self.DoClass(AType) = TypeClass.WideChar then
+          LHigh := UIntToStr(ADAM_FOLDING_WCHAR_HIGH);
+        else
+          if self.DoClass(AType) = TypeClass.SignedInt then
+            LLow := "-" + UIntToStr(IntLimit(self.FTree, AType, true));
+          end;
+          LHigh := UIntToStr(IntLimit(self.FTree, AType, false));
+        end;
+      end;
+      self.DoError(AId, ADAM_ERR_FOLDING_200, ADAM_MSG_FOLDING_NOT_FIT, NoArgs().Str(FloatToStr(AValue)).Str(
+        self.DoText(AType)).Str(LLow).Str(LHigh));
+    end;
+
+    // True when the integer-like AType holds the whole number AValue (a float constant's
+    // integer part, BNF sec 6): an integer type by its range (IntFits), a char by C's
+    // signed 8 bits, a wchar by 16 unsigned ones; a choices type takes the number as it is
+    hidden const method DoHoldsWhole(const AType: int64; const AValue: FoldedInt): bool;
+    var
+      LClass: TypeClass;
+    begin
+      LClass := self.DoClass(AType);
+      if LClass = TypeClass.Char then
+        if AValue.Negative then
+          return AValue.Magnitude <= ADAM_FOLDING_CHAR_LOW;
+        end;
+        return AValue.Magnitude <= ADAM_FOLDING_CHAR_HIGH;
+      end;
+      if LClass = TypeClass.WideChar then
+        return (AValue.Magnitude = 0) or ((not AValue.Negative) and (AValue.Magnitude <= ADAM_FOLDING_WCHAR_HIGH));
+      end;
+      if IsIntegerClass(LClass) then
+        return IntFits(self.FTree, AType, AValue.Negative, AValue.Magnitude);
+      end;
+      return true;
+    end;
+
     // SM0256 at AId: its constant overflows AType
     hidden method DoOverflow(const AId: int64; const AType: int64);
     begin
@@ -542,7 +615,8 @@ public type
     end;
 
     // The float result AValue of AId's operation in AType (rounded to float32 when that is
-    // its type): a finite operation that overflows to inf is SM0256
+    // its type, past its range an infinity): IEEE's (BNF sec 6, user 2026-10-20 "(a)"), an
+    // overflow an infinity and still a constant, any NaN the positive quiet one (DoNan)
     hidden method DoFloatResult(const AId: int64; const AType: int64; const AValue: float64);
     var
       LValue: float64;
@@ -551,9 +625,8 @@ public type
       if FloatBits(self.FTree, AType) = 32 then
         LValue := RoundToSingle(AValue);
       end;
-      if (not DoIsNan(LValue)) and (DoAbs(LValue) > ADAM_FOLDING_FLOAT64_MAX) then
-        self.DoOverflow(AId, AType);
-        return;
+      if DoIsNan(LValue) then
+        LValue := DoNan();
       end;
       self.DoSet(AId, self.DoFloatConst(LValue));
     end;
@@ -916,7 +989,8 @@ public type
     end;
 
     // A float operation AId (+ - * /, operator AOp) in AType: in float64, rounded once to
-    // float32 when that is its type; '/' by zero is SM0257
+    // float32 when that is its type, IEEE's result (DoFloatResult); '/' by a zero is NaN for
+    // 0 or a NaN over it, else an infinity, its sign the two signs' exclusive or
     hidden method DoFloatBinary(const AId: int64; const AOp: OperatorKind; const ALeft: int64;
       const ARight: int64; const AType: int64);
     var
@@ -935,10 +1009,15 @@ public type
         OperatorKind.Multiply: LResult := LA * LB;
         OperatorKind.Divide:
           if LB = 0.0 then
-            self.DoError(AId, ADAM_ERR_FOLDING_257, ADAM_MSG_FOLDING_BY_ZERO, NoArgs().Str(self.FTree[AId].Text));
-            return;
+            // written out, not left to the host's division: the same constant on every host
+            if (LA = 0.0) or DoIsNan(LA) then
+              LResult := DoNan();
+            else
+              LResult := DoInfinity(DoSignBit(LA) <> DoSignBit(LB));
+            end;
+          else
+            LResult := LA / LB;
           end;
-          LResult := LA / LB;
       else
         // no other operator takes floats
         return;
@@ -1006,7 +1085,8 @@ public type
 
     // A cast of the folded AOperand to AType written on AId: an integer-like value wraps
     // into an integer-like type (a choices type takes the number as it is), a float
-    // truncates into one (SM0256 when it does not fit) except into bool, where it is C's
+    // truncates into one (SM0200 when the type does not hold its integer part, a NaN or an
+    // infinity: DoFloatNotFit) except into bool, where it is C's
     // `x != 0` (bool(0.5) is true, a NaN true), anything numeric converts to a float
     // (rounded once to float32)
     hidden method DoCast(const AId: int64; const AOperand: int64; const AType: int64);
@@ -1040,8 +1120,8 @@ public type
       end;
       if LConst.Kind = ConstKind.Float then
         if (not DoFloatToInt(LConst.Float, LInt)) or
-          (IsIntegerClass(LClass) and (not IntFits(self.FTree, AType, LInt.Negative, LInt.Magnitude))) then
-          self.DoOverflow(AId, AType);
+          (not self.DoHoldsWhole(AType, LInt)) then
+          self.DoFloatNotFit(AId, LConst.Float, AType);
           return;
         end;
         self.DoSet(AId, self.DoIntConst(AType, self.DoWrapInto(AType, LInt)));
