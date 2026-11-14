@@ -207,6 +207,7 @@ public const
   ADAM_SEMANTICS_RUNTIME_INTF_RELEASE: string = "IntfRelease";
   ADAM_SEMANTICS_RUNTIME_INTF_ASSIGN: string = "IntfAssign";
   ADAM_SEMANTICS_RUNTIME_INTERFACE_OFFSET: string = "InterfaceOffset";
+  ADAM_SEMANTICS_RUNTIME_PARALLEL_RUN: string = "ParallelRun";
   // The platform unit's routines (Target.RuntimeUnit, imported by the runtime unit): the one
   // the OS calls for a frame whose unwind data holds a scope table, the entry's catching
   // scope's filter, and the one the OS calls as a thread starts and ends
@@ -370,6 +371,10 @@ public const
   ADAM_ERR_SEMANTICS_706: string = "SM0706";   // an array literal's element written as a range a..b
   ADAM_ERR_SEMANTICS_707: string = "SM0707";   // a set literal written with a comma before its ']'
   ADAM_ERR_SEMANTICS_708: string = "SM0708";   // async of a method call on an object the task may outlive
+  ADAM_ERR_SEMANTICS_709: string = "SM0709";   // a return inside a for parallel's body
+  ADAM_ERR_SEMANTICS_710: string = "SM0710";   // workerindex() / workercount() outside a for parallel's body
+  ADAM_ERR_SEMANTICS_711: string = "SM0711";   // varargs read inside a for parallel's body
+  ADAM_ERR_SEMANTICS_712: string = "SM0712";   // a for parallel's iterator read in its own bounds or workers
 
 // AText split at each '.' into AParts (System.SysUtils' SplitString)
 routine DoSplitDots(const AText: string; var AParts: StringArray);
@@ -5309,16 +5314,29 @@ public type
       end;
     end;
 
-    // The intrinsics with no argument (paramcount, exccode, excmsg, ProjectPassword)
+    // The intrinsics with no argument (paramcount, exccode, excmsg, ProjectPassword;
+    // workerindex / workercount, T2: int64, known only in a for parallel's body, SM0710)
     hidden method DoNoArgumentIntrinsic(const AId: int64; const AName: string);
+    var
+      LWorker: bool;
     begin
+      LWorker := (AName = "workerindex") or (AName = "workercount");
       if (AName = "paramcount") or (AName = "exccode") then
         self.DoSetType(AId, self.DoBuiltin("int32"));
       else
-        self.DoSetType(AId, self.DoBuiltin("string"));
+        if LWorker then
+          self.DoSetType(AId, self.DoBuiltin("int64"));
+        else
+          self.DoSetType(AId, self.DoBuiltin("string"));
+        end;
       end;
       if self.FTree.CountOf(AId, NodeRole.Argument) <> 0 then
         self.DoBadIntrinsic(AId, AName, ADAM_MSG_SEMANTICS_SIG_NONE);
+        return;
+      end;
+      if LWorker and not self.DoInParallelBody(AId) then
+        self.DoError(AId, ADAM_ERR_SEMANTICS_710, ADAM_MSG_SEMANTICS_PARALLEL_WORKER,
+          NoArgs().Str(AName));
         return;
       end;
       // ProjectPassword() reads the project's scrambled password (the Driver's
@@ -5822,6 +5840,8 @@ public type
         self.DoRuntimeRoutine(ADAM_SEMANTICS_RUNTIME_INTF_ASSIGN));
       self.FTree.SetRuntimeRoutine(RuntimeRoutine.InterfaceOffset,
         self.DoRuntimeRoutine(ADAM_SEMANTICS_RUNTIME_INTERFACE_OFFSET));
+      self.FTree.SetRuntimeRoutine(RuntimeRoutine.ParallelRun,
+        self.DoRuntimeRoutine(ADAM_SEMANTICS_RUNTIME_PARALLEL_RUN));
       self.FTree.SetVarKind(self.DoVarKind());
       self.FTree.SetAllocSite(self.DoAllocSite());
     end;
@@ -8490,8 +8510,10 @@ public type
       LAt := self.FTree.ParentOf(AId);
       while LAt <> 0 do
         LKind := self.FTree[LAt].Kind;
+        // a for parallel's iterator is its own VarDecl (T2), a for's a name of one
         if (LKind = NodeKind.ForStatement) and (self.FTree.RoleOf(LChild) = NodeRole.Statement) and
-          (self.FTree[self.FTree.FirstOf(LAt, NodeRole.Iterator)].ResolvedDecl = ADecl) then
+          ((self.FTree.FirstOf(LAt, NodeRole.Iterator) = ADecl) or
+          (self.FTree[self.FTree.FirstOf(LAt, NodeRole.Iterator)].ResolvedDecl = ADecl)) then
           return LAt;
         end;
         if IsRoutineLike(LKind) or (LKind = NodeKind.Module) or (LKind = NodeKind.TestBlock) then
@@ -8562,12 +8584,17 @@ public type
       end;
     end;
 
-    // for I := A to|downto B: I checked (DoIsIterator), then A and B convert to I's type
+    // for I := A to|downto B: I checked (DoIsIterator), then A and B convert to I's type;
+    // a for parallel its own check (DoParallelFor)
     hidden method DoFor(const AId: int64);
     var
       LIterator: int64;
       LType: int64;
     begin
+      if self.FTree[AId].HasFlag(NodeFlag.Parallel) then
+        self.DoParallelFor(AId);
+        return;
+      end;
       self.DoChildren(AId);
       LIterator := self.FTree.FirstOf(AId, NodeRole.Iterator);
       if not self.DoIsIterator(AId, LIterator) then
@@ -8576,6 +8603,183 @@ public type
       LType := self.DoTypeOf(LIterator);
       self.DoConvert(self.FTree.FirstOf(AId, NodeRole.Start), LType);
       self.DoConvert(self.FTree.FirstOf(AId, NodeRole.Limit), LType);
+    end;
+
+    // `for parallel [(W)] I := A to|downto B do .. end;` (BNF sec 5, T2): the workers' count
+    // W an int64; the bounds met at their common type (the same type: it; two integers:
+    // CommonArithmetic; else the start's, the limit converting to it), the type of the
+    // iterator the loop declares
+    // (its VarDecl, visited here: it has no written type), an integer, a char, a wchar or a
+    // choice (SM0601); neither the bounds nor W read the iterator (SM0712); then the body,
+    // and the variables and parameters of its routine the body uses recorded (DoCaptures)
+    hidden method DoParallelFor(const AId: int64);
+    var
+      LIterator: int64;
+      LStart: int64;
+      LLimit: int64;
+      LWorkers: int64;
+      LStartType: int64;
+      LLimitType: int64;
+      LType: int64;
+      LClass: TypeClass;
+      LI: int64;
+    begin
+      LIterator := self.FTree.FirstOf(AId, NodeRole.Iterator);
+      LStart := self.FTree.FirstOf(AId, NodeRole.Start);
+      LLimit := self.FTree.FirstOf(AId, NodeRole.Limit);
+      LWorkers := self.FTree.FirstOf(AId, NodeRole.Value);
+      // the iterator's type comes from the bounds, never from a visit of its own
+      if LIterator <> 0 then
+        self.DoFirstVisit(LIterator);
+      end;
+      self.DoVisit(LStart);
+      self.DoVisit(LLimit);
+      if LWorkers <> 0 then
+        self.DoVisit(LWorkers);
+        self.DoConvert(LWorkers, self.DoBuiltin("int64"));
+      end;
+      if LIterator <> 0 then
+        self.DoOwnIterator(LStart, LIterator);
+        self.DoOwnIterator(LLimit, LIterator);
+        self.DoOwnIterator(LWorkers, LIterator);
+      end;
+      LStartType := self.DoTypeOf(LStart);
+      LLimitType := self.DoTypeOf(LLimit);
+      // bounds of one type keep it (a uint8 loop stays one); two integer types meet
+      LType := LStartType;
+      if (LStartType <> 0) and (LLimitType <> 0) and (LStartType <> LLimitType) and
+        IsIntegerClass(self.DoClass(LStartType)) and IsIntegerClass(self.DoClass(LLimitType)) then
+        LType := CommonArithmetic(self.FTree, LStartType, LLimitType);
+      end;
+      if (LType <> 0) and (LIterator <> 0) then
+        LClass := self.DoClass(LType);
+        if IsIntegerClass(LClass) or (LClass = TypeClass.Char) or (LClass = TypeClass.WideChar) or
+          (LClass = TypeClass.ChoicesType) then
+          self.DoSetType(LIterator, LType);
+          self.DoConvert(LStart, LType);
+          self.DoConvert(LLimit, LType);
+        else
+          self.DoError(AId, ADAM_ERR_SEMANTICS_601, ADAM_MSG_SEMANTICS_FOR_TYPE,
+            NoArgs().Str(self.DoText(LType)));
+        end;
+      end;
+      for LI := 0 to self.FTree.CountOf(AId, NodeRole.Statement) - 1 do
+        self.DoVisit(self.FTree.NthOf(AId, NodeRole.Statement, LI));
+      end;
+      self.DoCaptures(AId);
+    end;
+
+    // SM0712 at each name under ARoot (a for parallel's bound or workers' count) that reads
+    // AIterator, the loop's own iterator: it is declared for the body alone
+    hidden method DoOwnIterator(const ARoot: int64; const AIterator: int64);
+    var
+      LI: int64;
+    begin
+      if ARoot = 0 then
+        return;
+      end;
+      if (self.FTree[ARoot].Kind = NodeKind.NameExpression) and
+        (self.FTree[ARoot].ResolvedDecl = AIterator) then
+        self.DoError(ARoot, ADAM_ERR_SEMANTICS_712, ADAM_MSG_SEMANTICS_PARALLEL_OWN,
+          NoArgs().Str(self.FTree[AIterator].Text));
+        return;
+      end;
+      for LI := 0 to self.FTree.ChildCount(ARoot) - 1 do
+        self.DoOwnIterator(self.FTree.ChildAt(ARoot, LI), AIterator);
+      end;
+    end;
+
+    // The for parallel AFor's Capture children (T2), made once (a second visit finds them):
+    // one per variable, constant or parameter of its routine its body names, in the order
+    // of first use (DoCaptureWalk), each its ResolvedDecl; the body reaches them by
+    // reference (Lowering's frame), shared by its workers
+    hidden method DoCaptures(const AFor: int64);
+    var
+      LSeen: ref Int64Map;
+      LI: int64;
+    begin
+      if self.FTree.CountOf(AFor, NodeRole.Capture) > 0 then
+        return;
+      end;
+      LSeen := ref Int64Map(0);
+      for LI := 0 to self.FTree.CountOf(AFor, NodeRole.Statement) - 1 do
+        self.DoCaptureWalk(AFor, self.FTree.NthOf(AFor, NodeRole.Statement, LI), LSeen, true);
+      end;
+    end;
+
+    // The walk of DoCaptures over AAt, a node of AFor's body: a name of a variable, a
+    // constant or a parameter of the routine (any declaration but a module's, Declaration)
+    // declared outside AFor and not in ASeen yet gets its Capture child. AOwn: AAt is AFor's
+    // own body, not a nested for parallel's (that one reports its own): a return there is
+    // SM0709 (the body is no part of the routine's own flow), a varargs read SM0711 (the
+    // routine's varargs never reach the body's workers)
+    hidden method DoCaptureWalk(const AFor: int64; const AAt: int64; const ASeen: ref Int64Map;
+      const AOwn: bool);
+    var
+      LKind: NodeKind;
+      LDecl: int64;
+      LDeclKind: NodeKind;
+      LCapture: int64;
+      LChild: int64;
+      LOwn: bool;
+      LI: int64;
+    begin
+      LKind := self.FTree[AAt].Kind;
+      if AOwn and (LKind = NodeKind.ReturnStatement) then
+        self.DoError(AAt, ADAM_ERR_SEMANTICS_709, ADAM_MSG_SEMANTICS_PARALLEL_RETURN, NoArgs());
+      end;
+      if AOwn and (LKind = NodeKind.VarargsExpression) then
+        self.DoError(AAt, ADAM_ERR_SEMANTICS_711, ADAM_MSG_SEMANTICS_PARALLEL_VARARGS, NoArgs());
+      end;
+      if LKind = NodeKind.NameExpression then
+        LDecl := self.FTree[AAt].ResolvedDecl;
+        if LDecl > 0 then
+          LDeclKind := self.FTree[LDecl].Kind;
+          if ((LDeclKind = NodeKind.VarDecl) or (LDeclKind = NodeKind.ConstDecl) or
+            (LDeclKind = NodeKind.Param)) and (self.FTree.RoleOf(LDecl) <> NodeRole.Declaration) and
+            (not self.FTree.IsAncestor(AFor, LDecl)) and (ASeen.Find(LDecl) = 0) then
+            ASeen.Put(LDecl, 1);
+            LCapture := self.FTree.AddChild(AFor, NodeRole.Capture, NodeKind.Capture,
+              self.FTree[AAt].Place, self.FTree[AAt].StartOffset, self.FTree[AAt].EndOffset);
+            self.FTree[LCapture].ResolvedDecl := LDecl;
+          end;
+        end;
+      end;
+      for LI := 0 to self.FTree.ChildCount(AAt) - 1 do
+        LChild := self.FTree.ChildAt(AAt, LI);
+        // a nested for parallel's own body reports its own returns and varargs reads
+        LOwn := AOwn;
+        if (LKind = NodeKind.ForStatement) and self.FTree[AAt].HasFlag(NodeFlag.Parallel) and
+          (self.FTree.RoleOf(LChild) = NodeRole.Statement) then
+          LOwn := false;
+        end;
+        self.DoCaptureWalk(AFor, LChild, ASeen, LOwn);
+      end;
+    end;
+
+    // True when AId stands in a for parallel's body inside its own routine (where
+    // workerindex() / workercount() are known, T2)
+    hidden const method DoInParallelBody(const AId: int64): bool;
+    var
+      LChild: int64;
+      LAt: int64;
+      LKind: NodeKind;
+    begin
+      LChild := AId;
+      LAt := self.FTree.ParentOf(AId);
+      while LAt <> 0 do
+        LKind := self.FTree[LAt].Kind;
+        if (LKind = NodeKind.ForStatement) and self.FTree[LAt].HasFlag(NodeFlag.Parallel) and
+          (self.FTree.RoleOf(LChild) = NodeRole.Statement) then
+          return true;
+        end;
+        if IsRoutineLike(LKind) or (LKind = NodeKind.Module) or (LKind = NodeKind.TestBlock) then
+          return false;
+        end;
+        LChild := LAt;
+        LAt := self.FTree.ParentOf(LAt);
+      end;
+      return false;
     end;
 
     // The type of the typed match subject ASubject when it is one a match takes (an

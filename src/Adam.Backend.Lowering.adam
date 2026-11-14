@@ -343,6 +343,16 @@ public const
   // internal): the descriptor's done when the task's object holds value objects that end
   // by a done (DoTaskEndBody): TaskDone, then those values ended
   ADAM_LOWERING_TASK_END_SYMBOL: string = "__adam_taskend";
+  // The prefix of a for parallel's body function's symbol (its index follows; internal,
+  // T2): System.Runtime's ParallelEntry, called per iteration with the loop's frame, the
+  // iterator's value as 64 bits, the worker and the workers' count; true when the body
+  // ran `leave` (DoParallelBody)
+  ADAM_LOWERING_PARALLEL_SYMBOL: string = "__adam_parallel";
+  // System.Runtime's ParallelRun flags (ADAM_RUNTIME_PARALLEL_*): a downto loop, unsigned
+  // bounds, a workers' count written
+  ADAM_LOWERING_PARALLEL_DOWNTO: int64 = 1;
+  ADAM_LOWERING_PARALLEL_UNSIGNED: int64 = 2;
+  ADAM_LOWERING_PARALLEL_GIVEN: int64 = 4;
   // The offset of a task's state word (System.Runtime's ADAM_RUNTIME_TASK_STATE) and the
   // state its call ended with when it returned (ADAM_RUNTIME_TASK_ENDED)
   ADAM_LOWERING_TASK_STATE_OFFSET: int64 = 8;
@@ -846,6 +856,17 @@ public type
     // (DoTaskBodies): by index, the function and its async expression
     hidden FTaskEntries: ref Int64List;
     hidden FTaskNodes: ref Int64List;
+    // The for parallel bodies DoParallelFor made (DoParallelEntry, T2), lowered last
+    // (DoParallelBodies): by index, the function, its for statement and whether its frame
+    // starts with self (1: the routine holding it is a method's). FParallelRoot: the for
+    // parallel whose body is being lowered (0: none); FWorkerIndex / FWorkerCount: that
+    // body's worker parameters, workerindex() / workercount() (0 outside one)
+    hidden FParallelEntries: ref Int64List;
+    hidden FParallelNodes: ref Int64List;
+    hidden FParallelSelves: ref Int64List;
+    hidden FParallelRoot: int64;
+    hidden FWorkerIndex: int64;
+    hidden FWorkerCount: int64;
     // The element routines DoElementRoutines made (DoElementFunction), their bodies lowered
     // last (DoEndBodies, DoElementBody): by index, the function, its element type, its
     // node and its walk (Built: the build, Copied: the copy, Ended: the end)
@@ -942,6 +963,12 @@ public type
       self.FForwardsDone := 0;
       self.FTaskEntries := ref Int64List();
       self.FTaskNodes := ref Int64List();
+      self.FParallelEntries := ref Int64List();
+      self.FParallelNodes := ref Int64List();
+      self.FParallelSelves := ref Int64List();
+      self.FParallelRoot := 0;
+      self.FWorkerIndex := 0;
+      self.FWorkerCount := 0;
       self.FElementFunctions := ref Int64List();
       self.FElementTypes := ref Int64List();
       self.FElementNodes := ref Int64List();
@@ -8205,6 +8232,13 @@ public type
     begin
       for LI := 0 to self.FTree.ChildCount(ARoot) - 1 do
         LChild := self.FTree.ChildAt(ARoot, LI);
+        if self.DoPassesTemporaries(ARoot, LChild) then
+          skip;
+        end;
+        // a statement local's slot is made with them (DoStatementSlot)
+        if self.DoIsStatementLocal(LChild) then
+          self.DoStatementSlot(LChild);
+        end;
         if self.DoIsUtf8Call(LChild) or self.DoIsTextIntrinsicCall(LChild) or
           self.DoIsIntrinsicCall(LChild, "FormatStr") then
           self.DoTemporary(LChild);
@@ -9926,6 +9960,13 @@ public type
     begin
       for LI := 0 to self.FTree.ChildCount(ARoot) - 1 do
         LChild := self.FTree.ChildAt(ARoot, LI);
+        // a for parallel's workers reach what it captures at once (T2): never pinned
+        if self.FTree[LChild].Kind = NodeKind.Capture then
+          LDecl := self.FTree[LChild].ResolvedDecl;
+          if LDecl <> 0 then
+            self.FUnpinned[LDecl] := true;
+          end;
+        end;
         if self.FTree[LChild].Kind = NodeKind.NameExpression then
           LDecl := self.FTree[LChild].ResolvedDecl;
           if (LDecl <> 0) and (not self.FUnpinned[LDecl]) and
@@ -10062,6 +10103,8 @@ public type
     // block, no protected region: DoStartRegions)
     hidden method DoStartManaged();
     begin
+      self.FWorkerIndex := 0;
+      self.FWorkerCount := 0;
       self.FManaged := ref Int64List();
       self.FManagedType := ref Int64List();
       self.FManagedLive := ref Int64List();
@@ -13168,6 +13211,19 @@ public type
           (self.FTree[LDecl].Text = "ready") then
           return self.DoReady(ACall);
         end;
+        // workerindex() / workercount(): the for parallel body's parameters (T2; SEM
+        // allows them only there)
+        if (LDecl <> 0) and (self.FTree[LDecl].Kind = NodeKind.IntrinsicDecl) and
+          ((self.FTree[LDecl].Text = "workerindex") or (self.FTree[LDecl].Text = "workercount")) then
+          if self.FWorkerIndex = 0 then
+            self.DoRefuse(ACall, self.FTree.ConstructPhrase(ACall));
+            return 0;
+          end;
+          if self.FTree[LDecl].Text = "workerindex" then
+            return self.FWorkerIndex;
+          end;
+          return self.FWorkerCount;
+        end;
         if (LDecl <> 0) and (self.FTree[LDecl].Kind = NodeKind.IntrinsicDecl) and
           (self.FTree[LDecl].Text = "alive") then
           return self.DoWeakAlive(ACall);
@@ -15697,6 +15753,10 @@ public type
         self.DoStatements(AId, NodeRole.Statement);
         return;
       end;
+      if self.DoIsStatementLocal(AId) then
+        self.DoStatementLocal(AId);
+        return;
+      end;
       if self.DoFlow(AId) then
         return;
       end;
@@ -15967,6 +16027,10 @@ public type
       LStep: int64;
       LExit: int64;
     begin
+      if self.FTree[AId].HasFlag(NodeFlag.Parallel) then
+        self.DoParallelFor(AId);
+        return;
+      end;
       LIterator := self.FTree.FirstOf(AId, NodeRole.Iterator);
       LIr := self.DoTypeAt(self.FTree[LIterator].ResolvedType, LIterator);
       if LIr = IrType.Void then
@@ -16000,6 +16064,363 @@ public type
       self.DoForStep(AId, LAddress, LIr);
       self.DoJumpTo(LBody, AId);
       self.FBlock := LExit;
+    end;
+
+    // The address of the storage of the variable or parameter ADecl of the current function
+    // (a by-reference one's address its slot holds); 0 when it has no slot (a folded
+    // constant, or a refusal reported at its declaration)
+    hidden method DoDeclAddress(const ADecl: int64; const ANode: int64): int64;
+    begin
+      if self.FSlotOf[ADecl] = 0 then
+        return 0;
+      end;
+      if self.FByRef[ADecl] then
+        return self.DoLoad(self.FSlotOf[ADecl], IrType.Pointer, ANode);
+      end;
+      return self.FSlotOf[ADecl];
+    end;
+
+    // `for parallel [(W)] I := A to|downto B do .. end;` AId (BNF sec 5, T2): its bounds
+    // (converted to I's type by SEM) and W evaluated once, here; its frame, a slot of one
+    // address per word: self's object first when the routine is a method's, then each
+    // Capture's variable's storage (DoDeclAddress; nil for one with none), so the body
+    // reaches them by reference; then System.Runtime's ParallelRun called with the body's
+    // function (DoParallelEntry, lowered last: DoParallelBody), the frame, the bounds as 64
+    // bits (extended by their signedness), the flags (downto, unsigned, W given) and W. It
+    // returns once every iteration has ended, raising again the first raise of the body
+    hidden method DoParallelFor(const AId: int64);
+    var
+      LIterator: int64;
+      LIr: IrType;
+      LStart: int64;
+      LLimit: int64;
+      LWorkersNode: int64;
+      LWorkers: int64;
+      LFlags: int64;
+      LWord: int64;
+      LCount: int64;
+      LAt: int64;
+      LFrame: int64;
+      LAddress: int64;
+      LEntry: int64;
+      LSelf: int64;
+      LArgs: ref Int64List;
+      LI: int64;
+    begin
+      LIterator := self.FTree.FirstOf(AId, NodeRole.Iterator);
+      LIr := self.DoTypeAt(self.FTree[LIterator].ResolvedType, LIterator);
+      if LIr = IrType.Void then
+        return;
+      end;
+      LStart := self.DoValue(self.FTree.FirstOf(AId, NodeRole.Start));
+      if LStart = 0 then
+        return;
+      end;
+      LLimit := self.DoValue(self.FTree.FirstOf(AId, NodeRole.Limit));
+      if LLimit = 0 then
+        return;
+      end;
+      LFlags := 0;
+      if self.FTree[AId].HasFlag(NodeFlag.Downto) then
+        LFlags := LFlags | ADAM_LOWERING_PARALLEL_DOWNTO;
+      end;
+      if not IsSignedType(LIr) then
+        LFlags := LFlags | ADAM_LOWERING_PARALLEL_UNSIGNED;
+      end;
+      LWorkersNode := self.FTree.FirstOf(AId, NodeRole.Value);
+      if LWorkersNode <> 0 then
+        LWorkers := self.DoValue(LWorkersNode);
+        if LWorkers = 0 then
+          return;
+        end;
+        LWorkers := self.DoConvertIr(LWorkers, IrType.Int64, AId);
+        LFlags := LFlags | ADAM_LOWERING_PARALLEL_GIVEN;
+      else
+        LWorkers := self.DoConstant(IrType.Int64, 0, AId);
+      end;
+      // the bounds and W are read once: their temporaries end here
+      self.DoEndTemporaries(self.FTree.FirstOf(AId, NodeRole.Start));
+      self.DoEndTemporaries(self.FTree.FirstOf(AId, NodeRole.Limit));
+      if LWorkersNode <> 0 then
+        self.DoEndTemporaries(LWorkersNode);
+      end;
+      LWord := self.FTarget.PointerSize();
+      LSelf := 0;
+      if self.FSelfSlot <> 0 then
+        LSelf := 1;
+      end;
+      LCount := self.FTree.CountOf(AId, NodeRole.Capture) + LSelf;
+      if LCount = 0 then
+        LFrame := self.DoConstant(IrType.Pointer, 0, AId);
+      else
+        LFrame := self.DoSizedSlot(AId, LCount * LWord, self.FTarget.PointerAlign());
+        LAt := 0;
+        if LSelf <> 0 then
+          self.DoStore(LFrame, self.DoLoad(self.FSelfSlot, IrType.Pointer, AId), AId);
+          LAt := 1;
+        end;
+        for LI := 0 to self.FTree.CountOf(AId, NodeRole.Capture) - 1 do
+          LAddress := self.DoDeclAddress(self.FTree[self.FTree.NthOf(AId, NodeRole.Capture, LI)].ResolvedDecl, AId);
+          if LAddress = 0 then
+            LAddress := self.DoConstant(IrType.Pointer, 0, AId);
+          end;
+          self.DoStore(self.DoByteOffset(LFrame, (LAt + LI) * LWord, AId), LAddress, AId);
+        end;
+      end;
+      LEntry := self.DoEmit(IrOp.CodeAddress, IrType.Pointer, AId);
+      self.FModule.InstrAt(LEntry).Link := self.DoParallelEntry(AId, LSelf);
+      LArgs := ref Int64List();
+      LArgs.Add(LEntry);
+      LArgs.Add(LFrame);
+      LArgs.Add(self.DoConvertIr(LStart, IrType.Int64, AId));
+      LArgs.Add(self.DoConvertIr(LLimit, IrType.Int64, AId));
+      LArgs.Add(self.DoConstant(IrType.Int64, LFlags, AId));
+      LArgs.Add(LWorkers);
+      self.DoCallRuntimeArgs(RuntimeRoutine.ParallelRun, LArgs, AId);
+    end;
+
+    // A new body function for the for parallel AFor (internal, System.Runtime's
+    // ParallelEntry: the frame, the value, the worker, the workers' count; a bool back),
+    // ASelf 1 when its frame starts with self; its body (DoParallelBody) is lowered last
+    // (DoParallelBodies), as the lowering of the routine holding AFor is still under way
+    hidden method DoParallelEntry(const AFor: int64; const ASelf: int64): int64;
+    var
+      LFunction: int64;
+    begin
+      LFunction := self.FModule.AddFunction(ADAM_LOWERING_PARALLEL_SYMBOL + IntToStr(self.FParallelEntries.Count),
+        IrType.Bool, AFor);
+      self.FModule.FunctionAt(LFunction).Internal := true;
+      self.FModule.FunctionAt(LFunction).Signature.AddParam(IrType.Pointer);
+      self.FModule.FunctionAt(LFunction).Signature.AddParam(IrType.Int64);
+      self.FModule.FunctionAt(LFunction).Signature.AddParam(IrType.Int64);
+      self.FModule.FunctionAt(LFunction).Signature.AddParam(IrType.Int64);
+      self.FParallelEntries.Add(LFunction);
+      self.FParallelNodes.Add(AFor);
+      self.FParallelSelves.Add(ASelf);
+      return LFunction;
+    end;
+
+    // Every for parallel body (DoParallelEntry's functions, DoParallelBody), each in a
+    // fresh function state, until none is left: a body may hold another for parallel
+    hidden method DoParallelBodies();
+    var
+      LI: int64;
+    begin
+      LI := 0;
+      while LI < self.FParallelEntries.Count do
+        self.DoParallelBody(LI);
+        LI := LI + 1;
+      end;
+    end;
+
+    // The body function AIndex (DoParallelEntry) of a for parallel: its parameters (the
+    // worker and the count are workerindex() / workercount()); self and each Capture's
+    // variable reached through the frame (a slot holding the address the frame word gives,
+    // the variable by reference while this body is lowered: FSlotOf / FByRef, given back
+    // after); the iterator a slot of its own holding the value at its type; the body's
+    // temporaries and statement locals (DoCodeTemporaries over the loop, FParallelRoot);
+    // then the statements, a leave ending the body with true (no new iteration starts), its
+    // end and a skip with false, each exit releasing what the body holds
+    hidden method DoParallelBody(const AIndex: int64);
+    var
+      LFor: int64;
+      LFrame: int64;
+      LValue: int64;
+      LWord: int64;
+      LAt: int64;
+      LCapture: int64;
+      LDecl: int64;
+      LSlot: int64;
+      LIterator: int64;
+      LIr: IrType;
+      LBody: int64;
+      LNext: int64;
+      LExit: int64;
+      LId: int64;
+      LResult: int64;
+      LSavedSlot: ref Int64List;
+      LSavedByRef: BoolArray;
+      LSavedByCopy: BoolArray;
+      LCount: int64;
+      LI: int64;
+    begin
+      LFor := self.FParallelNodes[AIndex];
+      self.FFunction := self.FParallelEntries[AIndex];
+      self.FBlock := self.FModule.AddBlock(self.FFunction);
+      self.DoStartManaged();
+      self.FRoutine := 0;
+      self.FResultSlot := 0;
+      self.FSelfSlot := 0;
+      self.FVarargsSlot := 0;
+      self.FPackSlot := 0;
+      LFrame := self.DoEmit(IrOp.Parameter, IrType.Pointer, LFor);
+      self.FModule.InstrAt(LFrame).Imm := 0;
+      LValue := self.DoEmit(IrOp.Parameter, IrType.Int64, LFor);
+      self.FModule.InstrAt(LValue).Imm := 1;
+      self.FWorkerIndex := self.DoEmit(IrOp.Parameter, IrType.Int64, LFor);
+      self.FModule.InstrAt(self.FWorkerIndex).Imm := 2;
+      self.FWorkerCount := self.DoEmit(IrOp.Parameter, IrType.Int64, LFor);
+      self.FModule.InstrAt(self.FWorkerCount).Imm := 3;
+      LWord := self.FTarget.PointerSize();
+      LAt := 0;
+      if self.FParallelSelves[AIndex] <> 0 then
+        self.FSelfSlot := self.DoSizedSlot(LFor, LWord, self.FTarget.PointerAlign());
+        self.DoStore(self.FSelfSlot, self.DoLoad(LFrame, IrType.Pointer, LFor), LFor);
+        LAt := 1;
+      end;
+      LCount := self.FTree.CountOf(LFor, NodeRole.Capture);
+      LSavedSlot := ref Int64List();
+      setlength(LSavedByRef, LCount);
+      setlength(LSavedByCopy, LCount);
+      for LI := 0 to LCount - 1 do
+        LCapture := self.FTree.NthOf(LFor, NodeRole.Capture, LI);
+        LDecl := self.FTree[LCapture].ResolvedDecl;
+        LSavedSlot.Add(self.FSlotOf[LDecl]);
+        LSavedByRef[LI] := self.FByRef[LDecl];
+        LSavedByCopy[LI] := self.FByCopy[LDecl];
+        // one with no storage (a folded constant) is read as it always is
+        if self.FSlotOf[LDecl] <> 0 then
+          LSlot := self.DoSizedSlot(LCapture, LWord, self.FTarget.PointerAlign());
+          self.DoStore(LSlot, self.DoLoad(self.DoByteOffset(LFrame, (LAt + LI) * LWord, LCapture),
+            IrType.Pointer, LCapture), LCapture);
+          self.FSlotOf[LDecl] := LSlot;
+          self.FByRef[LDecl] := true;
+          self.FByCopy[LDecl] := false;
+        end;
+      end;
+      LIterator := self.FTree.FirstOf(LFor, NodeRole.Iterator);
+      LIr := self.DoTypeAt(self.FTree[LIterator].ResolvedType, LIterator);
+      LSlot := self.DoSlot(LIterator, self.FTree[LIterator].ResolvedType, false);
+      if (LIr <> IrType.Void) and (LSlot <> 0) then
+        self.DoStore(LSlot, self.DoConvertIr(LValue, LIr, LFor), LFor);
+        self.FParallelRoot := LFor;
+        self.DoCodeTemporaries(LFor);
+        self.FParallelRoot := 0;
+        LBody := self.FModule.AddBlock(self.FFunction);
+        LNext := self.FModule.AddBlock(self.FFunction);
+        LExit := self.FModule.AddBlock(self.FFunction);
+        self.FExitOf[LFor] := LExit;
+        self.FNextOf[LFor] := LNext;
+        self.DoJumpTo(LBody, LFor);
+        if self.DoArm(LBody, LFor, NodeRole.Statement) then
+          self.DoJumpTo(LNext, LFor);
+        end;
+        // each result made before its return (a terminator ends its block)
+        self.FBlock := LNext;
+        self.DoReleaseManaged(LFor);
+        LResult := self.DoConstant(IrType.Bool, 0, LFor);
+        LId := self.DoEmit(IrOp.Ret, IrType.Void, LFor);
+        self.FModule.InstrAt(LId).Operands.Add(LResult);
+        self.FBlock := LExit;
+        self.DoReleaseManaged(LFor);
+        LResult := self.DoConstant(IrType.Bool, 1, LFor);
+        LId := self.DoEmit(IrOp.Ret, IrType.Void, LFor);
+        self.FModule.InstrAt(LId).Operands.Add(LResult);
+        self.DoCleanupScopes(LFor, self.DoLastBlock());
+      end;
+      for LI := 0 to LCount - 1 do
+        LDecl := self.FTree[self.FTree.NthOf(LFor, NodeRole.Capture, LI)].ResolvedDecl;
+        self.FSlotOf[LDecl] := LSavedSlot[LI];
+        self.FByRef[LDecl] := LSavedByRef[LI];
+        self.FByCopy[LDecl] := LSavedByCopy[LI];
+      end;
+      self.FSelfSlot := 0;
+      self.FWorkerIndex := 0;
+      self.FWorkerCount := 0;
+    end;
+
+    // True when ARoot's child AChild is passed by the temporaries' walk (DoTemporaries): a
+    // for parallel's body belongs to its own function (DoParallelBody), its bounds and W to
+    // the routine's, and its iterator's slot is made by its body (T2). FParallelRoot is the
+    // loop whose body is being lowered
+    hidden const method DoPassesTemporaries(const ARoot: int64; const AChild: int64): bool;
+    var
+      LRole: NodeRole;
+    begin
+      if (self.FTree[ARoot].Kind <> NodeKind.ForStatement) or
+        (not self.FTree[ARoot].HasFlag(NodeFlag.Parallel)) then
+        return false;
+      end;
+      LRole := self.FTree.RoleOf(AChild);
+      if LRole = NodeRole.Statement then
+        return ARoot <> self.FParallelRoot;
+      end;
+      if LRole = NodeRole.Iterator then
+        return true;
+      end;
+      return ARoot = self.FParallelRoot;
+    end;
+
+    // True when AId is a var or const declaration among statements (BNF sec 5: a var block
+    // in a statement list), not a routine's own (Local), a module's (Declaration) or a for
+    // parallel's iterator
+    hidden const method DoIsStatementLocal(const AId: int64): bool;
+    var
+      LRole: NodeRole;
+    begin
+      if (self.FTree[AId].Kind <> NodeKind.VarDecl) and (self.FTree[AId].Kind <> NodeKind.ConstDecl) then
+        return false;
+      end;
+      LRole := self.FTree.RoleOf(AId);
+      return (LRole <> NodeRole.Local) and (LRole <> NodeRole.Declaration) and
+        (LRole <> NodeRole.Iterator);
+    end;
+
+    // The slot of the statement local AId (DoIsStatementLocal), made with the function's
+    // temporaries (before any of its code runs: a managed one empty, an aggregate zeroed,
+    // released at every exit) as a routine's own local's is (DoLocalSlot); a scalar
+    // constant needs none (its uses are folded)
+    hidden method DoStatementSlot(const AId: int64);
+    var
+      LType: int64;
+    begin
+      if self.FTree[AId].Kind = NodeKind.VarDecl then
+        self.DoLocalSlot(AId);
+        return;
+      end;
+      LType := self.DoDeclType(AId);
+      if self.DoIsAggregate(LType) then
+        self.DoAggregateLocalSlot(AId, LType);
+      end;
+    end;
+
+    // The statement local AId (DoIsStatementLocal) where its declaration stands: what an
+    // earlier pass left in its slot ended first (a loop's body runs it again: a managed
+    // value released and its slot emptied, an aggregate's values released under its live
+    // flag and its bytes zeroed), then its initializer stored or zero (DoLocalInit, an
+    // aggregate constant's DoAggregateLocalInit); its initializer's temporaries end
+    hidden method DoStatementLocal(const AId: int64);
+    var
+      LType: int64;
+      LSlot: int64;
+    begin
+      LSlot := self.FSlotOf[AId];
+      if LSlot = 0 then
+        // a refused one was reported at its declaration; a scalar constant is folded
+        return;
+      end;
+      LType := self.DoDeclType(AId);
+      if self.DoIsAggregate(LType) then
+        if self.DoHoldsManaged(LType) or self.DoHasLifetime(LType) then
+          if not self.DoReleaseLive(LSlot, LType, self.FLiveOf[AId], false, AId) then
+            return;
+          end;
+        end;
+        self.DoFill(LSlot, TypeSize(self.FTree, self.FTarget, LType), AId);
+      else
+        if self.DoIsManaged(LType) then
+          if not self.DoReleaseAt(LSlot, LType, AId) then
+            return;
+          end;
+          self.DoStore(LSlot, self.DoConstant(IrType.Pointer, 0, AId), AId);
+        end;
+      end;
+      if self.FTree[AId].Kind = NodeKind.VarDecl then
+        self.DoLocalInit(AId);
+      else
+        self.DoAggregateLocalInit(AId, LType);
+      end;
+      self.DoEndTemporaries(self.FTree.FirstOf(AId, NodeRole.Initializer));
     end;
 
     // A branch from the current block on `subject AOp bound` (the subject loaded from its
@@ -18899,7 +19320,9 @@ public type
       end;
       self.DoUnitStart();
       self.DoUnitRelease();
-      // the task entries first: an end function one of them asks for is lowered after
+      // the for parallel bodies first (one may hold an async), then the task entries: an
+      // end function one of them asks for is lowered after
+      self.DoParallelBodies();
       self.DoTaskBodies();
       self.DoEndBodies();
       // a release build: the body copies of the other units' routines it calls, for the

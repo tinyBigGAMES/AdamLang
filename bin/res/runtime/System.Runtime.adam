@@ -113,6 +113,10 @@ threadstatic
   // TaskLeave), and its own ThreadStart block once known (TaskWait never joins itself)
   GTaskCounted: bool;
   GTaskSelf: ptr;
+  // How many for parallel bodies this thread is running (ParallelWork): a for parallel
+  // that gives no workers' count runs on this thread alone while it is above 0 (a nested
+  // one, T2)
+  GParallelDepth: int64;
   // The allocation site of the construct this thread is running (M3.12b): the compiled code
   // stores its id (1 .. the exe's site table count, in source order) right before a runtime
   // call that may allocate and 0 right after it, so every block DoGetMem makes inside that
@@ -6727,6 +6731,250 @@ begin
   LWords := ptr to uint64(AThread);
   PlatformThreadDetach(LWords[2]);
   FreeMem(AThread);
+end;
+
+public type
+  // A for parallel's body (the compiler's, one per loop, T2): its frame (the addresses of
+  // the routine's variables it uses), the iterator's value as 64 bits, the worker running
+  // it (0 .. ACount - 1) and the workers' count; true when the body ran `leave`
+  ParallelEntry = routine(const AFrame: ptr; const AValue: int64; const AWorker: int64;
+    const ACount: int64): bool;
+
+const
+  // The words of a for parallel's run (ParallelRun's block, shared by its workers): its
+  // body (ptr), its frame (ptr), the first value, the step (1 or -1), the last iteration's
+  // index (counted from 0: the span), the iterations of one chunk, the chunks, the workers,
+  // the next chunk to take (atomicadd), the stop word (1 once a leave or a raise stops new
+  // iterations), the raised word (1 once a raise is kept), that raise's code and text (a
+  // string value it holds one reference to)
+  ADAM_RUNTIME_PARALLEL_ENTRY: int64 = 0;
+  ADAM_RUNTIME_PARALLEL_FRAME: int64 = 1;
+  ADAM_RUNTIME_PARALLEL_FIRST: int64 = 2;
+  ADAM_RUNTIME_PARALLEL_STEP: int64 = 3;
+  ADAM_RUNTIME_PARALLEL_SPAN: int64 = 4;
+  ADAM_RUNTIME_PARALLEL_CHUNK: int64 = 5;
+  ADAM_RUNTIME_PARALLEL_CHUNKS: int64 = 6;
+  ADAM_RUNTIME_PARALLEL_WORKERS: int64 = 7;
+  ADAM_RUNTIME_PARALLEL_NEXT: int64 = 8;
+  ADAM_RUNTIME_PARALLEL_STOP: int64 = 9;
+  ADAM_RUNTIME_PARALLEL_RAISED: int64 = 10;
+  ADAM_RUNTIME_PARALLEL_CODE: int64 = 11;
+  ADAM_RUNTIME_PARALLEL_TEXT: int64 = 12;
+  ADAM_RUNTIME_PARALLEL_WORDS: int64 = 13;
+  // ParallelRun's flags (the compiler's): a downto loop, unsigned bounds, a workers' count
+  // written
+  ADAM_RUNTIME_PARALLEL_DOWNTO: int64 = 1;
+  ADAM_RUNTIME_PARALLEL_UNSIGNED: int64 = 2;
+  ADAM_RUNTIME_PARALLEL_GIVEN: int64 = 4;
+  // The chunks a worker's share is cut into (a worker that is done early takes another)
+  ADAM_RUNTIME_PARALLEL_SHARE: uint64 = 16;
+
+// One worker of the for parallel AShared (ParallelRun's block), the worker AWorker: chunk
+// after chunk taken until none is left or the stop word is set, each iteration's value
+// handed to the body (a leave sets the stop word: no new iteration starts). A raise in the
+// body sets it too; the first one is kept (its code and a reference to its text) for
+// ParallelRun to raise again once every worker is done
+routine ParallelWork(const AShared: ptr; const AWorker: int64);
+var
+  LWords: ptr to int64;
+  LSlots: ptr to ptr;
+  LEntry: ParallelEntry;
+  LFrame: ptr;
+  LFirst: uint64;
+  LDown: bool;
+  LSpan: uint64;
+  LChunk: uint64;
+  LChunks: uint64;
+  LCount: int64;
+  LTaken: uint64;
+  LLow: uint64;
+  LHigh: uint64;
+  LK: uint64;
+  LValue: uint64;
+begin
+  LWords := ptr to int64(AShared);
+  LSlots := ptr to ptr(AShared);
+  LEntry := ParallelEntry(LSlots[ADAM_RUNTIME_PARALLEL_ENTRY]);
+  LFrame := LSlots[ADAM_RUNTIME_PARALLEL_FRAME];
+  LFirst := uint64(LWords[ADAM_RUNTIME_PARALLEL_FIRST]);
+  LDown := LWords[ADAM_RUNTIME_PARALLEL_STEP] < 0;
+  LSpan := uint64(LWords[ADAM_RUNTIME_PARALLEL_SPAN]);
+  LChunk := uint64(LWords[ADAM_RUNTIME_PARALLEL_CHUNK]);
+  LChunks := uint64(LWords[ADAM_RUNTIME_PARALLEL_CHUNKS]);
+  LCount := LWords[ADAM_RUNTIME_PARALLEL_WORKERS];
+  GParallelDepth := GParallelDepth + 1;
+  guard
+    while atomicload(LWords[ADAM_RUNTIME_PARALLEL_STOP]) = 0 do
+      LTaken := uint64(atomicadd(LWords[ADAM_RUNTIME_PARALLEL_NEXT], 1));
+      if LTaken >= LChunks then
+        leave;
+      end;
+      // the chunk's indexes: LTaken * LChunk never passes the span (LChunks = span /
+      // chunk + 1), its last one cut at the span with no overflow
+      LLow := LTaken * LChunk;
+      LHigh := LSpan;
+      if LSpan - LLow >= LChunk then
+        LHigh := LLow + LChunk - 1;
+      end;
+      LK := LLow;
+      while atomicload(LWords[ADAM_RUNTIME_PARALLEL_STOP]) = 0 do
+        // the value in 64 bits, wrapping (an unsigned bound past int64's range included)
+        if LDown then
+          LValue := LFirst - LK;
+        else
+          LValue := LFirst + LK;
+        end;
+        if LEntry(LFrame, int64(LValue), AWorker, LCount) then
+          atomicstore(LWords[ADAM_RUNTIME_PARALLEL_STOP], 1);
+          leave;
+        end;
+        if LK = LHigh then
+          leave;
+        end;
+        LK := LK + 1;
+      end;
+    end;
+  except
+    if atomicswap(LWords[ADAM_RUNTIME_PARALLEL_RAISED], 1) = 0 then
+      StrAddRef(GRaiseText);
+      LSlots[ADAM_RUNTIME_PARALLEL_TEXT] := GRaiseText;
+      LWords[ADAM_RUNTIME_PARALLEL_CODE] := int64(GRaiseCode);
+    end;
+    atomicstore(LWords[ADAM_RUNTIME_PARALLEL_STOP], 1);
+  end;
+  GParallelDepth := GParallelDepth - 1;
+end;
+
+// A started worker's thread (ThreadStart's entry): its block holds ParallelRun's block and
+// the worker's index
+routine ParallelThread(const ABlock: ptr);
+var
+  LSlots: ptr to ptr;
+  LWords: ptr to int64;
+begin
+  LSlots := ptr to ptr(ABlock);
+  LWords := ptr to int64(ABlock);
+  ParallelWork(LSlots[0], LWords[1]);
+end;
+
+// `for parallel [(W)] I := A to|downto B do .. end;` (BNF sec 5, T2): the body AEntry run
+// once per value from AFirst to ALast (AFlags: downto, unsigned bounds, a workers' count
+// given; the bounds as 64 bits), over its frame AFrame, by the workers: AWorkers when it
+// is given (below 1: 1), else the processors' count (PlatformCpuCount), one alone inside
+// another for parallel's body; never more than the iterations when none is given. The
+// calling thread is worker 0; the others are threads started here (one that cannot start
+// leaves its share to the rest) and joined before this returns, so every iteration has
+// ended (the barrier). Then the first raise a body made is raised again here
+public routine ParallelRun(const AEntry: ParallelEntry; const AFrame: ptr; const AFirst: int64;
+  const ALast: int64; const AFlags: int64; const AWorkers: int64);
+var
+  LUnsigned: bool;
+  LSpan: uint64;
+  LStep: int64;
+  LWorkers: int64;
+  LChunk: uint64;
+  LShared: ptr;
+  LWords: ptr to int64;
+  LSlots: ptr to ptr;
+  LBlocks: ptr to ptr;
+  LIndexes: ptr to int64;
+  LThreads: ptr to ptr;
+  LStarted: int64;
+  LI: int64;
+  LCode: int32;
+  LText: ptr;
+begin
+  LUnsigned := (AFlags & ADAM_RUNTIME_PARALLEL_UNSIGNED) <> 0;
+  if (AFlags & ADAM_RUNTIME_PARALLEL_DOWNTO) = 0 then
+    if (LUnsigned and (uint64(AFirst) > uint64(ALast))) or ((not LUnsigned) and (AFirst > ALast)) then
+      return;
+    end;
+    LSpan := uint64(ALast) - uint64(AFirst);
+    LStep := 1;
+  else
+    if (LUnsigned and (uint64(AFirst) < uint64(ALast))) or ((not LUnsigned) and (AFirst < ALast)) then
+      return;
+    end;
+    LSpan := uint64(AFirst) - uint64(ALast);
+    LStep := -1;
+  end;
+  if (AFlags & ADAM_RUNTIME_PARALLEL_GIVEN) <> 0 then
+    LWorkers := AWorkers;
+    if LWorkers < 1 then
+      LWorkers := 1;
+    end;
+  else
+    LWorkers := 1;
+    if GParallelDepth = 0 then
+      LWorkers := PlatformCpuCount();
+    end;
+    if LWorkers < 1 then
+      LWorkers := 1;
+    end;
+    // the iterations are the span + 1
+    if uint64(LWorkers - 1) > LSpan then
+      LWorkers := int64(LSpan) + 1;
+    end;
+  end;
+  LChunk := LSpan div uint64(LWorkers) div ADAM_RUNTIME_PARALLEL_SHARE + 1;
+  LShared := DoGetMem(ADAM_RUNTIME_PARALLEL_WORDS * 8);
+  if LShared = nil then
+    MemoryFail(ptr to const char("a for parallel's run of "), ADAM_RUNTIME_PARALLEL_WORDS * 8,
+      ptr to const char(" bytes"));
+  end;
+  LWords := ptr to int64(LShared);
+  LSlots := ptr to ptr(LShared);
+  LSlots[ADAM_RUNTIME_PARALLEL_ENTRY] := ptr(AEntry);
+  LSlots[ADAM_RUNTIME_PARALLEL_FRAME] := AFrame;
+  LWords[ADAM_RUNTIME_PARALLEL_FIRST] := AFirst;
+  LWords[ADAM_RUNTIME_PARALLEL_STEP] := LStep;
+  LWords[ADAM_RUNTIME_PARALLEL_SPAN] := int64(LSpan);
+  LWords[ADAM_RUNTIME_PARALLEL_CHUNK] := int64(LChunk);
+  LWords[ADAM_RUNTIME_PARALLEL_CHUNKS] := int64(LSpan div LChunk + 1);
+  LWords[ADAM_RUNTIME_PARALLEL_WORKERS] := LWorkers;
+  LWords[ADAM_RUNTIME_PARALLEL_NEXT] := 0;
+  LWords[ADAM_RUNTIME_PARALLEL_STOP] := 0;
+  LWords[ADAM_RUNTIME_PARALLEL_RAISED] := 0;
+  LWords[ADAM_RUNTIME_PARALLEL_CODE] := 0;
+  LSlots[ADAM_RUNTIME_PARALLEL_TEXT] := nil;
+  // the other workers' blocks (two words each: the run, the index) and threads
+  LStarted := 0;
+  LBlocks := nil;
+  LThreads := nil;
+  if LWorkers > 1 then
+    LBlocks := ptr to ptr(DoGetMem((LWorkers - 1) * 16));
+    LThreads := ptr to ptr(DoGetMem((LWorkers - 1) * 8));
+  end;
+  if (LBlocks <> nil) and (LThreads <> nil) then
+    LIndexes := ptr to int64(LBlocks);
+    for LI := 1 to LWorkers - 1 do
+      LBlocks[(LI - 1) * 2] := LShared;
+      LIndexes[(LI - 1) * 2 + 1] := LI;
+      LThreads[LI - 1] := ThreadStart(ParallelThread, ptr(addr of LBlocks[(LI - 1) * 2]));
+      if LThreads[LI - 1] = nil then
+        leave;
+      end;
+      LStarted := LStarted + 1;
+    end;
+  end;
+  ParallelWork(LShared, 0);
+  for LI := 0 to LStarted - 1 do
+    ThreadJoin(LThreads[LI]);
+  end;
+  if LBlocks <> nil then
+    FreeMem(ptr(LBlocks));
+  end;
+  if LThreads <> nil then
+    FreeMem(ptr(LThreads));
+  end;
+  LCode := int32(LWords[ADAM_RUNTIME_PARALLEL_CODE]);
+  LText := LSlots[ADAM_RUNTIME_PARALLEL_TEXT];
+  if LWords[ADAM_RUNTIME_PARALLEL_RAISED] <> 0 then
+    FreeMem(LShared);
+    // the kept reference goes to the new raise
+    RaiseWith(LCode, LText);
+  end;
+  FreeMem(LShared);
 end;
 
 const
