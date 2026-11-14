@@ -241,6 +241,19 @@ routine RtlWaitOnAddress(const AAddress: ptr; const ACompare: ptr; const ASize: 
 routine RtlWakeAddressSingle(const AAddress: ptr); external "ntdll";
 // kernel32: milliseconds since the system started (PlatformMilliseconds)
 routine GetTickCount64(): uint64; external "kernel32";
+// kernel32: the hardware faults (PlatformCatch, PlatformAtFault): the process's last filter
+// of an exception no frame took (the one it replaces back), the stack the calling thread
+// keeps for handling its own stack overflow (ASize: the bytes asked for, the bytes it kept
+// before), a standard handle (ADAM_PLATFORM_STD_ERROR), the process ended at once with an
+// exit code (no exit-time handler, no DLL detach)
+routine SetUnhandledExceptionFilter(const AFilter: routine(const APointers: ptr): int32): ptr;
+  external "kernel32";
+routine SetThreadStackGuarantee(var ASize: uint32): int32; external "kernel32";
+routine GetStdHandle(const AWhich: uint32): uint64; external "kernel32";
+routine TerminateProcess(const AProcess: uint64; const ACode: uint32): int32;
+  external "kernel32";
+// ucrtbase: the guard page a caught stack overflow used up made again (0 when it could not)
+routine _resetstkoflw(): int32; external "ucrtbase";
 
 // ucrtbase: the calling thread's errno, two C strings compared (0 when equal), a C
 // string's length
@@ -300,6 +313,26 @@ const
   ADAM_PLATFORM_RAISE_CODE: uint32 = 0xE0414441;
   // RaiseException's flag of an exception that cannot be continued
   ADAM_PLATFORM_NONCONTINUABLE: uint32 = 1;
+  // The exception codes of the hardware faults (winnt.h EXCEPTION_*, PaskalCPP's
+  // is_hardware_fault): access violation, in-page error, integer and float divide by zero,
+  // stack overflow, integer overflow, float overflow and underflow, float invalid operation,
+  // illegal and privileged instruction
+  ADAM_PLATFORM_ACCESS_VIOLATION: uint32 = 0xC0000005;
+  ADAM_PLATFORM_IN_PAGE_ERROR: uint32 = 0xC0000006;
+  ADAM_PLATFORM_INT_DIVIDE_BY_ZERO: uint32 = 0xC0000094;
+  ADAM_PLATFORM_FLT_DIVIDE_BY_ZERO: uint32 = 0xC000008E;
+  ADAM_PLATFORM_STACK_OVERFLOW: uint32 = 0xC00000FD;
+  ADAM_PLATFORM_INT_OVERFLOW: uint32 = 0xC0000095;
+  ADAM_PLATFORM_FLT_OVERFLOW: uint32 = 0xC0000091;
+  ADAM_PLATFORM_FLT_UNDERFLOW: uint32 = 0xC0000093;
+  ADAM_PLATFORM_FLT_INVALID_OPERATION: uint32 = 0xC0000090;
+  ADAM_PLATFORM_ILLEGAL_INSTRUCTION: uint32 = 0xC000001D;
+  ADAM_PLATFORM_PRIV_INSTRUCTION: uint32 = 0xC0000096;
+  // GetStdHandle's STD_ERROR_HANDLE ((DWORD)-12)
+  ADAM_PLATFORM_STD_ERROR: uint32 = 0xFFFFFFF4;
+  // The bytes each thread keeps for handling its own stack overflow (SetThreadStackGuarantee):
+  // the dispatch, the filters, the unwind's funclets and the except part's start run there
+  ADAM_PLATFORM_STACK_GUARANTEE: uint32 = 65536;
   // MultiByteToWideChar's code page of UTF-8, and its flag that fails on invalid UTF-8
   ADAM_PLATFORM_UTF8: uint32 = 65001;
   ADAM_PLATFORM_UTF8_STRICT: uint32 = 8;
@@ -388,6 +421,18 @@ const
   ADAM_PLATFORM_MODULES_EXTRA: int64 = 16;
 
 public const
+  // The hardware fault kinds (PaskalCPP's EXC_ codes, the same on every target: System.Runtime's
+  // ADAM_RUNTIME_EXC_*) PlatformFaultTaken gives and the fault handler (PlatformAtFault) is
+  // called with: divide by zero, access violation (an in-page error too), stack overflow,
+  // numeric overflow (integer or float), illegal or privileged instruction, a bus error (a
+  // POSIX target's SIGBUS; never on this one), another fault (a float invalid operation)
+  ADAM_PLATFORM_FAULT_DIVIDE: int32 = 2;
+  ADAM_PLATFORM_FAULT_ACCESS: int32 = 3;
+  ADAM_PLATFORM_FAULT_STACK: int32 = 4;
+  ADAM_PLATFORM_FAULT_OVERFLOW: int32 = 5;
+  ADAM_PLATFORM_FAULT_INSTRUCTION: int32 = 6;
+  ADAM_PLATFORM_FAULT_BUS: int32 = 7;
+  ADAM_PLATFORM_FAULT_OTHER: int32 = 99;
   // C's errno values (ucrt's errno.h) a run-time hook reports (System.Runtime's
   // ADAM_ERRNO_*): no module defines the name, out of memory, a slot not writable, the name
   // already hooked, a name or argument refused; System.HookIO's stream that failed (EIO), a
@@ -446,6 +491,18 @@ var
   // thread but the main one runs), run on each thread but the main one as it ends
   // (PlatformThreadCallback); nil until then
   GThreadEnd: routine();
+  // System.Runtime's report of a hardware fault no guard took (PlatformAtFault: it never
+  // returns); nil until then
+  GFaultHandler: routine(const AKind: int32);
+
+threadstatic
+  // The hardware fault kind (ADAM_PLATFORM_FAULT_*) a guard's filter took on this thread
+  // (PlatformCatch), waiting for that guard's except part (PlatformFaultTaken); 0 when none
+  // (a raise taken since clears it: the raise in flight is the latest one, as for raises)
+  GFaultPending: int32;
+  // True once a guard's filter took a stack overflow on this thread, until the guard's
+  // except part makes the guard page again (PlatformFaultTaken), whatever was raised between
+  GStackRearm: bool;
 
 // Writes the ACount bytes at AText to stdout as they are
 public routine PlatformWrite(const AText: ptr; const ACount: int64);
@@ -492,22 +549,157 @@ begin
   RaiseException(ADAM_PLATFORM_RAISE_CODE, ADAM_PLATFORM_NONCONTINUABLE, 0, nil);
 end;
 
-// The filter of the entry's catching scope (C's __except filter, called by
-// __C_specific_handler as the exception is dispatched): APointers is the
-// EXCEPTION_POINTERS (its first word the EXCEPTION_RECORD, whose first DWORD is the code),
-// AFrame the entry's frame. 1 (execute the handler: caught) for the runtime's own
-// exception, 0 (continue the search) for any other, which goes on to the OS as it did before
-public routine PlatformCatch(const APointers: ptr; const AFrame: ptr): int32;
+// The hardware fault kind (ADAM_PLATFORM_FAULT_*) of the exception code ACode, 0 when it
+// is no hardware fault (PaskalCPP's is_hardware_fault / fault_code)
+routine DoFaultKind(const ACode: uint32): int32;
+begin
+  if (ACode = ADAM_PLATFORM_ACCESS_VIOLATION) or (ACode = ADAM_PLATFORM_IN_PAGE_ERROR) then
+    return ADAM_PLATFORM_FAULT_ACCESS;
+  end;
+  if (ACode = ADAM_PLATFORM_INT_DIVIDE_BY_ZERO) or
+    (ACode = ADAM_PLATFORM_FLT_DIVIDE_BY_ZERO) then
+    return ADAM_PLATFORM_FAULT_DIVIDE;
+  end;
+  if ACode = ADAM_PLATFORM_STACK_OVERFLOW then
+    return ADAM_PLATFORM_FAULT_STACK;
+  end;
+  if (ACode = ADAM_PLATFORM_INT_OVERFLOW) or (ACode = ADAM_PLATFORM_FLT_OVERFLOW) or
+    (ACode = ADAM_PLATFORM_FLT_UNDERFLOW) then
+    return ADAM_PLATFORM_FAULT_OVERFLOW;
+  end;
+  if (ACode = ADAM_PLATFORM_ILLEGAL_INSTRUCTION) or
+    (ACode = ADAM_PLATFORM_PRIV_INSTRUCTION) then
+    return ADAM_PLATFORM_FAULT_INSTRUCTION;
+  end;
+  if ACode = ADAM_PLATFORM_FLT_INVALID_OPERATION then
+    return ADAM_PLATFORM_FAULT_OTHER;
+  end;
+  return 0;
+end;
+
+// The exception code of the EXCEPTION_POINTERS APointers (its first word the
+// EXCEPTION_RECORD, whose first DWORD is the code)
+routine DoExceptionCode(const APointers: ptr): uint32;
 var
   LPointers: ptr to ptr;
   LRecord: ptr to uint32;
 begin
   LPointers := ptr to ptr(APointers);
   LRecord := ptr to uint32(LPointers[0]);
-  if LRecord[0] = ADAM_PLATFORM_RAISE_CODE then
+  return LRecord[0];
+end;
+
+// The filter of a guard's catching scope (C's __except filter, called by
+// __C_specific_handler as the exception is dispatched): APointers is the
+// EXCEPTION_POINTERS, AFrame the guard's frame. 1 (execute the handler: caught) for the
+// runtime's own exception and for a hardware fault (BNF sec 5: a guard takes both), which
+// is kept for the guard's except part to make the raise in flight (GFaultPending,
+// PlatformFaultTaken: no heap or stdio call runs here, the stack may be all but spent); 0
+// (continue the search) for any other, which goes on to the OS as it did before
+public routine PlatformCatch(const APointers: ptr; const AFrame: ptr): int32;
+var
+  LCode: uint32;
+  LKind: int32;
+begin
+  LCode := DoExceptionCode(APointers);
+  if LCode = ADAM_PLATFORM_RAISE_CODE then
+    GFaultPending := 0;
+    return 1;
+  end;
+  LKind := DoFaultKind(LCode);
+  if LKind = 0 then
+    return 0;
+  end;
+  GFaultPending := LKind;
+  if LKind = ADAM_PLATFORM_FAULT_STACK then
+    GStackRearm := true;
+  end;
+  return 1;
+end;
+
+// The filter of a last catching scope (the entry's, a module teardown's, a started
+// thread's: Lowering's DoCatchAll), whose catch reports the raise and ends the process
+// with its teardown (System.Runtime's Unhandled): 1 for the runtime's own exception only.
+// A hardware fault goes on to the OS, so it reaches the process's last filter
+// (PlatformAtFault: reported, no teardown, BNF sec 1) with nothing unwound, and a debugger
+// stops at the faulting line
+public routine PlatformCatchRaise(const APointers: ptr; const AFrame: ptr): int32;
+begin
+  if DoExceptionCode(APointers) = ADAM_PLATFORM_RAISE_CODE then
+    GFaultPending := 0;
     return 1;
   end;
   return 0;
+end;
+
+// A guard's except part's start (System.Runtime's FaultTaken): the hardware fault kind
+// its filter took (PlatformCatch), 0 when it took a raise; the guard page made again once
+// the frames of a stack overflow are gone (PaskalCPP's after_fault: else the thread's next
+// overflow is an access violation nothing can handle)
+public routine PlatformFaultTaken(): int32;
+var
+  LKind: int32;
+begin
+  if GStackRearm then
+    GStackRearm := false;
+    _resetstkoflw();
+  end;
+  LKind := GFaultPending;
+  GFaultPending := 0;
+  return LKind;
+end;
+
+// The process's last filter (SetUnhandledExceptionFilter; Windows calls it only with no
+// debugger attached): a hardware fault no guard took is reported by the fault handler
+// (PlatformAtFault), which ends the process; any other exception goes on (0)
+routine DoUnhandledFault(const APointers: ptr): int32;
+var
+  LKind: int32;
+  LHandler: routine(const AKind: int32);
+begin
+  LKind := DoFaultKind(DoExceptionCode(APointers));
+  LHandler := GFaultHandler;
+  if (LKind = 0) or (ptr(LHandler) = nil) then
+    return 0;
+  end;
+  LHandler(LKind);
+  return 0;
+end;
+
+// AHandler called with the fault kind (ADAM_PLATFORM_FAULT_*) of a hardware fault no guard
+// took, on the faulting thread with nothing unwound (DoUnhandledFault); it reports the
+// fault and ends the process (PlatformWriteErrorDirect, PlatformTerminate), never returning
+public routine PlatformAtFault(const AHandler: routine(const AKind: int32));
+begin
+  GFaultHandler := AHandler;
+  SetUnhandledExceptionFilter(DoUnhandledFault);
+end;
+
+// Writes the ACount bytes at AText to stderr in one system call, no stdio (its lock may be
+// held by the code that faulted): the fault report's line
+public routine PlatformWriteErrorDirect(const AText: ptr; const ACount: int64);
+var
+  LWritten: uint32;
+begin
+  WriteFile(GetStdHandle(ADAM_PLATFORM_STD_ERROR), AText, uint32(ACount), LWritten, nil);
+end;
+
+// Ends the process at once with the exit code ACode: no exit-time handler runs, no stream
+// is flushed, no DLL is told (PaskalCPP's report_unguarded_fault)
+public routine PlatformTerminate(const ACode: int32); noreturn;
+begin
+  TerminateProcess(GetCurrentProcess(), uint32(ACode));
+  _exit(ACode);
+end;
+
+// The calling thread keeps ADAM_PLATFORM_STACK_GUARANTEE bytes for handling its own stack
+// overflow (the main thread at this unit's start, a started one in DoThreadProc)
+routine DoGuaranteeStack();
+var
+  LSize: uint32;
+begin
+  LSize := ADAM_PLATFORM_STACK_GUARANTEE;
+  SetThreadStackGuarantee(LSize);
 end;
 
 // AHandler run when the process ends through exit, however it is called (the runtime's
@@ -1008,6 +1200,7 @@ begin
   LRun := PlatformThreadRun(LSlots[0]);
   LBlock := LSlots[1];
   free(AParameter);
+  DoGuaranteeStack();
   LRun(LBlock);
   return 0;
 end;
@@ -2654,10 +2847,12 @@ begin
 end;
 
 // What a C program's startup sets before main: the invalid parameter handler (MinGW's
-// crtexe.c). It runs before System.Runtime's section, whose implicit import this unit is
+// crtexe.c); and the main thread's stack kept for handling its own stack overflow. It runs
+// before System.Runtime's section, whose implicit import this unit is
 initialize
 begin
   _set_invalid_parameter_handler(DoInvalidParameter);
+  DoGuaranteeStack();
 end;
 
 end.
