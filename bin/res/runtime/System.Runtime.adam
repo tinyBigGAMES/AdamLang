@@ -117,6 +117,10 @@ threadstatic
   // that gives no workers' count runs on this thread alone while it is above 0 (a nested
   // one, T2)
   GParallelDepth: int64;
+  // The object of the task whose call this thread runs (TaskRun; a for parallel's workers
+  // take their run's, ParallelWork): cancelled() reads its cancel word, T3; nil on a thread
+  // that runs none. Never counted: the call's thread holds the task while it runs
+  GTaskCurrent: ptr;
   // The allocation site of the construct this thread is running (M3.12b): the compiled code
   // stores its id (1 .. the exe's site table count, in source order) right before a runtime
   // call that may allocate and 0 right after it, so every block DoGetMem makes inside that
@@ -6760,7 +6764,10 @@ const
   ADAM_RUNTIME_PARALLEL_RAISED: int64 = 10;
   ADAM_RUNTIME_PARALLEL_CODE: int64 = 11;
   ADAM_RUNTIME_PARALLEL_TEXT: int64 = 12;
-  ADAM_RUNTIME_PARALLEL_WORDS: int64 = 13;
+  // The task whose call runs the loop (its starter's GTaskCurrent, T3): every worker's
+  // cancelled() reads it
+  ADAM_RUNTIME_PARALLEL_TASK: int64 = 13;
+  ADAM_RUNTIME_PARALLEL_WORDS: int64 = 14;
   // ParallelRun's flags (the compiler's): a downto loop, unsigned bounds, a workers' count
   // written
   ADAM_RUNTIME_PARALLEL_DOWNTO: int64 = 1;
@@ -6791,9 +6798,13 @@ var
   LHigh: uint64;
   LK: uint64;
   LValue: uint64;
+  LTask: ptr;
 begin
   LWords := ptr to int64(AShared);
   LSlots := ptr to ptr(AShared);
+  // the run's task is this worker's while it works (the starter's own included)
+  LTask := GTaskCurrent;
+  GTaskCurrent := LSlots[ADAM_RUNTIME_PARALLEL_TASK];
   LEntry := ParallelEntry(LSlots[ADAM_RUNTIME_PARALLEL_ENTRY]);
   LFrame := LSlots[ADAM_RUNTIME_PARALLEL_FRAME];
   LFirst := uint64(LWords[ADAM_RUNTIME_PARALLEL_FIRST]);
@@ -6843,6 +6854,7 @@ begin
     atomicstore(LWords[ADAM_RUNTIME_PARALLEL_STOP], 1);
   end;
   GParallelDepth := GParallelDepth - 1;
+  GTaskCurrent := LTask;
 end;
 
 // A started worker's thread (ThreadStart's entry): its block holds ParallelRun's block and
@@ -6937,6 +6949,7 @@ begin
   LWords[ADAM_RUNTIME_PARALLEL_RAISED] := 0;
   LWords[ADAM_RUNTIME_PARALLEL_CODE] := 0;
   LSlots[ADAM_RUNTIME_PARALLEL_TEXT] := nil;
+  LSlots[ADAM_RUNTIME_PARALLEL_TASK] := GTaskCurrent;
   // the other workers' blocks (two words each: the run, the index) and threads
   LStarted := 0;
   LBlocks := nil;
@@ -6987,14 +7000,16 @@ const
   // the raise its call ended with (int64), that raise's text (a string value it holds one
   // reference to: the descriptor's map releases it), its entry (ptr: the compiler's routine
   // of one pointer for the call site, which reads the call's arguments from the object, runs
-  // the call and stores its result there), then the compiler's words: the arguments'
-  // copies and the result, from word 6 on
+  // the call and stores its result there), its cancel word (int64: 1 once cancel(T) asked
+  // its call to stop, T3; atomic), then the compiler's words: the arguments' copies and the
+  // result, from word 7 on
   ADAM_RUNTIME_TASK_THREAD: int64 = 0;
   ADAM_RUNTIME_TASK_STATE: int64 = 1;
   ADAM_RUNTIME_TASK_JOINED: int64 = 2;
   ADAM_RUNTIME_TASK_CODE: int64 = 3;
   ADAM_RUNTIME_TASK_TEXT: int64 = 4;
   ADAM_RUNTIME_TASK_ENTRY: int64 = 5;
+  ADAM_RUNTIME_TASK_CANCEL: int64 = 6;
   // A task's states: its call still running, ended with its result stored, ended by a raise,
   // ended by a raise an await has raised again (a task whose call raised ends the program at
   // its last release only while no await saw that raise: TaskDone)
@@ -7140,6 +7155,7 @@ begin
   LWords := ptr to int64(AObject);
   LSlots := ptr to ptr(AObject);
   LEntry := ThreadEntry(LSlots[ADAM_RUNTIME_TASK_ENTRY]);
+  GTaskCurrent := AObject;
   guard
     LEntry(AObject);
     atomicstore(LWords[ADAM_RUNTIME_TASK_STATE], ADAM_RUNTIME_TASK_ENDED);
@@ -7149,6 +7165,7 @@ begin
     LWords[ADAM_RUNTIME_TASK_CODE] := int64(GRaiseCode);
     atomicstore(LWords[ADAM_RUNTIME_TASK_STATE], ADAM_RUNTIME_TASK_RAISED);
   end;
+  GTaskCurrent := nil;
   // TaskStart writes the thread once ThreadStart has returned it: a call that ended before
   // that waits for it, so the thread taken below is the real one
   LThread := atomicload(LSlots[ADAM_RUNTIME_TASK_THREAD]);
@@ -7246,6 +7263,46 @@ begin
     StrAddRef(LSlots[ADAM_RUNTIME_TASK_TEXT]);
     RaiseWith(int32(LWords[ADAM_RUNTIME_TASK_CODE]), LSlots[ADAM_RUNTIME_TASK_TEXT]);
   end;
+end;
+
+// `cancel(T)` (BNF sec 7, T3): asks the call of the task ABlock to stop, its cancel word
+// set; nothing is stopped here (the call reads cancelled() and returns or raises as it
+// sees fit). A nil task: nothing
+routine TaskCancel(const ABlock: ptr);
+var
+  LWords: ptr to int64;
+begin
+  if ABlock = nil then
+    return;
+  end;
+  LWords := ptr to int64(TaskObject(ABlock));
+  atomicstore(LWords[ADAM_RUNTIME_TASK_CANCEL], 1);
+end;
+
+// `cancelled(T)` (BNF sec 7, T3): true once cancel(T) ran on the task ABlock; false for a
+// nil task
+routine TaskCancelled(const ABlock: ptr): bool;
+var
+  LWords: ptr to int64;
+begin
+  if ABlock = nil then
+    return false;
+  end;
+  LWords := ptr to int64(TaskObject(ABlock));
+  return atomicload(LWords[ADAM_RUNTIME_TASK_CANCEL]) <> 0;
+end;
+
+// `cancelled()` (BNF sec 7, T3): the cancel word of the task whose call this thread runs
+// (GTaskCurrent); false on a thread that runs none
+routine TaskCancelledSelf(): bool;
+var
+  LWords: ptr to int64;
+begin
+  if GTaskCurrent = nil then
+    return false;
+  end;
+  LWords := ptr to int64(GTaskCurrent);
+  return atomicload(LWords[ADAM_RUNTIME_TASK_CANCEL]) <> 0;
 end;
 
 // `ready(T)` (BNF sec 7): true once the call of the task ABlock has ended (its result
