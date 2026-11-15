@@ -351,11 +351,16 @@ public const
   // by a done (DoTaskEndBody): TaskDone, then those values ended
   ADAM_LOWERING_TASK_END_SYMBOL: string = "__adam_taskend";
   // A generator's object (BNF sec 4 sequence type, G1; System.Runtime's
-  // ADAM_RUNTIME_GENERATOR_* words): the runtime's nine words (its text and entry at the
-  // task's offsets), then the value of its last yield (DoGeneratorValueOffset: placed by T
-  // alone, so a for in over any sequence of T reads it), self's address for a method, then
-  // the arguments' copies (DoGeneratorLayout)
-  ADAM_LOWERING_GENERATOR_WORDS: int64 = 72;
+  // ADAM_RUNTIME_GENERATOR_* words): the runtime's twelve words (its text and entry at the
+  // task's offsets; its delegate, current and raised words, G1e), then the value of its
+  // last yield (DoGeneratorValueOffset: placed by T alone, so a for in over any sequence
+  // of T reads it, in whichever object of a yield from chain holds it), self's address for
+  // a method, then the arguments' copies (DoGeneratorLayout)
+  ADAM_LOWERING_GENERATOR_WORDS: int64 = 96;
+  // The byte offset in a generator's object of its current word (the runtime's
+  // ADAM_RUNTIME_GENERATOR_CURRENT): the object whose value the last resume gave, itself
+  // or, under a yield from, the innermost generator it delegates to (G1e)
+  ADAM_LOWERING_GENERATOR_CURRENT: int64 = 80;
   // The prefix of a generator's body function's symbol (its index follows; internal):
   // GeneratorRun calls it with the generator's object, it runs the routine's statements on
   // the generator's coroutine (DoGeneratorBody)
@@ -667,6 +672,13 @@ public type
     // that address). By a routine's or an external's node id: its aggregate result comes
     // back through a hidden first parameter, the caller's slot (Target.AggregateInRegister)
     hidden FByCopy: array of bool;
+    // By a parameter's node id: how it travels across a call, as DoParamIr found it (its
+    // address; for FPassByCopy an aggregate's caller copy's address). A call's arguments
+    // read these, never FByRef / FByCopy: those say how the function being lowered reaches
+    // the parameter, which a generator's or a task's body changes to its object's word
+    // (DoGeneratorBody, G1e0: a self-call in there passes by the parameter's own form)
+    hidden FPassByRef: array of bool;
+    hidden FPassByCopy: array of bool;
     hidden FHiddenResult: array of bool;
     // By a canonical routine type's node id: the IR signature calls through its values
     // carry; by a dispatched method's node id: the IR signature its calls through a vtable
@@ -907,6 +919,10 @@ public type
     // The slot a generator's body function keeps its object's address in (DoGeneratorBody;
     // a yield stores its value there, DoYield); 0 outside one
     hidden FGeneratorSlot: int64;
+    // The address of the element a `yield from S` pass hands on (G1e: S's element, in its
+    // copy, its block or the generator's object), its YieldElement child's place while
+    // that pass's yield is lowered (DoYieldElement); 0 otherwise
+    hidden FYieldElementAt: int64;
     // The for parallel bodies DoParallelFor made (DoParallelEntry, T2), lowered last
     // (DoParallelBodies): by index, the function, its for statement and whether its frame
     // starts with self (1: the routine holding it is a method's). FBodyRoot: the for
@@ -957,6 +973,8 @@ public type
       setlength(self.FDataOf, ATree.Count);
       setlength(self.FSlotRefused, ATree.Count);
       setlength(self.FByCopy, ATree.Count);
+      setlength(self.FPassByRef, ATree.Count);
+      setlength(self.FPassByCopy, ATree.Count);
       setlength(self.FHiddenResult, ATree.Count);
       setlength(self.FSignatureOf, ATree.Count);
       self.FResultSlot := 0;
@@ -1219,6 +1237,7 @@ public type
     begin
       if PassedByReference(self.FTree, AParam, self.DoLinkageOf(ARoutine)) then
         self.FByRef[AParam] := true;
+        self.FPassByRef[AParam] := true;
         return IrType.Pointer;
       end;
       LType := self.DoDeclType(AParam);
@@ -1229,6 +1248,8 @@ public type
         end;
         self.FByRef[AParam] := true;
         self.FByCopy[AParam] := true;
+        self.FPassByRef[AParam] := true;
+        self.FPassByCopy[AParam] := true;
         return IrType.Pointer;
       end;
       if self.DoIsManaged(LType) then
@@ -1691,7 +1712,7 @@ public type
       return (LKind = NodeKind.NameExpression) or (LKind = NodeKind.IndexExpression) or
         (LKind = NodeKind.MemberExpression) or self.DoIsDeref(AId) or
         (LKind = NodeKind.SelfExpression) or (LKind = NodeKind.ParentExpression) or
-        self.DoIsAsObject(AId);
+        (LKind = NodeKind.YieldElement) or self.DoIsAsObject(AId);
     end;
 
     // True when the member or index expression AId reads or writes a property (SEM's
@@ -4977,6 +4998,13 @@ public type
       if (LKind = NodeKind.SelfExpression) or (LKind = NodeKind.ParentExpression) then
         return self.DoSelfAddress(AId);
       end;
+      // a yield from pass's element (G1e): where that pass reads it (DoYieldElement)
+      if LKind = NodeKind.YieldElement then
+        if self.FYieldElementAt = 0 then
+          self.DoRefuse(AId, self.FTree.ConstructPhrase(AId));
+        end;
+        return self.FYieldElementAt;
+      end;
       if self.DoIsAsObject(AId) then
         return self.DoAsObject(AId, AWrite);
       end;
@@ -5039,10 +5067,10 @@ public type
       LType := self.DoDeclType(AParam);
       if self.DoIsAggregate(LType) and self.DoHasLifetime(LType) and
         (not self.FTree[AParam].HasFlag(NodeFlag.ConstParam)) and
-        ((not self.FByRef[AParam]) or self.FByCopy[AParam]) then
+        ((not self.FPassByRef[AParam]) or self.FPassByCopy[AParam]) then
         return self.DoOwnArgument(AArg, AParam, LType);
       end;
-      if self.FByCopy[AParam] then
+      if self.FPassByCopy[AParam] then
         LSource := self.DoArgumentSource(AArg, LType);
         if (LSource = 0) or self.DoHoldsManaged(LType) then
           return LSource;
@@ -5054,7 +5082,7 @@ public type
         self.DoCopyBytes(LSlot, LSource, TypeSize(self.FTree, self.FTarget, LType), AArg);
         return LSlot;
       end;
-      if self.FByRef[AParam] then
+      if self.FPassByRef[AParam] then
         if self.FTree[AParam].HasFlag(NodeFlag.VarParam) then
           return self.DoReachArgument(self.DoAnchoredAddress(AArg, true, false), AArg, LType);
         end;
@@ -5145,7 +5173,7 @@ public type
           return 0;
         end;
       end;
-      if self.FByCopy[AParam] then
+      if self.FPassByCopy[AParam] then
         return LSlot;
       end;
       return self.DoLoad(LSlot, self.DoAggregateIr(AType), AArg);
@@ -8461,7 +8489,7 @@ public type
           self.DoIsArrayValue(self.FTree[LChild].ResolvedType) then
           self.DoPointerTemporary(LChild, self.FTree[LChild].ResolvedType);
         end;
-        if self.FTree[LChild].Kind = NodeKind.ForInStatement then
+        if (self.FTree[LChild].Kind = NodeKind.ForInStatement) or self.DoIsYieldFrom(LChild) then
           self.DoForInTemporary(LChild);
         end;
         if self.DoIsCharCompound(LChild) then
@@ -11741,7 +11769,7 @@ public type
     hidden const method DoParamTaken(const AParam: int64): bool;
     begin
       return (not self.FTree[AParam].HasFlag(NodeFlag.ConstParam)) and
-        (not (self.FByRef[AParam] and not self.FByCopy[AParam]));
+        (not (self.FPassByRef[AParam] and not self.FPassByCopy[AParam]));
     end;
 
     // True when a task's call of the signature ASig takes a copy that ends by a done
@@ -13068,23 +13096,163 @@ public type
     end;
 
     // `yield E` AId in a generator's body (BNF sec 5, G1; ResolvedJump the generator, E
-    // converted to its T by SEM): E stored into the value in the generator's object
-    // (FGeneratorSlot): a value object with a lifetime by DoYieldObject, any other as an
-    // assignment stores it (DoYieldValue); E's temporaries ended, then GeneratorYield: the
-    // resumer goes on (its for in reads the value) until the next resume, when this body
-    // goes on here (an abort raised here instead)
+    // converted to its T by SEM): DoYieldOf E; `yield from S` (G1e) by DoYieldFrom
     hidden method DoYield(const AId: int64);
+    begin
+      if self.FGeneratorSlot = 0 then
+        self.DoRefuse(AId, self.FTree.ConstructPhrase(AId));
+        return;
+      end;
+      if self.DoIsYieldFrom(AId) then
+        self.DoYieldFrom(AId);
+        return;
+      end;
+      self.DoYieldOf(AId, self.FTree.FirstOf(AId, NodeRole.Value));
+    end;
+
+    // True when AId is a `yield from S` statement (BNF sec 5, G1e: the parser's YieldFrom)
+    hidden const method DoIsYieldFrom(const AId: int64): bool;
+    begin
+      return (self.FTree[AId].Kind = NodeKind.YieldStatement) and self.FTree[AId].HasFlag(NodeFlag.YieldFrom);
+    end;
+
+    // `yield from S` AId (BNF sec 5, G1e; its ResolvedType S's element type, SEM's): over a
+    // sequence of the generator's own T, delegated (DoYieldDelegate: its consumer resumes
+    // S's body directly, one switch a value however deep the chain); over anything else
+    // (an array, a string, a wstring, a set, a sequence of another element type) it is a
+    // for in whose pass yields the element (DoForIn, DoForInPass: its YieldElement child
+    // converted to T by SEM, as `yield X` would)
+    hidden method DoYieldFrom(const AId: int64);
+    var
+      LType: int64;
+    begin
+      LType := self.DoUsedType(self.FTree.FirstOf(AId, NodeRole.Value));
+      if (ClassOf(self.FTree, LType) = TypeClass.SequenceType) and
+        (self.FTree[AId].ResolvedType = self.DoGeneratorElement(self.FTree[AId].ResolvedJump)) then
+        self.DoYieldDelegate(AId);
+        return;
+      end;
+      self.DoForIn(AId);
+    end;
+
+    // The pass of the for in AId (or of the yield from AId, G1e) over the element at the
+    // address AAt (0: the scalar AValue) of the canonical type AElement: stored into the
+    // iterator AIterator (DoForInStore), or for a yield from handed on (DoYieldElement);
+    // false after LW0001
+    hidden method DoForInPass(const AId: int64; const AIterator: int64; const AAt: int64;
+      const AValue: int64; const AElement: int64): bool;
+    begin
+      if self.DoIsYieldFrom(AId) then
+        return self.DoYieldElement(AId, AAt, AValue, AElement);
+      end;
+      return self.DoForInStore(AIterator, AAt, AValue, AElement, AId);
+    end;
+
+    // A yield from AId's pass (G1e): its element at AAt (or the scalar AValue, put in a
+    // slot of the pass's own) is its YieldElement child's place (FYieldElementAt) while
+    // that child is yielded as `yield X` yields X (DoYieldOf: converted to T, copied,
+    // GeneratorYield); false after LW0001
+    hidden method DoYieldElement(const AId: int64; const AAt: int64; const AValue: int64;
+      const AElement: int64): bool;
+    var
+      LAt: int64;
+    begin
+      LAt := AAt;
+      if LAt = 0 then
+        LAt := self.DoSizedSlot(AId, TypeSize(self.FTree, self.FTarget, AElement),
+          TypeAlign(self.FTree, self.FTarget, AElement));
+        self.DoStore(LAt, AValue, AId);
+      end;
+      self.FYieldElementAt := LAt;
+      self.DoYieldOf(AId, self.FTree.FirstOf(AId, NodeRole.Element));
+      self.FYieldElementAt := 0;
+      return not self.DoEnded();
+    end;
+
+    // `yield from S` AId over a sequence of the generator's own T (G1e): S read once and
+    // held (DoForInTemporary's slot, a holder added; its block kept in FSlotOf[AId] for the
+    // cleanup), S's temporaries ended; then, in a protected region (DoEnterRegion), the
+    // runtime's GeneratorDelegate with this generator's object and S's block: this body
+    // stops there while its consumer resumes S's body (and whatever S delegates to)
+    // directly, and goes on once S has ended (a raise out of S raised there). The region's
+    // cleanup aborts S when this body is left on the way (an abort of this generator: the
+    // chain's pending finally / defer then run innermost first; GeneratorAbort, nothing
+    // for an ended S); then the hold ends. LW0001 inside a guard's finally, as a for in
+    hidden method DoYieldDelegate(const AId: int64);
+    var
+      LFunction: ref IrFunction;
+      LHandler: int64;
+      LSubject: int64;
+      LType: int64;
+      LValue: int64;
+      LSlot: int64;
+      LHead: int64;
+      LRun: int64;
+      LFirst: int64;
+      LLast: int64;
+      LObject: int64;
+      LFunclet: int64;
+    begin
+      LFunction := self.FModule.FunctionAt(self.FFunction);
+      if LFunction.Parent <> 0 then
+        self.DoRefuse(AId, self.FTree.ConstructPhrase(AId) + " inside a guard's finally");
+        return;
+      end;
+      LHandler := self.DoRuntimeFunction(RuntimeRoutine.FrameHandler, AId);
+      if LHandler = 0 then
+        return;
+      end;
+      LSubject := self.FTree.FirstOf(AId, NodeRole.Value);
+      LType := self.DoUsedType(LSubject);
+      LValue := self.DoValue(LSubject);
+      if LValue = 0 then
+        return;
+      end;
+      if self.DoAddHolder(LValue, LType, AId) = 0 then
+        return;
+      end;
+      self.DoStore(self.DoTempSlot(AId), LValue, AId);
+      LSlot := self.DoSizedSlot(AId, self.FTarget.PointerSize(), self.FTarget.PointerAlign());
+      self.FSlotOf[AId] := LSlot;
+      self.DoStore(LSlot, LValue, AId);
+      // S is read once: its temporaries end here
+      self.DoEndTemporaries(LSubject);
+      self.DoEnterRegion(AId);
+      LHead := self.FModule.AddBlock(self.FFunction);
+      self.DoJumpTo(LHead, AId);
+      LFirst := LFunction.Blocks.Count - 1;
+      self.FBlock := LHead;
+      LObject := self.DoLoad(self.FGeneratorSlot, IrType.Pointer, AId);
+      if self.DoCallRuntime(RuntimeRoutine.GeneratorDelegate, LObject,
+        self.DoLoad(LSlot, IrType.Pointer, AId), AId) = 0 then
+        return;
+      end;
+      LLast := LFunction.Blocks.Count - 1;
+      LRun := self.FModule.AddBlock(self.FFunction);
+      self.DoJumpTo(LRun, AId);
+      self.FBlock := LRun;
+      self.DoClosePads(AId);
+      self.DoRegionCleanup(AId);
+      LFunclet := self.DoFinallyFunclet(AId);
+      LFunction.AddScope(LFirst, LLast, LFunclet, -1);
+      self.FModule.FrameHandler := LHandler;
+      self.DoEndTemporary(AId);
+    end;
+
+    // The value of the yield AId's expression AExpr (E of `yield E`, or a yield from's
+    // YieldElement, G1e) stored into the value in the generator's object (FGeneratorSlot):
+    // a value object with a lifetime by DoYieldObject, any other as an assignment stores it
+    // (DoYieldValue); AExpr's temporaries ended, then GeneratorYield: the resumer goes on
+    // (its for in reads the value) until the next resume, when this body goes on here (an
+    // abort raised here instead)
+    hidden method DoYieldOf(const AId: int64; const AExpr: int64);
     var
       LExpr: int64;
       LElement: int64;
       LObject: int64;
       LDest: int64;
     begin
-      if self.FGeneratorSlot = 0 then
-        self.DoRefuse(AId, self.FTree.ConstructPhrase(AId));
-        return;
-      end;
-      LExpr := self.FTree.FirstOf(AId, NodeRole.Value);
+      LExpr := AExpr;
       LElement := self.DoGeneratorElement(self.FTree[AId].ResolvedJump);
       LObject := self.DoLoad(self.FGeneratorSlot, IrType.Pointer, AId);
       LDest := self.DoByteOffset(LObject, self.DoGeneratorValueOffset(LElement), AId);
@@ -13285,7 +13453,7 @@ public type
       LIr: IrType;
     begin
       LType := self.DoDeclType(AParam);
-      if self.FByCopy[AParam] or self.FByRef[AParam] then
+      if self.FPassByCopy[AParam] or self.FPassByRef[AParam] then
         return AAddress;
       end;
       if self.DoIsAggregate(LType) then
@@ -15412,12 +15580,12 @@ public type
     begin
       LType := self.DoDeclType(AParam);
       if self.DoIsAggregate(LType) then
-        if self.FByRef[AParam] or self.FByCopy[AParam] then
+        if self.FPassByRef[AParam] or self.FPassByCopy[AParam] then
           return AValue;
         end;
         return self.DoLoad(AValue, self.DoAggregateIr(LType), ANode);
       end;
-      if self.FByRef[AParam] or self.FByCopy[AParam] then
+      if self.FPassByRef[AParam] or self.FPassByCopy[AParam] then
         LSlot := self.DoSizedSlot(ANode, TypeSize(self.FTree, self.FTarget, LType),
           TypeAlign(self.FTree, self.FTarget, LType));
         self.DoStore(LSlot, AValue, ANode);
@@ -16592,19 +16760,19 @@ public type
       end;
       LSize := TypeSize(self.FTree, self.FTarget, LType);
       if self.DoHasLifetime(LType) and (not self.FTree[AParam].HasFlag(NodeFlag.ConstParam)) and
-        ((not self.FByRef[AParam]) or self.FByCopy[AParam]) then
+        ((not self.FPassByRef[AParam]) or self.FPassByCopy[AParam]) then
         LSlot := self.DoSizedSlot(ANode, LSize, TypeAlign(self.FTree, self.FTarget, LType));
         // zeroed each time it runs: the loop's next pair starts from nothing too
         self.DoFill(LSlot, LSize, ANode);
         if not self.DoCopyValue(LSlot, LAt, LType, ANode) then
           return 0;
         end;
-        if self.FByCopy[AParam] then
+        if self.FPassByCopy[AParam] then
           return LSlot;
         end;
         return self.DoLoad(LSlot, self.DoAggregateIr(LType), ANode);
       end;
-      if self.FByCopy[AParam] then
+      if self.FPassByCopy[AParam] then
         if self.DoHoldsManaged(LType) then
           return LAt;
         end;
@@ -16612,7 +16780,7 @@ public type
         self.DoCopyBytes(LSlot, LAt, LSize, ANode);
         return LSlot;
       end;
-      if self.FByRef[AParam] then
+      if self.FPassByRef[AParam] then
         return LAt;
       end;
       return self.DoLoad(LAt, self.DoAggregateIr(LType), ANode);
@@ -18899,7 +19067,7 @@ public type
         else
           LValue := self.DoConvertIr(LValue, LIr, AId);
         end;
-        if not self.DoForInStore(LIterator, 0, LValue, LElement, AId) then
+        if not self.DoForInPass(AId, LIterator, 0, LValue, LElement) then
           return;
         end;
       else
@@ -18926,7 +19094,7 @@ public type
           end;
           LAt := self.DoMovePointer(LBase, LIndex, LType, false, AId);
         end;
-        if not self.DoForInStore(LIterator, LAt, 0, LElement, AId) then
+        if not self.DoForInPass(AId, LIterator, LAt, 0, LElement) then
           return;
         end;
       end;
@@ -19021,9 +19189,12 @@ public type
       end;
       self.DoBranchOn(LMore, LBody, LExit, AId);
       self.FBlock := LBody;
-      LAt := self.DoByteOffset(self.DoLoad(LSlot, IrType.Pointer, AId),
-        ADAM_LOWERING_REF_HEADER + self.DoGeneratorValueOffset(LElement), AId);
-      if not self.DoForInStore(LIterator, LAt, 0, LElement, AId) then
+      // the value is in the object the resume names (its current word: itself, or the
+      // innermost generator of a yield from chain, G1e)
+      LAt := self.DoLoad(self.DoByteOffset(self.DoLoad(LSlot, IrType.Pointer, AId),
+        ADAM_LOWERING_REF_HEADER + ADAM_LOWERING_GENERATOR_CURRENT, AId), IrType.Pointer, AId);
+      LAt := self.DoByteOffset(LAt, self.DoGeneratorValueOffset(LElement), AId);
+      if not self.DoForInPass(AId, LIterator, LAt, 0, LElement) then
         return;
       end;
       self.DoJumpTo(LStatements, AId);
@@ -19738,7 +19909,7 @@ public type
         end;
         return;
       end;
-      if self.FTree[ANode].Kind = NodeKind.ForInStatement then
+      if (self.FTree[ANode].Kind = NodeKind.ForInStatement) or self.DoIsYieldFrom(ANode) then
         LAddress := self.DoLoad(self.FSlotOf[ANode], IrType.Pointer, ANode);
         if self.DoCallRuntime(RuntimeRoutine.GeneratorAbort, LAddress, 0, ANode) = 0 then
           return;

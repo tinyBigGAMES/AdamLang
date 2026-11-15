@@ -7479,8 +7479,13 @@ const
   // stores each yield's value there and calls GeneratorYield), its abort word (int64: one of
   // ADAM_RUNTIME_ABORT_*), the generator running on its resumer's thread before it (ptr:
   // GGeneratorCurrent put back as it switches away), how its body last switched away (int64:
-  // one of ADAM_RUNTIME_OUTCOME_*, written by the body's side only), then the compiler's
-  // words: the arguments' copies and the value, from word 9 on
+  // one of ADAM_RUNTIME_OUTCOME_*, written by the body's side only), the sequence its body
+  // delegates to (ptr: a `yield from S` block, G1e: GeneratorDelegate sets it, nil when
+  // none), the object whose value the last resume gave (ptr: itself, or the innermost
+  // generator of its yield from chain: the compiler's for in reads the value there), the
+  // generator it delegated to when that one raised (ptr: written by the resumer as it
+  // resumes this body past its yield from, nil otherwise; GeneratorDelegate raises it
+  // again), then the compiler's words: the arguments' copies and the value, from word 12 on
   ADAM_RUNTIME_GENERATOR_COROUTINE: int64 = 0;
   ADAM_RUNTIME_GENERATOR_STATE: int64 = 1;
   ADAM_RUNTIME_GENERATOR_RESUMER: int64 = 2;
@@ -7490,6 +7495,9 @@ const
   ADAM_RUNTIME_GENERATOR_ABORT: int64 = 6;
   ADAM_RUNTIME_GENERATOR_PREVIOUS: int64 = 7;
   ADAM_RUNTIME_GENERATOR_OUTCOME: int64 = 8;
+  ADAM_RUNTIME_GENERATOR_DELEGATE: int64 = 9;
+  ADAM_RUNTIME_GENERATOR_CURRENT: int64 = 10;
+  ADAM_RUNTIME_GENERATOR_RAISED: int64 = 11;
   // A generator's states: made, its body not started (a call runs none of it); stopped at a
   // yield; its body running (one resume at a time: a second one raises); ended (its body
   // returned, raised or was aborted: a sequence is consumed once, so a resume gives false)
@@ -7498,10 +7506,12 @@ const
   ADAM_RUNTIME_GENERATOR_RUNNING: int64 = 2;
   ADAM_RUNTIME_GENERATOR_FINISHED: int64 = 3;
   // How a body last switched away: at a yield (its value stored), at its end (returned, or
-  // aborted), by a raise out of it (kept as code and text, raised again at the resume)
+  // aborted), by a raise out of it (kept as code and text, raised again at the resume), at
+  // a yield from over a sequence (its delegate word set: its resumer goes on with that one)
   ADAM_RUNTIME_OUTCOME_YIELDED: int64 = 1;
   ADAM_RUNTIME_OUTCOME_ENDED: int64 = 2;
   ADAM_RUNTIME_OUTCOME_RAISED: int64 = 3;
+  ADAM_RUNTIME_OUTCOME_DELEGATED: int64 = 4;
   // A generator's abort word: none asked; asked (its next resume raises the abort at its
   // yield instead of going on); running (the abort is raised: a yield then raises)
   ADAM_RUNTIME_ABORT_NONE: int64 = 0;
@@ -7611,11 +7621,81 @@ begin
   RaiseWith(1, TextOfC(AText));
 end;
 
+// The generator AInner of the yield from chain of AObject (the one GeneratorResume runs,
+// RUNNING), not AObject itself, taken to be run: its state swapped to RUNNING; one running
+// already raises (code 1), AObject first put back SUSPENDED (stopped at its yield from, it
+// can be resumed again); the old state returned
+routine DoGeneratorTake(const AObject: ptr; const AInner: ptr): int64;
+var
+  LOld: int64;
+begin
+  LOld := atomicswap((ptr to int64(AInner))[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_RUNNING);
+  if LOld = ADAM_RUNTIME_GENERATOR_RUNNING then
+    atomicstore((ptr to int64(AObject))[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_SUSPENDED);
+    RaiseWith(1, TextOfC(ptr to const char("a generator resumed while it runs")));
+  end;
+  return LOld;
+end;
+
+// The generator of AObject's yield from chain whose delegate word names AInner (G1e)
+routine DoGeneratorParent(const AObject: ptr; const AInner: ptr): ptr;
+var
+  LAt: ptr;
+begin
+  LAt := AObject;
+  while TaskObject((ptr to ptr(LAt))[ADAM_RUNTIME_GENERATOR_DELEGATE]) <> AInner do
+    LAt := TaskObject((ptr to ptr(LAt))[ADAM_RUNTIME_GENERATOR_DELEGATE]);
+  end;
+  return LAt;
+end;
+
+// The next generator of AObject's yield from chain to run (G1e; AObject RUNNING, its body
+// stopped at a yield from): the innermost one (delegating to none), taken (RUNNING, its
+// stack made at its first run); one that has ended already (consumed elsewhere) ends its
+// delegator's yield from: that delegator, taken, is the one to run (its yield from goes on
+// past it). A stack that cannot be made raises (code 1), AObject first put back SUSPENDED
+routine DoGeneratorNext(const AObject: ptr): ptr;
+var
+  LInner: ptr;
+  LParent: ptr;
+  LSlots: ptr to ptr;
+begin
+  LParent := AObject;
+  LInner := TaskObject((ptr to ptr(AObject))[ADAM_RUNTIME_GENERATOR_DELEGATE]);
+  while (ptr to ptr(LInner))[ADAM_RUNTIME_GENERATOR_DELEGATE] <> nil do
+    LParent := LInner;
+    LInner := TaskObject((ptr to ptr(LInner))[ADAM_RUNTIME_GENERATOR_DELEGATE]);
+  end;
+  if DoGeneratorTake(AObject, LInner) = ADAM_RUNTIME_GENERATOR_FINISHED then
+    atomicstore((ptr to int64(LInner))[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_FINISHED);
+    (ptr to ptr(LParent))[ADAM_RUNTIME_GENERATOR_DELEGATE] := nil;
+    (ptr to ptr(LParent))[ADAM_RUNTIME_GENERATOR_RAISED] := nil;
+    if LParent <> AObject then
+      DoGeneratorTake(AObject, LParent);
+    end;
+    return LParent;
+  end;
+  LSlots := ptr to ptr(LInner);
+  if LSlots[ADAM_RUNTIME_GENERATOR_COROUTINE] = nil then
+    LSlots[ADAM_RUNTIME_GENERATOR_COROUTINE] := PlatformCoroutineNew(GeneratorRun, LInner);
+    if LSlots[ADAM_RUNTIME_GENERATOR_COROUTINE] = nil then
+      atomicstore((ptr to int64(LInner))[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_FINISHED);
+      atomicstore((ptr to int64(AObject))[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_SUSPENDED);
+      RaiseWith(1, TextOfC(ptr to const char("a generator's stack could not be made")));
+    end;
+  end;
+  return LInner;
+end;
+
 // A for .. in pass over the sequence ABlock (a generator's ref block; G1): its body run to
-// its next yield (true: the value is in its object) or its end (false; a raise out of it
-// raised here). Its first resume makes its stack. A nil or ended sequence: false at once.
-// A generator resumed while it runs (inside its own body, or on another thread at the same
-// time) raises (code 1); any thread may resume it, one at a time
+// its next yield (true: the value is in the object its current word names) or its end
+// (false; a raise out of it raised here). Its first resume makes its stack. A nil or ended
+// sequence: false at once. A generator resumed while it runs (inside its own body, or on
+// another thread at the same time) raises (code 1); any thread may resume it, one at a
+// time. A body stopped at a `yield from S` (G1e) is not resumed: the innermost generator of
+// its chain is, directly (one switch a value however deep the chain); as one ends, the one
+// delegating to it goes on past its yield from (a raise out of it raised there,
+// GeneratorDelegate); the value is then in whichever generator yielded it (current word)
 routine GeneratorResume(const ABlock: ptr): bool;
 var
   LObject: ptr;
@@ -7623,6 +7703,10 @@ var
   LSlots: ptr to ptr;
   LOld: int64;
   LSelf: ptr;
+  LRun: ptr;
+  LRunWords: ptr to int64;
+  LRunSlots: ptr to ptr;
+  LParent: ptr;
 begin
   if ABlock = nil then
     return false;
@@ -7648,8 +7732,100 @@ begin
       DoGeneratorFail(LObject, ptr to const char("a generator's stack could not be made"));
     end;
   end;
-  DoGeneratorEnter(LObject, LSelf);
-  return DoGeneratorBack(LObject);
+  // A body stopped at a yield from: its chain's next generator runs, not this body
+  LRun := LObject;
+  if LSlots[ADAM_RUNTIME_GENERATOR_DELEGATE] <> nil then
+    LRun := DoGeneratorNext(LObject);
+  end;
+  while true do
+    DoGeneratorEnter(LRun, LSelf);
+    LRunWords := ptr to int64(LRun);
+    LRunSlots := ptr to ptr(LRun);
+    if LRunWords[ADAM_RUNTIME_GENERATOR_OUTCOME] = ADAM_RUNTIME_OUTCOME_YIELDED then
+      LSlots[ADAM_RUNTIME_GENERATOR_CURRENT] := LRun;
+      if LRun = LObject then
+        return DoGeneratorBack(LObject);
+      end;
+      // a value of the chain's: both stopped (this body still at its yield from)
+      atomicstore(LRunWords[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_SUSPENDED);
+      atomicstore(LWords[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_SUSPENDED);
+      return true;
+    end;
+    if LRunWords[ADAM_RUNTIME_GENERATOR_OUTCOME] = ADAM_RUNTIME_OUTCOME_DELEGATED then
+      // stopped at its yield from: the chain goes on below it
+      if LRun <> LObject then
+        atomicstore(LRunWords[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_SUSPENDED);
+      end;
+      LRun := DoGeneratorNext(LObject);
+    else
+      // ended (returned or raised)
+      if LRun = LObject then
+        return DoGeneratorBack(LObject);
+      end;
+      PlatformCoroutineFree(LRunSlots[ADAM_RUNTIME_GENERATOR_COROUTINE]);
+      LRunSlots[ADAM_RUNTIME_GENERATOR_COROUTINE] := nil;
+      atomicstore(LRunWords[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_FINISHED);
+      // its delegator goes on past its yield from, a raise out of it raised there
+      LParent := DoGeneratorParent(LObject, LRun);
+      (ptr to ptr(LParent))[ADAM_RUNTIME_GENERATOR_DELEGATE] := nil;
+      (ptr to ptr(LParent))[ADAM_RUNTIME_GENERATOR_RAISED] := nil;
+      if LRunWords[ADAM_RUNTIME_GENERATOR_OUTCOME] = ADAM_RUNTIME_OUTCOME_RAISED then
+        (ptr to ptr(LParent))[ADAM_RUNTIME_GENERATOR_RAISED] := LRun;
+      end;
+      if LParent <> LObject then
+        DoGeneratorTake(LObject, LParent);
+      end;
+      LRun := LParent;
+    end;
+  end;
+end;
+
+// `yield from S` in the body of the generator object AObject over S's block ABlock, a
+// sequence of the same T (G1e; the compiler holds S, and aborts it if this body is left
+// on the way): this body stops here, its resumer resuming S's body directly (and whatever
+// S delegates to: GeneratorResume) until S has ended; then it goes on, a raise out of S
+// raised here. Resumed to be released (its abort asked), the abort is raised here, as at
+// a yield. nil or an ended S: nothing. S running (this generator itself, or one being
+// resumed) raises (code 1), so does a yield from while an abort runs
+routine GeneratorDelegate(const AObject: ptr; const ABlock: ptr);
+var
+  LWords: ptr to int64;
+  LSlots: ptr to ptr;
+  LState: int64;
+  LRaised: ptr;
+begin
+  LWords := ptr to int64(AObject);
+  LSlots := ptr to ptr(AObject);
+  if LWords[ADAM_RUNTIME_GENERATOR_ABORT] = ADAM_RUNTIME_ABORT_RUNNING then
+    RaiseWith(1, TextOfC(ptr to const char("a yield from in a generator being released")));
+  end;
+  if ABlock = nil then
+    return;
+  end;
+  LState := atomicload((ptr to int64(TaskObject(ABlock)))[ADAM_RUNTIME_GENERATOR_STATE]);
+  if LState = ADAM_RUNTIME_GENERATOR_RUNNING then
+    RaiseWith(1, TextOfC(ptr to const char("a generator resumed while it runs")));
+  end;
+  if LState = ADAM_RUNTIME_GENERATOR_FINISHED then
+    return;
+  end;
+  LSlots[ADAM_RUNTIME_GENERATOR_DELEGATE] := ABlock;
+  LSlots[ADAM_RUNTIME_GENERATOR_RAISED] := nil;
+  LWords[ADAM_RUNTIME_GENERATOR_OUTCOME] := ADAM_RUNTIME_OUTCOME_DELEGATED;
+  GGeneratorCurrent := LSlots[ADAM_RUNTIME_GENERATOR_PREVIOUS];
+  PlatformCoroutineSwitch(LSlots[ADAM_RUNTIME_GENERATOR_RESUMER]);
+  LSlots[ADAM_RUNTIME_GENERATOR_DELEGATE] := nil;
+  if LWords[ADAM_RUNTIME_GENERATOR_ABORT] = ADAM_RUNTIME_ABORT_ASKED then
+    LWords[ADAM_RUNTIME_GENERATOR_ABORT] := ADAM_RUNTIME_ABORT_RUNNING;
+    PlatformAbort();
+  end;
+  LRaised := LSlots[ADAM_RUNTIME_GENERATOR_RAISED];
+  if LRaised <> nil then
+    LSlots[ADAM_RUNTIME_GENERATOR_RAISED] := nil;
+    StrAddRef((ptr to ptr(LRaised))[ADAM_RUNTIME_GENERATOR_TEXT]);
+    RaiseWith(int32((ptr to int64(LRaised))[ADAM_RUNTIME_GENERATOR_CODE]),
+      (ptr to ptr(LRaised))[ADAM_RUNTIME_GENERATOR_TEXT]);
+  end;
 end;
 
 // `yield E` in a generator's body (the compiler has stored E in the object AObject): its
