@@ -8421,6 +8421,9 @@ public type
           self.DoIsArrayValue(self.FTree[LChild].ResolvedType) then
           self.DoPointerTemporary(LChild, self.FTree[LChild].ResolvedType);
         end;
+        if self.FTree[LChild].Kind = NodeKind.ForInStatement then
+          self.DoForInTemporary(LChild);
+        end;
         if self.DoIsCharCompound(LChild) then
           self.DoTemporary(self.FTree.FirstOf(LChild, NodeRole.Source));
         end;
@@ -9563,7 +9566,7 @@ public type
         ((LOp = OperatorKind.AddressOf) or (LOp = OperatorKind.Increment) or (LOp = OperatorKind.Decrement)) then
         self.DoEffWrite(ASlot, self.FTree.FirstOf(AId, NodeRole.Operand));
       end;
-      if LKind = NodeKind.ForStatement then
+      if (LKind = NodeKind.ForStatement) or (LKind = NodeKind.ForInStatement) then
         LIterator := self.FTree.FirstOf(AId, NodeRole.Iterator);
         if (LIterator <> 0) and (self.FTree[LIterator].Kind <> NodeKind.VarDecl) then
           self.DoEffWrite(ASlot, LIterator);
@@ -17266,6 +17269,10 @@ public type
         self.DoFor(AId);
         return true;
       end;
+      if LKind = NodeKind.ForInStatement then
+        self.DoForIn(AId);
+        return true;
+      end;
       if LKind = NodeKind.MatchStatement then
         self.DoMatch(AId);
         // the subject is read by every label test: its temporaries end with the match
@@ -17624,6 +17631,300 @@ public type
       self.DoForStep(AId, LAddress, LIr);
       self.DoJumpTo(LBody, AId);
       self.FBlock := LExit;
+    end;
+
+    // The hold of the for in AId (BNF sec 5, G1) on the value it walks, made with the
+    // function's temporaries (DoTemporaries): a text's or a dynamic array's block (a holder
+    // of its own: the loop walks the value as it was at its start, copy on write), a static
+    // array holding managed values or values with a lifetime (a copy of its own, ended under
+    // its live flag); none for any other (a plain static array or a set is copied by its
+    // bytes into a slot of DoForIn's)
+    hidden method DoForInTemporary(const AId: int64);
+    var
+      LType: int64;
+      LSize: int64;
+      LSlot: int64;
+    begin
+      LType := self.DoUsedType(self.FTree.FirstOf(AId, NodeRole.Value));
+      if self.DoIsText(LType) then
+        self.DoTemporary(AId);
+        return;
+      end;
+      if self.DoIsArrayValue(LType) then
+        self.DoPointerTemporary(AId, LType);
+        return;
+      end;
+      if (ClassOf(self.FTree, LType) <> TypeClass.StaticArray) or
+        not (self.DoHoldsManaged(LType) or self.DoHasLifetime(LType)) then
+        return;
+      end;
+      LSize := TypeSize(self.FTree, self.FTarget, LType);
+      LSlot := self.DoSizedSlot(AId, LSize, TypeAlign(self.FTree, self.FTarget, LType));
+      self.DoFill(LSlot, LSize, AId);
+      self.FTempOf[AId] := LSlot;
+      self.FTempTypeOf[AId] := LType;
+      self.DoAddManaged(LSlot, LType, AId);
+    end;
+
+    // The element of a for in stored into its iterator AIterator, of the canonical type
+    // AElement, as an assignment stores it: from the address ASource, or (ASource 0) the
+    // scalar AValue. An aggregate by DoAggregateCopy, one with a lifetime as DoMoveAssign
+    // moves a copy in (the iterator's old object ended under its live flag); a managed
+    // value by DoStoreManaged (a holder added, the old one released); a scalar by its bytes.
+    // False after LW0001
+    hidden method DoForInStore(const AIterator: int64; const ASource: int64; const AValue: int64;
+      const AElement: int64; const ANode: int64): bool;
+    var
+      LDest: int64;
+      LIr: IrType;
+      LSize: int64;
+      LTemp: int64;
+      LTo: int64;
+      LLive: int64;
+    begin
+      LDest := self.DoAddressFor(AIterator, true);
+      if LDest = 0 then
+        return false;
+      end;
+      if ASource = 0 then
+        self.DoStore(LDest, AValue, ANode);
+        return true;
+      end;
+      if self.DoIsAggregate(AElement) then
+        if not self.DoHasLifetime(AElement) then
+          self.DoAggregateCopy(LDest, ASource, AElement, ANode);
+          return not self.DoEnded();
+        end;
+        LSize := TypeSize(self.FTree, self.FTarget, AElement);
+        LTemp := self.DoSizedSlot(ANode, LSize, TypeAlign(self.FTree, self.FTarget, AElement));
+        // zeroed each pass: the next copy starts from nothing too
+        self.DoFill(LTemp, LSize, ANode);
+        if not self.DoCopyValue(LTemp, ASource, AElement, ANode) then
+          return false;
+        end;
+        LTo := self.DoMoveSource(AIterator);
+        LLive := 0;
+        if LTo <> 0 then
+          LLive := self.FLiveOf[LTo];
+        end;
+        if not self.DoReleaseLive(LDest, AElement, LLive, false, ANode) then
+          return false;
+        end;
+        self.DoCopyBytes(LDest, LTemp, LSize, ANode);
+        self.DoSetLive(LTo, true, ANode);
+        return true;
+      end;
+      if self.DoIsManaged(AElement) then
+        return self.DoStoreManaged(LDest, self.DoLoad(ASource, IrType.Pointer, ANode), AElement,
+          ANode) <> 0;
+      end;
+      LIr := self.DoTypeAt(AElement, ANode);
+      if LIr = IrType.Void then
+        return false;
+      end;
+      self.DoStore(LDest, self.DoLoad(ASource, LIr, ANode), ANode);
+      return true;
+    end;
+
+    // `for X in S do .. end;` AId over an array, a string, a wstring or a set (BNF sec 5,
+    // G1; a sequence's is G1c's). S is read once, here, and walked as it was: a text's or a
+    // dynamic array's block held (DoForInTemporary's slot, a holder added), a static array
+    // copied (into that slot when it holds managed values or lifetimes, else into a plain
+    // slot by its bytes), a set's bytes copied; then S's temporaries end. A counter slot
+    // from 0 while below the count (a static array's, a set's member range, else the
+    // block's length): the head tests it; the body stores the element (DoForInStore: an
+    // array's at the counter, a text's unit, a set's member low + counter when its bit is
+    // set, else straight to the next pass) and runs the statements; `skip` goes to the next
+    // block (the counter one more, back to the head), `leave` to the exit, where the hold
+    // ends (DoEndTemporary; a return or an unwind releases it with the function's managed
+    // slots)
+    hidden method DoForIn(const AId: int64);
+    var
+      LSubject: int64;
+      LIterator: int64;
+      LType: int64;
+      LElement: int64;
+      LClass: TypeClass;
+      LValue: int64;
+      LSource: int64;
+      LCopy: int64;
+      LSize: int64;
+      LCount: int64;
+      LCountSlot: int64;
+      LCounter: int64;
+      LLow: int64;
+      LHigh: int64;
+      LHead: int64;
+      LBody: int64;
+      LStatements: int64;
+      LNext: int64;
+      LExit: int64;
+      LIndex: int64;
+      LBase: int64;
+      LAt: int64;
+      LByte: int64;
+      LBit: int64;
+      LMember: int64;
+      LIr: IrType;
+      LScale: int64;
+      LId: int64;
+    begin
+      LSubject := self.FTree.FirstOf(AId, NodeRole.Value);
+      LIterator := self.FTree.FirstOf(AId, NodeRole.Iterator);
+      LType := self.DoUsedType(LSubject);
+      LElement := self.FTree[AId].ResolvedType;
+      LClass := ClassOf(self.FTree, LType);
+      if LClass = TypeClass.SequenceType then
+        self.DoRefuse(AId, "a for in over a sequence");
+        return;
+      end;
+      // a scalar element's IR type (a managed or aggregate one is stored by its address)
+      LIr := IrType.Void;
+      if not (self.DoIsManaged(LElement) or self.DoIsAggregate(LElement)) then
+        LIr := self.DoTypeAt(LElement, LIterator);
+        if LIr = IrType.Void then
+          return;
+        end;
+      end;
+      LLow := 0;
+      LHigh := 0;
+      LCopy := 0;
+      LCountSlot := self.DoSizedSlot(AId, 8, 8);
+      if (LClass = TypeClass.Text) or (LClass = TypeClass.WideText) or (LClass = TypeClass.DynamicArray) then
+        if LClass = TypeClass.DynamicArray then
+          LValue := self.DoValue(LSubject);
+        else
+          LValue := self.DoManagedValue(LSubject);
+        end;
+        if LValue = 0 then
+          return;
+        end;
+        if self.DoAddHolder(LValue, LType, AId) = 0 then
+          return;
+        end;
+        self.DoStore(self.DoTempSlot(AId), LValue, AId);
+        LCount := self.DoCallRuntime(RuntimeRoutine.StrLength, LValue, 0, AId);
+        if LCount = 0 then
+          return;
+        end;
+        self.DoStore(LCountSlot, self.DoConvertIr(LCount, IrType.Int64, AId), AId);
+      else
+        // a static array or a set: its bytes (or its copy) in a slot of the loop's own
+        LSource := self.DoAggregateSource(LSubject);
+        if LSource = 0 then
+          return;
+        end;
+        LSize := TypeSize(self.FTree, self.FTarget, LType);
+        if self.FTempOf[AId] <> 0 then
+          LCopy := self.FTempOf[AId];
+          if not self.DoCopyValue(LCopy, LSource, LType, AId) then
+            return;
+          end;
+          self.DoSetLive(AId, true, AId);
+        else
+          LCopy := self.DoSizedSlot(AId, LSize, TypeAlign(self.FTree, self.FTarget, LType));
+          self.DoCopyBytes(LCopy, LSource, LSize, AId);
+        end;
+        if LClass = TypeClass.SetType then
+          if not SetRange(self.FTree, self.FTarget, LType, LLow, LHigh) then
+            raise(ADAM_LOWERING_FAULT_LOW_BOUND + TypeText(self.FTree, LType));
+          end;
+          LCount := LHigh - LLow + 1;
+        else
+          LCount := ArrayCount(self.FTree, self.FTarget, LType);
+          if LCount < 0 then
+            raise(ADAM_LOWERING_FAULT_ARRAY_COUNT + TypeText(self.FTree, LType));
+          end;
+        end;
+        self.DoStore(LCountSlot, self.DoConstant(IrType.Int64, LCount, AId), AId);
+      end;
+      // S is read once: its temporaries end here
+      self.DoEndTemporaries(LSubject);
+      LCounter := self.DoSizedSlot(AId, 8, 8);
+      self.DoStore(LCounter, self.DoConstant(IrType.Int64, 0, AId), AId);
+      LHead := self.FModule.AddBlock(self.FFunction);
+      LBody := self.FModule.AddBlock(self.FFunction);
+      LStatements := self.FModule.AddBlock(self.FFunction);
+      LNext := self.FModule.AddBlock(self.FFunction);
+      LExit := self.FModule.AddBlock(self.FFunction);
+      self.DoJumpTo(LHead, AId);
+      self.FBlock := LHead;
+      LIndex := self.DoLoad(LCounter, IrType.Int64, AId);
+      self.DoBranchOn(self.DoCompareWith(IrPredicate.SLess, LIndex,
+        self.DoLoad(LCountSlot, IrType.Int64, AId), AId), LBody, LExit, AId);
+      self.FBlock := LBody;
+      // the counter read again in the body: its value is the body's own
+      LIndex := self.DoLoad(LCounter, IrType.Int64, AId);
+      if LClass = TypeClass.SetType then
+        // the member's byte (its bit div 8), then its bit in that byte (its bit mod 8); every
+        // operand emitted before the instruction that uses it
+        LByte := self.DoComputeIn(IrOp.Shr, LIndex, self.DoConstant(IrType.Int64, 3, AId),
+          IrType.Int64, AId);
+        LAt := self.DoEmit(IrOp.Offset, IrType.Pointer, AId);
+        self.FModule.InstrAt(LAt).Operands.Add(LCopy);
+        self.FModule.InstrAt(LAt).Operands.Add(LByte);
+        LByte := self.DoConvertIr(self.DoLoad(LAt, IrType.UInt8, AId), IrType.Int64, AId);
+        LBit := self.DoComputeIn(IrOp.BitAnd, self.DoComputeIn(IrOp.Shr, LByte,
+          self.DoComputeIn(IrOp.BitAnd, LIndex, self.DoConstant(IrType.Int64, 7, AId), IrType.Int64, AId),
+          IrType.Int64, AId), self.DoConstant(IrType.Int64, 1, AId), IrType.Int64, AId);
+        LMember := self.FModule.AddBlock(self.FFunction);
+        self.DoBranchOn(self.DoCompareWith(IrPredicate.NotEqual, LBit, self.DoConstant(IrType.Int64, 0, AId),
+          AId), LMember, LNext, AId);
+        self.FBlock := LMember;
+        LIndex := self.DoLoad(LCounter, IrType.Int64, AId);
+        LValue := self.DoComputeIn(IrOp.Add, LIndex, self.DoConstant(IrType.Int64, LLow, AId), IrType.Int64, AId);
+        // a bool member is the compare (no integer converts to bool), any other the value as
+        // its IR type
+        if LIr = IrType.Bool then
+          LValue := self.DoCompareWith(IrPredicate.NotEqual, LValue, self.DoConstant(IrType.Int64, 0, AId), AId);
+        else
+          LValue := self.DoConvertIr(LValue, LIr, AId);
+        end;
+        if not self.DoForInStore(LIterator, 0, LValue, LElement, AId) then
+          return;
+        end;
+      else
+        if (LClass = TypeClass.Text) or (LClass = TypeClass.WideText) then
+          LBase := self.DoByteOffset(self.DoLoad(self.DoTempSlot(AId), IrType.Pointer, AId),
+            ADAM_LOWERING_STRING_HEADER, AId);
+          // a wstring's unit is 2 bytes
+          if LClass = TypeClass.WideText then
+            LScale := self.DoConstant(IrType.Int64, ADAM_LOWERING_WIDE_UNIT, AId);
+            LId := self.DoEmit(IrOp.Mul, IrType.Int64, AId);
+            self.FModule.InstrAt(LId).Operands.Add(LIndex);
+            self.FModule.InstrAt(LId).Operands.Add(LScale);
+            LIndex := LId;
+          end;
+          LAt := self.DoEmit(IrOp.Offset, IrType.Pointer, AId);
+          self.FModule.InstrAt(LAt).Operands.Add(LBase);
+          self.FModule.InstrAt(LAt).Operands.Add(LIndex);
+        else
+          if LClass = TypeClass.DynamicArray then
+            LBase := self.DoByteOffset(self.DoLoad(self.DoTempSlot(AId), IrType.Pointer, AId),
+              ADAM_LOWERING_ARRAY_HEADER, AId);
+          else
+            LBase := LCopy;
+          end;
+          LAt := self.DoMovePointer(LBase, LIndex, LType, false, AId);
+        end;
+        if not self.DoForInStore(LIterator, LAt, 0, LElement, AId) then
+          return;
+        end;
+      end;
+      self.DoJumpTo(LStatements, AId);
+      self.FExitOf[AId] := LExit;
+      self.FNextOf[AId] := LNext;
+      if self.DoArm(LStatements, AId, NodeRole.Statement) then
+        self.DoJumpTo(LNext, AId);
+      end;
+      self.FBlock := LNext;
+      // the operands emitted before the add that uses them
+      LIndex := self.DoLoad(LCounter, IrType.Int64, AId);
+      LId := self.DoComputeIn(IrOp.Add, LIndex, self.DoConstant(IrType.Int64, 1, AId), IrType.Int64, AId);
+      self.DoStore(LCounter, LId, AId);
+      self.DoJumpTo(LHead, AId);
+      self.FBlock := LExit;
+      self.DoEndTemporary(AId);
     end;
 
     // The address of the storage of the variable or parameter ADecl of the current function
@@ -19217,6 +19518,12 @@ public type
       // a bound accessor (of a dispatched property) has no body: its code is the field's
       if self.DoIsAccessor(ARoutine) and self.DoIsBound(ARoutine) then
         self.DoBoundAccessor(ARoutine);
+        self.FRoutine := 0;
+        return;
+      end;
+      // a generator's body runs on a coroutine of its own (G1c)
+      if self.FTree[ARoutine].HasFlag(NodeFlag.Generator) then
+        self.DoRefuse(ARoutine, "a generator");
         self.FRoutine := 0;
         return;
       end;

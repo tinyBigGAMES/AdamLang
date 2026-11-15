@@ -449,6 +449,11 @@ public const
   ADAM_ERR_SEMANTICS_716: string = "SM0716";   // self / parent used inside an async block
   ADAM_ERR_SEMANTICS_717: string = "SM0717";   // return / leave / skip out of a defer statement
   ADAM_ERR_SEMANTICS_718: string = "SM0718";   // a declaration as a defer statement's statement
+  ADAM_ERR_SEMANTICS_719: string = "SM0719";   // a yield outside a generator's own body
+  ADAM_ERR_SEMANTICS_720: string = "SM0720";   // a return with a value in a generator
+  ADAM_ERR_SEMANTICS_721: string = "SM0721";   // a var parameter or varargs on a generator
+  ADAM_ERR_SEMANTICS_722: string = "SM0722";   // a for in over what no for in walks
+  ADAM_ERR_SEMANTICS_723: string = "SM0723";   // a for in variable not of the element's type
 
 // AText split at each '.' into AParts (System.SysUtils' SplitString)
 routine DoSplitDots(const AText: string; var AParts: StringArray);
@@ -1322,7 +1327,8 @@ begin
   return (AKind = NodeKind.NamedType) or (AKind = NodeKind.BuiltinTypeName) or
     (AKind = NodeKind.PointerType) or (AKind = NodeKind.ArrayType) or
     (AKind = NodeKind.RoutineType) or (AKind = NodeKind.OwnType) or
-    (AKind = NodeKind.RefType) or (AKind = NodeKind.WeakType) or (AKind = NodeKind.TaskType);
+    (AKind = NodeKind.RefType) or (AKind = NodeKind.WeakType) or (AKind = NodeKind.TaskType) or
+    (AKind = NodeKind.SequenceType);
 end;
 
 // True for the kinds of an expression (BNF sec 6)
@@ -9824,7 +9830,7 @@ public type
       while LAt <> 0 do
         LKind := self.FTree[LAt].Kind;
         if (LKind = NodeKind.WhileStatement) or (LKind = NodeKind.ForStatement) or
-          (LKind = NodeKind.RepeatStatement) then
+          (LKind = NodeKind.ForInStatement) or (LKind = NodeKind.RepeatStatement) then
           return LAt;
         end;
         if AMatch and (LKind = NodeKind.MatchStatement) then
@@ -10184,7 +10190,9 @@ public type
         self.DoNoReturnBody(AId, LBody);
         return;
       end;
-      if self.FTree.FirstOf(AId, NodeRole.ReturnType) = 0 then
+      // a generator may end anywhere (G1): its end finishes it
+      if (self.FTree.FirstOf(AId, NodeRole.ReturnType) = 0) or
+        self.FTree[AId].HasFlag(NodeFlag.Generator) then
         return;
       end;
       if self.DoListReturns(LBody, NodeRole.Statement) then
@@ -10283,6 +10291,14 @@ public type
       end;
       self.FTree[AId].ResolvedJump := LRoutine;
       LValue := self.FTree.FirstOf(AId, NodeRole.Value);
+      // a generator's return finishes it, handing nothing back (G1)
+      if self.DoGeneratorElement(LRoutine) <> 0 then
+        if LValue <> 0 then
+          self.DoError(LValue, ADAM_ERR_SEMANTICS_720, ADAM_MSG_SEMANTICS_GENERATOR_RETURN,
+            NoArgs());
+        end;
+        return;
+      end;
       LReturnNode := self.DoReturnTypeNode(LRoutine);
       if LReturnNode = 0 then
         if LValue <> 0 then
@@ -10351,7 +10367,8 @@ public type
       while LAt <> 0 do
         LKind := self.FTree[LAt].Kind;
         // a for parallel's iterator is its own VarDecl (T2), a for's a name of one
-        if (LKind = NodeKind.ForStatement) and (self.FTree.RoleOf(LChild) = NodeRole.Statement) and
+        if ((LKind = NodeKind.ForStatement) or (LKind = NodeKind.ForInStatement)) and
+          (self.FTree.RoleOf(LChild) = NodeRole.Statement) and
           ((self.FTree.FirstOf(LAt, NodeRole.Iterator) = ADecl) or
           (self.FTree[self.FTree.FirstOf(LAt, NodeRole.Iterator)].ResolvedDecl = ADecl)) then
           return LAt;
@@ -10373,10 +10390,33 @@ public type
     // bounds have no iterator type to convert to (a name or type lost before included)
     hidden method DoIsIterator(const AFor: int64; const AIterator: int64): bool;
     var
-      LDecl: int64;
-      LKind: string;
       LType: int64;
       LClass: TypeClass;
+    begin
+      if not self.DoIsIteratorVar(AFor, AIterator) then
+        return false;
+      end;
+      LType := self.DoTypeOf(AIterator);
+      LClass := self.DoClass(LType);
+      if LClass = TypeClass.Unknown then
+        return false;
+      end;
+      if IsIntegerClass(LClass) or (LClass = TypeClass.Char) or (LClass = TypeClass.WideChar) or
+        (LClass = TypeClass.ChoicesType) then
+        return true;
+      end;
+      self.DoError(AFor, ADAM_ERR_SEMANTICS_601, ADAM_MSG_SEMANTICS_FOR_TYPE,
+        NoArgs().Str(self.DoText(LType)));
+      return false;
+    end;
+
+    // The for / for in AFor's iterator AIterator is a variable (SM0600) that is not already
+    // the iterator of a loop AFor stands in (SM0602) nor one an async block around AFor
+    // copies (SM0714); each reported at AFor. False when it is no variable or found nowhere
+    hidden method DoIsIteratorVar(const AFor: int64; const AIterator: int64): bool;
+    var
+      LDecl: int64;
+      LKind: string;
     begin
       LDecl := self.FTree[AIterator].ResolvedDecl;
       if LDecl = 0 then
@@ -10398,18 +10438,152 @@ public type
         self.DoError(AFor, ADAM_ERR_SEMANTICS_714, ADAM_MSG_SEMANTICS_ASYNC_WRITE,
           NoArgs().Str(self.FTree[AIterator].Text));
       end;
-      LType := self.DoTypeOf(AIterator);
-      LClass := self.DoClass(LType);
-      if LClass = TypeClass.Unknown then
-        return false;
+      return true;
+    end;
+
+    // The element type a for in walks over a value of AType (BNF sec 5, G1): a sequence's
+    // T, an array's element, a string's char, a wstring's wchar, a set's member; 0 for any
+    // other type
+    hidden const method DoForInElement(const AType: int64): int64;
+    begin
+      match self.DoClass(AType) of
+        TypeClass.SequenceType, TypeClass.StaticArray, TypeClass.DynamicArray:
+          return TargetOf(self.FTree, AType);
+        TypeClass.Text:
+          return self.DoBuiltin("char");
+        TypeClass.WideText:
+          return self.DoBuiltin("wchar");
+        TypeClass.SetType:
+          return SetMemberOf(self.FTree, AType);
+      else
+        return 0;
       end;
-      if IsIntegerClass(LClass) or (LClass = TypeClass.Char) or (LClass = TypeClass.WideChar) or
-        (LClass = TypeClass.ChoicesType) then
-        return true;
+    end;
+
+    // for X in S (BNF sec 5, G1): X a variable (DoIsIteratorVar) of the element type S
+    // walks (SM0723); S a sequence, an array, a string, a wstring or a set (SM0722). Its
+    // ResolvedType is the element type (Lowering reads it)
+    hidden method DoForIn(const AId: int64);
+    var
+      LIterator: int64;
+      LSubject: int64;
+      LSubjectType: int64;
+      LElement: int64;
+      LType: int64;
+    begin
+      self.DoChildren(AId);
+      LIterator := self.FTree.FirstOf(AId, NodeRole.Iterator);
+      LSubject := self.FTree.FirstOf(AId, NodeRole.Value);
+      if (LIterator = 0) or (LSubject = 0) then
+        return;
       end;
-      self.DoError(AFor, ADAM_ERR_SEMANTICS_601, ADAM_MSG_SEMANTICS_FOR_TYPE,
-        NoArgs().Str(self.DoText(LType)));
-      return false;
+      LSubjectType := self.DoTypeOf(LSubject);
+      if (LSubjectType = 0) or (self.DoClass(LSubjectType) = TypeClass.Unknown) then
+        // lost where it was reported
+        return;
+      end;
+      LElement := self.DoForInElement(LSubjectType);
+      if LElement = 0 then
+        self.DoError(LSubject, ADAM_ERR_SEMANTICS_722, ADAM_MSG_SEMANTICS_FOR_IN_SUBJECT,
+          NoArgs().Str(self.DoText(LSubjectType)));
+        return;
+      end;
+      self.FTree[AId].ResolvedType := LElement;
+      if not self.DoIsIteratorVar(AId, LIterator) then
+        return;
+      end;
+      LType := self.DoTypeOf(LIterator);
+      if (LType <> 0) and (LType <> LElement) then
+        self.DoError(LIterator, ADAM_ERR_SEMANTICS_723, ADAM_MSG_SEMANTICS_FOR_IN_TYPE,
+          NoArgs().Str(self.FTree[LIterator].Text).Str(self.DoText(LType)).Str(self.DoText(LElement)));
+      end;
+    end;
+
+    // The element type of the routine-like ARoutine's sequence result when it is a generator
+    // (its result type a sequence of T: BNF sec 5, G1); 0 for any other routine and for none
+    hidden const method DoGeneratorElement(const ARoutine: int64): int64;
+    var
+      LReturnNode: int64;
+      LReturn: int64;
+    begin
+      LReturnNode := self.DoReturnTypeNode(ARoutine);
+      if LReturnNode = 0 then
+        return 0;
+      end;
+      LReturn := CanonicalOf(self.FTree, LReturnNode);
+      if (LReturn = 0) or (self.DoClass(LReturn) <> TypeClass.SequenceType) then
+        return 0;
+      end;
+      return TargetOf(self.FTree, LReturn);
+    end;
+
+    // A routine or method AId whose result is a sequence is a generator (G1): flagged
+    // Generator (Lowering, an .acu); a var parameter or varargs on it is SM0721 (its body
+    // runs after the call has returned, so the caller's place or arguments may be gone)
+    hidden method DoGenerator(const AId: int64);
+    var
+      LI: int64;
+      LParam: int64;
+    begin
+      if self.DoGeneratorElement(AId) = 0 then
+        return;
+      end;
+      self.FTree[AId].AddFlag(NodeFlag.Generator);
+      for LI := 0 to self.FTree.CountOf(AId, NodeRole.Param) - 1 do
+        LParam := self.FTree.NthOf(AId, NodeRole.Param, LI);
+        if self.FTree[LParam].HasFlag(NodeFlag.VarParam) then
+          self.DoError(LParam, ADAM_ERR_SEMANTICS_721, ADAM_MSG_SEMANTICS_GENERATOR_VAR,
+            NoArgs().Str(self.FTree[AId].Text).Str(self.FTree[LParam].Text));
+        end;
+      end;
+      if self.FTree[AId].HasFlag(NodeFlag.Variadic) then
+        self.DoError(AId, ADAM_ERR_SEMANTICS_721, ADAM_MSG_SEMANTICS_GENERATOR_VARARGS,
+          NoArgs().Str(self.FTree[AId].Text));
+      end;
+    end;
+
+    // yield E (BNF sec 5, G1): only in a generator's own body, never inside an async block
+    // or a for parallel's body there (SM0719); E converts to the generator's T. ResolvedJump
+    // is the generator
+    hidden method DoYield(const AId: int64);
+    var
+      LChild: int64;
+      LAt: int64;
+      LKind: NodeKind;
+      LElement: int64;
+      LValue: int64;
+    begin
+      self.DoChildren(AId);
+      LChild := AId;
+      LAt := self.FTree.ParentOf(AId);
+      while LAt <> 0 do
+        LKind := self.FTree[LAt].Kind;
+        if (LKind = NodeKind.AsyncExpression) or ((LKind = NodeKind.ForStatement) and
+          self.FTree[LAt].HasFlag(NodeFlag.Parallel) and
+          (self.FTree.RoleOf(LChild) = NodeRole.Statement)) then
+          self.DoError(AId, ADAM_ERR_SEMANTICS_719, ADAM_MSG_SEMANTICS_YIELD_INNER, NoArgs());
+          return;
+        end;
+        if IsRoutineLike(LKind) or (LKind = NodeKind.Module) or (LKind = NodeKind.TestBlock) then
+          leave;
+        end;
+        LChild := LAt;
+        LAt := self.FTree.ParentOf(LAt);
+      end;
+      LElement := 0;
+      if (LAt <> 0) and IsRoutineLike(self.FTree[LAt].Kind) then
+        LElement := self.DoGeneratorElement(LAt);
+      end;
+      if LElement = 0 then
+        self.DoError(AId, ADAM_ERR_SEMANTICS_719, ADAM_MSG_SEMANTICS_YIELD_OUTSIDE, NoArgs());
+        return;
+      end;
+      self.FTree[AId].ResolvedJump := LAt;
+      LValue := self.FTree.FirstOf(AId, NodeRole.Value);
+      if LValue <> 0 then
+        self.DoOwnMoves(LValue, true);
+        self.DoConvert(LValue, LElement);
+      end;
     end;
 
     // A write SEM can see to ATarget (an assignment, ++ / --, a var argument): when it names
@@ -11121,6 +11295,10 @@ public type
           self.DoDeferDecl(AId);
         NodeKind.ForStatement:
           self.DoFor(AId);
+        NodeKind.ForInStatement:
+          self.DoForIn(AId);
+        NodeKind.YieldStatement:
+          self.DoYield(AId);
         NodeKind.MatchStatement:
           self.DoMatch(AId);
         NodeKind.ExternalClause:
@@ -11130,6 +11308,7 @@ public type
       end;
       if (LKind = NodeKind.VarDecl) or (LKind = NodeKind.ConstDecl) or
         (LKind = NodeKind.ReturnStatement) or (LKind = NodeKind.ForStatement) or
+        (LKind = NodeKind.ForInStatement) or (LKind = NodeKind.YieldStatement) or
         (LKind = NodeKind.MatchStatement) or (LKind = NodeKind.ChoicesType) or
         (LKind = NodeKind.ExternalClause) then
         // A for's and a match's statements were typed by their own check above
@@ -11151,6 +11330,9 @@ public type
       // Its body typed first: a raise or noreturn call's callee is resolved by then
       if (LKind = NodeKind.RoutineDecl) or (LKind = NodeKind.MethodDecl) or
         (LKind = NodeKind.OperatorDecl) then
+        if LKind <> NodeKind.OperatorDecl then
+          self.DoGenerator(AId);
+        end;
         self.DoReturnPath(AId);
         self.DoMutexResult(AId);
       end;
