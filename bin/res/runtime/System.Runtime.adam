@@ -121,6 +121,11 @@ threadstatic
   // take their run's, ParallelWork): cancelled() reads its cancel word, T3; nil on a thread
   // that runs none. Never counted: the call's thread holds the task while it runs
   GTaskCurrent: ptr;
+  // The object of the generator whose body runs on this thread now (nil: none; G1),
+  // written by the switch that starts or leaves a body (DoGeneratorEnter, GeneratorYield,
+  // GeneratorEnd: the one it switches to), never read once a switch returns (a generator
+  // may go on on another thread); its last catching scope's catch reads it (GeneratorEnd)
+  GGeneratorCurrent: ptr;
   // The allocation site of the construct this thread is running (M3.12b): the compiled code
   // stores its id (1 .. the exe's site table count, in source order) right before a runtime
   // call that may allocate and 0 right after it, so every block DoGetMem makes inside that
@@ -7459,6 +7464,303 @@ begin
     GRaiseCode := int32(LWords[ADAM_RUNTIME_TASK_CODE]);
     Unhandled();
   end;
+end;
+
+const
+  // A generator's object (BNF sec 4 sequence type, G1: the part of its ref block past the
+  // header, TaskObject / TaskBlock's layout; its descriptor the compiler's per generator
+  // routine, its done GeneratorDone, its map releasing the text, the arguments' copies and
+  // the value) as words: its coroutine (ptr: PlatformCoroutineNew's, nil until its first
+  // resume and again once it ended), its state (int64: one of ADAM_RUNTIME_GENERATOR_*,
+  // written by the side that resumes it, atomically), the coroutine to switch back to (ptr:
+  // its resumer's, written at each resume), the code of the raise its body ended with
+  // (int64), that raise's text (a string value it holds one reference to), its entry (ptr:
+  // the compiler's body routine of one pointer, which reads the arguments from the object,
+  // stores each yield's value there and calls GeneratorYield), its abort word (int64: one of
+  // ADAM_RUNTIME_ABORT_*), the generator running on its resumer's thread before it (ptr:
+  // GGeneratorCurrent put back as it switches away), how its body last switched away (int64:
+  // one of ADAM_RUNTIME_OUTCOME_*, written by the body's side only), then the compiler's
+  // words: the arguments' copies and the value, from word 9 on
+  ADAM_RUNTIME_GENERATOR_COROUTINE: int64 = 0;
+  ADAM_RUNTIME_GENERATOR_STATE: int64 = 1;
+  ADAM_RUNTIME_GENERATOR_RESUMER: int64 = 2;
+  ADAM_RUNTIME_GENERATOR_CODE: int64 = 3;
+  ADAM_RUNTIME_GENERATOR_TEXT: int64 = 4;
+  ADAM_RUNTIME_GENERATOR_ENTRY: int64 = 5;
+  ADAM_RUNTIME_GENERATOR_ABORT: int64 = 6;
+  ADAM_RUNTIME_GENERATOR_PREVIOUS: int64 = 7;
+  ADAM_RUNTIME_GENERATOR_OUTCOME: int64 = 8;
+  // A generator's states: made, its body not started (a call runs none of it); stopped at a
+  // yield; its body running (one resume at a time: a second one raises); ended (its body
+  // returned, raised or was aborted: a sequence is consumed once, so a resume gives false)
+  ADAM_RUNTIME_GENERATOR_NEW: int64 = 0;
+  ADAM_RUNTIME_GENERATOR_SUSPENDED: int64 = 1;
+  ADAM_RUNTIME_GENERATOR_RUNNING: int64 = 2;
+  ADAM_RUNTIME_GENERATOR_FINISHED: int64 = 3;
+  // How a body last switched away: at a yield (its value stored), at its end (returned, or
+  // aborted), by a raise out of it (kept as code and text, raised again at the resume)
+  ADAM_RUNTIME_OUTCOME_YIELDED: int64 = 1;
+  ADAM_RUNTIME_OUTCOME_ENDED: int64 = 2;
+  ADAM_RUNTIME_OUTCOME_RAISED: int64 = 3;
+  // A generator's abort word: none asked; asked (its next resume raises the abort at its
+  // yield instead of going on); running (the abort is raised: a yield then raises)
+  ADAM_RUNTIME_ABORT_NONE: int64 = 0;
+  ADAM_RUNTIME_ABORT_ASKED: int64 = 1;
+  ADAM_RUNTIME_ABORT_RUNNING: int64 = 2;
+
+// A generator's body switched away for good (its own last step: GeneratorRun's, and the
+// catch of GeneratorRun's last catching scope, which the compiler gives it: an abort ends
+// there, its frames unwound): ended unless it raised, the generator before it the running
+// one again, then its resumer switched to. Nothing switches to this coroutine again (the
+// resumer frees it: DoGeneratorBack), so this never returns
+routine GeneratorEnd(); noreturn;
+var
+  LObject: ptr;
+  LWords: ptr to int64;
+  LSlots: ptr to ptr;
+begin
+  LObject := GGeneratorCurrent;
+  LWords := ptr to int64(LObject);
+  LSlots := ptr to ptr(LObject);
+  if LWords[ADAM_RUNTIME_GENERATOR_OUTCOME] <> ADAM_RUNTIME_OUTCOME_RAISED then
+    LWords[ADAM_RUNTIME_GENERATOR_OUTCOME] := ADAM_RUNTIME_OUTCOME_ENDED;
+  end;
+  GGeneratorCurrent := LSlots[ADAM_RUNTIME_GENERATOR_PREVIOUS];
+  PlatformCoroutineSwitch(LSlots[ADAM_RUNTIME_GENERATOR_RESUMER]);
+  // never reached: a finished generator's coroutine is never switched to again
+  PlatformTerminate(1);
+end;
+
+// A generator's coroutine's run (PlatformCoroutineNew runs it on the generator's own stack
+// with its object AObject, at its first resume): its entry called inside a catching scope
+// of its own; a raise out of the body (a hardware fault too: the guard takes both) is
+// kept, a reference added (its code and text, raised again at the resume, DoGeneratorBack);
+// then it ends (GeneratorEnd). The compiler gives this routine one more catching scope, the
+// outermost, for the abort alone (PlatformCatchAbort: no guard in the body takes it), its
+// catch GeneratorEnd: the body's frames unwound, their finally / defer / cleanup run
+routine GeneratorRun(const AObject: ptr);
+var
+  LWords: ptr to int64;
+  LSlots: ptr to ptr;
+  LEntry: ThreadEntry;
+begin
+  LWords := ptr to int64(AObject);
+  LSlots := ptr to ptr(AObject);
+  LEntry := ThreadEntry(LSlots[ADAM_RUNTIME_GENERATOR_ENTRY]);
+  guard
+    LEntry(AObject);
+    LWords[ADAM_RUNTIME_GENERATOR_OUTCOME] := ADAM_RUNTIME_OUTCOME_ENDED;
+  except
+    StrAddRef(GRaiseText);
+    LSlots[ADAM_RUNTIME_GENERATOR_TEXT] := GRaiseText;
+    LWords[ADAM_RUNTIME_GENERATOR_CODE] := int64(GRaiseCode);
+    LWords[ADAM_RUNTIME_GENERATOR_OUTCOME] := ADAM_RUNTIME_OUTCOME_RAISED;
+  end;
+  GeneratorEnd();
+end;
+
+// The generator object AObject's body run from where it stopped (its coroutine made
+// already), the calling coroutine ASelf (PlatformCoroutineSelf's) its resumer and this
+// thread's running generator kept to be put back; returns once the body switched back
+// (a yield, its end), perhaps on another thread: nothing of this thread's is read after
+routine DoGeneratorEnter(const AObject: ptr; const ASelf: ptr);
+var
+  LSlots: ptr to ptr;
+begin
+  LSlots := ptr to ptr(AObject);
+  LSlots[ADAM_RUNTIME_GENERATOR_RESUMER] := ASelf;
+  LSlots[ADAM_RUNTIME_GENERATOR_PREVIOUS] := GGeneratorCurrent;
+  GGeneratorCurrent := AObject;
+  PlatformCoroutineSwitch(LSlots[ADAM_RUNTIME_GENERATOR_COROUTINE]);
+end;
+
+// The generator object AObject's body back from DoGeneratorEnter (it switched away, so its
+// state is written here, on the resumer's side, never while its stack still runs): at a
+// yield it is stopped there (true: its value is stored); else it ended: its stack freed
+// (false), and a raise out of the body raised again (a reference added for the new raise)
+routine DoGeneratorBack(const AObject: ptr): bool;
+var
+  LWords: ptr to int64;
+  LSlots: ptr to ptr;
+begin
+  LWords := ptr to int64(AObject);
+  LSlots := ptr to ptr(AObject);
+  if LWords[ADAM_RUNTIME_GENERATOR_OUTCOME] = ADAM_RUNTIME_OUTCOME_YIELDED then
+    atomicstore(LWords[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_SUSPENDED);
+    return true;
+  end;
+  PlatformCoroutineFree(LSlots[ADAM_RUNTIME_GENERATOR_COROUTINE]);
+  LSlots[ADAM_RUNTIME_GENERATOR_COROUTINE] := nil;
+  atomicstore(LWords[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_FINISHED);
+  if LWords[ADAM_RUNTIME_GENERATOR_OUTCOME] = ADAM_RUNTIME_OUTCOME_RAISED then
+    StrAddRef(LSlots[ADAM_RUNTIME_GENERATOR_TEXT]);
+    RaiseWith(int32(LWords[ADAM_RUNTIME_GENERATOR_CODE]), LSlots[ADAM_RUNTIME_GENERATOR_TEXT]);
+  end;
+  return false;
+end;
+
+// The generator object AObject, taken by its state's swap to RUNNING, ended for good
+// without running (its body never started, or the coroutine it needs cannot be had), then
+// AText raised (code 1)
+routine DoGeneratorFail(const AObject: ptr; const AText: ptr to const char); noreturn;
+var
+  LWords: ptr to int64;
+begin
+  LWords := ptr to int64(AObject);
+  atomicstore(LWords[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_FINISHED);
+  RaiseWith(1, TextOfC(AText));
+end;
+
+// A for .. in pass over the sequence ABlock (a generator's ref block; G1): its body run to
+// its next yield (true: the value is in its object) or its end (false; a raise out of it
+// raised here). Its first resume makes its stack. A nil or ended sequence: false at once.
+// A generator resumed while it runs (inside its own body, or on another thread at the same
+// time) raises (code 1); any thread may resume it, one at a time
+routine GeneratorResume(const ABlock: ptr): bool;
+var
+  LObject: ptr;
+  LWords: ptr to int64;
+  LSlots: ptr to ptr;
+  LOld: int64;
+  LSelf: ptr;
+begin
+  if ABlock = nil then
+    return false;
+  end;
+  LObject := TaskObject(ABlock);
+  LWords := ptr to int64(LObject);
+  LSlots := ptr to ptr(LObject);
+  LOld := atomicswap(LWords[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_RUNNING);
+  if LOld = ADAM_RUNTIME_GENERATOR_RUNNING then
+    RaiseWith(1, TextOfC(ptr to const char("a generator resumed while it runs")));
+  end;
+  if LOld = ADAM_RUNTIME_GENERATOR_FINISHED then
+    atomicstore(LWords[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_FINISHED);
+    return false;
+  end;
+  LSelf := PlatformCoroutineSelf();
+  if LSelf = nil then
+    DoGeneratorFail(LObject, ptr to const char("a generator could not be run on this thread"));
+  end;
+  if LSlots[ADAM_RUNTIME_GENERATOR_COROUTINE] = nil then
+    LSlots[ADAM_RUNTIME_GENERATOR_COROUTINE] := PlatformCoroutineNew(GeneratorRun, LObject);
+    if LSlots[ADAM_RUNTIME_GENERATOR_COROUTINE] = nil then
+      DoGeneratorFail(LObject, ptr to const char("a generator's stack could not be made"));
+    end;
+  end;
+  DoGeneratorEnter(LObject, LSelf);
+  return DoGeneratorBack(LObject);
+end;
+
+// `yield E` in a generator's body (the compiler has stored E in the object AObject): its
+// resumer switched back to, the body stopped here until the next resume, perhaps on
+// another thread. Resumed to be released (its abort asked), the abort is raised here: the
+// body's frames unwind, their finally / defer run. A yield while that runs raises (code 1)
+routine GeneratorYield(const AObject: ptr);
+var
+  LWords: ptr to int64;
+  LSlots: ptr to ptr;
+begin
+  LWords := ptr to int64(AObject);
+  LSlots := ptr to ptr(AObject);
+  if LWords[ADAM_RUNTIME_GENERATOR_ABORT] = ADAM_RUNTIME_ABORT_RUNNING then
+    RaiseWith(1, TextOfC(ptr to const char("a yield in a generator being released")));
+  end;
+  LWords[ADAM_RUNTIME_GENERATOR_OUTCOME] := ADAM_RUNTIME_OUTCOME_YIELDED;
+  GGeneratorCurrent := LSlots[ADAM_RUNTIME_GENERATOR_PREVIOUS];
+  PlatformCoroutineSwitch(LSlots[ADAM_RUNTIME_GENERATOR_RESUMER]);
+  if LWords[ADAM_RUNTIME_GENERATOR_ABORT] = ADAM_RUNTIME_ABORT_ASKED then
+    LWords[ADAM_RUNTIME_GENERATOR_ABORT] := ADAM_RUNTIME_ABORT_RUNNING;
+    PlatformAbort();
+  end;
+end;
+
+// The generator object AObject, stopped at a yield and taken by its state's swap to
+// RUNNING, resumed once with its abort asked (its yield raises the abort: its pending
+// finally / defer run, GeneratorYield) until its body has ended; false when the calling
+// thread cannot run it (nothing ran)
+routine DoGeneratorStop(const AObject: ptr): bool;
+var
+  LWords: ptr to int64;
+  LSelf: ptr;
+begin
+  LWords := ptr to int64(AObject);
+  LSelf := PlatformCoroutineSelf();
+  if LSelf = nil then
+    return false;
+  end;
+  LWords[ADAM_RUNTIME_GENERATOR_ABORT] := ADAM_RUNTIME_ABORT_ASKED;
+  DoGeneratorEnter(AObject, LSelf);
+  return true;
+end;
+
+// A for .. in loop over the sequence ABlock left before its end (leave, return, raise:
+// the loop's cleanup, G1): a generator stopped at a yield is aborted there (its pending
+// finally / defer run, DoGeneratorStop) and ends; a raise out of that is raised here. One
+// never started, or ended, just ends (a sequence is consumed once). nil does nothing; one
+// running (resumed elsewhere at the same time) raises (code 1)
+routine GeneratorAbort(const ABlock: ptr);
+var
+  LObject: ptr;
+  LWords: ptr to int64;
+  LOld: int64;
+begin
+  if ABlock = nil then
+    return;
+  end;
+  LObject := TaskObject(ABlock);
+  LWords := ptr to int64(LObject);
+  LOld := atomicswap(LWords[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_RUNNING);
+  if LOld = ADAM_RUNTIME_GENERATOR_RUNNING then
+    RaiseWith(1, TextOfC(ptr to const char("a generator released while it runs")));
+  end;
+  if LOld <> ADAM_RUNTIME_GENERATOR_SUSPENDED then
+    atomicstore(LWords[ADAM_RUNTIME_GENERATOR_STATE], ADAM_RUNTIME_GENERATOR_FINISHED);
+    return;
+  end;
+  if not DoGeneratorStop(LObject) then
+    DoGeneratorFail(LObject, ptr to const char("a generator could not be released on this thread"));
+  end;
+  DoGeneratorBack(LObject);
+end;
+
+// A generator's done (its descriptor's: RefRelease runs it on the object AObject as the
+// last handle goes, before the descriptor's map releases its text, arguments and value;
+// no one else holds it, so it is not running). One stopped at a yield is aborted first
+// (its pending finally / defer run, DoGeneratorStop), its stack then freed; a raise out of
+// that abort, which no one can see here, ends the program as a raise nothing caught does
+// (Unhandled, with that raise's code and text), as a task's unawaited raise does
+routine GeneratorDone(const AObject: ptr);
+var
+  LWords: ptr to int64;
+  LSlots: ptr to ptr;
+begin
+  LWords := ptr to int64(AObject);
+  LSlots := ptr to ptr(AObject);
+  if LWords[ADAM_RUNTIME_GENERATOR_STATE] = ADAM_RUNTIME_GENERATOR_SUSPENDED then
+    LWords[ADAM_RUNTIME_GENERATOR_STATE] := ADAM_RUNTIME_GENERATOR_RUNNING;
+    if not DoGeneratorStop(AObject) then
+      StrRelease(GRaiseText);
+      GRaiseText := TextOfC(ptr to const char("a generator could not be released on this thread"));
+      GRaiseCode := 1;
+      Unhandled();
+    end;
+    LWords[ADAM_RUNTIME_GENERATOR_STATE] := ADAM_RUNTIME_GENERATOR_FINISHED;
+    PlatformCoroutineFree(LSlots[ADAM_RUNTIME_GENERATOR_COROUTINE]);
+    LSlots[ADAM_RUNTIME_GENERATOR_COROUTINE] := nil;
+    // only the abort's own raise: one raised before was raised again at its resume
+    if LWords[ADAM_RUNTIME_GENERATOR_OUTCOME] = ADAM_RUNTIME_OUTCOME_RAISED then
+      StrAddRef(LSlots[ADAM_RUNTIME_GENERATOR_TEXT]);
+      StrRelease(GRaiseText);
+      GRaiseText := LSlots[ADAM_RUNTIME_GENERATOR_TEXT];
+      GRaiseCode := int32(LWords[ADAM_RUNTIME_GENERATOR_CODE]);
+      Unhandled();
+    end;
+    return;
+  end;
+  // never started (no stack) or ended (freed as it ended): nil, or a stack never resumed
+  PlatformCoroutineFree(LSlots[ADAM_RUNTIME_GENERATOR_COROUTINE]);
+  LSlots[ADAM_RUNTIME_GENERATOR_COROUTINE] := nil;
 end;
 
 // A new lock, free, from the heap (counted: LockFree gives it back), or nil when there is

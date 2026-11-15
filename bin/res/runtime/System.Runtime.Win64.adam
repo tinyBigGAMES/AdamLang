@@ -241,6 +241,26 @@ routine RtlWaitOnAddress(const AAddress: ptr; const ACompare: ptr; const ASize: 
 routine RtlWakeAddressSingle(const AAddress: ptr); external "ntdll";
 // kernel32: milliseconds since the system started (PlatformMilliseconds)
 routine GetTickCount64(): uint64; external "kernel32";
+// kernel32: the fibers under the coroutines (PlatformCoroutineNew, PlatformCoroutineSwitch,
+// PlatformCoroutineFree): a new fiber (its stack ACommit bytes committed, AReserve reserved,
+// 0: the exe's; AFlags ADAM_PLATFORM_FIBER_FLOAT_SWITCH), nil when it could not be made; the
+// calling thread switched to the fiber AFiber; a fiber that is not running deleted (its
+// stack freed); the calling thread made a fiber (its fiber back, nil when it could not) and
+// made a plain thread again; whether the calling thread is a fiber already
+routine CreateFiberEx(const ACommit: uint64; const AReserve: uint64; const AFlags: uint32;
+  const AStart: routine(AParameter: ptr); const AParameter: ptr): ptr; external "kernel32";
+routine SwitchToFiber(const AFiber: ptr); external "kernel32";
+routine DeleteFiber(const AFiber: ptr); external "kernel32";
+routine ConvertThreadToFiberEx(const AParameter: ptr; const AFlags: uint32): ptr;
+  external "kernel32";
+routine ConvertFiberToThread(): int32; external "kernel32";
+routine IsThreadAFiber(): int32; external "kernel32";
+// kernel32 / ntdll: the calling thread's pseudo handle, and a thread's basic information
+// (AClass 0: THREAD_BASIC_INFORMATION, whose second word is the thread's TEB; 0 = success):
+// a thread made a fiber by its host, not here, has its fiber in its TEB (DoAdoptFiber)
+routine GetCurrentThread(): uint64; external "kernel32";
+routine NtQueryInformationThread(const AThread: uint64; const AClass: int32; const AInfo: ptr;
+  const ASize: uint32; const AReturned: ptr): int32; external "ntdll";
 // kernel32: the hardware faults (PlatformCatch, PlatformAtFault): the process's last filter
 // of an exception no frame took (the one it replaces back), the stack the calling thread
 // keeps for handling its own stack overflow (ASize: the bytes asked for, the bytes it kept
@@ -281,6 +301,17 @@ type
   // the block it was started with
   PlatformThreadRun = routine(const ABlock: ptr);
 
+  // A coroutine (PlatformCoroutineNew: a run on a stack of its own, switched to and from by
+  // PlatformCoroutineSwitch): its fiber, the routine its fiber runs first and that routine's
+  // block (nil and nil for a thread's own coroutine, DoThreadCoroutine), and whether the
+  // thread was made a fiber here (ConvertFiberToThread at its end) or by its host (kept)
+  PlatformCoroutine = record
+    Fiber: ptr;
+    Run: PlatformThreadRun;
+    Block: ptr;
+    Converted: bool;
+  end;
+
   // One import slot a run-time hook wrote: the slot, what it held, the load address of the
   // module it is in (a module that went away is never written again)
   PlatformHookSlot = record
@@ -311,6 +342,11 @@ const
   // The exception code of a raise: a customer code (bit 29 set), severity error (bits 30-31),
   // "ADA" in its low bytes, never one the OS or another runtime uses for its own
   ADAM_PLATFORM_RAISE_CODE: uint32 = 0xE0414441;
+  // The exception code of a generator's abort (PlatformAbort): a customer code as the raise's,
+  // "ADB" in its low bytes. No guard's filter takes it (PlatformCatch, PlatformCatchRaise):
+  // only the generator's own start's (PlatformCatchAbort), so the frames between run their
+  // finally and cleanup funclets and nothing else stops it
+  ADAM_PLATFORM_ABORT_CODE: uint32 = 0xE0414442;
   // RaiseException's flag of an exception that cannot be continued
   ADAM_PLATFORM_NONCONTINUABLE: uint32 = 1;
   // The exception codes of the hardware faults (winnt.h EXCEPTION_*, PaskalCPP's
@@ -503,6 +539,13 @@ threadstatic
   // True once a guard's filter took a stack overflow on this thread, until the guard's
   // except part makes the guard page again (PlatformFaultTaken), whatever was raised between
   GStackRearm: bool;
+  // The coroutine running on this thread (nil: none yet, the thread is no fiber of this
+  // unit's), written by the switch that starts it (PlatformCoroutineSwitch), and the thread's
+  // own coroutine (DoThreadCoroutine: its first fiber, nil until a switch needs it), given
+  // back as the thread ends (DoCoroutineThreadEnd). Neither is read once a switch returns:
+  // the coroutine may run on another thread from then on
+  GCoroutineCurrent: ptr to PlatformCoroutine;
+  GCoroutineThread: ptr to PlatformCoroutine;
 
 // Writes the ACount bytes at AText to stdout as they are
 public routine PlatformWrite(const AText: ptr; const ACount: int64);
@@ -547,6 +590,15 @@ end;
 public routine PlatformRaise(); noreturn;
 begin
   RaiseException(ADAM_PLATFORM_RAISE_CODE, ADAM_PLATFORM_NONCONTINUABLE, 0, nil);
+end;
+
+// Raises a generator's abort (ADAM_PLATFORM_ABORT_CODE, not continuable): no guard's except
+// part takes it, so the frames up to the generator's own start unwind (their finally and
+// cleanup funclets run) and its last catching scope (PlatformCatchAbort's) ends the
+// generator; it never returns
+public routine PlatformAbort(); noreturn;
+begin
+  RaiseException(ADAM_PLATFORM_ABORT_CODE, ADAM_PLATFORM_NONCONTINUABLE, 0, nil);
 end;
 
 // The hardware fault kind (ADAM_PLATFORM_FAULT_*) of the exception code ACode, 0 when it
@@ -595,7 +647,8 @@ end;
 // runtime's own exception and for a hardware fault (BNF sec 5: a guard takes both), which
 // is kept for the guard's except part to make the raise in flight (GFaultPending,
 // PlatformFaultTaken: no heap or stdio call runs here, the stack may be all but spent); 0
-// (continue the search) for any other, which goes on to the OS as it did before
+// (continue the search) for any other, which goes on to the OS as it did before, a
+// generator's abort included (ADAM_PLATFORM_ABORT_CODE: PlatformCatchAbort's alone)
 public routine PlatformCatch(const APointers: ptr; const AFrame: ptr): int32;
 var
   LCode: uint32;
@@ -627,6 +680,18 @@ public routine PlatformCatchRaise(const APointers: ptr; const AFrame: ptr): int3
 begin
   if DoExceptionCode(APointers) = ADAM_PLATFORM_RAISE_CODE then
     GFaultPending := 0;
+    return 1;
+  end;
+  return 0;
+end;
+
+// The filter of a generator's own start's last catching scope (System.Runtime's
+// GeneratorRun: Lowering's DoCatchAll), whose catch ends the generator (GeneratorEnd): 1 for
+// a generator's abort only (PlatformAbort). A raise was taken by the start's own guard
+// before it gets here, and nothing else is ever raised on a generator's stack
+public routine PlatformCatchAbort(const APointers: ptr; const AFrame: ptr): int32;
+begin
+  if DoExceptionCode(APointers) = ADAM_PLATFORM_ABORT_CODE then
     return 1;
   end;
   return 0;
@@ -722,6 +787,8 @@ const
   // PlatformThreadCallback acts on
   ADAM_PLATFORM_DLL_THREAD_DETACH: uint32 = 3;
 
+forward routine DoCoroutineThreadEnd();
+
 // AHandler run on each thread but the main one as it ends (PlatformThreadCallback), the
 // thread's own last code: its threadstatics are still there to release
 public routine PlatformAtThreadEnd(const AHandler: routine());
@@ -733,8 +800,9 @@ end;
 // loader calls it as the process starts and ends and as each thread starts and ends
 // (AModule the image, AReason winnt.h's DLL_* reason, AReserved unused), on that thread. A
 // thread's end (DLL_THREAD_DETACH: a thread that returned or called ExitThread, whoever
-// started it) runs the registered thread end (PlatformAtThreadEnd); the main thread ends
-// with the process, which runs nothing here (the program's end released its copies)
+// started it) runs the registered thread end (PlatformAtThreadEnd), then the thread's own
+// coroutine is given back (DoCoroutineThreadEnd); the main thread ends with the process,
+// which runs nothing here (the program's end released its copies)
 public routine PlatformThreadCallback(const AModule: ptr; const AReason: uint32;
   const AReserved: ptr);
 var
@@ -747,6 +815,7 @@ begin
   if ptr(LEnd) <> nil then
     LEnd();
   end;
+  DoCoroutineThreadEnd();
 end;
 
 @ifdef DEBUG
@@ -1249,6 +1318,178 @@ end;
 public routine PlatformThreadDetach(const AThread: uint64);
 begin
   CloseHandle(AThread);
+end;
+
+const
+  // CreateFiberEx / ConvertThreadToFiberEx's FIBER_FLAG_FLOAT_SWITCH: the floating-point
+  // state switched with the fiber
+  ADAM_PLATFORM_FIBER_FLOAT_SWITCH: uint32 = 1;
+  // A coroutine's stack: reserved, committed by page as it grows (0: the exe's commit)
+  ADAM_PLATFORM_COROUTINE_RESERVE: uint64 = 1048576;
+  ADAM_PLATFORM_COROUTINE_COMMIT: uint64 = 0;
+  // THREAD_BASIC_INFORMATION's words (NtQueryInformationThread's class 0), the TEB's word
+  // in it, and the TEB's word that holds the running fiber (NT_TIB.FiberData, at 0x20)
+  ADAM_PLATFORM_THREAD_INFO_WORDS: int64 = 6;
+  ADAM_PLATFORM_THREAD_INFO_TEB: int64 = 1;
+  ADAM_PLATFORM_TEB_FIBER: int64 = 4;
+
+// The fiber the calling thread's host made it (IsThreadAFiber, not converted here): the
+// running fiber read from the thread's TEB; nil when it cannot be read
+routine DoAdoptFiber(): ptr;
+var
+  LInfo: array[0..5] of uint64;
+  LTeb: ptr to ptr;
+begin
+  if NtQueryInformationThread(GetCurrentThread(), 0, ptr(addr of LInfo),
+    uint32(ADAM_PLATFORM_THREAD_INFO_WORDS * 8), nil) <> 0 then
+    return nil;
+  end;
+  LTeb := ptr to ptr(LInfo[ADAM_PLATFORM_THREAD_INFO_TEB]);
+  if LTeb = nil then
+    return nil;
+  end;
+  return LTeb[ADAM_PLATFORM_TEB_FIBER];
+end;
+
+// The calling thread's own coroutine (GCoroutineThread), made the first time it is asked
+// for: the thread made a fiber (ConvertThreadToFiberEx), or, made one by its host already,
+// its fiber taken as it is (DoAdoptFiber, never converted back); it becomes the running
+// coroutine (GCoroutineCurrent). nil when the thread cannot be made a fiber (no room)
+routine DoThreadCoroutine(): ptr to PlatformCoroutine;
+var
+  LCoroutine: ptr to PlatformCoroutine;
+  LFiber: ptr;
+  LConverted: bool;
+begin
+  if GCoroutineThread <> nil then
+    return GCoroutineThread;
+  end;
+  LConverted := false;
+  if IsThreadAFiber() <> 0 then
+    LFiber := DoAdoptFiber();
+  else
+    LFiber := ConvertThreadToFiberEx(nil, ADAM_PLATFORM_FIBER_FLOAT_SWITCH);
+    LConverted := LFiber <> nil;
+  end;
+  if LFiber = nil then
+    return nil;
+  end;
+  LCoroutine := ptr to PlatformCoroutine(malloc(uint64(size(PlatformCoroutine))));
+  if LCoroutine = nil then
+    if LConverted then
+      ConvertFiberToThread();
+    end;
+    return nil;
+  end;
+  // Run and Block stay nil: a thread's own coroutine has no run of its own
+  memset(ptr(LCoroutine), 0, uint64(size(PlatformCoroutine)));
+  LCoroutine^.Fiber := LFiber;
+  LCoroutine^.Converted := LConverted;
+  GCoroutineThread := LCoroutine;
+  GCoroutineCurrent := LCoroutine;
+  return LCoroutine;
+end;
+
+// A thread's end (PlatformThreadCallback, on that thread, on its own fiber: a thread
+// ends only from there): its own coroutine given back, the thread made a plain thread
+// again when it was converted here
+routine DoCoroutineThreadEnd();
+var
+  LCoroutine: ptr to PlatformCoroutine;
+begin
+  LCoroutine := GCoroutineThread;
+  if LCoroutine = nil then
+    return;
+  end;
+  GCoroutineThread := nil;
+  GCoroutineCurrent := nil;
+  if LCoroutine^.Converted then
+    ConvertFiberToThread();
+  end;
+  free(ptr(LCoroutine));
+end;
+
+// The OS's start of a coroutine's fiber (CreateFiberEx's start routine): AParameter is
+// its PlatformCoroutine; the stack the thread keeps for its own overflow asked for this
+// stack too (the fiber keeps its own), then its run called with its block. A run never
+// returns (it ends by switching away for good, System.Runtime's GeneratorEnd): a fiber's
+// start that returns would end the thread, so the process ends here instead
+routine DoFiberProc(AParameter: ptr);
+var
+  LCoroutine: ptr to PlatformCoroutine;
+  LRun: PlatformThreadRun;
+begin
+  LCoroutine := ptr to PlatformCoroutine(AParameter);
+  DoGuaranteeStack();
+  LRun := LCoroutine^.Run;
+  LRun(LCoroutine^.Block);
+  PlatformTerminate(1);
+end;
+
+// A new coroutine that runs ARun(ABlock) on a stack of its own (System.Runtime's
+// GeneratorRun) once it is first switched to (PlatformCoroutineSwitch), not before; ARun
+// never returns. nil when it could not be made (no room, or the OS refused)
+public routine PlatformCoroutineNew(const ARun: routine(const ABlock: ptr); const ABlock: ptr): ptr;
+var
+  LCoroutine: ptr to PlatformCoroutine;
+  LFiber: ptr;
+begin
+  LCoroutine := ptr to PlatformCoroutine(malloc(uint64(size(PlatformCoroutine))));
+  if LCoroutine = nil then
+    return nil;
+  end;
+  LCoroutine^.Run := ARun;
+  LCoroutine^.Block := ABlock;
+  LCoroutine^.Converted := false;
+  LFiber := CreateFiberEx(ADAM_PLATFORM_COROUTINE_COMMIT, ADAM_PLATFORM_COROUTINE_RESERVE,
+    ADAM_PLATFORM_FIBER_FLOAT_SWITCH, DoFiberProc, ptr(LCoroutine));
+  if LFiber = nil then
+    free(ptr(LCoroutine));
+    return nil;
+  end;
+  LCoroutine^.Fiber := LFiber;
+  return ptr(LCoroutine);
+end;
+
+// The coroutine running on the calling thread: the one switched to last, or the thread's
+// own (made a fiber the first time: DoThreadCoroutine); what a switch back names. nil
+// when the thread cannot be made a fiber
+public routine PlatformCoroutineSelf(): ptr;
+begin
+  if GCoroutineCurrent <> nil then
+    return ptr(GCoroutineCurrent);
+  end;
+  return ptr(DoThreadCoroutine());
+end;
+
+// The calling thread switched to the coroutine ATo (PlatformCoroutineNew's, or one
+// PlatformCoroutineSelf named), which runs from where it last switched away (its run's
+// start the first time); this returns when something switches back to the coroutine that
+// called it, perhaps on another thread. The calling thread runs a coroutine already
+// (PlatformCoroutineSelf gave one); ATo is never the running one, nor one running on
+// another thread. The running coroutine is written before the switch and nothing of this
+// thread's is read after it (the thread may be another one by then)
+public routine PlatformCoroutineSwitch(const ATo: ptr);
+var
+  LTo: ptr to PlatformCoroutine;
+begin
+  LTo := ptr to PlatformCoroutine(ATo);
+  GCoroutineCurrent := LTo;
+  SwitchToFiber(LTo^.Fiber);
+end;
+
+// The coroutine ACoroutine (PlatformCoroutineNew's) freed, its stack with it: it is not
+// running anywhere (finished, or never switched to again); nil does nothing
+public routine PlatformCoroutineFree(const ACoroutine: ptr);
+var
+  LCoroutine: ptr to PlatformCoroutine;
+begin
+  if ACoroutine = nil then
+    return;
+  end;
+  LCoroutine := ptr to PlatformCoroutine(ACoroutine);
+  DeleteFiber(LCoroutine^.Fiber);
+  free(ACoroutine);
 end;
 
 // The processors this process may run on, every group's (a for parallel's workers when it
