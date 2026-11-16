@@ -19,10 +19,11 @@
 ::                                                                           ::
 :: First the build's inputs are copied into a snapshot                       ::
 :: (projects\adam\output\snapshot: src\, projects\adam and                   ::
-:: projects\adamtest without their output\, bin\res\libs and                 ::
-:: bin\res\runtime), so the sources can be edited while it runs: every       ::
-:: stage reads the snapshot alone (each stage runs from the snapshot's       ::
-:: bin\, so its $P: res\ and its $R: paths are the snapshot's).              ::
+:: projects\adamtest without their output\, bin\res\libs, bin\res\runtime    ::
+:: and bin\res\assets\icons (the exes' @exeicon), so the sources can be      ::
+:: edited while it runs: every stage reads the snapshot alone (each stage    ::
+:: runs from the snapshot's bin\, so its $P: res\ and its $R: paths are      ::
+:: the snapshot's).                                                          ::
 ::                                                                           ::
 :: The adam.exe here builds the compiler (projects\adam) as stage A; A       ::
 :: builds it again as stage B; B builds it as stage C. B and C must be       ::
@@ -63,6 +64,9 @@ if errorlevel 1 (echo BUILD FAILED - snapshot & exit /b 1)
 call :snap "%BIN%res\libs" "%SNAP%\bin\res\libs"
 if errorlevel 1 (echo BUILD FAILED - snapshot & exit /b 1)
 call :snap "%BIN%res\runtime" "%SNAP%\bin\res\runtime"
+if errorlevel 1 (echo BUILD FAILED - snapshot & exit /b 1)
+:: adam.exe / adamtest.exe carry the Adam logo icon (@exeicon ADAM_LOGO_ICON, $R: relative)
+call :snap "%BIN%res\assets\icons" "%SNAP%\bin\res\assets\icons"
 if errorlevel 1 (echo BUILD FAILED - snapshot & exit /b 1)
 copy /y "%BIN%adam.exe" "%SNAP%\bin\adam.exe" >nul
 if errorlevel 1 (echo BUILD FAILED - snapshot & exit /b 1)
