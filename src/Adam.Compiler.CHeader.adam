@@ -1,0 +1,890 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Compiler.CHeader.adam - the C header of a dll or a lib (PLAN-ADAM M8g)
+
+  WriteCHeader writes <name>.h's text from the AST alone: every declaration
+  the Driver hands it (the main module's exported routines and variables, in
+  declaration order) that C can name, with every type they reach, each as
+  the build's target lays it out (Adam.Compiler.Layout).
+
+  - Builtins: int8 .. uint64 as <stdint.h>'s int8_t .. uint64_t (the same
+    width on every target); clong / culong, float32 / float64, bool, char and
+    wchar as the target's C type (Target.BuiltinCppType: C's long, wchar_t);
+    ptr as void *.
+  - A pointer to a type C can name points at it (const when it is a ptr to
+    const); to a record, overlay or object C cannot name, at its opaque
+    struct (declared, never defined); to anything else, at void.
+  - A record is a C struct, an overlay a C union, each typedef'd by its
+    Adam name (the unit's name before it when two units give one name):
+    its parent first (__adam_parent), then its fields in order, bitfields
+    with their widths, anonymous parts as anonymous members, packed under
+    #pragma pack(1), align(n) on the first member. Every one is checked
+    where it is defined: _Static_assert of its size, its alignment and each
+    byte field's offset as Adam lays them, so a C compiler that would lay it
+    out another way stops there.
+  - A choices type is its integer (int32_t or int64_t) and a constant per
+    value, <Type>_<Value>; a set its bits (uint8_t .. uint64_t, else a
+    struct of uint64_t words).
+  - A static array is C's array (a field's, a variable's, a pointer's
+    target: C passes and returns none by value), a routine value C's
+    function pointer.
+  - A var parameter, and a const one Adam passes by reference, is a pointer
+    to its type (to const for const).
+
+  A declaration C cannot call or name is left out, its reason a comment in
+  its place: C++ linkage (cpplink), a name that is a C or C++ keyword, a
+  type with no C form (string, wstring, a dynamic array, an object or an
+  interface by value, an own / ref / weak, a task, a sequence, a mutex,
+  varargs, a cpplink or method routine type, a static array passed or
+  returned by value). A field or parameter name that
+  is a C or C++ keyword takes a trailing _ (AD.5's rule).
+
+  A dll's declarations carry the target's C import specifier
+  (Target.CImportSpec: __declspec(dllimport) on Windows); a lib's none. The
+  text is deterministic: no time, no path, the AST's order.
+*******************************************************************************/
+
+module unit Adam.Compiler.CHeader;
+
+import System.SysUtils, Adam.Core.Common, Adam.Core.Containers, Adam.Target, Adam.Compiler.AST,
+  Adam.Compiler.Types, Adam.Compiler.Layout;
+
+const
+  // How deep a type is followed for its C form (a deeper one has none)
+  ADAM_CHEADER_MAX_DEPTH: int64 = 64;
+  // A FDefined state: a type being defined (a by-value cycle meets it), one defined
+  ADAM_CHEADER_DEFINING: int64 = 1;
+  ADAM_CHEADER_DEFINED: int64 = 2;
+
+  // The header's own macros, written once by whichever Adam header comes first
+  ADAM_CHEADER_MACROS: string =
+    "#ifndef __adam_c_header\n" +
+    "#define __adam_c_header\n" +
+    "#ifdef __cplusplus\n" +
+    "#define __adam_static_assert static_assert\n" +
+    "#define __adam_alignof alignof\n" +
+    "#define __adam_alignas alignas\n" +
+    "#define __adam_noreturn [[noreturn]]\n" +
+    "#else\n" +
+    "#define __adam_static_assert _Static_assert\n" +
+    "#define __adam_alignof _Alignof\n" +
+    "#define __adam_alignas _Alignas\n" +
+    "#define __adam_noreturn _Noreturn\n" +
+    "#endif\n" +
+    "#endif\n";
+
+  // The headers every Adam header includes: the fixed-width integers, offsetof and
+  // wchar_t, bool
+  ADAM_CHEADER_INCLUDES: string =
+    "#include <stddef" + ADAM_EXT_C_HEADER + ">\n" +
+    "#include <stdint" + ADAM_EXT_C_HEADER + ">\n" +
+    "#include <stdbool" + ADAM_EXT_C_HEADER + ">\n";
+
+// True when AName is a C or C++ keyword (C23's and C++23's, the words a header compiled as
+// either cannot declare), or a name <stdint.h> / <stdbool.h> / <stddef.h> define
+routine DoIsCKeyword(const AName: string): bool;
+begin
+  match AName of
+    "alignas", "alignof", "auto", "bool", "break", "case", "char", "const", "constexpr",
+    "continue", "default", "do", "double", "else", "enum", "extern", "false", "float", "for",
+    "goto", "if", "inline", "int", "long", "nullptr", "register", "restrict", "return", "short",
+    "signed", "sizeof", "static", "static_assert", "struct", "switch", "thread_local", "true",
+    "typedef", "typeof", "typeof_unqual", "union", "unsigned", "void", "volatile", "while",
+    "_Alignas", "_Alignof", "_Atomic", "_BitInt", "_Bool", "_Complex", "_Decimal128",
+    "_Decimal32", "_Decimal64", "_Generic", "_Imaginary", "_Noreturn", "_Static_assert",
+    "_Thread_local":
+      return true;
+    "asm", "catch", "char8_t", "char16_t", "char32_t", "class", "concept", "const_cast",
+    "consteval", "constinit", "co_await", "co_return", "co_yield", "decltype", "delete",
+    "dynamic_cast", "explicit", "export", "friend", "mutable", "namespace", "new", "noexcept",
+    "operator", "private", "protected", "public", "reinterpret_cast", "requires",
+    "static_cast", "template", "this", "throw", "try", "typeid", "typename", "using",
+    "virtual", "wchar_t":
+      return true;
+    "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+    "size_t", "ptrdiff_t", "offsetof", "NULL":
+      return true;
+  else
+    // any other name is C's to use
+  end;
+  return false;
+end;
+
+// AName as a C name: a trailing _ when it is a C or C++ keyword (AD.5's rule)
+routine DoCIdent(const AName: string): string;
+begin
+  if DoIsCKeyword(AName) then
+    return AName + "_";
+  end;
+  return AName;
+end;
+
+// The declarator AInner after the type named AName (const first when AConst); AInner
+// empty: the type alone (a parameter of a routine type)
+routine DoLeaf(const AName: string; const AConst: bool; const AInner: string): string;
+var
+  LText: string;
+begin
+  LText := AName;
+  if AConst then
+    LText := "const " + LText;
+  end;
+  if AInner <> "" then
+    LText := LText + " " + AInner;
+  end;
+  return LText;
+end;
+
+// "*" before the declarator AInner, "*const" when the pointer itself is const (AConst)
+routine DoStar(const AConst: bool; const AInner: string): string;
+begin
+  if not AConst then
+    return "*" + AInner;
+  end;
+  if AInner = "" then
+    return "*const";
+  end;
+  return "*const " + AInner;
+end;
+
+type
+  // One header being written (see the header)
+  CHeaderWriter = object
+    hidden FTree: ref SyntaxTree;
+    hidden FTarget: ref Target;
+    // The typedefs of every struct and union reached (first reach order), then the
+    // definitions (a type after every type it holds by value), then the declarations
+    hidden FForwards: ref TextBuilder;
+    hidden FTypes: ref TextBuilder;
+    hidden FDecls: ref TextBuilder;
+    // A struct's or union's typedef written (1); a type's definition state
+    // (ADAM_CHEADER_DEFINING / DEFINED)
+    hidden FForwarded: ref Int64Map;
+    hidden FDefined: ref Int64Map;
+    // A named type's C name: FNames[FNameOf.Find(type) - 1]; the type each C name went to
+    hidden FNameOf: ref Int64Map;
+    hidden FNames: StringArray;
+    hidden FUsed: ref StringIdMap;
+    // The records and overlays reached through a pointer, defined once the declaration
+    // that reached them is (a pointer needs only the typedef; a record pointing at itself
+    // is never defined inside its own definition)
+    hidden FPending: ref Int64List;
+    // What a dll's declaration carries ("" for a lib)
+    hidden FImport: string;
+
+    init(const ATree: ref SyntaxTree; const ATarget: ref Target; const AImport: string);
+    begin
+      self.FTree := ATree;
+      self.FTarget := ATarget;
+      self.FImport := AImport;
+      self.FForwards := ref TextBuilder();
+      self.FTypes := ref TextBuilder();
+      self.FDecls := ref TextBuilder();
+      self.FForwarded := ref Int64Map(0);
+      self.FDefined := ref Int64Map(0);
+      self.FNameOf := ref Int64Map(0);
+      setlength(self.FNames, 0);
+      self.FUsed := ref StringIdMap();
+      self.FPending := ref Int64List();
+    end;
+
+    // The name of the unit that declares the node AId
+    hidden const method DoUnitOf(const AId: int64): string;
+    var
+      LAt: int64;
+    begin
+      LAt := AId;
+      while (LAt <> 0) and (self.FTree.ParentOf(LAt) <> ADAM_AST_PROGRAM) do
+        LAt := self.FTree.ParentOf(LAt);
+      end;
+      if LAt = 0 then
+        return "";
+      end;
+      return self.FTree[LAt].Text;
+    end;
+
+    // The C name of the named type AType (a record, overlay, object, choices or set
+    // TypeDecl): its Adam name, made a C name; the unit's name before it (dots as _) when
+    // another type took that name first
+    hidden method DoTypeName(const AType: int64): string;
+    var
+      LIndex: int64;
+      LName: string;
+      LCount: int64;
+    begin
+      LIndex := self.FNameOf.Find(AType);
+      if LIndex > 0 then
+        return self.FNames[LIndex - 1];
+      end;
+      LName := DoCIdent(self.FTree[AType].Text);
+      if (self.FUsed.Find(LName) <> 0) and (self.FUsed.Find(LName) <> AType) then
+        LName := ReplaceStr(self.DoUnitOf(AType), ".", "_") + "_" + self.FTree[AType].Text;
+      end;
+      self.FUsed.Put(LName, AType);
+      LCount := len(self.FNames);
+      setlength(self.FNames, LCount + 1);
+      self.FNames[LCount] := LName;
+      self.FNameOf.Put(AType, LCount + 1);
+      return LName;
+    end;
+
+    // The canonical type the declaration ADecl (a variable, a field, a parameter) has: its
+    // written type, else the type Semantics gave it
+    hidden const method DoDeclType(const ADecl: int64): int64;
+    var
+      LExpr: int64;
+    begin
+      LExpr := self.FTree.FirstOf(ADecl, NodeRole.TypeOf);
+      if LExpr <> 0 then
+        return CanonicalOf(self.FTree, LExpr);
+      end;
+      return self.FTree[ADecl].ResolvedType;
+    end;
+
+    // The C name of the builtin scalar AType: int8 .. uint64 as <stdint.h> names them, any
+    // other as the target's C type ("" for none)
+    hidden method DoBuiltinName(const AType: int64): string;
+    var
+      LName: string;
+    begin
+      LName := self.FTree[AType].Text;
+      if (LName = "int8") or (LName = "int16") or (LName = "int32") or (LName = "int64") or
+        (LName = "uint8") or (LName = "uint16") or (LName = "uint32") or (LName = "uint64") then
+        return LName + "_t";
+      end;
+      return self.FTarget.BuiltinCppType(LName);
+    end;
+
+    // True when a value of AType crosses a C call as itself: it has a C form and is no
+    // static array (C passes an array as a pointer to it and returns none, where Adam passes
+    // the aggregate by value)
+    hidden method DoValueCForm(const AType: int64; const ADepth: int64): bool;
+    begin
+      return (ClassOf(self.FTree, AType) <> TypeClass.StaticArray) and self.DoHasCForm(AType, ADepth);
+    end;
+
+    // True when C can name the parameter AParam: one passed by reference is a pointer
+    // (always named), any other crosses as its value (DoValueCForm)
+    hidden method DoParamCForm(const AParam: int64; const ADepth: int64): bool;
+    begin
+      return PassedByReference(self.FTree, AParam, Linkage.C) or
+        self.DoValueCForm(self.DoDeclType(AParam), ADepth);
+    end;
+
+    // True when C can name the result of the routine signature ASig (none: void)
+    hidden method DoResultCForm(const ASig: int64; const ADepth: int64): bool;
+    var
+      LReturn: int64;
+    begin
+      LReturn := self.FTree.FirstOf(ASig, NodeRole.ReturnType);
+      return (LReturn = 0) or self.DoValueCForm(CanonicalOf(self.FTree, LReturn), ADepth);
+    end;
+
+    // True when C can name every parameter and the result of the routine signature ASig
+    // (a routine declaration or a routine type)
+    hidden method DoSignatureCForm(const ASig: int64; const ADepth: int64): bool;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to self.FTree.CountOf(ASig, NodeRole.Param) - 1 do
+        if not self.DoParamCForm(self.FTree.NthOf(ASig, NodeRole.Param, LI), ADepth + 1) then
+          return false;
+        end;
+      end;
+      return self.DoResultCForm(ASig, ADepth + 1);
+    end;
+
+    // True when C can name every member of the record or overlay body (or anonymous part)
+    // ABody laid out APacked: each field's type has a C form (no embed: an object's);
+    // an anonymous part packed inside a part that is not has none (#pragma pack covers a
+    // whole definition)
+    hidden method DoBodyCForm(const ABody: int64; const APacked: bool; const ADepth: int64): bool;
+    var
+      LI: int64;
+      LMember: int64;
+      LKind: NodeKind;
+    begin
+      for LI := 0 to self.FTree.CountOf(ABody, NodeRole.Member) - 1 do
+        LMember := self.FTree.NthOf(ABody, NodeRole.Member, LI);
+        LKind := self.FTree[LMember].Kind;
+        if LKind = NodeKind.EmbedDecl then
+          return false;
+        end;
+        if (LKind = NodeKind.FieldDecl) and not self.DoHasCForm(self.DoDeclType(LMember), ADepth + 1) then
+          return false;
+        end;
+        if (LKind = NodeKind.AnonRecord) or (LKind = NodeKind.AnonOverlay) then
+          if (not APacked) and self.FTree[LMember].HasFlag(NodeFlag.Packed) then
+            return false;
+          end;
+          if not self.DoBodyCForm(LMember, APacked, ADepth + 1) then
+            return false;
+          end;
+        end;
+      end;
+      return true;
+    end;
+
+    // The first member of the body ABody that is laid out (a field or an anonymous part);
+    // 0 when it has none
+    hidden const method DoFirstMember(const ABody: int64): int64;
+    var
+      LI: int64;
+      LMember: int64;
+      LKind: NodeKind;
+    begin
+      for LI := 0 to self.FTree.CountOf(ABody, NodeRole.Member) - 1 do
+        LMember := self.FTree.NthOf(ABody, NodeRole.Member, LI);
+        LKind := self.FTree[LMember].Kind;
+        if (LKind = NodeKind.FieldDecl) or (LKind = NodeKind.AnonRecord) or
+          (LKind = NodeKind.AnonOverlay) then
+          return LMember;
+        end;
+      end;
+      return 0;
+    end;
+
+    // True when C can name a value of the canonical type AType as Adam lays it out (see the
+    // header); 0, an unknown layout and a type past ADAM_CHEADER_MAX_DEPTH have none
+    hidden method DoHasCForm(const AType: int64; const ADepth: int64): bool;
+    var
+      LBody: int64;
+      LParent: int64;
+      LFirst: int64;
+      LLow: int64;
+      LHigh: int64;
+    begin
+      if (AType = 0) or (ADepth > ADAM_CHEADER_MAX_DEPTH) then
+        return false;
+      end;
+      match ClassOf(self.FTree, AType) of
+        TypeClass.SignedInt, TypeClass.UnsignedInt, TypeClass.Float, TypeClass.Boolean,
+        TypeClass.Char, TypeClass.WideChar:
+          return self.DoBuiltinName(AType) <> "";
+        TypeClass.UntypedPointer, TypeClass.Pointer:
+          return true;
+        TypeClass.ChoicesType:
+          return (TypeSize(self.FTree, self.FTarget, AType) > 0) and
+            ChoicesRange(self.FTree, AType, LLow, LHigh);
+        TypeClass.SetType:
+          return TypeSize(self.FTree, self.FTarget, AType) > 0;
+        TypeClass.StaticArray:
+          return (ArrayCount(self.FTree, self.FTarget, AType) > 0) and
+            self.DoHasCForm(TargetOf(self.FTree, AType), ADepth + 1);
+        TypeClass.RoutineType:
+          if self.FTree[AType].HasFlag(NodeFlag.Cpplink) or self.FTree[AType].HasFlag(NodeFlag.TakesSelf) then
+            return false;
+          end;
+          return self.DoSignatureCForm(AType, ADepth);
+        TypeClass.RecordType, TypeClass.OverlayType:
+          if TypeSize(self.FTree, self.FTarget, AType) <= 0 then
+            return false;
+          end;
+          LBody := BodyOf(self.FTree, AType);
+          LParent := self.FTree.FirstOf(LBody, NodeRole.Parent);
+          if (LParent <> 0) and not self.DoHasCForm(CanonicalOf(self.FTree, LParent), ADepth + 1) then
+            return false;
+          end;
+          // align(n) goes on the first member: a part has no member to carry it
+          LFirst := self.DoFirstMember(LBody);
+          if (self.FTree.FirstOf(LBody, NodeRole.Align) <> 0) and (LParent = 0) and
+            ((LFirst = 0) or (self.FTree[LFirst].Kind <> NodeKind.FieldDecl)) then
+            return false;
+          end;
+          return self.DoBodyCForm(LBody, self.FTree[LBody].HasFlag(NodeFlag.Packed), ADepth);
+      else
+        // string, wstring, varargs, a mutex, a dynamic array, an object or an interface by
+        // value, an own / ref / weak, a task, a sequence, nil: Adam's own, no C form
+      end;
+      return false;
+    end;
+
+    // The typedef of the record, overlay or object AType (struct or union by its kind),
+    // written the first time it is reached
+    hidden method DoForward(const AType: int64);
+    var
+      LWord: string;
+      LName: string;
+    begin
+      if self.FForwarded.Find(AType) <> 0 then
+        return;
+      end;
+      self.FForwarded.Put(AType, 1);
+      LWord := "struct";
+      if ClassOf(self.FTree, AType) = TypeClass.OverlayType then
+        LWord := "union";
+      end;
+      LName := self.DoTypeName(AType);
+      self.FForwards.Add("typedef " + LWord + " " + LName + " " + LName + ";\n");
+    end;
+
+    // A pointer to ATarget (to const when AConstTarget) with the declarator AInner, which
+    // already holds the pointer's "*" (see DoStar): a type with a C form is pointed at
+    // (an array or a routine type with AInner in parentheses), a record, overlay or object
+    // with none at its opaque struct, anything else at void
+    hidden method DoRenderPointer(const ATarget: int64; const AConstTarget: bool; const AInner: string): string;
+    var
+      LClass: TypeClass;
+    begin
+      LClass := ClassOf(self.FTree, ATarget);
+      if self.DoHasCForm(ATarget, 0) then
+        if (LClass = TypeClass.RecordType) or (LClass = TypeClass.OverlayType) then
+          // only the typedef now: the definition comes once the declaration is written
+          self.DoForward(ATarget);
+          self.FPending.Add(ATarget);
+          return DoLeaf(self.DoTypeName(ATarget), AConstTarget, AInner);
+        end;
+        if LClass = TypeClass.StaticArray then
+          return self.DoRender(ATarget, "(" + AInner + ")", AConstTarget);
+        end;
+        return self.DoRender(ATarget, AInner, AConstTarget);
+      end;
+      if (LClass = TypeClass.RecordType) or (LClass = TypeClass.OverlayType) or
+        (LClass = TypeClass.ObjectType) then
+        self.DoForward(ATarget);
+        return DoLeaf(self.DoTypeName(ATarget), AConstTarget, AInner);
+      end;
+      return DoLeaf("void", AConstTarget, AInner);
+    end;
+
+    // The parameter list of the routine signature ASig, each named by its C name when
+    // ANamed (a routine type's are not); "void" for none, ", ..." after the last when it is
+    // variadic
+    hidden method DoParams(const ASig: int64; const ANamed: bool): string;
+    var
+      LText: string;
+      LI: int64;
+      LParam: int64;
+      LName: string;
+      LType: int64;
+    begin
+      LText := "";
+      for LI := 0 to self.FTree.CountOf(ASig, NodeRole.Param) - 1 do
+        LParam := self.FTree.NthOf(ASig, NodeRole.Param, LI);
+        LName := "";
+        if ANamed then
+          LName := DoCIdent(self.FTree[LParam].Text);
+        end;
+        LType := self.DoDeclType(LParam);
+        if LI > 0 then
+          LText := LText + ", ";
+        end;
+        if PassedByReference(self.FTree, LParam, Linkage.C) then
+          LText := LText + self.DoRenderPointer(LType, self.FTree[LParam].HasFlag(NodeFlag.ConstParam),
+            DoStar(false, LName));
+        else
+          LText := LText + self.DoRender(LType, LName, false);
+        end;
+      end;
+      if self.FTree[ASig].HasFlag(NodeFlag.Variadic) then
+        if LText = "" then
+          return "...";
+        end;
+        return LText + ", ...";
+      end;
+      if LText = "" then
+        return "void";
+      end;
+      return LText;
+    end;
+
+    // A value of AType (0: void) declared by AInner, const when AConst (see the header); a
+    // named type reached is defined first
+    hidden method DoRender(const AType: int64; const AInner: string; const AConst: bool): string;
+    var
+      LReturn: int64;
+      LCount: int64;
+    begin
+      if AType = 0 then
+        return DoLeaf("void", false, AInner);
+      end;
+      match ClassOf(self.FTree, AType) of
+        TypeClass.SignedInt, TypeClass.UnsignedInt, TypeClass.Float, TypeClass.Boolean,
+        TypeClass.Char, TypeClass.WideChar:
+          return DoLeaf(self.DoBuiltinName(AType), AConst, AInner);
+        TypeClass.UntypedPointer:
+          return DoLeaf("void", false, DoStar(AConst, AInner));
+        TypeClass.Pointer:
+          return self.DoRenderPointer(TargetOf(self.FTree, AType), IsConstTarget(self.FTree, AType),
+            DoStar(AConst, AInner));
+        TypeClass.StaticArray:
+          LCount := ArrayCount(self.FTree, self.FTarget, AType);
+          return self.DoRender(TargetOf(self.FTree, AType), AInner + "[" + IntToStr(LCount) + "]", AConst);
+        TypeClass.RoutineType:
+          LReturn := self.FTree.FirstOf(AType, NodeRole.ReturnType);
+          if LReturn <> 0 then
+            LReturn := CanonicalOf(self.FTree, LReturn);
+          end;
+          return self.DoRender(LReturn, "(" + DoStar(AConst, AInner) + ")(" + self.DoParams(AType, false) + ")",
+            false);
+        TypeClass.RecordType, TypeClass.OverlayType, TypeClass.ChoicesType, TypeClass.SetType:
+          self.DoDefine(AType);
+          return DoLeaf(self.DoTypeName(AType), AConst, AInner);
+      else
+        // no other type has a C form (DoHasCForm, asked first)
+      end;
+      return DoLeaf("void", AConst, AInner);
+    end;
+
+    // The members of the body (or anonymous part) ABody as C members, each line after
+    // AIndent; AAlign before the first field's declaration (align(n)'s, "" for none)
+    hidden method DoMembers(const ABody: int64; const AIndent: string; const AAlign: string): string;
+    var
+      LText: string;
+      LI: int64;
+      LMember: int64;
+      LKind: NodeKind;
+      LInner: string;
+      LFirst: bool;
+    begin
+      LText := "";
+      LFirst := true;
+      for LI := 0 to self.FTree.CountOf(ABody, NodeRole.Member) - 1 do
+        LMember := self.FTree.NthOf(ABody, NodeRole.Member, LI);
+        LKind := self.FTree[LMember].Kind;
+        if LKind = NodeKind.FieldDecl then
+          LInner := DoCIdent(self.FTree[LMember].Text);
+          if self.FTree[LMember].ResolvedBitWidth > 0 then
+            LInner := LInner + " : " + IntToStr(int64(self.FTree[LMember].ResolvedBitWidth));
+          end;
+          LText := LText + AIndent;
+          if LFirst then
+            LText := LText + AAlign;
+          end;
+          LText := LText + self.DoRender(self.DoDeclType(LMember), LInner, false) + ";\n";
+          LFirst := false;
+        end;
+        if (LKind = NodeKind.AnonRecord) or (LKind = NodeKind.AnonOverlay) then
+          if LKind = NodeKind.AnonRecord then
+            LText := LText + AIndent + "struct {\n";
+          else
+            LText := LText + AIndent + "union {\n";
+          end;
+          LText := LText + self.DoMembers(LMember, AIndent + "  ", "") + AIndent + "};\n";
+          LFirst := false;
+        end;
+      end;
+      return LText;
+    end;
+
+    // The offset checks of every byte field of the body (or anonymous part) ABody of the
+    // type named AName (a field's ResolvedOffset is from the start of the named type, through
+    // anonymous parts, as offsetof reads it); a bitfield has no offsetof
+    hidden const method DoOffsetChecks(const ABody: int64; const AName: string): string;
+    var
+      LText: string;
+      LI: int64;
+      LMember: int64;
+      LKind: NodeKind;
+      LField: string;
+    begin
+      LText := "";
+      for LI := 0 to self.FTree.CountOf(ABody, NodeRole.Member) - 1 do
+        LMember := self.FTree.NthOf(ABody, NodeRole.Member, LI);
+        LKind := self.FTree[LMember].Kind;
+        if (LKind = NodeKind.FieldDecl) and (self.FTree[LMember].ResolvedBitWidth <= 0) then
+          LField := DoCIdent(self.FTree[LMember].Text);
+          LText := LText + "__adam_static_assert(offsetof(" + AName + ", " + LField + ") == " +
+            IntToStr(self.FTree[LMember].ResolvedOffset) + ", \"" + AName + "." + LField +
+            ": Adam's offset\");\n";
+        end;
+        if (LKind = NodeKind.AnonRecord) or (LKind = NodeKind.AnonOverlay) then
+          LText := LText + self.DoOffsetChecks(LMember, AName);
+        end;
+      end;
+      return LText;
+    end;
+
+    // The size and alignment checks of the type named AName, as Adam lays AType out
+    hidden method DoSizeChecks(const AType: int64; const AName: string): string;
+    begin
+      return "__adam_static_assert(sizeof(" + AName + ") == " +
+        IntToStr(TypeSize(self.FTree, self.FTarget, AType)) + ", \"" + AName + ": Adam's size\");\n" +
+        "__adam_static_assert(__adam_alignof(" + AName + ") == " +
+        IntToStr(TypeAlign(self.FTree, self.FTarget, AType)) + ", \"" + AName +
+        ": Adam's alignment\");\n";
+    end;
+
+    // The record or overlay AType's definition (its typedef first, see the header)
+    hidden method DoDefineAggregate(const AType: int64);
+    var
+      LBody: int64;
+      LName: string;
+      LWord: string;
+      LAlign: string;
+      LValue: int64;
+      LParent: int64;
+      LMembers: string;
+      LText: string;
+      LPacked: bool;
+    begin
+      self.DoForward(AType);
+      LName := self.DoTypeName(AType);
+      LBody := BodyOf(self.FTree, AType);
+      LPacked := self.FTree[LBody].HasFlag(NodeFlag.Packed);
+      LWord := "struct";
+      if ClassOf(self.FTree, AType) = TypeClass.OverlayType then
+        LWord := "union";
+      end;
+      LAlign := "";
+      LValue := 0;
+      if BoundValue(self.FTree, self.FTarget, self.FTree.FirstOf(LBody, NodeRole.Align), LValue) then
+        LAlign := "__adam_alignas(" + IntToStr(LValue) + ") ";
+      end;
+      LMembers := "";
+      LParent := self.FTree.FirstOf(LBody, NodeRole.Parent);
+      if LParent <> 0 then
+        LMembers := "  " + LAlign + self.DoRender(CanonicalOf(self.FTree, LParent), "__adam_parent", false) +
+          ";\n";
+        LAlign := "";
+      end;
+      LMembers := LMembers + self.DoMembers(LBody, "  ", LAlign);
+      if LMembers = "" then
+        // Adam's empty aggregate is one byte (C++'s): C's struct gets a byte for it
+        LMembers := "  char __adam_empty;\n";
+      end;
+      LText := "";
+      if LPacked then
+        LText := "#pragma pack(push, 1)\n";
+      end;
+      LText := LText + LWord + " " + LName + " {\n" + LMembers + "};\n";
+      if LPacked then
+        LText := LText + "#pragma pack(pop)\n";
+      end;
+      LText := LText + self.DoSizeChecks(AType, LName) + self.DoOffsetChecks(LBody, LName) + "\n";
+      self.FTypes.Add(LText);
+    end;
+
+    // The choices type AType's definition: its integer and a constant per value
+    // (<Type>_<Value>): an enum's for an int32 type, a #define for an int64 one
+    hidden method DoDefineChoices(const AType: int64);
+    var
+      LName: string;
+      LBody: int64;
+      LI: int64;
+      LValue: int64;
+      LNumber: int64;
+      LWide: bool;
+      LText: string;
+      LNumberText: string;
+    begin
+      LName := self.DoTypeName(AType);
+      LBody := BodyOf(self.FTree, AType);
+      LWide := TypeSize(self.FTree, self.FTarget, AType) > 4;
+      if LWide then
+        LText := "typedef int64_t " + LName + ";\n";
+      else
+        LText := "typedef int32_t " + LName + ";\nenum {\n";
+      end;
+      for LI := 0 to self.FTree.CountOf(LBody, NodeRole.Member) - 1 do
+        LValue := self.FTree.NthOf(LBody, NodeRole.Member, LI);
+        LNumber := int64(self.FTree[LValue].ResolvedConst.Bits);
+        if LWide then
+          // INT64_MIN has no literal of its own
+          if LNumber = -9223372036854775807 - 1 then
+            LNumberText := "INT64_MIN";
+          else
+            LNumberText := "INT64_C(" + IntToStr(LNumber) + ")";
+          end;
+          LText := LText + "#define " + LName + "_" + self.FTree[LValue].Text + " " + LNumberText + "\n";
+        else
+          LText := LText + "  " + LName + "_" + self.FTree[LValue].Text + " = " + IntToStr(LNumber);
+          if LI < self.FTree.CountOf(LBody, NodeRole.Member) - 1 then
+            LText := LText + ",";
+          end;
+          LText := LText + "\n";
+        end;
+      end;
+      if not LWide then
+        LText := LText + "};\n";
+      end;
+      self.FTypes.Add(LText + "\n");
+    end;
+
+    // The set type AType's definition: its bits as the unsigned integer of its size, else
+    // a struct of uint64_t words (checked as Adam lays it out)
+    hidden method DoDefineSet(const AType: int64);
+    var
+      LName: string;
+      LSize: int64;
+    begin
+      LName := self.DoTypeName(AType);
+      LSize := TypeSize(self.FTree, self.FTarget, AType);
+      if (LSize = 1) or (LSize = 2) or (LSize = 4) or (LSize = 8) then
+        self.FTypes.Add("typedef uint" + IntToStr(LSize * 8) + "_t " + LName + ";\n\n");
+        return;
+      end;
+      self.FTypes.Add("typedef struct {\n  uint64_t Bits[" + IntToStr(LSize div 8) + "];\n} " + LName +
+        ";\n" + self.DoSizeChecks(AType, LName) + "\n");
+    end;
+
+    // The named type AType (a record, overlay, choices or set with a C form) defined once,
+    // after every type it holds by value; one being defined (a by-value cycle) is left
+    hidden method DoDefine(const AType: int64);
+    var
+      LClass: TypeClass;
+    begin
+      if self.FDefined.Find(AType) <> 0 then
+        return;
+      end;
+      self.FDefined.Put(AType, ADAM_CHEADER_DEFINING);
+      LClass := ClassOf(self.FTree, AType);
+      if (LClass = TypeClass.RecordType) or (LClass = TypeClass.OverlayType) then
+        self.DoDefineAggregate(AType);
+      end;
+      if LClass = TypeClass.ChoicesType then
+        self.DoDefineChoices(AType);
+      end;
+      if LClass = TypeClass.SetType then
+        self.DoDefineSet(AType);
+      end;
+      self.FDefined.Put(AType, ADAM_CHEADER_DEFINED);
+    end;
+
+    // The records and overlays reached through pointers defined (a definition may reach
+    // more: the list grows while it is walked)
+    hidden method DoDefinePending();
+    var
+      LI: int64;
+    begin
+      LI := 0;
+      while LI < self.FPending.Count do
+        self.DoDefine(self.FPending[LI]);
+        LI := LI + 1;
+      end;
+      self.FPending.Clear();
+    end;
+
+    // AReason in a comment in place of the declaration ADecl, which C cannot declare
+    hidden method DoLeftOut(const ADecl: int64; const AReason: string);
+    begin
+      self.FDecls.Add("/* " + self.FTree[ADecl].Text + ": not declared, " + AReason + " */\n");
+    end;
+
+    // Why C cannot declare the routine ADecl ("" when it can): its first parameter, then
+    // its result, with no C form
+    hidden method DoRoutineReason(const ADecl: int64): string;
+    var
+      LI: int64;
+      LParam: int64;
+    begin
+      for LI := 0 to self.FTree.CountOf(ADecl, NodeRole.Param) - 1 do
+        LParam := self.FTree.NthOf(ADecl, NodeRole.Param, LI);
+        if not self.DoParamCForm(LParam, 0) then
+          return "the type of parameter " + self.FTree[LParam].Text + " has no C form";
+        end;
+      end;
+      if not self.DoResultCForm(ADecl, 0) then
+        return "its result type has no C form";
+      end;
+      return "";
+    end;
+
+    // The declaration ADecl (an exported routine or variable) as C declares it, else its
+    // reason in a comment (see the header)
+    method Declare(const ADecl: int64);
+    var
+      LSymbol: string;
+      LReason: string;
+      LReturn: int64;
+      LText: string;
+    begin
+      LSymbol := self.FTree[ADecl].ResolvedSymbol;
+      if self.FTree[ADecl].ResolvedLinkage <> Linkage.C then
+        self.DoLeftOut(ADecl, "C++ linkage (cpplink): its symbol is an Itanium name");
+        return;
+      end;
+      if DoIsCKeyword(LSymbol) then
+        self.DoLeftOut(ADecl, "its name is a C or C++ keyword");
+        return;
+      end;
+      LText := "extern ";
+      if self.FImport <> "" then
+        LText := LText + self.FImport + " ";
+      end;
+      if self.FTree[ADecl].Kind = NodeKind.VarDecl then
+        if not self.DoHasCForm(self.DoDeclType(ADecl), 0) then
+          self.DoLeftOut(ADecl, "its type has no C form");
+          return;
+        end;
+        self.FDecls.Add(LText + self.DoRender(self.DoDeclType(ADecl), LSymbol, false) + ";\n");
+        self.DoDefinePending();
+        return;
+      end;
+      LReason := self.DoRoutineReason(ADecl);
+      if LReason <> "" then
+        self.DoLeftOut(ADecl, LReason);
+        return;
+      end;
+      if self.FTree[ADecl].HasFlag(NodeFlag.NoReturn) then
+        LText := "__adam_noreturn " + LText;
+      end;
+      LReturn := self.FTree.FirstOf(ADecl, NodeRole.ReturnType);
+      if LReturn <> 0 then
+        LReturn := CanonicalOf(self.FTree, LReturn);
+      end;
+      self.FDecls.Add(LText + self.DoRender(LReturn, LSymbol + "(" + self.DoParams(ADecl, true) + ")", false) +
+        ";\n");
+      self.DoDefinePending();
+    end;
+
+    // The whole header of the main module named AName, its kind's word AKind (dll, lib)
+    const method Text(const AName: string; const AKind: string): string;
+    var
+      LGuard: string;
+      LOut: ref TextBuilder;
+    begin
+      LGuard := "__adam_" + ReplaceStr(AName, ".", "_") + "_h";
+      LOut := ref TextBuilder();
+      LOut.Add("/* " + AName + ADAM_EXT_C_HEADER + " - the C interface of the Adam " + AKind + " " + AName +
+        ", written by adam: do not edit */\n\n");
+      LOut.Add("#ifndef " + LGuard + "\n#define " + LGuard + "\n\n");
+      LOut.Add(ADAM_CHEADER_INCLUDES + "\n" + ADAM_CHEADER_MACROS + "\n");
+      LOut.Add("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
+      if self.FForwards.Count > 0 then
+        LOut.Add(self.FForwards.Text() + "\n");
+      end;
+      LOut.Add(self.FTypes.Text());
+      LOut.Add(self.FDecls.Text());
+      LOut.Add("\n#ifdef __cplusplus\n}\n#endif\n\n#endif\n");
+      return LOut.Text();
+    end;
+  end;
+
+// The C header of the main module AModule (a dll when ADll, else a lib) declaring ADecls
+// (its exported routines and variables, in declaration order) as ATarget lays them out
+// (see the header)
+public routine WriteCHeader(const ATree: ref SyntaxTree; const ATarget: ref Target; const AModule: int64;
+  const ADecls: Int64Array; const ADll: bool): string;
+var
+  LWriter: ref CHeaderWriter;
+  LKind: string;
+  LI: int64;
+begin
+  LKind := "lib";
+  if ADll then
+    LWriter := ref CHeaderWriter(ATree, ATarget, ATarget.CImportSpec());
+    LKind := "dll";
+  else
+    LWriter := ref CHeaderWriter(ATree, ATarget, "");
+  end;
+  for LI := 0 to len(ADecls) - 1 do
+    LWriter.Declare(ADecls[LI]);
+  end;
+  return LWriter.Text(ATree[AModule].Text, LKind);
+end;
+
+end.
