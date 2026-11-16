@@ -1,0 +1,1395 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.CImport.Writer.adam - `adam cimport`'s binding writer (M9d; DESIGN
+  sec 15): the parsed declarations as an Adam `.C` unit
+
+  CUnitWriter  one import's unit text (Write): the declarations of the
+               headers the spec binds, in the headers' own names (AD.5),
+               reached from C by `external` under their C names; Counts of
+               what was written and what was not bound; CI reports into the
+               Diagnostics it is made with
+
+  Which declarations: a header file is BOUND when it is not a system file
+  and lies in one of the spec's sources folders (by default the folder of
+  each header the spec names); it is USED when its path matches a glob of
+  a [uses] entry (that unit owns its declarations: they are named, never
+  written here, and the unit is imported); any other file is FOREIGN: its
+  typedefs are looked through to what they name (size_t is the target's
+  integer), its structs reached only by pointer (an untyped ptr). A
+  declaration the spec skips ([skip] globs) is left out on purpose.
+
+  How a declaration is written: a typedef as a type alias (a function or
+  function pointer type as a routine type), a struct as a record and a
+  union as an overlay laid out as C lays them out (an unnamed struct /
+  union field type inline, `u: overlay .. end;`), a struct only declared
+  (struct foo;) as an empty record that pointers name, an enum as an
+  alias of the integer type holding its values (Adam.CImport.CTypes) and
+  its constants typed by it as consts, a routine as `public routine clink
+  .. external`, a variable as a module variable with an external clause;
+  a pointer as `ptr to [const] T` (void and any target Adam cannot say as
+  the untyped ptr: the same pointer to C). A struct named by a typedef of
+  its own (typedef struct { .. } foo;) takes that name; a struct tag that
+  another declaration's name already takes (struct stat and stat) is
+  struct_<tag> (union_ / enum_). The spec's renames apply to file-scope
+  names; a name that is an Adam keyword takes a trailing '_' (AD.5).
+  Types come in dependency order (what a field holds by value first), a
+  struct named through a pointer before its record by a forward type.
+
+  What cannot be bound (long double, _Atomic, a bitfield record until M9e,
+  a static or inline routine, a type from a foreign header by value ..) is
+  one CI0001 warning by name with the reason, never dropped silently; two
+  declarations given one Adam name is CI0003 at the second. The spec's
+  [[insert]]s edit the finished text (an anchor not found is CI0002 at the
+  spec's insert). The text is deterministic: declarations in the headers'
+  order, no path of the machine in it.
+*******************************************************************************/
+
+module unit Adam.CImport.Writer;
+
+import System.SysUtils, Adam.Core.Common, Adam.Core.Containers, Adam.Core.Messages,
+  Adam.Compiler.SourceText,
+  Adam.Compiler.Diagnostics, Adam.CImport.Spec, Adam.CImport.Headers, Adam.CImport.Preprocessor,
+  Adam.CImport.CTypes, Adam.CImport.Parser;
+
+public const
+  ADAM_ERR_CIMPORT_WRITER_001: string = "CI0001";   // (warning) a declaration not bound
+  ADAM_ERR_CIMPORT_WRITER_002: string = "CI0002";   // an [[insert]]'s anchor not found
+  ADAM_ERR_CIMPORT_WRITER_003: string = "CI0003";   // two declarations given one Adam name
+  ADAM_ERR_CIMPORT_WRITER_004: string = "CI0004";   // the unit file cannot be written
+
+  // A routine's line is wrapped before this column (the std units' width)
+  ADAM_CIMPORT_WRITER_WIDTH: int64 = 100;
+  // The prefixes a struct / union / enum tag takes when another name has its own
+  ADAM_CIMPORT_WRITER_STRUCT_PREFIX: string = "struct_";
+  ADAM_CIMPORT_WRITER_UNION_PREFIX: string = "union_";
+  ADAM_CIMPORT_WRITER_ENUM_PREFIX: string = "enum_";
+  // An unnamed parameter's name: this and its number from 1
+  ADAM_CIMPORT_WRITER_PARAM: string = "p";
+  // A record's or enum's work state
+  ADAM_CIMPORT_STATE_NEW: int64 = 0;
+  ADAM_CIMPORT_STATE_BUSY: int64 = 1;
+  ADAM_CIMPORT_STATE_OK: int64 = 2;
+  ADAM_CIMPORT_STATE_BAD: int64 = 3;
+
+// A C name as an Adam name in place: an Adam keyword with a trailing '_' (AD.5)
+routine DoLocalName(const ACName: string): string;
+begin
+  if IsAdamName(ACName) then
+    return ACName;
+  end;
+  return ACName + "_";
+end;
+
+// True when AName matches one of AGlobs
+routine DoMatchesAny(const AName: string; const AGlobs: StringArray): bool;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(AGlobs) - 1 do
+    if MatchesGlob(AName, AGlobs[LI]) then
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+// ALine wrapped before ADAM_CIMPORT_WRITER_WIDTH: broken after a "; " (a parameter's end, the
+// result's), each further line indented by two blanks, as the std units are written
+routine DoWrapped(const ALine: string): string;
+var
+  LOut: ref TextBuilder;
+  LCurrent: string;
+  LPiece: string;
+  LAt: int64;
+  LNext: int64;
+begin
+  if len(ALine) <= ADAM_CIMPORT_WRITER_WIDTH then
+    return ALine;
+  end;
+  LOut := ref TextBuilder();
+  LCurrent := "";
+  LAt := 0;
+  while LAt < len(ALine) do
+    LNext := IndexOf("; ", ALine, LAt);
+    if LNext < 0 then
+      LPiece := Substring(ALine, LAt, len(ALine) - LAt);
+      LAt := len(ALine);
+    else
+      LPiece := Substring(ALine, LAt, LNext + 1 - LAt);
+      LAt := LNext + 2;
+    end;
+    if LCurrent = "" then
+      LCurrent := LPiece;
+      skip;
+    end;
+    if len(LCurrent) + 1 + len(LPiece) > ADAM_CIMPORT_WRITER_WIDTH then
+      LOut.Add(LCurrent + "\n");
+      LCurrent := "  " + LPiece;
+    else
+      LCurrent := LCurrent + " " + LPiece;
+    end;
+  end;
+  LOut.Add(LCurrent);
+  return LOut.Text();
+end;
+
+public type
+  // Whose a header file's declarations are (see the header)
+  FileRole = choices(Unknown, Foreign, Bound, Used);
+
+  FileRoleArray = array of FileRole;
+
+  // What a unit holds (adam cimport's summary)
+  WriterCounts = record
+    Routines: int64;
+    Variables: int64;
+    Types: int64;
+    Constants: int64;
+    Unbound: int64;
+  end;
+
+  // One import's unit text (see the header)
+  CUnitWriter = object
+    hidden FReports: ref Diagnostics;
+    hidden FSpec: ref ImportSpec;
+    hidden FPre: ref Preprocessor;
+    hidden FParser: ref CParser;
+    hidden FTypes: ref CTypeTable;
+    hidden FTriple: string;
+    hidden FLibrary: string;
+    hidden FSources: StringArray;
+    hidden FRoles: FileRoleArray;
+    hidden FUses: Int64Array;
+    hidden FUsed: BoolArray;
+    // per record: its C name ("" none), state, why it is bad, written, forward written,
+    // reported
+    hidden FRecordNames: StringArray;
+    hidden FRecordState: Int64Array;
+    hidden FRecordWhy: StringArray;
+    hidden FRecordWritten: BoolArray;
+    hidden FRecordForward: BoolArray;
+    hidden FRecordReported: BoolArray;
+    // per enum: its C name, written
+    hidden FEnumNames: StringArray;
+    hidden FEnumWritten: BoolArray;
+    // per declaration: a typedef merged into the record / enum it names, its state, why it is
+    // bad, written, reported
+    hidden FMerged: BoolArray;
+    hidden FDeclState: Int64Array;
+    hidden FDeclWhy: StringArray;
+    hidden FDeclWritten: BoolArray;
+    hidden FDeclReported: BoolArray;
+    hidden FOrdinary: ref StringIdMap;
+    hidden FClaims: ref StringIdMap;
+    hidden FClaimNames: StringArray;
+    hidden FClaimCount: int64;
+    hidden FEmitting: bool;
+    hidden FTypeText: ref TextBuilder;
+    hidden FForwardText: ref TextBuilder;
+    hidden FCounts: WriterCounts;
+
+    init(const AReports: ref Diagnostics; const ASpec: ref ImportSpec; const APre: ref Preprocessor;
+      const AParser: ref CParser; const ATriple: string; const ASources: StringArray);
+    var
+      LI: int64;
+    begin
+      self.FReports := AReports;
+      self.FSpec := ASpec;
+      self.FPre := APre;
+      self.FParser := AParser;
+      self.FTypes := AParser.Types();
+      self.FTriple := ATriple;
+      self.FLibrary := ASpec.LibraryFor(ATriple);
+      setlength(self.FSources, len(ASources));
+      for LI := 0 to len(ASources) - 1 do
+        self.FSources[LI] := ForwardSlashes(ASources[LI]);
+        if not EndsStr("/", self.FSources[LI]) then
+          self.FSources[LI] := self.FSources[LI] + "/";
+        end;
+      end;
+      setlength(self.FUsed, len(ASpec.Uses));
+      self.FOrdinary := ref StringIdMap();
+      self.FClaims := ref StringIdMap();
+      self.FClaimCount := 0;
+      self.FEmitting := false;
+      self.FTypeText := ref TextBuilder();
+      self.FForwardText := ref TextBuilder();
+      self.FCounts.Routines := 0;
+      self.FCounts.Variables := 0;
+      self.FCounts.Types := 0;
+      self.FCounts.Constants := 0;
+      self.FCounts.Unbound := 0;
+    end;
+
+    // What was written (valid after Write)
+    const method Counts(): WriterCounts;
+    begin
+      return self.FCounts;
+    end;
+
+    // ---- files and names -------------------------------------------------------------------
+
+    // The role of the header file AFile (see the header), found once
+    hidden method DoRole(const AFile: int32): FileRole;
+    var
+      LOld: int64;
+      LHeader: HeaderFile;
+      LFull: string;
+      LRole: FileRole;
+      LUse: int64;
+      LI: int64;
+      LJ: int64;
+    begin
+      if AFile < 0 then
+        return FileRole.Foreign;
+      end;
+      if int64(AFile) >= len(self.FRoles) then
+        LOld := len(self.FRoles);
+        setlength(self.FRoles, int64(AFile) * 2 + 8);
+        setlength(self.FUses, len(self.FRoles));
+        for LI := LOld to len(self.FRoles) - 1 do
+          self.FRoles[LI] := FileRole.Unknown;
+          self.FUses[LI] := -1;
+        end;
+      end;
+      if self.FRoles[AFile] <> FileRole.Unknown then
+        return self.FRoles[AFile];
+      end;
+      LHeader := self.FPre.FileHeader(AFile);
+      LRole := FileRole.Foreign;
+      LUse := -1;
+      for LI := 0 to len(self.FSpec.Uses) - 1 do
+        for LJ := 0 to len(self.FSpec.Uses[LI].Headers) - 1 do
+          if (LUse < 0) and (LHeader.Path <> "") and
+            MatchesGlob(ForwardSlashes(LHeader.Path), self.FSpec.Uses[LI].Headers[LJ]) then
+            LUse := LI;
+          end;
+        end;
+      end;
+      if LUse >= 0 then
+        LRole := FileRole.Used;
+      else
+        if not self.FPre.IsSystemFile(AFile) and (LHeader.FullName <> "") then
+          LFull := ForwardSlashes(LHeader.FullName);
+          for LI := 0 to len(self.FSources) - 1 do
+            if StartsStr(self.FSources[LI], LFull) then
+              LRole := FileRole.Bound;
+            end;
+          end;
+        end;
+      end;
+      self.FRoles[AFile] := LRole;
+      self.FUses[AFile] := LUse;
+      return LRole;
+    end;
+
+    // The Adam name of the file-scope C name ACName: the spec's rename, else ACName; an Adam
+    // keyword with a trailing '_'
+    hidden const method DoAdamName(const ACName: string): string;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FSpec.Renames) - 1 do
+        if self.FSpec.Renames[LI].CName = ACName then
+          return self.FSpec.Renames[LI].AdamName;
+        end;
+      end;
+      return DoLocalName(ACName);
+    end;
+
+    // True when the spec skips the type named ACName
+    hidden const method DoSkipsType(const ACName: string): bool;
+    begin
+      return DoMatchesAny(ACName, self.FSpec.SkipTypes);
+    end;
+
+    // True when the spec skips the routine or variable named ACName
+    hidden const method DoSkipsRoutine(const ACName: string): bool;
+    begin
+      return DoMatchesAny(ACName, self.FSpec.SkipRoutines);
+    end;
+
+    // The place of a declaration's name
+    hidden const method DoPlaceOf(const AFile: int32; const ALine: int32; const AColumn: int32):
+      SourcePlace;
+    begin
+      if AFile < 0 then
+        return NoPlace();
+      end;
+      return PlaceAt(self.FPre.FileName(AFile), ALine, AColumn);
+    end;
+
+    // CI0001 at a declaration: ACName is not bound, for AWhy
+    hidden method DoUnbound(const ACName: string; const AFile: int32; const ALine: int32;
+      const AColumn: int32; const AWhy: string);
+    begin
+      self.FCounts.Unbound := self.FCounts.Unbound + 1;
+      if self.FReports <> nil then
+        self.FReports.Add(Severity.Warning, ADAM_ERR_CIMPORT_WRITER_001,
+          self.DoPlaceOf(AFile, ALine, AColumn), ADAM_MSG_CIMPORT_WRITER_UNBOUND,
+          NoArgs().Str(ACName).Str(AWhy));
+      end;
+    end;
+
+    // AAdamName claimed for the C name ACName: 0 when it is new, 1 when ACName already has it
+    // (a declaration repeated), 2 when another C name has it (CI0003 at the place given)
+    hidden method DoClaim(const AAdamName: string; const ACName: string; const AFile: int32;
+      const ALine: int32; const AColumn: int32): int64;
+    var
+      LId: int64;
+    begin
+      LId := self.FClaims.Find(AAdamName);
+      if LId > 0 then
+        if self.FClaimNames[LId - 1] = ACName then
+          return 1;
+        end;
+        if self.FReports <> nil then
+          self.FReports.Add(Severity.Error, ADAM_ERR_CIMPORT_WRITER_003,
+            self.DoPlaceOf(AFile, ALine, AColumn), ADAM_MSG_CIMPORT_WRITER_CLASH,
+            NoArgs().Str(AAdamName).Str(self.FClaimNames[LId - 1]).Str(ACName));
+        end;
+        return 2;
+      end;
+      if self.FClaimCount = len(self.FClaimNames) then
+        setlength(self.FClaimNames, self.FClaimCount * 2 + 16);
+      end;
+      self.FClaimNames[self.FClaimCount] := ACName;
+      self.FClaimCount := self.FClaimCount + 1;
+      self.FClaims.Put(AAdamName, self.FClaimCount);
+      return 0;
+    end;
+
+    // Every record and enum named (see the header): the file-scope names first (a tag one of
+    // them takes gets its prefix), then the typedefs that name an unnamed one
+    hidden method DoNames();
+    var
+      LDecl: CDecl;
+      LType: CType;
+      LRecord: CRecord;
+      LEnum: CEnum;
+      LRole: FileRole;
+      LI: int64;
+      LJ: int64;
+    begin
+      setlength(self.FMerged, self.FParser.DeclCount);
+      setlength(self.FDeclState, self.FParser.DeclCount);
+      setlength(self.FDeclWhy, self.FParser.DeclCount);
+      setlength(self.FDeclWritten, self.FParser.DeclCount);
+      setlength(self.FDeclReported, self.FParser.DeclCount);
+      for LI := 0 to self.FParser.DeclCount - 1 do
+        LDecl := self.FParser.Decl(LI);
+        LRole := self.DoRole(LDecl.File);
+        if (LDecl.Kind <> CDeclKind.Tag) and (LRole <> FileRole.Foreign) then
+          self.FOrdinary.Put(LDecl.Name, LI + 1);
+        end;
+      end;
+      for LI := 0 to self.FTypes.EnumCount - 1 do
+        LEnum := self.FTypes.EnumAt(LI);
+        if self.DoRole(LEnum.File) <> FileRole.Foreign then
+          for LJ := 0 to len(LEnum.Names) - 1 do
+            self.FOrdinary.Put(LEnum.Names[LJ], self.FParser.DeclCount + 1);
+          end;
+        end;
+      end;
+      // a typedef of an unnamed record / enum names it; one of the tag's own name merges
+      setlength(self.FRecordNames, self.FTypes.RecordCount);
+      setlength(self.FEnumNames, self.FTypes.EnumCount);
+      for LI := 0 to self.FTypes.RecordCount - 1 do
+        self.FRecordNames[LI] := self.FTypes.RecordAt(LI).Tag;
+      end;
+      for LI := 0 to self.FTypes.EnumCount - 1 do
+        self.FEnumNames[LI] := self.FTypes.EnumAt(LI).Tag;
+      end;
+      for LI := 0 to self.FParser.DeclCount - 1 do
+        LDecl := self.FParser.Decl(LI);
+        if LDecl.Kind <> CDeclKind.Typedef then
+          skip;
+        end;
+        LType := self.FTypes.Item(LDecl.TypeId);
+        if LType.Kind = CTypeKind.Record then
+          if self.FRecordNames[LType.Index] = "" then
+            self.FRecordNames[LType.Index] := LDecl.Name;
+          end;
+          if self.FRecordNames[LType.Index] = LDecl.Name then
+            self.FMerged[LI] := true;
+          end;
+        end;
+        if LType.Kind = CTypeKind.Enum then
+          if self.FEnumNames[LType.Index] = "" then
+            self.FEnumNames[LType.Index] := LDecl.Name;
+          end;
+          if self.FEnumNames[LType.Index] = LDecl.Name then
+            self.FMerged[LI] := true;
+          end;
+        end;
+      end;
+      // a tag whose name an ordinary declaration (other than its merged typedef) takes
+      for LI := 0 to self.FTypes.RecordCount - 1 do
+        LRecord := self.FTypes.RecordAt(LI);
+        if (LRecord.Tag <> "") and (self.FRecordNames[LI] = LRecord.Tag) and
+          self.DoTakenByOther(LRecord.Tag) then
+          if LRecord.IsUnion then
+            self.FRecordNames[LI] := ADAM_CIMPORT_WRITER_UNION_PREFIX + LRecord.Tag;
+          else
+            self.FRecordNames[LI] := ADAM_CIMPORT_WRITER_STRUCT_PREFIX + LRecord.Tag;
+          end;
+        end;
+      end;
+      for LI := 0 to self.FTypes.EnumCount - 1 do
+        LEnum := self.FTypes.EnumAt(LI);
+        if (LEnum.Tag <> "") and (self.FEnumNames[LI] = LEnum.Tag) and
+          self.DoTakenByOther(LEnum.Tag) then
+          self.FEnumNames[LI] := ADAM_CIMPORT_WRITER_ENUM_PREFIX + LEnum.Tag;
+        end;
+      end;
+      setlength(self.FRecordState, self.FTypes.RecordCount);
+      setlength(self.FRecordWhy, self.FTypes.RecordCount);
+      setlength(self.FRecordWritten, self.FTypes.RecordCount);
+      setlength(self.FRecordForward, self.FTypes.RecordCount);
+      setlength(self.FRecordReported, self.FTypes.RecordCount);
+      setlength(self.FEnumWritten, self.FTypes.EnumCount);
+    end;
+
+    // True when ATag is the name of a file-scope declaration that is no typedef merged into a
+    // tag of that name
+    hidden const method DoTakenByOther(const ATag: string): bool;
+    var
+      LId: int64;
+    begin
+      LId := self.FOrdinary.Find(ATag);
+      if LId = 0 then
+        return false;
+      end;
+      if LId > self.FParser.DeclCount then
+        return true;
+      end;
+      return not self.FMerged[LId - 1];
+    end;
+
+    // ---- what can be named -----------------------------------------------------------------
+
+    // True when the record AIndex is named in the unit: bound (not skipped, bindable) and named,
+    // or owned by a [uses] unit
+    hidden method DoRecordNamed(const AIndex: int64): bool;
+    var
+      LRole: FileRole;
+    begin
+      if self.FRecordNames[AIndex] = "" then
+        return false;
+      end;
+      LRole := self.DoRole(self.FTypes.RecordAt(AIndex).File);
+      if LRole = FileRole.Used then
+        self.DoNoteUse(self.FTypes.RecordAt(AIndex).File);
+        return true;
+      end;
+      if (LRole <> FileRole.Bound) or self.DoSkipsType(self.FRecordNames[AIndex]) then
+        return false;
+      end;
+      return self.DoRecordState(AIndex) <> ADAM_CIMPORT_STATE_BAD;
+    end;
+
+    // The record AIndex's state, found once (see DoRecordWhy); a record being judged is BUSY
+    // (one reached through its own pointers is taken as named)
+    hidden method DoRecordState(const AIndex: int64): int64;
+    var
+      LWhy: string;
+    begin
+      if self.FRecordState[AIndex] = ADAM_CIMPORT_STATE_NEW then
+        self.FRecordState[AIndex] := ADAM_CIMPORT_STATE_BUSY;
+        LWhy := self.DoRecordWhy(AIndex);
+        self.FRecordWhy[AIndex] := LWhy;
+        if LWhy = "" then
+          self.FRecordState[AIndex] := ADAM_CIMPORT_STATE_OK;
+        else
+          self.FRecordState[AIndex] := ADAM_CIMPORT_STATE_BAD;
+        end;
+      end;
+      return self.FRecordState[AIndex];
+    end;
+
+    // Why the record AIndex cannot be written ("" when it can): an only declared one can (an
+    // empty record)
+    hidden method DoRecordWhy(const AIndex: int64): string;
+    var
+      LRecord: CRecord;
+      LWhy: string;
+      LI: int64;
+    begin
+      LRecord := self.FTypes.RecordAt(AIndex);
+      if not LRecord.Complete then
+        return "";
+      end;
+      if LRecord.HasBitfields then
+        return ADAM_MSG_CIMPORT_WRITER_WHY_BITFIELDS;
+      end;
+      if LRecord.HasFlexible then
+        return ADAM_MSG_CIMPORT_WRITER_WHY_FLEXIBLE;
+      end;
+      for LI := 0 to len(LRecord.Fields) - 1 do
+        if LRecord.Fields[LI].Name = "" then
+          return ADAM_MSG_CIMPORT_WRITER_WHY_ANON_MEMBER;
+        end;
+        LWhy := "";
+        if self.DoFieldText(LRecord.Fields[LI].TypeId, "", LWhy) = "" then
+          return LWhy;
+        end;
+      end;
+      return "";
+    end;
+
+    // The [uses] unit owning AFile is imported
+    hidden method DoNoteUse(const AFile: int32);
+    begin
+      if (AFile >= 0) and (int64(AFile) < len(self.FUses)) and (self.FUses[AFile] >= 0) then
+        self.FUsed[self.FUses[AFile]] := true;
+      end;
+    end;
+
+    // True when the enum AIndex is named in the unit (bound, named, not skipped, or a [uses]
+    // unit's)
+    hidden method DoEnumNamed(const AIndex: int64): bool;
+    var
+      LRole: FileRole;
+    begin
+      if self.FEnumNames[AIndex] = "" then
+        return false;
+      end;
+      LRole := self.DoRole(self.FTypes.EnumAt(AIndex).File);
+      if LRole = FileRole.Used then
+        self.DoNoteUse(self.FTypes.EnumAt(AIndex).File);
+        return true;
+      end;
+      return (LRole = FileRole.Bound) and not self.DoSkipsType(self.FEnumNames[AIndex]);
+    end;
+
+    // True when the typedef ADecl is named in the unit: merged into a named record / enum, or
+    // bound and bindable, or a [uses] unit's
+    hidden method DoTypedefNamed(const ADecl: int64): bool;
+    var
+      LDecl: CDecl;
+      LType: CType;
+      LRole: FileRole;
+    begin
+      LDecl := self.FParser.Decl(ADecl);
+      if self.FMerged[ADecl] then
+        LType := self.FTypes.Item(LDecl.TypeId);
+        if LType.Kind = CTypeKind.Record then
+          return self.DoRecordNamed(LType.Index);
+        end;
+        return self.DoEnumNamed(LType.Index);
+      end;
+      LRole := self.DoRole(LDecl.File);
+      if LRole = FileRole.Used then
+        self.DoNoteUse(LDecl.File);
+        return true;
+      end;
+      if (LRole <> FileRole.Bound) or self.DoSkipsType(LDecl.Name) then
+        return false;
+      end;
+      return self.DoDeclState(ADecl) = ADAM_CIMPORT_STATE_OK;
+    end;
+
+    // The typedef / routine / variable ADecl's state, found once (its type's text)
+    hidden method DoDeclState(const ADecl: int64): int64;
+    var
+      LWhy: string;
+      LDecl: CDecl;
+    begin
+      if self.FDeclState[ADecl] = ADAM_CIMPORT_STATE_NEW then
+        self.FDeclState[ADecl] := ADAM_CIMPORT_STATE_BUSY;
+        LDecl := self.FParser.Decl(ADecl);
+        LWhy := "";
+        if LDecl.Kind = CDeclKind.Typedef then
+          self.DoTypedefText(LDecl.TypeId, LWhy);
+        end;
+        if LDecl.Kind = CDeclKind.Routine then
+          self.DoRoutineWhy(LDecl, LWhy);
+        end;
+        if LDecl.Kind = CDeclKind.Variable then
+          self.DoVariableWhy(LDecl, LWhy);
+        end;
+        self.FDeclWhy[ADecl] := LWhy;
+        if LWhy = "" then
+          self.FDeclState[ADecl] := ADAM_CIMPORT_STATE_OK;
+        else
+          self.FDeclState[ADecl] := ADAM_CIMPORT_STATE_BAD;
+        end;
+      end;
+      return self.FDeclState[ADecl];
+    end;
+
+    // AWhy set when the routine ADecl cannot be bound
+    hidden method DoRoutineWhy(const ADecl: CDecl; var AWhy: string);
+    begin
+      if ADecl.IsStatic or (ADecl.IsInline and not ADecl.IsExtern) then
+        AWhy := ADAM_MSG_CIMPORT_WRITER_WHY_INLINE;
+        return;
+      end;
+      self.DoSignature(ADecl.TypeId, AWhy);
+    end;
+
+    // AWhy set when the variable ADecl cannot be bound
+    hidden method DoVariableWhy(const ADecl: CDecl; var AWhy: string);
+    begin
+      if ADecl.IsStatic then
+        AWhy := ADAM_MSG_CIMPORT_WRITER_WHY_STATIC;
+        return;
+      end;
+      self.DoText(ADecl.TypeId, AWhy);
+    end;
+
+    // ---- type text -------------------------------------------------------------------------
+
+    // True when the type AId is const, through the typedef names on the way to what it is
+    hidden const method DoIsConst(const AId: int64): bool;
+    var
+      LId: int64;
+    begin
+      LId := AId;
+      while true do
+        if self.FTypes.Item(LId).IsConst then
+          return true;
+        end;
+        if self.FTypes.Item(LId).Kind <> CTypeKind.Named then
+          return false;
+        end;
+        LId := self.FTypes.Item(LId).Base;
+      end;
+    end;
+
+    // The Adam text of the type AId as a field, variable, parameter or result holds it; "" with
+    // AWhy set when Adam cannot say it (see the header)
+    hidden method DoText(const AId: int64; var AWhy: string): string;
+    var
+      LType: CType;
+      LText: string;
+      LName: string;
+    begin
+      LType := self.FTypes.Item(AId);
+      if LType.IsAtomic then
+        AWhy := ADAM_MSG_CIMPORT_WRITER_WHY_ATOMIC;
+        return "";
+      end;
+      match LType.Kind of
+        CTypeKind.Named:
+          if self.DoTypedefNamed(LType.Index) then
+            return self.DoTypedefName(LType.Index);
+          end;
+          return self.DoText(LType.Base, AWhy);
+        CTypeKind.Record:
+          if self.DoRecordNamed(LType.Index) then
+            return self.DoAdamName(self.FRecordNames[LType.Index]);
+          end;
+          AWhy := self.DoRecordUseWhy(LType.Index);
+          return "";
+        CTypeKind.Enum:
+          if self.DoEnumNamed(LType.Index) then
+            return self.DoAdamName(self.FEnumNames[LType.Index]);
+          end;
+          return BuiltinName(self.FTypes.EnumAt(LType.Index).Underlying);
+        CTypeKind.Pointer:
+          return self.DoPointerText(LType);
+        CTypeKind.Array:
+          if LType.Count < 0 then
+            AWhy := ADAM_MSG_CIMPORT_WRITER_WHY_NO_SIZE;
+            return "";
+          end;
+          if LType.Count = 0 then
+            AWhy := ADAM_MSG_CIMPORT_WRITER_WHY_ZERO;
+            return "";
+          end;
+          LText := self.DoText(LType.Base, AWhy);
+          if LText = "" then
+            return "";
+          end;
+          return "array[0.." + IntToStr(LType.Count - 1) + "] of " + LText;
+        CTypeKind.Function:
+          AWhy := ADAM_MSG_CIMPORT_WRITER_WHY_FUNCTION;
+          return "";
+        CTypeKind.Void:
+          AWhy := ADAM_MSG_CIMPORT_WRITER_WHY_VOID;
+          return "";
+        CTypeKind.VaList:
+          // the target's va_list: a plain pointer where it is one (the same pointer to C)
+          if self.FTypes.TargetOf().VaListIsPointer() then
+            return "ptr";
+          end;
+      else
+      end;
+      LName := BuiltinName(LType.Kind);
+      if LName = "" then
+        AWhy := NoArgs().Str(CKindText(LType.Kind)).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_TYPE);
+      end;
+      return LName;
+    end;
+
+    // The Adam name the typedef ADecl is written under (a merged one its record's / enum's)
+    hidden const method DoTypedefName(const ADecl: int64): string;
+    var
+      LDecl: CDecl;
+      LType: CType;
+    begin
+      LDecl := self.FParser.Decl(ADecl);
+      if self.FMerged[ADecl] then
+        LType := self.FTypes.Item(LDecl.TypeId);
+        if LType.Kind = CTypeKind.Record then
+          return self.DoAdamName(self.FRecordNames[LType.Index]);
+        end;
+        return self.DoAdamName(self.FEnumNames[LType.Index]);
+      end;
+      return self.DoAdamName(LDecl.Name);
+    end;
+
+    // Why a record cannot be used by value here: a foreign header's, skipped, unnamed, or not
+    // bound itself
+    hidden method DoRecordUseWhy(const AIndex: int64): string;
+    var
+      LRecord: CRecord;
+      LName: string;
+    begin
+      LRecord := self.FTypes.RecordAt(AIndex);
+      LName := self.FRecordNames[AIndex];
+      if LName = "" then
+        return ADAM_MSG_CIMPORT_WRITER_WHY_ANON_USE;
+      end;
+      if self.DoRole(LRecord.File) <> FileRole.Bound then
+        return NoArgs().Str(LName).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_FOREIGN);
+      end;
+      if self.DoSkipsType(LName) then
+        return NoArgs().Str(LName).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_SKIPPED);
+      end;
+      return NoArgs().Str(LName).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_RECORD);
+    end;
+
+    // A pointer's text (see the header): to a function the routine type, to void or to what
+    // Adam cannot say the untyped ptr, else ptr to [const] T. While the unit is written, a
+    // record named through it before its own record gets a forward type, and a typedef not
+    // written yet is looked through (a typedef has no forward form)
+    hidden method DoPointerText(const AType: CType): string;
+    var
+      LTarget: int64;
+      LResolved: CType;
+      LText: string;
+      LWhy: string;
+      LConst: string;
+    begin
+      LTarget := AType.Base;
+      LResolved := self.FTypes.Item(self.FTypes.Resolved(LTarget));
+      if LResolved.Kind = CTypeKind.Void then
+        return "ptr";
+      end;
+      LWhy := "";
+      if LResolved.Kind = CTypeKind.Function then
+        LText := self.DoFunctionText(LTarget, LWhy);
+        if LText = "" then
+          return "ptr";
+        end;
+        return LText;
+      end;
+      if self.FEmitting then
+        while (self.FTypes.Item(LTarget).Kind = CTypeKind.Named) and
+          not self.FDeclWritten[self.FTypes.Item(LTarget).Index] and
+          not self.DoIsForeignTypedef(self.FTypes.Item(LTarget).Index) do
+          LTarget := self.FTypes.Item(LTarget).Base;
+        end;
+        if (self.FTypes.Item(LTarget).Kind = CTypeKind.Record) then
+          self.DoForward(self.FTypes.Item(LTarget).Index);
+        end;
+      end;
+      LText := self.DoText(LTarget, LWhy);
+      if LText = "" then
+        return "ptr";
+      end;
+      LConst := "";
+      if self.DoIsConst(AType.Base) then
+        LConst := "const ";
+      end;
+      return "ptr to " + LConst + LText;
+    end;
+
+    // True when the typedef ADecl is not written by this unit (a foreign or [uses] header's,
+    // or one merged into its record), so waiting for it is not needed
+    hidden method DoIsForeignTypedef(const ADecl: int64): bool;
+    begin
+      return self.FMerged[ADecl] or
+        (self.DoRole(self.FParser.Decl(ADecl).File) <> FileRole.Bound);
+    end;
+
+    // The forward type of the record AIndex, when it is written by this unit and not yet
+    hidden method DoForward(const AIndex: int64);
+    begin
+      if self.FRecordWritten[AIndex] or self.FRecordForward[AIndex] then
+        return;
+      end;
+      if not self.DoRecordNamed(AIndex) or
+        (self.DoRole(self.FTypes.RecordAt(AIndex).File) <> FileRole.Bound) then
+        return;
+      end;
+      self.FRecordForward[AIndex] := true;
+      self.FForwardText.Add("public forward type " + self.DoAdamName(self.FRecordNames[AIndex]) +
+        ";\n");
+    end;
+
+    // The routine type of the function type AId (reached through typedef names: a typedef of a
+    // function type written by the unit gives its name); "" with AWhy when Adam cannot say it
+    hidden method DoFunctionText(const AId: int64; var AWhy: string): string;
+    var
+      LType: CType;
+      LSignature: string;
+    begin
+      LType := self.FTypes.Item(AId);
+      if LType.Kind = CTypeKind.Named then
+        if self.DoTypedefNamed(LType.Index) and
+          (not self.FEmitting or self.FDeclWritten[LType.Index] or
+          self.DoIsForeignTypedef(LType.Index)) then
+          return self.DoTypedefName(LType.Index);
+        end;
+        return self.DoFunctionText(LType.Base, AWhy);
+      end;
+      LSignature := self.DoSignature(AId, AWhy);
+      if AWhy <> "" then
+        return "";
+      end;
+      return "routine clink" + LSignature;
+    end;
+
+    // The parameter list and result of the function type AId as Adam writes them
+    // ("(a: int32; ...): T"); AWhy set when a parameter or the result cannot be said
+    hidden method DoSignature(const AId: int64; var AWhy: string): string;
+    var
+      LType: CType;
+      LFunc: CType;
+      LParts: StringArray;
+      LName: string;
+      LText: string;
+      LResult: CType;
+      LI: int64;
+      LJ: int64;
+      LUnique: bool;
+    begin
+      LFunc := self.FTypes.Item(self.FTypes.Resolved(AId));
+      setlength(LParts, len(LFunc.Params));
+      for LI := 0 to len(LFunc.Params) - 1 do
+        LName := LFunc.Params[LI].Name;
+        if LName = "" then
+          LName := ADAM_CIMPORT_WRITER_PARAM + IntToStr(LI + 1);
+        end;
+        LName := DoLocalName(LName);
+        LUnique := true;
+        for LJ := 0 to LI - 1 do
+          if StartsStr(LName + ":", LParts[LJ]) then
+            LUnique := false;
+          end;
+        end;
+        if not LUnique then
+          LName := LName + IntToStr(LI + 1);
+        end;
+        LType := self.FTypes.Item(self.FTypes.Resolved(LFunc.Params[LI].TypeId));
+        if LType.Kind = CTypeKind.Void then
+          AWhy := ADAM_MSG_CIMPORT_WRITER_WHY_VOID;
+          return "";
+        end;
+        LText := self.DoText(LFunc.Params[LI].TypeId, AWhy);
+        if LText = "" then
+          return "";
+        end;
+        LParts[LI] := LName + ": " + LText;
+      end;
+      LText := "(" + JoinStrings(LParts, "; ");
+      if LFunc.Variadic then
+        if len(LParts) > 0 then
+          LText := LText + "; ";
+        end;
+        LText := LText + "...";
+      end;
+      LText := LText + ")";
+      LResult := self.FTypes.Item(self.FTypes.Resolved(LFunc.Base));
+      if LResult.Kind <> CTypeKind.Void then
+        LName := self.DoText(LFunc.Base, AWhy);
+        if LName = "" then
+          return "";
+        end;
+        LText := LText + ": " + LName;
+      end;
+      return LText;
+    end;
+
+    // A typedef's text: a function type's routine type, else its type's text
+    hidden method DoTypedefText(const AId: int64; var AWhy: string): string;
+    begin
+      if self.FTypes.Item(self.FTypes.Resolved(AId)).Kind = CTypeKind.Function then
+        return self.DoFunctionText(AId, AWhy);
+      end;
+      return self.DoText(AId, AWhy);
+    end;
+
+    // A field's type text: an unnamed struct / union inline (record / overlay .. end at
+    // AIndent's depth), else DoText
+    hidden method DoFieldText(const AId: int64; const AIndent: string; var AWhy: string): string;
+    var
+      LType: CType;
+      LRecord: CRecord;
+      LText: ref TextBuilder;
+      LField: string;
+      LI: int64;
+    begin
+      LType := self.FTypes.Item(AId);
+      if (LType.Kind <> CTypeKind.Record) or (self.FRecordNames[LType.Index] <> "") then
+        return self.DoText(AId, AWhy);
+      end;
+      LRecord := self.FTypes.RecordAt(LType.Index);
+      if LRecord.HasBitfields then
+        AWhy := ADAM_MSG_CIMPORT_WRITER_WHY_BITFIELDS;
+        return "";
+      end;
+      if LRecord.HasFlexible then
+        AWhy := ADAM_MSG_CIMPORT_WRITER_WHY_FLEXIBLE;
+        return "";
+      end;
+      LText := ref TextBuilder();
+      if LRecord.IsUnion then
+        LText.Add("overlay\n");
+      else
+        LText.Add("record\n");
+      end;
+      for LI := 0 to len(LRecord.Fields) - 1 do
+        if LRecord.Fields[LI].Name = "" then
+          AWhy := ADAM_MSG_CIMPORT_WRITER_WHY_ANON_MEMBER;
+          return "";
+        end;
+        LField := self.DoFieldText(LRecord.Fields[LI].TypeId, AIndent + "  ", AWhy);
+        if LField = "" then
+          return "";
+        end;
+        LText.Add(AIndent + "  " + DoLocalName(LRecord.Fields[LI].Name) + ": " + LField + ";\n");
+      end;
+      LText.Add(AIndent + "end");
+      return LText.Text();
+    end;
+
+    // ---- the unit --------------------------------------------------------------------------
+
+    // The types the type AId holds by value written first (typedefs, records, enums)
+    hidden method DoEmitDeps(const AId: int64);
+    var
+      LType: CType;
+      LRecord: CRecord;
+      LI: int64;
+    begin
+      LType := self.FTypes.Item(AId);
+      match LType.Kind of
+        CTypeKind.Named:
+          if not self.DoIsForeignTypedef(LType.Index) then
+            self.DoEmitTypedef(LType.Index);
+          else
+            if self.FMerged[LType.Index] then
+              self.DoEmitDeps(self.FParser.Decl(LType.Index).TypeId);
+            else
+              self.DoEmitDeps(LType.Base);
+            end;
+          end;
+        CTypeKind.Record:
+          if self.FRecordNames[LType.Index] <> "" then
+            self.DoEmitRecord(LType.Index);
+          else
+            LRecord := self.FTypes.RecordAt(LType.Index);
+            for LI := 0 to len(LRecord.Fields) - 1 do
+              self.DoEmitDeps(LRecord.Fields[LI].TypeId);
+            end;
+          end;
+        CTypeKind.Enum:
+          self.DoEmitEnum(LType.Index);
+        CTypeKind.Array:
+          self.DoEmitDeps(LType.Base);
+      else
+      end;
+    end;
+
+    // The record AIndex written into the type block (once, its by-value types first), or
+    // reported when it cannot be
+    hidden method DoEmitRecord(const AIndex: int64);
+    var
+      LRecord: CRecord;
+      LName: string;
+      LWhy: string;
+      LField: string;
+      LText: ref TextBuilder;
+      LI: int64;
+    begin
+      if self.FRecordWritten[AIndex] or (self.FRecordNames[AIndex] = "") then
+        return;
+      end;
+      LRecord := self.FTypes.RecordAt(AIndex);
+      if (self.DoRole(LRecord.File) <> FileRole.Bound) or
+        self.DoSkipsType(self.FRecordNames[AIndex]) then
+        return;
+      end;
+      if self.DoRecordState(AIndex) = ADAM_CIMPORT_STATE_BAD then
+        if not self.FRecordReported[AIndex] then
+          self.FRecordReported[AIndex] := true;
+          self.DoUnbound(self.FRecordNames[AIndex], LRecord.File, LRecord.Line, LRecord.Column,
+            self.FRecordWhy[AIndex]);
+        end;
+        return;
+      end;
+      LName := self.DoAdamName(self.FRecordNames[AIndex]);
+      // what it holds by value first (C has no by-value cycle); a pointer back to it from
+      // there, or from its own fields, needs its forward type: it is not written yet
+      for LI := 0 to len(LRecord.Fields) - 1 do
+        self.DoEmitDeps(LRecord.Fields[LI].TypeId);
+      end;
+      if self.DoClaim(LName, self.FRecordNames[AIndex], LRecord.File, LRecord.Line,
+        LRecord.Column) <> 0 then
+        self.FRecordWritten[AIndex] := true;
+        return;
+      end;
+      LText := ref TextBuilder();
+      if not LRecord.Complete then
+        LText.Add("  " + LName + " = record\n  end;\n");
+      else
+        if LRecord.IsUnion then
+          LText.Add("  " + LName + " = overlay\n");
+        else
+          LText.Add("  " + LName + " = record\n");
+        end;
+        for LI := 0 to len(LRecord.Fields) - 1 do
+          LWhy := "";
+          LField := self.DoFieldText(LRecord.Fields[LI].TypeId, "    ", LWhy);
+          LText.Add("    " + DoLocalName(LRecord.Fields[LI].Name) + ": " + LField + ";\n");
+        end;
+        LText.Add("  end;\n");
+      end;
+      self.FRecordWritten[AIndex] := true;
+      self.FTypeText.Add(LText.Text());
+      self.FCounts.Types := self.FCounts.Types + 1;
+    end;
+
+    // The enum AIndex written as an alias of its integer type (once), when it is named
+    hidden method DoEmitEnum(const AIndex: int64);
+    var
+      LEnum: CEnum;
+      LName: string;
+    begin
+      if self.FEnumWritten[AIndex] or (self.FEnumNames[AIndex] = "") then
+        return;
+      end;
+      LEnum := self.FTypes.EnumAt(AIndex);
+      if (self.DoRole(LEnum.File) <> FileRole.Bound) or self.DoSkipsType(self.FEnumNames[AIndex]) then
+        return;
+      end;
+      self.FEnumWritten[AIndex] := true;
+      LName := self.DoAdamName(self.FEnumNames[AIndex]);
+      if self.DoClaim(LName, self.FEnumNames[AIndex], LEnum.File, LEnum.Line, LEnum.Column) <> 0 then
+        return;
+      end;
+      self.FTypeText.Add("  " + LName + " = " + BuiltinName(LEnum.Underlying) + ";\n");
+      self.FCounts.Types := self.FCounts.Types + 1;
+    end;
+
+    // The typedef ADecl written as a type alias (once, its by-value types first), or reported;
+    // a merged one writes its record / enum
+    hidden method DoEmitTypedef(const ADecl: int64);
+    var
+      LDecl: CDecl;
+      LName: string;
+      LWhy: string;
+      LText: string;
+      LType: CType;
+    begin
+      if self.FDeclWritten[ADecl] then
+        return;
+      end;
+      LDecl := self.FParser.Decl(ADecl);
+      if self.FMerged[ADecl] then
+        self.FDeclWritten[ADecl] := true;
+        LType := self.FTypes.Item(LDecl.TypeId);
+        if LType.Kind = CTypeKind.Record then
+          self.DoEmitRecord(LType.Index);
+        else
+          self.DoEmitEnum(LType.Index);
+        end;
+        return;
+      end;
+      if (self.DoRole(LDecl.File) <> FileRole.Bound) or self.DoSkipsType(LDecl.Name) then
+        return;
+      end;
+      self.FDeclWritten[ADecl] := true;
+      if self.DoDeclState(ADecl) = ADAM_CIMPORT_STATE_BAD then
+        self.DoUnbound(LDecl.Name, LDecl.File, LDecl.Line, LDecl.Column, self.FDeclWhy[ADecl]);
+        return;
+      end;
+      if self.FTypes.Item(self.FTypes.Resolved(LDecl.TypeId)).Kind <> CTypeKind.Function then
+        self.FDeclWritten[ADecl] := false;
+        self.DoEmitDeps(LDecl.TypeId);
+        self.FDeclWritten[ADecl] := true;
+      end;
+      LName := self.DoAdamName(LDecl.Name);
+      if self.DoClaim(LName, LDecl.Name, LDecl.File, LDecl.Line, LDecl.Column) <> 0 then
+        return;
+      end;
+      // the alias's own text, its typedef not yet counted as written (no alias of itself)
+      self.FDeclWritten[ADecl] := false;
+      LWhy := "";
+      LText := self.DoTypedefText(LDecl.TypeId, LWhy);
+      self.FDeclWritten[ADecl] := true;
+      self.FTypeText.Add("  " + LName + " = " + LText + ";\n");
+      self.FCounts.Types := self.FCounts.Types + 1;
+    end;
+
+    // The text of the routine ADecl's declaration, wrapped (see DoWrapped)
+    hidden method DoRoutineLine(const ADecl: CDecl; const AName: string): string;
+    var
+      LWhy: string;
+      LSignature: string;
+    begin
+      LWhy := "";
+      LSignature := self.DoSignature(ADecl.TypeId, LWhy);
+      return DoWrapped("public routine clink " + AName + LSignature + "; " + self.DoExternal());
+    end;
+
+    // The external clause the unit's routines and variables end in
+    hidden const method DoExternal(): string;
+    begin
+      if self.FLibrary = "" then
+        return "external;";
+      end;
+      return "external \"" + self.FLibrary + "\";";
+    end;
+
+    // The unit's text written (see the header) into AText; false when a CI error was reported
+    method Write(var AText: string): bool;
+    var
+      LDecl: CDecl;
+      LEnum: CEnum;
+      LOut: ref TextBuilder;
+      LConsts: ref TextBuilder;
+      LVars: ref TextBuilder;
+      LRoutines: ref TextBuilder;
+      LImports: StringArray;
+      LCount: int64;
+      LHeaders: StringArray;
+      LName: string;
+      LWhy: string;
+      LText: string;
+      LOk: bool;
+      LI: int64;
+      LJ: int64;
+    begin
+      self.DoNames();
+      // every state judged before any text, so no record is taken as named that is not
+      for LI := 0 to self.FTypes.RecordCount - 1 do
+        self.DoRecordState(LI);
+      end;
+      for LI := 0 to self.FParser.DeclCount - 1 do
+        if self.FParser.Decl(LI).Kind <> CDeclKind.Tag then
+          self.DoDeclState(LI);
+        end;
+      end;
+      self.FEmitting := true;
+      LConsts := ref TextBuilder();
+      LVars := ref TextBuilder();
+      LRoutines := ref TextBuilder();
+      for LI := 0 to self.FTypes.EnumCount - 1 do
+        LEnum := self.FTypes.EnumAt(LI);
+        if (self.DoRole(LEnum.File) <> FileRole.Bound) or not LEnum.Complete then
+          skip;
+        end;
+        for LJ := 0 to len(LEnum.Names) - 1 do
+          LName := self.DoAdamName(LEnum.Names[LJ]);
+          if self.DoClaim(LName, LEnum.Names[LJ], LEnum.File, LEnum.Line, LEnum.Column) <> 0 then
+            skip;
+          end;
+          LConsts.Add("  " + LName + ": " + BuiltinName(LEnum.Underlying) + " = " +
+            IntToStr(LEnum.Values[LJ]) + ";\n");
+          self.FCounts.Constants := self.FCounts.Constants + 1;
+        end;
+      end;
+      for LI := 0 to self.FParser.DeclCount - 1 do
+        LDecl := self.FParser.Decl(LI);
+        if self.DoRole(LDecl.File) <> FileRole.Bound then
+          skip;
+        end;
+        if LDecl.Kind = CDeclKind.Typedef then
+          self.DoEmitTypedef(LI);
+          skip;
+        end;
+        if LDecl.Kind = CDeclKind.Tag then
+          self.DoEmitDeps(LDecl.TypeId);
+          skip;
+        end;
+        if self.DoSkipsRoutine(LDecl.Name) or self.FDeclWritten[LI] then
+          skip;
+        end;
+        self.FDeclWritten[LI] := true;
+        if self.DoDeclState(LI) = ADAM_CIMPORT_STATE_BAD then
+          if not self.DoRepeats(LI) then
+            self.DoUnbound(LDecl.Name, LDecl.File, LDecl.Line, LDecl.Column, self.FDeclWhy[LI]);
+          end;
+          skip;
+        end;
+        self.DoEmitDeps(LDecl.TypeId);
+      end;
+      // every bound record / enum no declaration reached (a pointer's target)
+      for LI := 0 to self.FTypes.RecordCount - 1 do
+        self.DoEmitRecord(LI);
+      end;
+      for LI := 0 to self.FTypes.EnumCount - 1 do
+        self.DoEmitEnum(LI);
+      end;
+      // routines and variables after every type: the type block is complete
+      for LI := 0 to self.FParser.DeclCount - 1 do
+        LDecl := self.FParser.Decl(LI);
+        if (LDecl.Kind = CDeclKind.Typedef) or (LDecl.Kind = CDeclKind.Tag) or
+          (self.DoRole(LDecl.File) <> FileRole.Bound) or self.DoSkipsRoutine(LDecl.Name) or
+          (self.DoDeclState(LI) <> ADAM_CIMPORT_STATE_OK) then
+          skip;
+        end;
+        LName := self.DoAdamName(LDecl.Name);
+        if self.DoClaim(LName, LDecl.Name, LDecl.File, LDecl.Line, LDecl.Column) <> 0 then
+          skip;
+        end;
+        if LDecl.Kind = CDeclKind.Routine then
+          LRoutines.Add(self.DoRoutineLine(LDecl, LName) + "\n");
+          self.FCounts.Routines := self.FCounts.Routines + 1;
+        else
+          LWhy := "";
+          LVars.Add("  " + LName + ": " + self.DoText(LDecl.TypeId, LWhy) + "; " +
+            self.DoExternal() + "\n");
+          self.FCounts.Variables := self.FCounts.Variables + 1;
+        end;
+      end;
+      self.FEmitting := false;
+      LOut := ref TextBuilder();
+      setlength(LHeaders, len(self.FSpec.Headers));
+      for LI := 0 to len(self.FSpec.Headers) - 1 do
+        LHeaders[LI] := self.FSpec.Headers[LI].Text;
+      end;
+      // line comments: the text holds no block comment's end, so a row's spec can show it
+      LOut.Add("// " + self.FSpec.UnitName + ADAM_EXT_SOURCE + " - written by adam cimport for " +
+        self.FTriple +
+        "\n// from " + ExtractFileName(ForwardSlashes(self.FSpec.FileName)) + " (" +
+        JoinStrings(LHeaders, ", ") + ").\n");
+      LOut.Add("// Regenerate it with adam cimport; a change belongs in the spec\n");
+      LOut.Add("// ([renames], [skip], [[insert]]).\n\n");
+      LOut.Add("module unit " + self.FSpec.UnitName + ";\n");
+      LCount := 0;
+      setlength(LImports, len(self.FSpec.Uses));
+      for LI := 0 to len(self.FSpec.Uses) - 1 do
+        if self.FUsed[LI] then
+          LImports[LCount] := self.FSpec.Uses[LI].UnitName;
+          LCount := LCount + 1;
+        end;
+      end;
+      setlength(LImports, LCount);
+      if LCount > 0 then
+        LOut.Add("\nimport " + JoinStrings(LImports, ", ") + ";\n");
+      end;
+      if self.FCounts.Constants > 0 then
+        LOut.Add("\npublic const\n" + LConsts.Text());
+      end;
+      LText := self.FForwardText.Text();
+      if LText <> "" then
+        LOut.Add("\n" + LText);
+      end;
+      if self.FCounts.Types > 0 then
+        LOut.Add("\npublic type\n" + self.FTypeText.Text());
+      end;
+      if self.FCounts.Variables > 0 then
+        LOut.Add("\npublic var\n" + LVars.Text());
+      end;
+      if self.FCounts.Routines > 0 then
+        LOut.Add("\n" + LRoutines.Text());
+      end;
+      LOut.Add("\nend.\n");
+      AText := LOut.Text();
+      LOk := self.DoInserts(AText);
+      return LOk and ((self.FReports = nil) or not self.FReports.HasErrors());
+    end;
+
+    // True when the routine / variable ADecl repeats an earlier declaration of its name (its
+    // report made once)
+    hidden const method DoRepeats(const ADecl: int64): bool;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to ADecl - 1 do
+        if (self.FParser.Decl(LI).Name = self.FParser.Decl(ADecl).Name) and
+          (self.FParser.Decl(LI).Kind = self.FParser.Decl(ADecl).Kind) then
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // The spec's [[insert]]s applied to AText in order; false when an anchor is not there
+    // (CI0002 at the insert)
+    hidden method DoInserts(var AText: string): bool;
+    var
+      LInsert: SpecInsert;
+      LAt: int64;
+      LFound: int64;
+      LSeen: int64;
+      LOk: bool;
+      LI: int64;
+    begin
+      LOk := true;
+      for LI := 0 to len(self.FSpec.Inserts) - 1 do
+        LInsert := self.FSpec.Inserts[LI];
+        LFound := -1;
+        LSeen := 0;
+        LAt := IndexOf(LInsert.Anchor, AText, 0);
+        while LAt >= 0 do
+          LSeen := LSeen + 1;
+          if LSeen = LInsert.Occurrence then
+            LFound := LAt;
+          end;
+          LAt := IndexOf(LInsert.Anchor, AText, LAt + len(LInsert.Anchor));
+        end;
+        if LFound < 0 then
+          LOk := false;
+          if self.FReports <> nil then
+            if LSeen = 0 then
+              self.FReports.Add(Severity.Error, ADAM_ERR_CIMPORT_WRITER_002,
+                self.FSpec.PlaceOf(LInsert.Line, LInsert.Column),
+                ADAM_MSG_CIMPORT_WRITER_INSERT_MISSING, NoArgs().Str(LInsert.Anchor));
+            else
+              self.FReports.Add(Severity.Error, ADAM_ERR_CIMPORT_WRITER_002,
+                self.FSpec.PlaceOf(LInsert.Line, LInsert.Column),
+                ADAM_MSG_CIMPORT_WRITER_INSERT_COUNT,
+                NoArgs().Str(LInsert.Anchor).Int(LSeen).Int(LInsert.Occurrence));
+            end;
+          end;
+          skip;
+        end;
+        match LInsert.Place of
+          InsertPlace.Before:
+            AText := Substring(AText, 0, LFound) + LInsert.Text + Substring(AText, LFound,
+              len(AText) - LFound);
+          InsertPlace.After:
+            AText := Substring(AText, 0, LFound + len(LInsert.Anchor)) + LInsert.Text +
+              Substring(AText, LFound + len(LInsert.Anchor),
+              len(AText) - LFound - len(LInsert.Anchor));
+          InsertPlace.Replace:
+            AText := Substring(AText, 0, LFound) + LInsert.Text +
+              Substring(AText, LFound + len(LInsert.Anchor),
+              len(AText) - LFound - len(LInsert.Anchor));
+        end;
+      end;
+      return LOk;
+    end;
+  end;
+
+end.

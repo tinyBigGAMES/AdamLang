@@ -1,0 +1,1966 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.CImport.Parser.adam - `adam cimport`'s C declaration parser (M9c;
+  DESIGN sec 15): the preprocessed tokens of an import as C declarations
+
+  CDeclKind   what a declaration declares: a typedef name, a routine, a
+              variable, or a struct / union / enum by its tag alone
+              (struct foo { .. }; with no declarator)
+  CDecl       one file-scope declaration: its kind, name, type (Adam.CImport.
+              CTypes' index), where its name is written, its storage class
+              (static, extern), inline, and whether it is a definition with a
+              body (a static inline routine's body is skipped by balance)
+  CParser     one import's parse over a Preprocessor's tokens (Parse): every
+              file-scope declaration in order (DeclCount, Decl) and the types
+              they use (Types). Reports into the Diagnostics it is made with
+              (CC codes, at the token's header file, line and column)
+
+  C17 with the GNU / Microsoft extensions the system headers write:
+  declaration specifiers in any order (storage classes, qualifiers, the
+  fundamental type words, struct / union / enum specifiers, typedef
+  names), declarators to any depth (pointers with their qualifiers,
+  arrays, functions, parentheses), abstract declarators (parameters,
+  sizeof, casts), parameter lists (void, unnamed, variadic, f() with no
+  prototype; an array or function parameter adjusted to a pointer),
+  struct / union bodies (bitfields marked for M9e's layout, anonymous
+  members, a flexible array member last), enum bodies with integer
+  constant expressions (each value the previous + 1 when none is given;
+  C23's enum : type), initializers and function bodies skipped by
+  balance, _Static_assert skipped. Integer constant expressions: C's
+  operators and precedence over int64, integer and character constants,
+  enum constants, sizeof / _Alignof of a type the target lays out, casts
+  to an integer type. __attribute__, __declspec, _Alignas, asm labels and
+  Microsoft's calling-convention words are passed over by balance here;
+  what they mean is M9e's (#pragma pack too: its Pragma tokens are passed
+  over). A declaration the parser cannot read is one CC report at the
+  first token it cannot take, then it resumes after the next ';' outside
+  brackets: nothing is skipped silently. Target-neutral: every size is
+  the target part's, through CTypeTable.
+*******************************************************************************/
+
+module unit Adam.CImport.Parser;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Core.Messages, Adam.Compiler.SourceText,
+  Adam.Compiler.Diagnostics, Adam.Target, Adam.CImport.Lexer, Adam.CImport.Preprocessor,
+  Adam.CImport.CTypes;
+
+public const
+  ADAM_ERR_CIMPORT_PARSER_001: string = "CC0001";   // a token is not the one expected
+  ADAM_ERR_CIMPORT_PARSER_002: string = "CC0002";   // a declaration names no type
+  ADAM_ERR_CIMPORT_PARSER_003: string = "CC0003";   // type specifiers that do not combine
+  ADAM_ERR_CIMPORT_PARSER_004: string = "CC0004";   // not an integer constant expression
+  ADAM_ERR_CIMPORT_PARSER_005: string = "CC0005";   // division by zero in a constant expression
+  ADAM_ERR_CIMPORT_PARSER_006: string = "CC0006";   // an array size below zero
+  ADAM_ERR_CIMPORT_PARSER_007: string = "CC0007";   // a tag of another kind
+  ADAM_ERR_CIMPORT_PARSER_008: string = "CC0008";   // a struct / union / enum defined twice
+  ADAM_ERR_CIMPORT_PARSER_009: string = "CC0009";   // a C form the parser does not read
+  ADAM_ERR_CIMPORT_PARSER_010: string = "CC0010";   // the headers end inside a declaration
+  ADAM_ERR_CIMPORT_PARSER_011: string = "CC0011";   // a declarator with no name
+
+  // A growable list's first storage, doubled each time it is full
+  ADAM_CIMPORT_PARSER_FIRST: int64 = 64;
+
+public type
+  // What a declaration declares (see the header)
+  CDeclKind = choices(Typedef, Routine, Variable, Tag);
+
+  // One file-scope declaration (see the header); TypeId a Tag's record / enum type
+  CDecl = record
+    Kind: CDeclKind;
+    Name: string;
+    TypeId: int64;
+    File: int32;
+    Line: int32;
+    Column: int32;
+    IsStatic: bool;
+    IsExtern: bool;
+    IsInline: bool;
+    HasBody: bool;
+  end;
+
+  CDeclArray = array of CDecl;
+
+  // What declaration specifiers say: the type, the storage class, inline; Ok false when
+  // they were not valid (reported)
+  CSpecifiers = record
+    TypeId: int64;
+    IsTypedef: bool;
+    IsStatic: bool;
+    IsExtern: bool;
+    IsInline: bool;
+    Ok: bool;
+  end;
+
+  // One step of a direct declarator's suffixes: an array of Count (-1 none) or a function
+  // (its parameters)
+  CSuffix = record
+    IsFunction: bool;
+    Count: int64;
+    Params: CParamArray;
+    Variadic: bool;
+    NoPrototype: bool;
+  end;
+
+  CSuffixArray = array of CSuffix;
+
+// True when AText is a word the parser passes over with a parenthesized argument
+// (__attribute__((..)), __declspec(..), _Alignas(..), an asm label)
+routine DoIsBalancedWord(const AText: string): bool;
+begin
+  match AText of
+    "__attribute__", "__attribute", "__declspec", "_Alignas", "alignas", "asm", "__asm",
+    "__asm__":
+      return true;
+  end;
+  return false;
+end;
+
+// True when AText is a word the parser passes over alone (Microsoft's calling conventions and
+// pointer words, GNU's __extension__, nullability; one x64 convention, so none changes a type)
+routine DoIsIgnoredWord(const AText: string): bool;
+begin
+  match AText of
+    "__cdecl", "_cdecl", "__stdcall", "_stdcall", "__fastcall", "_fastcall", "__vectorcall",
+    "__thiscall", "__ptr64", "__ptr32", "__unaligned", "__w64", "__extension__", "_Nullable",
+    "_Nonnull", "_Null_unspecified", "__restrict", "__restrict__", "restrict", "_Noreturn",
+    "__noreturn__", "noreturn":
+      return true;
+  end;
+  return false;
+end;
+
+// True when AText is a qualifier word
+routine DoIsQualifier(const AText: string): bool;
+begin
+  match AText of
+    "const", "__const", "__const__", "volatile", "__volatile", "__volatile__", "_Atomic":
+      return true;
+  end;
+  return false;
+end;
+
+// True when AText is a word only a declaration's specifiers hold (a type word, a storage
+// class, struct / union / enum)
+routine DoIsSpecifierWord(const AText: string): bool;
+begin
+  match AText of
+    "void", "char", "short", "int", "long", "signed", "__signed", "__signed__", "unsigned",
+    "float", "double", "_Bool", "bool", "__int128", "_Complex", "__complex__", "__int64",
+    "__int32", "__int16", "__int8", "struct", "union", "enum", "typedef", "extern", "static",
+    "auto", "register", "_Thread_local", "thread_local", "__thread", "constexpr", "inline",
+    "__inline", "__inline__", "__forceinline", "__builtin_va_list":
+      return true;
+  end;
+  return DoIsQualifier(AText);
+end;
+
+// The value of a C digit in base ABase; -1 when AChar is none
+routine DoDigit(const AChar: char; const ABase: int64): int64;
+var
+  LValue: int64;
+begin
+  LValue := -1;
+  if (AChar >= '0') and (AChar <= '9') then
+    LValue := int64(AChar) - int64('0');
+  end;
+  if (AChar >= 'a') and (AChar <= 'f') then
+    LValue := int64(AChar) - int64('a') + 10;
+  end;
+  if (AChar >= 'A') and (AChar <= 'F') then
+    LValue := int64(AChar) - int64('A') + 10;
+  end;
+  if LValue >= ABase then
+    return -1;
+  end;
+  return LValue;
+end;
+
+// An integer constant's value (C's prefixes 0x / 0b / 0, C23's ' separators, the u / l / ll
+// suffixes and Microsoft's i8 .. i64 taken off, wrapped to 64 bits as C's largest type);
+// false when AText is no integer constant (a floating one, a stray letter)
+routine DoIntValue(const AText: string; var AValue: int64): bool;
+var
+  LEnd: int64;
+  LAt: int64;
+  LBase: int64;
+  LDigit: int64;
+  LValue: uint64;
+  LChar: char;
+  LAny: bool;
+begin
+  LEnd := len(AText);
+  while LEnd > 0 do
+    LChar := AText[LEnd - 1];
+    if (LChar = 'u') or (LChar = 'U') or (LChar = 'l') or (LChar = 'L') then
+      LEnd := LEnd - 1;
+      skip;
+    end;
+    leave;
+  end;
+  if (LEnd > 2) and ((AText[LEnd - 2] = 'i') or (AText[LEnd - 2] = 'I')) and
+    (AText[LEnd - 1] = '8') then
+    LEnd := LEnd - 2;
+  end;
+  if (LEnd > 3) and ((AText[LEnd - 3] = 'i') or (AText[LEnd - 3] = 'I')) then
+    if Substring(AText, LEnd - 2, 2) = "16" then
+      LEnd := LEnd - 3;
+    end;
+    if Substring(AText, LEnd - 2, 2) = "32" then
+      LEnd := LEnd - 3;
+    end;
+    if Substring(AText, LEnd - 2, 2) = "64" then
+      LEnd := LEnd - 3;
+    end;
+  end;
+  LAt := 0;
+  LBase := 10;
+  if (LEnd > 2) and (AText[0] = '0') and ((AText[1] = 'x') or (AText[1] = 'X')) then
+    LBase := 16;
+    LAt := 2;
+  else
+    if (LEnd > 2) and (AText[0] = '0') and ((AText[1] = 'b') or (AText[1] = 'B')) then
+      LBase := 2;
+      LAt := 2;
+    else
+      if (LEnd > 1) and (AText[0] = '0') then
+        LBase := 8;
+        LAt := 1;
+      end;
+    end;
+  end;
+  LValue := 0;
+  LAny := LBase = 8;
+  while LAt < LEnd do
+    LChar := AText[LAt];
+    LAt := LAt + 1;
+    if LChar = '\'' then
+      skip;
+    end;
+    LDigit := DoDigit(LChar, LBase);
+    if LDigit < 0 then
+      return false;
+    end;
+    LValue := LValue * uint64(LBase) + uint64(LDigit);
+    LAny := true;
+  end;
+  AValue := int64(LValue);
+  return LAny;
+end;
+
+// A field added to ARecord's fields (ACount the count so far, the storage doubling)
+routine DoAddField(var ARecord: CRecord; var ACount: int64; const AField: CField);
+begin
+  if ACount = len(ARecord.Fields) then
+    if ACount = 0 then
+      setlength(ARecord.Fields, 8);
+    else
+      setlength(ARecord.Fields, ACount * 2);
+    end;
+  end;
+  ARecord.Fields[ACount] := AField;
+  ACount := ACount + 1;
+end;
+
+// "struct" or "union"
+routine DoRecordWord(const AUnion: bool): string;
+begin
+  if AUnion then
+    return "union";
+  end;
+  return "struct";
+end;
+
+public type
+  // One import's parse (see the header)
+  CParser = object
+    hidden FReports: ref Diagnostics;
+    hidden FPre: ref Preprocessor;
+    hidden FTarget: ref Target;
+    hidden FTypes: ref CTypeTable;
+    hidden FToks: PpTokenArray;
+    hidden FTokCount: int64;
+    hidden FPos: int64;
+    hidden FBad: bool;
+    hidden FDecls: CDeclArray;
+    hidden FDeclCount: int64;
+    // typedef name -> its decl index + 1
+    hidden FTypedefs: ref StringIdMap;
+    // tag -> its record / enum index + 1
+    hidden FRecordTags: ref StringIdMap;
+    hidden FEnumTags: ref StringIdMap;
+    // enum constant -> its index in FConstValues + 1
+    hidden FConsts: ref StringIdMap;
+    hidden FConstValues: Int64Array;
+    hidden FConstCount: int64;
+
+    init(const AReports: ref Diagnostics; const APre: ref Preprocessor; const ATarget: ref Target);
+    begin
+      self.FReports := AReports;
+      self.FPre := APre;
+      self.FTarget := ATarget;
+      self.FTypes := ref CTypeTable(ATarget);
+      self.FTokCount := 0;
+      self.FPos := 0;
+      self.FBad := false;
+      self.FDeclCount := 0;
+      self.FTypedefs := ref StringIdMap();
+      self.FRecordTags := ref StringIdMap();
+      self.FEnumTags := ref StringIdMap();
+      self.FConsts := ref StringIdMap();
+      self.FConstCount := 0;
+    end;
+
+    // The types the declarations use
+    const method Types(): ref CTypeTable;
+    begin
+      return self.FTypes;
+    end;
+
+    property DeclCount: int64 read FDeclCount;
+
+    // The declaration AIndex (0 .. DeclCount - 1), in the order the headers give them
+    const method Decl(const AIndex: int64): CDecl;
+    begin
+      return self.FDecls[AIndex];
+    end;
+
+    // ---- tokens ----------------------------------------------------------------------------
+
+    // The token at the cursor (an EndOfFile token past the last)
+    hidden const method DoTok(): PpToken;
+    begin
+      return self.FToks[self.FPos];
+    end;
+
+    // The token AAhead places after the cursor (EndOfFile past the last)
+    hidden const method DoPeek(const AAhead: int64): PpToken;
+    begin
+      if self.FPos + AAhead >= self.FTokCount then
+        return self.FToks[self.FTokCount - 1];
+      end;
+      return self.FToks[self.FPos + AAhead];
+    end;
+
+    // True when the token at the cursor is AText (a punctuator or a word)
+    hidden const method DoIs(const AText: string): bool;
+    var
+      LTok: PpToken;
+    begin
+      LTok := self.FToks[self.FPos];
+      return ((LTok.Kind = PpKind.Punct) or (LTok.Kind = PpKind.Identifier)) and
+        (LTok.Text = AText);
+    end;
+
+    // True when the cursor is at the end of the tokens
+    hidden const method DoAtEnd(): bool;
+    begin
+      return self.FToks[self.FPos].Kind = PpKind.EndOfFile;
+    end;
+
+    // The cursor moved one token on (never past the end)
+    hidden method DoNext();
+    begin
+      if self.FPos < self.FTokCount - 1 then
+        self.FPos := self.FPos + 1;
+      end;
+    end;
+
+    // The place of ATok in its header
+    hidden const method DoPlace(const ATok: PpToken): SourcePlace;
+    begin
+      if ATok.File < 0 then
+        return NoPlace();
+      end;
+      return PlaceAt(self.FPre.FileName(ATok.File), ATok.Line, ATok.Column);
+    end;
+
+    // An error at ATok, once per declaration (the first is the one that counts)
+    hidden method DoError(const ACode: string; const ATok: PpToken; const ATemplate: string;
+      const AArgs: MessageArgs);
+    begin
+      if self.FBad then
+        return;
+      end;
+      self.FBad := true;
+      if self.FReports <> nil then
+        self.FReports.Add(Severity.Error, ACode, self.DoPlace(ATok), ATemplate, AArgs);
+      end;
+    end;
+
+    // What a report names a token as ("the end of the headers" for the end)
+    hidden const method DoSpelling(const ATok: PpToken): string;
+    begin
+      if ATok.Kind = PpKind.EndOfFile then
+        return ADAM_MSG_CIMPORT_PARSER_END;
+      end;
+      return ATok.Text;
+    end;
+
+    // The cursor's token taken when it is AText; else CC0001 (or CC0010 at the end), false
+    hidden method DoExpect(const AText: string): bool;
+    begin
+      if self.DoIs(AText) then
+        self.DoNext();
+        return true;
+      end;
+      if self.DoAtEnd() then
+        self.DoError(ADAM_ERR_CIMPORT_PARSER_010, self.DoTok(), ADAM_MSG_CIMPORT_PARSER_EARLY_END,
+          NoArgs());
+        return false;
+      end;
+      self.DoError(ADAM_ERR_CIMPORT_PARSER_001, self.DoTok(), ADAM_MSG_CIMPORT_PARSER_EXPECTED,
+        NoArgs().Str(AText).Str(self.DoSpelling(self.DoTok())));
+      return false;
+    end;
+
+    // The cursor at '(' / '[' / '{' moved past its closer (brackets nested, any kind); false
+    // (CC0010) when the headers end first
+    hidden method DoSkipBalanced(): bool;
+    var
+      LDepth: int64;
+      LText: string;
+    begin
+      LDepth := 0;
+      while not self.DoAtEnd() do
+        LText := self.DoTok().Text;
+        if self.DoTok().Kind = PpKind.Punct then
+          if (LText = "(") or (LText = "[") or (LText = "{") then
+            LDepth := LDepth + 1;
+          end;
+          if (LText = ")") or (LText = "]") or (LText = "}") then
+            LDepth := LDepth - 1;
+          end;
+        end;
+        self.DoNext();
+        if LDepth = 0 then
+          return true;
+        end;
+      end;
+      self.DoError(ADAM_ERR_CIMPORT_PARSER_010, self.DoTok(), ADAM_MSG_CIMPORT_PARSER_EARLY_END,
+        NoArgs());
+      return false;
+    end;
+
+    // The cursor at a nested declarator's '(' moved past its ')': brackets nest, and a ';' or
+    // '{' before the ')' (no declarator holds one) is CC0001 there, false
+    hidden method DoSkipDeclaratorParens(): bool;
+    var
+      LDepth: int64;
+      LText: string;
+    begin
+      LDepth := 0;
+      while not self.DoAtEnd() do
+        LText := self.DoTok().Text;
+        if self.DoTok().Kind = PpKind.Punct then
+          if (LText = ";") or (LText = "{") or (LText = "}") then
+            return self.DoExpect(")");
+          end;
+          if (LText = "(") or (LText = "[") then
+            LDepth := LDepth + 1;
+          end;
+          if (LText = ")") or (LText = "]") then
+            LDepth := LDepth - 1;
+          end;
+        end;
+        self.DoNext();
+        if LDepth = 0 then
+          return true;
+        end;
+      end;
+      return self.DoExpect(")");
+    end;
+
+    // Passed over: every attribute-like word with its parenthesized argument and every ignored
+    // word at the cursor (see DoIsBalancedWord / DoIsIgnoredWord)
+    hidden method DoSkipAttributes();
+    begin
+      while self.DoTok().Kind = PpKind.Identifier do
+        if DoIsIgnoredWord(self.DoTok().Text) then
+          self.DoNext();
+          skip;
+        end;
+        if DoIsBalancedWord(self.DoTok().Text) then
+          self.DoNext();
+          if self.DoIs("(") then
+            self.DoSkipBalanced();
+          end;
+          skip;
+        end;
+        leave;
+      end;
+    end;
+
+    // The cursor moved past the end of a broken declaration: past the next ';' outside
+    // brackets (a bracketed run passed over whole), or past a stray closer
+    hidden method DoRecover();
+    var
+      LText: string;
+    begin
+      while not self.DoAtEnd() do
+        LText := self.DoTok().Text;
+        if self.DoTok().Kind = PpKind.Punct then
+          if LText = ";" then
+            self.DoNext();
+            return;
+          end;
+          if (LText = "(") or (LText = "[") or (LText = "{") then
+            self.DoSkipBalanced();
+            if LText = "{" then
+              if self.DoIs(";") then
+                self.DoNext();
+              end;
+              return;
+            end;
+            skip;
+          end;
+        end;
+        self.DoNext();
+      end;
+    end;
+
+    // ---- declarations ----------------------------------------------------------------------
+
+    // ADecl added at the end
+    hidden method DoAddDecl(const ADecl: CDecl);
+    begin
+      if self.FDeclCount = len(self.FDecls) then
+        if self.FDeclCount = 0 then
+          setlength(self.FDecls, ADAM_CIMPORT_PARSER_FIRST);
+        else
+          setlength(self.FDecls, self.FDeclCount * 2);
+        end;
+      end;
+      self.FDecls[self.FDeclCount] := ADecl;
+      self.FDeclCount := self.FDeclCount + 1;
+    end;
+
+    // A declaration of AKind named AName (at ATok) of ATypeId, with ASpec's storage class
+    hidden method DoDeclare(const AKind: CDeclKind; const AName: string; const ATok: PpToken;
+      const ATypeId: int64; const ASpec: CSpecifiers; const ABody: bool);
+    var
+      LDecl: CDecl;
+    begin
+      LDecl.Kind := AKind;
+      LDecl.Name := AName;
+      LDecl.TypeId := ATypeId;
+      LDecl.File := ATok.File;
+      LDecl.Line := ATok.Line;
+      LDecl.Column := ATok.Column;
+      LDecl.IsStatic := ASpec.IsStatic;
+      LDecl.IsExtern := ASpec.IsExtern;
+      LDecl.IsInline := ASpec.IsInline;
+      LDecl.HasBody := ABody;
+      if (AKind = CDeclKind.Typedef) and (self.FTypedefs.Find(AName) = 0) then
+        self.FTypedefs.Put(AName, self.FDeclCount + 1);
+      end;
+      self.DoAddDecl(LDecl);
+    end;
+
+    // True when AText is a typedef name declared so far
+    hidden const method DoIsTypedefName(const AText: string): bool;
+    begin
+      return self.FTypedefs.Find(AText) > 0;
+    end;
+
+    // True when the cursor starts a type name (a specifier or qualifier word, a typedef name)
+    hidden const method DoStartsTypeName(): bool;
+    var
+      LTok: PpToken;
+    begin
+      LTok := self.DoTok();
+      if LTok.Kind <> PpKind.Identifier then
+        return false;
+      end;
+      return DoIsSpecifierWord(LTok.Text) or self.DoIsTypedefName(LTok.Text);
+    end;
+
+    // The declaration specifiers at the cursor (see the header)
+    hidden method DoSpecifiers(): CSpecifiers;
+    var
+      LSpec: CSpecifiers;
+      LText: string;
+      LStart: PpToken;
+      LTypeId: int64;
+      LVoid: bool;
+      LChar: bool;
+      LShort: bool;
+      LInt: bool;
+      LLongs: int64;
+      LSigned: bool;
+      LUnsigned: bool;
+      LFloat: bool;
+      LDouble: bool;
+      LBool: bool;
+      LInt128: bool;
+      LComplex: bool;
+      LConst: bool;
+      LVolatile: bool;
+      LAtomic: bool;
+      LBasic: bool;
+      LKind: CTypeKind;
+    begin
+      LSpec.TypeId := ADAM_CIMPORT_NONE;
+      LSpec.IsTypedef := false;
+      LSpec.IsStatic := false;
+      LSpec.IsExtern := false;
+      LSpec.IsInline := false;
+      LSpec.Ok := false;
+      LStart := self.DoTok();
+      LTypeId := ADAM_CIMPORT_NONE;
+      LVoid := false;
+      LChar := false;
+      LShort := false;
+      LInt := false;
+      LLongs := 0;
+      LSigned := false;
+      LUnsigned := false;
+      LFloat := false;
+      LDouble := false;
+      LBool := false;
+      LInt128 := false;
+      LComplex := false;
+      LConst := false;
+      LVolatile := false;
+      LAtomic := false;
+      while self.DoTok().Kind = PpKind.Identifier do
+        LText := self.DoTok().Text;
+        LBasic := LVoid or LChar or LShort or LInt or (LLongs > 0) or LSigned or LUnsigned or
+          LFloat or LDouble or LBool or LInt128 or LComplex;
+        if LText = "typedef" then
+          LSpec.IsTypedef := true;
+        else
+          if LText = "extern" then
+            LSpec.IsExtern := true;
+          else
+            if LText = "static" then
+              LSpec.IsStatic := true;
+            else
+              if (LText = "inline") or (LText = "__inline") or (LText = "__inline__") or
+                (LText = "__forceinline") then
+                LSpec.IsInline := true;
+              else
+                if (LText = "auto") or (LText = "register") or (LText = "_Thread_local") or
+                  (LText = "thread_local") or (LText = "__thread") or (LText = "constexpr") then
+                  self.DoNext();
+                  skip;
+                else
+                  if (LText = "const") or (LText = "__const") or (LText = "__const__") then
+                    LConst := true;
+                  else
+                    if (LText = "volatile") or (LText = "__volatile") or (LText = "__volatile__") then
+                      LVolatile := true;
+                    else
+                      if LText = "_Atomic" then
+                        if self.DoPeek(1).Text = "(" then
+                          self.DoError(ADAM_ERR_CIMPORT_PARSER_009, self.DoTok(),
+                            ADAM_MSG_CIMPORT_PARSER_UNSUPPORTED, NoArgs().Str("_Atomic(type)"));
+                          return LSpec;
+                        end;
+                        LAtomic := true;
+                      else
+                        if DoIsIgnoredWord(LText) or DoIsBalancedWord(LText) then
+                          self.DoSkipAttributes();
+                          skip;
+                        else
+                          if not self.DoTypeWord(LText, LVoid, LChar, LShort, LInt, LLongs,
+                            LSigned, LUnsigned, LFloat, LDouble, LBool, LInt128, LComplex) then
+                            if (LText = "struct") or (LText = "union") or (LText = "enum") then
+                              if (LTypeId <> ADAM_CIMPORT_NONE) or LBasic then
+                                self.DoError(ADAM_ERR_CIMPORT_PARSER_003, self.DoTok(),
+                                  ADAM_MSG_CIMPORT_PARSER_COMBINE, NoArgs().Str(LText));
+                                return LSpec;
+                              end;
+                              if LText = "enum" then
+                                LTypeId := self.DoEnumSpecifier();
+                              else
+                                LTypeId := self.DoRecordSpecifier();
+                              end;
+                              if LTypeId = ADAM_CIMPORT_NONE then
+                                return LSpec;
+                              end;
+                              skip;
+                            end;
+                            if (LText = "typeof") or (LText = "__typeof__") or
+                              (LText = "__typeof") or (LText = "typeof_unqual") or
+                              (LText = "_BitInt") or (LText = "_Decimal32") or
+                              (LText = "_Decimal64") or (LText = "_Decimal128") or
+                              (LText = "__auto_type") then
+                              self.DoError(ADAM_ERR_CIMPORT_PARSER_009, self.DoTok(),
+                                ADAM_MSG_CIMPORT_PARSER_UNSUPPORTED, NoArgs().Str(LText));
+                              return LSpec;
+                            end;
+                            if (LTypeId = ADAM_CIMPORT_NONE) and not LBasic and
+                              (LText = "__builtin_va_list") then
+                              LTypeId := self.FTypes.Add(CTypeKind.VaList, ADAM_CIMPORT_NONE);
+                              self.DoNext();
+                              skip;
+                            end;
+                            if (LTypeId = ADAM_CIMPORT_NONE) and not LBasic and
+                              self.DoIsTypedefName(LText) then
+                              LTypeId := self.FTypes.Add(CTypeKind.Named,
+                                self.FDecls[self.FTypedefs.Find(LText) - 1].TypeId);
+                              self.DoSetIndex(LTypeId, self.FTypedefs.Find(LText) - 1);
+                              self.DoNext();
+                              skip;
+                            end;
+                            leave;
+                          end;
+                          if LTypeId <> ADAM_CIMPORT_NONE then
+                            self.DoError(ADAM_ERR_CIMPORT_PARSER_003, self.DoTok(),
+                              ADAM_MSG_CIMPORT_PARSER_COMBINE, NoArgs().Str(LText));
+                            return LSpec;
+                          end;
+                        end;
+                      end;
+                    end;
+                  end;
+                end;
+              end;
+            end;
+          end;
+        end;
+        self.DoNext();
+      end;
+      LBasic := LVoid or LChar or LShort or LInt or (LLongs > 0) or LSigned or LUnsigned or
+        LFloat or LDouble or LBool or LInt128 or LComplex;
+      if LTypeId = ADAM_CIMPORT_NONE then
+        if not LBasic then
+          if self.DoTok().Kind = PpKind.Identifier then
+            self.DoError(ADAM_ERR_CIMPORT_PARSER_002, self.DoTok(), ADAM_MSG_CIMPORT_PARSER_NO_TYPE,
+              NoArgs().Str(self.DoTok().Text));
+          else
+            self.DoError(ADAM_ERR_CIMPORT_PARSER_002, LStart, ADAM_MSG_CIMPORT_PARSER_NO_TYPE,
+              NoArgs().Str(self.DoSpelling(LStart)));
+          end;
+          return LSpec;
+        end;
+        if not self.DoBasicKind(LStart, LVoid, LChar, LShort, LInt, LLongs, LSigned, LUnsigned,
+          LFloat, LDouble, LBool, LInt128, LComplex, LKind) then
+          return LSpec;
+        end;
+        LTypeId := self.FTypes.Add(LKind, ADAM_CIMPORT_NONE);
+      end;
+      LSpec.TypeId := self.FTypes.Qualified(LTypeId, LConst, LVolatile, LAtomic);
+      LSpec.Ok := true;
+      return LSpec;
+    end;
+
+    // The type AId's Index set to AIndex (a Named type's typedef decl)
+    hidden method DoSetIndex(const AId: int64; const AIndex: int64);
+    var
+      LType: CType;
+    begin
+      LType := self.FTypes.Item(AId);
+      LType.Index := AIndex;
+      self.FTypes.Put(AId, LType);
+    end;
+
+    // True (the flag set) when AText is one of the fundamental type words
+    hidden method DoTypeWord(const AText: string; var AVoid: bool; var AChar: bool;
+      var AShort: bool; var AInt: bool; var ALongs: int64; var ASigned: bool;
+      var AUnsigned: bool; var AFloat: bool; var ADouble: bool; var ABool: bool;
+      var AInt128: bool; var AComplex: bool): bool;
+    begin
+      match AText of
+        "void": AVoid := true;
+        "char", "__int8": AChar := true;
+        "short", "__int16": AShort := true;
+        "int", "__int32": AInt := true;
+        "long": ALongs := ALongs + 1;
+        "__int64": ALongs := 2;
+        "signed", "__signed", "__signed__": ASigned := true;
+        "unsigned": AUnsigned := true;
+        "float": AFloat := true;
+        "double": ADouble := true;
+        "_Bool", "bool": ABool := true;
+        "__int128": AInt128 := true;
+        "_Complex", "__complex__": AComplex := true;
+      else
+        return false;
+      end;
+      return true;
+    end;
+
+    // The fundamental kind the type words name in AKind; false (CC0003 at AAt) when they do not
+    // make one (C's table of valid multisets)
+    hidden method DoBasicKind(const AAt: PpToken; const AVoid: bool; const AChar: bool;
+      const AShort: bool; const AInt: bool; const ALongs: int64; const ASigned: bool;
+      const AUnsigned: bool; const AFloat: bool; const ADouble: bool; const ABool: bool;
+      const AInt128: bool; const AComplex: bool; var AKind: CTypeKind): bool;
+    var
+      LIntegerWords: int64;
+      LOk: bool;
+    begin
+      LOk := not (ASigned and AUnsigned) and (ALongs <= 2);
+      LIntegerWords := 0;
+      if AChar then
+        LIntegerWords := LIntegerWords + 1;
+      end;
+      if AShort then
+        LIntegerWords := LIntegerWords + 1;
+      end;
+      if ALongs > 0 then
+        LIntegerWords := LIntegerWords + 1;
+      end;
+      if AInt128 then
+        LIntegerWords := LIntegerWords + 1;
+      end;
+      if LIntegerWords > 1 then
+        LOk := false;
+      end;
+      if AVoid or ABool or AFloat or ADouble then
+        if AChar or AShort or AInt or AInt128 or ASigned or AUnsigned then
+          LOk := false;
+        end;
+        if (ALongs > 0) and not (ADouble and (ALongs = 1)) then
+          LOk := false;
+        end;
+        if (AVoid and (ABool or AFloat or ADouble)) or (ABool and (AFloat or ADouble)) or
+          (AFloat and ADouble) then
+          LOk := false;
+        end;
+      end;
+      if AComplex and not (AFloat or ADouble) then
+        LOk := false;
+      end;
+      if not LOk then
+        self.DoError(ADAM_ERR_CIMPORT_PARSER_003, AAt, ADAM_MSG_CIMPORT_PARSER_BAD_TYPE, NoArgs());
+        return false;
+      end;
+      if AComplex then
+        AKind := CTypeKind.Complex;
+        return true;
+      end;
+      if AVoid then
+        AKind := CTypeKind.Void;
+        return true;
+      end;
+      if ABool then
+        AKind := CTypeKind.Bool;
+        return true;
+      end;
+      if AFloat then
+        AKind := CTypeKind.Float;
+        return true;
+      end;
+      if ADouble then
+        AKind := CTypeKind.Double;
+        if ALongs = 1 then
+          AKind := CTypeKind.LongDouble;
+        end;
+        return true;
+      end;
+      if AChar then
+        AKind := CTypeKind.Char;
+        if ASigned then
+          AKind := CTypeKind.SChar;
+        end;
+        if AUnsigned then
+          AKind := CTypeKind.UChar;
+        end;
+        return true;
+      end;
+      if AShort then
+        AKind := CTypeKind.Short;
+        if AUnsigned then
+          AKind := CTypeKind.UShort;
+        end;
+        return true;
+      end;
+      if AInt128 then
+        AKind := CTypeKind.Int128;
+        if AUnsigned then
+          AKind := CTypeKind.UInt128;
+        end;
+        return true;
+      end;
+      if ALongs = 1 then
+        AKind := CTypeKind.Long;
+        if AUnsigned then
+          AKind := CTypeKind.ULong;
+        end;
+        return true;
+      end;
+      if ALongs = 2 then
+        AKind := CTypeKind.LongLong;
+        if AUnsigned then
+          AKind := CTypeKind.ULongLong;
+        end;
+        return true;
+      end;
+      AKind := CTypeKind.Int;
+      if AUnsigned then
+        AKind := CTypeKind.UInt;
+      end;
+      return true;
+    end;
+
+    // A struct or union specifier at the cursor (its word first): the record's type, its
+    // body read when one is given; ADAM_CIMPORT_NONE when it is not valid (reported)
+    hidden method DoRecordSpecifier(): int64;
+    var
+      LUnion: bool;
+      LWord: PpToken;
+      LTag: string;
+      LIndex: int64;
+      LRecord: CRecord;
+      LId: int64;
+    begin
+      LWord := self.DoTok();
+      LUnion := LWord.Text = "union";
+      self.DoNext();
+      self.DoSkipAttributes();
+      LTag := "";
+      if (self.DoTok().Kind = PpKind.Identifier) and not DoIsBalancedWord(self.DoTok().Text) then
+        LTag := self.DoTok().Text;
+        LWord := self.DoTok();
+        self.DoNext();
+      end;
+      self.DoSkipAttributes();
+      if (LTag = "") and not self.DoIs("{") then
+        self.DoExpect("{");
+        return ADAM_CIMPORT_NONE;
+      end;
+      LIndex := -1;
+      if LTag <> "" then
+        LIndex := self.FRecordTags.Find(LTag) - 1;
+      end;
+      if LIndex < 0 then
+        LIndex := self.FTypes.AddRecord(LTag, LUnion, LWord.File, LWord.Line, LWord.Column);
+        if LTag <> "" then
+          self.FRecordTags.Put(LTag, LIndex + 1);
+        end;
+      else
+        if self.FTypes.RecordAt(LIndex).IsUnion <> LUnion then
+          self.DoError(ADAM_ERR_CIMPORT_PARSER_007, LWord, ADAM_MSG_CIMPORT_PARSER_TAG_KIND,
+            NoArgs().Str(LTag).Str(DoRecordWord(not LUnion)));
+          return ADAM_CIMPORT_NONE;
+        end;
+      end;
+      if self.DoIs("{") then
+        LRecord := self.FTypes.RecordAt(LIndex);
+        if LRecord.Complete then
+          self.DoError(ADAM_ERR_CIMPORT_PARSER_008, LWord, ADAM_MSG_CIMPORT_PARSER_TWICE,
+            NoArgs().Str(DoRecordWord(LUnion)).Str(LTag));
+          return ADAM_CIMPORT_NONE;
+        end;
+        // the place a record is defined is where its body is
+        LRecord.File := LWord.File;
+        LRecord.Line := LWord.Line;
+        LRecord.Column := LWord.Column;
+        if not self.DoRecordBody(LRecord) then
+          return ADAM_CIMPORT_NONE;
+        end;
+        LRecord.Complete := true;
+        self.FTypes.PutRecord(LIndex, LRecord);
+        self.DoSkipAttributes();
+      end;
+      LId := self.FTypes.Add(CTypeKind.Record, ADAM_CIMPORT_NONE);
+      self.DoSetIndex(LId, LIndex);
+      return LId;
+    end;
+
+    // A record body at the cursor ('{' .. '}') read into ARecord's fields; false when not
+    // valid (reported)
+    hidden method DoRecordBody(var ARecord: CRecord): bool;
+    var
+      LSpec: CSpecifiers;
+      LField: CField;
+      LCount: int64;
+      LName: string;
+      LNameTok: PpToken;
+      LTypeId: int64;
+      LWidth: int64;
+      LResolved: CType;
+    begin
+      self.DoNext();
+      LCount := 0;
+      setlength(ARecord.Fields, 0);
+      while not self.DoIs("}") do
+        if self.DoAtEnd() then
+          self.DoExpect("}");
+          return false;
+        end;
+        if self.DoTok().Kind = PpKind.Pragma then
+          self.DoNext();
+          skip;
+        end;
+        if self.DoIs(";") then
+          self.DoNext();
+          skip;
+        end;
+        if self.DoIs("_Static_assert") or self.DoIs("static_assert") then
+          if not self.DoStaticAssert() then
+            return false;
+          end;
+          skip;
+        end;
+        LSpec := self.DoSpecifiers();
+        if not LSpec.Ok then
+          return false;
+        end;
+        if self.DoIs(";") then
+          // a member with no declarator: an anonymous struct / union member (C11)
+          self.DoNext();
+          if self.FTypes.Item(LSpec.TypeId).Kind = CTypeKind.Record then
+            LField.Name := "";
+            LField.TypeId := LSpec.TypeId;
+            LField.BitWidth := -1;
+            LField.Offset := 0;
+            LField.File := ARecord.File;
+            LField.Line := ARecord.Line;
+            LField.Column := ARecord.Column;
+            DoAddField(ARecord, LCount, LField);
+          end;
+          skip;
+        end;
+        while true do
+          LName := "";
+          LNameTok := self.DoTok();
+          LTypeId := LSpec.TypeId;
+          if not self.DoIs(":") then
+            LTypeId := self.DoDeclarator(LSpec.TypeId, LName, LNameTok);
+            if LTypeId = ADAM_CIMPORT_NONE then
+              return false;
+            end;
+          end;
+          LWidth := -1;
+          if self.DoIs(":") then
+            self.DoNext();
+            if not self.DoConstant(LWidth) then
+              return false;
+            end;
+            ARecord.HasBitfields := true;
+          end;
+          self.DoSkipAttributes();
+          LResolved := self.FTypes.Item(self.FTypes.Resolved(LTypeId));
+          if (LResolved.Kind = CTypeKind.Array) and (LResolved.Count < 0) then
+            ARecord.HasFlexible := true;
+          end;
+          LField.Name := LName;
+          LField.TypeId := LTypeId;
+          LField.BitWidth := LWidth;
+          LField.Offset := 0;
+          LField.File := LNameTok.File;
+          LField.Line := LNameTok.Line;
+          LField.Column := LNameTok.Column;
+          DoAddField(ARecord, LCount, LField);
+          if self.DoIs(",") then
+            self.DoNext();
+            skip;
+          end;
+          leave;
+        end;
+        if not self.DoExpect(";") then
+          return false;
+        end;
+      end;
+      setlength(ARecord.Fields, LCount);
+      self.DoNext();
+      return true;
+    end;
+
+    // An enum specifier at the cursor ('enum' first): the enum's type, its body read when one is
+    // given; ADAM_CIMPORT_NONE when it is not valid (reported)
+    hidden method DoEnumSpecifier(): int64;
+    var
+      LWord: PpToken;
+      LTag: string;
+      LIndex: int64;
+      LEnum: CEnum;
+      LFixed: CSpecifiers;
+      LHasFixed: bool;
+      LName: PpToken;
+      LValue: int64;
+      LCount: int64;
+      LId: int64;
+    begin
+      LWord := self.DoTok();
+      self.DoNext();
+      self.DoSkipAttributes();
+      LTag := "";
+      if (self.DoTok().Kind = PpKind.Identifier) and not DoIsBalancedWord(self.DoTok().Text) then
+        LTag := self.DoTok().Text;
+        LWord := self.DoTok();
+        self.DoNext();
+      end;
+      self.DoSkipAttributes();
+      LHasFixed := false;
+      if self.DoIs(":") then
+        self.DoNext();
+        LFixed := self.DoSpecifiers();
+        if not LFixed.Ok then
+          return ADAM_CIMPORT_NONE;
+        end;
+        LHasFixed := true;
+      end;
+      if (LTag = "") and not self.DoIs("{") then
+        self.DoExpect("{");
+        return ADAM_CIMPORT_NONE;
+      end;
+      LIndex := -1;
+      if LTag <> "" then
+        LIndex := self.FEnumTags.Find(LTag) - 1;
+      end;
+      if LIndex < 0 then
+        LIndex := self.FTypes.AddEnum(LTag, LWord.File, LWord.Line, LWord.Column);
+        if LTag <> "" then
+          self.FEnumTags.Put(LTag, LIndex + 1);
+        end;
+      end;
+      if self.DoIs("{") then
+        LEnum := self.FTypes.EnumAt(LIndex);
+        if LEnum.Complete then
+          self.DoError(ADAM_ERR_CIMPORT_PARSER_008, LWord, ADAM_MSG_CIMPORT_PARSER_TWICE,
+            NoArgs().Str("enum").Str(LTag));
+          return ADAM_CIMPORT_NONE;
+        end;
+        LEnum.File := LWord.File;
+        LEnum.Line := LWord.Line;
+        LEnum.Column := LWord.Column;
+        self.DoNext();
+        LValue := -1;
+        LCount := 0;
+        setlength(LEnum.Names, 0);
+        setlength(LEnum.Values, 0);
+        while not self.DoIs("}") do
+          LName := self.DoTok();
+          if LName.Kind <> PpKind.Identifier then
+            self.DoExpect("}");
+            return ADAM_CIMPORT_NONE;
+          end;
+          self.DoNext();
+          self.DoSkipAttributes();
+          if self.DoIs("=") then
+            self.DoNext();
+            if not self.DoConstant(LValue) then
+              return ADAM_CIMPORT_NONE;
+            end;
+          else
+            LValue := LValue + 1;
+          end;
+          if LCount = len(LEnum.Names) then
+            setlength(LEnum.Names, LCount * 2 + 8);
+            setlength(LEnum.Values, LCount * 2 + 8);
+          end;
+          LEnum.Names[LCount] := LName.Text;
+          LEnum.Values[LCount] := LValue;
+          LCount := LCount + 1;
+          self.DoAddConst(LName.Text, LValue);
+          if self.DoIs(",") then
+            self.DoNext();
+            skip;
+          end;
+          if not self.DoIs("}") then
+            self.DoExpect("}");
+            return ADAM_CIMPORT_NONE;
+          end;
+        end;
+        self.DoNext();
+        self.DoSkipAttributes();
+        setlength(LEnum.Names, LCount);
+        setlength(LEnum.Values, LCount);
+        LEnum.Complete := true;
+        self.FTypes.PutEnum(LIndex, LEnum);
+        self.FTypes.SetEnumUnderlying(LIndex);
+        if LHasFixed then
+          LEnum := self.FTypes.EnumAt(LIndex);
+          LEnum.Underlying := self.FTypes.Item(self.FTypes.Resolved(LFixed.TypeId)).Kind;
+          self.FTypes.PutEnum(LIndex, LEnum);
+        end;
+      end;
+      LId := self.FTypes.Add(CTypeKind.Enum, ADAM_CIMPORT_NONE);
+      self.DoSetIndex(LId, LIndex);
+      return LId;
+    end;
+
+    // An enum constant AName of AValue, known to later constant expressions
+    hidden method DoAddConst(const AName: string; const AValue: int64);
+    begin
+      if self.FConstCount = len(self.FConstValues) then
+        if self.FConstCount = 0 then
+          setlength(self.FConstValues, ADAM_CIMPORT_PARSER_FIRST);
+        else
+          setlength(self.FConstValues, self.FConstCount * 2);
+        end;
+      end;
+      self.FConstValues[self.FConstCount] := AValue;
+      self.FConstCount := self.FConstCount + 1;
+      self.FConsts.Put(AName, self.FConstCount);
+    end;
+
+    // _Static_assert ( .. ) ; at the cursor passed over; false when not valid (reported)
+    hidden method DoStaticAssert(): bool;
+    begin
+      self.DoNext();
+      if not self.DoIs("(") then
+        return self.DoExpect("(");
+      end;
+      if not self.DoSkipBalanced() then
+        return false;
+      end;
+      return self.DoExpect(";");
+    end;
+
+    // True when the '(' at the cursor opens a nested declarator (not a parameter list): the
+    // token after it is '*', '(', '[', '^', an attribute or ignored word, or a name that is no
+    // type
+    hidden const method DoNestedStart(): bool;
+    var
+      LTok: PpToken;
+    begin
+      LTok := self.DoPeek(1);
+      if LTok.Kind = PpKind.Punct then
+        return (LTok.Text = "*") or (LTok.Text = "(") or (LTok.Text = "[") or (LTok.Text = "^");
+      end;
+      if LTok.Kind = PpKind.Identifier then
+        if DoIsIgnoredWord(LTok.Text) or DoIsBalancedWord(LTok.Text) then
+          return true;
+        end;
+        return not DoIsSpecifierWord(LTok.Text) and not self.DoIsTypedefName(LTok.Text);
+      end;
+      return false;
+    end;
+
+    // A declarator at the cursor over the type ABase (see the header): its name in AName ("" for
+    // an abstract one) at ANameTok, its type; ADAM_CIMPORT_NONE when not valid (reported)
+    hidden method DoDeclarator(const ABase: int64; var AName: string; var ANameTok: PpToken): int64;
+    var
+      LBase: int64;
+      LConst: bool;
+      LVolatile: bool;
+      LAtomic: bool;
+      LInner: int64;
+      LAfter: int64;
+      LType: int64;
+    begin
+      LBase := ABase;
+      self.DoSkipAttributes();
+      while self.DoIs("*") do
+        self.DoNext();
+        LConst := false;
+        LVolatile := false;
+        LAtomic := false;
+        while self.DoTok().Kind = PpKind.Identifier do
+          if DoIsQualifier(self.DoTok().Text) then
+            if (self.DoTok().Text = "volatile") or (self.DoTok().Text = "__volatile") or
+              (self.DoTok().Text = "__volatile__") then
+              LVolatile := true;
+            else
+              if self.DoTok().Text = "_Atomic" then
+                LAtomic := true;
+              else
+                LConst := true;
+              end;
+            end;
+            self.DoNext();
+            skip;
+          end;
+          if DoIsIgnoredWord(self.DoTok().Text) or DoIsBalancedWord(self.DoTok().Text) then
+            self.DoSkipAttributes();
+            skip;
+          end;
+          leave;
+        end;
+        LBase := self.FTypes.Qualified(self.FTypes.Add(CTypeKind.Pointer, LBase), LConst,
+          LVolatile, LAtomic);
+      end;
+      self.DoSkipAttributes();
+      if self.DoIs("(") and self.DoNestedStart() then
+        self.DoNext();
+        LInner := self.FPos;
+        self.FPos := LInner - 1;
+        if not self.DoSkipDeclaratorParens() then
+          return ADAM_CIMPORT_NONE;
+        end;
+        LType := self.DoSuffixes(LBase);
+        if LType = ADAM_CIMPORT_NONE then
+          return ADAM_CIMPORT_NONE;
+        end;
+        LAfter := self.FPos;
+        self.FPos := LInner;
+        LType := self.DoDeclarator(LType, AName, ANameTok);
+        if LType = ADAM_CIMPORT_NONE then
+          return ADAM_CIMPORT_NONE;
+        end;
+        if not self.DoExpect(")") then
+          return ADAM_CIMPORT_NONE;
+        end;
+        self.FPos := LAfter;
+        return LType;
+      end;
+      if (self.DoTok().Kind = PpKind.Identifier) and not DoIsSpecifierWord(self.DoTok().Text) then
+        AName := self.DoTok().Text;
+        ANameTok := self.DoTok();
+        self.DoNext();
+      end;
+      return self.DoSuffixes(LBase);
+    end;
+
+    // A direct declarator's suffixes at the cursor ([..] and (..), attributes between) made
+    // into a type over ABase, the last suffix innermost; ADAM_CIMPORT_NONE when not valid
+    hidden method DoSuffixes(const ABase: int64): int64;
+    var
+      LSuffixes: CSuffixArray;
+      LCount: int64;
+      LSuffix: CSuffix;
+      LType: int64;
+      LItem: CType;
+      LI: int64;
+    begin
+      LCount := 0;
+      while true do
+        self.DoSkipAttributes();
+        if self.DoIs("[") then
+          self.DoNext();
+          while (self.DoTok().Kind = PpKind.Identifier) and ((self.DoTok().Text = "static") or
+            DoIsQualifier(self.DoTok().Text) or DoIsIgnoredWord(self.DoTok().Text)) do
+            self.DoNext();
+          end;
+          LSuffix.IsFunction := false;
+          LSuffix.Count := -1;
+          setlength(LSuffix.Params, 0);
+          LSuffix.Variadic := false;
+          LSuffix.NoPrototype := false;
+          if self.DoIs("*") and (self.DoPeek(1).Text = "]") then
+            self.DoNext();
+          end;
+          if not self.DoIs("]") then
+            if not self.DoConstant(LSuffix.Count) then
+              return ADAM_CIMPORT_NONE;
+            end;
+            if LSuffix.Count < 0 then
+              self.DoError(ADAM_ERR_CIMPORT_PARSER_006, self.DoTok(),
+                ADAM_MSG_CIMPORT_PARSER_ARRAY_SIZE, NoArgs().Int(LSuffix.Count));
+              return ADAM_CIMPORT_NONE;
+            end;
+          end;
+          if not self.DoExpect("]") then
+            return ADAM_CIMPORT_NONE;
+          end;
+          if LCount = len(LSuffixes) then
+            setlength(LSuffixes, LCount * 2 + 4);
+          end;
+          LSuffixes[LCount] := LSuffix;
+          LCount := LCount + 1;
+          skip;
+        end;
+        if self.DoIs("(") then
+          if not self.DoParams(LSuffix) then
+            return ADAM_CIMPORT_NONE;
+          end;
+          if LCount = len(LSuffixes) then
+            setlength(LSuffixes, LCount * 2 + 4);
+          end;
+          LSuffixes[LCount] := LSuffix;
+          LCount := LCount + 1;
+          skip;
+        end;
+        leave;
+      end;
+      LType := ABase;
+      for LI := LCount - 1 downto 0 do
+        if LSuffixes[LI].IsFunction then
+          LType := self.FTypes.Add(CTypeKind.Function, LType);
+          LItem := self.FTypes.Item(LType);
+          LItem.Params := LSuffixes[LI].Params;
+          LItem.Variadic := LSuffixes[LI].Variadic;
+          LItem.NoPrototype := LSuffixes[LI].NoPrototype;
+          self.FTypes.Put(LType, LItem);
+        else
+          LType := self.FTypes.Add(CTypeKind.Array, LType);
+          LItem := self.FTypes.Item(LType);
+          LItem.Count := LSuffixes[LI].Count;
+          self.FTypes.Put(LType, LItem);
+        end;
+      end;
+      return LType;
+    end;
+
+    // A parameter list at the cursor ('(' .. ')') into ASuffix as a function suffix; false when
+    // not valid (reported)
+    hidden method DoParams(var ASuffix: CSuffix): bool;
+    var
+      LSpec: CSpecifiers;
+      LParam: CParam;
+      LCount: int64;
+      LNameTok: PpToken;
+      LTypeId: int64;
+      LResolved: CType;
+    begin
+      ASuffix.IsFunction := true;
+      ASuffix.Count := -1;
+      ASuffix.Variadic := false;
+      ASuffix.NoPrototype := false;
+      setlength(ASuffix.Params, 0);
+      self.DoNext();
+      if self.DoIs(")") then
+        ASuffix.NoPrototype := true;
+        self.DoNext();
+        return true;
+      end;
+      if self.DoIs("void") and (self.DoPeek(1).Text = ")") then
+        self.DoNext();
+        self.DoNext();
+        return true;
+      end;
+      LCount := 0;
+      while true do
+        if self.DoIs("...") then
+          ASuffix.Variadic := true;
+          self.DoNext();
+          leave;
+        end;
+        LSpec := self.DoSpecifiers();
+        if not LSpec.Ok then
+          return false;
+        end;
+        LParam.Name := "";
+        LNameTok := self.DoTok();
+        LTypeId := self.DoDeclarator(LSpec.TypeId, LParam.Name, LNameTok);
+        if LTypeId = ADAM_CIMPORT_NONE then
+          return false;
+        end;
+        self.DoSkipAttributes();
+        // C's adjustments: an array parameter is a pointer to its element, a function one a
+        // pointer to the function
+        LResolved := self.FTypes.Item(self.FTypes.Resolved(LTypeId));
+        if LResolved.Kind = CTypeKind.Array then
+          LTypeId := self.FTypes.Add(CTypeKind.Pointer, LResolved.Base);
+        end;
+        if LResolved.Kind = CTypeKind.Function then
+          LTypeId := self.FTypes.Add(CTypeKind.Pointer, LTypeId);
+        end;
+        LParam.TypeId := LTypeId;
+        if LCount = len(ASuffix.Params) then
+          setlength(ASuffix.Params, LCount * 2 + 4);
+        end;
+        ASuffix.Params[LCount] := LParam;
+        LCount := LCount + 1;
+        if self.DoIs(",") then
+          self.DoNext();
+          skip;
+        end;
+        leave;
+      end;
+      setlength(ASuffix.Params, LCount);
+      return self.DoExpect(")");
+    end;
+
+    // A type name at the cursor (sizeof, a cast): specifiers and an abstract declarator; its
+    // type, ADAM_CIMPORT_NONE when not valid (reported)
+    hidden method DoTypeName(): int64;
+    var
+      LSpec: CSpecifiers;
+      LName: string;
+      LNameTok: PpToken;
+    begin
+      LSpec := self.DoSpecifiers();
+      if not LSpec.Ok then
+        return ADAM_CIMPORT_NONE;
+      end;
+      LName := "";
+      LNameTok := self.DoTok();
+      return self.DoDeclarator(LSpec.TypeId, LName, LNameTok);
+    end;
+
+    // An initializer (after '=') passed over: to the next ',' or ';' outside brackets
+    hidden method DoSkipInitializer();
+    var
+      LText: string;
+    begin
+      while not self.DoAtEnd() do
+        LText := self.DoTok().Text;
+        if self.DoTok().Kind = PpKind.Punct then
+          if (LText = ",") or (LText = ";") then
+            return;
+          end;
+          if (LText = "(") or (LText = "[") or (LText = "{") then
+            self.DoSkipBalanced();
+            skip;
+          end;
+        end;
+        self.DoNext();
+      end;
+    end;
+
+    // One file-scope declaration at the cursor; false when not valid (reported)
+    hidden method DoExternal(): bool;
+    var
+      LSpec: CSpecifiers;
+      LName: string;
+      LNameTok: PpToken;
+      LTypeId: int64;
+      LKind: CTypeKind;
+      LType: CType;
+    begin
+      if (self.DoTok().Kind = PpKind.Pragma) or self.DoIs(";") then
+        self.DoNext();
+        return true;
+      end;
+      if self.DoIs("_Static_assert") or self.DoIs("static_assert") then
+        return self.DoStaticAssert();
+      end;
+      if self.DoIs("asm") or self.DoIs("__asm") or self.DoIs("__asm__") then
+        self.DoNext();
+        self.DoSkipAttributes();
+        if self.DoIs("(") and not self.DoSkipBalanced() then
+          return false;
+        end;
+        return self.DoExpect(";");
+      end;
+      LSpec := self.DoSpecifiers();
+      if not LSpec.Ok then
+        return false;
+      end;
+      if self.DoIs(";") then
+        LKind := self.FTypes.Item(LSpec.TypeId).Kind;
+        if (LKind = CTypeKind.Record) or (LKind = CTypeKind.Enum) then
+          self.DoDeclare(CDeclKind.Tag, "", self.DoTok(), LSpec.TypeId, LSpec, false);
+        end;
+        self.DoNext();
+        return true;
+      end;
+      while true do
+        LName := "";
+        LNameTok := self.DoTok();
+        LTypeId := self.DoDeclarator(LSpec.TypeId, LName, LNameTok);
+        if LTypeId = ADAM_CIMPORT_NONE then
+          return false;
+        end;
+        if LName = "" then
+          self.DoError(ADAM_ERR_CIMPORT_PARSER_011, LNameTok, ADAM_MSG_CIMPORT_PARSER_NO_NAME,
+            NoArgs().Str(self.DoSpelling(LNameTok)));
+          return false;
+        end;
+        self.DoSkipAttributes();
+        LType := self.FTypes.Item(LTypeId);
+        if LSpec.IsTypedef then
+          self.DoDeclare(CDeclKind.Typedef, LName, LNameTok, LTypeId, LSpec, false);
+        else
+          if LType.Kind = CTypeKind.Function then
+            if self.DoIs("{") then
+              self.DoDeclare(CDeclKind.Routine, LName, LNameTok, LTypeId, LSpec, true);
+              return self.DoSkipBalanced();
+            end;
+            self.DoDeclare(CDeclKind.Routine, LName, LNameTok, LTypeId, LSpec, false);
+          else
+            if self.DoIs("=") then
+              self.DoNext();
+              self.DoSkipInitializer();
+            end;
+            self.DoDeclare(CDeclKind.Variable, LName, LNameTok, LTypeId, LSpec, false);
+          end;
+        end;
+        if self.DoIs(",") then
+          self.DoNext();
+          skip;
+        end;
+        leave;
+      end;
+      return self.DoExpect(";");
+    end;
+
+    // The preprocessor's tokens parsed (see the header); false when a declaration was not
+    // valid (every one reported)
+    method Parse(): bool;
+    var
+      LEnd: PpToken;
+      LOk: bool;
+      LI: int64;
+    begin
+      self.FTokCount := self.FPre.Count() + 1;
+      setlength(self.FToks, self.FTokCount);
+      for LI := 0 to self.FTokCount - 2 do
+        self.FToks[LI] := self.FPre.Token(LI);
+      end;
+      LEnd.Kind := PpKind.EndOfFile;
+      LEnd.Text := "";
+      LEnd.File := -1;
+      LEnd.Line := 0;
+      LEnd.Column := 0;
+      LEnd.Space := false;
+      LEnd.LineStart := true;
+      LEnd.Hide := 0;
+      if self.FTokCount > 1 then
+        LEnd.File := self.FToks[self.FTokCount - 2].File;
+        LEnd.Line := self.FToks[self.FTokCount - 2].Line;
+        LEnd.Column := self.FToks[self.FTokCount - 2].Column;
+      end;
+      self.FToks[self.FTokCount - 1] := LEnd;
+      self.FPos := 0;
+      LOk := true;
+      while not self.DoAtEnd() do
+        self.FBad := false;
+        if not self.DoExternal() then
+          LOk := false;
+          self.DoRecover();
+        end;
+      end;
+      return LOk;
+    end;
+
+    // ---- constant expressions --------------------------------------------------------------
+
+    // An integer constant expression at the cursor (a conditional expression, C's grammar) into
+    // AValue; false when it is not one (reported)
+    hidden method DoConstant(var AValue: int64): bool;
+    begin
+      return self.DoConditional(AValue);
+    end;
+
+    hidden method DoConditional(var AValue: int64): bool;
+    var
+      LThen: int64;
+      LElse: int64;
+    begin
+      if not self.DoBinary(0, AValue) then
+        return false;
+      end;
+      if not self.DoIs("?") then
+        return true;
+      end;
+      self.DoNext();
+      if not self.DoConditional(LThen) then
+        return false;
+      end;
+      if not self.DoExpect(":") then
+        return false;
+      end;
+      if not self.DoConditional(LElse) then
+        return false;
+      end;
+      if AValue <> 0 then
+        AValue := LThen;
+      else
+        AValue := LElse;
+      end;
+      return true;
+    end;
+
+    // The binding strength of the binary operator at the cursor (1 ||, 2 &&, 3 |, 4 ^, 5 &,
+    // 6 == !=, 7 < > <= >=, 8 << >>, 9 + -, 10 * / %); 0 for none
+    hidden const method DoPrecedence(): int64;
+    var
+      LTok: PpToken;
+    begin
+      LTok := self.DoTok();
+      if LTok.Kind <> PpKind.Punct then
+        return 0;
+      end;
+      match LTok.Text of
+        "||": return 1;
+        "&&": return 2;
+        "|": return 3;
+        "^": return 4;
+        "&": return 5;
+        "==", "!=": return 6;
+        "<", ">", "<=", ">=": return 7;
+        "<<", ">>": return 8;
+        "+", "-": return 9;
+        "*", "/", "%": return 10;
+      end;
+      return 0;
+    end;
+
+    // A binary expression whose operators bind tighter than AMin (precedence climbing)
+    hidden method DoBinary(const AMin: int64; var AValue: int64): bool;
+    var
+      LPrec: int64;
+      LOp: PpToken;
+      LRight: int64;
+    begin
+      if not self.DoUnary(AValue) then
+        return false;
+      end;
+      while true do
+        LPrec := self.DoPrecedence();
+        if LPrec <= AMin then
+          leave;
+        end;
+        LOp := self.DoTok();
+        self.DoNext();
+        if not self.DoBinary(LPrec, LRight) then
+          return false;
+        end;
+        if not self.DoApply(LOp, AValue, LRight) then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    // AValue := AValue op ARight for the operator AOp; false (CC0005) for a division by zero
+    hidden method DoApply(const AOp: PpToken; var AValue: int64; const ARight: int64): bool;
+    begin
+      match AOp.Text of
+        "||": AValue := int64((AValue <> 0) or (ARight <> 0));
+        "&&": AValue := int64((AValue <> 0) and (ARight <> 0));
+        "|": AValue := AValue | ARight;
+        "^": AValue := AValue xor ARight;
+        "&": AValue := AValue & ARight;
+        "==": AValue := int64(AValue = ARight);
+        "!=": AValue := int64(AValue <> ARight);
+        "<": AValue := int64(AValue < ARight);
+        ">": AValue := int64(AValue > ARight);
+        "<=": AValue := int64(AValue <= ARight);
+        ">=": AValue := int64(AValue >= ARight);
+        "<<": AValue := AValue << (ARight & 63);
+        ">>": AValue := AValue >> (ARight & 63);
+        "+": AValue := AValue + ARight;
+        "-": AValue := AValue - ARight;
+        "*": AValue := AValue * ARight;
+        "/", "%":
+          if ARight = 0 then
+            self.DoError(ADAM_ERR_CIMPORT_PARSER_005, AOp, ADAM_MSG_CIMPORT_PARSER_DIVIDE_ZERO,
+              NoArgs());
+            return false;
+          end;
+          if AOp.Text = "/" then
+            AValue := AValue div ARight;
+          else
+            AValue := AValue mod ARight;
+          end;
+      end;
+      return true;
+    end;
+
+    // A unary expression: - + ~ !, sizeof / _Alignof, a cast, or a primary
+    hidden method DoUnary(var AValue: int64): bool;
+    var
+      LTok: PpToken;
+      LTypeId: int64;
+      LSize: int64;
+      LSave: int64;
+    begin
+      LTok := self.DoTok();
+      if (LTok.Kind = PpKind.Punct) and ((LTok.Text = "-") or (LTok.Text = "+") or
+        (LTok.Text = "~") or (LTok.Text = "!")) then
+        self.DoNext();
+        if not self.DoUnary(AValue) then
+          return false;
+        end;
+        match LTok.Text of
+          "-": AValue := 0 - AValue;
+          "~": AValue := ~AValue;
+          "!": AValue := int64(AValue = 0);
+        end;
+        return true;
+      end;
+      if (LTok.Kind = PpKind.Identifier) and ((LTok.Text = "sizeof") or
+        (LTok.Text = "_Alignof") or (LTok.Text = "alignof") or (LTok.Text = "__alignof__")) then
+        self.DoNext();
+        LSave := self.FPos;
+        if self.DoIs("(") then
+          self.DoNext();
+          if self.DoStartsTypeName() then
+            LTypeId := self.DoTypeName();
+            if LTypeId = ADAM_CIMPORT_NONE then
+              return false;
+            end;
+            if not self.DoExpect(")") then
+              return false;
+            end;
+            if LTok.Text = "sizeof" then
+              LSize := self.FTypes.SizeOf(LTypeId);
+            else
+              LSize := self.FTypes.AlignOf(LTypeId);
+            end;
+            if LSize < 0 then
+              self.DoError(ADAM_ERR_CIMPORT_PARSER_004, LTok, ADAM_MSG_CIMPORT_PARSER_NO_SIZE,
+                NoArgs().Str(LTok.Text));
+              return false;
+            end;
+            AValue := LSize;
+            return true;
+          end;
+        end;
+        self.FPos := LSave;
+        self.DoError(ADAM_ERR_CIMPORT_PARSER_004, LTok, ADAM_MSG_CIMPORT_PARSER_NOT_CONSTANT,
+          NoArgs().Str(LTok.Text));
+        return false;
+      end;
+      if self.DoIs("(") then
+        LSave := self.FPos;
+        self.DoNext();
+        if self.DoStartsTypeName() then
+          LTypeId := self.DoTypeName();
+          if LTypeId = ADAM_CIMPORT_NONE then
+            return false;
+          end;
+          if not self.DoExpect(")") then
+            return false;
+          end;
+          if not self.DoUnary(AValue) then
+            return false;
+          end;
+          return self.DoCast(LTok, LTypeId, AValue);
+        end;
+        self.FPos := LSave;
+      end;
+      return self.DoPrimary(AValue);
+    end;
+
+    // AValue converted to the type ATypeId (a cast at AAt): an integer type's width and
+    // signedness by the target; false (CC0004) for a cast to a type that is no integer
+    hidden method DoCast(const AAt: PpToken; const ATypeId: int64; var AValue: int64): bool;
+    var
+      LType: CType;
+      LBits: int64;
+      LSize: int64;
+      LSigned: bool;
+    begin
+      LType := self.FTypes.Item(self.FTypes.Resolved(ATypeId));
+      if LType.Kind = CTypeKind.Pointer then
+        return true;
+      end;
+      if not IsIntegerKind(LType.Kind) and (LType.Kind <> CTypeKind.Enum) then
+        self.DoError(ADAM_ERR_CIMPORT_PARSER_004, AAt, ADAM_MSG_CIMPORT_PARSER_NOT_CONSTANT,
+          NoArgs().Str("(" + CKindText(LType.Kind) + ")"));
+        return false;
+      end;
+      LSize := self.FTypes.SizeOf(ATypeId);
+      if (LSize <= 0) or (LSize >= 8) then
+        return true;
+      end;
+      LBits := LSize * 8;
+      LSigned := (LType.Kind = CTypeKind.SChar) or (LType.Kind = CTypeKind.Short) or
+        (LType.Kind = CTypeKind.Int) or (LType.Kind = CTypeKind.Long) or
+        ((LType.Kind = CTypeKind.Char) and self.FTarget.CharSigned());
+      if LType.Kind = CTypeKind.Bool then
+        AValue := int64(AValue <> 0);
+        return true;
+      end;
+      AValue := AValue & ((int64(1) << LBits) - 1);
+      if LSigned and ((AValue >> (LBits - 1)) <> 0) then
+        AValue := AValue - (int64(1) << LBits);
+      end;
+      return true;
+    end;
+
+    // A primary expression: an integer or character constant, an enum constant, ( expr )
+    hidden method DoPrimary(var AValue: int64): bool;
+    var
+      LTok: PpToken;
+      LId: int64;
+    begin
+      LTok := self.DoTok();
+      if self.DoIs("(") then
+        self.DoNext();
+        if not self.DoConditional(AValue) then
+          return false;
+        end;
+        return self.DoExpect(")");
+      end;
+      if LTok.Kind = PpKind.Number then
+        if not DoIntValue(LTok.Text, AValue) then
+          self.DoError(ADAM_ERR_CIMPORT_PARSER_004, LTok, ADAM_MSG_CIMPORT_PARSER_NOT_CONSTANT,
+            NoArgs().Str(LTok.Text));
+          return false;
+        end;
+        self.DoNext();
+        return true;
+      end;
+      if LTok.Kind = PpKind.CharConst then
+        AValue := self.DoCharValue(LTok.Text);
+        self.DoNext();
+        return true;
+      end;
+      if LTok.Kind = PpKind.Identifier then
+        LId := self.FConsts.Find(LTok.Text);
+        if LId > 0 then
+          AValue := self.FConstValues[LId - 1];
+          self.DoNext();
+          return true;
+        end;
+      end;
+      if self.DoAtEnd() then
+        self.DoError(ADAM_ERR_CIMPORT_PARSER_010, LTok, ADAM_MSG_CIMPORT_PARSER_EARLY_END, NoArgs());
+        return false;
+      end;
+      self.DoError(ADAM_ERR_CIMPORT_PARSER_004, LTok, ADAM_MSG_CIMPORT_PARSER_NOT_CONSTANT,
+        NoArgs().Str(LTok.Text));
+      return false;
+    end;
+
+    // A character constant's value: a plain one an int of its bytes (a multi-character one
+    // big-endian, as clang), a single byte by the target's char signedness; a prefixed one (L,
+    // u, U, u8) its first character's code point
+    hidden method DoCharValue(const AText: string): int64;
+    var
+      LAt: int64;
+      LPrefixed: bool;
+      LValue: int64;
+      LByte: int64;
+      LCount: int64;
+      LDigit: int64;
+      LChar: char;
+    begin
+      LAt := 0;
+      while (LAt < len(AText)) and (AText[LAt] <> '\'') do
+        LAt := LAt + 1;
+      end;
+      LPrefixed := LAt > 0;
+      LAt := LAt + 1;
+      LValue := 0;
+      LCount := 0;
+      while (LAt < len(AText)) and (AText[LAt] <> '\'') do
+        LChar := AText[LAt];
+        LAt := LAt + 1;
+        LByte := int64(uint8(LChar));
+        if (LChar = '\\') and (LAt < len(AText)) then
+          LChar := AText[LAt];
+          LAt := LAt + 1;
+          LByte := int64(uint8(LChar));
+          match LChar of
+            'n': LByte := 10;
+            't': LByte := 9;
+            'r': LByte := 13;
+            'a': LByte := 7;
+            'b': LByte := 8;
+            'f': LByte := 12;
+            'v': LByte := 11;
+            'e': LByte := 27;
+            'x':
+              LByte := 0;
+              while (LAt < len(AText)) and (DoDigit(AText[LAt], 16) >= 0) do
+                LByte := LByte * 16 + DoDigit(AText[LAt], 16);
+                LAt := LAt + 1;
+              end;
+            '0', '1', '2', '3', '4', '5', '6', '7':
+              LByte := DoDigit(LChar, 8);
+              LDigit := 1;
+              while (LDigit < 3) and (LAt < len(AText)) and (DoDigit(AText[LAt], 8) >= 0) do
+                LByte := LByte * 8 + DoDigit(AText[LAt], 8);
+                LAt := LAt + 1;
+                LDigit := LDigit + 1;
+              end;
+          end;
+        end;
+        if LPrefixed then
+          return LByte;
+        end;
+        LValue := (LValue << 8) | (LByte & 255);
+        LCount := LCount + 1;
+      end;
+      if (LCount = 1) and self.FTarget.CharSigned() and (LValue > 127) then
+        LValue := LValue - 256;
+      end;
+      return LValue;
+    end;
+  end;
+
+end.
