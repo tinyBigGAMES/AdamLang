@@ -1,0 +1,276 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  flow_defer_resources.adam - defer (BNF sec 5, D1) releasing real
+  resources: a heap block (getmem / defer freemem), a file (OpenFileHandle /
+  defer CloseFileHandle) and a lock (LockEnter / defer LockLeave), taken in
+  that order and released last first, by every way out of the statement list:
+  its end, a return (its value kept), a raise, a skip and a leave of a loop
+  (each pass its own), a hardware fault (a nil write). After each way out
+  nothing is held: no block, file or lock is counted as live, every alloc has
+  its free, the file can be removed (an open file never can) and the lock is
+  taken again; nothing leaks
+*******************************************************************************/
+
+/*
+@@test
+  kind run
+  exitcode 0
+  | end held 1
+  | end order lock file block
+  | end allocs 1 frees 1 blocks 0 files 0 held 0 removed true relocked true
+  | return 7 order lock file block
+  | return allocs 1 frees 1 blocks 0 files 0 held 0 removed true relocked true
+  | raise caught boom order lock file block
+  | raise allocs 1 frees 1 blocks 0 files 0 held 0 removed true relocked true
+  | loop order lock file block lock file block lock file block
+  | loop allocs 3 frees 3 blocks 0 files 0 held 0 removed true relocked true
+  | fault caught 3 Access violation order lock file block
+  | fault allocs 1 frees 1 blocks 0 files 0 held 0 removed true relocked true
+  | [Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+@@end
+*/
+
+module exe flow_defer_resources;
+
+import System.SysUtils;
+
+var
+  // The lock every case takes, the file every case opens (beside the exe)
+  GLock: ptr;
+  GPath: string;
+  // What is live now, and how many blocks were taken and given back in this case
+  GBlocks: int32;
+  GFiles: int32;
+  GHeld: int32;
+  GAllocs: int32;
+  GFrees: int32;
+  // The releases in the order they ran
+  GOrder: string;
+  GNil: ptr to int64;
+
+// A heap block of 64 bytes, counted
+routine TakeBlock(): ptr;
+begin
+  GBlocks := GBlocks + 1;
+  GAllocs := GAllocs + 1;
+  return getmem(64);
+end;
+
+// The block ABlock given back, counted
+routine GiveBlock(const ABlock: ptr);
+begin
+  freemem(ABlock);
+  GBlocks := GBlocks - 1;
+  GFrees := GFrees + 1;
+  GOrder := GOrder + " block";
+end;
+
+// The file GPath opened for writing (created or emptied), one byte written, counted
+routine OpenData(): uint64;
+var
+  LPath: ptr to char;
+  LHandle: uint64;
+  LByte: uint8;
+begin
+  LHandle := 0;
+  LPath := StringToC(GPath);
+  if OpenFileHandle(LPath, ADAM_FILE_WRITE, LHandle) then
+    GFiles := GFiles + 1;
+    LByte := 65;
+    WriteFileHandle(LHandle, addr of LByte, 1);
+  end;
+  freemem(LPath);
+  return LHandle;
+end;
+
+// The file AHandle closed, counted
+routine CloseData(const AHandle: uint64);
+begin
+  if AHandle <> 0 then
+    CloseFileHandle(AHandle);
+    GFiles := GFiles - 1;
+  end;
+  GOrder := GOrder + " file";
+end;
+
+// GLock held, counted
+routine Enter();
+begin
+  LockEnter(GLock);
+  GHeld := GHeld + 1;
+end;
+
+// GLock let go, counted
+routine Leave();
+begin
+  LockLeave(GLock);
+  GHeld := GHeld - 1;
+  GOrder := GOrder + " lock";
+end;
+
+// A new case: nothing counted yet
+routine Start();
+begin
+  GAllocs := 0;
+  GFrees := 0;
+  GOrder := "";
+end;
+
+// The case ALabel after its way out: what is live, the counts, whether the file can be
+// removed (Windows never removes a file open without delete sharing) and whether the lock is
+// taken again (only when it is not counted as held: entering a held lock would wait forever)
+routine Check(const ALabel: string);
+var
+  LPath: ptr to char;
+  LRemoved: bool;
+  LRelocked: bool;
+begin
+  LPath := StringToC(GPath);
+  LRemoved := RemoveFile(LPath);
+  freemem(LPath);
+  LRelocked := false;
+  if GHeld = 0 then
+    LockEnter(GLock);
+    LockLeave(GLock);
+    LRelocked := true;
+  end;
+  println("{} allocs {} frees {} blocks {} files {} held {} removed {} relocked {}", ALabel,
+    GAllocs, GFrees, GBlocks, GFiles, GHeld, LRemoved, LRelocked);
+end;
+
+// The three taken, each release deferred at once; the list ends
+routine ByEnd();
+var
+  LBlock: ptr;
+  LFile: uint64;
+begin
+  LBlock := TakeBlock();
+  defer GiveBlock(LBlock);
+  LFile := OpenData();
+  defer CloseData(LFile);
+  Enter();
+  defer Leave();
+  println("{}", "end held " + IntToStr(GHeld));
+end;
+
+// The three taken; a return leaves with its value
+routine ByReturn(): int32;
+var
+  LBlock: ptr;
+  LFile: uint64;
+begin
+  LBlock := TakeBlock();
+  defer GiveBlock(LBlock);
+  LFile := OpenData();
+  defer CloseData(LFile);
+  Enter();
+  defer Leave();
+  return 7;
+end;
+
+// The three taken; a raise leaves the list
+routine ByRaise();
+var
+  LBlock: ptr;
+  LFile: uint64;
+begin
+  LBlock := TakeBlock();
+  defer GiveBlock(LBlock);
+  LFile := OpenData();
+  defer CloseData(LFile);
+  Enter();
+  defer Leave();
+  raise("boom");
+end;
+
+// The three taken in each pass of a loop: pass 1 ends, pass 2 skips, pass 3 leaves
+routine ByLoop();
+var
+  LI: int32;
+  LBlock: ptr;
+  LFile: uint64;
+begin
+  for LI := 1 to 5 do
+    LBlock := TakeBlock();
+    defer GiveBlock(LBlock);
+    LFile := OpenData();
+    defer CloseData(LFile);
+    Enter();
+    defer Leave();
+    if LI = 2 then
+      skip;
+    end;
+    if LI = 3 then
+      leave;
+    end;
+  end;
+end;
+
+// The three taken; a write through nil faults
+routine ByFault();
+var
+  LBlock: ptr;
+  LFile: uint64;
+begin
+  LBlock := TakeBlock();
+  defer GiveBlock(LBlock);
+  LFile := OpenData();
+  defer CloseData(LFile);
+  Enter();
+  defer Leave();
+  GNil[0] := 5;
+end;
+
+begin
+  GLock := LockCreate();
+  GPath := paramstr(0) + ".tmp";
+  GNil := nil;
+  GBlocks := 0;
+  GFiles := 0;
+  GHeld := 0;
+
+  Start();
+  ByEnd();
+  println("{}", "end order" + GOrder);
+  Check("end");
+
+  Start();
+  println("{}", "return " + IntToStr(ByReturn()) + " order" + GOrder);
+  Check("return");
+
+  Start();
+  guard
+    ByRaise();
+  except
+    println("{}", "raise caught " + excmsg() + " order" + GOrder);
+  end;
+  Check("raise");
+
+  Start();
+  ByLoop();
+  println("{}", "loop order" + GOrder);
+  Check("loop");
+
+  Start();
+  guard
+    ByFault();
+  except
+    println("{}", "fault caught " + IntToStr(exccode()) + " " + excmsg() + " order" + GOrder);
+  end;
+  Check("fault");
+
+  LockFree(GLock);
+end.
