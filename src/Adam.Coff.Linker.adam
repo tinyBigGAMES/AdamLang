@@ -24,7 +24,13 @@
   is winnt.h's IMAGE_DOS_SIGNATURE, the two bytes every image starts with.
 
   LinkImage   one SectionSet (one object per program until M8; objects are
-              never re-read, M2.9) linked into an exe's bytes. A library an
+              never re-read, M2.9) linked into an exe's bytes, or a dll's
+              (ExeSettings.Dll, M8a: IMAGE_FILE_DLL, its base 0x180000000,
+              always relocatable; the exports, sorted byte-wise, each kept
+              by the link-time removal as the entry is, in an export table
+              after the import tables in .rdata: the directory, the address
+              table, the name pointer table, the ordinal table, the dll's
+              name and the names; its data directory 0). A library an
               import names that is a static one (an archive with no short
               import) gives no DLL: the import is unbound (its symbol
               Undefined) and the library's objects that define what the
@@ -150,6 +156,7 @@ public const
   ADAM_LINKER_FAULT_ALIGN: string = "Linker: a section aligned past a page: ";
   ADAM_LINKER_FAULT_FIELD: string = "Linker: a value its relocation field does not hold: ";
   ADAM_LINKER_FAULT_UNDEFINED: string = "Linker: a relocation to an undefined symbol: ";
+  ADAM_LINKER_FAULT_EXPORT: string = "Linker: an export is no symbol defined in a section: ";
   ADAM_LINKER_FAULT_THUNK: string = "Linker: an import thunk defined apart from its symbol: ";
   ADAM_LINKER_FAULT_LOCAL_SLOT: string = "Linker: a local import slot defined apart from its symbol: ";
   ADAM_LINKER_FAULT_PDATA: string = "Linker: a .pdata that is no whole number of entries: ";
@@ -166,12 +173,14 @@ public const
   ADAM_LINKER_FILE_RELOCS_STRIPPED: int64 = 0x0001;
   ADAM_LINKER_FILE_EXECUTABLE_IMAGE: int64 = 0x0002;
   ADAM_LINKER_FILE_LARGE_ADDRESS_AWARE: int64 = 0x0020;
+  ADAM_LINKER_FILE_DLL: int64 = 0x2000;
   // Optional Header (PE32+): 24 bytes of standard fields and 88 of Windows-specific ones,
   // then 16 data directories of 8 bytes; the directories used
   ADAM_LINKER_MAGIC_PE32PLUS: int64 = 0x20B;
   ADAM_LINKER_DIRECTORIES_AT: int64 = 112;
   ADAM_LINKER_DIRECTORY_COUNT: int64 = 16;
   ADAM_LINKER_DIRECTORY_SIZE: int64 = 8;
+  ADAM_LINKER_DIRECTORY_EXPORT: int64 = 0;
   ADAM_LINKER_DIRECTORY_IMPORT: int64 = 1;
   ADAM_LINKER_DIRECTORY_RESOURCE: int64 = 2;
   ADAM_LINKER_DIRECTORY_EXCEPTION: int64 = 3;
@@ -180,6 +189,16 @@ public const
   ADAM_LINKER_DIRECTORY_IAT: int64 = 12;
   // The Windows-specific values written (see the header)
   ADAM_LINKER_IMAGE_BASE: int64 = 0x140000000;
+  // A dll's preferred base (lld's and link.exe's default for a 64-bit dll); a dll is always
+  // relocatable, as the loader may place it anywhere
+  ADAM_LINKER_DLL_IMAGE_BASE: int64 = 0x180000000;
+  // The .edata Section: the export directory table's size, the export address and name
+  // pointer tables' entries, an ordinal table entry, the ordinal base, the tables' alignment
+  ADAM_LINKER_EXPORT_DIRECTORY_SIZE: int64 = 40;
+  ADAM_LINKER_EXPORT_ENTRY_SIZE: int64 = 4;
+  ADAM_LINKER_EXPORT_ORDINAL_SIZE: int64 = 2;
+  ADAM_LINKER_EXPORT_ORDINAL_BASE: int64 = 1;
+  ADAM_LINKER_EXPORT_ALIGN: int64 = 4;
   ADAM_LINKER_FILE_ALIGN: int64 = 512;
   ADAM_LINKER_VERSION_MAJOR: int64 = 6;
   ADAM_LINKER_VERSION_MINOR: int64 = 0;
@@ -348,6 +367,15 @@ type
     hidden FDirectoryAt: int64;
     hidden FAddressesAt: int64;
     hidden FAddressesSize: int64;
+    // A dll's exports (DoExports, M8a): the names sorted byte-wise and each one's symbol; the
+    // export table in .rdata (DoLayExports): its start, each name's place, the dll name's,
+    // its size
+    hidden FExportNames: StringArray;
+    hidden FExportSymbols: Int64Array;
+    hidden FExportAt: int64;
+    hidden FExportNameAt: Int64Array;
+    hidden FExportDllAt: int64;
+    hidden FExportSize: int64;
     // Per set section: whether the image keeps it (DoRemoveUnreached, SU2.7)
     hidden FLive: BoolArray;
     // The Abs64 relocations' count and, once laid out, their RVAs in order
@@ -391,6 +419,9 @@ type
       self.FDirectoryAt := 0;
       self.FAddressesAt := 0;
       self.FAddressesSize := 0;
+      self.FExportAt := 0;
+      self.FExportDllAt := 0;
+      self.FExportSize := 0;
       self.FSiteCount := 0;
       self.FHeadersSize := 0;
       self.FImageSize := 0;
@@ -926,6 +957,10 @@ type
         end;
       end;
       self.DoKeep(self.FSet.SymbolAt(self.FEntrySymbol).SectionId, LStack, LTop);
+      // a dll's exports are reached from outside it (M8a)
+      for LR := 0 to len(self.FExportSymbols) - 1 do
+        self.DoKeep(self.FSet.SymbolAt(self.FExportSymbols[LR]).SectionId, LStack, LTop);
+      end;
       while LTop > 0 do
         LTop := LTop - 1;
         LId := LStack[LTop];
@@ -1236,6 +1271,56 @@ type
       AImage.Size := LAt;
     end;
 
+    // A dll's exports (M8a, ExeSettings.Exports) sorted byte-wise (the order the loader's
+    // binary search over the name pointer table compares in), each with its symbol; raises
+    // for an export no section defines (the Driver names only the main module's own
+    // routines and variables: a compiler bug)
+    hidden method DoExports();
+    var
+      LId: int64;
+      LI: int64;
+    begin
+      if not self.FSettings.Dll then
+        return;
+      end;
+      self.FExportNames := self.FSettings.Exports;
+      SortStrings(self.FExportNames);
+      setlength(self.FExportSymbols, len(self.FExportNames));
+      for LI := 0 to len(self.FExportNames) - 1 do
+        LId := self.FSet.FindSymbol(self.FExportNames[LI]);
+        if (LId = 0) or (self.FSet.SymbolAt(LId).Kind <> SymbolKind.Defined) then
+          raise(ADAM_LINKER_FAULT_EXPORT + self.FExportNames[LI]);
+        end;
+        self.FExportSymbols[LI] := LId;
+      end;
+    end;
+
+    // A dll's export table laid at the end of AImage (.rdata, after the import tables): the
+    // export directory table, the export address table, the name pointer table, the ordinal
+    // table, then the dll's name and each export's name, each ended by a zero byte (PE Format
+    // "The .edata Section"); written by DoExportTable once every section has its RVA
+    hidden method DoLayExports(const AImage: ref ImageSection);
+    var
+      LAt: int64;
+      LCount: int64;
+      LI: int64;
+    begin
+      LCount := len(self.FExportNames);
+      LAt := AlignUp(AImage.Size, ADAM_LINKER_EXPORT_ALIGN);
+      self.FExportAt := LAt;
+      LAt := LAt + ADAM_LINKER_EXPORT_DIRECTORY_SIZE + 2 * ADAM_LINKER_EXPORT_ENTRY_SIZE * LCount +
+        ADAM_LINKER_EXPORT_ORDINAL_SIZE * LCount;
+      self.FExportDllAt := LAt;
+      LAt := LAt + len(self.FSettings.DllName) + 1;
+      setlength(self.FExportNameAt, LCount);
+      for LI := 0 to LCount - 1 do
+        self.FExportNameAt[LI] := LAt;
+        LAt := LAt + len(self.FExportNames[LI]) + 1;
+      end;
+      self.FExportSize := LAt - self.FExportAt;
+      AImage.Size := LAt;
+    end;
+
     // How many Abs64 relocations the set holds (each a base relocation; a tombstoned one,
     // whose field reads 0, is none)
     hidden const method DoCountSites(): int64;
@@ -1275,6 +1360,9 @@ type
       self.DoLayIn(LImage, SectionKind.ReadOnly);
       if len(self.FLibraries) > 0 then
         self.DoLayTables(LImage);
+      end;
+      if self.FSettings.Dll then
+        self.DoLayExports(LImage);
       end;
       self.DoAppend(LImage);
       self.FRdataIndex := self.DoIndexOf(LImage);
@@ -1494,7 +1582,10 @@ type
       PutLe(self.FBytes, ADAM_LINKER_SIGNATURE_AT, uint64(ADAM_LINKER_SIGNATURE), 4);
       LAt := ADAM_LINKER_SIGNATURE_AT + ADAM_LINKER_SIGNATURE_SIZE;
       LFlags := ADAM_LINKER_FILE_EXECUTABLE_IMAGE | ADAM_LINKER_FILE_LARGE_ADDRESS_AWARE;
-      if self.FSiteCount = 0 then
+      if self.FSettings.Dll then
+        LFlags := LFlags | ADAM_LINKER_FILE_DLL;
+      end;
+      if (self.FSiteCount = 0) and not self.FSettings.Dll then
         LFlags := LFlags | ADAM_LINKER_FILE_RELOCS_STRIPPED;
       end;
       // Machine, NumberOfSections; TimeDateStamp and the symbol table's fields stay 0
@@ -1534,7 +1625,7 @@ type
     begin
       LAt := ADAM_LINKER_SIGNATURE_AT + ADAM_LINKER_SIGNATURE_SIZE + ADAM_LINKER_FILE_HEADER_SIZE;
       LDll := ADAM_LINKER_DLL_NX_COMPAT;
-      if self.FSiteCount > 0 then
+      if (self.FSiteCount > 0) or self.FSettings.Dll then
         LDll := LDll | ADAM_LINKER_DLL_DYNAMIC_BASE | ADAM_LINKER_DLL_HIGH_ENTROPY_VA;
       end;
       LBaseOfCode := 0;
@@ -1547,7 +1638,7 @@ type
       PutLe(self.FBytes, LAt + 12, uint64(self.DoSizeOf(false, false)), 4);
       PutLe(self.FBytes, LAt + 16, uint64(self.DoSymbolRva(self.FEntrySymbol)), 4);
       PutLe(self.FBytes, LAt + 20, uint64(LBaseOfCode), 4);
-      PutLe(self.FBytes, LAt + 24, uint64(ADAM_LINKER_IMAGE_BASE), 8);
+      PutLe(self.FBytes, LAt + 24, uint64(self.DoImageBase()), 8);
       PutLe(self.FBytes, LAt + 32, uint64(self.FMachine.PageSize), 4);
       PutLe(self.FBytes, LAt + 36, uint64(ADAM_LINKER_FILE_ALIGN), 4);
       PutLe(self.FBytes, LAt + 40, uint64(ADAM_LINKER_VERSION_MAJOR), 2);
@@ -1652,6 +1743,54 @@ type
       self.DoDirectory(ADAM_LINKER_DIRECTORY_IAT, LRva + self.FAddressesAt, self.FAddressesSize);
     end;
 
+    // The image's preferred base: a dll's (ADAM_LINKER_DLL_IMAGE_BASE) or an exe's
+    hidden const method DoImageBase(): int64;
+    begin
+      if self.FSettings.Dll then
+        return ADAM_LINKER_DLL_IMAGE_BASE;
+      end;
+      return ADAM_LINKER_IMAGE_BASE;
+    end;
+
+    // A dll's export table (DoLayExports' places) and its data directory: the directory's
+    // Name RVA (the dll's name), Ordinal Base, the two tables' counts and RVAs (Characteristics,
+    // TimeDateStamp and the version stay 0: deterministic); each address entry the RVA of its
+    // export's symbol, each ordinal its own index (the name and address tables share one order)
+    hidden method DoExportTable();
+    var
+      LBase: int64;
+      LRva: int64;
+      LCount: int64;
+      LAddresses: int64;
+      LNames: int64;
+      LOrdinals: int64;
+      LI: int64;
+    begin
+      LBase := self.FImage[self.FRdataIndex].RawAt;
+      LRva := self.FImage[self.FRdataIndex].VirtualAddress;
+      LCount := len(self.FExportNames);
+      LAddresses := self.FExportAt + ADAM_LINKER_EXPORT_DIRECTORY_SIZE;
+      LNames := LAddresses + ADAM_LINKER_EXPORT_ENTRY_SIZE * LCount;
+      LOrdinals := LNames + ADAM_LINKER_EXPORT_ENTRY_SIZE * LCount;
+      PutLe(self.FBytes, LBase + self.FExportAt + 12, uint64(LRva + self.FExportDllAt), 4);
+      PutLe(self.FBytes, LBase + self.FExportAt + 16, uint64(ADAM_LINKER_EXPORT_ORDINAL_BASE), 4);
+      PutLe(self.FBytes, LBase + self.FExportAt + 20, uint64(LCount), 4);
+      PutLe(self.FBytes, LBase + self.FExportAt + 24, uint64(LCount), 4);
+      PutLe(self.FBytes, LBase + self.FExportAt + 28, uint64(LRva + LAddresses), 4);
+      PutLe(self.FBytes, LBase + self.FExportAt + 32, uint64(LRva + LNames), 4);
+      PutLe(self.FBytes, LBase + self.FExportAt + 36, uint64(LRva + LOrdinals), 4);
+      for LI := 0 to LCount - 1 do
+        PutLe(self.FBytes, LBase + LAddresses + ADAM_LINKER_EXPORT_ENTRY_SIZE * LI,
+          uint64(self.DoSymbolRva(self.FExportSymbols[LI])), 4);
+        PutLe(self.FBytes, LBase + LNames + ADAM_LINKER_EXPORT_ENTRY_SIZE * LI,
+          uint64(LRva + self.FExportNameAt[LI]), 4);
+        PutLe(self.FBytes, LBase + LOrdinals + ADAM_LINKER_EXPORT_ORDINAL_SIZE * LI, uint64(LI), 2);
+        self.DoPutText(LBase + self.FExportNameAt[LI], self.FExportNames[LI]);
+      end;
+      self.DoPutText(LBase + self.FExportDllAt, self.FSettings.DllName);
+      self.DoDirectory(ADAM_LINKER_DIRECTORY_EXPORT, LRva + self.FExportAt, self.FExportSize);
+    end;
+
     // Every relocation applied to its field (see the header)
     hidden method DoRelocate();
     var
@@ -1682,7 +1821,7 @@ type
             RelocKind.Rva32:
               self.DoPutChecked(LAt, LTarget, 0, ADAM_LINKER_RVA32_HIGH, 4);
             RelocKind.Abs64:
-              PutLe(self.FBytes, LAt, uint64(ADAM_LINKER_IMAGE_BASE + LTarget), 8);
+              PutLe(self.FBytes, LAt, uint64(self.DoImageBase() + LTarget), 8);
             RelocKind.SecRel32:
               self.DoPutChecked(LAt, LTarget - self.DoImageStartOf(LReloc.Symbol), 0,
                 ADAM_LINKER_RVA32_HIGH, 4);
@@ -1878,6 +2017,9 @@ type
       if len(self.FLibraries) > 0 then
         self.DoImportTables();
       end;
+      if self.FSettings.Dll then
+        self.DoExportTable();
+      end;
       self.DoRelocate();
       self.DoExceptionTable();
       if self.FResourceIndex >= 0 then
@@ -1923,6 +2065,7 @@ type
       end;
       if not self.FFailed then
         self.DoEntry();
+        self.DoExports();
         self.DoRemoveUnreached();
         self.DoResources();
       end;

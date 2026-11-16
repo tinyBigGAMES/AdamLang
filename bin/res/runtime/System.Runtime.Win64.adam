@@ -40,6 +40,13 @@ routine _exit(const ACode: int32); noreturn; external "ucrtbase";
 // ucrtbase's exit-time handler list (C's atexit is in the static C runtime, which an Adam
 // exe does not carry; ucrtbase exports the list as _crt_atexit)
 routine _crt_atexit(const AHandler: routine()): int32; external "ucrtbase";
+// ucrtbase: a module's own exit-time handler list (an _onexit_table_t: three words, made
+// empty by _initialize_onexit_table), a handler added to it, and the list run, the last
+// added first (what a C dll's startup code does with its own list at its unload, M8a)
+routine _initialize_onexit_table(const ATable: ptr): int32; external "ucrtbase";
+routine _register_onexit_function(const ATable: ptr; const AHandler: routine()): int32;
+  external "ucrtbase";
+routine _execute_onexit_table(const ATable: ptr): int32; external "ucrtbase";
 
 // ucrtbase: the C heap
 routine malloc(const ASize: uint64): ptr; external "ucrtbase";
@@ -297,6 +304,10 @@ type
   // BaseDllName, DllBase, SizeOfImage); it runs inside the loader's lock
   PlatformDllNotification = routine(const AReason: uint32; const AData: ptr; const AContext: ptr);
 
+  // The process's last filter of an exception no frame took (SetUnhandledExceptionFilter's),
+  // the type a dll puts the one it replaced back as (PlatformDllEvent)
+  PlatformFaultFilter = routine(const APointers: ptr): int32;
+
   // What a thread PlatformThreadStart made runs first (System.Runtime's ThreadRun), given
   // the block it was started with
   PlatformThreadRun = routine(const ABlock: ptr);
@@ -530,6 +541,14 @@ var
   // System.Runtime's report of a hardware fault no guard took (PlatformAtFault: it never
   // returns); nil until then
   GFaultHandler: routine(const AKind: int32);
+  // A dll's runtime (M8a, PlatformDllEvent): GDllMode once its load began, its own exit-time
+  // handler list (an _onexit_table_t, run at its unload: never the process's, which outlives
+  // it), and the process's last filter it replaced (put back at its unload, GDllFilterSet
+  // once it was replaced: a dll's code is gone after its unload)
+  GDllMode: bool;
+  GDllExits: array[0..2] of ptr;
+  GDllFilterSet: bool;
+  GDllFilterBefore: ptr;
 
 threadstatic
   // The hardware fault kind (ADAM_PLATFORM_FAULT_*) a guard's filter took on this thread
@@ -735,9 +754,16 @@ end;
 // took, on the faulting thread with nothing unwound (DoUnhandledFault); it reports the
 // fault and ends the process (PlatformWriteErrorDirect, PlatformTerminate), never returning
 public routine PlatformAtFault(const AHandler: routine(const AKind: int32));
+var
+  LBefore: ptr;
 begin
   GFaultHandler := AHandler;
-  SetUnhandledExceptionFilter(DoUnhandledFault);
+  LBefore := SetUnhandledExceptionFilter(DoUnhandledFault);
+  // a dll puts the process's filter back at its unload (PlatformDllEvent)
+  if GDllMode and not GDllFilterSet then
+    GDllFilterBefore := LBefore;
+    GDllFilterSet := true;
+  end;
 end;
 
 // Writes the ACount bytes at AText to stderr in one system call, no stdio (its lock may be
@@ -767,19 +793,58 @@ begin
   SetThreadStackGuarantee(LSize);
 end;
 
-// AHandler run when the process ends through exit, however it is called (the runtime's
-// Halt or a program's own call of ucrtbase's exit), the last one registered first
-public routine PlatformAtExit(const AHandler: routine());
-begin
-  _crt_atexit(AHandler);
-end;
-
 // C's atexit, which the static C runtime defines and an Adam exe does not carry: a C library
 // linked into the program registers AHandler in the same exit-time list PlatformAtExit uses
-// (ucrtbase's); 0, or nonzero when the list has no room
+// (ucrtbase's; a dll's own, M8a, as a C dll's startup code makes its atexit use its own);
+// 0, or nonzero when the list has no room
 public routine atexit(const AHandler: routine()): int32;
 begin
+  if GDllMode then
+    return _register_onexit_function(addr of GDllExits, AHandler);
+  end;
   return _crt_atexit(AHandler);
+end;
+
+// AHandler run when the process ends through exit, however it is called (the runtime's
+// Halt or a program's own call of ucrtbase's exit), the last one registered first; in a dll
+// (M8a) when it is unloaded (by FreeLibrary or as the process ends), from its own list
+public routine PlatformAtExit(const AHandler: routine());
+begin
+  atexit(AHandler);
+end;
+
+const
+  // The loader's reasons for a dll's entry (winnt.h's DLL_PROCESS_DETACH / _ATTACH)
+  ADAM_PLATFORM_DLL_PROCESS_DETACH: int32 = 0;
+  ADAM_PLATFORM_DLL_PROCESS_ATTACH: int32 = 1;
+
+// The loader's call of a dll's entry (M8a: the compiler's dll entry hands its three words
+// on: the dll's module, the reason, the reserved word): at the load (DLL_PROCESS_ATTACH) the
+// dll's exit-time handlers get their own list (atexit) and the answer is true (the
+// compiler's entry then starts the dll: its units' inits and starts, their teardowns
+// registered in that list); at the unload (DLL_PROCESS_DETACH, by FreeLibrary or as the
+// process ends) that list runs, the last registered first (the teardowns, then the heap
+// report; stdout flushed), and the process's filter the dll replaced is put back; a
+// thread's start or end
+// asks nothing here (the TLS callback, PlatformThreadCallback, ends a thread's copies)
+public routine PlatformDllEvent(const AModule: ptr; const AReason: int32; const AReserved: ptr): bool;
+begin
+  if AReason = ADAM_PLATFORM_DLL_PROCESS_ATTACH then
+    _initialize_onexit_table(addr of GDllExits);
+    GDllMode := true;
+    return true;
+  end;
+  if AReason = ADAM_PLATFORM_DLL_PROCESS_DETACH then
+    _execute_onexit_table(addr of GDllExits);
+    // what the handlers printed goes out now: at the process's end its exit flushed stdout
+    // before the unload, and nothing flushes it after
+    PlatformFlush();
+    if GDllFilterSet then
+      SetUnhandledExceptionFilter(PlatformFaultFilter(GDllFilterBefore));
+      GDllFilterSet := false;
+    end;
+  end;
+  return false;
 end;
 
 const
