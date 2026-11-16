@@ -8480,6 +8480,10 @@ public type
         if self.DoIsIntrinsicCall(LChild, "lock") then
           self.DoPointerTemporary(LChild, self.FTree[LChild].ResolvedType);
         end;
+        // pull(S, X)'s hold on S over its resume (DoPull)
+        if self.DoIsIntrinsicCall(LChild, "pull") then
+          self.DoPointerTemporary(LChild, self.DoUsedType(self.FTree.NthOf(LChild, NodeRole.Argument, 0)));
+        end;
         if ((self.FTree[LChild].Kind = NodeKind.RefNew) or (self.FTree[LChild].Kind = NodeKind.OwnNew) or
           (self.FTree[LChild].Kind = NodeKind.AsyncExpression)) and
           self.DoIsRefValue(self.FTree[LChild].ResolvedType) then
@@ -9188,9 +9192,11 @@ public type
     // (role Effects): IntValue its EFFECT bits, and unless ALL one EffectWrite child per
     // field, embed and module variable it may write (in source order: DoEffBefore) and per
     // var or by-reference parameter of its own it may write. Its own writes (an assignment's
-    // target, `addr of`, ++ / --, a for's variable, setlength's array, DoEffWrite), then
-    // what the routines it runs write (its calls, its accessors, the inits, dones and
-    // copies its values' types run: DoEffEdge), to a fixed point (DoEffSolve). A routine
+    // target, `addr of`, ++ / --, a for's variable, setlength's array, pull's place,
+    // DoEffWrite), then what the routines it runs write (its calls, its accessors, the
+    // inits, dones and copies its values' types run: DoEffEdge; a generator it resumes, by
+    // a for in, a yield from or a pull over a sequence: anything, DoEffAll), to a fixed
+    // point (DoEffSolve). A routine
     // summarized already (a compiled unit's) is read as it is (DoEffDecode)
     method SummarizeWrites();
     var
@@ -9640,6 +9646,12 @@ public type
           self.DoEffWrite(ASlot, LIterator);
         end;
       end;
+      // a for in or a yield from over a sequence resumes a generator: its body runs here,
+      // whatever wrote the sequence (a parameter's caller's), so it may write anything
+      if ((LKind = NodeKind.ForInStatement) or self.DoIsYieldFrom(AId)) and
+        (ClassOf(self.FTree, self.DoUsedType(self.FTree.FirstOf(AId, NodeRole.Value))) = TypeClass.SequenceType) then
+        self.DoEffAll(ASlot);
+      end;
       if (LKind = NodeKind.VarDecl) or (LKind = NodeKind.RefNew) or (LKind = NodeKind.OwnNew) then
         if LKind = NodeKind.VarDecl then
           self.DoEffRelease(ASlot, self.DoDeclType(AId));
@@ -9701,7 +9713,8 @@ public type
     end;
 
     // The call ACall of ASlot's routine: an edge to the routine it runs (DoCallSig); setlength
-    // writes its array, create / destroy run an object's init / done (anything), every other
+    // writes its array, pull writes its place and resumes a generator (its body runs here:
+    // anything), create / destroy run an object's init / done (anything), every other
     // intrinsic, a cast and a typed pack's read write nothing; a routine value or any call
     // DoCallSig does not map may write anything
     hidden method DoEffCall(const ASlot: int64; const ACall: int64);
@@ -9721,7 +9734,10 @@ public type
           if LName = "setlength" then
             self.DoEffWrite(ASlot, self.FTree.FirstOf(ACall, NodeRole.Argument));
           end;
-          if (LName = "create") or (LName = "destroy") then
+          if LName = "pull" then
+            self.DoEffWrite(ASlot, self.FTree.NthOf(ACall, NodeRole.Argument, 1));
+          end;
+          if (LName = "create") or (LName = "destroy") or (LName = "pull") then
             self.DoEffAll(ASlot);
           end;
           return;
@@ -13834,6 +13850,61 @@ public type
       return self.DoCallRuntime(RuntimeRoutine.TaskReady, LBlock, 0, ACall);
     end;
 
+    // pull(S, X) (BNF sec 7, G1f): S's block held over the resume (a holder of its own in
+    // the call's hidden slot, what a previous pass left there released first, as
+    // DoWeakLock's: a body that drops the last other reference to S cannot end it while it
+    // runs), then GeneratorResume as a for in's head resumes it (false once S has ended; a
+    // raise out of its body is raised again there). When it gave a value, that value (in
+    // the object S's current word names: itself, or the innermost generator of a yield
+    // from chain, G1e) is stored into X as a for in's pass stores it (DoForInStore); X is
+    // reached only then, after the body ran (its place may have moved meanwhile). The
+    // resume's bool, 0 after LW0001
+    hidden method DoPull(const ACall: int64): int64;
+    var
+      LSubject: int64;
+      LType: int64;
+      LElement: int64;
+      LBlock: int64;
+      LSlot: int64;
+      LMore: int64;
+      LStore: int64;
+      LJoin: int64;
+      LAt: int64;
+    begin
+      LSubject := self.FTree.NthOf(ACall, NodeRole.Argument, 0);
+      LType := self.DoUsedType(LSubject);
+      LElement := self.FTree[LType].ResolvedType;
+      LBlock := self.DoValue(LSubject);
+      if LBlock = 0 then
+        return 0;
+      end;
+      if self.DoAddHolder(LBlock, LType, ACall) = 0 then
+        return 0;
+      end;
+      LSlot := self.DoTempSlot(ACall);
+      if not self.DoReleaseAt(LSlot, LType, ACall) then
+        return 0;
+      end;
+      self.DoStore(LSlot, LBlock, ACall);
+      LMore := self.DoCallRuntime(RuntimeRoutine.GeneratorResume, LBlock, 0, ACall);
+      if LMore = 0 then
+        return 0;
+      end;
+      LStore := self.FModule.AddBlock(self.FFunction);
+      LJoin := self.FModule.AddBlock(self.FFunction);
+      self.DoBranchOn(LMore, LStore, LJoin, ACall);
+      self.FBlock := LStore;
+      LAt := self.DoLoad(self.DoByteOffset(LBlock, ADAM_LOWERING_REF_HEADER + ADAM_LOWERING_GENERATOR_CURRENT,
+        ACall), IrType.Pointer, ACall);
+      LAt := self.DoByteOffset(LAt, self.DoGeneratorValueOffset(LElement), ACall);
+      if not self.DoForInStore(self.FTree.NthOf(ACall, NodeRole.Argument, 1), LAt, 0, LElement, ACall) then
+        return 0;
+      end;
+      self.DoJumpTo(LJoin, ACall);
+      self.FBlock := LJoin;
+      return LMore;
+    end;
+
     // cancel(T) (ACancel) / cancelled(T) / cancelled() (BNF sec 7, T3): TaskCancel /
     // TaskCancelled on the task's value (borrowed), TaskCancelledSelf with no argument (the
     // flag of the task whose call this thread runs); the call (cancelled's bool), 0 after
@@ -14899,6 +14970,10 @@ public type
         if (LDecl <> 0) and (self.FTree[LDecl].Kind = NodeKind.IntrinsicDecl) and
           (self.FTree[LDecl].Text = "ready") then
           return self.DoReady(ACall);
+        end;
+        if (LDecl <> 0) and (self.FTree[LDecl].Kind = NodeKind.IntrinsicDecl) and
+          (self.FTree[LDecl].Text = "pull") then
+          return self.DoPull(ACall);
         end;
         if (LDecl <> 0) and (self.FTree[LDecl].Kind = NodeKind.IntrinsicDecl) and
           ((self.FTree[LDecl].Text = "cancel") or (self.FTree[LDecl].Text = "cancelled")) then
