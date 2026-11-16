@@ -29,12 +29,14 @@
 module unit Adam.Coff.Format;
 
 import System.SysUtils, System.Runtime, Adam.Core.Common, Adam.Core.Containers, Adam.Compiler.SourceText, Adam.Compiler.Diagnostics, Adam.Compiler.AST,
-  Adam.Backend.Sections, Adam.Backend.Parts, Adam.Coff.Writer, Adam.Coff.Reader, Adam.Coff.Exports,
+  Adam.Backend.Ssa, Adam.Backend.Sections, Adam.Backend.Parts, Adam.Coff.Writer, Adam.Coff.Reader, Adam.Coff.Exports,
   Adam.Coff.Foreign, Adam.Coff.Linker, Adam.Coff.Archive;
 
 const
   // The report budget of ReadSection's scratch Diagnostics: only whether the read worked counts
   ADAM_COFF_READ_BUDGET: int64 = 1;
+  // Raised (a compiler bug) by WriteStaticLibrary for a member that is no object it reads
+  ADAM_COFF_FAULT_MEMBER: string = "Coff.Format: a static library member is no object: ";
 
 public const
   // The format's name
@@ -53,6 +55,15 @@ public const
   ADAM_COFF_SECTION_INFO: string = ".adam";
   // A unit object's import list (ImportListName; an Info section: LNK_INFO | LNK_REMOVE)
   ADAM_COFF_SECTION_IMPORTS: string = ".adamimp";
+  // The C start list (StartListGroupOf, M8d): the table's start bound, its entries (C++'s
+  // and a lib's initializers: what mingw-w64's and MSVC's startup run, _initterm's
+  // __xc_a .. __xc_z) and its end bound; one `.CRT` group, laid in suffix order
+  ADAM_COFF_SECTION_START_FIRST: string = ".CRT$XCA";
+  ADAM_COFF_SECTION_START_ENTRY: string = ".CRT$XCU";
+  ADAM_COFF_SECTION_START_LAST: string = ".CRT$XCZ";
+  // The C TLS callback list's user entries (M8d2: C's __xl_a .. __xl_z, the loader's TLS
+  // callbacks; mingw-w64's tlssup lists `.CRT$XL*` and Adam's linker does too)
+  ADAM_COFF_SECTION_THREAD_CALLBACK: string = ".CRT$XLC";
 
 public type
   // COFF / PE (see the header)
@@ -173,6 +184,106 @@ public type
     override method ImportListName(): string;
     begin
       return ADAM_COFF_SECTION_IMPORTS;
+    end;
+
+    // GNU's static archive name, lib<name>.a
+    override method StaticLibraryName(const AModuleName: string): string;
+    begin
+      return ADAM_EXPORTS_LIB_PREFIX + AModuleName + ADAM_EXT_AR;
+    end;
+
+    // Adam.Coff.Archive's WriteArchive over AObjects, each member named by its object's
+    // name and the GNU object ending (.o), its index entries its defined external symbols
+    // (storage class external, in a section or absolute) in its symbol table's order
+    override method WriteStaticLibrary(const AObjects: ObjectFileArray): ByteArray;
+    var
+      LMembers: ArchiveInputArray;
+      LScratch: ref Diagnostics;
+      LObject: CoffObjectData;
+      LSymbol: CoffSymbol;
+      LDefines: StringArray;
+      LName: string;
+      LCount: int64;
+      LI: int64;
+      LJ: int64;
+    begin
+      setlength(LMembers, len(AObjects));
+      for LI := 0 to len(AObjects) - 1 do
+        LScratch := ref Diagnostics(ADAM_COFF_READ_BUDGET);
+        LName := AObjects[LI].MemberName + ADAM_EXT_COFF_OBJ;
+        if not ReadCoffObject(AObjects[LI].Bytes, 0, len(AObjects[LI].Bytes), LName, NoPlace(),
+          LScratch, LObject) then
+          raise(ADAM_COFF_FAULT_MEMBER + LName);
+        end;
+        setlength(LDefines, len(LObject.Symbols));
+        LCount := 0;
+        for LJ := 0 to len(LObject.Symbols) - 1 do
+          LSymbol := LObject.Symbols[LJ];
+          if (not LSymbol.IsAux) and (LSymbol.StorageClass = ADAM_COFF_SYM_CLASS_EXTERNAL) and
+            (LSymbol.SectionNumber <> 0) then
+            LDefines[LCount] := LSymbol.SymbolName;
+            LCount := LCount + 1;
+          end;
+        end;
+        setlength(LDefines, LCount);
+        LMembers[LI].MemberName := LName;
+        LMembers[LI].Bytes := AObjects[LI].Bytes;
+        LMembers[LI].Defines := LDefines;
+      end;
+      return WriteArchive(LMembers);
+    end;
+
+    override method ReadStaticLibrary(const ABytes: ByteArray; var AObjects: ObjectFileArray): bool;
+    var
+      LArchive: ArchiveData;
+      LScratch: ref Diagnostics;
+      LMember: ArchiveMember;
+      LCount: int64;
+      LI: int64;
+    begin
+      setlength(AObjects, 0);
+      LScratch := ref Diagnostics(ADAM_COFF_READ_BUDGET);
+      if not ReadArchive(ABytes, "", NoPlace(), LScratch, LArchive) then
+        return false;
+      end;
+      setlength(AObjects, len(LArchive.Members));
+      LCount := 0;
+      for LI := 0 to len(LArchive.Members) - 1 do
+        LMember := LArchive.Members[LI];
+        if LMember.Kind = MemberKind.CoffObject then
+          // WriteStaticLibrary's member names end in the object ending it added
+          if not EndsStr(ADAM_EXT_COFF_OBJ, LMember.MemberName) then
+            setlength(AObjects, 0);
+            return false;
+          end;
+          AObjects[LCount].MemberName := Substring(LMember.MemberName, 0,
+            len(LMember.MemberName) - len(ADAM_EXT_COFF_OBJ));
+          setlength(AObjects[LCount].Bytes, LMember.Size);
+          if LMember.Size > 0 then
+            CopyBytes(addr of AObjects[LCount].Bytes[0], addr of ABytes[LMember.DataAt],
+              LMember.Size);
+          end;
+          LCount := LCount + 1;
+        end;
+        if LMember.Kind = MemberKind.ShortImport then
+          setlength(AObjects, 0);
+          return false;
+        end;
+      end;
+      setlength(AObjects, LCount);
+      return true;
+    end;
+
+    override method StartListGroupOf(const APlace: StartListPlace): string;
+    begin
+      match APlace of
+        StartListPlace.None: return "";
+        StartListPlace.First: return ADAM_COFF_SECTION_START_FIRST;
+        StartListPlace.Entry: return ADAM_COFF_SECTION_START_ENTRY;
+        StartListPlace.Last: return ADAM_COFF_SECTION_START_LAST;
+        StartListPlace.ThreadCallback: return ADAM_COFF_SECTION_THREAD_CALLBACK;
+      end;
+      return "";
     end;
 
     // Through Adam.Coff.Foreign's whole-object merge (ForeignLinker.AddObject), the
