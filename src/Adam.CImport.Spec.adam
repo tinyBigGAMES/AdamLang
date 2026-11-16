@@ -1,0 +1,1140 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.CImport.Spec.adam - An import spec: the TOML file `adam cimport`
+  runs (<name>.cimport.toml, M9; DESIGN sec 15)
+
+  ImportSpec   one spec: Load reads it over System.Toml, checks every key
+               and value, and keeps what it says; it reports into the
+               Diagnostics it is made with (CP codes), every report at the
+               spec's file, line and column (the value's place; a missing
+               key at the whole file). Made with nil it still answers,
+               reporting nothing.
+
+  The file (format 1), every key optional unless marked:
+
+    format = 1                          required: the spec's format
+    [import]
+    header   = "zlib.h" | ["a.h", ...]  required: the headers, each looked
+                                        up as #include <...> is
+    unit     = "System.Zlib.C"          required: the unit written
+    library  = "zlib" | { "<triple>" = "name", ... }   the library its
+                                        routines are `external` in (one
+                                        name, or one per target triple)
+    linkage  = "static" | "dll"         default static
+    output   = "folder"                 where <unit>.adam is written
+                                        (default: the spec's folder;
+                                        adam cimport -o wins)
+    sources  = ["folder", ...]          the folders whose declarations are
+                                        bound (default: each header's)
+    [preprocess]
+    defines   = ["NAME", "NAME=value"]  as clang -D (NAME alone is 1)
+    undefines = ["NAME"]                as clang -U
+    includes  = ["folder", ...]         searched before the system headers
+    [skip]
+    types / routines / macros = ["glob", ...]   C names left out ('*', '?')
+    [renames]
+    "<C name>" = "<Adam name>"
+    [uses]
+    "<unit>" = ["header glob", ...]     the declarations of those headers
+                                        are that unit's: imported, never
+                                        written again
+    [[insert]]
+    before | after | replace = "text"   exactly one: where in the unit
+    text = "..."                        required: what goes there
+    occurrence = N                      which match (default 1)
+
+  A folder is relative to the spec's own folder and must exist. A key or a
+  table the spec does not know is an error at its value (never ignored: a
+  misspelt key would change the unit in silence). Names: a unit name is
+  dotted identifiers, no segment an Adam keyword (BNF sec 9); a C name and
+  a define's NAME are C identifiers; a rename's Adam name is an identifier
+  and no Adam keyword (a header name that is one gets its trailing `_`
+  without a rename, AD.5). Target-neutral: a library's triple is checked
+  against Adam.Target.Registry, nothing here names a target.
+*******************************************************************************/
+
+module unit Adam.CImport.Spec;
+
+import System.SysUtils, System.IO, System.Toml.C, System.Toml, Adam.Core.Common, Adam.Core.Messages,
+  Adam.Compiler.SourceText, Adam.Compiler.Diagnostics, Adam.Compiler.Lexer, Adam.Target,
+  Adam.Target.Registry;
+
+public const
+  ADAM_ERR_CIMPORT_SPEC_001: string = "CP0001";   // the spec cannot be read or is not TOML
+  ADAM_ERR_CIMPORT_SPEC_002: string = "CP0002";   // a required key is missing
+  ADAM_ERR_CIMPORT_SPEC_003: string = "CP0003";   // a key holds the wrong kind of value
+  ADAM_ERR_CIMPORT_SPEC_004: string = "CP0004";   // a key or table the spec does not know
+  ADAM_ERR_CIMPORT_SPEC_005: string = "CP0005";   // the spec's format is not one Adam reads
+  ADAM_ERR_CIMPORT_SPEC_006: string = "CP0006";   // a unit name is not valid
+  ADAM_ERR_CIMPORT_SPEC_007: string = "CP0007";   // the linkage is not static or dll
+  ADAM_ERR_CIMPORT_SPEC_008: string = "CP0008";   // a library's key is not a target triple
+  ADAM_ERR_CIMPORT_SPEC_009: string = "CP0009";   // a folder does not exist
+  ADAM_ERR_CIMPORT_SPEC_010: string = "CP0010";   // a define / undefine / C name is not valid
+  ADAM_ERR_CIMPORT_SPEC_011: string = "CP0011";   // a rename's Adam name is not valid
+  ADAM_ERR_CIMPORT_SPEC_012: string = "CP0012";   // an [[insert]] without exactly one anchor
+  ADAM_ERR_CIMPORT_SPEC_013: string = "CP0013";   // an [[insert]]'s occurrence below 1
+  ADAM_ERR_CIMPORT_SPEC_014: string = "CP0014";   // an empty text where a name is wanted
+  ADAM_ERR_CIMPORT_SPEC_015: string = "CP0015";   // the file's name is no import spec's
+
+  // The newest import spec format Adam reads
+  ADAM_CIMPORT_SPEC_FORMAT: int64 = 1;
+
+  // The tables and keys of a spec (see the header)
+  ADAM_CIMPORT_KEY_FORMAT: string = "format";
+  ADAM_CIMPORT_TABLE_IMPORT: string = "import";
+  ADAM_CIMPORT_TABLE_PREPROCESS: string = "preprocess";
+  ADAM_CIMPORT_TABLE_SKIP: string = "skip";
+  ADAM_CIMPORT_TABLE_RENAMES: string = "renames";
+  ADAM_CIMPORT_TABLE_USES: string = "uses";
+  ADAM_CIMPORT_TABLE_INSERT: string = "insert";
+  ADAM_CIMPORT_KEY_HEADER: string = "header";
+  ADAM_CIMPORT_KEY_UNIT: string = "unit";
+  ADAM_CIMPORT_KEY_LIBRARY: string = "library";
+  ADAM_CIMPORT_KEY_LINKAGE: string = "linkage";
+  ADAM_CIMPORT_KEY_OUTPUT: string = "output";
+  ADAM_CIMPORT_KEY_SOURCES: string = "sources";
+  ADAM_CIMPORT_KEY_DEFINES: string = "defines";
+  ADAM_CIMPORT_KEY_UNDEFINES: string = "undefines";
+  ADAM_CIMPORT_KEY_INCLUDES: string = "includes";
+  ADAM_CIMPORT_KEY_TYPES: string = "types";
+  ADAM_CIMPORT_KEY_ROUTINES: string = "routines";
+  ADAM_CIMPORT_KEY_MACROS: string = "macros";
+  ADAM_CIMPORT_KEY_BEFORE: string = "before";
+  ADAM_CIMPORT_KEY_AFTER: string = "after";
+  ADAM_CIMPORT_KEY_REPLACE: string = "replace";
+  ADAM_CIMPORT_KEY_TEXT: string = "text";
+  ADAM_CIMPORT_KEY_OCCURRENCE: string = "occurrence";
+
+  // linkage's two values
+  ADAM_CIMPORT_LINKAGE_STATIC: string = "static";
+  ADAM_CIMPORT_LINKAGE_DLL: string = "dll";
+
+  // A define given with no value is 1, as clang -D NAME
+  ADAM_CIMPORT_DEFINE_DEFAULT: string = "1";
+
+public type
+  // How the unit's routines reach the library: linked in (a static library), or imported
+  // from a dll
+  ImportLinkage = choices(Static, Dll);
+
+  // A text of the spec and the place of its value (line, column; 0 = the whole file)
+  SpecText = record
+    Text: string;
+    Line: int32;
+    Column: int32;
+  end;
+
+  SpecTextArray = array of SpecText;
+
+  // The library one target triple binds against; Triple "" = every target
+  SpecLibrary = record
+    Triple: string;
+    Name: string;
+  end;
+
+  SpecLibraryArray = array of SpecLibrary;
+
+  // A define as clang -D takes it: NAME, its value ("1" when none was given)
+  SpecDefine = record
+    Name: string;
+    Value: string;
+  end;
+
+  SpecDefineArray = array of SpecDefine;
+
+  // A C name and the Adam name the unit gives it
+  SpecRename = record
+    CName: string;
+    AdamName: string;
+  end;
+
+  SpecRenameArray = array of SpecRename;
+
+  // A unit that owns the declarations of the headers its globs match
+  SpecUse = record
+    UnitName: string;
+    Headers: StringArray;
+  end;
+
+  SpecUseArray = array of SpecUse;
+
+  // Where an [[insert]] puts its text: before its anchor, after it, or in its place
+  InsertPlace = choices(Before, After, Replace);
+
+  // One [[insert]]: its anchor text, which match of it (1 = the first), what goes there and
+  // where the edit is in the spec (its anchor's place)
+  SpecInsert = record
+    Place: InsertPlace;
+    Anchor: string;
+    Text: string;
+    Occurrence: int64;
+    Line: int32;
+    Column: int32;
+  end;
+
+  SpecInsertArray = array of SpecInsert;
+
+// AText added at the end of AList
+routine DoAddString(var AList: StringArray; const AText: string);
+var
+  LCount: int64;
+begin
+  LCount := len(AList);
+  setlength(AList, LCount + 1);
+  AList[LCount] := AText;
+end;
+
+// The path of AKey in the table at ATable ("" = the root)
+routine DoKeyPath(const ATable: string; const AKey: string): string;
+begin
+  if ATable = "" then
+    return TomlQuoteKey(AKey);
+  end;
+  return ATable + "." + TomlQuoteKey(AKey);
+end;
+
+// The path of the item AIndex of the array at APath
+routine DoItemPath(const APath: string; const AIndex: int64): string;
+begin
+  return APath + "[" + IntToStr(AIndex) + "]";
+end;
+
+// The path as the user wrote it in the spec: a table's name and its key joined by '.', each
+// unquoted (what a report names)
+routine DoShownKey(const ATable: string; const AKey: string): string;
+begin
+  if ATable = "" then
+    return AKey;
+  end;
+  return ATable + "." + AKey;
+end;
+
+// True when AText is a C identifier: a letter or '_', then letters, digits and '_'
+public routine IsCIdentifier(const AText: string): bool;
+var
+  LI: int64;
+  LChar: char;
+begin
+  if AText = "" then
+    return false;
+  end;
+  for LI := 0 to len(AText) - 1 do
+    LChar := AText[LI];
+    if not (((LChar >= 'a') and (LChar <= 'z')) or ((LChar >= 'A') and (LChar <= 'Z')) or
+      (LChar = '_') or ((LI > 0) and (LChar >= '0') and (LChar <= '9'))) then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// True when AText can name an Adam declaration: a C identifier that is no Adam keyword
+public routine IsAdamName(const AText: string): bool;
+begin
+  return IsCIdentifier(AText) and (KeywordKind(AText) = TokenKind.Identifier);
+end;
+
+// True when AText is a unit name: Adam names joined by '.' (BNF sec 9)
+public routine IsUnitName(const AText: string): bool;
+var
+  LParts: StringArray;
+  LI: int64;
+begin
+  if AText = "" then
+    return false;
+  end;
+  LParts := SplitString(AText, ".");
+  for LI := 0 to len(LParts) - 1 do
+    if not IsAdamName(LParts[LI]) then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+public type
+  // One import spec (see the header)
+  ImportSpec = object
+    hidden FReports: ref Diagnostics;
+    // The spec's path as given (every report's file) and as resolved, and its folder
+    hidden FFileName: string;
+    hidden FPath: string;
+    hidden FFolder: string;
+    hidden FValid: bool;
+
+    // What the spec says, valid once Load succeeds. Includes and Sources are the folders
+    // resolved against the spec's folder; Output is "" when the spec names none
+    Headers: SpecTextArray;
+    UnitName: string;
+    Libraries: SpecLibraryArray;
+    Linkage: ImportLinkage;
+    Output: string;
+    Sources: StringArray;
+    Defines: SpecDefineArray;
+    Undefines: StringArray;
+    Includes: StringArray;
+    SkipTypes: StringArray;
+    SkipRoutines: StringArray;
+    SkipMacros: StringArray;
+    Renames: SpecRenameArray;
+    Uses: SpecUseArray;
+    Inserts: SpecInsertArray;
+
+    // AReports takes every report (nil: none is made)
+    init(const AReports: ref Diagnostics);
+    begin
+      self.FReports := AReports;
+      self.DoClear();
+    end;
+
+    hidden method DoClear();
+    begin
+      self.FFileName := "";
+      self.FPath := "";
+      self.FFolder := "";
+      self.FValid := false;
+      setlength(self.Headers, 0);
+      self.UnitName := "";
+      setlength(self.Libraries, 0);
+      self.Linkage := ImportLinkage.Static;
+      self.Output := "";
+      setlength(self.Sources, 0);
+      setlength(self.Defines, 0);
+      setlength(self.Undefines, 0);
+      setlength(self.Includes, 0);
+      setlength(self.SkipTypes, 0);
+      setlength(self.SkipRoutines, 0);
+      setlength(self.SkipMacros, 0);
+      setlength(self.Renames, 0);
+      setlength(self.Uses, 0);
+      setlength(self.Inserts, 0);
+    end;
+
+    // The spec's path as given: the file every report of it names
+    property FileName: string read FFileName;
+    // The folder the spec is in (resolved): its relative folders are relative to it
+    property Folder: string read FFolder;
+
+    // The place ALine / AColumn in the spec (0 = the whole file)
+    const method PlaceOf(const ALine: int32; const AColumn: int32): SourcePlace;
+    begin
+      return PlaceAt(self.FFileName, ALine, AColumn);
+    end;
+
+    // The place of AText's value in the spec
+    const method TextPlace(const AText: SpecText): SourcePlace;
+    begin
+      return self.PlaceOf(AText.Line, AText.Column);
+    end;
+
+    hidden method DoError(const ACode: string; const APlace: SourcePlace; const ATemplate: string;
+      const AArgs: MessageArgs);
+    begin
+      self.FValid := false;
+      if self.FReports <> nil then
+        self.FReports.Add(Severity.Error, ACode, APlace, ATemplate, AArgs);
+      end;
+    end;
+
+    // The place of the value at APath in ADoc; the whole file when it has none
+    hidden method DoValuePlace(var ADoc: TomlDocument; const APath: string): SourcePlace;
+    var
+      LDatum: toml_datum_t;
+    begin
+      if not ADoc.Find(APath, LDatum) or (LDatum.lineno <= 0) then
+        return self.PlaceOf(0, 0);
+      end;
+      return self.PlaceOf(LDatum.lineno, LDatum.colno);
+    end;
+
+    // AText with the place of the value at APath in ADoc
+    hidden method DoTextAt(var ADoc: TomlDocument; const APath: string;
+      const AText: string): SpecText;
+    var
+      LText: SpecText;
+      LPlace: SourcePlace;
+    begin
+      LPlace := self.DoValuePlace(ADoc, APath);
+      LText.Text := AText;
+      LText.Line := LPlace.Line;
+      LText.Column := LPlace.Column;
+      return LText;
+    end;
+
+    // CP0003 at the value at APath (AShown as the user wrote it) that is not AWanted
+    hidden method DoWrongKind(var ADoc: TomlDocument; const APath: string; const AShown: string;
+      const AWanted: string);
+    begin
+      self.DoError(ADAM_ERR_CIMPORT_SPEC_003, self.DoValuePlace(ADoc, APath),
+        ADAM_MSG_CIMPORT_SPEC_KEY_TYPE, NoArgs().Str(AShown).Str(AWanted));
+    end;
+
+    // CP0002 for the key AShown, at the whole file
+    hidden method DoMissing(const AShown: string);
+    begin
+      self.DoError(ADAM_ERR_CIMPORT_SPEC_002, self.PlaceOf(0, 0), ADAM_MSG_CIMPORT_SPEC_KEY_MISSING,
+        NoArgs().Str(AShown));
+    end;
+
+    // The string at ATable.AKey into AValue: true when it is one, or when it is absent and
+    // not ARequired (AValue ""); else reported, false
+    hidden method DoString(var ADoc: TomlDocument; const ATable: string; const AKey: string;
+      const ARequired: bool; var AValue: string): bool;
+    var
+      LPath: string;
+    begin
+      LPath := DoKeyPath(ATable, AKey);
+      AValue := "";
+      if not ADoc.Has(LPath) then
+        if ARequired then
+          self.DoMissing(DoShownKey(ATable, AKey));
+          return false;
+        end;
+        return true;
+      end;
+      if (ADoc.KindOf(LPath) <> TomlKind.String) or not ADoc.GetString(LPath, AValue) then
+        self.DoWrongKind(ADoc, LPath, DoShownKey(ATable, AKey), ADAM_MSG_CIMPORT_SPEC_KIND_STRING);
+        return false;
+      end;
+      return true;
+    end;
+
+    // The strings at APath (AShown as written) into AList, each with its place: an array of
+    // strings, or one string when AOneAllowed; absent: none. A wrong kind: reported, false
+    hidden method DoTexts(var ADoc: TomlDocument; const APath: string; const AShown: string;
+      const AOneAllowed: bool; var AList: SpecTextArray): bool;
+    var
+      LKind: TomlKind;
+      LCount: int64;
+      LI: int64;
+      LItem: string;
+      LValue: string;
+      LWanted: string;
+    begin
+      setlength(AList, 0);
+      LWanted := ADAM_MSG_CIMPORT_SPEC_KIND_STRINGS;
+      if AOneAllowed then
+        LWanted := ADAM_MSG_CIMPORT_SPEC_KIND_STRING_OR_STRINGS;
+      end;
+      LKind := ADoc.KindOf(APath);
+      if LKind = TomlKind.Missing then
+        return true;
+      end;
+      if (LKind = TomlKind.String) and AOneAllowed then
+        if not ADoc.GetString(APath, LValue) then
+          self.DoWrongKind(ADoc, APath, AShown, LWanted);
+          return false;
+        end;
+        setlength(AList, 1);
+        AList[0] := self.DoTextAt(ADoc, APath, LValue);
+        return true;
+      end;
+      if (LKind <> TomlKind.Array) or not ADoc.Count(APath, LCount) then
+        self.DoWrongKind(ADoc, APath, AShown, LWanted);
+        return false;
+      end;
+      setlength(AList, LCount);
+      for LI := 0 to LCount - 1 do
+        LItem := DoItemPath(APath, LI);
+        if (ADoc.KindOf(LItem) <> TomlKind.String) or not ADoc.GetString(LItem, LValue) then
+          self.DoWrongKind(ADoc, LItem, AShown, LWanted);
+          setlength(AList, 0);
+          return false;
+        end;
+        AList[LI] := self.DoTextAt(ADoc, LItem, LValue);
+      end;
+      return true;
+    end;
+
+    // DoTexts' strings without their places
+    hidden method DoStrings(var ADoc: TomlDocument; const ATable: string; const AKey: string;
+      var AList: StringArray): bool;
+    var
+      LTexts: SpecTextArray;
+      LI: int64;
+    begin
+      setlength(AList, 0);
+      if not self.DoTexts(ADoc, DoKeyPath(ATable, AKey), DoShownKey(ATable, AKey), false,
+        LTexts) then
+        return false;
+      end;
+      for LI := 0 to len(LTexts) - 1 do
+        DoAddString(AList, LTexts[LI].Text);
+      end;
+      return true;
+    end;
+
+    // The folders at ATable.AKey resolved against the spec's folder into AList; each must be
+    // a folder that exists (CP0009 at it). False, reported
+    hidden method DoFolders(var ADoc: TomlDocument; const ATable: string; const AKey: string;
+      var AList: StringArray): bool;
+    var
+      LTexts: SpecTextArray;
+      LI: int64;
+      LFolder: string;
+      LOk: bool;
+    begin
+      setlength(AList, 0);
+      if not self.DoTexts(ADoc, DoKeyPath(ATable, AKey), DoShownKey(ATable, AKey), false,
+        LTexts) then
+        return false;
+      end;
+      LOk := true;
+      for LI := 0 to len(LTexts) - 1 do
+        LFolder := ResolvePath(LTexts[LI].Text, self.FFolder);
+        if (Trim(LTexts[LI].Text) = "") or (LFolder = "") or not DirectoryExists(LFolder) then
+          self.DoError(ADAM_ERR_CIMPORT_SPEC_009, self.TextPlace(LTexts[LI]),
+            ADAM_MSG_CIMPORT_SPEC_NO_FOLDER,
+            NoArgs().Str(LTexts[LI].Text).Str(ForwardSlashes(LFolder)));
+          LOk := false;
+        else
+          DoAddString(AList, LFolder);
+        end;
+      end;
+      return LOk;
+    end;
+
+    // CP0004 for every key of the table at APath (AShown as written, "" = the root) that is
+    // not in AKnown; AKnownText lists them in the report
+    hidden method DoCheckKeys(var ADoc: TomlDocument; const APath: string; const AShown: string;
+      const AKnown: StringArray; const AKnownText: string);
+    var
+      LCount: int64;
+      LI: int64;
+      LJ: int64;
+      LKey: string;
+      LFound: bool;
+      LPath: string;
+    begin
+      if not ADoc.Count(APath, LCount) then
+        return;
+      end;
+      for LI := 0 to LCount - 1 do
+        if ADoc.KeyAt(APath, LI, LKey) then
+          LFound := false;
+          for LJ := 0 to len(AKnown) - 1 do
+            if AKnown[LJ] = LKey then
+              LFound := true;
+            end;
+          end;
+          if not LFound then
+            LPath := DoKeyPath(APath, LKey);
+            if AShown = "" then
+              self.DoError(ADAM_ERR_CIMPORT_SPEC_004, self.DoValuePlace(ADoc, LPath),
+                ADAM_MSG_CIMPORT_SPEC_ROOT_UNKNOWN, NoArgs().Str(LKey).Str(AKnownText));
+            else
+              self.DoError(ADAM_ERR_CIMPORT_SPEC_004, self.DoValuePlace(ADoc, LPath),
+                ADAM_MSG_CIMPORT_SPEC_KEY_UNKNOWN, NoArgs().Str(LKey).Str(AShown).Str(AKnownText));
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // True when ATable is absent or a table; else CP0003, false
+    hidden method DoIsTable(var ADoc: TomlDocument; const ATable: string): bool;
+    var
+      LKind: TomlKind;
+    begin
+      LKind := ADoc.KindOf(TomlQuoteKey(ATable));
+      if (LKind = TomlKind.Missing) or (LKind = TomlKind.Table) then
+        return true;
+      end;
+      self.DoWrongKind(ADoc, TomlQuoteKey(ATable), ATable, ADAM_MSG_CIMPORT_SPEC_KIND_TABLE);
+      return false;
+    end;
+
+    // The root: format and the tables
+    hidden method DoReadRoot(var ADoc: TomlDocument);
+    var
+      LKnown: StringArray;
+      LFormat: int64;
+      LPath: string;
+    begin
+      setlength(LKnown, 0);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_FORMAT);
+      DoAddString(LKnown, ADAM_CIMPORT_TABLE_IMPORT);
+      DoAddString(LKnown, ADAM_CIMPORT_TABLE_PREPROCESS);
+      DoAddString(LKnown, ADAM_CIMPORT_TABLE_SKIP);
+      DoAddString(LKnown, ADAM_CIMPORT_TABLE_RENAMES);
+      DoAddString(LKnown, ADAM_CIMPORT_TABLE_USES);
+      DoAddString(LKnown, ADAM_CIMPORT_TABLE_INSERT);
+      self.DoCheckKeys(ADoc, "", "", LKnown, JoinStrings(LKnown, ", "));
+      LPath := TomlQuoteKey(ADAM_CIMPORT_KEY_FORMAT);
+      if not ADoc.Has(LPath) then
+        self.DoMissing(ADAM_CIMPORT_KEY_FORMAT);
+        return;
+      end;
+      if (ADoc.KindOf(LPath) <> TomlKind.Integer) or not ADoc.GetInt64(LPath, LFormat) then
+        self.DoWrongKind(ADoc, LPath, ADAM_CIMPORT_KEY_FORMAT, ADAM_MSG_CIMPORT_SPEC_KIND_INTEGER);
+        return;
+      end;
+      if (LFormat < 1) or (LFormat > ADAM_CIMPORT_SPEC_FORMAT) then
+        self.DoError(ADAM_ERR_CIMPORT_SPEC_005, self.DoValuePlace(ADoc, LPath),
+          ADAM_MSG_CIMPORT_SPEC_FORMAT, NoArgs().Int(LFormat).Int(ADAM_CIMPORT_SPEC_FORMAT));
+      end;
+    end;
+
+    // [import]'s library: one name for every target, or a table of names by target triple
+    hidden method DoReadLibrary(var ADoc: TomlDocument);
+    var
+      LPath: string;
+      LKind: TomlKind;
+      LCount: int64;
+      LI: int64;
+      LTriple: string;
+      LItem: string;
+      LName: string;
+      LLibrary: SpecLibrary;
+    begin
+      LPath := DoKeyPath(ADAM_CIMPORT_TABLE_IMPORT, ADAM_CIMPORT_KEY_LIBRARY);
+      LKind := ADoc.KindOf(LPath);
+      if LKind = TomlKind.Missing then
+        return;
+      end;
+      if LKind = TomlKind.String then
+        if ADoc.GetString(LPath, LName) and (Trim(LName) <> "") then
+          LLibrary.Triple := "";
+          LLibrary.Name := LName;
+          setlength(self.Libraries, 1);
+          self.Libraries[0] := LLibrary;
+          return;
+        end;
+        self.DoError(ADAM_ERR_CIMPORT_SPEC_014, self.DoValuePlace(ADoc, LPath),
+          ADAM_MSG_CIMPORT_SPEC_EMPTY, NoArgs().Str(DoShownKey(ADAM_CIMPORT_TABLE_IMPORT,
+          ADAM_CIMPORT_KEY_LIBRARY)));
+        return;
+      end;
+      if (LKind <> TomlKind.Table) or not ADoc.Count(LPath, LCount) then
+        self.DoWrongKind(ADoc, LPath, DoShownKey(ADAM_CIMPORT_TABLE_IMPORT,
+          ADAM_CIMPORT_KEY_LIBRARY), ADAM_MSG_CIMPORT_SPEC_KIND_LIBRARY);
+        return;
+      end;
+      for LI := 0 to LCount - 1 do
+        if ADoc.KeyAt(LPath, LI, LTriple) then
+          LItem := DoKeyPath(LPath, LTriple);
+          if FindTarget(LTriple) = nil then
+            self.DoError(ADAM_ERR_CIMPORT_SPEC_008, self.DoValuePlace(ADoc, LItem),
+              ADAM_MSG_CIMPORT_SPEC_BAD_TRIPLE, NoArgs().Str(LTriple).Str(KnownTriples()));
+          else
+            if (ADoc.KindOf(LItem) <> TomlKind.String) or not ADoc.GetString(LItem, LName) then
+              self.DoWrongKind(ADoc, LItem, DoShownKey(ADAM_CIMPORT_TABLE_IMPORT,
+                ADAM_CIMPORT_KEY_LIBRARY) + "." + LTriple, ADAM_MSG_CIMPORT_SPEC_KIND_STRING);
+            else
+              if Trim(LName) = "" then
+                self.DoError(ADAM_ERR_CIMPORT_SPEC_014, self.DoValuePlace(ADoc, LItem),
+                  ADAM_MSG_CIMPORT_SPEC_EMPTY, NoArgs().Str(DoShownKey(ADAM_CIMPORT_TABLE_IMPORT,
+                  ADAM_CIMPORT_KEY_LIBRARY) + "." + LTriple));
+              else
+                LLibrary.Triple := LTriple;
+                LLibrary.Name := LName;
+                setlength(self.Libraries, len(self.Libraries) + 1);
+                self.Libraries[len(self.Libraries) - 1] := LLibrary;
+              end;
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // [import]
+    hidden method DoReadImport(var ADoc: TomlDocument);
+    var
+      LKnown: StringArray;
+      LHeaderPath: string;
+      LUnitPath: string;
+      LText: string;
+      LI: int64;
+    begin
+      setlength(LKnown, 0);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_HEADER);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_UNIT);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_LIBRARY);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_LINKAGE);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_OUTPUT);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_SOURCES);
+      if not self.DoIsTable(ADoc, ADAM_CIMPORT_TABLE_IMPORT) then
+        return;
+      end;
+      self.DoCheckKeys(ADoc, TomlQuoteKey(ADAM_CIMPORT_TABLE_IMPORT), ADAM_CIMPORT_TABLE_IMPORT,
+        LKnown, JoinStrings(LKnown, ", "));
+
+      // header: required, one or more names, none empty
+      LHeaderPath := DoKeyPath(ADAM_CIMPORT_TABLE_IMPORT, ADAM_CIMPORT_KEY_HEADER);
+      if not ADoc.Has(LHeaderPath) then
+        self.DoMissing(DoShownKey(ADAM_CIMPORT_TABLE_IMPORT, ADAM_CIMPORT_KEY_HEADER));
+      else
+        if self.DoTexts(ADoc, LHeaderPath, DoShownKey(ADAM_CIMPORT_TABLE_IMPORT,
+          ADAM_CIMPORT_KEY_HEADER), true, self.Headers) then
+          if len(self.Headers) = 0 then
+            self.DoError(ADAM_ERR_CIMPORT_SPEC_014, self.DoValuePlace(ADoc, LHeaderPath),
+              ADAM_MSG_CIMPORT_SPEC_NO_HEADER, NoArgs().Str(DoShownKey(ADAM_CIMPORT_TABLE_IMPORT,
+              ADAM_CIMPORT_KEY_HEADER)));
+          end;
+          for LI := 0 to len(self.Headers) - 1 do
+            if Trim(self.Headers[LI].Text) = "" then
+              self.DoError(ADAM_ERR_CIMPORT_SPEC_014, self.TextPlace(self.Headers[LI]),
+                ADAM_MSG_CIMPORT_SPEC_EMPTY, NoArgs().Str(DoShownKey(ADAM_CIMPORT_TABLE_IMPORT,
+                ADAM_CIMPORT_KEY_HEADER)));
+            end;
+          end;
+        end;
+      end;
+
+      // unit: required, a unit name
+      LUnitPath := DoKeyPath(ADAM_CIMPORT_TABLE_IMPORT, ADAM_CIMPORT_KEY_UNIT);
+      if self.DoString(ADoc, ADAM_CIMPORT_TABLE_IMPORT, ADAM_CIMPORT_KEY_UNIT, true, LText) then
+        if IsUnitName(LText) then
+          self.UnitName := LText;
+        else
+          self.DoError(ADAM_ERR_CIMPORT_SPEC_006, self.DoValuePlace(ADoc, LUnitPath),
+            ADAM_MSG_CIMPORT_SPEC_BAD_UNIT, NoArgs().Str(LText));
+        end;
+      end;
+
+      self.DoReadLibrary(ADoc);
+
+      // linkage: static (the default) or dll
+      if self.DoString(ADoc, ADAM_CIMPORT_TABLE_IMPORT, ADAM_CIMPORT_KEY_LINKAGE, false, LText) then
+        if LText = ADAM_CIMPORT_LINKAGE_DLL then
+          self.Linkage := ImportLinkage.Dll;
+        else
+          if (LText <> "") and (LText <> ADAM_CIMPORT_LINKAGE_STATIC) then
+            self.DoError(ADAM_ERR_CIMPORT_SPEC_007, self.DoValuePlace(ADoc,
+              DoKeyPath(ADAM_CIMPORT_TABLE_IMPORT, ADAM_CIMPORT_KEY_LINKAGE)),
+              ADAM_MSG_CIMPORT_SPEC_BAD_LINKAGE, NoArgs().Str(LText));
+          end;
+        end;
+      end;
+
+      // output: a folder (it need not exist yet: the writer makes it)
+      if self.DoString(ADoc, ADAM_CIMPORT_TABLE_IMPORT, ADAM_CIMPORT_KEY_OUTPUT, false, LText) then
+        if LText <> "" then
+          self.Output := ResolvePath(LText, self.FFolder);
+          if self.Output = "" then
+            self.DoError(ADAM_ERR_CIMPORT_SPEC_014, self.DoValuePlace(ADoc,
+              DoKeyPath(ADAM_CIMPORT_TABLE_IMPORT, ADAM_CIMPORT_KEY_OUTPUT)),
+              ADAM_MSG_CIMPORT_SPEC_EMPTY, NoArgs().Str(DoShownKey(ADAM_CIMPORT_TABLE_IMPORT,
+              ADAM_CIMPORT_KEY_OUTPUT)));
+          end;
+        end;
+      end;
+
+      self.DoFolders(ADoc, ADAM_CIMPORT_TABLE_IMPORT, ADAM_CIMPORT_KEY_SOURCES, self.Sources);
+    end;
+
+    // [preprocess]
+    hidden method DoReadPreprocess(var ADoc: TomlDocument);
+    var
+      LKnown: StringArray;
+      LTexts: SpecTextArray;
+      LDefine: SpecDefine;
+      LEqual: int64;
+      LI: int64;
+    begin
+      setlength(LKnown, 0);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_DEFINES);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_UNDEFINES);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_INCLUDES);
+      if not self.DoIsTable(ADoc, ADAM_CIMPORT_TABLE_PREPROCESS) then
+        return;
+      end;
+      self.DoCheckKeys(ADoc, TomlQuoteKey(ADAM_CIMPORT_TABLE_PREPROCESS),
+        ADAM_CIMPORT_TABLE_PREPROCESS, LKnown, JoinStrings(LKnown, ", "));
+
+      // defines: NAME or NAME=value (NAME alone is 1, as clang -D)
+      if self.DoTexts(ADoc, DoKeyPath(ADAM_CIMPORT_TABLE_PREPROCESS, ADAM_CIMPORT_KEY_DEFINES),
+        DoShownKey(ADAM_CIMPORT_TABLE_PREPROCESS, ADAM_CIMPORT_KEY_DEFINES), false, LTexts) then
+        for LI := 0 to len(LTexts) - 1 do
+          LEqual := IndexOf("=", LTexts[LI].Text, 0);
+          if LEqual < 0 then
+            LDefine.Name := LTexts[LI].Text;
+            LDefine.Value := ADAM_CIMPORT_DEFINE_DEFAULT;
+          else
+            LDefine.Name := Substring(LTexts[LI].Text, 0, LEqual);
+            LDefine.Value := Substring(LTexts[LI].Text, LEqual + 1, len(LTexts[LI].Text) - LEqual - 1);
+          end;
+          if IsCIdentifier(LDefine.Name) then
+            setlength(self.Defines, len(self.Defines) + 1);
+            self.Defines[len(self.Defines) - 1] := LDefine;
+          else
+            self.DoError(ADAM_ERR_CIMPORT_SPEC_010, self.TextPlace(LTexts[LI]),
+              ADAM_MSG_CIMPORT_SPEC_BAD_DEFINE, NoArgs().Str(LTexts[LI].Text));
+          end;
+        end;
+      end;
+
+      // undefines: names
+      if self.DoTexts(ADoc, DoKeyPath(ADAM_CIMPORT_TABLE_PREPROCESS, ADAM_CIMPORT_KEY_UNDEFINES),
+        DoShownKey(ADAM_CIMPORT_TABLE_PREPROCESS, ADAM_CIMPORT_KEY_UNDEFINES), false, LTexts) then
+        for LI := 0 to len(LTexts) - 1 do
+          if IsCIdentifier(LTexts[LI].Text) then
+            DoAddString(self.Undefines, LTexts[LI].Text);
+          else
+            self.DoError(ADAM_ERR_CIMPORT_SPEC_010, self.TextPlace(LTexts[LI]),
+              ADAM_MSG_CIMPORT_SPEC_BAD_CNAME, NoArgs().Str(LTexts[LI].Text));
+          end;
+        end;
+      end;
+
+      self.DoFolders(ADoc, ADAM_CIMPORT_TABLE_PREPROCESS, ADAM_CIMPORT_KEY_INCLUDES, self.Includes);
+    end;
+
+    // [skip]
+    hidden method DoReadSkip(var ADoc: TomlDocument);
+    var
+      LKnown: StringArray;
+    begin
+      setlength(LKnown, 0);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_TYPES);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_ROUTINES);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_MACROS);
+      if not self.DoIsTable(ADoc, ADAM_CIMPORT_TABLE_SKIP) then
+        return;
+      end;
+      self.DoCheckKeys(ADoc, TomlQuoteKey(ADAM_CIMPORT_TABLE_SKIP), ADAM_CIMPORT_TABLE_SKIP, LKnown,
+        JoinStrings(LKnown, ", "));
+      self.DoStrings(ADoc, ADAM_CIMPORT_TABLE_SKIP, ADAM_CIMPORT_KEY_TYPES, self.SkipTypes);
+      self.DoStrings(ADoc, ADAM_CIMPORT_TABLE_SKIP, ADAM_CIMPORT_KEY_ROUTINES, self.SkipRoutines);
+      self.DoStrings(ADoc, ADAM_CIMPORT_TABLE_SKIP, ADAM_CIMPORT_KEY_MACROS, self.SkipMacros);
+    end;
+
+    // [renames]: each key a C name, its value the Adam name
+    hidden method DoReadRenames(var ADoc: TomlDocument);
+    var
+      LTable: string;
+      LCount: int64;
+      LI: int64;
+      LKey: string;
+      LItem: string;
+      LName: string;
+      LRename: SpecRename;
+    begin
+      if not self.DoIsTable(ADoc, ADAM_CIMPORT_TABLE_RENAMES) then
+        return;
+      end;
+      LTable := TomlQuoteKey(ADAM_CIMPORT_TABLE_RENAMES);
+      if not ADoc.Count(LTable, LCount) then
+        return;
+      end;
+      for LI := 0 to LCount - 1 do
+        if ADoc.KeyAt(LTable, LI, LKey) then
+          LItem := DoKeyPath(LTable, LKey);
+          if not IsCIdentifier(LKey) then
+            self.DoError(ADAM_ERR_CIMPORT_SPEC_010, self.DoValuePlace(ADoc, LItem),
+              ADAM_MSG_CIMPORT_SPEC_BAD_CNAME, NoArgs().Str(LKey));
+          else
+            if (ADoc.KindOf(LItem) <> TomlKind.String) or not ADoc.GetString(LItem, LName) then
+              self.DoWrongKind(ADoc, LItem, DoShownKey(ADAM_CIMPORT_TABLE_RENAMES, LKey),
+                ADAM_MSG_CIMPORT_SPEC_KIND_STRING);
+            else
+              if IsAdamName(LName) then
+                LRename.CName := LKey;
+                LRename.AdamName := LName;
+                setlength(self.Renames, len(self.Renames) + 1);
+                self.Renames[len(self.Renames) - 1] := LRename;
+              else
+                self.DoError(ADAM_ERR_CIMPORT_SPEC_011, self.DoValuePlace(ADoc, LItem),
+                  ADAM_MSG_CIMPORT_SPEC_BAD_RENAME, NoArgs().Str(LKey).Str(LName));
+              end;
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // [uses]: each key a unit, its value the header globs it owns
+    hidden method DoReadUses(var ADoc: TomlDocument);
+    var
+      LTable: string;
+      LCount: int64;
+      LI: int64;
+      LKey: string;
+      LItem: string;
+      LUse: SpecUse;
+      LTexts: SpecTextArray;
+      LJ: int64;
+    begin
+      if not self.DoIsTable(ADoc, ADAM_CIMPORT_TABLE_USES) then
+        return;
+      end;
+      LTable := TomlQuoteKey(ADAM_CIMPORT_TABLE_USES);
+      if not ADoc.Count(LTable, LCount) then
+        return;
+      end;
+      for LI := 0 to LCount - 1 do
+        if ADoc.KeyAt(LTable, LI, LKey) then
+          LItem := DoKeyPath(LTable, LKey);
+          if not IsUnitName(LKey) then
+            self.DoError(ADAM_ERR_CIMPORT_SPEC_006, self.DoValuePlace(ADoc, LItem),
+              ADAM_MSG_CIMPORT_SPEC_BAD_UNIT, NoArgs().Str(LKey));
+          else
+            if self.DoTexts(ADoc, LItem, DoShownKey(ADAM_CIMPORT_TABLE_USES, LKey), false,
+              LTexts) then
+              LUse.UnitName := LKey;
+              setlength(LUse.Headers, 0);
+              for LJ := 0 to len(LTexts) - 1 do
+                DoAddString(LUse.Headers, LTexts[LJ].Text);
+              end;
+              setlength(self.Uses, len(self.Uses) + 1);
+              self.Uses[len(self.Uses) - 1] := LUse;
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // One [[insert]] at APath (an item of the insert array)
+    hidden method DoReadInsert(var ADoc: TomlDocument; const APath: string; const AKnown: StringArray);
+    var
+      LInsert: SpecInsert;
+      LAnchors: int64;
+      LAnchorPath: string;
+      LText: string;
+      LPlace: SourcePlace;
+      LOccurrence: int64;
+      LOccurrencePath: string;
+      LOk: bool;
+    begin
+      if ADoc.KindOf(APath) <> TomlKind.Table then
+        self.DoWrongKind(ADoc, APath, ADAM_CIMPORT_TABLE_INSERT, ADAM_MSG_CIMPORT_SPEC_KIND_TABLES);
+        return;
+      end;
+      self.DoCheckKeys(ADoc, APath, ADAM_CIMPORT_TABLE_INSERT, AKnown, JoinStrings(AKnown, ", "));
+      LOk := true;
+      LAnchors := 0;
+      LAnchorPath := "";
+      if ADoc.Has(DoKeyPath(APath, ADAM_CIMPORT_KEY_BEFORE)) then
+        LAnchors := LAnchors + 1;
+        LInsert.Place := InsertPlace.Before;
+        LAnchorPath := DoKeyPath(APath, ADAM_CIMPORT_KEY_BEFORE);
+      end;
+      if ADoc.Has(DoKeyPath(APath, ADAM_CIMPORT_KEY_AFTER)) then
+        LAnchors := LAnchors + 1;
+        LInsert.Place := InsertPlace.After;
+        LAnchorPath := DoKeyPath(APath, ADAM_CIMPORT_KEY_AFTER);
+      end;
+      if ADoc.Has(DoKeyPath(APath, ADAM_CIMPORT_KEY_REPLACE)) then
+        LAnchors := LAnchors + 1;
+        LInsert.Place := InsertPlace.Replace;
+        LAnchorPath := DoKeyPath(APath, ADAM_CIMPORT_KEY_REPLACE);
+      end;
+      if LAnchors <> 1 then
+        self.DoError(ADAM_ERR_CIMPORT_SPEC_012, self.DoValuePlace(ADoc, APath),
+          ADAM_MSG_CIMPORT_SPEC_INSERT_ANCHOR, NoArgs());
+        return;
+      end;
+      if (ADoc.KindOf(LAnchorPath) <> TomlKind.String) or not ADoc.GetString(LAnchorPath, LText) then
+        self.DoWrongKind(ADoc, LAnchorPath, ADAM_CIMPORT_TABLE_INSERT,
+          ADAM_MSG_CIMPORT_SPEC_KIND_STRING);
+        return;
+      end;
+      LPlace := self.DoValuePlace(ADoc, LAnchorPath);
+      if LText = "" then
+        self.DoError(ADAM_ERR_CIMPORT_SPEC_014, LPlace, ADAM_MSG_CIMPORT_SPEC_EMPTY,
+          NoArgs().Str(ADAM_CIMPORT_TABLE_INSERT));
+        LOk := false;
+      end;
+      LInsert.Anchor := LText;
+      LInsert.Line := LPlace.Line;
+      LInsert.Column := LPlace.Column;
+      if not ADoc.Has(DoKeyPath(APath, ADAM_CIMPORT_KEY_TEXT)) then
+        self.DoError(ADAM_ERR_CIMPORT_SPEC_002, LPlace, ADAM_MSG_CIMPORT_SPEC_KEY_MISSING,
+          NoArgs().Str(DoShownKey(ADAM_CIMPORT_TABLE_INSERT, ADAM_CIMPORT_KEY_TEXT)));
+        return;
+      end;
+      if (ADoc.KindOf(DoKeyPath(APath, ADAM_CIMPORT_KEY_TEXT)) <> TomlKind.String) or
+        not ADoc.GetString(DoKeyPath(APath, ADAM_CIMPORT_KEY_TEXT), LText) then
+        self.DoWrongKind(ADoc, DoKeyPath(APath, ADAM_CIMPORT_KEY_TEXT),
+          DoShownKey(ADAM_CIMPORT_TABLE_INSERT, ADAM_CIMPORT_KEY_TEXT),
+          ADAM_MSG_CIMPORT_SPEC_KIND_STRING);
+        return;
+      end;
+      LInsert.Text := LText;
+      LInsert.Occurrence := 1;
+      LOccurrencePath := DoKeyPath(APath, ADAM_CIMPORT_KEY_OCCURRENCE);
+      if ADoc.Has(LOccurrencePath) then
+        if (ADoc.KindOf(LOccurrencePath) <> TomlKind.Integer) or
+          not ADoc.GetInt64(LOccurrencePath, LOccurrence) then
+          self.DoWrongKind(ADoc, LOccurrencePath, DoShownKey(ADAM_CIMPORT_TABLE_INSERT,
+            ADAM_CIMPORT_KEY_OCCURRENCE), ADAM_MSG_CIMPORT_SPEC_KIND_INTEGER);
+          return;
+        end;
+        if LOccurrence < 1 then
+          self.DoError(ADAM_ERR_CIMPORT_SPEC_013, self.DoValuePlace(ADoc, LOccurrencePath),
+            ADAM_MSG_CIMPORT_SPEC_OCCURRENCE, NoArgs().Int(LOccurrence));
+          return;
+        end;
+        LInsert.Occurrence := LOccurrence;
+      end;
+      if LOk then
+        setlength(self.Inserts, len(self.Inserts) + 1);
+        self.Inserts[len(self.Inserts) - 1] := LInsert;
+      end;
+    end;
+
+    // [[insert]]: an array of tables, read in order
+    hidden method DoReadInserts(var ADoc: TomlDocument);
+    var
+      LPath: string;
+      LKind: TomlKind;
+      LCount: int64;
+      LI: int64;
+      LKnown: StringArray;
+    begin
+      LPath := TomlQuoteKey(ADAM_CIMPORT_TABLE_INSERT);
+      LKind := ADoc.KindOf(LPath);
+      if LKind = TomlKind.Missing then
+        return;
+      end;
+      if (LKind <> TomlKind.Array) or not ADoc.Count(LPath, LCount) then
+        self.DoWrongKind(ADoc, LPath, ADAM_CIMPORT_TABLE_INSERT, ADAM_MSG_CIMPORT_SPEC_KIND_TABLES);
+        return;
+      end;
+      setlength(LKnown, 0);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_BEFORE);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_AFTER);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_REPLACE);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_TEXT);
+      DoAddString(LKnown, ADAM_CIMPORT_KEY_OCCURRENCE);
+      for LI := 0 to LCount - 1 do
+        self.DoReadInsert(ADoc, DoItemPath(LPath, LI), LKnown);
+      end;
+    end;
+
+    // A parse error a document left (ASourceName(line,col): message, ASourceName(line):
+    // message or ASourceName: message, System.Toml's forms; ASourceName the path it read)
+    // reported at its place in the spec: CP0001
+    hidden method DoParseError(const AText: string; const ASourceName: string);
+    var
+      LRest: string;
+      LClose: int64;
+      LComma: int64;
+      LLine: int64;
+      LCol: int64;
+      LMessage: string;
+    begin
+      LLine := 0;
+      LCol := 0;
+      LMessage := AText;
+      if StartsStr(ASourceName + "(", AText) then
+        LRest := Substring(AText, len(ASourceName) + 1, len(AText) - len(ASourceName) - 1);
+        LClose := IndexOf("): ", LRest, 0);
+        if LClose > 0 then
+          LComma := IndexOf(",", LRest, 0);
+          if (LComma > 0) and (LComma < LClose) then
+            if not TryStrToInt(Substring(LRest, 0, LComma), LLine) or
+              not TryStrToInt(Substring(LRest, LComma + 1, LClose - LComma - 1), LCol) then
+              LLine := 0;
+              LCol := 0;
+            end;
+          else
+            if not TryStrToInt(Substring(LRest, 0, LClose), LLine) then
+              LLine := 0;
+            end;
+          end;
+          if LLine > 0 then
+            LMessage := Substring(LRest, LClose + 3, len(LRest) - LClose - 3);
+          end;
+        end;
+      else
+        if StartsStr(ASourceName + ": ", AText) then
+          LMessage := Substring(AText, len(ASourceName) + 2, len(AText) - len(ASourceName) - 2);
+        end;
+      end;
+      self.DoError(ADAM_ERR_CIMPORT_SPEC_001, self.PlaceOf(int32(LLine), int32(LCol)),
+        ADAM_MSG_CIMPORT_SPEC_NOT_TOML, NoArgs().Str(LMessage));
+    end;
+
+    // Reads the spec at APath (relative to the working folder) and checks it (see the
+    // header); every mistake is reported. True when it holds no error
+    method Load(const APath: string): bool;
+    var
+      LDoc: TomlDocument;
+    begin
+      self.DoClear();
+      self.FFileName := APath;
+      self.FValid := true;
+      if not EndsStr(LowerCase(ADAM_EXT_CIMPORT_SPEC), LowerCase(APath)) then
+        self.DoError(ADAM_ERR_CIMPORT_SPEC_015, NoPlace(), ADAM_MSG_CIMPORT_SPEC_NOT_SPEC,
+          NoArgs().Str(ForwardSlashes(APath)).Str(ADAM_EXT_CIMPORT_SPEC));
+        return false;
+      end;
+      self.FPath := ResolvePath(APath);
+      if (self.FPath = "") or not FileExists(self.FPath) then
+        self.DoError(ADAM_ERR_CIMPORT_SPEC_001, self.PlaceOf(0, 0), ADAM_MSG_CIMPORT_SPEC_READ_FAILED,
+          NoArgs());
+        return false;
+      end;
+      self.FFolder := ExtractFileDir(self.FPath);
+      if not LDoc.ParseFile(self.FPath) then
+        // System.Toml names the file by the path it read; the report names it as given
+        self.DoParseError(LDoc.ErrorText(), self.FPath);
+        return false;
+      end;
+      self.DoReadRoot(LDoc);
+      self.DoReadImport(LDoc);
+      self.DoReadPreprocess(LDoc);
+      self.DoReadSkip(LDoc);
+      self.DoReadRenames(LDoc);
+      self.DoReadUses(LDoc);
+      self.DoReadInserts(LDoc);
+      return self.FValid;
+    end;
+
+    // True when the last Load succeeded
+    const method IsValid(): bool;
+    begin
+      return self.FValid;
+    end;
+
+    // The library the unit's routines are `external` in for ATriple: its own entry, else the
+    // one for every target; "" when the spec names none for it
+    const method LibraryFor(const ATriple: string): string;
+    var
+      LI: int64;
+      LAll: string;
+    begin
+      LAll := "";
+      for LI := 0 to len(self.Libraries) - 1 do
+        if self.Libraries[LI].Triple = ATriple then
+          return self.Libraries[LI].Name;
+        end;
+        if self.Libraries[LI].Triple = "" then
+          LAll := self.Libraries[LI].Name;
+        end;
+      end;
+      return LAll;
+    end;
+
+    // The unit's file: <unit>.adam in AOutputDir (adam cimport -o, resolved against the
+    // working folder) when given, else in the spec's output folder, else beside the spec
+    const method UnitPath(const AOutputDir: string): string;
+    var
+      LFolder: string;
+    begin
+      LFolder := self.FFolder;
+      if self.Output <> "" then
+        LFolder := self.Output;
+      end;
+      if AOutputDir <> "" then
+        LFolder := ResolvePath(AOutputDir);
+      end;
+      return ResolvePath(self.UnitName + ADAM_EXT_SOURCE, LFolder);
+    end;
+  end;
+
+end.
