@@ -1,0 +1,3016 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.CImport.Preprocessor.adam - `adam cimport`'s C preprocessor (M9b;
+  DESIGN sec 15): C's translation phase 4, as clang -E does it, over the
+  headers Adam.CImport.Headers finds
+
+  Preprocessor  one import's preprocessing: Predefine (the target's
+                <triple>.predefines.h: what clang defines before a file),
+                Define / Undefine (the spec's, as -D / -U on a command
+                line), Include (a spec header, as #include <name>); the
+                tokens it gives (Count, Token, with each token's file:
+                FileName, IsSystemFile) and EmitLines (the clang -E text,
+                what --emit-pp prints). It reports into the Diagnostics it
+                is made with (CP codes, at the header's line and column)
+
+  Macros: object-like and function-like, # and ##, __VA_ARGS__ and named
+  variadics (name...), GNU's `, ## __VA_ARGS__`, C23's __VA_OPT__,
+  arguments expanded before substitution unless # or ## takes them, the
+  result rescanned. A macro is never expanded inside its own expansion by
+  Prosser's hide sets (the algorithm of the C standard's rationale): each
+  token carries the set of macros that made it (interned, so a set is a
+  number), an object-like expansion adds its macro to the name's set, a
+  function-like one to the set the name and its ')' share. Directives:
+  #define #undef #include #include_next #import #if #ifdef #ifndef #elif
+  #elifdef #elifndef #else #endif #line (and GNU's # N "file") #error
+  #warning #pragma #ident #sccs #assert #unassert, the null directive.
+  #pragma once, push_macro / pop_macro and GCC system_header are acted on;
+  every pragma but once, push_macro and pop_macro (clang -E keeps none of
+  them) is kept as a Pragma token for the parser (pack),
+  _Pragma("..") the same. A file whose tokens all sit inside one
+  #ifndef X / #define X .. #endif (or #if !defined X) is not opened again
+  while X is defined (clang's multiple-include optimization); includes
+  nest at most ADAM_CIMPORT_INCLUDE_DEPTH deep.
+
+  #if: defined NAME / defined(NAME), then macros expanded, then every
+  identifier left is 0; C's integer constant expressions over intmax_t and
+  uintmax_t (the usual conversions, short-circuit, division by zero an
+  error only where it is evaluated); integer constants with C's and
+  MSVC's suffixes, character constants (the target's char signedness).
+  Builtins: __FILE__ __LINE__ __COUNTER__ __INCLUDE_LEVEL__ __BASE_FILE__
+  __FILE_NAME__, __DATE__ __TIME__ __TIMESTAMP__ as the unknown-date
+  texts (output never holds a time, AD.7), __has_include(_next) (the
+  header search, only in #if), __has_attribute __has_c_attribute
+  __has_builtin __has_feature __has_extension __has_declspec_attribute
+  (Adam.CImport.Clang's frozen table), __has_warning and
+  __building_module (0). Warnings are not made in a system header (clang's
+  rule); errors always are. A token's place is where it was written, an
+  expanded token's the place of the macro name that made it.
+  Target-neutral: the triple is only the table's and the headers' key.
+*******************************************************************************/
+
+module unit Adam.CImport.Preprocessor;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Core.Messages, Adam.Compiler.SourceText,
+  Adam.Compiler.Diagnostics, Adam.CImport.Headers, Adam.CImport.Lexer, Adam.CImport.Clang;
+
+public const
+  ADAM_ERR_CIMPORT_PP_001: string = "CP0019";   // a conditional with no #endif in its file
+  ADAM_ERR_CIMPORT_PP_002: string = "CP0020";   // #elif / #else / #endif without #if
+  ADAM_ERR_CIMPORT_PP_003: string = "CP0021";   // #elif / #else after #else
+  ADAM_ERR_CIMPORT_PP_004: string = "CP0022";   // not a directive
+  ADAM_ERR_CIMPORT_PP_005: string = "CP0023";   // a macro name missing or not one
+  ADAM_ERR_CIMPORT_PP_006: string = "CP0024";   // a macro's parameters not valid
+  ADAM_ERR_CIMPORT_PP_007: string = "CP0025";   // '#' not followed by a parameter
+  ADAM_ERR_CIMPORT_PP_008: string = "CP0026";   // '##' at either end of a body
+  ADAM_ERR_CIMPORT_PP_009: string = "CP0027";   // a macro call with no closing ')'
+  ADAM_ERR_CIMPORT_PP_010: string = "CP0028";   // a macro called with the wrong argument count
+  ADAM_ERR_CIMPORT_PP_011: string = "CP0029";   // ## does not make one valid token
+  ADAM_ERR_CIMPORT_PP_012: string = "CP0030";   // an #if expression not valid
+  ADAM_ERR_CIMPORT_PP_013: string = "CP0031";   // division by zero in #if
+  ADAM_ERR_CIMPORT_PP_014: string = "CP0032";   // #include with no header name
+  ADAM_ERR_CIMPORT_PP_015: string = "CP0033";   // includes nested too deep
+  ADAM_ERR_CIMPORT_PP_016: string = "CP0034";   // #error
+  ADAM_ERR_CIMPORT_PP_017: string = "CP0035";   // (warning) #warning
+  ADAM_ERR_CIMPORT_PP_018: string = "CP0036";   // (warning) a macro redefined differently
+  ADAM_ERR_CIMPORT_PP_019: string = "CP0037";   // #line not valid
+  ADAM_ERR_CIMPORT_PP_020: string = "CP0038";   // a builtin used where it is not taken
+  ADAM_ERR_CIMPORT_PP_021: string = "CP0039";   // _Pragma not valid
+
+  // How deep #include nests (clang's limit)
+  ADAM_CIMPORT_INCLUDE_DEPTH: int64 = 200;
+  // The pseudo file the spec's defines and undefines are read from (clang's name)
+  ADAM_CIMPORT_COMMAND_LINE: string = "<command line>";
+  // A growable list's first storage, doubled each time it is full
+  ADAM_CIMPORT_PP_FIRST: int64 = 16;
+  // What __DATE__ / __TIME__ / __TIMESTAMP__ give: the C standard's texts for a date that is
+  // not known (no output holds a time, AD.7)
+  ADAM_CIMPORT_DATE: string = "\"??? ?? ????\"";
+  ADAM_CIMPORT_TIME: string = "\"??:??:??\"";
+  ADAM_CIMPORT_TIMESTAMP: string = "\"??? ??? ?? ??:??:?? ????\"";
+  // The lowest intmax_t (its / -1 and % -1 are not divided)
+  ADAM_CIMPORT_INTMAX_MIN: int64 = -9223372036854775807 - 1;
+  ADAM_CIMPORT_INTMAX_MAX: uint64 = 9223372036854775807u;
+
+public type
+  // A macro's kind: Plain (object-like), Function (function-like) or a builtin
+  MacroKind = choices(Plain, Function, Builtin);
+
+  // What a builtin macro gives
+  BuiltinMacro = choices(None, File, Line, Counter, IncludeLevel, BaseFile, FileName, Date, Time,
+    Timestamp, HasInclude, HasIncludeNext, HasAttribute, HasCAttribute, HasBuiltin, HasFeature,
+    HasExtension, HasDeclspecAttribute, HasWarning, BuildingModule);
+
+  // One macro; Active false once #undef'd (the slot is kept: a hide set names it by number)
+  PpMacro = record
+    Name: string;
+    Kind: MacroKind;
+    Builtin: BuiltinMacro;
+    Params: StringArray;
+    Variadic: bool;
+    Body: PpTokenArray;
+    Active: bool;
+  end;
+
+  PpMacroArray = array of PpMacro;
+  PpArgArray = array of PpTokenArray;
+
+  // One file tokens are marked with: the header (NoHeader's root for a pseudo file), the name
+  // reports and markers print, and whether it is a system file (no warnings in it)
+  PpFile = record
+    Header: HeaderFile;
+    Name: string;
+    System: bool;
+  end;
+
+  PpFileArray = array of PpFile;
+
+  // One open file (its lexer beside it, in the preprocessor's lexers): the file its tokens are marked with (another after a #line
+  // naming a file), the line #line moved it by, the conditionals open when it was opened, and
+  // its include guard's state (0 nothing yet, 1 inside #ifndef GuardName at GuardDepth, 2
+  // past its #endif, -1 not a guarded file)
+  PpSource = record
+    File: int32;
+    NameFile: int32;
+    LineDelta: int32;
+    CondBase: int64;
+    Guard: int32;
+    GuardName: string;
+    GuardDepth: int64;
+  end;
+
+  PpSourceArray = array of PpSource;
+
+  // One open conditional: whether its group is the one taken now, whether any group was, an
+  // #else seen, and where it opened (directive name, file, line, column)
+  PpCond = record
+    Active: bool;
+    Taken: bool;
+    SeenElse: bool;
+    Directive: string;
+    File: int32;
+    Line: int32;
+    Column: int32;
+  end;
+
+  PpCondArray = array of PpCond;
+
+  // An #if value: intmax_t (Unsigned false) or uintmax_t, as its 64 bits
+  PpValue = record
+    Bits: uint64;
+    Unsigned: bool;
+  end;
+
+  Int64ArrayArray = array of Int64Array;
+
+// A signed (AUnsigned false) or unsigned #if value
+routine DoValue(const ABits: uint64; const AUnsigned: bool): PpValue;
+var
+  LValue: PpValue;
+begin
+  LValue.Bits := ABits;
+  LValue.Unsigned := AUnsigned;
+  return LValue;
+end;
+
+// 1 or 0 as a signed #if value
+routine DoTruth(const ATrue: bool): PpValue;
+begin
+  if ATrue then
+    return DoValue(1, false);
+  end;
+  return DoValue(0, false);
+end;
+
+// The byte at AIndex of AText as 0..255; -1 past either end
+routine DoByte(const AText: string; const AIndex: int64): int32;
+begin
+  if (AIndex < 0) or (AIndex >= len(AText)) then
+    return -1;
+  end;
+  return int32(uint8(AText[AIndex]));
+end;
+
+// A list's next storage: twice ACount (the first one when it is empty)
+routine DoGrow(const ACount: int64): int64;
+begin
+  if ACount < ADAM_CIMPORT_PP_FIRST then
+    return ADAM_CIMPORT_PP_FIRST;
+  end;
+  return ACount * 2;
+end;
+
+// AText added to ALines (ACount of them used; the storage doubles)
+routine DoAddLine(var ALines: StringArray; var ACount: int64; const AText: string);
+begin
+  if ACount = len(ALines) then
+    setlength(ALines, DoGrow(ACount));
+  end;
+  ALines[ACount] := AText;
+  ACount := ACount + 1;
+end;
+
+// AMacro with the parameter AName added last
+routine DoAddParam(var AMacro: PpMacro; const AName: string);
+var
+  LCount: int64;
+begin
+  LCount := len(AMacro.Params);
+  setlength(AMacro.Params, LCount + 1);
+  AMacro.Params[LCount] := AName;
+end;
+
+// The byte value of an ASCII character
+routine DoCode(const AChar: char): int32;
+begin
+  return int32(uint8(AChar));
+end;
+
+// True when ATok is the punctuator AText
+routine DoIsPunct(const ATok: PpToken; const AText: string): bool;
+begin
+  return (ATok.Kind = PpKind.Punct) and (ATok.Text = AText);
+end;
+
+// True when ATok is the identifier AText
+routine DoIsWord(const ATok: PpToken; const AText: string): bool;
+begin
+  return (ATok.Kind = PpKind.Identifier) and (ATok.Text = AText);
+end;
+
+// AText with every '\' and '"' escaped by a '\' (a string literal's body)
+routine DoEscape(const AText: string): string;
+var
+  LOut: ref TextBuilder;
+  LRun: int64;
+  LI: int64;
+  LB: int32;
+begin
+  LOut := ref TextBuilder();
+  LRun := 0;
+  for LI := 0 to len(AText) - 1 do
+    LB := DoByte(AText, LI);
+    if (LB = DoCode('\\')) or (LB = DoCode('"')) then
+      LOut.Add(Substring(AText, LRun, LI - LRun));
+      LOut.Add("\\");
+      LRun := LI;
+    end;
+  end;
+  LOut.Add(Substring(AText, LRun, len(AText) - LRun));
+  return LOut.Text();
+end;
+
+// A string literal's body, its prefix and quotes taken off and \\ and \" undone (_Pragma's
+// destringizing)
+routine DoDestringize(const AText: string): string;
+var
+  LOut: ref TextBuilder;
+  LStart: int64;
+  LEnd: int64;
+  LRun: int64;
+  LI: int64;
+  LB: int32;
+begin
+  LStart := IndexOf("\"", AText, 0) + 1;
+  LEnd := len(AText) - 1;
+  LOut := ref TextBuilder();
+  LRun := LStart;
+  LI := LStart;
+  while LI < LEnd do
+    LB := DoByte(AText, LI);
+    if (LB = DoCode('\\')) and ((DoByte(AText, LI + 1) = DoCode('\\')) or
+      (DoByte(AText, LI + 1) = DoCode('"'))) then
+      LOut.Add(Substring(AText, LRun, LI - LRun));
+      LRun := LI + 1;
+      LI := LI + 2;
+    else
+      LI := LI + 1;
+    end;
+  end;
+  LOut.Add(Substring(AText, LRun, LEnd - LRun));
+  return LOut.Text();
+end;
+
+// The tokens' spellings joined, a blank where a token had one before it (the first excepted)
+routine DoSpell(const ATokens: PpTokenArray; const AFrom: int64; const ATo: int64): string;
+var
+  LOut: ref TextBuilder;
+  LI: int64;
+begin
+  LOut := ref TextBuilder();
+  for LI := AFrom to ATo - 1 do
+    if (LI > AFrom) and ATokens[LI].Space then
+      LOut.Add(" ");
+    end;
+    LOut.Add(ATokens[LI].Text);
+  end;
+  return LOut.Text();
+end;
+
+// The last '/'-separated part of APath
+routine DoLastPart(const APath: string): string;
+var
+  LI: int64;
+begin
+  LI := len(APath) - 1;
+  while LI >= 0 do
+    if (APath[LI] = '/') or (APath[LI] = '\\') then
+      return Substring(APath, LI + 1, len(APath) - LI - 1);
+    end;
+    LI := LI - 1;
+  end;
+  return APath;
+end;
+
+// True when the emitted text must put a blank between APrev and ANext so they are read back
+// as the two tokens they are (clang -E's rule of avoiding an accidental paste)
+routine DoNeedSpace(const APrev: PpToken; const ANext: PpToken): bool;
+var
+  LLast: int32;
+  LFirst: int32;
+begin
+  LLast := DoByte(APrev.Text, len(APrev.Text) - 1);
+  LFirst := DoByte(ANext.Text, 0);
+  if PpIsNameByte(LLast) and (PpIsNameByte(LFirst) or (LFirst = DoCode('.')) or
+    (LFirst = DoCode('"')) or (LFirst = DoCode('\''))) then
+    return true;
+  end;
+  if (APrev.Kind = PpKind.Number) and ((LFirst = DoCode('.')) or (LFirst = DoCode('+')) or
+    (LFirst = DoCode('-'))) then
+    return true;
+  end;
+  if (LLast = DoCode('.')) and PpIsDigit(LFirst) then
+    return true;
+  end;
+  if (LLast = DoCode('/')) and ((LFirst = DoCode('/')) or (LFirst = DoCode('*'))) then
+    return true;
+  end;
+  if (APrev.Kind = PpKind.Punct) and (ANext.Kind = PpKind.Punct) then
+    return PunctLength(APrev.Text + ANext.Text, 0) > len(APrev.Text);
+  end;
+  return false;
+end;
+
+// The value of AByte as a digit of ABase (2, 8, 10 or 16); -1 when it is none
+routine DoDigit(const AByte: int32; const ABase: uint64): int64;
+var
+  LValue: int64;
+begin
+  LValue := -1;
+  if PpIsDigit(AByte) then
+    LValue := int64(AByte - DoCode('0'));
+  else
+    if (AByte >= DoCode('a')) and (AByte <= DoCode('f')) then
+      LValue := int64(AByte - DoCode('a')) + 10;
+    else
+      if (AByte >= DoCode('A')) and (AByte <= DoCode('F')) then
+        LValue := int64(AByte - DoCode('A')) + 10;
+      end;
+    end;
+  end;
+  if (LValue < 0) or (uint64(LValue) >= ABase) then
+    return -1;
+  end;
+  return LValue;
+end;
+
+// True when ASuffix (lower case) is an integer suffix C or MSVC takes
+routine DoIsIntSuffix(const ASuffix: string): bool;
+begin
+  return (ASuffix = "") or (ASuffix = "u") or (ASuffix = "l") or (ASuffix = "ul") or
+    (ASuffix = "lu") or (ASuffix = "ll") or (ASuffix = "ull") or (ASuffix = "llu") or
+    (ASuffix = "z") or (ASuffix = "uz") or (ASuffix = "zu") or (ASuffix = "wb") or
+    (ASuffix = "uwb") or (ASuffix = "i8") or (ASuffix = "i16") or (ASuffix = "i32") or
+    (ASuffix = "i64") or (ASuffix = "ui8") or (ASuffix = "ui16") or (ASuffix = "ui32") or
+    (ASuffix = "ui64");
+end;
+
+public type
+  // One import's preprocessing (see the header)
+  Preprocessor = object
+    hidden FReports: ref Diagnostics;
+    hidden FSearch: ref HeaderSearch;
+    hidden FTable: ref HasTable;
+    hidden FTriple: string;
+    hidden FCharSigned: bool;
+    hidden FFiles: PpFileArray;
+    hidden FFileCount: int64;
+    hidden FFileIds: ref StringIdMap;
+    hidden FMacros: PpMacroArray;
+    hidden FMacroCount: int64;
+    hidden FMacroIds: ref StringIdMap;
+    hidden FPushed: PpMacroArray;
+    hidden FPushedCount: int64;
+    hidden FHides: Int64ArrayArray;
+    hidden FHideCount: int64;
+    hidden FHideKeys: ref StringIdMap;
+    hidden FHideMemo: ref StringIdMap;
+    hidden FSources: PpSourceArray;
+    hidden FLexers: array of ref PpLexer;
+    hidden FSourceCount: int64;
+    hidden FConds: PpCondArray;
+    hidden FCondCount: int64;
+    hidden FPending: PpTokenArray;
+    hidden FPendingCount: int64;
+    hidden FFromFile: bool;
+    hidden FIfMode: bool;
+    hidden FOnce: ref StringIdMap;
+    hidden FGuards: ref StringIdMap;
+    hidden FGuardNames: StringArray;
+    hidden FGuardCount: int64;
+    hidden FOut: ref PpTokenList;
+    hidden FCounter: int64;
+    hidden FBaseName: string;
+    hidden FEvalTokens: PpTokenArray;
+    hidden FEvalPos: int64;
+    hidden FEvalBad: bool;
+    hidden FEvalHash: PpToken;
+
+    // AReports takes every report; ASearch finds the headers; ATriple keys the __has_* table;
+    // ACharSigned: the target's plain char is signed (a character constant's value in #if)
+    init(const AReports: ref Diagnostics; const ASearch: ref HeaderSearch; const ATriple: string;
+      const ACharSigned: bool);
+    var
+      LEmpty: Int64Array;
+    begin
+      self.FReports := AReports;
+      self.FSearch := ASearch;
+      self.FTable := ref HasTable();
+      self.FTriple := ATriple;
+      self.FCharSigned := ACharSigned;
+      self.FFileCount := 0;
+      self.FFileIds := ref StringIdMap();
+      self.FMacroCount := 0;
+      self.FMacroIds := ref StringIdMap();
+      self.FPushedCount := 0;
+      // Hide set 0 is the empty set
+      setlength(LEmpty, 0);
+      setlength(self.FHides, ADAM_CIMPORT_PP_FIRST);
+      self.FHides[0] := LEmpty;
+      self.FHideCount := 1;
+      self.FHideKeys := ref StringIdMap();
+      self.FHideMemo := ref StringIdMap();
+      self.FSourceCount := 0;
+      self.FCondCount := 0;
+      self.FPendingCount := 0;
+      self.FFromFile := true;
+      self.FIfMode := false;
+      self.FOnce := ref StringIdMap();
+      self.FGuards := ref StringIdMap();
+      self.FGuardCount := 0;
+      self.FOut := ref PpTokenList();
+      self.FCounter := 0;
+      self.FBaseName := "";
+      self.FEvalPos := 0;
+      self.FEvalBad := false;
+      self.DoAddBuiltins();
+    end;
+
+    // ---- reports ---------------------------------------------------------------------------
+
+    // The place of ATok in its file
+    hidden const method DoPlace(const ATok: PpToken): SourcePlace;
+    begin
+      if (ATok.File < 0) or (int64(ATok.File) >= self.FFileCount) then
+        return NoPlace();
+      end;
+      return PlaceAt(self.FFiles[ATok.File].Name, ATok.Line, ATok.Column);
+    end;
+
+    hidden method DoError(const ACode: string; const ATok: PpToken; const ATemplate: string;
+      const AArgs: MessageArgs);
+    begin
+      if self.FReports <> nil then
+        self.FReports.Add(Severity.Error, ACode, self.DoPlace(ATok), ATemplate, AArgs);
+      end;
+    end;
+
+    // A warning at ATok, unless ATok is in a system file (clang's rule)
+    hidden method DoWarning(const ACode: string; const ATok: PpToken; const ATemplate: string;
+      const AArgs: MessageArgs);
+    begin
+      if (ATok.File >= 0) and (int64(ATok.File) < self.FFileCount) then
+        if self.FFiles[ATok.File].System then
+          return;
+        end;
+      end;
+      if self.FReports <> nil then
+        self.FReports.Add(Severity.Warning, ACode, self.DoPlace(ATok), ATemplate, AArgs);
+      end;
+    end;
+
+    // ---- macros ----------------------------------------------------------------------------
+
+    // Adds or replaces the macro AMacro.Name
+    hidden method DoSetMacro(const AMacro: PpMacro);
+    var
+      LId: int64;
+    begin
+      LId := self.FMacroIds.Find(AMacro.Name);
+      if LId > 0 then
+        self.FMacros[LId - 1] := AMacro;
+        return;
+      end;
+      if self.FMacroCount = len(self.FMacros) then
+        setlength(self.FMacros, DoGrow(self.FMacroCount));
+      end;
+      self.FMacros[self.FMacroCount] := AMacro;
+      self.FMacroCount := self.FMacroCount + 1;
+      self.FMacroIds.Put(AMacro.Name, self.FMacroCount);
+    end;
+
+    hidden method DoAddBuiltin(const AName: string; const ABuiltin: BuiltinMacro);
+    var
+      LMacro: PpMacro;
+    begin
+      LMacro.Name := AName;
+      LMacro.Kind := MacroKind.Builtin;
+      LMacro.Builtin := ABuiltin;
+      setlength(LMacro.Params, 0);
+      LMacro.Variadic := false;
+      setlength(LMacro.Body, 0);
+      LMacro.Active := true;
+      self.DoSetMacro(LMacro);
+    end;
+
+    // The builtin macros (see the header); __has_cpp_attribute is not one in C (clang's)
+    hidden method DoAddBuiltins();
+    begin
+      self.DoAddBuiltin("__FILE__", BuiltinMacro.File);
+      self.DoAddBuiltin("__LINE__", BuiltinMacro.Line);
+      self.DoAddBuiltin("__COUNTER__", BuiltinMacro.Counter);
+      self.DoAddBuiltin("__INCLUDE_LEVEL__", BuiltinMacro.IncludeLevel);
+      self.DoAddBuiltin("__BASE_FILE__", BuiltinMacro.BaseFile);
+      self.DoAddBuiltin("__FILE_NAME__", BuiltinMacro.FileName);
+      self.DoAddBuiltin("__DATE__", BuiltinMacro.Date);
+      self.DoAddBuiltin("__TIME__", BuiltinMacro.Time);
+      self.DoAddBuiltin("__TIMESTAMP__", BuiltinMacro.Timestamp);
+      self.DoAddBuiltin("__has_include", BuiltinMacro.HasInclude);
+      self.DoAddBuiltin("__has_include_next", BuiltinMacro.HasIncludeNext);
+      self.DoAddBuiltin("__has_attribute", BuiltinMacro.HasAttribute);
+      self.DoAddBuiltin("__has_c_attribute", BuiltinMacro.HasCAttribute);
+      self.DoAddBuiltin("__has_builtin", BuiltinMacro.HasBuiltin);
+      self.DoAddBuiltin("__has_feature", BuiltinMacro.HasFeature);
+      self.DoAddBuiltin("__has_extension", BuiltinMacro.HasExtension);
+      self.DoAddBuiltin("__has_declspec_attribute", BuiltinMacro.HasDeclspecAttribute);
+      self.DoAddBuiltin("__has_warning", BuiltinMacro.HasWarning);
+      self.DoAddBuiltin("__building_module", BuiltinMacro.BuildingModule);
+    end;
+
+    // True when AName is a defined macro (a builtin included)
+    hidden const method DoIsDefined(const AName: string): bool;
+    var
+      LId: int64;
+    begin
+      LId := self.FMacroIds.Find(AName);
+      return (LId > 0) and self.FMacros[LId - 1].Active;
+    end;
+
+    // AMacro's parameter AName's index; -1 when ATok is not one of its parameters
+    hidden const method DoParam(const AMacro: PpMacro; const ATok: PpToken): int64;
+    var
+      LI: int64;
+    begin
+      if (AMacro.Kind <> MacroKind.Function) or (ATok.Kind <> PpKind.Identifier) then
+        return -1;
+      end;
+      for LI := 0 to len(AMacro.Params) - 1 do
+        if AMacro.Params[LI] = ATok.Text then
+          return LI;
+        end;
+      end;
+      return -1;
+    end;
+
+    // ---- hide sets (see the header): sorted macro ids, interned, 0 the empty set ----------
+
+    // The set of AIds (sorted, no repeats) as its number
+    hidden method DoHideIntern(const AIds: Int64Array): int64;
+    var
+      LKey: ref TextBuilder;
+      LId: int64;
+      LI: int64;
+    begin
+      if len(AIds) = 0 then
+        return 0;
+      end;
+      LKey := ref TextBuilder();
+      for LI := 0 to len(AIds) - 1 do
+        LKey.Add(IntToStr(AIds[LI]));
+        LKey.Add(",");
+      end;
+      LId := self.FHideKeys.Find(LKey.Text());
+      if LId > 0 then
+        return LId;
+      end;
+      if self.FHideCount = len(self.FHides) then
+        setlength(self.FHides, DoGrow(self.FHideCount));
+      end;
+      self.FHides[self.FHideCount] := AIds;
+      self.FHideKeys.Put(LKey.Text(), self.FHideCount);
+      self.FHideCount := self.FHideCount + 1;
+      return self.FHideCount - 1;
+    end;
+
+    // True when the set AHide holds the macro AId
+    hidden const method DoHideHas(const AHide: int64; const AId: int64): bool;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FHides[AHide]) - 1 do
+        if self.FHides[AHide][LI] = AId then
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // The union (AUnion) or the intersection of the sets A and B, remembered
+    hidden method DoHideMerge(const A: int64; const B: int64; const AUnion: bool): int64;
+    var
+      LKey: string;
+      LMemo: int64;
+      LA: Int64Array;
+      LB: Int64Array;
+      LOut: Int64Array;
+      LCount: int64;
+      LI: int64;
+      LJ: int64;
+      LResult: int64;
+    begin
+      if AUnion then
+        if A = 0 then
+          return B;
+        end;
+        if (B = 0) or (A = B) then
+          return A;
+        end;
+        LKey := "u" + IntToStr(A) + "," + IntToStr(B);
+      else
+        if (A = 0) or (B = 0) then
+          return 0;
+        end;
+        if A = B then
+          return A;
+        end;
+        LKey := "i" + IntToStr(A) + "," + IntToStr(B);
+      end;
+      LMemo := self.FHideMemo.Find(LKey);
+      if LMemo > 0 then
+        return LMemo - 1;
+      end;
+      LA := self.FHides[A];
+      LB := self.FHides[B];
+      setlength(LOut, len(LA) + len(LB));
+      LCount := 0;
+      LI := 0;
+      LJ := 0;
+      // A merge of two sorted lists
+      while (LI < len(LA)) or (LJ < len(LB)) do
+        if (LJ >= len(LB)) or ((LI < len(LA)) and (LA[LI] < LB[LJ])) then
+          if AUnion then
+            LOut[LCount] := LA[LI];
+            LCount := LCount + 1;
+          end;
+          LI := LI + 1;
+        else
+          if (LI >= len(LA)) or (LB[LJ] < LA[LI]) then
+            if AUnion then
+              LOut[LCount] := LB[LJ];
+              LCount := LCount + 1;
+            end;
+            LJ := LJ + 1;
+          else
+            LOut[LCount] := LA[LI];
+            LCount := LCount + 1;
+            LI := LI + 1;
+            LJ := LJ + 1;
+          end;
+        end;
+      end;
+      setlength(LOut, LCount);
+      LResult := self.DoHideIntern(LOut);
+      self.FHideMemo.Put(LKey, LResult + 1);
+      return LResult;
+    end;
+
+    // The set AHide with the macro AId added
+    hidden method DoHideAdd(const AHide: int64; const AId: int64): int64;
+    var
+      LOne: Int64Array;
+    begin
+      setlength(LOne, 1);
+      LOne[0] := AId;
+      return self.DoHideMerge(AHide, self.DoHideIntern(LOne), true);
+    end;
+
+    // ---- the input: tokens pushed back in front of the current source --------------------
+
+    hidden method DoPush(const ATok: PpToken);
+    begin
+      if self.FPendingCount = len(self.FPending) then
+        setlength(self.FPending, DoGrow(self.FPendingCount));
+      end;
+      self.FPending[self.FPendingCount] := ATok;
+      self.FPendingCount := self.FPendingCount + 1;
+    end;
+
+    // ATokens pushed so the first is read next
+    hidden method DoPushAll(const ATokens: PpTokenArray);
+    var
+      LI: int64;
+    begin
+      LI := len(ATokens) - 1;
+      while LI >= 0 do
+        self.DoPush(ATokens[LI]);
+        LI := LI - 1;
+      end;
+    end;
+
+    // An end-of-file token
+    hidden const method DoEndToken(): PpToken;
+    var
+      LTok: PpToken;
+    begin
+      LTok.Kind := PpKind.EndOfFile;
+      LTok.Text := "";
+      LTok.File := -1;
+      LTok.Line := 0;
+      LTok.Column := 0;
+      LTok.Space := false;
+      LTok.LineStart := true;
+      LTok.Hide := 0;
+      return LTok;
+    end;
+
+    // The next token: a pushed one, else the current file's (directives done on the way),
+    // else the end
+    hidden method DoNext(): PpToken;
+    begin
+      if self.FPendingCount > 0 then
+        self.FPendingCount := self.FPendingCount - 1;
+        return self.FPending[self.FPendingCount];
+      end;
+      if self.FFromFile then
+        return self.DoFileToken();
+      end;
+      return self.DoEndToken();
+    end;
+
+    // ATokens fully macro-expanded on their own (an argument, a directive's line): AIfMode
+    // as #if reads them (defined and __has_include taken)
+    hidden method DoExpandList(const ATokens: PpTokenArray; const AIfMode: bool): PpTokenArray;
+    var
+      LSaved: PpTokenArray;
+      LFresh: PpTokenArray;
+      LSavedCount: int64;
+      LSavedFile: bool;
+      LSavedIf: bool;
+      LOut: ref PpTokenList;
+      LTok: PpToken;
+    begin
+      LSaved := self.FPending;
+      LSavedCount := self.FPendingCount;
+      LSavedFile := self.FFromFile;
+      LSavedIf := self.FIfMode;
+      setlength(LFresh, len(ATokens));
+      self.FPending := LFresh;
+      self.FPendingCount := 0;
+      self.FFromFile := false;
+      self.FIfMode := AIfMode;
+      self.DoPushAll(ATokens);
+      LOut := ref PpTokenList();
+      while self.DoExpandNext(LTok) do
+        LOut.Add(LTok);
+      end;
+      self.FPending := LSaved;
+      self.FPendingCount := LSavedCount;
+      self.FFromFile := LSavedFile;
+      self.FIfMode := LSavedIf;
+      return LOut.ToArray();
+    end;
+
+    // ---- expansion -------------------------------------------------------------------------
+
+    // The next token with every macro expanded (rescanned until none is left at the front);
+    // false at the end of the input
+    hidden method DoExpandNext(var ATok: PpToken): bool;
+    var
+      LTok: PpToken;
+      LId: int64;
+      LMacro: PpMacro;
+    begin
+      while true do
+        LTok := self.DoNext();
+        if LTok.Kind = PpKind.EndOfFile then
+          ATok := LTok;
+          return false;
+        end;
+        if LTok.Kind <> PpKind.Identifier then
+          ATok := LTok;
+          return true;
+        end;
+        if self.FIfMode and (LTok.Text = "defined") then
+          ATok := self.DoDefinedOperator(LTok);
+          return true;
+        end;
+        if LTok.Text = "_Pragma" then
+          if self.DoPragmaOperator(LTok, ATok) then
+            return true;
+          end;
+          skip;
+        end;
+        LId := self.FMacroIds.Find(LTok.Text);
+        if LId = 0 then
+          ATok := LTok;
+          return true;
+        end;
+        LMacro := self.FMacros[LId - 1];
+        if not LMacro.Active or self.DoHideHas(LTok.Hide, LId) then
+          ATok := LTok;
+          return true;
+        end;
+        if LMacro.Kind = MacroKind.Plain then
+          self.DoExpandPlain(LMacro, LId, LTok);
+          skip;
+        end;
+        if LMacro.Kind = MacroKind.Function then
+          if not self.DoExpandFunction(LMacro, LId, LTok) then
+            ATok := LTok;
+            return true;
+          end;
+          skip;
+        end;
+        if not self.DoExpandBuiltin(LMacro, LTok) then
+          ATok := LTok;
+          return true;
+        end;
+      end;
+    end;
+
+    // The expansion ABody pushed back for rescanning: each token's hide set joined with AHide,
+    // placed where AOrigin (the macro's name) is, the first spaced as AOrigin
+    hidden method DoPushExpansion(const ABody: PpTokenArray; const AHide: int64;
+      const AOrigin: PpToken);
+    var
+      LList: PpTokenArray;
+      LI: int64;
+    begin
+      setlength(LList, len(ABody));
+      for LI := 0 to len(ABody) - 1 do
+        LList[LI] := ABody[LI];
+        LList[LI].Hide := self.DoHideMerge(ABody[LI].Hide, AHide, true);
+        LList[LI].File := AOrigin.File;
+        LList[LI].Line := AOrigin.Line;
+        LList[LI].Column := AOrigin.Column;
+        LList[LI].LineStart := false;
+      end;
+      if len(LList) > 0 then
+        LList[0].Space := AOrigin.Space;
+      end;
+      self.DoPushAll(LList);
+    end;
+
+    // An object-like macro's expansion (its ## done)
+    hidden method DoExpandPlain(const AMacro: PpMacro; const AId: int64; const AOrigin: PpToken);
+    var
+      LArgs: PpArgArray;
+    begin
+      setlength(LArgs, 0);
+      self.DoPushExpansion(self.DoSubst(AMacro, LArgs, AOrigin), self.DoHideAdd(AOrigin.Hide, AId),
+        AOrigin);
+    end;
+
+    // A function-like macro's call: false (nothing taken) when no '(' follows its name
+    hidden method DoExpandFunction(const AMacro: PpMacro; const AId: int64;
+      const AOrigin: PpToken): bool;
+    var
+      LNext: PpToken;
+      LClose: PpToken;
+      LArgs: PpArgArray;
+      LHide: int64;
+    begin
+      LNext := self.DoNext();
+      if not DoIsPunct(LNext, "(") then
+        if LNext.Kind <> PpKind.EndOfFile then
+          self.DoPush(LNext);
+        end;
+        return false;
+      end;
+      if not self.DoCollectArgs(AMacro, AOrigin, LArgs, LClose) then
+        // Reported; the call is dropped
+        return true;
+      end;
+      LHide := self.DoHideAdd(self.DoHideMerge(AOrigin.Hide, LClose.Hide, false), AId);
+      self.DoPushExpansion(self.DoSubst(AMacro, LArgs, AOrigin), LHide, AOrigin);
+      return true;
+    end;
+
+    // A call's arguments (raw), its '(' taken: split at the commas outside parentheses (the
+    // variadic part keeps its commas), up to the ')' (AClose). The count is checked against
+    // the parameters (an omitted variadic part is empty). False after a report
+    hidden method DoCollectArgs(const AMacro: PpMacro; const AOrigin: PpToken; var AArgs: PpArgArray;
+      var AClose: PpToken): bool;
+    var
+      LList: ref PpTokenList;
+      LTok: PpToken;
+      LDepth: int64;
+      LCount: int64;
+      LParams: int64;
+      LDone: bool;
+    begin
+      setlength(AArgs, 0);
+      LParams := len(AMacro.Params);
+      LList := ref PpTokenList();
+      LDepth := 0;
+      LCount := 0;
+      LDone := false;
+      while not LDone do
+        LTok := self.DoNext();
+        if LTok.Kind = PpKind.EndOfFile then
+          self.DoError(ADAM_ERR_CIMPORT_PP_009, AOrigin, ADAM_MSG_CIMPORT_PP_UNTERMINATED_CALL,
+            NoArgs().Str(AMacro.Name));
+          return false;
+        end;
+        if LTok.LineStart then
+          // A newline inside a call is a blank
+          LTok.LineStart := false;
+          LTok.Space := true;
+        end;
+        if DoIsPunct(LTok, ")") and (LDepth = 0) then
+          AClose := LTok;
+          LDone := true;
+        else
+          if DoIsPunct(LTok, ",") and (LDepth = 0) and
+            not (AMacro.Variadic and (LCount = LParams - 1)) then
+            setlength(AArgs, LCount + 1);
+            AArgs[LCount] := LList.ToArray();
+            LCount := LCount + 1;
+            LList := ref PpTokenList();
+          else
+            if DoIsPunct(LTok, "(") then
+              LDepth := LDepth + 1;
+            end;
+            if DoIsPunct(LTok, ")") then
+              LDepth := LDepth - 1;
+            end;
+            LList.Add(LTok);
+          end;
+        end;
+      end;
+      setlength(AArgs, LCount + 1);
+      AArgs[LCount] := LList.ToArray();
+      LCount := LCount + 1;
+      // f() of a macro with no parameters is no argument at all
+      if (LParams = 0) and (LCount = 1) and (len(AArgs[0]) = 0) then
+        setlength(AArgs, 0);
+        return true;
+      end;
+      if AMacro.Variadic and (LCount = LParams - 1) then
+        setlength(AArgs, LCount + 1);
+        setlength(AArgs[LCount], 0);
+        LCount := LCount + 1;
+      end;
+      if LCount <> LParams then
+        if AMacro.Variadic then
+          self.DoError(ADAM_ERR_CIMPORT_PP_010, AOrigin, ADAM_MSG_CIMPORT_PP_ARG_COUNT_VARIADIC,
+            NoArgs().Str(AMacro.Name).Int(LParams - 1).Int(LCount));
+        else
+          self.DoError(ADAM_ERR_CIMPORT_PP_010, AOrigin, ADAM_MSG_CIMPORT_PP_ARG_COUNT,
+            NoArgs().Str(AMacro.Name).Int(LParams).Int(LCount));
+        end;
+        return false;
+      end;
+      return true;
+    end;
+
+    // ALeft and ARight pasted into one token (##) in ALeft; false (reported at AOrigin) when
+    // their spellings are not one token
+    hidden method DoPaste(var ALeft: PpToken; const ARight: PpToken; const AOrigin: PpToken): bool;
+    var
+      LTok: PpToken;
+    begin
+      if not LexOne(ALeft.Text + ARight.Text, LTok) then
+        self.DoError(ADAM_ERR_CIMPORT_PP_011, AOrigin, ADAM_MSG_CIMPORT_PP_BAD_PASTE,
+          NoArgs().Str(ALeft.Text).Str(ARight.Text));
+        return false;
+      end;
+      LTok.Space := ALeft.Space;
+      LTok.LineStart := false;
+      LTok.Hide := 0;
+      LTok.File := ALeft.File;
+      LTok.Line := ALeft.Line;
+      LTok.Column := ALeft.Column;
+      ALeft := LTok;
+      return true;
+    end;
+
+    // The argument ATokens as a string literal (#): spellings joined by one blank where there
+    // was any, a literal's '\' and '"' escaped
+    hidden const method DoStringize(const ATokens: PpTokenArray; const ASpace: bool): PpToken;
+    var
+      LOut: ref TextBuilder;
+      LTok: PpToken;
+      LI: int64;
+    begin
+      LOut := ref TextBuilder();
+      LOut.Add("\"");
+      for LI := 0 to len(ATokens) - 1 do
+        if (LI > 0) and ATokens[LI].Space then
+          LOut.Add(" ");
+        end;
+        if (ATokens[LI].Kind = PpKind.StringLit) or (ATokens[LI].Kind = PpKind.CharConst) then
+          LOut.Add(DoEscape(ATokens[LI].Text));
+        else
+          LOut.Add(ATokens[LI].Text);
+        end;
+      end;
+      LOut.Add("\"");
+      LTok := self.DoEndToken();
+      LTok.Kind := PpKind.StringLit;
+      LTok.Text := LOut.Text();
+      LTok.Space := ASpace;
+      LTok.LineStart := false;
+      return LTok;
+    end;
+
+    // The index of the ')' closing the '(' at AOpen of ABody; len(ABody) when none does
+    hidden const method DoCloseParen(const ABody: PpTokenArray; const AOpen: int64): int64;
+    var
+      LDepth: int64;
+      LI: int64;
+    begin
+      LDepth := 0;
+      for LI := AOpen to len(ABody) - 1 do
+        if DoIsPunct(ABody[LI], "(") then
+          LDepth := LDepth + 1;
+        end;
+        if DoIsPunct(ABody[LI], ")") then
+          LDepth := LDepth - 1;
+          if LDepth = 0 then
+            return LI;
+          end;
+        end;
+      end;
+      return len(ABody);
+    end;
+
+    // AMacro's body (from AFrom up to ATo) with AArgs (raw) put in for its parameters: a
+    // plain use expanded first, # and ## taking it as written, GNU's `, ## __VA_ARGS__`
+    // dropping the comma when the variadic part is empty, __VA_OPT__(..) its contents only
+    // when it is not. The tokens added to AOut
+    hidden method DoSubstRange(const AMacro: PpMacro; const AArgs: PpArgArray; var AExpanded: PpArgArray;
+      var ADone: BoolArray; const AFrom: int64; const ATo: int64; const AOrigin: PpToken;
+      const AOut: ref PpTokenList);
+    var
+      LBody: PpTokenArray;
+      LTok: PpToken;
+      LLast: PpToken;
+      LI: int64;
+      LJ: int64;
+      LP: int64;
+      LQ: int64;
+      LVa: int64;
+    begin
+      LBody := AMacro.Body;
+      LVa := -1;
+      if AMacro.Variadic then
+        LVa := len(AMacro.Params) - 1;
+      end;
+      LI := AFrom;
+      while LI < ATo do
+        LTok := LBody[LI];
+        LP := -1;
+        if LI + 1 < ATo then
+          LP := self.DoParam(AMacro, LBody[LI + 1]);
+        end;
+        // # parameter
+        if DoIsPunct(LTok, "#") and (AMacro.Kind = MacroKind.Function) and (LP >= 0) then
+          AOut.Add(self.DoStringize(AArgs[LP], LTok.Space));
+          LI := LI + 2;
+          skip;
+        end;
+        // , ## __VA_ARGS__ (GNU)
+        if DoIsPunct(LTok, ",") and (LI + 2 < ATo) and DoIsPunct(LBody[LI + 1], "##") then
+          LQ := self.DoParam(AMacro, LBody[LI + 2]);
+          if (LQ >= 0) and (LQ = LVa) then
+            if len(AArgs[LQ]) = 0 then
+              LI := LI + 3;
+            else
+              AOut.Add(LTok);
+              LI := LI + 2;
+            end;
+            skip;
+          end;
+        end;
+        // __VA_OPT__ ( .. )
+        if DoIsWord(LTok, "__VA_OPT__") and (LVa >= 0) and (LI + 1 < ATo) and
+          DoIsPunct(LBody[LI + 1], "(") then
+          LJ := self.DoCloseParen(LBody, LI + 1);
+          if len(self.DoArgExpanded(AArgs, AExpanded, ADone, LVa)) > 0 then
+            self.DoSubstRange(AMacro, AArgs, AExpanded, ADone, LI + 2, LJ, AOrigin, AOut);
+          end;
+          LI := LJ + 1;
+          skip;
+        end;
+        // ## right operand
+        if DoIsPunct(LTok, "##") and (LI + 1 < ATo) then
+          if AOut.Count = 0 then
+            // Nothing on the left (an empty argument before it): the right side as is
+            if LP >= 0 then
+              self.DoAddAll(AOut, AArgs[LP], 0);
+            else
+              AOut.Add(LBody[LI + 1]);
+            end;
+            LI := LI + 2;
+            skip;
+          end;
+          LLast := AOut.Item(AOut.Count - 1);
+          if LP >= 0 then
+            if len(AArgs[LP]) > 0 then
+              if self.DoPaste(LLast, AArgs[LP][0], AOrigin) then
+                AOut.Put(AOut.Count - 1, LLast);
+                self.DoAddAll(AOut, AArgs[LP], 1);
+              else
+                self.DoAddAll(AOut, AArgs[LP], 0);
+              end;
+            end;
+          else
+            if self.DoPaste(LLast, LBody[LI + 1], AOrigin) then
+              AOut.Put(AOut.Count - 1, LLast);
+            else
+              AOut.Add(LBody[LI + 1]);
+            end;
+          end;
+          LI := LI + 2;
+          skip;
+        end;
+        LP := self.DoParam(AMacro, LTok);
+        if LP >= 0 then
+          // A parameter ## something: taken as written; an empty one gives the right side as
+          // is (or nothing for a parameter there)
+          if (LI + 1 < ATo) and DoIsPunct(LBody[LI + 1], "##") then
+            if len(AArgs[LP]) = 0 then
+              LQ := -1;
+              if LI + 2 < ATo then
+                LQ := self.DoParam(AMacro, LBody[LI + 2]);
+              end;
+              if LQ >= 0 then
+                self.DoAddAll(AOut, AArgs[LQ], 0);
+                LI := LI + 3;
+              else
+                LI := LI + 2;
+              end;
+              skip;
+            end;
+            self.DoAddSpaced(AOut, AArgs[LP], LTok.Space);
+            LI := LI + 1;
+            skip;
+          end;
+          self.DoAddSpaced(AOut, self.DoArgExpanded(AArgs, AExpanded, ADone, LP), LTok.Space);
+          LI := LI + 1;
+          skip;
+        end;
+        AOut.Add(LTok);
+        LI := LI + 1;
+      end;
+    end;
+
+    // AArgs[AIndex] fully expanded, made once
+    hidden method DoArgExpanded(const AArgs: PpArgArray; var AExpanded: PpArgArray; var ADone: BoolArray;
+      const AIndex: int64): PpTokenArray;
+    begin
+      if not ADone[AIndex] then
+        AExpanded[AIndex] := self.DoExpandList(AArgs[AIndex], self.FIfMode);
+        ADone[AIndex] := true;
+      end;
+      return AExpanded[AIndex];
+    end;
+
+    // ATokens from AFrom added to AOut
+    hidden const method DoAddAll(const AOut: ref PpTokenList; const ATokens: PpTokenArray;
+      const AFrom: int64);
+    var
+      LI: int64;
+    begin
+      for LI := AFrom to len(ATokens) - 1 do
+        AOut.Add(ATokens[LI]);
+      end;
+    end;
+
+    // ATokens added to AOut, the first spaced as ASpace (the parameter it stands for)
+    hidden const method DoAddSpaced(const AOut: ref PpTokenList; const ATokens: PpTokenArray;
+      const ASpace: bool);
+    var
+      LTok: PpToken;
+      LI: int64;
+    begin
+      for LI := 0 to len(ATokens) - 1 do
+        LTok := ATokens[LI];
+        if LI = 0 then
+          LTok.Space := ASpace;
+        end;
+        AOut.Add(LTok);
+      end;
+    end;
+
+    // AMacro's body with AArgs put in (DoSubstRange over the whole body)
+    hidden method DoSubst(const AMacro: PpMacro; const AArgs: PpArgArray;
+      const AOrigin: PpToken): PpTokenArray;
+    var
+      LExpanded: PpArgArray;
+      LDone: BoolArray;
+      LOut: ref PpTokenList;
+      LI: int64;
+    begin
+      setlength(LExpanded, len(AArgs));
+      setlength(LDone, len(AArgs));
+      for LI := 0 to len(AArgs) - 1 do
+        LDone[LI] := false;
+      end;
+      LOut := ref PpTokenList();
+      self.DoSubstRange(AMacro, AArgs, LExpanded, LDone, 0, len(AMacro.Body), AOrigin, LOut);
+      return LOut.ToArray();
+    end;
+
+    // A number token at AOrigin's place
+    hidden const method DoNumberToken(const AValue: int64; const AOrigin: PpToken): PpToken;
+    var
+      LTok: PpToken;
+    begin
+      LTok := AOrigin;
+      LTok.Kind := PpKind.Number;
+      LTok.Text := IntToStr(AValue);
+      LTok.Hide := 0;
+      return LTok;
+    end;
+
+    // A string token holding AText at AOrigin's place
+    hidden const method DoStringToken(const AText: string; const AOrigin: PpToken): PpToken;
+    var
+      LTok: PpToken;
+    begin
+      LTok := AOrigin;
+      LTok.Kind := PpKind.StringLit;
+      LTok.Text := "\"" + DoEscape(AText) + "\"";
+      LTok.Hide := 0;
+      return LTok;
+    end;
+
+    // defined NAME / defined ( NAME ), its 'defined' taken: 1 or 0
+    hidden method DoDefinedOperator(const AOrigin: PpToken): PpToken;
+    var
+      LTok: PpToken;
+      LParen: bool;
+    begin
+      LTok := self.DoNext();
+      LParen := DoIsPunct(LTok, "(");
+      if LParen then
+        LTok := self.DoNext();
+      end;
+      if LTok.Kind <> PpKind.Identifier then
+        self.DoError(ADAM_ERR_CIMPORT_PP_005, AOrigin, ADAM_MSG_CIMPORT_PP_DEFINED_OPERAND, NoArgs());
+        if LTok.Kind <> PpKind.EndOfFile then
+          self.DoPush(LTok);
+        end;
+        return self.DoNumberToken(0, AOrigin);
+      end;
+      if LParen then
+        if not DoIsPunct(self.DoNext(), ")") then
+          self.DoError(ADAM_ERR_CIMPORT_PP_005, AOrigin, ADAM_MSG_CIMPORT_PP_DEFINED_OPERAND,
+            NoArgs());
+        end;
+      end;
+      if self.DoIsDefined(LTok.Text) then
+        return self.DoNumberToken(1, AOrigin);
+      end;
+      return self.DoNumberToken(0, AOrigin);
+    end;
+
+    // __DATE__ / __TIME__ / __TIMESTAMP__'s fixed text at AOrigin's place (see the header)
+    hidden const method DoFixedText(const ABuiltin: BuiltinMacro; const AOrigin: PpToken): PpToken;
+    var
+      LTok: PpToken;
+    begin
+      LTok := AOrigin;
+      LTok.Kind := PpKind.StringLit;
+      LTok.Hide := 0;
+      LTok.Text := ADAM_CIMPORT_TIMESTAMP;
+      if ABuiltin = BuiltinMacro.Date then
+        LTok.Text := ADAM_CIMPORT_DATE;
+      end;
+      if ABuiltin = BuiltinMacro.Time then
+        LTok.Text := ADAM_CIMPORT_TIME;
+      end;
+      return LTok;
+    end;
+
+    // The header the current file is (NoHeader when none is open)
+    hidden const method DoCurrentHeader(): HeaderFile;
+    begin
+      if self.FSourceCount = 0 then
+        return NoHeader();
+      end;
+      return self.FFiles[self.FSources[self.FSourceCount - 1].File].Header;
+    end;
+
+    // A builtin's '(' .. ')' (raw, nested parentheses kept), its name taken; false (reported)
+    // when no '(' follows or no ')' closes it
+    hidden method DoBuiltinArgs(const AOrigin: PpToken; var AArgs: PpTokenArray): bool;
+    var
+      LList: ref PpTokenList;
+      LTok: PpToken;
+      LDepth: int64;
+    begin
+      setlength(AArgs, 0);
+      LTok := self.DoNext();
+      if not DoIsPunct(LTok, "(") then
+        if LTok.Kind <> PpKind.EndOfFile then
+          self.DoPush(LTok);
+        end;
+        self.DoError(ADAM_ERR_CIMPORT_PP_020, AOrigin, ADAM_MSG_CIMPORT_PP_BUILTIN_ARGS,
+          NoArgs().Str(AOrigin.Text));
+        return false;
+      end;
+      LList := ref PpTokenList();
+      LDepth := 0;
+      while true do
+        LTok := self.DoNext();
+        if LTok.Kind = PpKind.EndOfFile then
+          self.DoError(ADAM_ERR_CIMPORT_PP_020, AOrigin, ADAM_MSG_CIMPORT_PP_BUILTIN_ARGS,
+            NoArgs().Str(AOrigin.Text));
+          return false;
+        end;
+        if DoIsPunct(LTok, ")") then
+          if LDepth = 0 then
+            AArgs := LList.ToArray();
+            return true;
+          end;
+          LDepth := LDepth - 1;
+        end;
+        if DoIsPunct(LTok, "(") then
+          LDepth := LDepth + 1;
+        end;
+        LList.Add(LTok);
+      end;
+    end;
+
+    // A header name from ATokens: "name" (AQuoted) or < .. > spelled back; false when they
+    // are neither
+    hidden const method DoHeaderNameOf(const ATokens: PpTokenArray; var AName: string;
+      var AQuoted: bool): bool;
+    var
+      LI: int64;
+    begin
+      AName := "";
+      AQuoted := false;
+      if len(ATokens) = 0 then
+        return false;
+      end;
+      if (ATokens[0].Kind = PpKind.StringLit) and (DoByte(ATokens[0].Text, 0) = DoCode('"')) then
+        AName := Substring(ATokens[0].Text, 1, len(ATokens[0].Text) - 2);
+        AQuoted := true;
+        return true;
+      end;
+      if DoIsPunct(ATokens[0], "<") then
+        for LI := 1 to len(ATokens) - 1 do
+          if DoIsPunct(ATokens[LI], ">") then
+            AName := DoSpell(ATokens, 1, LI);
+            return AName <> "";
+          end;
+        end;
+      end;
+      return false;
+    end;
+
+    // A builtin macro's value pushed back (see the header); false when it gives nothing here
+    // (the name stays an identifier)
+    hidden method DoExpandBuiltin(const AMacro: PpMacro; const AOrigin: PpToken): bool;
+    var
+      LArgs: PpTokenArray;
+      LName: string;
+      LQuoted: bool;
+      LFound: HeaderFile;
+      LValue: int64;
+      LFile: int32;
+    begin
+      LFile := -1;
+      if self.FSourceCount > 0 then
+        LFile := self.FSources[self.FSourceCount - 1].NameFile;
+      end;
+      match AMacro.Builtin of
+        BuiltinMacro.File:
+          LName := "";
+          if LFile >= 0 then
+            LName := self.FFiles[LFile].Name;
+          end;
+          self.DoPush(self.DoStringToken(LName, AOrigin));
+          return true;
+        BuiltinMacro.Line:
+          self.DoPush(self.DoNumberToken(int64(AOrigin.Line), AOrigin));
+          return true;
+        BuiltinMacro.Counter:
+          self.DoPush(self.DoNumberToken(self.FCounter, AOrigin));
+          self.FCounter := self.FCounter + 1;
+          return true;
+        BuiltinMacro.IncludeLevel:
+          LValue := self.FSourceCount - 1;
+          if LValue < 0 then
+            LValue := 0;
+          end;
+          self.DoPush(self.DoNumberToken(LValue, AOrigin));
+          return true;
+        BuiltinMacro.BaseFile:
+          self.DoPush(self.DoStringToken(self.FBaseName, AOrigin));
+          return true;
+        BuiltinMacro.FileName:
+          LName := "";
+          if LFile >= 0 then
+            LName := DoLastPart(self.FFiles[LFile].Name);
+          end;
+          self.DoPush(self.DoStringToken(LName, AOrigin));
+          return true;
+        BuiltinMacro.Date, BuiltinMacro.Time, BuiltinMacro.Timestamp:
+          self.DoPush(self.DoFixedText(AMacro.Builtin, AOrigin));
+          return true;
+      else
+      end;
+      if (AMacro.Builtin = BuiltinMacro.HasInclude) or (AMacro.Builtin = BuiltinMacro.HasIncludeNext) then
+        if not self.FIfMode then
+          self.DoError(ADAM_ERR_CIMPORT_PP_020, AOrigin, ADAM_MSG_CIMPORT_PP_IF_ONLY,
+            NoArgs().Str(AOrigin.Text));
+          return false;
+        end;
+        if not self.DoBuiltinArgs(AOrigin, LArgs) then
+          self.DoPush(self.DoNumberToken(0, AOrigin));
+          return true;
+        end;
+        if not self.DoHeaderNameOf(LArgs, LName, LQuoted) then
+          if not self.DoHeaderNameOf(self.DoExpandList(LArgs, true), LName, LQuoted) then
+            self.DoError(ADAM_ERR_CIMPORT_PP_020, AOrigin, ADAM_MSG_CIMPORT_PP_BUILTIN_ARGS,
+              NoArgs().Str(AOrigin.Text));
+            self.DoPush(self.DoNumberToken(0, AOrigin));
+            return true;
+          end;
+        end;
+        LValue := 0;
+        if self.FSearch.Find(LName, LQuoted, self.DoCurrentHeader(),
+          AMacro.Builtin = BuiltinMacro.HasIncludeNext, LFound) then
+          LValue := 1;
+        end;
+        self.DoPush(self.DoNumberToken(LValue, AOrigin));
+        return true;
+      end;
+      if not self.DoBuiltinArgs(AOrigin, LArgs) then
+        self.DoPush(self.DoNumberToken(0, AOrigin));
+        return true;
+      end;
+      LName := DoSpell(LArgs, 0, len(LArgs));
+      LValue := 0;
+      match AMacro.Builtin of
+        BuiltinMacro.HasAttribute:
+          LValue := self.FTable.HasAnswer(HasKind.Attribute, LName, self.FTriple);
+        BuiltinMacro.HasCAttribute:
+          LValue := self.FTable.HasAnswer(HasKind.CAttribute, LName, self.FTriple);
+        BuiltinMacro.HasBuiltin:
+          LValue := self.FTable.HasAnswer(HasKind.Builtin, LName, self.FTriple);
+        BuiltinMacro.HasFeature:
+          LValue := self.FTable.HasAnswer(HasKind.Feature, LName, self.FTriple);
+        BuiltinMacro.HasExtension:
+          LValue := self.FTable.HasAnswer(HasKind.Extension, LName, self.FTriple);
+        BuiltinMacro.HasDeclspecAttribute:
+          LValue := self.FTable.HasAnswer(HasKind.DeclspecAttribute, LName, self.FTriple);
+      else
+      end;
+      self.DoPush(self.DoNumberToken(LValue, AOrigin));
+      return true;
+    end;
+
+    // ---- pragmas ---------------------------------------------------------------------------
+
+    // A pragma's tokens (after the word pragma) acted on (see the header) and, unless it is
+    // #pragma once, push_macro or pop_macro, kept as a Pragma token at AHash's place in APragma; false when nothing
+    // is kept
+    hidden method DoPragma(const ATokens: PpTokenArray; const AHash: PpToken; var APragma: PpToken): bool;
+    var
+      LName: string;
+      LTop: int64;
+    begin
+      if (len(ATokens) > 0) and DoIsWord(ATokens[0], "once") then
+        if self.FSourceCount > 0 then
+          self.FOnce.Put(self.FFiles[self.FSources[self.FSourceCount - 1].File].Header.FullName, 1);
+        end;
+        return false;
+      end;
+      if (len(ATokens) >= 4) and ((DoIsWord(ATokens[0], "push_macro")) or
+        DoIsWord(ATokens[0], "pop_macro")) and DoIsPunct(ATokens[1], "(") and
+        (ATokens[2].Kind = PpKind.StringLit) then
+        LName := DoDestringize(ATokens[2].Text);
+        if DoIsWord(ATokens[0], "push_macro") then
+          self.DoPushMacro(LName);
+        else
+          self.DoPopMacro(LName);
+        end;
+        // Acted on, not kept (clang -E does not pass them on)
+        return false;
+      end;
+      if (len(ATokens) >= 2) and DoIsWord(ATokens[0], "GCC") and
+        DoIsWord(ATokens[1], "system_header") and (self.FSourceCount > 0) then
+        LTop := self.FSourceCount - 1;
+        self.FFiles[self.FSources[LTop].File].System := true;
+        self.FFiles[self.FSources[LTop].NameFile].System := true;
+      end;
+      APragma := AHash;
+      APragma.Kind := PpKind.Pragma;
+      APragma.Text := DoSpell(ATokens, 0, len(ATokens));
+      APragma.Hide := 0;
+      APragma.Space := false;
+      return true;
+    end;
+
+    // #pragma push_macro("AName"): the macro as it is now (or that there is none) saved
+    hidden method DoPushMacro(const AName: string);
+    var
+      LMacro: PpMacro;
+      LId: int64;
+    begin
+      LId := self.FMacroIds.Find(AName);
+      if LId > 0 then
+        LMacro := self.FMacros[LId - 1];
+      else
+        LMacro.Name := AName;
+        LMacro.Kind := MacroKind.Plain;
+        LMacro.Builtin := BuiltinMacro.None;
+        setlength(LMacro.Params, 0);
+        LMacro.Variadic := false;
+        setlength(LMacro.Body, 0);
+        LMacro.Active := false;
+      end;
+      if self.FPushedCount = len(self.FPushed) then
+        setlength(self.FPushed, DoGrow(self.FPushedCount));
+      end;
+      self.FPushed[self.FPushedCount] := LMacro;
+      self.FPushedCount := self.FPushedCount + 1;
+    end;
+
+    // #pragma pop_macro("AName"): the last saved AName put back (nothing when none is saved)
+    hidden method DoPopMacro(const AName: string);
+    var
+      LI: int64;
+      LJ: int64;
+    begin
+      LI := self.FPushedCount - 1;
+      while LI >= 0 do
+        if self.FPushed[LI].Name = AName then
+          if self.FPushed[LI].Active or (self.FMacroIds.Find(AName) > 0) then
+            self.DoSetMacro(self.FPushed[LI]);
+          end;
+          for LJ := LI to self.FPushedCount - 2 do
+            self.FPushed[LJ] := self.FPushed[LJ + 1];
+          end;
+          self.FPushedCount := self.FPushedCount - 1;
+          return;
+        end;
+        LI := LI - 1;
+      end;
+    end;
+
+    // _Pragma ( "..." ), its name taken: the string's text lexed as a #pragma line; true with
+    // APragma when a Pragma token is kept
+    hidden method DoPragmaOperator(const AOrigin: PpToken; var APragma: PpToken): bool;
+    var
+      LArgs: PpTokenArray;
+      LLexer: ref PpLexer;
+      LList: ref PpTokenList;
+      LTok: PpToken;
+    begin
+      if not self.DoBuiltinArgs(AOrigin, LArgs) then
+        return false;
+      end;
+      if (len(LArgs) <> 1) or (LArgs[0].Kind <> PpKind.StringLit) then
+        self.DoError(ADAM_ERR_CIMPORT_PP_021, AOrigin, ADAM_MSG_CIMPORT_PP_BAD_PRAGMA, NoArgs());
+        return false;
+      end;
+      LLexer := ref PpLexer(DoDestringize(LArgs[0].Text), AOrigin.File);
+      LList := ref PpTokenList();
+      LTok := LLexer.Next();
+      // The pragma word itself is not in the string: the tokens are the pragma's
+      while LTok.Kind <> PpKind.EndOfFile do
+        LList.Add(LTok);
+        LTok := LLexer.Next();
+      end;
+      return self.DoPragma(LList.ToArray(), AOrigin, APragma);
+    end;
+
+    // ---- files -----------------------------------------------------------------------------
+
+    // The file index of AHeader as AName (one per name, kept for every token marked with it)
+    hidden method DoFileIndex(const AHeader: HeaderFile; const AName: string; const ASystem: bool): int32;
+    var
+      LId: int64;
+      LFile: PpFile;
+    begin
+      LId := self.FFileIds.Find(AName);
+      if LId > 0 then
+        return int32(LId - 1);
+      end;
+      LFile.Header := AHeader;
+      LFile.Name := AName;
+      LFile.System := ASystem;
+      if self.FFileCount = len(self.FFiles) then
+        setlength(self.FFiles, DoGrow(self.FFileCount));
+      end;
+      self.FFiles[self.FFileCount] := LFile;
+      self.FFileCount := self.FFileCount + 1;
+      self.FFileIds.Put(AName, self.FFileCount);
+      return int32(self.FFileCount - 1);
+    end;
+
+    // AText opened as the file AHeader (AName in reports), its tokens read next
+    hidden method DoOpen(const AHeader: HeaderFile; const AName: string; const AText: string;
+      const ASystem: bool);
+    var
+      LSource: PpSource;
+      LFile: int32;
+    begin
+      LFile := self.DoFileIndex(AHeader, AName, ASystem);
+      LSource.File := LFile;
+      LSource.NameFile := LFile;
+      LSource.LineDelta := 0;
+      LSource.CondBase := self.FCondCount;
+      LSource.Guard := 0;
+      LSource.GuardName := "";
+      LSource.GuardDepth := 0;
+      if self.FSourceCount = len(self.FSources) then
+        setlength(self.FSources, DoGrow(self.FSourceCount));
+        setlength(self.FLexers, len(self.FSources));
+      end;
+      self.FSources[self.FSourceCount] := LSource;
+      self.FLexers[self.FSourceCount] := ref PpLexer(AText, LFile);
+      self.FSourceCount := self.FSourceCount + 1;
+    end;
+
+    // The current file done: its open conditionals reported (CP0019), its guard kept, closed
+    hidden method DoEndSource();
+    var
+      LTop: int64;
+      LSource: PpSource;
+      LCond: PpCond;
+      LTok: PpToken;
+      LI: int64;
+    begin
+      LTop := self.FSourceCount - 1;
+      LSource := self.FSources[LTop];
+      for LI := LSource.CondBase to self.FCondCount - 1 do
+        LCond := self.FConds[LI];
+        LTok := self.DoEndToken();
+        LTok.File := LCond.File;
+        LTok.Line := LCond.Line;
+        LTok.Column := LCond.Column;
+        self.DoError(ADAM_ERR_CIMPORT_PP_001, LTok, ADAM_MSG_CIMPORT_PP_UNTERMINATED_IF,
+          NoArgs().Str(LCond.Directive));
+      end;
+      if self.FCondCount > LSource.CondBase then
+        self.FCondCount := LSource.CondBase;
+      end;
+      if LSource.Guard = 2 then
+        if self.FGuardCount = len(self.FGuardNames) then
+          setlength(self.FGuardNames, DoGrow(self.FGuardCount));
+        end;
+        self.FGuardNames[self.FGuardCount] := LSource.GuardName;
+        self.FGuardCount := self.FGuardCount + 1;
+        self.FGuards.Put(self.FFiles[LSource.File].Header.FullName, self.FGuardCount);
+      end;
+      self.FLexers[LTop] := nil;
+      self.FSourceCount := LTop;
+    end;
+
+    // ATok (from the current file's lexer) marked with the current file and #line's moves
+    hidden const method DoMap(var ATok: PpToken);
+    var
+      LTop: int64;
+    begin
+      LTop := self.FSourceCount - 1;
+      ATok.File := self.FSources[LTop].NameFile;
+      ATok.Line := ATok.Line + self.FSources[LTop].LineDelta;
+    end;
+
+    // The current file's lexer
+    hidden const method DoLexer(): ref PpLexer;
+    begin
+      return self.FLexers[self.FSourceCount - 1];
+    end;
+
+    // The tokens left on the directive's line (none of the next)
+    hidden method DoLineTokens(): PpTokenArray;
+    var
+      LLexer: ref PpLexer;
+      LList: ref PpTokenList;
+      LTok: PpToken;
+    begin
+      LLexer := self.DoLexer();
+      LList := ref PpTokenList();
+      LTok := LLexer.Peek();
+      while (LTok.Kind <> PpKind.EndOfFile) and not LTok.LineStart do
+        LLexer.Next();
+        self.DoMap(LTok);
+        LList.Add(LTok);
+        LTok := LLexer.Peek();
+      end;
+      return LList.ToArray();
+    end;
+
+    // A token outside every directive: the file is no longer a guarded one where the guard
+    // has not opened yet or has closed
+    hidden method DoGuardToken();
+    var
+      LTop: int64;
+    begin
+      LTop := self.FSourceCount - 1;
+      if (self.FSources[LTop].Guard = 0) or (self.FSources[LTop].Guard = 2) then
+        self.FSources[LTop].Guard := -1;
+      end;
+    end;
+
+    // The next token of the files, directives done on the way (a #pragma kept is one)
+    hidden method DoFileToken(): PpToken;
+    var
+      LTok: PpToken;
+      LPragma: PpToken;
+    begin
+      while self.FSourceCount > 0 do
+        LTok := self.DoLexer().Next();
+        if LTok.Kind = PpKind.EndOfFile then
+          self.DoEndSource();
+          skip;
+        end;
+        self.DoMap(LTok);
+        if LTok.LineStart and DoIsPunct(LTok, "#") then
+          if self.DoDirective(LTok, LPragma) then
+            return LPragma;
+          end;
+          skip;
+        end;
+        self.DoGuardToken();
+        return LTok;
+      end;
+      return self.DoEndToken();
+    end;
+
+    // ---- conditionals ----------------------------------------------------------------------
+
+    // A conditional opened by #ADirective at AHash: AActive its first group is taken
+    hidden method DoOpenCond(const ADirective: string; const AHash: PpToken; const AActive: bool);
+    var
+      LCond: PpCond;
+    begin
+      LCond.Active := AActive;
+      LCond.Taken := AActive;
+      LCond.SeenElse := false;
+      LCond.Directive := ADirective;
+      LCond.File := AHash.File;
+      LCond.Line := AHash.Line;
+      LCond.Column := AHash.Column;
+      if self.FCondCount = len(self.FConds) then
+        setlength(self.FConds, DoGrow(self.FCondCount));
+      end;
+      self.FConds[self.FCondCount] := LCond;
+      self.FCondCount := self.FCondCount + 1;
+    end;
+
+    // True when the current file has a conditional of its own open
+    hidden const method DoHasCond(): bool;
+    begin
+      return self.FCondCount > self.FSources[self.FSourceCount - 1].CondBase;
+    end;
+
+    // A branch directive at the guard's own level ends the guard
+    hidden method DoGuardBranch();
+    var
+      LTop: int64;
+    begin
+      LTop := self.FSourceCount - 1;
+      if (self.FSources[LTop].Guard = 1) and (self.FCondCount = self.FSources[LTop].GuardDepth) then
+        self.FSources[LTop].Guard := -1;
+      end;
+    end;
+
+    // The macro name on a directive's line (#ifdef, #undef ...); false (reported) when the
+    // line has none. The rest of the line is taken
+    hidden method DoNameOnLine(const AName: PpToken; var AMacro: string): bool;
+    var
+      LTokens: PpTokenArray;
+    begin
+      LTokens := self.DoLineTokens();
+      AMacro := "";
+      if (len(LTokens) = 0) or (LTokens[0].Kind <> PpKind.Identifier) then
+        self.DoError(ADAM_ERR_CIMPORT_PP_005, AName, ADAM_MSG_CIMPORT_PP_NO_MACRO_NAME,
+          NoArgs().Str(AName.Text));
+        return false;
+      end;
+      AMacro := LTokens[0].Text;
+      return true;
+    end;
+
+    // The value of #ifdef / #ifndef / #elifdef / #elifndef's name (false when it has none)
+    hidden method DoDefinedTest(const AName: PpToken; const ANegate: bool): bool;
+    var
+      LMacro: string;
+    begin
+      if not self.DoNameOnLine(AName, LMacro) then
+        return false;
+      end;
+      return self.DoIsDefined(LMacro) <> ANegate;
+    end;
+
+    // The groups after the taken one skipped, or a group not taken: every line up to the
+    // #elif / #else / #endif that ends it at its level (nested conditionals counted; their
+    // lines are only lexed). Returns once a group is taken or the conditional ends
+    hidden method DoSkipGroup();
+    var
+      LLexer: ref PpLexer;
+      LTok: PpToken;
+      LName: PpToken;
+      LDepth: int64;
+    begin
+      LDepth := 0;
+      while true do
+        LLexer := self.DoLexer();
+        LTok := LLexer.Next();
+        if LTok.Kind = PpKind.EndOfFile then
+          // The lexer gives its end again: the file's end reports the open conditional
+          return;
+        end;
+        if not (LTok.LineStart and DoIsPunct(LTok, "#")) then
+          skip;
+        end;
+        self.DoMap(LTok);
+        LName := LLexer.Peek();
+        if LName.LineStart or (LName.Kind <> PpKind.Identifier) then
+          LLexer.SkipLine();
+          skip;
+        end;
+        LLexer.Next();
+        self.DoMap(LName);
+        if (LName.Text = "if") or (LName.Text = "ifdef") or (LName.Text = "ifndef") then
+          LDepth := LDepth + 1;
+          LLexer.SkipLine();
+          skip;
+        end;
+        if LName.Text = "endif" then
+          if LDepth > 0 then
+            LDepth := LDepth - 1;
+            LLexer.SkipLine();
+            skip;
+          end;
+          self.DoEndif(LName);
+          return;
+        end;
+        if (LDepth = 0) and ((LName.Text = "elif") or (LName.Text = "elifdef") or
+          (LName.Text = "elifndef") or (LName.Text = "else")) then
+          if self.DoSkippedBranch(LName) then
+            return;
+          end;
+          skip;
+        end;
+        LLexer.SkipLine();
+      end;
+    end;
+
+    // #elif / #elifdef / #elifndef / #else (AName) of the conditional being skipped: true when
+    // its group is taken
+    hidden method DoSkippedBranch(const AName: PpToken): bool;
+    var
+      LTop: int64;
+      LValue: bool;
+    begin
+      LTop := self.FCondCount - 1;
+      self.DoGuardBranch();
+      if self.FConds[LTop].SeenElse then
+        self.DoError(ADAM_ERR_CIMPORT_PP_003, AName, ADAM_MSG_CIMPORT_PP_AFTER_ELSE,
+          NoArgs().Str(AName.Text));
+        self.DoLexer().SkipLine();
+        return false;
+      end;
+      if AName.Text = "else" then
+        self.FConds[LTop].SeenElse := true;
+        self.DoLexer().SkipLine();
+        if not self.FConds[LTop].Taken then
+          self.FConds[LTop].Active := true;
+          self.FConds[LTop].Taken := true;
+          return true;
+        end;
+        return false;
+      end;
+      if self.FConds[LTop].Taken then
+        self.DoLexer().SkipLine();
+        return false;
+      end;
+      if AName.Text = "elif" then
+        LValue := self.DoCondition(AName, self.DoLineTokens());
+      else
+        LValue := self.DoDefinedTest(AName, AName.Text = "elifndef");
+      end;
+      if LValue then
+        self.FConds[LTop].Active := true;
+        self.FConds[LTop].Taken := true;
+      end;
+      return LValue;
+    end;
+
+    // #endif (AName): the conditional closed
+    hidden method DoEndif(const AName: PpToken);
+    var
+      LTop: int64;
+    begin
+      self.DoLexer().SkipLine();
+      if not self.DoHasCond() then
+        self.DoError(ADAM_ERR_CIMPORT_PP_002, AName, ADAM_MSG_CIMPORT_PP_NO_IF,
+          NoArgs().Str(AName.Text));
+        return;
+      end;
+      LTop := self.FSourceCount - 1;
+      if (self.FSources[LTop].Guard = 1) and (self.FCondCount = self.FSources[LTop].GuardDepth) then
+        self.FSources[LTop].Guard := 2;
+      end;
+      self.FCondCount := self.FCondCount - 1;
+    end;
+
+    // #if / #ifdef / #ifndef (AName) in a taken group
+    hidden method DoIfDirective(const AHash: PpToken; const AName: PpToken);
+    var
+      LTokens: PpTokenArray;
+      LValue: bool;
+      LTop: int64;
+      LGuard: string;
+    begin
+      LGuard := "";
+      LTop := self.FSourceCount - 1;
+      if AName.Text = "if" then
+        LTokens := self.DoLineTokens();
+        // #if !defined X / #if !defined(X): a guard's form too
+        if (len(LTokens) >= 3) and DoIsPunct(LTokens[0], "!") and DoIsWord(LTokens[1], "defined") then
+          if (len(LTokens) = 3) and (LTokens[2].Kind = PpKind.Identifier) then
+            LGuard := LTokens[2].Text;
+          end;
+          if (len(LTokens) = 5) and DoIsPunct(LTokens[2], "(") and
+            (LTokens[3].Kind = PpKind.Identifier) and DoIsPunct(LTokens[4], ")") then
+            LGuard := LTokens[3].Text;
+          end;
+        end;
+        LValue := self.DoCondition(AName, LTokens);
+      else
+        if AName.Text = "ifndef" then
+          LTokens := self.DoLineTokens();
+          if (len(LTokens) > 0) and (LTokens[0].Kind = PpKind.Identifier) then
+            LGuard := LTokens[0].Text;
+            LValue := not self.DoIsDefined(LGuard);
+          else
+            self.DoError(ADAM_ERR_CIMPORT_PP_005, AName, ADAM_MSG_CIMPORT_PP_NO_MACRO_NAME,
+              NoArgs().Str(AName.Text));
+            LValue := false;
+          end;
+        else
+          LValue := self.DoDefinedTest(AName, false);
+        end;
+      end;
+      if (self.FSources[LTop].Guard = 0) and (LGuard <> "") then
+        self.FSources[LTop].Guard := 1;
+        self.FSources[LTop].GuardName := LGuard;
+        self.FSources[LTop].GuardDepth := self.FCondCount + 1;
+      else
+        self.DoGuardOther();
+      end;
+      self.DoOpenCond(AName.Text, AHash, LValue);
+      if not LValue then
+        self.DoSkipGroup();
+      end;
+    end;
+
+    // A directive that is not the guard's own: the file is no longer a guarded one where the
+    // guard has not opened yet or has closed
+    hidden method DoGuardOther();
+    begin
+      self.DoGuardToken();
+    end;
+
+    // ---- directives ------------------------------------------------------------------------
+
+    // The directive whose '#' is AHash (first on its line, in a taken group); true with a
+    // Pragma token in APragma when one is kept
+    hidden method DoDirective(const AHash: PpToken; var APragma: PpToken): bool;
+    var
+      LLexer: ref PpLexer;
+      LName: PpToken;
+      LTokens: PpTokenArray;
+      LWord: string;
+      LText: string;
+      LMacro: string;
+      LId: int64;
+    begin
+      LLexer := self.DoLexer();
+      LName := LLexer.Peek();
+      if LName.LineStart then
+        // The null directive
+        self.DoGuardOther();
+        return false;
+      end;
+      LLexer.Next();
+      self.DoMap(LName);
+      if LName.Kind = PpKind.Number then
+        // GNU's line marker # N "file"
+        self.DoGuardOther();
+        self.DoLineDirective(AHash, LName, true);
+        return false;
+      end;
+      if LName.Kind <> PpKind.Identifier then
+        self.DoError(ADAM_ERR_CIMPORT_PP_004, LName, ADAM_MSG_CIMPORT_PP_BAD_DIRECTIVE,
+          NoArgs().Str(LName.Text));
+        LLexer.SkipLine();
+        return false;
+      end;
+      LWord := LName.Text;
+      if (LWord = "if") or (LWord = "ifdef") or (LWord = "ifndef") then
+        self.DoIfDirective(AHash, LName);
+        return false;
+      end;
+      if (LWord = "elif") or (LWord = "elifdef") or (LWord = "elifndef") or (LWord = "else") then
+        if not self.DoHasCond() then
+          self.DoError(ADAM_ERR_CIMPORT_PP_002, LName, ADAM_MSG_CIMPORT_PP_NO_IF, NoArgs().Str(LWord));
+          LLexer.SkipLine();
+          return false;
+        end;
+        // The group before was taken: this one and the rest are skipped
+        self.DoGuardBranch();
+        if self.FConds[self.FCondCount - 1].SeenElse then
+          self.DoError(ADAM_ERR_CIMPORT_PP_003, LName, ADAM_MSG_CIMPORT_PP_AFTER_ELSE,
+            NoArgs().Str(LWord));
+        end;
+        if LWord = "else" then
+          self.FConds[self.FCondCount - 1].SeenElse := true;
+        end;
+        self.FConds[self.FCondCount - 1].Active := false;
+        LLexer.SkipLine();
+        self.DoSkipGroup();
+        return false;
+      end;
+      if LWord = "endif" then
+        self.DoEndif(LName);
+        return false;
+      end;
+      self.DoGuardOther();
+      if LWord = "define" then
+        self.DoDefine(LName);
+        return false;
+      end;
+      if LWord = "undef" then
+        if self.DoNameOnLine(LName, LMacro) then
+          LId := self.FMacroIds.Find(LMacro);
+          if LId > 0 then
+            self.FMacros[LId - 1].Active := false;
+          end;
+        end;
+        return false;
+      end;
+      if (LWord = "include") or (LWord = "include_next") or (LWord = "import") or
+        (LWord = "include_macros") then
+        self.DoIncludeDirective(LName, LWord = "include_next", LWord = "import");
+        return false;
+      end;
+      if LWord = "line" then
+        self.DoLineDirective(AHash, LName, false);
+        return false;
+      end;
+      if LWord = "error" then
+        LText := LLexer.RestOfLine();
+        self.DoError(ADAM_ERR_CIMPORT_PP_016, LName, ADAM_MSG_CIMPORT_PP_ERROR, NoArgs().Str(LText));
+        return false;
+      end;
+      if LWord = "warning" then
+        LText := LLexer.RestOfLine();
+        self.DoWarning(ADAM_ERR_CIMPORT_PP_017, LName, ADAM_MSG_CIMPORT_PP_WARNING,
+          NoArgs().Str(LText));
+        return false;
+      end;
+      if LWord = "pragma" then
+        LTokens := self.DoLineTokens();
+        return self.DoPragma(LTokens, AHash, APragma);
+      end;
+      if (LWord = "ident") or (LWord = "sccs") or (LWord = "assert") or (LWord = "unassert") then
+        LLexer.SkipLine();
+        return false;
+      end;
+      self.DoError(ADAM_ERR_CIMPORT_PP_004, LName, ADAM_MSG_CIMPORT_PP_BAD_DIRECTIVE,
+        NoArgs().Str(LWord));
+      LLexer.SkipLine();
+      return false;
+    end;
+
+    // True when two definitions are the same (no warning for a repeat): kind, parameters and
+    // body, token by token with the blanks between them
+    hidden const method DoSameMacro(const A: PpMacro; const B: PpMacro): bool;
+    var
+      LI: int64;
+    begin
+      if (A.Kind <> B.Kind) or (A.Variadic <> B.Variadic) or (len(A.Params) <> len(B.Params)) or
+        (len(A.Body) <> len(B.Body)) then
+        return false;
+      end;
+      for LI := 0 to len(A.Params) - 1 do
+        if A.Params[LI] <> B.Params[LI] then
+          return false;
+        end;
+      end;
+      for LI := 0 to len(A.Body) - 1 do
+        if (A.Body[LI].Kind <> B.Body[LI].Kind) or (A.Body[LI].Text <> B.Body[LI].Text) then
+          return false;
+        end;
+        if (LI > 0) and (A.Body[LI].Space <> B.Body[LI].Space) then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    // #define (AName the word define)
+    hidden method DoDefine(const AName: PpToken);
+    var
+      LLexer: ref PpLexer;
+      LTok: PpToken;
+      LMacro: PpMacro;
+      LParams: ref TextBuilder;
+      LCount: int64;
+      LI: int64;
+      LId: int64;
+      LDone: bool;
+    begin
+      LLexer := self.DoLexer();
+      LTok := LLexer.Peek();
+      if LTok.LineStart or (LTok.Kind <> PpKind.Identifier) then
+        self.DoError(ADAM_ERR_CIMPORT_PP_005, AName, ADAM_MSG_CIMPORT_PP_NO_MACRO_NAME,
+          NoArgs().Str(AName.Text));
+        LLexer.SkipLine();
+        return;
+      end;
+      LLexer.Next();
+      self.DoMap(LTok);
+      if LTok.Text = "defined" then
+        self.DoError(ADAM_ERR_CIMPORT_PP_005, LTok, ADAM_MSG_CIMPORT_PP_DEFINED_NAME, NoArgs());
+        LLexer.SkipLine();
+        return;
+      end;
+      LMacro.Name := LTok.Text;
+      LMacro.Kind := MacroKind.Plain;
+      LMacro.Builtin := BuiltinMacro.None;
+      setlength(LMacro.Params, 0);
+      LMacro.Variadic := false;
+      LMacro.Active := true;
+      LTok := LLexer.Peek();
+      if not LTok.LineStart and DoIsPunct(LTok, "(") and not LTok.Space then
+        // A function-like macro: ( [ name { , name } [ , ... ] | ... ] ) or name...
+        LLexer.Next();
+        LMacro.Kind := MacroKind.Function;
+        LParams := ref TextBuilder();
+        LCount := 0;
+        LDone := false;
+        while not LDone do
+          LTok := LLexer.Peek();
+          if LTok.LineStart then
+            self.DoBadParams(LMacro.Name, AName);
+            return;
+          end;
+          LLexer.Next();
+          if DoIsPunct(LTok, ")") and (LCount = 0) then
+            LDone := true;
+          else
+            if DoIsPunct(LTok, "...") then
+              DoAddParam(LMacro, "__VA_ARGS__");
+              LMacro.Variadic := true;
+              LTok := LLexer.Next();
+              if not DoIsPunct(LTok, ")") or LTok.LineStart then
+                self.DoBadParams(LMacro.Name, AName);
+                return;
+              end;
+              LDone := true;
+            else
+              if LTok.Kind <> PpKind.Identifier then
+                self.DoBadParams(LMacro.Name, AName);
+                return;
+              end;
+              DoAddParam(LMacro, LTok.Text);
+              LCount := LCount + 1;
+              LTok := LLexer.Next();
+              if LTok.LineStart then
+                self.DoBadParams(LMacro.Name, AName);
+                return;
+              end;
+              if DoIsPunct(LTok, "...") then
+                LMacro.Variadic := true;
+                LTok := LLexer.Next();
+                if not DoIsPunct(LTok, ")") or LTok.LineStart then
+                  self.DoBadParams(LMacro.Name, AName);
+                  return;
+                end;
+                LDone := true;
+              else
+                if DoIsPunct(LTok, ")") then
+                  LDone := true;
+                else
+                  if not DoIsPunct(LTok, ",") then
+                    self.DoBadParams(LMacro.Name, AName);
+                    return;
+                  end;
+                end;
+              end;
+            end;
+          end;
+        end;
+      end;
+      LMacro.Body := self.DoLineTokens();
+      for LI := 0 to len(LMacro.Body) - 1 do
+        LMacro.Body[LI].LineStart := false;
+        LMacro.Body[LI].Hide := 0;
+      end;
+      if len(LMacro.Body) > 0 then
+        LMacro.Body[0].Space := false;
+        if DoIsPunct(LMacro.Body[0], "##") or DoIsPunct(LMacro.Body[len(LMacro.Body) - 1], "##") then
+          self.DoError(ADAM_ERR_CIMPORT_PP_008, AName, ADAM_MSG_CIMPORT_PP_PASTE_EDGE,
+            NoArgs().Str(LMacro.Name));
+          return;
+        end;
+      end;
+      if LMacro.Kind = MacroKind.Function then
+        for LI := 0 to len(LMacro.Body) - 1 do
+          if DoIsPunct(LMacro.Body[LI], "#") then
+            if (LI + 1 >= len(LMacro.Body)) or ((self.DoParam(LMacro, LMacro.Body[LI + 1]) < 0) and
+              not DoIsWord(LMacro.Body[LI + 1], "__VA_OPT__")) then
+              self.DoError(ADAM_ERR_CIMPORT_PP_007, AName, ADAM_MSG_CIMPORT_PP_HASH_PARAM,
+                NoArgs().Str(LMacro.Name));
+              return;
+            end;
+          end;
+        end;
+      end;
+      LId := self.FMacroIds.Find(LMacro.Name);
+      if LId > 0 then
+        if self.FMacros[LId - 1].Active and (self.FMacros[LId - 1].Kind <> MacroKind.Builtin) and
+          not self.DoSameMacro(self.FMacros[LId - 1], LMacro) then
+          self.DoWarning(ADAM_ERR_CIMPORT_PP_018, AName, ADAM_MSG_CIMPORT_PP_REDEFINED,
+            NoArgs().Str(LMacro.Name));
+        end;
+      end;
+      self.DoSetMacro(LMacro);
+    end;
+
+    // CP0024 for the macro AMacro's parameters; the rest of the line taken
+    hidden method DoBadParams(const AMacro: string; const AName: PpToken);
+    begin
+      self.DoError(ADAM_ERR_CIMPORT_PP_006, AName, ADAM_MSG_CIMPORT_PP_BAD_PARAMS,
+        NoArgs().Str(AMacro));
+      self.DoLexer().SkipLine();
+    end;
+
+    // #include / #include_next (ANext) / #import (AOnce: the file is read once), AName the
+    // directive's word
+    hidden method DoIncludeDirective(const AName: PpToken; const ANext: bool; const AOnce: bool);
+    var
+      LLexer: ref PpLexer;
+      LTokens: PpTokenArray;
+      LHeader: string;
+      LQuoted: bool;
+    begin
+      LLexer := self.DoLexer();
+      LQuoted := false;
+      if LLexer.HeaderName(LHeader) then
+        LLexer.SkipLine();
+      else
+        LTokens := self.DoLineTokens();
+        if not self.DoHeaderNameOf(LTokens, LHeader, LQuoted) then
+          if not self.DoHeaderNameOf(self.DoExpandList(LTokens, false), LHeader, LQuoted) then
+            self.DoError(ADAM_ERR_CIMPORT_PP_014, AName, ADAM_MSG_CIMPORT_PP_BAD_INCLUDE,
+              NoArgs().Str(AName.Text));
+            return;
+          end;
+        end;
+      end;
+      self.DoIncludeFile(LHeader, LQuoted, ANext, AOnce, AName);
+    end;
+
+    // The header AHeader opened from the current file (see the header: once, guards, depth)
+    hidden method DoIncludeFile(const AHeader: string; const AQuoted: bool; const ANext: bool;
+      const AOnce: bool; const AAt: PpToken);
+    var
+      LFound: HeaderFile;
+      LText: string;
+      LGuard: int64;
+    begin
+      if not self.FSearch.Find(AHeader, AQuoted, self.DoCurrentHeader(), ANext, LFound) then
+        self.FSearch.ReportMissing(AHeader, self.DoPlace(AAt));
+        return;
+      end;
+      if self.FOnce.Find(LFound.FullName) > 0 then
+        return;
+      end;
+      LGuard := self.FGuards.Find(LFound.FullName);
+      if LGuard > 0 then
+        if self.DoIsDefined(self.FGuardNames[LGuard - 1]) then
+          return;
+        end;
+      end;
+      if self.FSourceCount >= ADAM_CIMPORT_INCLUDE_DEPTH then
+        self.DoError(ADAM_ERR_CIMPORT_PP_015, AAt, ADAM_MSG_CIMPORT_PP_DEPTH,
+          NoArgs().Int(self.FSourceCount));
+        return;
+      end;
+      if AOnce then
+        self.FOnce.Put(LFound.FullName, 1);
+      end;
+      if not self.FSearch.Read(LFound, self.DoPlace(AAt), LText) then
+        return;
+      end;
+      self.DoOpen(LFound, LFound.FullName, LText, self.FSearch.IsSystem(LFound.Root));
+    end;
+
+    // #line N ["file"] (or GNU's # N "file" flags, ANumber its N): the next line is N, of
+    // "file" when one is named
+    hidden method DoLineDirective(const AHash: PpToken; const AName: PpToken; const AMarker: bool);
+    var
+      LTokens: PpTokenArray;
+      LValue: int64;
+      LTop: int64;
+      LRaw: int64;
+      LFile: PpFile;
+      LI: int64;
+    begin
+      LTokens := self.DoLineTokens();
+      if AMarker then
+        // The number was the directive's name
+        setlength(LTokens, len(LTokens) + 1);
+        LI := len(LTokens) - 1;
+        while LI > 0 do
+          LTokens[LI] := LTokens[LI - 1];
+          LI := LI - 1;
+        end;
+        LTokens[0] := AName;
+      else
+        LTokens := self.DoExpandList(LTokens, false);
+      end;
+      if (len(LTokens) = 0) or (LTokens[0].Kind <> PpKind.Number) or
+        not TryStrToInt(LTokens[0].Text, LValue) or (LValue < 1) then
+        self.DoError(ADAM_ERR_CIMPORT_PP_019, AName, ADAM_MSG_CIMPORT_PP_BAD_LINE, NoArgs());
+        return;
+      end;
+      LTop := self.FSourceCount - 1;
+      // AHash's physical line: its mapped line less the move so far
+      LRaw := int64(AHash.Line) - int64(self.FSources[LTop].LineDelta);
+      self.FSources[LTop].LineDelta := int32(LValue - (LRaw + 1));
+      if (len(LTokens) >= 2) and (LTokens[1].Kind = PpKind.StringLit) then
+        LFile := self.FFiles[self.FSources[LTop].File];
+        self.FSources[LTop].NameFile := self.DoFileIndex(LFile.Header,
+          DoDestringize(LTokens[1].Text), LFile.System);
+      end;
+    end;
+
+    // ---- #if expressions -------------------------------------------------------------------
+
+    // The value of the #if / #elif (AName) line ATokens (false after a report)
+    hidden method DoCondition(const AName: PpToken; const ATokens: PpTokenArray): bool;
+    var
+      LValue: PpValue;
+    begin
+      if len(ATokens) = 0 then
+        self.DoError(ADAM_ERR_CIMPORT_PP_012, AName, ADAM_MSG_CIMPORT_PP_IF_EMPTY,
+          NoArgs().Str(AName.Text));
+        return false;
+      end;
+      self.FEvalTokens := self.DoExpandList(ATokens, true);
+      self.FEvalPos := 0;
+      self.FEvalBad := false;
+      self.FEvalHash := AName;
+      LValue := self.DoEvalComma(true);
+      if not self.FEvalBad and (self.FEvalPos < len(self.FEvalTokens)) then
+        self.DoEvalError(ADAM_MSG_CIMPORT_PP_IF_UNEXPECTED,
+          NoArgs().Str(self.FEvalTokens[self.FEvalPos].Text));
+      end;
+      if self.FEvalBad then
+        return false;
+      end;
+      return LValue.Bits <> 0;
+    end;
+
+    // CP0030 (once per expression) at the token being read, else at the directive
+    hidden method DoEvalError(const ATemplate: string; const AArgs: MessageArgs);
+    var
+      LAt: PpToken;
+    begin
+      if self.FEvalBad then
+        return;
+      end;
+      self.FEvalBad := true;
+      LAt := self.FEvalHash;
+      if self.FEvalPos < len(self.FEvalTokens) then
+        LAt := self.FEvalTokens[self.FEvalPos];
+      end;
+      self.DoError(ADAM_ERR_CIMPORT_PP_012, LAt, ATemplate, AArgs);
+    end;
+
+    // True when the token being read is the punctuator AText
+    hidden const method DoEvalAt(const AText: string): bool;
+    begin
+      return (self.FEvalPos < len(self.FEvalTokens)) and
+        DoIsPunct(self.FEvalTokens[self.FEvalPos], AText);
+    end;
+
+    // expression { , expression }
+    hidden method DoEvalComma(const AEval: bool): PpValue;
+    var
+      LValue: PpValue;
+    begin
+      LValue := self.DoEvalCond(AEval);
+      while self.DoEvalAt(",") and not self.FEvalBad do
+        self.FEvalPos := self.FEvalPos + 1;
+        LValue := self.DoEvalCond(AEval);
+      end;
+      return LValue;
+    end;
+
+    // a ? b : c
+    hidden method DoEvalCond(const AEval: bool): PpValue;
+    var
+      LTest: PpValue;
+      LThen: PpValue;
+      LElse: PpValue;
+    begin
+      LTest := self.DoEvalBinary(1, AEval);
+      if not self.DoEvalAt("?") or self.FEvalBad then
+        return LTest;
+      end;
+      self.FEvalPos := self.FEvalPos + 1;
+      LThen := self.DoEvalComma(AEval and (LTest.Bits <> 0));
+      if not self.DoEvalAt(":") then
+        self.DoEvalError(ADAM_MSG_CIMPORT_PP_IF_COLON, NoArgs());
+        return LTest;
+      end;
+      self.FEvalPos := self.FEvalPos + 1;
+      LElse := self.DoEvalCond(AEval and (LTest.Bits = 0));
+      if LTest.Bits <> 0 then
+        return DoValue(LThen.Bits, LThen.Unsigned or LElse.Unsigned);
+      end;
+      return DoValue(LElse.Bits, LThen.Unsigned or LElse.Unsigned);
+    end;
+
+    // The binary operator being read's precedence (|| 1 .. * / % 10); 0 for none
+    hidden const method DoEvalPrecedence(): int64;
+    var
+      LText: string;
+    begin
+      if (self.FEvalPos >= len(self.FEvalTokens)) or
+        (self.FEvalTokens[self.FEvalPos].Kind <> PpKind.Punct) then
+        return 0;
+      end;
+      LText := self.FEvalTokens[self.FEvalPos].Text;
+      if LText = "||" then
+        return 1;
+      end;
+      if LText = "&&" then
+        return 2;
+      end;
+      if LText = "|" then
+        return 3;
+      end;
+      if LText = "^" then
+        return 4;
+      end;
+      if LText = "&" then
+        return 5;
+      end;
+      if (LText = "==") or (LText = "!=") then
+        return 6;
+      end;
+      if (LText = "<") or (LText = ">") or (LText = "<=") or (LText = ">=") then
+        return 7;
+      end;
+      if (LText = "<<") or (LText = ">>") then
+        return 8;
+      end;
+      if (LText = "+") or (LText = "-") then
+        return 9;
+      end;
+      if (LText = "*") or (LText = "/") or (LText = "%") then
+        return 10;
+      end;
+      return 0;
+    end;
+
+    // The binary operators from AMin's precedence up (precedence climbing, left to right)
+    hidden method DoEvalBinary(const AMin: int64; const AEval: bool): PpValue;
+    var
+      LLeft: PpValue;
+      LRight: PpValue;
+      LOp: string;
+      LPrec: int64;
+    begin
+      LLeft := self.DoEvalUnary(AEval);
+      while not self.FEvalBad do
+        LPrec := self.DoEvalPrecedence();
+        if (LPrec = 0) or (LPrec < AMin) then
+          return LLeft;
+        end;
+        LOp := self.FEvalTokens[self.FEvalPos].Text;
+        self.FEvalPos := self.FEvalPos + 1;
+        if LOp = "&&" then
+          LRight := self.DoEvalBinary(LPrec + 1, AEval and (LLeft.Bits <> 0));
+          LLeft := DoTruth((LLeft.Bits <> 0) and (LRight.Bits <> 0));
+        else
+          if LOp = "||" then
+            LRight := self.DoEvalBinary(LPrec + 1, AEval and (LLeft.Bits = 0));
+            LLeft := DoTruth((LLeft.Bits <> 0) or (LRight.Bits <> 0));
+          else
+            LRight := self.DoEvalBinary(LPrec + 1, AEval);
+            LLeft := self.DoEvalApply(LOp, LLeft, LRight, AEval);
+          end;
+        end;
+      end;
+      return LLeft;
+    end;
+
+    // A shift of ABits by ACount (signed or not: ASigned shifts right keep the sign)
+    hidden const method DoEvalShift(const ABits: uint64; const ACount: PpValue; const ALeft: bool;
+      const ASigned: bool): uint64;
+    var
+      LNegative: bool;
+      LCount: uint64;
+    begin
+      LNegative := ASigned and ((ABits shr uint64(63)) <> 0);
+      LCount := ACount.Bits;
+      if (not ACount.Unsigned and ((LCount shr uint64(63)) <> 0)) or (LCount >= 64) then
+        if not ALeft and LNegative then
+          return ~uint64(0);
+        end;
+        return 0;
+      end;
+      if ALeft then
+        return ABits shl LCount;
+      end;
+      if LNegative then
+        return ~((~ABits) shr LCount);
+      end;
+      return ABits shr LCount;
+    end;
+
+    // ALeft AOp ARight by C's rules (the usual conversions to intmax_t / uintmax_t)
+    hidden method DoEvalApply(const AOp: string; const ALeft: PpValue; const ARight: PpValue;
+      const AEval: bool): PpValue;
+    var
+      LUnsigned: bool;
+      LA: int64;
+      LB: int64;
+    begin
+      LUnsigned := ALeft.Unsigned or ARight.Unsigned;
+      LA := int64(ALeft.Bits);
+      LB := int64(ARight.Bits);
+      if AOp = "+" then
+        return DoValue(ALeft.Bits + ARight.Bits, LUnsigned);
+      end;
+      if AOp = "-" then
+        return DoValue(ALeft.Bits - ARight.Bits, LUnsigned);
+      end;
+      if AOp = "*" then
+        return DoValue(ALeft.Bits * ARight.Bits, LUnsigned);
+      end;
+      if (AOp = "/") or (AOp = "%") then
+        if ARight.Bits = 0 then
+          if AEval then
+            self.DoError(ADAM_ERR_CIMPORT_PP_013, self.FEvalHash, ADAM_MSG_CIMPORT_PP_DIV_ZERO,
+              NoArgs());
+            self.FEvalBad := true;
+          end;
+          return DoValue(0, LUnsigned);
+        end;
+        if LUnsigned then
+          if AOp = "/" then
+            return DoValue(ALeft.Bits div ARight.Bits, true);
+          end;
+          return DoValue(ALeft.Bits mod ARight.Bits, true);
+        end;
+        if (LA = ADAM_CIMPORT_INTMAX_MIN) and (LB = -1) then
+          // The one quotient intmax_t cannot hold: it wraps, as clang's does
+          if AOp = "/" then
+            return DoValue(ALeft.Bits, false);
+          end;
+          return DoValue(0, false);
+        end;
+        if AOp = "/" then
+          return DoValue(uint64(LA div LB), false);
+        end;
+        return DoValue(uint64(LA mod LB), false);
+      end;
+      if AOp = "<<" then
+        return DoValue(self.DoEvalShift(ALeft.Bits, ARight, true, not ALeft.Unsigned), ALeft.Unsigned);
+      end;
+      if AOp = ">>" then
+        return DoValue(self.DoEvalShift(ALeft.Bits, ARight, false, not ALeft.Unsigned), ALeft.Unsigned);
+      end;
+      if AOp = "==" then
+        return DoTruth(ALeft.Bits = ARight.Bits);
+      end;
+      if AOp = "!=" then
+        return DoTruth(ALeft.Bits <> ARight.Bits);
+      end;
+      if (AOp = "<") or (AOp = ">") or (AOp = "<=") or (AOp = ">=") then
+        if LUnsigned then
+          if AOp = "<" then
+            return DoTruth(ALeft.Bits < ARight.Bits);
+          end;
+          if AOp = ">" then
+            return DoTruth(ALeft.Bits > ARight.Bits);
+          end;
+          if AOp = "<=" then
+            return DoTruth(ALeft.Bits <= ARight.Bits);
+          end;
+          return DoTruth(ALeft.Bits >= ARight.Bits);
+        end;
+        if AOp = "<" then
+          return DoTruth(LA < LB);
+        end;
+        if AOp = ">" then
+          return DoTruth(LA > LB);
+        end;
+        if AOp = "<=" then
+          return DoTruth(LA <= LB);
+        end;
+        return DoTruth(LA >= LB);
+      end;
+      if AOp = "&" then
+        return DoValue(ALeft.Bits & ARight.Bits, LUnsigned);
+      end;
+      if AOp = "|" then
+        return DoValue(ALeft.Bits | ARight.Bits, LUnsigned);
+      end;
+      return DoValue(ALeft.Bits xor ARight.Bits, LUnsigned);
+    end;
+
+    // + - ~ ! and the primaries: a number, a character constant, an identifier (0), ( .. )
+    hidden method DoEvalUnary(const AEval: bool): PpValue;
+    var
+      LTok: PpToken;
+      LValue: PpValue;
+    begin
+      if self.FEvalPos >= len(self.FEvalTokens) then
+        self.DoEvalError(ADAM_MSG_CIMPORT_PP_IF_END, NoArgs());
+        return DoValue(0, false);
+      end;
+      LTok := self.FEvalTokens[self.FEvalPos];
+      if LTok.Kind = PpKind.Punct then
+        if (LTok.Text = "+") or (LTok.Text = "-") or (LTok.Text = "~") or (LTok.Text = "!") then
+          self.FEvalPos := self.FEvalPos + 1;
+          LValue := self.DoEvalUnary(AEval);
+          if LTok.Text = "-" then
+            return DoValue(uint64(0) - LValue.Bits, LValue.Unsigned);
+          end;
+          if LTok.Text = "~" then
+            return DoValue(~LValue.Bits, LValue.Unsigned);
+          end;
+          if LTok.Text = "!" then
+            return DoTruth(LValue.Bits = 0);
+          end;
+          return LValue;
+        end;
+        if LTok.Text = "(" then
+          self.FEvalPos := self.FEvalPos + 1;
+          LValue := self.DoEvalComma(AEval);
+          if not self.DoEvalAt(")") then
+            self.DoEvalError(ADAM_MSG_CIMPORT_PP_IF_PAREN, NoArgs());
+            return LValue;
+          end;
+          self.FEvalPos := self.FEvalPos + 1;
+          return LValue;
+        end;
+      end;
+      if LTok.Kind = PpKind.Number then
+        LValue := self.DoEvalNumber(LTok);
+        self.FEvalPos := self.FEvalPos + 1;
+        return LValue;
+      end;
+      if LTok.Kind = PpKind.CharConst then
+        LValue := self.DoEvalChar(LTok);
+        self.FEvalPos := self.FEvalPos + 1;
+        return LValue;
+      end;
+      if LTok.Kind = PpKind.Identifier then
+        // An identifier no macro replaced is 0
+        self.FEvalPos := self.FEvalPos + 1;
+        return DoValue(0, false);
+      end;
+      self.DoEvalError(ADAM_MSG_CIMPORT_PP_IF_UNEXPECTED, NoArgs().Str(LTok.Text));
+      return DoValue(0, false);
+    end;
+
+    // An integer constant's value (see the header); a float or a bad one is CP0030
+    hidden method DoEvalNumber(const ATok: PpToken): PpValue;
+    var
+      LText: string;
+      LBase: uint64;
+      LValue: uint64;
+      LDigit: int64;
+      LDigits: int64;
+      LOverflow: bool;
+      LI: int64;
+      LSuffix: string;
+    begin
+      LText := ReplaceStr(ATok.Text, "'", "");
+      LBase := 10;
+      LI := 0;
+      if (len(LText) > 1) and (LText[0] = '0') and ((LText[1] = 'x') or (LText[1] = 'X')) then
+        LBase := 16;
+        LI := 2;
+      else
+        if (len(LText) > 1) and (LText[0] = '0') and ((LText[1] = 'b') or (LText[1] = 'B')) then
+          LBase := 2;
+          LI := 2;
+        else
+          if LText[0] = '0' then
+            LBase := 8;
+          end;
+        end;
+      end;
+      LValue := 0;
+      LDigits := 0;
+      LOverflow := false;
+      while LI < len(LText) do
+        LDigit := DoDigit(DoByte(LText, LI), LBase);
+        if LDigit < 0 then
+          // An 8 or 9 in an octal constant is a bad digit, not a suffix
+          if (LBase = 8) and PpIsDigit(DoByte(LText, LI)) then
+            self.DoEvalError(ADAM_MSG_CIMPORT_PP_IF_NUMBER, NoArgs().Str(ATok.Text));
+            return DoValue(0, false);
+          end;
+          leave;
+        end;
+        if LValue > (~uint64(0) - uint64(LDigit)) div LBase then
+          LOverflow := true;
+        end;
+        LValue := LValue * LBase + uint64(LDigit);
+        LDigits := LDigits + 1;
+        LI := LI + 1;
+      end;
+      LSuffix := LowerCase(Substring(LText, LI, len(LText) - LI));
+      if ((LDigits = 0) and (LBase <> 8)) or not DoIsIntSuffix(LSuffix) then
+        self.DoEvalError(ADAM_MSG_CIMPORT_PP_IF_NUMBER, NoArgs().Str(ATok.Text));
+        return DoValue(0, false);
+      end;
+      if LOverflow then
+        self.DoEvalError(ADAM_MSG_CIMPORT_PP_IF_TOO_BIG, NoArgs().Str(ATok.Text));
+        return DoValue(0, false);
+      end;
+      return DoValue(LValue, (IndexOf("u", LSuffix, 0) >= 0) or (LValue > ADAM_CIMPORT_INTMAX_MAX));
+    end;
+
+    // A character constant's value: a narrow one byte by byte (several make one int, as
+    // clang's), a single byte by the target's char signedness; a wide one its last character
+    // (U'..' unsigned)
+    hidden method DoEvalChar(const ATok: PpToken): PpValue;
+    var
+      LText: string;
+      LWide: bool;
+      LStart: int64;
+      LEnd: int64;
+      LI: int64;
+      LCode: uint64;
+      LValue: uint64;
+      LCount: int64;
+      LDigit: int64;
+      LB: int32;
+      LAt: int64;
+    begin
+      LText := ATok.Text;
+      LStart := IndexOf("'", LText, 0) + 1;
+      LWide := (LStart > 1) and (Substring(LText, 0, LStart - 1) <> "u8");
+      LEnd := len(LText) - 1;
+      LValue := 0;
+      LCount := 0;
+      LI := LStart;
+      while LI < LEnd do
+        LB := DoByte(LText, LI);
+        LI := LI + 1;
+        if LB = DoCode('\\') then
+          LB := DoByte(LText, LI);
+          LI := LI + 1;
+          LCode := uint64(LB);
+          match char(uint8(LB)) of
+            'n': LCode := 10;
+            't': LCode := 9;
+            'r': LCode := 13;
+            'a': LCode := 7;
+            'b': LCode := 8;
+            'f': LCode := 12;
+            'v': LCode := 11;
+            'e', 'E': LCode := 27;
+            'x':
+              LCode := 0;
+              LDigit := DoDigit(DoByte(LText, LI), 16);
+              while LDigit >= 0 do
+                LCode := LCode * 16 + uint64(LDigit);
+                LI := LI + 1;
+                LDigit := DoDigit(DoByte(LText, LI), 16);
+              end;
+            '0', '1', '2', '3', '4', '5', '6', '7':
+              LCode := uint64(LB - DoCode('0'));
+              LDigit := DoDigit(DoByte(LText, LI), 8);
+              while (LDigit >= 0) and (LI < LEnd) and (LCode < 32) do
+                LCode := LCode * 8 + uint64(LDigit);
+                LI := LI + 1;
+                LDigit := DoDigit(DoByte(LText, LI), 8);
+              end;
+          else
+          end;
+        else
+          LCode := uint64(LB);
+          if LWide and (LB >= 128) then
+            // A UTF-8 sequence is one wide character
+            LAt := LI - 1;
+            LCode := uint64(DecodeUtf8Char(LText, LAt));
+            LI := LAt;
+          end;
+        end;
+        if LWide then
+          LValue := LCode;
+        else
+          LValue := (LValue shl uint64(8)) | (LCode & uint64(255));
+        end;
+        LCount := LCount + 1;
+      end;
+      if LWide then
+        return DoValue(LValue, Substring(LText, 0, 1) = "U");
+      end;
+      if (LCount = 1) and self.FCharSigned and (LValue >= 128) then
+        return DoValue(LValue | (~uint64(255)), false);
+      end;
+      return DoValue(LValue, false);
+    end;
+
+    // ---- the import's inputs and its tokens ------------------------------------------------
+
+    // Every token of the files now open, expanded, kept
+    hidden method DoRun();
+    var
+      LTok: PpToken;
+    begin
+      while self.DoExpandNext(LTok) do
+        self.FOut.Add(LTok);
+      end;
+    end;
+
+    // The target's predefines read (see the header); false (reported) when they cannot be
+    method Predefine(): bool;
+    var
+      LText: string;
+      LName: string;
+    begin
+      if not self.FSearch.ReadPredefines(self.FTriple, LText, LName) then
+        return false;
+      end;
+      self.DoOpen(NoHeader(), LName, LText, true);
+      self.DoRun();
+      return true;
+    end;
+
+    // -D AName=AValue
+    method Define(const AName: string; const AValue: string);
+    begin
+      self.DoOpen(NoHeader(), ADAM_CIMPORT_COMMAND_LINE, "#define " + AName + " " + AValue + "\n",
+        false);
+      self.DoRun();
+    end;
+
+    // -U AName
+    method Undefine(const AName: string);
+    begin
+      self.DoOpen(NoHeader(), ADAM_CIMPORT_COMMAND_LINE, "#undef " + AName + "\n", false);
+      self.DoRun();
+    end;
+
+    // The spec's header AFile (found by the search), preprocessed as #include <name> is;
+    // APlace: its name in the spec (a read failure's place)
+    method Include(const AFile: HeaderFile; const APlace: SourcePlace);
+    var
+      LText: string;
+    begin
+      if self.FBaseName = "" then
+        self.FBaseName := AFile.FullName;
+      end;
+      if self.FOnce.Find(AFile.FullName) > 0 then
+        return;
+      end;
+      if not self.FSearch.Read(AFile, APlace, LText) then
+        return;
+      end;
+      self.DoOpen(AFile, AFile.FullName, LText, self.FSearch.IsSystem(AFile.Root));
+      self.DoRun();
+    end;
+
+    // How many tokens the inputs gave so far
+    const method Count(): int64;
+    begin
+      return self.FOut.Count;
+    end;
+
+    // The token AIndex (0 .. Count - 1)
+    const method Token(const AIndex: int64): PpToken;
+    begin
+      return self.FOut.Item(AIndex);
+    end;
+
+    // The name of a token's file (its File)
+    const method FileName(const AFile: int32): string;
+    begin
+      return self.FFiles[AFile].Name;
+    end;
+
+    // The header a token's file is (its root says whose)
+    const method FileHeader(const AFile: int32): HeaderFile;
+    begin
+      return self.FFiles[AFile].Header;
+    end;
+
+    // True when a token's file is a system file
+    const method IsSystemFile(const AFile: int32): bool;
+    begin
+      return self.FFiles[AFile].System;
+    end;
+
+    // The tokens as clang -E's text, one string per line: a line marker # N "file" where the
+    // file changes or a line does not follow the one before, each pragma #pragma on a line of
+    // its own, a blank between two tokens where one was written or reading them back would
+    // join them
+    const method EmitLines(): StringArray;
+    var
+      LLines: StringArray;
+      LCount: int64;
+      LLine: ref TextBuilder;
+      LHas: bool;
+      LFile: int32;
+      LNumber: int32;
+      LPrev: PpToken;
+      LTok: PpToken;
+      LI: int64;
+    begin
+      setlength(LLines, ADAM_CIMPORT_PP_FIRST);
+      LCount := 0;
+      LLine := ref TextBuilder();
+      LHas := false;
+      LFile := -1;
+      LNumber := 0;
+      for LI := 0 to self.FOut.Count - 1 do
+        LTok := self.FOut.Item(LI);
+        if (LTok.File <> LFile) or (LTok.Line <> LNumber) then
+          if LHas then
+            DoAddLine(LLines, LCount, LLine.Text());
+            LLine := ref TextBuilder();
+            LHas := false;
+          end;
+          if (LTok.File <> LFile) or (LTok.Line <> LNumber + 1) then
+            DoAddLine(LLines, LCount, "# " + IntToStr(int64(LTok.Line)) + " \"" +
+              self.FFiles[LTok.File].Name + "\"");
+          end;
+          LFile := LTok.File;
+          LNumber := LTok.Line;
+        end;
+        if LTok.Kind = PpKind.Pragma then
+          if LHas then
+            DoAddLine(LLines, LCount, LLine.Text());
+            LLine := ref TextBuilder();
+            LHas := false;
+          end;
+          DoAddLine(LLines, LCount, "#pragma " + LTok.Text);
+          skip;
+        end;
+        if LHas and (LTok.Space or DoNeedSpace(LPrev, LTok)) then
+          LLine.Add(" ");
+        end;
+        LLine.Add(LTok.Text);
+        LPrev := LTok;
+        LHas := true;
+      end;
+      if LHas then
+        DoAddLine(LLines, LCount, LLine.Text());
+      end;
+      setlength(LLines, LCount);
+      return LLines;
+    end;
+  end;
+
+end.

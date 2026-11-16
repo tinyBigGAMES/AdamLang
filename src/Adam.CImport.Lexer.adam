@@ -1,0 +1,642 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.CImport.Lexer.adam - C preprocessing tokens for `adam cimport` (M9b;
+  DESIGN sec 15): one header's text as the pp-tokens of C's translation
+  phases 1..3, as clang makes them
+
+  PpToken      one token: its kind, its spelling, where it is (the
+               preprocessor's file index, line, column: UTF-8 byte columns),
+               whether blanks or a comment came before it (Space) and whether
+               it is the first on its line (LineStart: what a directive's '#'
+               needs), and its hide set (the macros that made it: the
+               preprocessor's, 0 here)
+  PpTokenList  a growable list of tokens (the storage doubles)
+  PpLexer      one text's tokens on demand: Next, Peek (one ahead),
+               HeaderName (an #include's <name>, read raw), RestOfLine (an
+               #error's text), SkipLine
+  LexOne       a text that is exactly one token (what ## must make)
+  PunctLength  the longest punctuator at a place (the emitter's spacing)
+
+  Phases 1 and 2 are done once, up front: CR LF and a lone CR become LF and
+  every line splice (a backslash, blanks allowed before the newline as
+  clang takes them, then the newline) is removed into one buffer; where
+  each physical line starts in that buffer is kept, so a token's line and
+  column stay physical. A comment is one blank (a block comment never ends
+  a line: a '#' after one is not first on its line). Identifiers take '$'
+  and every byte from 0x80 (UTF-8 names), as clang does; a pp-number is
+  C's (digits, letters, '_', '.', e+ e- p+ p- and C23's ' separators);
+  character and string literals keep their prefix (L u U u8). A literal
+  with no closing quote on its line, or a byte no token starts with, is an
+  Other token (clang -E passes them through too); the digraphs are spelled
+  as the tokens they stand for. Target-neutral.
+*******************************************************************************/
+
+module unit Adam.CImport.Lexer;
+
+import System.SysUtils, Adam.Core.Containers;
+
+public const
+  // A token list's first storage, doubled each time it is full
+  ADAM_CIMPORT_LEXER_FIRST: int64 = 16;
+
+public type
+  // What a pp-token is; Pragma is the preprocessor's (a #pragma / _Pragma kept for the parser:
+  // its Text the pragma's tokens, spelled with single spaces)
+  PpKind = choices(EndOfFile, Identifier, Number, CharConst, StringLit, Punct, Other, Pragma);
+
+  // One token (see the header)
+  PpToken = record
+    Kind: PpKind;
+    Text: string;
+    File: int32;
+    Line: int32;
+    Column: int32;
+    Space: bool;
+    LineStart: bool;
+    Hide: int64;
+  end;
+
+  PpTokenArray = array of PpToken;
+
+  // Tokens in the order added (see the header)
+  PpTokenList = object
+    hidden FItems: PpTokenArray;
+    hidden FCount: int64;
+
+    init();
+    begin
+      self.FCount := 0;
+    end;
+
+    property Count: int64 read FCount;
+
+    // The token at AIndex (0 .. Count - 1)
+    const method Item(const AIndex: int64): PpToken;
+    begin
+      return self.FItems[AIndex];
+    end;
+
+    // Adds AToken at the end
+    method Add(const AToken: PpToken);
+    begin
+      if self.FCount = len(self.FItems) then
+        if self.FCount = 0 then
+          setlength(self.FItems, ADAM_CIMPORT_LEXER_FIRST);
+        else
+          setlength(self.FItems, self.FCount * 2);
+        end;
+      end;
+      self.FItems[self.FCount] := AToken;
+      self.FCount := self.FCount + 1;
+    end;
+
+    // AToken in place of the token at AIndex (0 .. Count - 1)
+    method Put(const AIndex: int64; const AToken: PpToken);
+    begin
+      self.FItems[AIndex] := AToken;
+    end;
+
+    // Every token, as an array of exactly Count
+    const method ToArray(): PpTokenArray;
+    var
+      LList: PpTokenArray;
+      LI: int64;
+    begin
+      setlength(LList, self.FCount);
+      for LI := 0 to self.FCount - 1 do
+        LList[LI] := self.FItems[LI];
+      end;
+      return LList;
+    end;
+  end;
+
+// The byte at AIndex of AText as 0..255; -1 past either end
+routine DoByte(const AText: string; const AIndex: int64): int32;
+begin
+  if (AIndex < 0) or (AIndex >= len(AText)) then
+    return -1;
+  end;
+  return int32(uint8(AText[AIndex]));
+end;
+
+// The byte value of an ASCII character
+routine DoCode(const AChar: char): int32;
+begin
+  return int32(uint8(AChar));
+end;
+
+// True for '0'..'9'
+public routine PpIsDigit(const AByte: int32): bool;
+begin
+  return (AByte >= DoCode('0')) and (AByte <= DoCode('9'));
+end;
+
+// True for a byte an identifier starts with: a letter, '_', '$' or any byte from 0x80
+public routine PpIsNameStart(const AByte: int32): bool;
+begin
+  if (AByte >= DoCode('a')) and (AByte <= DoCode('z')) then
+    return true;
+  end;
+  if (AByte >= DoCode('A')) and (AByte <= DoCode('Z')) then
+    return true;
+  end;
+  return (AByte = DoCode('_')) or (AByte = DoCode('$')) or (AByte >= 128);
+end;
+
+// True for a byte an identifier goes on with
+public routine PpIsNameByte(const AByte: int32): bool;
+begin
+  return PpIsNameStart(AByte) or PpIsDigit(AByte);
+end;
+
+// True for a blank that is not a newline: space, tab, VT, FF, CR
+routine DoIsBlank(const AByte: int32): bool;
+begin
+  return (AByte = DoCode(' ')) or (AByte = 9) or (AByte = 11) or (AByte = 12) or (AByte = 13);
+end;
+
+// True when AText holds AWord at AAt
+routine DoAt(const AText: string; const AAt: int64; const AWord: string): bool;
+var
+  LI: int64;
+begin
+  if AAt + len(AWord) > len(AText) then
+    return false;
+  end;
+  for LI := 0 to len(AWord) - 1 do
+    if AText[AAt + LI] <> AWord[LI] then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// The length of the longest C punctuator at AAt of AText (a digraph counted as written); 0
+// when none starts there
+public routine PunctLength(const AText: string; const AAt: int64): int64;
+var
+  LB: int32;
+begin
+  if DoAt(AText, AAt, "%:%:") then
+    return 4;
+  end;
+  if DoAt(AText, AAt, "<<=") or DoAt(AText, AAt, ">>=") or DoAt(AText, AAt, "...") then
+    return 3;
+  end;
+  if DoAt(AText, AAt, "->") or DoAt(AText, AAt, "++") or DoAt(AText, AAt, "--") or
+    DoAt(AText, AAt, "<<") or DoAt(AText, AAt, ">>") or DoAt(AText, AAt, "<=") or
+    DoAt(AText, AAt, ">=") or DoAt(AText, AAt, "==") or DoAt(AText, AAt, "!=") or
+    DoAt(AText, AAt, "&&") or DoAt(AText, AAt, "||") or DoAt(AText, AAt, "*=") or
+    DoAt(AText, AAt, "/=") or DoAt(AText, AAt, "%=") or DoAt(AText, AAt, "+=") or
+    DoAt(AText, AAt, "-=") or DoAt(AText, AAt, "&=") or DoAt(AText, AAt, "^=") or
+    DoAt(AText, AAt, "|=") or DoAt(AText, AAt, "##") or DoAt(AText, AAt, "<:") or
+    DoAt(AText, AAt, ":>") or DoAt(AText, AAt, "<%") or DoAt(AText, AAt, "%>") or
+    DoAt(AText, AAt, "%:") then
+    return 2;
+  end;
+  LB := DoByte(AText, AAt);
+  if LB < 0 then
+    return 0;
+  end;
+  match char(uint8(LB)) of
+    '[', ']', '(', ')', '{', '}', '.', '&', '*', '+', '-', '~', '!', '/', '%', '<', '>', '^',
+      '|', '?', ':', ';', '=', ',', '#':
+      return 1;
+  end;
+  return 0;
+end;
+
+// A punctuator's spelling as the token it stands for: a digraph becomes its token
+routine DoCanonicalPunct(const AText: string): string;
+begin
+  if AText = "<:" then
+    return "[";
+  end;
+  if AText = ":>" then
+    return "]";
+  end;
+  if AText = "<%" then
+    return "{";
+  end;
+  if AText = "%>" then
+    return "}";
+  end;
+  if AText = "%:" then
+    return "#";
+  end;
+  if AText = "%:%:" then
+    return "##";
+  end;
+  return AText;
+end;
+
+// True when AText is a literal prefix: L, u, U or u8
+routine DoIsLiteralPrefix(const AText: string): bool;
+begin
+  return (AText = "L") or (AText = "u") or (AText = "U") or (AText = "u8");
+end;
+
+public type
+  // One text's tokens (see the header)
+  PpLexer = object
+    hidden FBuf: string;
+    hidden FLines: ref Int64List;
+    hidden FPos: int64;
+    hidden FLineIndex: int64;
+    hidden FFile: int32;
+    hidden FAtLineStart: bool;
+    hidden FHasPeek: bool;
+    hidden FPeek: PpToken;
+
+    // The tokens of AText, each one marked as AFile's
+    init(const AText: string; const AFile: int32);
+    begin
+      self.FFile := AFile;
+      self.FPos := 0;
+      self.FLineIndex := 0;
+      self.FAtLineStart := true;
+      self.FHasPeek := false;
+      self.DoSplice(AText);
+    end;
+
+    // Phases 1 and 2 (see the header): FBuf and where each physical line starts in it
+    hidden method DoSplice(const AText: string);
+    var
+      LOut: ref TextBuilder;
+      LCount: int64;
+      LI: int64;
+      LJ: int64;
+      LRun: int64;
+      LB: int32;
+      LNext: int32;
+    begin
+      LOut := ref TextBuilder();
+      self.FLines := ref Int64List();
+      self.FLines.Add(0);
+      LCount := len(AText);
+      LI := 0;
+      LRun := 0;
+      while LI < LCount do
+        LB := DoByte(AText, LI);
+        if LB = DoCode('\\') then
+          // A splice: the backslash, blanks, then a newline (CR LF, LF or CR)
+          LJ := LI + 1;
+          while (DoByte(AText, LJ) = DoCode(' ')) or (DoByte(AText, LJ) = 9) or
+            (DoByte(AText, LJ) = 11) or (DoByte(AText, LJ) = 12) do
+            LJ := LJ + 1;
+          end;
+          LNext := DoByte(AText, LJ);
+          if (LNext = 10) or (LNext = 13) then
+            LOut.Add(Substring(AText, LRun, LI - LRun));
+            LJ := LJ + 1;
+            if (LNext = 13) and (DoByte(AText, LJ) = 10) then
+              LJ := LJ + 1;
+            end;
+            LI := LJ;
+            LRun := LI;
+            self.FLines.Add(LOut.Count);
+          else
+            LI := LI + 1;
+          end;
+        else
+          if LB = 13 then
+            LOut.Add(Substring(AText, LRun, LI - LRun));
+            LOut.Add("\n");
+            LI := LI + 1;
+            if DoByte(AText, LI) = 10 then
+              LI := LI + 1;
+            end;
+            LRun := LI;
+            self.FLines.Add(LOut.Count);
+          else
+            LI := LI + 1;
+            if LB = 10 then
+              self.FLines.Add(LOut.Count + (LI - LRun));
+            end;
+          end;
+        end;
+      end;
+      LOut.Add(Substring(AText, LRun, LCount - LRun));
+      self.FBuf := LOut.Text();
+    end;
+
+    // The physical line and column of the buffer offset AAt (offsets are asked in order, so
+    // the line cursor only moves forward)
+    hidden method DoPlace(const AAt: int64; var ALine: int32; var AColumn: int32);
+    begin
+      while (self.FLineIndex + 1 < self.FLines.Count) and
+        (self.FLines[self.FLineIndex + 1] <= AAt) do
+        self.FLineIndex := self.FLineIndex + 1;
+      end;
+      ALine := int32(self.FLineIndex + 1);
+      AColumn := int32(AAt - self.FLines[self.FLineIndex] + 1);
+    end;
+
+    // The byte at FPos + AAhead; -1 past the end
+    hidden const method DoAhead(const AAhead: int64): int32;
+    begin
+      return DoByte(self.FBuf, self.FPos + AAhead);
+    end;
+
+    // Skips blanks and comments up to (never past) the next newline; true when any was skipped
+    hidden method DoSkipBlanks(): bool;
+    var
+      LSkipped: bool;
+      LEnd: int64;
+      LB: int32;
+    begin
+      LSkipped := false;
+      while self.FPos < len(self.FBuf) do
+        LB := self.DoAhead(0);
+        if DoIsBlank(LB) then
+          self.FPos := self.FPos + 1;
+          LSkipped := true;
+        else
+          if (LB = DoCode('/')) and (self.DoAhead(1) = DoCode('*')) then
+            // A block comment is one blank, its newlines included (an unterminated one runs
+            // to the end of the text)
+            LEnd := IndexOf("*/", self.FBuf, self.FPos + 2);
+            if LEnd < 0 then
+              self.FPos := len(self.FBuf);
+            else
+              self.FPos := LEnd + 2;
+            end;
+            LSkipped := true;
+          else
+            if (LB = DoCode('/')) and (self.DoAhead(1) = DoCode('/')) then
+              LEnd := IndexOf("\n", self.FBuf, self.FPos);
+              if LEnd < 0 then
+                self.FPos := len(self.FBuf);
+              else
+                self.FPos := LEnd;
+              end;
+              LSkipped := true;
+            else
+              return LSkipped;
+            end;
+          end;
+        end;
+      end;
+      return LSkipped;
+    end;
+
+    // The end of a literal opened by the quote at AStart: the index after its closing quote;
+    // -1 when its line ends first
+    hidden const method DoLiteralEnd(const AStart: int64): int64;
+    var
+      LQuote: int32;
+      LI: int64;
+      LB: int32;
+    begin
+      LQuote := DoByte(self.FBuf, AStart);
+      LI := AStart + 1;
+      while LI < len(self.FBuf) do
+        LB := DoByte(self.FBuf, LI);
+        if LB = 10 then
+          return -1;
+        end;
+        if LB = DoCode('\\') then
+          LI := LI + 2;
+        else
+          LI := LI + 1;
+          if LB = LQuote then
+            return LI;
+          end;
+        end;
+      end;
+      return -1;
+    end;
+
+    // The end of the pp-number from AStart
+    hidden const method DoNumberEnd(const AStart: int64): int64;
+    var
+      LI: int64;
+      LB: int32;
+      LPrev: int32;
+    begin
+      LI := AStart + 1;
+      while LI < len(self.FBuf) do
+        LB := DoByte(self.FBuf, LI);
+        LPrev := DoByte(self.FBuf, LI - 1);
+        if PpIsNameByte(LB) or (LB = DoCode('.')) then
+          LI := LI + 1;
+        else
+          if ((LB = DoCode('+')) or (LB = DoCode('-'))) and ((LPrev = DoCode('e')) or
+            (LPrev = DoCode('E')) or (LPrev = DoCode('p')) or (LPrev = DoCode('P'))) then
+            LI := LI + 1;
+          else
+            if (LB = DoCode('\'')) and PpIsNameByte(DoByte(self.FBuf, LI + 1)) then
+              LI := LI + 2;
+            else
+              return LI;
+            end;
+          end;
+        end;
+      end;
+      return LI;
+    end;
+
+    // The next token from the buffer
+    hidden method DoScan(): PpToken;
+    var
+      LTok: PpToken;
+      LStart: int64;
+      LEnd: int64;
+      LB: int32;
+      LLength: int64;
+      LDone: bool;
+    begin
+      LTok.Space := false;
+      LTok.Hide := 0;
+      LTok.File := self.FFile;
+      LDone := false;
+      while not LDone do
+        if self.DoSkipBlanks() then
+          LTok.Space := true;
+        end;
+        if self.DoAhead(0) = 10 then
+          self.FPos := self.FPos + 1;
+          self.FAtLineStart := true;
+          LTok.Space := false;
+        else
+          LDone := true;
+        end;
+      end;
+      LTok.LineStart := self.FAtLineStart;
+      LStart := self.FPos;
+      self.DoPlace(LStart, LTok.Line, LTok.Column);
+      if LStart >= len(self.FBuf) then
+        LTok.Kind := PpKind.EndOfFile;
+        LTok.Text := "";
+        LTok.LineStart := true;
+        return LTok;
+      end;
+      self.FAtLineStart := false;
+      LB := self.DoAhead(0);
+      LEnd := LStart + 1;
+      LTok.Kind := PpKind.Other;
+      if PpIsNameStart(LB) then
+        LEnd := LStart + 1;
+        while PpIsNameByte(DoByte(self.FBuf, LEnd)) do
+          LEnd := LEnd + 1;
+        end;
+        LTok.Kind := PpKind.Identifier;
+        // L"..", u8'..': a prefix glued to its literal
+        if DoIsLiteralPrefix(Substring(self.FBuf, LStart, LEnd - LStart)) and
+          ((DoByte(self.FBuf, LEnd) = DoCode('"')) or (DoByte(self.FBuf, LEnd) = DoCode('\''))) then
+          LB := DoByte(self.FBuf, LEnd);
+          LLength := self.DoLiteralEnd(LEnd);
+          if LLength > 0 then
+            LEnd := LLength;
+            if LB = DoCode('"') then
+              LTok.Kind := PpKind.StringLit;
+            else
+              LTok.Kind := PpKind.CharConst;
+            end;
+          end;
+        end;
+      else
+        if PpIsDigit(LB) or ((LB = DoCode('.')) and PpIsDigit(self.DoAhead(1))) then
+          LEnd := self.DoNumberEnd(LStart);
+          LTok.Kind := PpKind.Number;
+        else
+          if (LB = DoCode('"')) or (LB = DoCode('\'')) then
+            LLength := self.DoLiteralEnd(LStart);
+            if LLength > 0 then
+              LEnd := LLength;
+              if LB = DoCode('"') then
+                LTok.Kind := PpKind.StringLit;
+              else
+                LTok.Kind := PpKind.CharConst;
+              end;
+            else
+              // No closing quote on the line: the rest of the line, as clang -E passes it
+              LEnd := IndexOf("\n", self.FBuf, LStart);
+              if LEnd < 0 then
+                LEnd := len(self.FBuf);
+              end;
+            end;
+          else
+            LLength := PunctLength(self.FBuf, LStart);
+            if LLength > 0 then
+              LEnd := LStart + LLength;
+              LTok.Kind := PpKind.Punct;
+            end;
+          end;
+        end;
+      end;
+      LTok.Text := Substring(self.FBuf, LStart, LEnd - LStart);
+      if LTok.Kind = PpKind.Punct then
+        LTok.Text := DoCanonicalPunct(LTok.Text);
+      end;
+      self.FPos := LEnd;
+      return LTok;
+    end;
+
+    // The next token (an end-of-file token, LineStart set, once the text is done)
+    method Next(): PpToken;
+    begin
+      if self.FHasPeek then
+        self.FHasPeek := false;
+        return self.FPeek;
+      end;
+      return self.DoScan();
+    end;
+
+    // The token Next gives next, not taken
+    method Peek(): PpToken;
+    begin
+      if not self.FHasPeek then
+        self.FPeek := self.DoScan();
+        self.FHasPeek := true;
+      end;
+      return self.FPeek;
+    end;
+
+    // An #include's <name>, read raw from here (the directive's name just taken, nothing
+    // peeked): blanks and comments skipped on this line, then '<' up to '>' on the same line.
+    // False (nothing taken but the blanks) when the line does not go on with one
+    method HeaderName(var AName: string): bool;
+    var
+      LEnd: int64;
+      LLine: int64;
+    begin
+      AName := "";
+      if self.FHasPeek then
+        return false;
+      end;
+      self.DoSkipBlanks();
+      if self.DoAhead(0) <> DoCode('<') then
+        return false;
+      end;
+      LEnd := IndexOf(">", self.FBuf, self.FPos + 1);
+      LLine := IndexOf("\n", self.FBuf, self.FPos + 1);
+      if (LEnd < 0) or ((LLine >= 0) and (LLine < LEnd)) then
+        return false;
+      end;
+      AName := Substring(self.FBuf, self.FPos + 1, LEnd - self.FPos - 1);
+      self.FPos := LEnd + 1;
+      return true;
+    end;
+
+    // The rest of this line, raw and trimmed (an #error's text; nothing peeked)
+    method RestOfLine(): string;
+    var
+      LEnd: int64;
+      LText: string;
+    begin
+      if self.FHasPeek then
+        return "";
+      end;
+      LEnd := IndexOf("\n", self.FBuf, self.FPos);
+      if LEnd < 0 then
+        LEnd := len(self.FBuf);
+      end;
+      LText := Substring(self.FBuf, self.FPos, LEnd - self.FPos);
+      self.FPos := LEnd;
+      return Trim(LText);
+    end;
+
+    // The tokens left on this line taken, none of the next
+    method SkipLine();
+    var
+      LTok: PpToken;
+    begin
+      LTok := self.Peek();
+      while (LTok.Kind <> PpKind.EndOfFile) and not LTok.LineStart do
+        self.Next();
+        LTok := self.Peek();
+      end;
+    end;
+  end;
+
+// True when AText is exactly one token (no blank before it); AToken is it (its place line 1)
+public routine LexOne(const AText: string; var AToken: PpToken): bool;
+var
+  LLexer: ref PpLexer;
+  LEnd: PpToken;
+begin
+  LLexer := ref PpLexer(AText, 0);
+  AToken := LLexer.Next();
+  if (AToken.Kind = PpKind.EndOfFile) or AToken.Space then
+    return false;
+  end;
+  LEnd := LLexer.Next();
+  // The end must sit right after the token (a digraph's spelling is shorter than its text)
+  return (LEnd.Kind = PpKind.EndOfFile) and not LEnd.Space and (LEnd.Column = len(AText) + 1);
+end;
+
+end.
