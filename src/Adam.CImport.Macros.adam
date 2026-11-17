@@ -114,6 +114,9 @@ public type
     Params: StringArray;
     ParamTypes: Int64Array;
     Body: string;
+    // the header files of the routines its body calls (AddCallee's AFile), so the writer
+    // imports a [uses] unit a call needs
+    Files: Int64Array;
   end;
 
 // A C name as an Adam name in place: an Adam keyword with a trailing '_' (AD.5), as the
@@ -318,7 +321,11 @@ public type
     hidden FCalleeIds: ref StringIdMap;
     hidden FCalleeNames: StringArray;
     hidden FCalleeTypes: Int64Array;
+    hidden FCalleeFiles: Int64Array;
     hidden FCalleeCount: int64;
+    // the files of the routines the macro being evaluated calls (MacroResult.Files)
+    hidden FCalled: Int64Array;
+    hidden FCalledCount: int64;
     // the types the unit names: "t<typedef decl>" / "r<record>" -> slot + 1, the Adam name
     hidden FTypeNameIds: ref StringIdMap;
     hidden FTypeNames: StringArray;
@@ -374,16 +381,19 @@ public type
       end;
     end;
 
-    // The routine ACName (its function type ATypeId) bound as AAdamName: a function-like
-    // macro may call it
-    method AddCallee(const ACName: string; const AAdamName: string; const ATypeId: int64);
+    // The routine ACName (its function type ATypeId, declared in the header file AFile) bound
+    // as AAdamName, by this unit or a [uses] unit: a function-like macro may call it
+    method AddCallee(const ACName: string; const AAdamName: string; const ATypeId: int64;
+      const AFile: int64);
     begin
       if self.FCalleeCount = len(self.FCalleeNames) then
         setlength(self.FCalleeNames, self.FCalleeCount * 2 + 16);
         setlength(self.FCalleeTypes, len(self.FCalleeNames));
+        setlength(self.FCalleeFiles, len(self.FCalleeNames));
       end;
       self.FCalleeNames[self.FCalleeCount] := AAdamName;
       self.FCalleeTypes[self.FCalleeCount] := ATypeId;
+      self.FCalleeFiles[self.FCalleeCount] := AFile;
       self.FCalleeCount := self.FCalleeCount + 1;
       self.FCalleeIds.Put(ACName, self.FCalleeCount);
     end;
@@ -930,6 +940,17 @@ public type
       return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
     end;
 
+    // The type name the body's token at FPos starts (TypeNameIn), ADAM_CIMPORT_NONE when none
+    // does: a function-like macro's parameter is its argument wherever it stands, never a
+    // type word, even one spelled as a C keyword (SDL_DEFINE_AUDIO_FORMAT's `signed`)
+    hidden method DoTypeNameHere(): int64;
+    begin
+      if (self.FPos < len(self.FToks)) and (self.DoParamIndex(self.FToks[self.FPos].Text) >= 0) then
+        return ADAM_CIMPORT_NONE;
+      end;
+      return self.FParser.TypeNameIn(self.FToks, self.FPos);
+    end;
+
     // The parameter AName's index; -1 when it is none (or the macro is object-like)
     hidden method DoParamIndex(const AName: string): int64;
     var
@@ -1417,7 +1438,7 @@ public type
       if self.DoIs("(") then
         LSave := self.FPos;
         self.DoNext();
-        LTypeId := self.FParser.TypeNameIn(self.FToks, self.FPos);
+        LTypeId := self.DoTypeNameHere();
         if LTypeId <> ADAM_CIMPORT_NONE then
           if not self.DoExpect(")") then
             return false;
@@ -1452,7 +1473,7 @@ public type
       if self.DoIs("(") then
         LSave := self.FPos;
         self.DoNext();
-        LTypeId := self.FParser.TypeNameIn(self.FToks, self.FPos);
+        LTypeId := self.DoTypeNameHere();
         if LTypeId <> ADAM_CIMPORT_NONE then
           if not self.DoExpect(")") then
             return false;
@@ -1506,7 +1527,9 @@ public type
     end;
 
     // (ATypeId) AValue: an integer, _Bool or float type takes the value as C converts it
-    // (the type kept: a typedef's name types the constant); a pointer has no Adam const
+    // (the type kept: a typedef's name types the constant); a pointer has no Adam const, but
+    // in a function-like macro's body a run-time pointer (or pointer-wide integer) becomes
+    // Adam's pointer cast (DoPointerCast)
     hidden method DoCast(const ATypeId: int64; var AValue: MacroValue): bool;
     var
       LKind: CTypeKind;
@@ -1521,6 +1544,9 @@ public type
         return true;
       end;
       if LType.Kind = CTypeKind.Pointer then
+        if self.FFunction and (AValue.Kind = MacroValueKind.Runtime) then
+          return self.DoPointerCast(ATypeId, AValue);
+        end;
         return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_POINTER);
       end;
       if LKind = CTypeKind.LongDouble then
@@ -1540,6 +1566,58 @@ public type
       LText := self.DoArithText(AValue, LKind);
       AValue := self.DoRuntime(LText, ATypeId, LKind = CTypeKind.Bool);
       return self.FWhy = "";
+    end;
+
+    // (ATypeId) AValue for the pointer type ATypeId and a run-time AValue: `ptr to [const] T(..)`
+    // (BNF sec 6's pointer cast; `ptr(..)` for void *), T a builtin or a type the unit names.
+    // What it takes is what Adam's cast takes: a pointer, or an integer of pointer width; a
+    // cast that drops the pointee's const has no Adam form (SM0265)
+    hidden method DoPointerCast(const ATypeId: int64; var AValue: MacroValue): bool;
+    var
+      LTarget: CType;
+      LPointee: CType;
+      LSource: CType;
+      LName: string;
+      LText: string;
+      LSourceConst: bool;
+    begin
+      LTarget := self.FTypes.Item(self.FTypes.Resolved(ATypeId));
+      LPointee := self.FTypes.Item(LTarget.Base);
+      LSource := self.FTypes.Item(self.FTypes.Resolved(AValue.TypeId));
+      LSourceConst := false;
+      if LSource.Kind = CTypeKind.Pointer then
+        LSourceConst := self.FTypes.Item(LSource.Base).IsConst;
+      else
+        if not self.DoIsInteger(LSource.Kind) or (self.DoSize(LSource.Kind) <> 8) then
+          return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_POINTER);
+        end;
+      end;
+      if LSourceConst and not LPointee.IsConst then
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_CONST_DROP);
+      end;
+      if self.FTypes.Item(self.FTypes.Resolved(LTarget.Base)).Kind = CTypeKind.Void then
+        if LPointee.IsConst then
+          LText := "ptr to const(" + AValue.Text + ")";
+        else
+          LText := "ptr(" + AValue.Text + ")";
+        end;
+        AValue := self.DoRuntime(LText, ATypeId, false);
+        return true;
+      end;
+      LName := self.DoTypeNameOf(LTarget.Base);
+      if LName = "" then
+        LName := BuiltinName(LPointee.Kind);
+      end;
+      if LName = "" then
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_POINTER);
+      end;
+      if LPointee.IsConst then
+        LText := "ptr to const " + LName + "(" + AValue.Text + ")";
+      else
+        LText := "ptr to " + LName + "(" + AValue.Text + ")";
+      end;
+      AValue := self.DoRuntime(LText, ATypeId, false);
+      return true;
     end;
 
     // (ATypeId){ .. }: a struct's compound literal as an Adam record literal's field inits,
@@ -2082,6 +2160,11 @@ public type
       end;
       setlength(LArgs, LCount);
       LText := self.FCalleeNames[ACallee] + "(" + JoinStrings(LArgs, ", ") + ")";
+      if self.FCalledCount = len(self.FCalled) then
+        setlength(self.FCalled, self.FCalledCount * 2 + 8);
+      end;
+      self.FCalled[self.FCalledCount] := self.FCalleeFiles[ACallee];
+      self.FCalledCount := self.FCalledCount + 1;
       LBool := self.DoKindOf(LType.Base) = CTypeKind.Bool;
       AValue := self.DoRuntime(LText, LType.Base, LBool);
       if self.FTypes.Item(self.FTypes.Resolved(LType.Base)).Kind = CTypeKind.Void then
@@ -2266,6 +2349,8 @@ public type
       LResult.Body := "";
       setlength(LResult.Params, 0);
       setlength(LResult.ParamTypes, 0);
+      setlength(LResult.Files, 0);
+      self.FCalledCount := 0;
       self.FWhy := "";
       self.FDead := 0;
       self.FPos := 0;
@@ -2311,6 +2396,10 @@ public type
       end;
       LResult.Bound := true;
       LResult.Value := LValue;
+      setlength(LResult.Files, self.FCalledCount);
+      for LI := 0 to self.FCalledCount - 1 do
+        LResult.Files[LI] := self.FCalled[LI];
+      end;
       return LResult;
     end;
 
