@@ -42,9 +42,18 @@
   array with no size, long double, __int128, _Complex: facts no target
   method gives yet) has SizeOf -1; the binding writer reports what it
   cannot bind by name (CI), never drops it silently. Records are laid out
-  naturally (each field at its alignment, the size rounded up to the
-  largest); a record with a bitfield or a flexible array member is marked
-  and left unlaid (Laid false), its layout is M9e's.
+  as C lays them out on the target (M9e): each field at its alignment
+  capped by #pragma pack's N in effect at its body, __attribute__((packed))
+  aligning every field that is no bitfield at 1 (clang's rule on a
+  Microsoft-bitfield target: a bitfield's unit keeps its alignment, proven
+  by zig cc on x86_64-windows-gnu), a field's packed / aligned attribute
+  applied, bitfields by the target's rule (BitfieldRule), a flexible array
+  member (T d[], and GNU's T d[0] last) of size 0 aligning the record, an
+  anonymous member placed as a member of its own type, the size rounded
+  up to the largest alignment (raised by the record's aligned attribute),
+  an empty struct of size 0 (GNU C). LayoutAs lays a record out as Adam
+  lays it out under packed(N): every field and bitfield unit capped at N
+  (what the binding writer compares Adam's form against).
 *******************************************************************************/
 
 module unit Adam.CImport.CTypes;
@@ -61,7 +70,7 @@ public type
   // What a type is (see the header)
   CTypeKind = choices(Void, Bool, Char, SChar, UChar, Short, UShort, Int, UInt, Long, ULong,
     LongLong, ULongLong, Int128, UInt128, Float, Double, LongDouble, Complex, VaList, Pointer, Array,
-    Function, Record, Enum, Named);
+    Function, Record, Enum, Named, Float16, BFloat16, Float128);
 
   // One parameter of a function type; Name "" when the header gives none
   CParam = record
@@ -88,13 +97,19 @@ public type
 
   CTypeArray = array of CType;
 
-  // One field of a record: Name "" for an anonymous member; BitWidth -1 when it is no
-  // bitfield; Offset in bytes once the record is laid out; where the header declares it
+  // One field of a record: Name "" for an anonymous member or an unnamed bitfield; BitWidth
+  // -1 when it is no bitfield; Offset in bytes (a bitfield's unit's) and BitOffset (in that
+  // unit) once the record is laid out; its own attributes: packed, aligned(N) (0 none), the
+  // first one the importer does not know (Unknown, "" none); where the header declares it
   CField = record
     Name: string;
     TypeId: int64;
     BitWidth: int64;
     Offset: int64;
+    BitOffset: int64;
+    Packed: bool;
+    Aligned: int64;
+    Unknown: string;
     File: int32;
     Line: int32;
     Column: int32;
@@ -102,7 +117,9 @@ public type
 
   CFieldArray = array of CField;
 
-  // A struct or union (see the header)
+  // A struct or union (see the header): Pack the #pragma pack N in effect at its body (0
+  // none), Packed / Aligned (0 none) / Unknown its own attributes; once laid out its Size,
+  // its Alignment and its Natural alignment (before the aligned attribute raised it)
   CRecord = record
     Tag: string;
     IsUnion: bool;
@@ -111,8 +128,13 @@ public type
     Laid: bool;
     HasBitfields: bool;
     HasFlexible: bool;
+    Pack: int64;
+    Packed: bool;
+    Aligned: int64;
+    Unknown: string;
     Size: int64;
     Alignment: int64;
+    Natural: int64;
     File: int32;
     Line: int32;
     Column: int32;
@@ -120,10 +142,12 @@ public type
 
   CRecordArray = array of CRecord;
 
-  // An enum (see the header); Underlying is the fundamental kind that holds its values
+  // An enum (see the header); Underlying is the fundamental kind that holds its values;
+  // Unknown the first attribute the importer does not know ("" none)
   CEnum = record
     Tag: string;
     Complete: bool;
+    Unknown: string;
     Names: StringArray;
     Values: Int64Array;
     Underlying: CTypeKind;
@@ -182,9 +206,54 @@ begin
     CTypeKind.LongDouble: return "long double";
     CTypeKind.Complex: return "_Complex";
     CTypeKind.VaList: return "__builtin_va_list";
+    CTypeKind.Float16: return "_Float16";
+    CTypeKind.BFloat16: return "__bf16";
+    CTypeKind.Float128: return "__float128";
   else
   end;
   return "";
+end;
+
+// The packing a record's fields are capped at in C: 1 for __attribute__((packed)), else
+// #pragma pack's N (0 none)
+public routine CPackOf(const ARecord: CRecord): int64;
+begin
+  if ARecord.Packed then
+    return 1;
+  end;
+  return ARecord.Pack;
+end;
+
+// The tighter of two packings (0 none): Adam's rule for an inline or anonymous part, which
+// takes the tighter of its own and its container's (BNF sec 4, packed(N))
+public routine TighterPack(const AOuter: int64; const AOwn: int64): int64;
+begin
+  if AOuter = 0 then
+    return AOwn;
+  end;
+  if (AOwn = 0) or (AOuter < AOwn) then
+    return AOuter;
+  end;
+  return AOwn;
+end;
+
+// True when AFirst and ASecond are laid out alike: size, alignment, each field's offset and
+// bit offset (two layouts of one record, or a record and its flattened form)
+public routine SameLayout(const AFirst: CRecord; const ASecond: CRecord): bool;
+var
+  LI: int64;
+begin
+  if not AFirst.Laid or not ASecond.Laid or (AFirst.Size <> ASecond.Size) or
+    (AFirst.Alignment <> ASecond.Alignment) or (len(AFirst.Fields) <> len(ASecond.Fields)) then
+    return false;
+  end;
+  for LI := 0 to len(AFirst.Fields) - 1 do
+    if (AFirst.Fields[LI].Offset <> ASecond.Fields[LI].Offset) or
+      (AFirst.Fields[LI].BitOffset <> ASecond.Fields[LI].BitOffset) then
+      return false;
+    end;
+  end;
+  return true;
 end;
 
 // True when AKind is one of C's integer kinds (an enum's values and a bitfield's type)
@@ -299,8 +368,13 @@ public type
       LRecord.Laid := false;
       LRecord.HasBitfields := false;
       LRecord.HasFlexible := false;
+      LRecord.Pack := 0;
+      LRecord.Packed := false;
+      LRecord.Aligned := 0;
+      LRecord.Unknown := "";
       LRecord.Size := -1;
       LRecord.Alignment := -1;
+      LRecord.Natural := -1;
       LRecord.File := AFile;
       LRecord.Line := ALine;
       LRecord.Column := AColumn;
@@ -336,6 +410,7 @@ public type
       end;
       LEnum.Tag := ATag;
       LEnum.Complete := false;
+      LEnum.Unknown := "";
       LEnum.Underlying := CTypeKind.Int;
       LEnum.File := AFile;
       LEnum.Line := ALine;
@@ -444,55 +519,164 @@ public type
       return self.FTarget.BuiltinAlign(BuiltinName(LType.Kind));
     end;
 
-    // The record AIndex laid out (see the header), once: each field at its alignment (a
-    // union's at 0), the size the end rounded up to the largest alignment. Left unlaid when it
-    // is incomplete, has a bitfield or a flexible array member, or a field has no size
+    // The record AIndex laid out as C lays it out (see the header), once. Left unlaid when it
+    // is incomplete or a field has no size (a by-value cycle is no C)
     method LayoutRecord(const AIndex: int64);
     var
       LRecord: CRecord;
-      LOffset: int64;
-      LSize: int64;
-      LAlign: int64;
-      LFieldSize: int64;
-      LFieldAlign: int64;
-      LI: int64;
     begin
       LRecord := self.FRecords[AIndex];
-      if LRecord.Laid or not LRecord.Complete or LRecord.HasBitfields or LRecord.HasFlexible then
+      if LRecord.Laid or not LRecord.Complete then
         return;
       end;
-      LOffset := 0;
-      LSize := 0;
-      LAlign := 1;
-      for LI := 0 to len(LRecord.Fields) - 1 do
-        LFieldSize := self.SizeOf(LRecord.Fields[LI].TypeId);
-        LFieldAlign := self.AlignOf(LRecord.Fields[LI].TypeId);
-        if (LFieldSize < 0) or (LFieldAlign <= 0) then
-          return;
-        end;
-        if LFieldAlign > LAlign then
-          LAlign := LFieldAlign;
-        end;
-        if LRecord.IsUnion then
-          LRecord.Fields[LI].Offset := 0;
-          if LFieldSize > LSize then
-            LSize := LFieldSize;
-          end;
-        else
-          LOffset := AlignUp(LOffset, LFieldAlign);
-          LRecord.Fields[LI].Offset := LOffset;
-          LOffset := LOffset + LFieldSize;
-          LSize := LOffset;
-        end;
+      LRecord := self.DoLayout(LRecord, LRecord.Pack, LRecord.Packed);
+      if LRecord.Laid then
+        self.FRecords[AIndex] := LRecord;
       end;
-      LRecord.Size := AlignUp(LSize, LAlign);
-      LRecord.Alignment := LAlign;
-      LRecord.Laid := true;
-      self.FRecords[AIndex] := LRecord;
     end;
 
-    // The enum AIndex's underlying kind set from its values (see the header)
-    method SetEnumUnderlying(const AIndex: int64);
+    // ARecord's fields laid out as Adam lays them out under packed(APack) (0 none): every
+    // field's and bitfield unit's alignment capped at APack (see DoLayout)
+    method LayoutAs(const ARecord: CRecord; const APack: int64): CRecord;
+    begin
+      return self.DoLayout(ARecord, APack, false);
+    end;
+
+    // ARecord's fields laid out (see the header): each field's and bitfield unit's alignment
+    // capped at APack (0 none); AAttrPacked (__attribute__((packed))): each field that is no
+    // bitfield aligned at 1. A copy of ARecord with each field's Offset / BitOffset and its
+    // Size, Alignment, Natural set, Laid false when a field has no size here
+    hidden method DoLayout(const ARecord: CRecord; const APack: int64;
+      const AAttrPacked: bool): CRecord;
+    var
+      LOut: CRecord;
+      LField: CField;
+      LType: CType;
+      LOffset: int64;
+      LRunOffset: int64;
+      LRunSize: int64;
+      LRunUsed: int64;
+      LMaxAlign: int64;
+      LSize: int64;
+      LAlign: int64;
+      LAt: int64;
+      LI: int64;
+    begin
+      LOut := ARecord;
+      LOut.Laid := false;
+      if not ARecord.Complete then
+        return LOut;
+      end;
+      // the cursor: the next free byte (a union: its widest member's end), the open bitfield
+      // run (its unit's offset and size, the bits used), the largest member alignment
+      LOffset := 0;
+      LRunOffset := 0;
+      LRunSize := 0;
+      LRunUsed := 0;
+      LMaxAlign := 1;
+      for LI := 0 to len(LOut.Fields) - 1 do
+        LField := LOut.Fields[LI];
+        LField.BitOffset := 0;
+        LType := self.FTypes[self.Resolved(LField.TypeId)];
+        if (LType.Kind = CTypeKind.Array) and (LType.Count <= 0) then
+          // a flexible array member (or GNU's [0]): no bytes, the element's alignment
+          LSize := 0;
+          LAlign := self.AlignOf(LType.Base);
+        else
+          LSize := self.SizeOf(LField.TypeId);
+          LAlign := self.AlignOf(LField.TypeId);
+        end;
+        if (LSize < 0) or (LAlign <= 0) then
+          return LOut;
+        end;
+        if (APack > 0) and (LAlign > APack) then
+          LAlign := APack;
+        end;
+        if LField.Packed or (AAttrPacked and (LField.BitWidth < 0)) then
+          LAlign := 1;
+        end;
+        if LField.Aligned > LAlign then
+          LAlign := LField.Aligned;
+        end;
+        if LField.BitWidth = 0 then
+          // an unnamed zero-width bitfield (the target's rule: Microsoft's ignores one that
+          // follows no bitfield; after one it ends the unit, rounds up to its type's
+          // alignment and raises the record's)
+          match self.FTarget.Bitfields() of
+            BitfieldRule.Microsoft:
+              if LRunSize > 0 then
+                LRunSize := 0;
+                if LAlign > LMaxAlign then
+                  LMaxAlign := LAlign;
+                end;
+                if LOut.IsUnion then
+                  if LSize > LOffset then
+                    LOffset := LSize;
+                  end;
+                else
+                  LOffset := AlignUp(LOffset, LAlign);
+                end;
+              end;
+          end;
+          LField.Offset := LOffset;
+          if LOut.IsUnion then
+            LField.Offset := 0;
+          end;
+          LOut.Fields[LI] := LField;
+          skip;
+        end;
+        if LAlign > LMaxAlign then
+          LMaxAlign := LAlign;
+        end;
+        if LOut.IsUnion then
+          LRunSize := 0;
+          LField.Offset := 0;
+          if LSize > LOffset then
+            LOffset := LSize;
+          end;
+          LOut.Fields[LI] := LField;
+          skip;
+        end;
+        if LField.BitWidth > 0 then
+          match self.FTarget.Bitfields() of
+            BitfieldRule.Microsoft:
+              // joins the open run while its unit has the same size and its bits hold it,
+              // else starts a new unit
+              if (LRunSize = LSize) and (LRunUsed + LField.BitWidth <= LSize * 8) then
+                LField.Offset := LRunOffset;
+                LField.BitOffset := LRunUsed;
+                LRunUsed := LRunUsed + LField.BitWidth;
+              else
+                LAt := AlignUp(LOffset, LAlign);
+                LOffset := LAt + LSize;
+                LRunOffset := LAt;
+                LRunSize := LSize;
+                LRunUsed := LField.BitWidth;
+                LField.Offset := LAt;
+              end;
+          end;
+          LOut.Fields[LI] := LField;
+          skip;
+        end;
+        LRunSize := 0;
+        LAt := AlignUp(LOffset, LAlign);
+        LOffset := LAt + LSize;
+        LField.Offset := LAt;
+        LOut.Fields[LI] := LField;
+      end;
+      LOut.Natural := LMaxAlign;
+      if LOut.Aligned > LMaxAlign then
+        LMaxAlign := LOut.Aligned;
+      end;
+      LOut.Size := AlignUp(LOffset, LMaxAlign);
+      LOut.Alignment := LMaxAlign;
+      LOut.Laid := true;
+      return LOut;
+    end;
+
+    // The enum AIndex's underlying kind set from its values (see the header); APacked
+    // (__attribute__((packed))): the smallest integer kind that holds them (GCC's rule)
+    method SetEnumUnderlying(const AIndex: int64; const APacked: bool);
     var
       LEnum: CEnum;
       LNegative: bool;
@@ -525,7 +709,38 @@ public type
       if LFitsInt then
         LEnum.Underlying := CTypeKind.Int;
       end;
+      if APacked then
+        if LNegative then
+          if self.DoAllWithin(LEnum.Values, -32768, 32767) then
+            LEnum.Underlying := CTypeKind.Short;
+          end;
+          if self.DoAllWithin(LEnum.Values, -128, 127) then
+            LEnum.Underlying := CTypeKind.SChar;
+          end;
+        else
+          if self.DoAllWithin(LEnum.Values, 0, 65535) then
+            LEnum.Underlying := CTypeKind.UShort;
+          end;
+          if self.DoAllWithin(LEnum.Values, 0, 255) then
+            LEnum.Underlying := CTypeKind.UChar;
+          end;
+        end;
+      end;
       self.FEnums[AIndex] := LEnum;
+    end;
+
+    // True when every one of AValues lies in ALow .. AHigh
+    hidden const method DoAllWithin(const AValues: Int64Array; const ALow: int64;
+      const AHigh: int64): bool;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(AValues) - 1 do
+        if (AValues[LI] < ALow) or (AValues[LI] > AHigh) then
+          return false;
+        end;
+      end;
+      return true;
     end;
   end;
 

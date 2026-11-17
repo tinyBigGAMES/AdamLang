@@ -35,17 +35,31 @@
   arrays, functions, parentheses), abstract declarators (parameters,
   sizeof, casts), parameter lists (void, unnamed, variadic, f() with no
   prototype; an array or function parameter adjusted to a pointer),
-  struct / union bodies (bitfields marked for M9e's layout, anonymous
-  members, a flexible array member last), enum bodies with integer
+  struct / union bodies (bitfields, unnamed bitfields, anonymous members of
+  an untagged struct / union, a flexible array member last; laid out by
+  Adam.CImport.CTypes), enum bodies with integer
   constant expressions (each value the previous + 1 when none is given;
   C23's enum : type), initializers and function bodies skipped by
   balance, _Static_assert skipped. Integer constant expressions: C's
   operators and precedence over int64, integer and character constants,
   enum constants, sizeof / _Alignof of a type the target lays out, casts
-  to an integer type. __attribute__, __declspec, _Alignas, asm labels and
-  Microsoft's calling-convention words are passed over by balance here;
-  what they mean is M9e's (#pragma pack too: its Pragma tokens are passed
-  over). A declaration the parser cannot read is one CC report at the
+  to an integer type. Attributes (M9e) are read where C writes them and
+  kept on what they apply to: __attribute__((..)) and __declspec(..) items
+  packed, aligned(N) (bare: the target's BiggestAlign), noreturn (and
+  _Noreturn), mode(M) (an integer of M's size), __declspec(align(N)) /
+  (thread), _Alignas(N or type), an asm label's symbol (the bound C
+  name), the thread-local storage classes; an item that changes nothing a
+  binding needs (deprecated, visibility, format, dllimport ..) is dropped by
+  name, any other is kept as the first Unknown one (the writer reports
+  what carries one, never binds it wrong). In a declaration's specifiers
+  they apply to its declarators; after struct / union / enum or its '}'
+  to the type; in or after a declarator to that declarator; a record body
+  takes the #pragma pack N in effect at its '{' (push / pop with labels,
+  pack(), the N through the preprocessor's PragmaText: its macros
+  expanded). Microsoft's calling-convention words, __extension__,
+  restrict and nullability are passed over (one x64 convention). _Float16,
+  __bf16 and __float128 are types (no Adam type has their form). A
+  declaration the parser cannot read is one CC report at the
   first token it cannot take, then it resumes after the next ';' outside
   brackets: nothing is skipped silently. Target-neutral: every size is
   the target part's, through CTypeTable.
@@ -77,7 +91,22 @@ public type
   // What a declaration declares (see the header)
   CDeclKind = choices(Typedef, Routine, Variable, Tag);
 
-  // One file-scope declaration (see the header); TypeId a Tag's record / enum type
+  // What attributes say (see the header): packed, aligned(N) (0 none), noreturn,
+  // thread-local (__declspec(thread)), an asm label's symbol ("" none), GNU's mode(M) ("" none),
+  // the first item the importer does not know ("" none)
+  CAttrs = record
+    Packed: bool;
+    Aligned: int64;
+    NoReturn: bool;
+    Thread: bool;
+    AsmName: string;
+    Mode: string;
+    Unknown: string;
+  end;
+
+  // One file-scope declaration (see the header); TypeId a Tag's record / enum type; its
+  // attributes: noreturn, the asm label's symbol, aligned(N), the first Unknown one;
+  // IsThread a thread-local variable
   CDecl = record
     Kind: CDeclKind;
     Name: string;
@@ -88,19 +117,26 @@ public type
     IsStatic: bool;
     IsExtern: bool;
     IsInline: bool;
+    IsThread: bool;
     HasBody: bool;
+    NoReturn: bool;
+    AsmName: string;
+    Aligned: int64;
+    Unknown: string;
   end;
 
   CDeclArray = array of CDecl;
 
-  // What declaration specifiers say: the type, the storage class, inline; Ok false when
-  // they were not valid (reported)
+  // What declaration specifiers say: the type, the storage class, inline, thread-local, the
+  // attributes written among them; Ok false when they were not valid (reported)
   CSpecifiers = record
     TypeId: int64;
     IsTypedef: bool;
     IsStatic: bool;
     IsExtern: bool;
     IsInline: bool;
+    IsThread: bool;
+    Attrs: CAttrs;
     Ok: bool;
   end;
 
@@ -142,6 +178,158 @@ begin
   return false;
 end;
 
+// True when AText is one of C's noreturn words (C11's _Noreturn, stdnoreturn.h's noreturn, the
+// GNU spelling)
+routine DoIsNoReturnWord(const AText: string): bool;
+begin
+  match AText of
+    "_Noreturn", "__noreturn__", "noreturn":
+      return true;
+  end;
+  return false;
+end;
+
+// True when AValue is a packing #pragma pack takes (1 2 4 8 16)
+routine DoIsPackValue(const AValue: int64): bool;
+begin
+  return (AValue = 1) or (AValue = 2) or (AValue = 4) or (AValue = 8) or (AValue = 16);
+end;
+
+// True when AText names one of clang's floating types beyond C's (_Float16, __fp16, __bf16,
+// __float128, _Float128)
+routine DoIsExtraFloatWord(const AText: string): bool;
+begin
+  match AText of
+    "_Float16", "__fp16", "__bf16", "__float128", "_Float128":
+      return true;
+  end;
+  return false;
+end;
+
+// The kind of the floating type word AText (DoIsExtraFloatWord)
+routine DoExtraFloatKind(const AText: string): CTypeKind;
+begin
+  if AText = "__bf16" then
+    return CTypeKind.BFloat16;
+  end;
+  if (AText = "__float128") or (AText = "_Float128") then
+    return CTypeKind.Float128;
+  end;
+  return CTypeKind.Float16;
+end;
+
+// True when AKind is one of clang's floating types beyond C's
+routine DoIsExtraFloatKind(const AKind: CTypeKind): bool;
+begin
+  return (AKind = CTypeKind.Float16) or (AKind = CTypeKind.BFloat16) or
+    (AKind = CTypeKind.Float128);
+end;
+
+// No attributes
+routine NoAttrs(): CAttrs;
+var
+  LAttrs: CAttrs;
+begin
+  LAttrs.Packed := false;
+  LAttrs.Aligned := 0;
+  LAttrs.NoReturn := false;
+  LAttrs.Thread := false;
+  LAttrs.AsmName := "";
+  LAttrs.Mode := "";
+  LAttrs.Unknown := "";
+  return LAttrs;
+end;
+
+// AFrom's attributes added to AInto (aligned the larger, the first Unknown and asm label kept)
+routine DoMergeAttrs(var AInto: CAttrs; const AFrom: CAttrs);
+begin
+  AInto.Packed := AInto.Packed or AFrom.Packed;
+  if AFrom.Aligned > AInto.Aligned then
+    AInto.Aligned := AFrom.Aligned;
+  end;
+  AInto.NoReturn := AInto.NoReturn or AFrom.NoReturn;
+  AInto.Thread := AInto.Thread or AFrom.Thread;
+  if AInto.AsmName = "" then
+    AInto.AsmName := AFrom.AsmName;
+  end;
+  if AInto.Mode = "" then
+    AInto.Mode := AFrom.Mode;
+  end;
+  if AInto.Unknown = "" then
+    AInto.Unknown := AFrom.Unknown;
+  end;
+end;
+
+// A GNU attribute's name without the __ .. __ its reserved spelling adds (__packed__ is packed)
+routine DoAttrName(const AText: string): string;
+begin
+  if (len(AText) > 4) and StartsStr("__", AText) and EndsStr("__", AText) then
+    return Substring(AText, 2, len(AText) - 4);
+  end;
+  return AText;
+end;
+
+// True when the GNU attribute AName changes nothing a binding needs (dropped by name): a
+// diagnostic, an optimizer hint, a visibility or linkage note, x64's one calling convention
+routine DoIsDroppedAttribute(const AName: string): bool;
+begin
+  match AName of
+    "deprecated", "unavailable", "availability", "visibility", "format", "format_arg",
+    "nonnull", "returns_nonnull", "pure", "const", "malloc", "alloc_size", "alloc_align",
+    "warn_unused_result", "nothrow", "leaf", "unused", "used", "always_inline", "noinline",
+    "gnu_inline", "artificial", "cold", "hot", "sentinel", "dllimport", "dllexport", "nodebug",
+    "weak", "access", "warning", "error", "no_instrument_function", "may_alias", "nonstring",
+    "fallthrough", "noescape", "diagnose_if", "returns_twice", "nocf_check", "cdecl",
+    "stdcall", "fastcall", "thiscall", "vectorcall", "ms_abi", "regparm", "no_sanitize",
+    "no_sanitize_address", "no_sanitize_thread", "no_sanitize_undefined", "no_stack_protector",
+    "section", "retain", "flatten", "noipa", "optimize", "target", "no_split_stack",
+    "assume_aligned", "enum_extensibility", "flag_enum", "swift_name", "ns_returns_retained",
+    "cf_returns_retained", "objc_root_class", "minsize", "nomerge", "not_tail_called",
+    "disable_tail_calls", "warn_if_not_aligned", "designated_init", "pass_object_size",
+    "require_constant_initialization", "uninitialized", "constructor", "destructor",
+    "cleanup":
+      return true;
+  end;
+  return false;
+end;
+
+// True when the __declspec item AName changes nothing a binding needs (dropped by name)
+routine DoIsDroppedDeclspec(const AName: string): bool;
+begin
+  match AName of
+    "dllimport", "dllexport", "selectany", "deprecated", "novtable", "nothrow", "noinline",
+    "noalias", "restrict", "safebuffers", "allocator", "code_seg", "uuid", "property",
+    "spectre", "empty_bases", "allocate", "guard", "naked", "jitintrinsic", "process",
+    "appdomain", "nocopy":
+      return true;
+  end;
+  return false;
+end;
+
+// A string literal token's body: its prefix (L, u8, u, U) and quotes taken off, \\ and \"
+// undone (an asm label's symbol)
+routine DoStringBody(const AText: string): string;
+var
+  LOut: ref TextBuilder;
+  LStart: int64;
+  LI: int64;
+begin
+  LStart := IndexOf("\"", AText, 0);
+  if (LStart < 0) or (len(AText) < LStart + 2) then
+    return "";
+  end;
+  LOut := ref TextBuilder();
+  LI := LStart + 1;
+  while LI < len(AText) - 1 do
+    if (AText[LI] = '\\') and (LI + 1 < len(AText) - 1) then
+      LI := LI + 1;
+    end;
+    LOut.Add(Substring(AText, LI, 1));
+    LI := LI + 1;
+  end;
+  return LOut.Text();
+end;
+
 // True when AText is a qualifier word
 routine DoIsQualifier(const AText: string): bool;
 begin
@@ -161,7 +349,8 @@ begin
     "float", "double", "_Bool", "bool", "__int128", "_Complex", "__complex__", "__int64",
     "__int32", "__int16", "__int8", "struct", "union", "enum", "typedef", "extern", "static",
     "auto", "register", "_Thread_local", "thread_local", "__thread", "constexpr", "inline",
-    "__inline", "__inline__", "__forceinline", "__builtin_va_list":
+    "__inline", "__inline__", "__forceinline", "__builtin_va_list", "_Float16", "__fp16",
+    "__bf16", "__float128", "_Float128":
       return true;
   end;
   return DoIsQualifier(AText);
@@ -305,6 +494,13 @@ public type
     hidden FConsts: ref StringIdMap;
     hidden FConstValues: Int64Array;
     hidden FConstCount: int64;
+    // the attributes read so far for what is being declared (see DoAttributes)
+    hidden FAttrs: CAttrs;
+    // #pragma pack: the N in effect (0 none), the pushed values and their labels
+    hidden FPack: int64;
+    hidden FPackStack: Int64Array;
+    hidden FPackLabels: StringArray;
+    hidden FPackDepth: int64;
 
     init(const AReports: ref Diagnostics; const APre: ref Preprocessor; const ATarget: ref Target);
     begin
@@ -321,6 +517,9 @@ public type
       self.FEnumTags := ref StringIdMap();
       self.FConsts := ref StringIdMap();
       self.FConstCount := 0;
+      self.FAttrs := NoAttrs();
+      self.FPack := 0;
+      self.FPackDepth := 0;
     end;
 
     // The types the declarations use
@@ -483,23 +682,355 @@ public type
       return self.DoExpect(")");
     end;
 
-    // Passed over: every attribute-like word with its parenthesized argument and every ignored
-    // word at the cursor (see DoIsBalancedWord / DoIsIgnoredWord)
-    hidden method DoSkipAttributes();
+    // Every attribute-like word at the cursor read into FAttrs (see the header): the noreturn
+    // words, __attribute__((..)), __declspec(..), _Alignas(..), an asm label; the ignored
+    // words passed over. A form not valid is reported (FBad)
+    hidden method DoAttributes();
+    var
+      LText: string;
     begin
       while self.DoTok().Kind = PpKind.Identifier do
-        if DoIsIgnoredWord(self.DoTok().Text) then
+        LText := self.DoTok().Text;
+        if DoIsNoReturnWord(LText) then
+          self.FAttrs.NoReturn := true;
           self.DoNext();
           skip;
         end;
-        if DoIsBalancedWord(self.DoTok().Text) then
+        if DoIsIgnoredWord(LText) then
           self.DoNext();
-          if self.DoIs("(") then
-            self.DoSkipBalanced();
-          end;
+          skip;
+        end;
+        if (LText = "__attribute__") or (LText = "__attribute") then
+          self.DoNext();
+          self.DoGnuAttributes();
+          skip;
+        end;
+        if LText = "__declspec" then
+          self.DoNext();
+          self.DoDeclspec();
+          skip;
+        end;
+        if (LText = "_Alignas") or (LText = "alignas") then
+          self.DoNext();
+          self.DoAlignas();
+          skip;
+        end;
+        if (LText = "asm") or (LText = "__asm") or (LText = "__asm__") then
+          self.DoNext();
+          self.DoAsmLabel();
           skip;
         end;
         leave;
+      end;
+    end;
+
+    // The value an attribute AName's (N) gives, the cursor at '(': the constant inside, the
+    // cursor past ')'. One the importer cannot compute here (__alignof__ of a type with no
+    // size: clang's max_align_t) is no error in the headers: AName becomes FAttrs' Unknown
+    // (whatever carries it is reported, never bound wrong), the (..) passed over, 0
+    hidden method DoAttributeValue(const AName: string): int64;
+    var
+      LValue: int64;
+      LStart: int64;
+      LWasBad: bool;
+      LOk: bool;
+    begin
+      LStart := self.FPos;
+      self.DoNext();
+      LValue := 0;
+      // its reports held back: FBad set, DoError reports nothing
+      LWasBad := self.FBad;
+      self.FBad := true;
+      LOk := self.DoConstant(LValue) and self.DoIs(")");
+      self.FBad := LWasBad;
+      if LOk then
+        self.DoNext();
+        return LValue;
+      end;
+      self.FPos := LStart;
+      self.DoSkipBalanced();
+      if self.FAttrs.Unknown = "" then
+        self.FAttrs.Unknown := AName;
+      end;
+      return 0;
+    end;
+
+    // The attribute AValue bytes aligned added to FAttrs (the larger kept)
+    hidden method DoAlignedBy(const AValue: int64);
+    begin
+      if AValue > self.FAttrs.Aligned then
+        self.FAttrs.Aligned := AValue;
+      end;
+    end;
+
+    // __attribute__ (( item, .. )) after the word: each item into FAttrs (see the header)
+    hidden method DoGnuAttributes();
+    var
+      LName: string;
+    begin
+      if not self.DoExpect("(") or not self.DoExpect("(") then
+        return;
+      end;
+      while not self.DoIs(")") do
+        if self.DoIs(",") then
+          self.DoNext();
+          skip;
+        end;
+        if self.DoTok().Kind <> PpKind.Identifier then
+          self.DoExpect(")");
+          return;
+        end;
+        LName := DoAttrName(self.DoTok().Text);
+        self.DoNext();
+        if LName = "aligned" then
+          if self.DoIs("(") then
+            self.DoAlignedBy(self.DoAttributeValue("aligned"));
+          else
+            self.DoAlignedBy(self.FTarget.BiggestAlign());
+          end;
+          skip;
+        end;
+        if (LName = "mode") and self.DoIs("(") and (self.DoPeek(1).Kind = PpKind.Identifier) and
+          (self.DoPeek(2).Text = ")") then
+          // mode(M): an integer of M's size (glibc's int64_t on some targets)
+          if self.FAttrs.Mode = "" then
+            self.FAttrs.Mode := DoAttrName(self.DoPeek(1).Text);
+          end;
+          self.DoNext();
+          self.DoNext();
+          self.DoNext();
+          skip;
+        end;
+        if LName = "packed" then
+          self.FAttrs.Packed := true;
+        else
+          if LName = "noreturn" then
+            self.FAttrs.NoReturn := true;
+          else
+            if not DoIsDroppedAttribute(LName) and (self.FAttrs.Unknown = "") then
+              self.FAttrs.Unknown := LName;
+            end;
+          end;
+        end;
+        if self.DoIs("(") and not self.DoSkipBalanced() then
+          return;
+        end;
+      end;
+      if self.DoExpect(")") then
+        self.DoExpect(")");
+      end;
+    end;
+
+    // __declspec ( item .. ) after the word: each item into FAttrs (see the header)
+    hidden method DoDeclspec();
+    var
+      LName: string;
+    begin
+      if not self.DoExpect("(") then
+        return;
+      end;
+      while not self.DoIs(")") do
+        if self.DoTok().Kind <> PpKind.Identifier then
+          self.DoExpect(")");
+          return;
+        end;
+        LName := self.DoTok().Text;
+        self.DoNext();
+        if (LName = "align") and self.DoIs("(") then
+          self.DoAlignedBy(self.DoAttributeValue("align"));
+          skip;
+        end;
+        if LName = "noreturn" then
+          self.FAttrs.NoReturn := true;
+        else
+          if LName = "thread" then
+            self.FAttrs.Thread := true;
+          else
+            if not DoIsDroppedDeclspec(LName) and (self.FAttrs.Unknown = "") then
+              self.FAttrs.Unknown := LName;
+            end;
+          end;
+        end;
+        if self.DoIs("(") and not self.DoSkipBalanced() then
+          return;
+        end;
+      end;
+      self.DoExpect(")");
+    end;
+
+    // _Alignas ( constant or type ) after the word into FAttrs: a type gives its alignment
+    hidden method DoAlignas();
+    var
+      LTypeId: int64;
+    begin
+      if not self.DoIs("(") then
+        self.DoExpect("(");
+        return;
+      end;
+      if self.DoPeek(1).Kind = PpKind.Identifier then
+        self.DoNext();
+        if self.DoStartsTypeName() then
+          LTypeId := self.DoTypeName();
+          if LTypeId <> ADAM_CIMPORT_NONE then
+            if self.FTypes.AlignOf(LTypeId) > 0 then
+              self.DoAlignedBy(self.FTypes.AlignOf(LTypeId));
+            else
+              // a type with no size here (long double): its alignment is not known
+              if self.FAttrs.Unknown = "" then
+                self.FAttrs.Unknown := "_Alignas";
+              end;
+            end;
+          end;
+          self.DoExpect(")");
+          return;
+        end;
+        // a constant that starts with a name: read from the '(' again
+        self.FPos := self.FPos - 1;
+      end;
+      self.DoAlignedBy(self.DoAttributeValue("_Alignas"));
+    end;
+
+    // An asm label after its word: ( "sym" .. ) the symbol (adjacent strings joined) into
+    // FAttrs; a word with no '(' after it is passed over
+    hidden method DoAsmLabel();
+    var
+      LText: ref TextBuilder;
+    begin
+      if not self.DoIs("(") then
+        return;
+      end;
+      self.DoNext();
+      LText := ref TextBuilder();
+      while self.DoTok().Kind = PpKind.StringLit do
+        LText.Add(DoStringBody(self.DoTok().Text));
+        self.DoNext();
+      end;
+      if self.DoExpect(")") and (LText.Text() <> "") and (self.FAttrs.AsmName = "") then
+        self.FAttrs.AsmName := LText.Text();
+      end;
+    end;
+
+    // The type ATypeId with GNU's mode(AMode) applied to AAttrs: the integer of the mode's size
+    // and the type's signedness (QI / byte 1, HI 2, SI 4, DI 8, TI 16 bytes, word / pointer the
+    // target's pointer size); a mode on any other type, or one the importer does not know, is
+    // AAttrs' Unknown "mode" and the type is kept
+    hidden method DoModeType(const ATypeId: int64; var AAttrs: CAttrs): int64;
+    var
+      LKind: CTypeKind;
+      LUnsigned: bool;
+      LSize: int64;
+    begin
+      if AAttrs.Mode = "" then
+        return ATypeId;
+      end;
+      LKind := self.FTypes.Item(self.FTypes.Resolved(ATypeId)).Kind;
+      LUnsigned := (LKind = CTypeKind.UChar) or (LKind = CTypeKind.UShort) or
+        (LKind = CTypeKind.UInt) or (LKind = CTypeKind.ULong) or (LKind = CTypeKind.ULongLong) or
+        (LKind = CTypeKind.UInt128) or ((LKind = CTypeKind.Char) and not self.FTarget.CharSigned());
+      LSize := 0;
+      match AAttrs.Mode of
+        "QI", "byte": LSize := 1;
+        "HI": LSize := 2;
+        "SI": LSize := 4;
+        "DI": LSize := 8;
+        "TI": LSize := 16;
+        "word", "pointer": LSize := self.FTarget.PointerSize();
+      else
+      end;
+      if not IsIntegerKind(LKind) or (LKind = CTypeKind.Bool) or (LSize = 0) then
+        if AAttrs.Unknown = "" then
+          AAttrs.Unknown := "mode";
+        end;
+        return ATypeId;
+      end;
+      match LSize of
+        1:
+          LKind := CTypeKind.SChar;
+          if LUnsigned then
+            LKind := CTypeKind.UChar;
+          end;
+        2:
+          LKind := CTypeKind.Short;
+          if LUnsigned then
+            LKind := CTypeKind.UShort;
+          end;
+        4:
+          LKind := CTypeKind.Int;
+          if LUnsigned then
+            LKind := CTypeKind.UInt;
+          end;
+        8:
+          LKind := CTypeKind.LongLong;
+          if LUnsigned then
+            LKind := CTypeKind.ULongLong;
+          end;
+      else
+        LKind := CTypeKind.Int128;
+        if LUnsigned then
+          LKind := CTypeKind.UInt128;
+        end;
+      end;
+      return self.FTypes.Add(LKind, ADAM_CIMPORT_NONE);
+    end;
+
+    // The #pragma at the cursor taken (see the header): pack's forms change FPack, any other
+    // pragma is passed over
+    hidden method DoPragma();
+    var
+      LText: string;
+      LParts: StringArray;
+      LValue: int64;
+      LLabel: string;
+      LI: int64;
+    begin
+      LText := ReplaceStr(self.FPre.PragmaText(self.FPos), " ", "");
+      self.DoNext();
+      if not StartsStr("pack(", LText) or not EndsStr(")", LText) then
+        return;
+      end;
+      LParts := SplitString(Substring(LText, 5, len(LText) - 6), ",");
+      if LParts[0] = "" then
+        // pack(): back to the target's packing
+        self.FPack := 0;
+        return;
+      end;
+      if (LParts[0] = "push") or (LParts[0] = "pop") then
+        LLabel := "";
+        LValue := 0;
+        for LI := 1 to len(LParts) - 1 do
+          if not TryStrToInt(LParts[LI], LValue) then
+            LLabel := LParts[LI];
+            LValue := 0;
+          end;
+        end;
+        if LParts[0] = "push" then
+          if self.FPackDepth = len(self.FPackStack) then
+            setlength(self.FPackStack, self.FPackDepth * 2 + 8);
+            setlength(self.FPackLabels, len(self.FPackStack));
+          end;
+          self.FPackStack[self.FPackDepth] := self.FPack;
+          self.FPackLabels[self.FPackDepth] := LLabel;
+          self.FPackDepth := self.FPackDepth + 1;
+        else
+          // pop: one entry, or down to the one LLabel pushed (none of that label: nothing)
+          LI := self.FPackDepth - 1;
+          if LLabel <> "" then
+            while (LI >= 0) and (self.FPackLabels[LI] <> LLabel) do
+              LI := LI - 1;
+            end;
+          end;
+          if LI >= 0 then
+            self.FPack := self.FPackStack[LI];
+            self.FPackDepth := LI;
+          end;
+        end;
+        if DoIsPackValue(LValue) then
+          self.FPack := LValue;
+        end;
+        return;
+      end;
+      if TryStrToInt(LParts[0], LValue) and DoIsPackValue(LValue) then
+        self.FPack := LValue;
       end;
     end;
 
@@ -547,9 +1078,10 @@ public type
       self.FDeclCount := self.FDeclCount + 1;
     end;
 
-    // A declaration of AKind named AName (at ATok) of ATypeId, with ASpec's storage class
+    // A declaration of AKind named AName (at ATok) of ATypeId, with ASpec's storage class and
+    // the attributes AAttrs (its specifiers' and its declarator's)
     hidden method DoDeclare(const AKind: CDeclKind; const AName: string; const ATok: PpToken;
-      const ATypeId: int64; const ASpec: CSpecifiers; const ABody: bool);
+      const ATypeId: int64; const ASpec: CSpecifiers; const AAttrs: CAttrs; const ABody: bool);
     var
       LDecl: CDecl;
     begin
@@ -562,7 +1094,12 @@ public type
       LDecl.IsStatic := ASpec.IsStatic;
       LDecl.IsExtern := ASpec.IsExtern;
       LDecl.IsInline := ASpec.IsInline;
+      LDecl.IsThread := ASpec.IsThread or AAttrs.Thread;
       LDecl.HasBody := ABody;
+      LDecl.NoReturn := AAttrs.NoReturn;
+      LDecl.AsmName := AAttrs.AsmName;
+      LDecl.Aligned := AAttrs.Aligned;
+      LDecl.Unknown := AAttrs.Unknown;
       if (AKind = CDeclKind.Typedef) and (self.FTypedefs.Find(AName) = 0) then
         self.FTypedefs.Put(AName, self.FDeclCount + 1);
       end;
@@ -587,8 +1124,24 @@ public type
       return DoIsSpecifierWord(LTok.Text) or self.DoIsTypedefName(LTok.Text);
     end;
 
-    // The declaration specifiers at the cursor (see the header)
+    // The declaration specifiers at the cursor (see the header), the attributes among them in
+    // their Attrs (the attributes read before them kept apart)
     hidden method DoSpecifiers(): CSpecifiers;
+    var
+      LOuter: CAttrs;
+      LSpec: CSpecifiers;
+    begin
+      LOuter := self.FAttrs;
+      self.FAttrs := NoAttrs();
+      LSpec := self.DoSpecifierWords();
+      LSpec.Attrs := self.FAttrs;
+      LSpec.IsThread := LSpec.IsThread or self.FAttrs.Thread;
+      self.FAttrs := LOuter;
+      return LSpec;
+    end;
+
+    // The declaration specifiers' words at the cursor (DoSpecifiers' work)
+    hidden method DoSpecifierWords(): CSpecifiers;
     var
       LSpec: CSpecifiers;
       LText: string;
@@ -610,6 +1163,7 @@ public type
       LVolatile: bool;
       LAtomic: bool;
       LBasic: bool;
+      LOnlyComplex: bool;
       LKind: CTypeKind;
     begin
       LSpec.TypeId := ADAM_CIMPORT_NONE;
@@ -617,6 +1171,8 @@ public type
       LSpec.IsStatic := false;
       LSpec.IsExtern := false;
       LSpec.IsInline := false;
+      LSpec.IsThread := false;
+      LSpec.Attrs := NoAttrs();
       LSpec.Ok := false;
       LStart := self.DoTok();
       LTypeId := ADAM_CIMPORT_NONE;
@@ -652,8 +1208,13 @@ public type
                 (LText = "__forceinline") then
                 LSpec.IsInline := true;
               else
-                if (LText = "auto") or (LText = "register") or (LText = "_Thread_local") or
-                  (LText = "thread_local") or (LText = "__thread") or (LText = "constexpr") then
+                if (LText = "_Thread_local") or (LText = "thread_local") or
+                  (LText = "__thread") then
+                  LSpec.IsThread := true;
+                  self.DoNext();
+                  skip;
+                end;
+                if (LText = "auto") or (LText = "register") or (LText = "constexpr") then
                   self.DoNext();
                   skip;
                 else
@@ -671,10 +1232,19 @@ public type
                         end;
                         LAtomic := true;
                       else
-                        if DoIsIgnoredWord(LText) or DoIsBalancedWord(LText) then
-                          self.DoSkipAttributes();
+                        if DoIsIgnoredWord(LText) or DoIsBalancedWord(LText) or
+                          DoIsNoReturnWord(LText) then
+                          self.DoAttributes();
                           skip;
                         else
+                          if ((LText = "_Complex") or (LText = "__complex__")) and
+                            (LTypeId <> ADAM_CIMPORT_NONE) and
+                            DoIsExtraFloatKind(self.FTypes.Item(LTypeId).Kind) then
+                            // _Float16 _Complex: C's complex, no Adam type
+                            LTypeId := self.FTypes.Add(CTypeKind.Complex, ADAM_CIMPORT_NONE);
+                            self.DoNext();
+                            skip;
+                          end;
                           if not self.DoTypeWord(LText, LVoid, LChar, LShort, LInt, LLongs,
                             LSigned, LUnsigned, LFloat, LDouble, LBool, LInt128, LComplex) then
                             if (LText = "struct") or (LText = "union") or (LText = "enum") then
@@ -705,6 +1275,23 @@ public type
                             if (LTypeId = ADAM_CIMPORT_NONE) and not LBasic and
                               (LText = "__builtin_va_list") then
                               LTypeId := self.FTypes.Add(CTypeKind.VaList, ADAM_CIMPORT_NONE);
+                              self.DoNext();
+                              skip;
+                            end;
+                            // clang's other floating types: types with no Adam form (a
+                            // _Complex one is C's complex: no Adam type either)
+                            // no type word before it but a _Complex
+                            LOnlyComplex := LComplex and not (LVoid or LChar or LShort or LInt or
+                              (LLongs > 0) or LSigned or LUnsigned or LFloat or LDouble or LBool or
+                              LInt128);
+                            if (LTypeId = ADAM_CIMPORT_NONE) and (not LBasic or LOnlyComplex) and
+                              DoIsExtraFloatWord(LText) then
+                              LTypeId := self.FTypes.Add(DoExtraFloatKind(LText),
+                                ADAM_CIMPORT_NONE);
+                              if LComplex then
+                                LTypeId := self.FTypes.Add(CTypeKind.Complex, ADAM_CIMPORT_NONE);
+                                LComplex := false;
+                              end;
                               self.DoNext();
                               skip;
                             end;
@@ -909,27 +1496,42 @@ public type
     end;
 
     // A struct or union specifier at the cursor (its word first): the record's type, its
-    // body read when one is given; ADAM_CIMPORT_NONE when it is not valid (reported)
+    // body read when one is given, the attributes written on it its own (see the header);
+    // ADAM_CIMPORT_NONE when it is not valid (reported)
     hidden method DoRecordSpecifier(): int64;
+    var
+      LOuter: CAttrs;
+      LId: int64;
+    begin
+      LOuter := self.FAttrs;
+      self.FAttrs := NoAttrs();
+      LId := self.DoRecordSpecifierIn();
+      self.FAttrs := LOuter;
+      return LId;
+    end;
+
+    // DoRecordSpecifier's work, FAttrs the record's own
+    hidden method DoRecordSpecifierIn(): int64;
     var
       LUnion: bool;
       LWord: PpToken;
       LTag: string;
       LIndex: int64;
       LRecord: CRecord;
+      LBefore: CAttrs;
       LId: int64;
     begin
       LWord := self.DoTok();
       LUnion := LWord.Text = "union";
       self.DoNext();
-      self.DoSkipAttributes();
+      self.DoAttributes();
       LTag := "";
       if (self.DoTok().Kind = PpKind.Identifier) and not DoIsBalancedWord(self.DoTok().Text) then
         LTag := self.DoTok().Text;
         LWord := self.DoTok();
         self.DoNext();
       end;
-      self.DoSkipAttributes();
+      self.DoAttributes();
       if (LTag = "") and not self.DoIs("{") then
         self.DoExpect("{");
         return ADAM_CIMPORT_NONE;
@@ -957,16 +1559,23 @@ public type
             NoArgs().Str(DoRecordWord(LUnion)).Str(LTag));
           return ADAM_CIMPORT_NONE;
         end;
-        // the place a record is defined is where its body is
+        // the place a record is defined is where its body is; its packing the one in effect
+        // at its '{'
         LRecord.File := LWord.File;
         LRecord.Line := LWord.Line;
         LRecord.Column := LWord.Column;
+        LRecord.Pack := self.FPack;
+        LBefore := self.FAttrs;
         if not self.DoRecordBody(LRecord) then
           return ADAM_CIMPORT_NONE;
         end;
+        self.FAttrs := LBefore;
+        self.DoAttributes();
+        LRecord.Packed := self.FAttrs.Packed;
+        LRecord.Aligned := self.FAttrs.Aligned;
+        LRecord.Unknown := self.FAttrs.Unknown;
         LRecord.Complete := true;
         self.FTypes.PutRecord(LIndex, LRecord);
-        self.DoSkipAttributes();
       end;
       LId := self.FTypes.Add(CTypeKind.Record, ADAM_CIMPORT_NONE);
       self.DoSetIndex(LId, LIndex);
@@ -977,6 +1586,7 @@ public type
     // valid (reported)
     hidden method DoRecordBody(var ARecord: CRecord): bool;
     var
+      LAttrs: CAttrs;
       LSpec: CSpecifiers;
       LField: CField;
       LCount: int64;
@@ -995,7 +1605,7 @@ public type
           return false;
         end;
         if self.DoTok().Kind = PpKind.Pragma then
-          self.DoNext();
+          self.DoPragma();
           skip;
         end;
         if self.DoIs(";") then
@@ -1013,13 +1623,19 @@ public type
           return false;
         end;
         if self.DoIs(";") then
-          // a member with no declarator: an anonymous struct / union member (C11)
+          // a member with no declarator: an anonymous struct / union member when the struct /
+          // union has no tag (C11); a tagged one only declares its tag, an enum its constants
           self.DoNext();
-          if self.FTypes.Item(LSpec.TypeId).Kind = CTypeKind.Record then
+          if (self.FTypes.Item(LSpec.TypeId).Kind = CTypeKind.Record) and
+            (self.FTypes.RecordAt(self.FTypes.Item(LSpec.TypeId).Index).Tag = "") then
             LField.Name := "";
             LField.TypeId := LSpec.TypeId;
             LField.BitWidth := -1;
             LField.Offset := 0;
+            LField.BitOffset := 0;
+            LField.Packed := LSpec.Attrs.Packed;
+            LField.Aligned := LSpec.Attrs.Aligned;
+            LField.Unknown := LSpec.Attrs.Unknown;
             LField.File := ARecord.File;
             LField.Line := ARecord.Line;
             LField.Column := ARecord.Column;
@@ -1031,6 +1647,7 @@ public type
           LName := "";
           LNameTok := self.DoTok();
           LTypeId := LSpec.TypeId;
+          self.FAttrs := NoAttrs();
           if not self.DoIs(":") then
             LTypeId := self.DoDeclarator(LSpec.TypeId, LName, LNameTok);
             if LTypeId = ADAM_CIMPORT_NONE then
@@ -1045,7 +1662,10 @@ public type
             end;
             ARecord.HasBitfields := true;
           end;
-          self.DoSkipAttributes();
+          self.DoAttributes();
+          LAttrs := LSpec.Attrs;
+          DoMergeAttrs(LAttrs, self.FAttrs);
+          LTypeId := self.DoModeType(LTypeId, LAttrs);
           LResolved := self.FTypes.Item(self.FTypes.Resolved(LTypeId));
           if (LResolved.Kind = CTypeKind.Array) and (LResolved.Count < 0) then
             ARecord.HasFlexible := true;
@@ -1054,6 +1674,10 @@ public type
           LField.TypeId := LTypeId;
           LField.BitWidth := LWidth;
           LField.Offset := 0;
+          LField.BitOffset := 0;
+          LField.Packed := LAttrs.Packed;
+          LField.Aligned := LAttrs.Aligned;
+          LField.Unknown := LAttrs.Unknown;
           LField.File := LNameTok.File;
           LField.Line := LNameTok.Line;
           LField.Column := LNameTok.Column;
@@ -1074,9 +1698,24 @@ public type
     end;
 
     // An enum specifier at the cursor ('enum' first): the enum's type, its body read when one is
-    // given; ADAM_CIMPORT_NONE when it is not valid (reported)
+    // given, the attributes written on it its own (packed: the smallest integer type that holds
+    // its values, GCC's rule); ADAM_CIMPORT_NONE when it is not valid (reported)
     hidden method DoEnumSpecifier(): int64;
     var
+      LOuter: CAttrs;
+      LId: int64;
+    begin
+      LOuter := self.FAttrs;
+      self.FAttrs := NoAttrs();
+      LId := self.DoEnumSpecifierIn();
+      self.FAttrs := LOuter;
+      return LId;
+    end;
+
+    // DoEnumSpecifier's work, FAttrs the enum's own
+    hidden method DoEnumSpecifierIn(): int64;
+    var
+      LBefore: CAttrs;
       LWord: PpToken;
       LTag: string;
       LIndex: int64;
@@ -1090,14 +1729,14 @@ public type
     begin
       LWord := self.DoTok();
       self.DoNext();
-      self.DoSkipAttributes();
+      self.DoAttributes();
       LTag := "";
       if (self.DoTok().Kind = PpKind.Identifier) and not DoIsBalancedWord(self.DoTok().Text) then
         LTag := self.DoTok().Text;
         LWord := self.DoTok();
         self.DoNext();
       end;
-      self.DoSkipAttributes();
+      self.DoAttributes();
       LHasFixed := false;
       if self.DoIs(":") then
         self.DoNext();
@@ -1143,7 +1782,10 @@ public type
             return ADAM_CIMPORT_NONE;
           end;
           self.DoNext();
-          self.DoSkipAttributes();
+          // an enumerator's own attributes (deprecated ..) are not the enum's
+          LBefore := self.FAttrs;
+          self.DoAttributes();
+          self.FAttrs := LBefore;
           if self.DoIs("=") then
             self.DoNext();
             if not self.DoConstant(LValue) then
@@ -1170,12 +1812,13 @@ public type
           end;
         end;
         self.DoNext();
-        self.DoSkipAttributes();
+        self.DoAttributes();
         setlength(LEnum.Names, LCount);
         setlength(LEnum.Values, LCount);
         LEnum.Complete := true;
+        LEnum.Unknown := self.FAttrs.Unknown;
         self.FTypes.PutEnum(LIndex, LEnum);
-        self.FTypes.SetEnumUnderlying(LIndex);
+        self.FTypes.SetEnumUnderlying(LIndex, self.FAttrs.Packed);
         if LHasFixed then
           LEnum := self.FTypes.EnumAt(LIndex);
           LEnum.Underlying := self.FTypes.Item(self.FTypes.Resolved(LFixed.TypeId)).Kind;
@@ -1248,7 +1891,7 @@ public type
       LType: int64;
     begin
       LBase := ABase;
-      self.DoSkipAttributes();
+      self.DoAttributes();
       while self.DoIs("*") do
         self.DoNext();
         LConst := false;
@@ -1270,7 +1913,7 @@ public type
             skip;
           end;
           if DoIsIgnoredWord(self.DoTok().Text) or DoIsBalancedWord(self.DoTok().Text) then
-            self.DoSkipAttributes();
+            self.DoAttributes();
             skip;
           end;
           leave;
@@ -1278,7 +1921,7 @@ public type
         LBase := self.FTypes.Qualified(self.FTypes.Add(CTypeKind.Pointer, LBase), LConst,
           LVolatile, LAtomic);
       end;
-      self.DoSkipAttributes();
+      self.DoAttributes();
       if self.DoIs("(") and self.DoNestedStart() then
         self.DoNext();
         LInner := self.FPos;
@@ -1323,7 +1966,7 @@ public type
     begin
       LCount := 0;
       while true do
-        self.DoSkipAttributes();
+        self.DoAttributes();
         if self.DoIs("[") then
           self.DoNext();
           while (self.DoTok().Kind = PpKind.Identifier) and ((self.DoTok().Text = "static") or
@@ -1394,6 +2037,7 @@ public type
     // not valid (reported)
     hidden method DoParams(var ASuffix: CSuffix): bool;
     var
+      LOuter: CAttrs;
       LSpec: CSpecifiers;
       LParam: CParam;
       LCount: int64;
@@ -1430,11 +2074,15 @@ public type
         end;
         LParam.Name := "";
         LNameTok := self.DoTok();
+        // a parameter's attributes are not its function's declarator's
+        LOuter := self.FAttrs;
+        self.FAttrs := NoAttrs();
         LTypeId := self.DoDeclarator(LSpec.TypeId, LParam.Name, LNameTok);
         if LTypeId = ADAM_CIMPORT_NONE then
           return false;
         end;
-        self.DoSkipAttributes();
+        self.DoAttributes();
+        self.FAttrs := LOuter;
         // C's adjustments: an array parameter is a pointer to its element, a function one a
         // pointer to the function
         LResolved := self.FTypes.Item(self.FTypes.Resolved(LTypeId));
@@ -1464,9 +2112,11 @@ public type
     // type, ADAM_CIMPORT_NONE when not valid (reported)
     hidden method DoTypeName(): int64;
     var
+      LOuter: CAttrs;
       LSpec: CSpecifiers;
       LName: string;
       LNameTok: PpToken;
+      LTypeId: int64;
     begin
       LSpec := self.DoSpecifiers();
       if not LSpec.Ok then
@@ -1474,7 +2124,12 @@ public type
       end;
       LName := "";
       LNameTok := self.DoTok();
-      return self.DoDeclarator(LSpec.TypeId, LName, LNameTok);
+      // a type name's attributes are not the declarator's around it (sizeof in an array size)
+      LOuter := self.FAttrs;
+      self.FAttrs := NoAttrs();
+      LTypeId := self.DoDeclarator(LSpec.TypeId, LName, LNameTok);
+      self.FAttrs := LOuter;
+      return LTypeId;
     end;
 
     // An initializer (after '=') passed over: to the next ',' or ';' outside brackets
@@ -1501,13 +2156,18 @@ public type
     hidden method DoExternal(): bool;
     var
       LSpec: CSpecifiers;
+      LAttrs: CAttrs;
       LName: string;
       LNameTok: PpToken;
       LTypeId: int64;
       LKind: CTypeKind;
       LType: CType;
     begin
-      if (self.DoTok().Kind = PpKind.Pragma) or self.DoIs(";") then
+      if self.DoTok().Kind = PpKind.Pragma then
+        self.DoPragma();
+        return true;
+      end;
+      if self.DoIs(";") then
         self.DoNext();
         return true;
       end;
@@ -1516,7 +2176,7 @@ public type
       end;
       if self.DoIs("asm") or self.DoIs("__asm") or self.DoIs("__asm__") then
         self.DoNext();
-        self.DoSkipAttributes();
+        self.DoAttributes();
         if self.DoIs("(") and not self.DoSkipBalanced() then
           return false;
         end;
@@ -1529,7 +2189,8 @@ public type
       if self.DoIs(";") then
         LKind := self.FTypes.Item(LSpec.TypeId).Kind;
         if (LKind = CTypeKind.Record) or (LKind = CTypeKind.Enum) then
-          self.DoDeclare(CDeclKind.Tag, "", self.DoTok(), LSpec.TypeId, LSpec, false);
+          self.DoDeclare(CDeclKind.Tag, "", self.DoTok(), LSpec.TypeId, LSpec, LSpec.Attrs,
+            false);
         end;
         self.DoNext();
         return true;
@@ -1537,6 +2198,7 @@ public type
       while true do
         LName := "";
         LNameTok := self.DoTok();
+        self.FAttrs := NoAttrs();
         LTypeId := self.DoDeclarator(LSpec.TypeId, LName, LNameTok);
         if LTypeId = ADAM_CIMPORT_NONE then
           return false;
@@ -1546,23 +2208,27 @@ public type
             NoArgs().Str(self.DoSpelling(LNameTok)));
           return false;
         end;
-        self.DoSkipAttributes();
+        self.DoAttributes();
+        // the declaration's attributes: its specifiers' and its declarator's (an asm label)
+        LAttrs := LSpec.Attrs;
+        DoMergeAttrs(LAttrs, self.FAttrs);
+        LTypeId := self.DoModeType(LTypeId, LAttrs);
         LType := self.FTypes.Item(LTypeId);
         if LSpec.IsTypedef then
-          self.DoDeclare(CDeclKind.Typedef, LName, LNameTok, LTypeId, LSpec, false);
+          self.DoDeclare(CDeclKind.Typedef, LName, LNameTok, LTypeId, LSpec, LAttrs, false);
         else
           if LType.Kind = CTypeKind.Function then
             if self.DoIs("{") then
-              self.DoDeclare(CDeclKind.Routine, LName, LNameTok, LTypeId, LSpec, true);
+              self.DoDeclare(CDeclKind.Routine, LName, LNameTok, LTypeId, LSpec, LAttrs, true);
               return self.DoSkipBalanced();
             end;
-            self.DoDeclare(CDeclKind.Routine, LName, LNameTok, LTypeId, LSpec, false);
+            self.DoDeclare(CDeclKind.Routine, LName, LNameTok, LTypeId, LSpec, LAttrs, false);
           else
             if self.DoIs("=") then
               self.DoNext();
               self.DoSkipInitializer();
             end;
-            self.DoDeclare(CDeclKind.Variable, LName, LNameTok, LTypeId, LSpec, false);
+            self.DoDeclare(CDeclKind.Variable, LName, LNameTok, LTypeId, LSpec, LAttrs, false);
           end;
         end;
         if self.DoIs(",") then
@@ -1608,6 +2274,11 @@ public type
         if not self.DoExternal() then
           LOk := false;
           self.DoRecover();
+          skip;
+        end;
+        // a form not valid inside a declaration that still ended well (an attribute's)
+        if self.FBad then
+          LOk := false;
         end;
       end;
       return LOk;
