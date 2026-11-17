@@ -1992,6 +1992,119 @@ type
       LInstr.AddOperand(self.DoVReg(AId));
     end;
 
+    // A bit op (BNF sec 7's bit intrinsics, M9j0) on baseline x86_64 (no lzcnt / tzcnt /
+    // popcnt, which only later CPUs have): byteswap the operand moved into the result and
+    // bswapped (a 16-bit one zero-extended, bswapped at 4 bytes and shifted down 16);
+    // leadingzeros (width - 1) - bsr, the bsr's index -1 by a cmov when the operand is 0
+    // (bsr sets ZF and leaves no index); trailingzeros bsf, the width by a cmov for 0;
+    // popcount the SWAR count (Hacker's Delight 5-1: pairs, nibbles, bytes, then the bytes
+    // summed into the top one by a multiply). Every count is below 65, an int32
+    hidden method DoBitOp(const AId: int64; const AInstr: ref IrInstr);
+    var
+      LFrom: IrType;
+      LWidth: int64;
+      LDest: ref MachineOperand;
+      LSource: ref MachineOperand;
+      LFallback: ref MachineOperand;
+      LMove: ref MachineInstr;
+    begin
+      LFrom := self.FModule.InstrAt(AInstr.Operands[0]).ValueType;
+      LWidth := DoWidth(LFrom, AId);
+      LDest := self.DoVReg(AId);
+      LSource := self.DoVReg(AInstr.Operands[0]);
+      if AInstr.Kind = IrOp.ByteSwap then
+        if LWidth = 2 then
+          self.DoEmitPair(X64Op.MovZX16, 4, LDest, LSource, AInstr.Node);
+          LMove := self.DoEmit(X64Op.Bswap, 4, AInstr.Node);
+          LMove.AddOperand(self.DoVReg(AId));
+          self.DoShiftBy(X64Op.Shr, 4, self.DoVReg(AId), 16, AInstr.Node);
+          return;
+        end;
+        self.DoEmitPair(X64Op.Mov, LWidth, LDest, LSource, AInstr.Node);
+        LMove := self.DoEmit(X64Op.Bswap, LWidth, AInstr.Node);
+        LMove.AddOperand(self.DoVReg(AId));
+        return;
+      end;
+      if AInstr.Kind = IrOp.PopCount then
+        self.DoPopCount(AId, AInstr, LWidth);
+        return;
+      end;
+      LFallback := VirtualOperand(self.FMachine.NewVReg(RegClass.General));
+      if AInstr.Kind = IrOp.LeadingZeros then
+        // bsr's index (or -1 for 0) into a scratch, then (width - 1) less it
+        self.DoEmitPair(X64Op.Mov, 4, LFallback, ImmediateOperand(-1), AInstr.Node);
+        LSource := VirtualOperand(self.FMachine.NewVReg(RegClass.General));
+        self.DoEmitPair(X64Op.Bsr, LWidth, LSource, self.DoVReg(AInstr.Operands[0]),
+          AInstr.Node);
+        LMove := self.DoEmit(X64Op.CMov, 4, AInstr.Node);
+        LMove.Cond := X64Cond.Equal;
+        LMove.AddOperand(LSource);
+        LMove.AddOperand(LFallback);
+        self.DoEmitPair(X64Op.Mov, 4, LDest, ImmediateOperand(LWidth * 8 - 1), AInstr.Node);
+        self.DoEmitPair(X64Op.Sub, 4, self.DoVReg(AId), LSource, AInstr.Node);
+        return;
+      end;
+      // trailingzeros: bsf's index, the width for 0
+      self.DoEmitPair(X64Op.Mov, 4, LFallback, ImmediateOperand(LWidth * 8), AInstr.Node);
+      self.DoEmitPair(X64Op.Bsf, LWidth, LDest, LSource, AInstr.Node);
+      LMove := self.DoEmit(X64Op.CMov, 4, AInstr.Node);
+      LMove.Cond := X64Cond.Equal;
+      LMove.AddOperand(self.DoVReg(AId));
+      LMove.AddOperand(LFallback);
+    end;
+
+    // popcount of the AWidth-byte (4 / 8) operand of AInstr into AId's register (DoBitOp):
+    // x - ((x >> 1) & 0x55..), then (x & 0x33..) + ((x >> 2) & 0x33..), then (x + (x >> 4)) &
+    // 0x0F.., then (x * 0x01..) >> (bits - 8); each mask in a register (a 64-bit one has no
+    // immediate form)
+    hidden method DoPopCount(const AId: int64; const AInstr: ref IrInstr; const AWidth: int64);
+    var
+      LTemp: ref MachineOperand;
+      LMask: ref MachineOperand;
+      LFives: int64;
+      LThrees: int64;
+      LNibbles: int64;
+      LOnes: int64;
+    begin
+      LFives := 0x55555555;
+      LThrees := 0x33333333;
+      LNibbles := 0x0F0F0F0F;
+      LOnes := 0x01010101;
+      if AWidth = 8 then
+        LFives := 0x5555555555555555;
+        LThrees := 0x3333333333333333;
+        LNibbles := 0x0F0F0F0F0F0F0F0F;
+        LOnes := 0x0101010101010101;
+      end;
+      LTemp := VirtualOperand(self.FMachine.NewVReg(RegClass.General));
+      LMask := VirtualOperand(self.FMachine.NewVReg(RegClass.General));
+      self.DoEmitPair(X64Op.Mov, AWidth, self.DoVReg(AId), self.DoVReg(AInstr.Operands[0]),
+        AInstr.Node);
+      // x - ((x >> 1) & 0x55..): each pair's count
+      self.DoEmitPair(X64Op.Mov, AWidth, LTemp, self.DoVReg(AId), AInstr.Node);
+      self.DoShiftBy(X64Op.Shr, AWidth, LTemp, 1, AInstr.Node);
+      self.DoEmitPair(X64Op.Mov, AWidth, LMask, ImmediateOperand(LFives), AInstr.Node);
+      self.DoEmitPair(X64Op.BitAnd, AWidth, LTemp, LMask, AInstr.Node);
+      self.DoEmitPair(X64Op.Sub, AWidth, self.DoVReg(AId), LTemp, AInstr.Node);
+      // (x & 0x33..) + ((x >> 2) & 0x33..): each nibble's count
+      self.DoEmitPair(X64Op.Mov, AWidth, LTemp, self.DoVReg(AId), AInstr.Node);
+      self.DoShiftBy(X64Op.Shr, AWidth, LTemp, 2, AInstr.Node);
+      self.DoEmitPair(X64Op.Mov, AWidth, LMask, ImmediateOperand(LThrees), AInstr.Node);
+      self.DoEmitPair(X64Op.BitAnd, AWidth, LTemp, LMask, AInstr.Node);
+      self.DoEmitPair(X64Op.BitAnd, AWidth, self.DoVReg(AId), LMask, AInstr.Node);
+      self.DoEmitPair(X64Op.Add, AWidth, self.DoVReg(AId), LTemp, AInstr.Node);
+      // (x + (x >> 4)) & 0x0F..: each byte's count
+      self.DoEmitPair(X64Op.Mov, AWidth, LTemp, self.DoVReg(AId), AInstr.Node);
+      self.DoShiftBy(X64Op.Shr, AWidth, LTemp, 4, AInstr.Node);
+      self.DoEmitPair(X64Op.Add, AWidth, self.DoVReg(AId), LTemp, AInstr.Node);
+      self.DoEmitPair(X64Op.Mov, AWidth, LMask, ImmediateOperand(LNibbles), AInstr.Node);
+      self.DoEmitPair(X64Op.BitAnd, AWidth, self.DoVReg(AId), LMask, AInstr.Node);
+      // the bytes' sum lands in the top byte
+      self.DoEmitPair(X64Op.Mov, AWidth, LMask, ImmediateOperand(LOnes), AInstr.Node);
+      self.DoEmitPair(X64Op.IMul, AWidth, self.DoVReg(AId), LMask, AInstr.Node);
+      self.DoShiftBy(X64Op.Shr, AWidth, self.DoVReg(AId), AWidth * 8 - 8, AInstr.Node);
+    end;
+
     // A jcc of ACond to the machine block AOnTrue, then a jmp to AOnFalse, at ANode
     hidden method DoSplit(const ACond: X64Cond; const AOnTrue: int64; const AOnFalse: int64;
       const ANode: int64);
@@ -2834,6 +2947,8 @@ type
         IrOp.Convert: self.DoConvert(AId, LInstr);
         IrOp.Mul, IrOp.BitAnd, IrOp.BitOr, IrOp.BitXor: self.DoCombine(AId, LInstr);
         IrOp.Neg, IrOp.BitNot: self.DoNegate(AId, LInstr);
+        IrOp.ByteSwap, IrOp.LeadingZeros, IrOp.TrailingZeros, IrOp.PopCount:
+          self.DoBitOp(AId, LInstr);
         IrOp.Shl, IrOp.Shr, IrOp.Sar: self.DoShift(AId, LInstr);
         IrOp.SDiv, IrOp.UDiv, IrOp.SRem, IrOp.URem: self.DoDivide(AId, LInstr);
         IrOp.FDiv: self.DoFloatArith(AId, LInstr);
