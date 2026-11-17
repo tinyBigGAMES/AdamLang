@@ -1,0 +1,2194 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.CImport.Macros.adam - `adam cimport`'s macros (M9f; DESIGN sec 15):
+  a #define as the Adam constant or routine it means
+
+  MacroEvaluator  one import's macros, each read as the input ends
+                  (Evaluate): its expansion (Preprocessor.ExpandMacro)
+                  parsed as a C expression and typed by C's rules on the
+                  target. Told the routines the unit binds (AddCallee),
+                  which a function-like macro may call
+  MacroResult     what a macro is: a constant (its MacroValue: an integer,
+                  a float, a string or a struct's compound literal, with
+                  its C type), a routine (its parameters' types, its
+                  body's Adam expression, its C result type), nothing to
+                  bind (an empty #define: a guard or a flag) or not
+                  bindable, Why the reason (a CI0001 by name)
+
+  An object-like macro is a constant when its body is one of C's constant
+  expressions: an integer constant typed by its suffix and base (C's list:
+  int, long, long long for a decimal; the unsigned ones between for hex /
+  octal / binary; clang's unsigned long long for a decimal past long long),
+  a character constant (int, the target's char signedness), a float
+  constant (double; f float; l long double, which Adam has no type for),
+  adjacent string literals (u8 or plain: a `string` const; L / u / U are
+  not), an enum constant (its enum's integer type), sizeof / _Alignof of a
+  type or an expression (size_t, from the target's __SIZE_TYPE__), casts
+  to an integer, _Bool or float type (the value converted as C converts
+  it), a compound literal (T){..} of a struct whose fields are numbers
+  (positional or .name = designated, the rest 0), and C's operators with
+  the usual arithmetic conversions; ?: && || evaluate only the arm C
+  evaluates. A signed value that overflows its type, a division by zero
+  or a shift outside the type is not a constant (C's rule; unsigned
+  arithmetic wraps). A pointer constant ((void *)0) has no Adam const.
+
+  A function-like macro is an Adam routine when its body is an expression
+  Adam can say and every parameter is typed: a parameter takes the type
+  of the parameter of a bound routine it is passed to whole (parentheses
+  allowed), the first such use; the body then may use it as C's operators
+  do (each operand converted to C's common type with an Adam type cast
+  where the type changes, comparisons and && || ! as Adam bools, / as div
+  on integers, % as mod), call bound routines (each argument converted to
+  its parameter's type; a string literal for a char pointer, 0 for any
+  pointer as nil) and fold every constant part. A void call is a routine
+  with no result. A variadic macro, # / ## left in the body, a parameter
+  no call types, a name that is no parameter, constant or bound routine
+  are reported by name with the reason, never dropped silently.
+*******************************************************************************/
+
+module unit Adam.CImport.Macros;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Core.Messages, Adam.Compiler.Diagnostics,
+  Adam.Target,
+  Adam.CImport.Spec, Adam.CImport.Lexer, Adam.CImport.Preprocessor, Adam.CImport.CTypes,
+  Adam.CImport.Parser;
+
+public const
+  // The lowest int64 and its text (the literal 9223372036854775808 is past int64)
+  ADAM_CIMPORT_MACRO_INT64_MIN: int64 = -9223372036854775807 - 1;
+  ADAM_CIMPORT_MACRO_INT64_MIN_TEXT: string = "-9223372036854775807 - 1";
+  ADAM_CIMPORT_MACRO_INT64_MAX: uint64 = 9223372036854775807u;
+  // sizeof's type as the target's predefines name it
+  ADAM_CIMPORT_MACRO_SIZE_TYPE: string = "__SIZE_TYPE__";
+  // Not looked up yet (sizeof's type)
+  ADAM_CIMPORT_MACRO_UNKNOWN: int64 = -2;
+
+public type
+  // What a macro's expression is: a constant integer, float, string bytes (Text) or a
+  // compound literal's field inits (Literal: Adam text "f: v, .."), or, in a function-like
+  // macro, Adam text evaluated at run time (Runtime) or a void call (Void)
+  MacroValueKind = choices(Int, Float, Text, Literal, Runtime, Void);
+
+  // One typed expression: its C type (TypeId), an Int's bits (by its type's signedness), a
+  // Float's value and its literal's text when one literal gave it (Spelling, suffix off), a
+  // Text's bytes / a Literal's inits / a Runtime's Adam text; IsBool: the Runtime text is an
+  // Adam bool (a comparison, && || !, a _Bool)
+  MacroValue = record
+    Kind: MacroValueKind;
+    TypeId: int64;
+    Value: int64;
+    Real: float64;
+    Text: string;
+    Spelling: string;
+    IsBool: bool;
+  end;
+
+  // What a macro is (see the header): Bound false with Why "" when it binds nothing (an empty
+  // body); IsRoutine with its parameters' Adam names and C types and its Body (Value: the
+  // body's type in TypeId, Kind Void for none)
+  MacroResult = record
+    Bound: bool;
+    Why: string;
+    IsRoutine: bool;
+    Value: MacroValue;
+    Params: StringArray;
+    ParamTypes: Int64Array;
+    Body: string;
+  end;
+
+// A C name as an Adam name in place: an Adam keyword with a trailing '_' (AD.5), as the
+// binding writer writes a field or parameter
+routine DoLocalName(const ACName: string): string;
+begin
+  if IsAdamName(ACName) then
+    return ACName;
+  end;
+  return ACName + "_";
+end;
+
+// The value of a C digit in base ABase; -1 when AChar is none
+routine DoDigit(const AChar: char; const ABase: int64): int64;
+var
+  LValue: int64;
+begin
+  LValue := -1;
+  if (AChar >= '0') and (AChar <= '9') then
+    LValue := int64(AChar) - int64('0');
+  end;
+  if (AChar >= 'a') and (AChar <= 'f') then
+    LValue := int64(AChar) - int64('a') + 10;
+  end;
+  if (AChar >= 'A') and (AChar <= 'F') then
+    LValue := int64(AChar) - int64('A') + 10;
+  end;
+  if LValue >= ABase then
+    return -1;
+  end;
+  return LValue;
+end;
+
+// The bytes of a C character / string literal's body ABody (between its quotes), its
+// escapes taken as clang takes them in a narrow literal (\u / \U as UTF-8); false for a
+// malformed escape
+routine DoDecode(const ABody: string; var ABytes: Int64Array): bool;
+var
+  LCount: int64;
+  LAt: int64;
+  LByte: int64;
+  LCode: int64;
+  LDigits: int64;
+  LWant: int64;
+  LChar: char;
+begin
+  setlength(ABytes, len(ABody));
+  LCount := 0;
+  LAt := 0;
+  while LAt < len(ABody) do
+    LChar := ABody[LAt];
+    LAt := LAt + 1;
+    if (LChar <> '\\') or (LAt >= len(ABody)) then
+      ABytes[LCount] := int64(uint8(LChar));
+      LCount := LCount + 1;
+      skip;
+    end;
+    LChar := ABody[LAt];
+    LAt := LAt + 1;
+    LByte := int64(uint8(LChar));
+    match LChar of
+      'n': LByte := 10;
+      't': LByte := 9;
+      'r': LByte := 13;
+      'a': LByte := 7;
+      'b': LByte := 8;
+      'f': LByte := 12;
+      'v': LByte := 11;
+      'e': LByte := 27;
+      'x':
+        LByte := 0;
+        LDigits := 0;
+        while (LAt < len(ABody)) and (DoDigit(ABody[LAt], 16) >= 0) do
+          LByte := (LByte * 16 + DoDigit(ABody[LAt], 16)) & 255;
+          LAt := LAt + 1;
+          LDigits := LDigits + 1;
+        end;
+        if LDigits = 0 then
+          return false;
+        end;
+      '0', '1', '2', '3', '4', '5', '6', '7':
+        LByte := DoDigit(LChar, 8);
+        LDigits := 1;
+        while (LDigits < 3) and (LAt < len(ABody)) and (DoDigit(ABody[LAt], 8) >= 0) do
+          LByte := LByte * 8 + DoDigit(ABody[LAt], 8);
+          LAt := LAt + 1;
+          LDigits := LDigits + 1;
+        end;
+        LByte := LByte & 255;
+      'u', 'U':
+        LWant := 4;
+        if LChar = 'U' then
+          LWant := 8;
+        end;
+        LCode := 0;
+        LDigits := 0;
+        while (LDigits < LWant) and (LAt < len(ABody)) and (DoDigit(ABody[LAt], 16) >= 0) do
+          LCode := LCode * 16 + DoDigit(ABody[LAt], 16);
+          LAt := LAt + 1;
+          LDigits := LDigits + 1;
+        end;
+        if (LDigits < LWant) or (LCode > 1114111) then
+          return false;
+        end;
+        // UTF-8: one to four bytes
+        if LCode < 128 then
+          LByte := LCode;
+        else
+          if LCode < 2048 then
+            ABytes[LCount] := 192 | (LCode >> 6);
+            LCount := LCount + 1;
+          else
+            if LCode < 65536 then
+              ABytes[LCount] := 224 | (LCode >> 12);
+              ABytes[LCount + 1] := 128 | ((LCode >> 6) & 63);
+              LCount := LCount + 2;
+            else
+              ABytes[LCount] := 240 | (LCode >> 18);
+              ABytes[LCount + 1] := 128 | ((LCode >> 12) & 63);
+              ABytes[LCount + 2] := 128 | ((LCode >> 6) & 63);
+              LCount := LCount + 3;
+            end;
+          end;
+          LByte := 128 | (LCode & 63);
+        end;
+    else
+    end;
+    ABytes[LCount] := LByte;
+    LCount := LCount + 1;
+  end;
+  setlength(ABytes, LCount);
+  return true;
+end;
+
+// One byte of a string as Adam literal text: printable ASCII as itself (\ and " escaped),
+// \n \t \r, any other byte a three-digit octal escape (never read on into a next digit)
+routine DoByteText(const AByte: int64): string;
+begin
+  match AByte of
+    10: return "\\n";
+    9: return "\\t";
+    13: return "\\r";
+    92: return "\\\\";
+    34: return "\\\"";
+  else
+  end;
+  if (AByte >= 32) and (AByte < 127) then
+    return StringOfChar(char(uint8(AByte)), 1);
+  end;
+  return "\\" + StringOfChar(char(uint8(int64('0') + ((AByte >> 6) & 7))), 1) +
+    StringOfChar(char(uint8(int64('0') + ((AByte >> 3) & 7))), 1) +
+    StringOfChar(char(uint8(int64('0') + (AByte & 7))), 1);
+end;
+
+// The Adam string literal of the bytes ABytes (the bytes are one string's, never a C
+// string's text, so a C escape never reaches Adam's reading of it)
+routine DoStringText(const ABytes: Int64Array): string;
+var
+  LOut: ref TextBuilder;
+  LI: int64;
+begin
+  LOut := ref TextBuilder();
+  LOut.Add("\"");
+  for LI := 0 to len(ABytes) - 1 do
+    LOut.Add(DoByteText(ABytes[LI]));
+  end;
+  LOut.Add("\"");
+  return LOut.Text();
+end;
+
+// True when AText (a float's text) reads as an Adam float literal and not an integer one
+routine DoHasFloatMark(const AText: string): bool;
+begin
+  return (IndexOf(".", AText, 0) >= 0) or (IndexOf("e", AText, 0) >= 0) or
+    (IndexOf("E", AText, 0) >= 0) or (IndexOf("p", AText, 0) >= 0) or
+    (IndexOf("P", AText, 0) >= 0);
+end;
+
+// AText in parentheses when it starts with a '-' (a negative constant beside an operator)
+routine DoOperand(const AText: string): string;
+begin
+  if StartsStr("-", AText) then
+    return "(" + AText + ")";
+  end;
+  return AText;
+end;
+
+public type
+  // One import's macros (see the header)
+  MacroEvaluator = object
+    hidden FPre: ref Preprocessor;
+    hidden FParser: ref CParser;
+    hidden FTypes: ref CTypeTable;
+    hidden FTarget: ref Target;
+    // a fundamental kind's type (by CKindText, its id + 1)
+    hidden FBuiltins: ref StringIdMap;
+    // every enum constant: its value and its enum's integer type
+    hidden FEnumIds: ref StringIdMap;
+    hidden FEnumValues: Int64Array;
+    hidden FEnumTypes: Int64Array;
+    // the routines a macro may call: C name -> slot + 1, the Adam name, the function type
+    hidden FCalleeIds: ref StringIdMap;
+    hidden FCalleeNames: StringArray;
+    hidden FCalleeTypes: Int64Array;
+    hidden FCalleeCount: int64;
+    hidden FSizeType: int64;
+    // one evaluation: its tokens, the cursor, the first reason it fails, a function-like
+    // macro's parameters and their types, how deep in an arm C does not evaluate
+    hidden FToks: PpTokenArray;
+    hidden FPos: int64;
+    hidden FWhy: string;
+    hidden FFunction: bool;
+    hidden FParams: StringArray;
+    hidden FParamTypes: Int64Array;
+    hidden FDead: int64;
+
+    init(const APre: ref Preprocessor; const AParser: ref CParser);
+    var
+      LEnum: CEnum;
+      LCount: int64;
+      LI: int64;
+      LJ: int64;
+    begin
+      self.FPre := APre;
+      self.FParser := AParser;
+      self.FTypes := AParser.Types();
+      self.FTarget := self.FTypes.TargetOf();
+      self.FBuiltins := ref StringIdMap();
+      self.FEnumIds := ref StringIdMap();
+      self.FCalleeIds := ref StringIdMap();
+      self.FCalleeCount := 0;
+      self.FSizeType := ADAM_CIMPORT_MACRO_UNKNOWN;
+      self.FDead := 0;
+      LCount := 0;
+      for LI := 0 to self.FTypes.EnumCount - 1 do
+        LCount := LCount + len(self.FTypes.EnumAt(LI).Names);
+      end;
+      setlength(self.FEnumValues, LCount);
+      setlength(self.FEnumTypes, LCount);
+      LCount := 0;
+      for LI := 0 to self.FTypes.EnumCount - 1 do
+        LEnum := self.FTypes.EnumAt(LI);
+        if not LEnum.Complete then
+          skip;
+        end;
+        for LJ := 0 to len(LEnum.Names) - 1 do
+          self.FEnumValues[LCount] := LEnum.Values[LJ];
+          self.FEnumTypes[LCount] := self.DoBuiltin(LEnum.Underlying);
+          LCount := LCount + 1;
+          self.FEnumIds.Put(LEnum.Names[LJ], LCount);
+        end;
+      end;
+    end;
+
+    // The routine ACName (its function type ATypeId) bound as AAdamName: a function-like
+    // macro may call it
+    method AddCallee(const ACName: string; const AAdamName: string; const ATypeId: int64);
+    begin
+      if self.FCalleeCount = len(self.FCalleeNames) then
+        setlength(self.FCalleeNames, self.FCalleeCount * 2 + 16);
+        setlength(self.FCalleeTypes, len(self.FCalleeNames));
+      end;
+      self.FCalleeNames[self.FCalleeCount] := AAdamName;
+      self.FCalleeTypes[self.FCalleeCount] := ATypeId;
+      self.FCalleeCount := self.FCalleeCount + 1;
+      self.FCalleeIds.Put(ACName, self.FCalleeCount);
+    end;
+
+    // ---- types -----------------------------------------------------------------------------
+
+    // The type of the fundamental kind AKind (one per kind, made once)
+    hidden method DoBuiltin(const AKind: CTypeKind): int64;
+    var
+      LId: int64;
+    begin
+      LId := self.FBuiltins.Find(CKindText(AKind));
+      if LId > 0 then
+        return LId - 1;
+      end;
+      LId := self.FTypes.Add(AKind, ADAM_CIMPORT_NONE);
+      self.FBuiltins.Put(CKindText(AKind), LId + 1);
+      return LId;
+    end;
+
+    // The kind a value of type AId computes as: a typedef looked through, an enum its integer
+    // type
+    hidden method DoKindOf(const AId: int64): CTypeKind;
+    var
+      LType: CType;
+    begin
+      LType := self.FTypes.Item(self.FTypes.Resolved(AId));
+      if LType.Kind = CTypeKind.Enum then
+        return self.FTypes.EnumAt(LType.Index).Underlying;
+      end;
+      return LType.Kind;
+    end;
+
+    // The size in bytes of the fundamental kind AKind on the target
+    hidden method DoSize(const AKind: CTypeKind): int64;
+    begin
+      return self.FTarget.BuiltinSize(BuiltinName(AKind));
+    end;
+
+    hidden method DoSigned(const AKind: CTypeKind): bool;
+    begin
+      match AKind of
+        CTypeKind.SChar, CTypeKind.Short, CTypeKind.Int, CTypeKind.Long, CTypeKind.LongLong:
+          return true;
+        CTypeKind.Char:
+          return self.FTarget.CharSigned();
+      else
+      end;
+      return false;
+    end;
+
+    // C's integer conversion rank
+    hidden method DoRank(const AKind: CTypeKind): int64;
+    begin
+      match AKind of
+        CTypeKind.Bool: return 1;
+        CTypeKind.Char, CTypeKind.SChar, CTypeKind.UChar: return 2;
+        CTypeKind.Short, CTypeKind.UShort: return 3;
+        CTypeKind.Int, CTypeKind.UInt: return 4;
+        CTypeKind.Long, CTypeKind.ULong: return 5;
+      else
+      end;
+      return 6;
+    end;
+
+    hidden method DoUnsignedOf(const AKind: CTypeKind): CTypeKind;
+    begin
+      match AKind of
+        CTypeKind.Int: return CTypeKind.UInt;
+        CTypeKind.Long: return CTypeKind.ULong;
+        CTypeKind.LongLong: return CTypeKind.ULongLong;
+      else
+      end;
+      return AKind;
+    end;
+
+    // True for the integer kinds an Adam constant can have (no __int128)
+    hidden method DoIsInteger(const AKind: CTypeKind): bool;
+    begin
+      return IsIntegerKind(AKind) and (BuiltinName(AKind) <> "");
+    end;
+
+    hidden method DoIsFloat(const AKind: CTypeKind): bool;
+    begin
+      return (AKind = CTypeKind.Float) or (AKind = CTypeKind.Double);
+    end;
+
+    // C's integer promotion: a kind below int's rank is int (every value fits)
+    hidden method DoPromote(const AKind: CTypeKind): CTypeKind;
+    begin
+      if self.DoRank(AKind) < 4 then
+        return CTypeKind.Int;
+      end;
+      return AKind;
+    end;
+
+    // The usual arithmetic conversions of two integer kinds
+    hidden method DoCommon(const A: CTypeKind; const B: CTypeKind): CTypeKind;
+    var
+      LA: CTypeKind;
+      LB: CTypeKind;
+      LSigned: CTypeKind;
+      LUnsigned: CTypeKind;
+    begin
+      LA := self.DoPromote(A);
+      LB := self.DoPromote(B);
+      if LA = LB then
+        return LA;
+      end;
+      if self.DoSigned(LA) = self.DoSigned(LB) then
+        if self.DoRank(LA) >= self.DoRank(LB) then
+          return LA;
+        end;
+        return LB;
+      end;
+      if self.DoSigned(LA) then
+        LSigned := LA;
+        LUnsigned := LB;
+      else
+        LSigned := LB;
+        LUnsigned := LA;
+      end;
+      if self.DoRank(LUnsigned) >= self.DoRank(LSigned) then
+        return LUnsigned;
+      end;
+      if self.DoSize(LSigned) > self.DoSize(LUnsigned) then
+        return LSigned;
+      end;
+      return self.DoUnsignedOf(LSigned);
+    end;
+
+    // AValue's bits as the integer kind AKind holds them (cut to its size, sign-extended for
+    // a signed one; a _Bool 0 or 1)
+    hidden method DoWrap(const AValue: int64; const AKind: CTypeKind): int64;
+    var
+      LBits: int64;
+      LValue: int64;
+    begin
+      if AKind = CTypeKind.Bool then
+        return int64(AValue <> 0);
+      end;
+      LBits := self.DoSize(AKind) * 8;
+      if (LBits <= 0) or (LBits >= 64) then
+        return AValue;
+      end;
+      LValue := AValue & ((int64(1) << LBits) - 1);
+      if self.DoSigned(AKind) and (((LValue >> (LBits - 1)) & 1) <> 0) then
+        LValue := LValue - (int64(1) << LBits);
+      end;
+      return LValue;
+    end;
+
+    // True when AValue (exact) is a value of the signed kind AKind
+    hidden method DoFitsSigned(const AValue: int64; const AKind: CTypeKind): bool;
+    var
+      LBits: int64;
+    begin
+      LBits := self.DoSize(AKind) * 8;
+      if LBits >= 64 then
+        return true;
+      end;
+      return (AValue >= 0 - (int64(1) << (LBits - 1))) and (AValue < (int64(1) << (LBits - 1)));
+    end;
+
+    // True when the unsigned AValue is at most the largest value of the kind AKind
+    hidden method DoFitsKind(const AValue: uint64; const AKind: CTypeKind): bool;
+    var
+      LBits: int64;
+    begin
+      LBits := self.DoSize(AKind) * 8;
+      if self.DoSigned(AKind) then
+        LBits := LBits - 1;
+      end;
+      if LBits >= 64 then
+        return true;
+      end;
+      return AValue <= (uint64(1) << uint64(LBits)) - 1u;
+    end;
+
+    // sizeof's type: the target's __SIZE_TYPE__ read as a type name; ADAM_CIMPORT_NONE when
+    // the predefines give none
+    hidden method DoSizeType(): int64;
+    var
+      LMacro: PpMacro;
+      LPos: int64;
+      LI: int64;
+    begin
+      if self.FSizeType <> ADAM_CIMPORT_MACRO_UNKNOWN then
+        return self.FSizeType;
+      end;
+      self.FSizeType := ADAM_CIMPORT_NONE;
+      for LI := 0 to self.FPre.MacroCount() - 1 do
+        LMacro := self.FPre.MacroAt(LI);
+        if LMacro.Active and (LMacro.Name = ADAM_CIMPORT_MACRO_SIZE_TYPE) then
+          LPos := 0;
+          self.FSizeType := self.FParser.TypeNameIn(LMacro.Body, LPos);
+          if LPos <> len(LMacro.Body) then
+            self.FSizeType := ADAM_CIMPORT_NONE;
+          end;
+        end;
+      end;
+      return self.FSizeType;
+    end;
+
+    // ---- values ----------------------------------------------------------------------------
+
+    // The first reason the evaluation fails kept; always false (a parse step's result)
+    hidden method DoFail(const AWhy: string): bool;
+    begin
+      if self.FWhy = "" then
+        self.FWhy := AWhy;
+      end;
+      return false;
+    end;
+
+    // A fault C forgives where it does not evaluate (?: && ||'s other arm): false (AWhy) only
+    // where it is evaluated
+    hidden method DoFault(const AWhy: string): bool;
+    begin
+      if self.FDead > 0 then
+        return true;
+      end;
+      return self.DoFail(AWhy);
+    end;
+
+    hidden method DoInt(const AValue: int64; const AKind: CTypeKind): MacroValue;
+    var
+      LValue: MacroValue;
+    begin
+      LValue.Kind := MacroValueKind.Int;
+      LValue.TypeId := self.DoBuiltin(AKind);
+      LValue.Value := AValue;
+      LValue.Real := 0.0;
+      LValue.Text := "";
+      LValue.Spelling := "";
+      LValue.IsBool := false;
+      return LValue;
+    end;
+
+    hidden method DoFloat(const AReal: float64; const AKind: CTypeKind): MacroValue;
+    var
+      LValue: MacroValue;
+    begin
+      LValue := self.DoInt(0, AKind);
+      LValue.Kind := MacroValueKind.Float;
+      LValue.Real := AReal;
+      if AKind = CTypeKind.Float then
+        LValue.Real := float64(float32(AReal));
+      end;
+      return LValue;
+    end;
+
+    hidden method DoRuntime(const AText: string; const ATypeId: int64; const ABool: bool):
+      MacroValue;
+    var
+      LValue: MacroValue;
+    begin
+      LValue := self.DoInt(0, CTypeKind.Int);
+      LValue.Kind := MacroValueKind.Runtime;
+      LValue.TypeId := ATypeId;
+      LValue.Text := AText;
+      LValue.IsBool := ABool;
+      return LValue;
+    end;
+
+    // True when AValue is a number (an integer or float constant)
+    hidden method DoIsNumber(const AValue: MacroValue): bool;
+    begin
+      return (AValue.Kind = MacroValueKind.Int) or (AValue.Kind = MacroValueKind.Float);
+    end;
+
+    // True when AValue computes as a number (a constant one, or run-time text of a number
+    // type)
+    hidden method DoIsArithmetic(const AValue: MacroValue): bool;
+    var
+      LKind: CTypeKind;
+    begin
+      if self.DoIsNumber(AValue) then
+        return true;
+      end;
+      if AValue.Kind <> MacroValueKind.Runtime then
+        return false;
+      end;
+      if AValue.IsBool then
+        return true;
+      end;
+      LKind := self.DoKindOf(AValue.TypeId);
+      return self.DoIsInteger(LKind) or self.DoIsFloat(LKind);
+    end;
+
+    // The kind AValue computes as (a run-time bool's C type is its own: int or _Bool)
+    hidden method DoValueKind(const AValue: MacroValue): CTypeKind;
+    begin
+      return self.DoKindOf(AValue.TypeId);
+    end;
+
+    // The number AValue converted to the arithmetic kind AKind as C converts it; false (the
+    // reason kept) when a float does not fit the integer kind
+    hidden method DoConvert(var AValue: MacroValue; const AKind: CTypeKind): bool;
+    var
+      LFrom: CTypeKind;
+      LReal: float64;
+    begin
+      LFrom := self.DoValueKind(AValue);
+      if AValue.Kind = MacroValueKind.Int then
+        if self.DoIsFloat(AKind) then
+          if self.DoSigned(LFrom) or (AValue.Value >= 0) then
+            LReal := float64(AValue.Value);
+          else
+            LReal := float64(uint64(AValue.Value));
+          end;
+          AValue := self.DoFloat(LReal, AKind);
+          return true;
+        end;
+        AValue := self.DoInt(self.DoWrap(AValue.Value, AKind), AKind);
+        return true;
+      end;
+      if AValue.Kind = MacroValueKind.Float then
+        if self.DoIsFloat(AKind) then
+          if AKind <> LFrom then
+            AValue.Spelling := "";
+          end;
+          LReal := AValue.Real;
+          AValue := self.DoFloat(LReal, AKind);
+          return true;
+        end;
+        // a float to an integer: truncated; a value the kind does not hold is no constant
+        if AKind = CTypeKind.Bool then
+          AValue := self.DoInt(int64(AValue.Real <> 0.0), AKind);
+          return true;
+        end;
+        if not (AValue.Real > -9223372036854775808.0) or not (AValue.Real < 9223372036854775808.0) then
+          return self.DoFault(NoArgs().Str(CKindText(AKind)).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_OVERFLOW));
+        end;
+        LReal := AValue.Real;
+        AValue := self.DoInt(int64(LReal), AKind);
+        if self.DoSigned(AKind) and not self.DoFitsSigned(AValue.Value, AKind) then
+          return self.DoFault(NoArgs().Str(CKindText(AKind)).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_OVERFLOW));
+        end;
+        AValue.Value := self.DoWrap(AValue.Value, AKind);
+        return true;
+      end;
+      return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+    end;
+
+    // The Adam text of the constant AValue (see the header); "" (the reason kept) when Adam
+    // has no literal for it
+    hidden method DoConstText(const AValue: MacroValue): string;
+    var
+      LKind: CTypeKind;
+      LText: string;
+    begin
+      LKind := self.DoValueKind(AValue);
+      if AValue.Kind = MacroValueKind.Int then
+        if LKind = CTypeKind.Bool then
+          if AValue.Value <> 0 then
+            return "true";
+          end;
+          return "false";
+        end;
+        if LKind = CTypeKind.Char then
+          if (AValue.Value & 255) = 39 then
+            return "'\\''";
+          end;
+          return "'" + DoByteText(AValue.Value & 255) + "'";
+        end;
+        if self.DoSigned(LKind) then
+          if AValue.Value = ADAM_CIMPORT_MACRO_INT64_MIN then
+            return ADAM_CIMPORT_MACRO_INT64_MIN_TEXT;
+          end;
+          return IntToStr(AValue.Value);
+        end;
+        if uint64(AValue.Value) > ADAM_CIMPORT_MACRO_INT64_MAX then
+          return UIntToStr(uint64(AValue.Value)) + "u";
+        end;
+        return UIntToStr(uint64(AValue.Value));
+      end;
+      if AValue.Kind = MacroValueKind.Float then
+        LText := AValue.Spelling;
+        if LText = "" then
+          LText := FloatToStr(AValue.Real);
+        end;
+        if (IndexOf("inf", LText, 0) >= 0) or (IndexOf("nan", LText, 0) >= 0) then
+          self.DoFail(NoArgs().Str(LText).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_FLOAT));
+          return "";
+        end;
+        if not DoHasFloatMark(LText) then
+          LText := LText + ".0";
+        end;
+        if LKind = CTypeKind.Float then
+          LText := LText + "f";
+        end;
+        return LText;
+      end;
+      // a string's (and a compound literal's) Adam text is made when it is read
+      return AValue.Text;
+    end;
+
+    // AValue as Adam text of the arithmetic kind AKind: a constant converted and written, a
+    // run-time value cast where its kind is another (a bool as 0 / 1)
+    hidden method DoArithText(const AValue: MacroValue; const AKind: CTypeKind): string;
+    var
+      LValue: MacroValue;
+    begin
+      if self.DoIsNumber(AValue) then
+        LValue := AValue;
+        if not self.DoConvert(LValue, AKind) then
+          return "";
+        end;
+        return DoOperand(self.DoConstText(LValue));
+      end;
+      if AKind = CTypeKind.Bool then
+        return self.DoBoolText(AValue);
+      end;
+      if AValue.IsBool or (self.DoValueKind(AValue) <> AKind) then
+        return BuiltinName(AKind) + "(" + AValue.Text + ")";
+      end;
+      return AValue.Text;
+    end;
+
+    // AValue as an Adam bool's text (C's test against 0)
+    hidden method DoBoolText(const AValue: MacroValue): string;
+    begin
+      if self.DoIsNumber(AValue) then
+        if ((AValue.Kind = MacroValueKind.Int) and (AValue.Value <> 0)) or
+          ((AValue.Kind = MacroValueKind.Float) and (AValue.Real <> 0.0)) then
+          return "true";
+        end;
+        return "false";
+      end;
+      if AValue.IsBool then
+        return AValue.Text;
+      end;
+      return "(" + AValue.Text + " <> 0)";
+    end;
+
+    // True when the constant AValue is not 0
+    hidden method DoTrue(const AValue: MacroValue): bool;
+    begin
+      if AValue.Kind = MacroValueKind.Float then
+        return AValue.Real <> 0.0;
+      end;
+      return AValue.Value <> 0;
+    end;
+
+    // ---- tokens ----------------------------------------------------------------------------
+
+    hidden method DoTok(): PpToken;
+    var
+      LTok: PpToken;
+    begin
+      if self.FPos < len(self.FToks) then
+        return self.FToks[self.FPos];
+      end;
+      LTok.Kind := PpKind.EndOfFile;
+      LTok.Text := "";
+      LTok.File := -1;
+      LTok.Line := 0;
+      LTok.Column := 0;
+      LTok.Space := false;
+      LTok.LineStart := true;
+      LTok.Hide := 0;
+      return LTok;
+    end;
+
+    hidden method DoIs(const AText: string): bool;
+    var
+      LTok: PpToken;
+    begin
+      LTok := self.DoTok();
+      return ((LTok.Kind = PpKind.Punct) or (LTok.Kind = PpKind.Identifier)) and
+        (LTok.Text = AText);
+    end;
+
+    hidden method DoNext();
+    begin
+      if self.FPos < len(self.FToks) then
+        self.FPos := self.FPos + 1;
+      end;
+    end;
+
+    hidden method DoExpect(const AText: string): bool;
+    begin
+      if self.DoIs(AText) then
+        self.DoNext();
+        return true;
+      end;
+      return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+    end;
+
+    // The parameter AName's index; -1 when it is none (or the macro is object-like)
+    hidden method DoParamIndex(const AName: string): int64;
+    var
+      LI: int64;
+    begin
+      if not self.FFunction then
+        return -1;
+      end;
+      for LI := 0 to len(self.FParams) - 1 do
+        if self.FParams[LI] = AName then
+          return LI;
+        end;
+      end;
+      return -1;
+    end;
+
+    // ---- expressions (C's grammar) ---------------------------------------------------------
+
+    hidden method DoExpr(var AValue: MacroValue): bool;
+    var
+      LThen: MacroValue;
+      LElse: MacroValue;
+      LKind: CTypeKind;
+      LTaken: bool;
+    begin
+      if not self.DoBinary(0, AValue) then
+        return false;
+      end;
+      if not self.DoIs("?") then
+        return true;
+      end;
+      self.DoNext();
+      if self.DoIsNumber(AValue) then
+        LTaken := self.DoTrue(AValue);
+        if not LTaken then
+          self.FDead := self.FDead + 1;
+        end;
+        if not self.DoExpr(LThen) then
+          return false;
+        end;
+        if not LTaken then
+          self.FDead := self.FDead - 1;
+        end;
+        if not self.DoExpect(":") then
+          return false;
+        end;
+        if LTaken then
+          self.FDead := self.FDead + 1;
+        end;
+        if not self.DoExpr(LElse) then
+          return false;
+        end;
+        if LTaken then
+          self.FDead := self.FDead - 1;
+        end;
+        if not self.DoIsNumber(LThen) or not self.DoIsNumber(LElse) then
+          return self.DoArmsText(AValue, LThen, LElse);
+        end;
+        LKind := self.DoArmsKind(LThen, LElse);
+        if LTaken then
+          AValue := LThen;
+        else
+          AValue := LElse;
+        end;
+        return self.DoConvert(AValue, LKind);
+      end;
+      if not self.DoExpr(LThen) then
+        return false;
+      end;
+      if not self.DoExpect(":") then
+        return false;
+      end;
+      if not self.DoExpr(LElse) then
+        return false;
+      end;
+      return self.DoArmsText(AValue, LThen, LElse);
+    end;
+
+    // The common kind of two arithmetic arms
+    hidden method DoArmsKind(const AThen: MacroValue; const AElse: MacroValue): CTypeKind;
+    var
+      LThen: CTypeKind;
+      LElse: CTypeKind;
+    begin
+      LThen := self.DoValueKind(AThen);
+      LElse := self.DoValueKind(AElse);
+      if self.DoIsFloat(LThen) or self.DoIsFloat(LElse) then
+        if (LThen = CTypeKind.Double) or (LElse = CTypeKind.Double) then
+          return CTypeKind.Double;
+        end;
+        return CTypeKind.Float;
+      end;
+      return self.DoCommon(LThen, LElse);
+    end;
+
+    // ACond ? AThen : AElse evaluated at run time (Adam's ?:, both arms of their common kind)
+    hidden method DoArmsText(var ACond: MacroValue; const AThen: MacroValue;
+      const AElse: MacroValue): bool;
+    var
+      LKind: CTypeKind;
+      LText: string;
+    begin
+      if not self.DoIsArithmetic(ACond) or not self.DoIsArithmetic(AThen) or
+        not self.DoIsArithmetic(AElse) then
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+      end;
+      LKind := self.DoArmsKind(AThen, AElse);
+      LText := "(" + self.DoBoolText(ACond) + " ? " + self.DoArithText(AThen, LKind) + " : " +
+        self.DoArithText(AElse, LKind) + ")";
+      ACond := self.DoRuntime(LText, self.DoBuiltin(LKind), false);
+      return self.FWhy = "";
+    end;
+
+    // The binding strength of the binary operator at the cursor (C's: 1 || .. 10 * / %); 0
+    // for none
+    hidden method DoPrecedence(): int64;
+    var
+      LTok: PpToken;
+    begin
+      LTok := self.DoTok();
+      if LTok.Kind <> PpKind.Punct then
+        return 0;
+      end;
+      match LTok.Text of
+        "||": return 1;
+        "&&": return 2;
+        "|": return 3;
+        "^": return 4;
+        "&": return 5;
+        "==", "!=": return 6;
+        "<", ">", "<=", ">=": return 7;
+        "<<", ">>": return 8;
+        "+", "-": return 9;
+        "*", "/", "%": return 10;
+      end;
+      return 0;
+    end;
+
+    // A binary expression whose operators bind tighter than AMin (precedence climbing); the
+    // right side of && / || C does not evaluate when the left one decides
+    hidden method DoBinary(const AMin: int64; var AValue: MacroValue): bool;
+    var
+      LPrec: int64;
+      LOp: string;
+      LRight: MacroValue;
+      LDead: bool;
+    begin
+      if not self.DoUnary(AValue) then
+        return false;
+      end;
+      while true do
+        LPrec := self.DoPrecedence();
+        if LPrec <= AMin then
+          leave;
+        end;
+        LOp := self.DoTok().Text;
+        self.DoNext();
+        LDead := false;
+        if self.DoIsNumber(AValue) and (((LOp = "&&") and not self.DoTrue(AValue)) or
+          ((LOp = "||") and self.DoTrue(AValue))) then
+          LDead := true;
+          self.FDead := self.FDead + 1;
+        end;
+        if not self.DoBinary(LPrec, LRight) then
+          return false;
+        end;
+        if LDead then
+          self.FDead := self.FDead - 1;
+        end;
+        if not self.DoApply(LOp, AValue, LRight) then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    // AValue := AValue op ARight (see the header)
+    hidden method DoApply(const AOp: string; var AValue: MacroValue; const ARight: MacroValue):
+      bool;
+    var
+      LKind: CTypeKind;
+      LLeft: MacroValue;
+      LRight: MacroValue;
+      LFloat: bool;
+      LCompare: bool;
+      LAdam: string;
+    begin
+      if not self.DoIsArithmetic(AValue) or not self.DoIsArithmetic(ARight) then
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+      end;
+      if (AOp = "&&") or (AOp = "||") then
+        if self.DoIsNumber(AValue) and self.DoIsNumber(ARight) then
+          if AOp = "&&" then
+            AValue := self.DoInt(int64(self.DoTrue(AValue) and self.DoTrue(ARight)), CTypeKind.Int);
+          else
+            AValue := self.DoInt(int64(self.DoTrue(AValue) or self.DoTrue(ARight)), CTypeKind.Int);
+          end;
+          return true;
+        end;
+        LAdam := " and ";
+        if AOp = "||" then
+          LAdam := " or ";
+        end;
+        AValue := self.DoRuntime("(" + self.DoBoolText(AValue) + LAdam + self.DoBoolText(ARight) +
+          ")", self.DoBuiltin(CTypeKind.Int), true);
+        return true;
+      end;
+      LCompare := (AOp = "==") or (AOp = "!=") or (AOp = "<") or (AOp = ">") or (AOp = "<=") or
+        (AOp = ">=");
+      LFloat := self.DoIsFloat(self.DoValueKind(AValue)) or self.DoIsFloat(self.DoValueKind(ARight));
+      if LFloat and ((AOp = "%") or (AOp = "<<") or (AOp = ">>") or (AOp = "&") or (AOp = "|") or
+        (AOp = "^")) then
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+      end;
+      if (AOp = "<<") or (AOp = ">>") then
+        // a shift's type is its left operand's, promoted
+        LKind := self.DoPromote(self.DoValueKind(AValue));
+      else
+        LKind := self.DoArmsKind(AValue, ARight);
+      end;
+      if self.DoIsNumber(AValue) and self.DoIsNumber(ARight) then
+        LLeft := AValue;
+        LRight := ARight;
+        if (AOp = "<<") or (AOp = ">>") then
+          if not self.DoConvert(LLeft, LKind) or
+            not self.DoConvert(LRight, self.DoPromote(self.DoValueKind(LRight))) then
+            return false;
+          end;
+        else
+          if not self.DoConvert(LLeft, LKind) or not self.DoConvert(LRight, LKind) then
+            return false;
+          end;
+        end;
+        if LFloat then
+          return self.DoFoldFloat(AOp, LKind, LLeft.Real, LRight.Real, AValue);
+        end;
+        return self.DoFoldInt(AOp, LKind, LLeft.Value, LRight, AValue);
+      end;
+      // at run time: both sides of the common kind, the operator as Adam spells it
+      LAdam := AOp;
+      match AOp of
+        "^": LAdam := "xor";
+        "==": LAdam := "=";
+        "!=": LAdam := "<>";
+        "/":
+          if not LFloat then
+            LAdam := "div";
+          end;
+        "%": LAdam := "mod";
+      else
+      end;
+      if (AOp = "<<") or (AOp = ">>") then
+        AValue := self.DoRuntime("(" + self.DoArithText(AValue, LKind) + " " + LAdam + " " +
+          self.DoArithText(ARight, self.DoPromote(self.DoValueKind(ARight))) + ")",
+          self.DoBuiltin(LKind), false);
+        return self.FWhy = "";
+      end;
+      AValue := self.DoRuntime("(" + self.DoArithText(AValue, LKind) + " " + LAdam + " " +
+        self.DoArithText(ARight, LKind) + ")", self.DoBuiltin(LKind), LCompare);
+      if LCompare then
+        AValue.TypeId := self.DoBuiltin(CTypeKind.Int);
+      end;
+      return self.FWhy = "";
+    end;
+
+    // A float operator on two constants of the float kind AKind
+    hidden method DoFoldFloat(const AOp: string; const AKind: CTypeKind; const A: float64;
+      const B: float64; var AValue: MacroValue): bool;
+    begin
+      match AOp of
+        "+": AValue := self.DoFloat(A + B, AKind);
+        "-": AValue := self.DoFloat(A - B, AKind);
+        "*": AValue := self.DoFloat(A * B, AKind);
+        "/": AValue := self.DoFloat(A / B, AKind);
+        "==": AValue := self.DoInt(int64(A = B), CTypeKind.Int);
+        "!=": AValue := self.DoInt(int64(A <> B), CTypeKind.Int);
+        "<": AValue := self.DoInt(int64(A < B), CTypeKind.Int);
+        ">": AValue := self.DoInt(int64(A > B), CTypeKind.Int);
+        "<=": AValue := self.DoInt(int64(A <= B), CTypeKind.Int);
+        ">=": AValue := self.DoInt(int64(A >= B), CTypeKind.Int);
+      else
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+      end;
+      return true;
+    end;
+
+    // An integer operator on A and ARight (both converted: of AKind, a shift's count its own
+    // promoted kind); a signed result past its kind, a division by zero or a shift outside
+    // the kind is no constant
+    hidden method DoFoldInt(const AOp: string; const AKind: CTypeKind; const A: int64;
+      const ARight: MacroValue; var AValue: MacroValue): bool;
+    var
+      LSigned: bool;
+      LB: int64;
+      LBits: int64;
+      LResult: int64;
+      LUA: uint64;
+      LUB: uint64;
+      LOverflow: bool;
+    begin
+      LSigned := self.DoSigned(AKind);
+      LB := ARight.Value;
+      LBits := self.DoSize(AKind) * 8;
+      LUA := uint64(A);
+      LUB := uint64(LB);
+      LOverflow := false;
+      LResult := 0;
+      match AOp of
+        "==": LResult := int64(A = LB);
+        "!=": LResult := int64(A <> LB);
+        "<", ">", "<=", ">=":
+          if LSigned then
+            match AOp of
+              "<": LResult := int64(A < LB);
+              ">": LResult := int64(A > LB);
+              "<=": LResult := int64(A <= LB);
+              ">=": LResult := int64(A >= LB);
+            end;
+          else
+            match AOp of
+              "<": LResult := int64(LUA < LUB);
+              ">": LResult := int64(LUA > LUB);
+              "<=": LResult := int64(LUA <= LUB);
+              ">=": LResult := int64(LUA >= LUB);
+            end;
+          end;
+          AValue := self.DoInt(LResult, CTypeKind.Int);
+          return true;
+        "&": LResult := A & LB;
+        "|": LResult := A | LB;
+        "^": LResult := A xor LB;
+        "<<", ">>":
+          // the count is of its own kind: negative only when that kind is signed
+          if (self.DoSigned(self.DoValueKind(ARight)) and (LB < 0)) or (LUB >= uint64(LBits)) then
+            if not self.DoFault(NoArgs().Str(IntToStr(LB)).Str(CKindText(AKind)).Fill(
+              ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_SHIFT)) then
+              return false;
+            end;
+            LUB := 0u;
+          end;
+          if AOp = "<<" then
+            LResult := int64(LUA << LUB);
+          else
+            if LSigned then
+              LResult := A >> int64(LUB);
+            else
+              LResult := int64(LUA >> LUB);
+            end;
+          end;
+        "+":
+          LResult := int64(LUA + LUB);
+          if LSigned and (LBits >= 64) then
+            LOverflow := (((A xor LResult) & (LB xor LResult)) < 0);
+          end;
+        "-":
+          LResult := int64(LUA - LUB);
+          if LSigned and (LBits >= 64) then
+            LOverflow := (((A xor LB) & (A xor LResult)) < 0);
+          end;
+        "*":
+          LResult := int64(LUA * LUB);
+          if LSigned and (LBits >= 64) and (A <> 0) then
+            LOverflow := ((A = -1) and (LB = ADAM_CIMPORT_MACRO_INT64_MIN)) or
+              ((LB = -1) and (A = ADAM_CIMPORT_MACRO_INT64_MIN)) or
+              ((LResult div A) <> LB);
+          end;
+          if LSigned and (LBits < 64) then
+            // both fit 32 bits: the exact product fits 64
+            LResult := A * LB;
+          end;
+        "/", "%":
+          if LB = 0 then
+            if not self.DoFault(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_DIVIDE) then
+              return false;
+            end;
+            AValue := self.DoInt(0, AKind);
+            return true;
+          end;
+          if LSigned then
+            if (A = ADAM_CIMPORT_MACRO_INT64_MIN) and (LB = -1) and (LBits >= 64) then
+              LOverflow := true;
+              LResult := A;
+            else
+              if AOp = "/" then
+                LResult := A div LB;
+              else
+                LResult := A mod LB;
+              end;
+            end;
+          else
+            if AOp = "/" then
+              LResult := int64(LUA div LUB);
+            else
+              LResult := int64(LUA mod LUB);
+            end;
+          end;
+      else
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+      end;
+      if LSigned and (LBits < 64) and not self.DoFitsSigned(LResult, AKind) and
+        (AOp <> "<<") and (AOp <> "&") and (AOp <> "|") and (AOp <> "^") then
+        LOverflow := true;
+      end;
+      if LOverflow then
+        if not self.DoFault(NoArgs().Str(CKindText(AKind)).Fill(
+          ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_OVERFLOW)) then
+          return false;
+        end;
+      end;
+      AValue := self.DoInt(self.DoWrap(LResult, AKind), AKind);
+      return true;
+    end;
+
+    // A unary expression: - + ~ !, sizeof / _Alignof, a cast, a compound literal, a primary
+    hidden method DoUnary(var AValue: MacroValue): bool;
+    var
+      LTok: PpToken;
+      LTypeId: int64;
+      LKind: CTypeKind;
+      LOperand: MacroValue;
+      LSave: int64;
+    begin
+      LTok := self.DoTok();
+      if (LTok.Kind = PpKind.Punct) and ((LTok.Text = "-") or (LTok.Text = "+") or
+        (LTok.Text = "~") or (LTok.Text = "!")) then
+        self.DoNext();
+        if not self.DoUnary(AValue) then
+          return false;
+        end;
+        if not self.DoIsArithmetic(AValue) then
+          return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+        end;
+        if LTok.Text = "!" then
+          if self.DoIsNumber(AValue) then
+            AValue := self.DoInt(int64(not self.DoTrue(AValue)), CTypeKind.Int);
+            return true;
+          end;
+          AValue := self.DoRuntime("(not " + self.DoBoolText(AValue) + ")",
+            self.DoBuiltin(CTypeKind.Int), true);
+          return true;
+        end;
+        LKind := self.DoValueKind(AValue);
+        if not self.DoIsFloat(LKind) then
+          LKind := self.DoPromote(LKind);
+        else
+          if LTok.Text = "~" then
+            return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+          end;
+        end;
+        if LTok.Text = "+" then
+          if self.DoIsNumber(AValue) then
+            return self.DoConvert(AValue, LKind);
+          end;
+          AValue := self.DoRuntime(self.DoArithText(AValue, LKind), self.DoBuiltin(LKind), false);
+          return true;
+        end;
+        if self.DoIsNumber(AValue) then
+          if not self.DoConvert(AValue, LKind) then
+            return false;
+          end;
+          if AValue.Kind = MacroValueKind.Float then
+            AValue.Real := 0.0 - AValue.Real;
+            if AValue.Spelling <> "" then
+              AValue.Spelling := "-" + AValue.Spelling;
+            end;
+            return true;
+          end;
+          if LTok.Text = "~" then
+            AValue := self.DoInt(self.DoWrap(~AValue.Value, LKind), LKind);
+            return true;
+          end;
+          LOperand := AValue;
+          return self.DoFoldInt("-", LKind, 0, LOperand, AValue);
+        end;
+        AValue := self.DoRuntime("(" + LTok.Text + self.DoArithText(AValue, LKind) + ")",
+          self.DoBuiltin(LKind), false);
+        return self.FWhy = "";
+      end;
+      if (LTok.Kind = PpKind.Identifier) and ((LTok.Text = "sizeof") or
+        (LTok.Text = "_Alignof") or (LTok.Text = "alignof") or (LTok.Text = "__alignof__") or
+        (LTok.Text = "__alignof")) then
+        self.DoNext();
+        return self.DoSizeof(LTok.Text = "sizeof", AValue);
+      end;
+      if self.DoIs("(") then
+        LSave := self.FPos;
+        self.DoNext();
+        LTypeId := self.FParser.TypeNameIn(self.FToks, self.FPos);
+        if LTypeId <> ADAM_CIMPORT_NONE then
+          if not self.DoExpect(")") then
+            return false;
+          end;
+          if self.DoIs("{") then
+            return self.DoCompound(LTypeId, AValue);
+          end;
+          if not self.DoUnary(AValue) then
+            return false;
+          end;
+          return self.DoCast(LTypeId, AValue);
+        end;
+        self.FPos := LSave;
+      end;
+      return self.DoPrimary(AValue);
+    end;
+
+    // sizeof (ASize) or _Alignof of a type name in parentheses or of an expression's type
+    // (never evaluated): size_t
+    hidden method DoSizeof(const ASize: bool; var AValue: MacroValue): bool;
+    var
+      LTypeId: int64;
+      LSizeType: int64;
+      LSize: int64;
+      LSave: int64;
+      LOperand: MacroValue;
+    begin
+      LTypeId := ADAM_CIMPORT_NONE;
+      if self.DoIs("(") then
+        LSave := self.FPos;
+        self.DoNext();
+        LTypeId := self.FParser.TypeNameIn(self.FToks, self.FPos);
+        if LTypeId <> ADAM_CIMPORT_NONE then
+          if not self.DoExpect(")") then
+            return false;
+          end;
+        else
+          self.FPos := LSave;
+        end;
+      end;
+      LSize := -1;
+      if LTypeId = ADAM_CIMPORT_NONE then
+        self.FDead := self.FDead + 1;
+        if not self.DoUnary(LOperand) then
+          return false;
+        end;
+        self.FDead := self.FDead - 1;
+        if LOperand.Kind = MacroValueKind.Text then
+          LSize := LOperand.Value + 1;
+          if not ASize then
+            LSize := 1;
+          end;
+        else
+          LTypeId := LOperand.TypeId;
+        end;
+      end;
+      if LSize < 0 then
+        if ASize then
+          LSize := self.FTypes.SizeOf(LTypeId);
+        else
+          LSize := self.FTypes.AlignOf(LTypeId);
+        end;
+      end;
+      if LSize < 0 then
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_NO_SIZE);
+      end;
+      LSizeType := self.DoSizeType();
+      if LSizeType = ADAM_CIMPORT_NONE then
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_SIZE_TYPE);
+      end;
+      AValue := self.DoInt(LSize, self.DoKindOf(LSizeType));
+      AValue.TypeId := LSizeType;
+      return true;
+    end;
+
+    // (ATypeId) AValue: an integer, _Bool or float type takes the value as C converts it
+    // (the type kept: a typedef's name types the constant); a pointer has no Adam const
+    hidden method DoCast(const ATypeId: int64; var AValue: MacroValue): bool;
+    var
+      LKind: CTypeKind;
+      LType: CType;
+      LText: string;
+    begin
+      LType := self.FTypes.Item(self.FTypes.Resolved(ATypeId));
+      LKind := self.DoKindOf(ATypeId);
+      if (LType.Kind = CTypeKind.Void) and (AValue.Kind = MacroValueKind.Runtime) then
+        AValue.Kind := MacroValueKind.Void;
+        AValue.TypeId := ATypeId;
+        return true;
+      end;
+      if LType.Kind = CTypeKind.Pointer then
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_POINTER);
+      end;
+      if LKind = CTypeKind.LongDouble then
+        return self.DoFail(NoArgs().Str(CKindText(LKind)).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_TYPE));
+      end;
+      if not (self.DoIsInteger(LKind) or self.DoIsFloat(LKind)) or
+        not self.DoIsArithmetic(AValue) then
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+      end;
+      if self.DoIsNumber(AValue) then
+        if not self.DoConvert(AValue, LKind) then
+          return false;
+        end;
+        AValue.TypeId := ATypeId;
+        return true;
+      end;
+      LText := self.DoArithText(AValue, LKind);
+      AValue := self.DoRuntime(LText, ATypeId, LKind = CTypeKind.Bool);
+      return self.FWhy = "";
+    end;
+
+    // (ATypeId){ .. }: a struct's compound literal as an Adam record literal's field inits,
+    // each a constant number converted to its field's type (.name = designators; the fields
+    // not given 0)
+    hidden method DoCompound(const ATypeId: int64; var AValue: MacroValue): bool;
+    var
+      LType: CType;
+      LRecord: CRecord;
+      LTexts: StringArray;
+      LInit: MacroValue;
+      LKind: CTypeKind;
+      LOut: ref TextBuilder;
+      LField: int64;
+      LI: int64;
+      LJ: int64;
+      LWhy: string;
+    begin
+      LType := self.FTypes.Item(self.FTypes.Resolved(ATypeId));
+      LWhy := NoArgs().Str(self.DoTypeSpelling(ATypeId)).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_RECORD);
+      if LType.Kind <> CTypeKind.Record then
+        return self.DoFail(LWhy);
+      end;
+      LRecord := self.FTypes.RecordAt(LType.Index);
+      if not LRecord.Complete or LRecord.IsUnion or LRecord.HasBitfields or LRecord.HasFlexible then
+        return self.DoFail(LWhy);
+      end;
+      setlength(LTexts, len(LRecord.Fields));
+      for LI := 0 to len(LRecord.Fields) - 1 do
+        LKind := self.DoKindOf(LRecord.Fields[LI].TypeId);
+        if (LRecord.Fields[LI].Name = "") or not (self.DoIsInteger(LKind) or self.DoIsFloat(LKind)) then
+          return self.DoFail(LWhy);
+        end;
+        LTexts[LI] := "";
+      end;
+      self.DoNext();
+      LField := 0;
+      while not self.DoIs("}") do
+        if self.DoIs(".") then
+          self.DoNext();
+          LField := -1;
+          for LJ := 0 to len(LRecord.Fields) - 1 do
+            if LRecord.Fields[LJ].Name = self.DoTok().Text then
+              LField := LJ;
+            end;
+          end;
+          if LField < 0 then
+            return self.DoFail(LWhy);
+          end;
+          self.DoNext();
+          if not self.DoExpect("=") then
+            return false;
+          end;
+        end;
+        if LField >= len(LRecord.Fields) then
+          return self.DoFail(LWhy);
+        end;
+        if not self.DoExpr(LInit) then
+          return false;
+        end;
+        if not self.DoIsNumber(LInit) then
+          return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+        end;
+        if not self.DoConvert(LInit, self.DoKindOf(LRecord.Fields[LField].TypeId)) then
+          return false;
+        end;
+        LInit.TypeId := LRecord.Fields[LField].TypeId;
+        LTexts[LField] := self.DoConstText(LInit);
+        if LTexts[LField] = "" then
+          return false;
+        end;
+        LField := LField + 1;
+        if not self.DoIs(",") then
+          leave;
+        end;
+        self.DoNext();
+      end;
+      if not self.DoExpect("}") then
+        return false;
+      end;
+      LOut := ref TextBuilder();
+      for LI := 0 to len(LRecord.Fields) - 1 do
+        if LI > 0 then
+          LOut.Add(", ");
+        end;
+        if LTexts[LI] = "" then
+          LInit := self.DoInt(0, CTypeKind.Int);
+          if not self.DoConvert(LInit, self.DoKindOf(LRecord.Fields[LI].TypeId)) then
+            return false;
+          end;
+          LInit.TypeId := LRecord.Fields[LI].TypeId;
+          LTexts[LI] := self.DoConstText(LInit);
+        end;
+        LOut.Add(DoLocalName(LRecord.Fields[LI].Name) + ": " + LTexts[LI]);
+      end;
+      AValue := self.DoInt(0, CTypeKind.Int);
+      AValue.Kind := MacroValueKind.Literal;
+      AValue.TypeId := ATypeId;
+      AValue.Text := LOut.Text();
+      return true;
+    end;
+
+    // How a report names the type AId: a typedef's name, a tag, else C's kind word
+    hidden method DoTypeSpelling(const AId: int64): string;
+    var
+      LType: CType;
+    begin
+      LType := self.FTypes.Item(AId);
+      if LType.Kind = CTypeKind.Record then
+        return self.FTypes.RecordAt(LType.Index).Tag;
+      end;
+      return CKindText(LType.Kind);
+    end;
+
+    // A primary expression: ( expr ), a number, a character constant, adjacent strings, a
+    // parameter, an enum constant, a call of a bound routine
+    hidden method DoPrimary(var AValue: MacroValue): bool;
+    var
+      LTok: PpToken;
+      LId: int64;
+      LParam: int64;
+    begin
+      LTok := self.DoTok();
+      if self.DoIs("(") then
+        self.DoNext();
+        if not self.DoExpr(AValue) then
+          return false;
+        end;
+        return self.DoExpect(")");
+      end;
+      match LTok.Kind of
+        PpKind.Number:
+          self.DoNext();
+          return self.DoNumber(LTok.Text, AValue);
+        PpKind.CharConst:
+          self.DoNext();
+          return self.DoCharConst(LTok.Text, AValue);
+        PpKind.StringLit:
+          return self.DoStrings(AValue);
+        PpKind.Identifier:
+          LParam := self.DoParamIndex(LTok.Text);
+          if LParam >= 0 then
+            self.DoNext();
+            if self.FParamTypes[LParam] = ADAM_CIMPORT_NONE then
+              return self.DoFail(NoArgs().Str(LTok.Text).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_PARAM));
+            end;
+            AValue := self.DoRuntime(DoLocalName(LTok.Text), self.FParamTypes[LParam], false);
+            if self.DoKindOf(AValue.TypeId) = CTypeKind.Bool then
+              AValue.IsBool := true;
+            end;
+            return true;
+          end;
+          LId := self.FEnumIds.Find(LTok.Text);
+          if LId > 0 then
+            self.DoNext();
+            AValue := self.DoInt(self.FEnumValues[LId - 1], self.DoKindOf(self.FEnumTypes[LId - 1]));
+            return true;
+          end;
+          LId := self.FCalleeIds.Find(LTok.Text);
+          if self.FFunction and (LId > 0) then
+            self.DoNext();
+            if self.DoIs("(") then
+              return self.DoCall(LId - 1, LTok.Text, AValue);
+            end;
+          end;
+          if self.FFunction then
+            return self.DoFail(NoArgs().Str(LTok.Text).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_NAME_ROUTINE));
+          end;
+          return self.DoFail(NoArgs().Str(LTok.Text).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_NAME));
+      else
+      end;
+      return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+    end;
+
+    // An integer or float constant's value and type (see the header)
+    hidden method DoNumber(const AText: string; var AValue: MacroValue): bool;
+    var
+      LLast: char;
+      LReal: float64;
+      LText: string;
+      LKind: CTypeKind;
+    begin
+      if self.DoIntLiteral(AText, AValue) then
+        return true;
+      end;
+      if self.FWhy <> "" then
+        return false;
+      end;
+      // a float: its suffix decides its type
+      LText := AText;
+      LKind := CTypeKind.Double;
+      LLast := LText[len(LText) - 1];
+      if (LLast = 'f') or (LLast = 'F') then
+        if not StartsStr("0x", LowerCase(LText)) or (IndexOf("p", LowerCase(LText), 0) >= 0) then
+          LKind := CTypeKind.Float;
+          LText := Substring(LText, 0, len(LText) - 1);
+        end;
+      else
+        if (LLast = 'l') or (LLast = 'L') then
+          return self.DoFail(NoArgs().Str(CKindText(CTypeKind.LongDouble)).Fill(
+            ADAM_MSG_CIMPORT_WRITER_WHY_TYPE));
+        end;
+      end;
+      if LKind = CTypeKind.Float then
+        if not TryStrToFloat32(LText, LReal) then
+          return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+        end;
+      else
+        if not TryStrToFloat(LText, LReal) then
+          return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+        end;
+      end;
+      AValue := self.DoFloat(LReal, LKind);
+      AValue.Spelling := LText;
+      return true;
+    end;
+
+    // An integer constant (C's prefixes, ' separators, the u / l / ll suffixes and
+    // Microsoft's i64) typed by C's list (see the header); false when AText is none (a float),
+    // or (the reason kept) when no C integer type holds it
+    hidden method DoIntLiteral(const AText: string; var AValue: MacroValue): bool;
+    var
+      LEnd: int64;
+      LAt: int64;
+      LBase: int64;
+      LDigit: int64;
+      LValue: uint64;
+      LUnsigned: bool;
+      LLongs: int64;
+      LSuffix: string;
+      LKinds: array[0..5] of CTypeKind;
+      LCount: int64;
+      LI: int64;
+    begin
+      LAt := 0;
+      LBase := 10;
+      if (len(AText) > 2) and (AText[0] = '0') and ((AText[1] = 'x') or (AText[1] = 'X')) then
+        LBase := 16;
+        LAt := 2;
+      else
+        if (len(AText) > 2) and (AText[0] = '0') and ((AText[1] = 'b') or (AText[1] = 'B')) then
+          LBase := 2;
+          LAt := 2;
+        else
+          // octal: its leading 0 is one of its digits (0u is 0)
+          if (len(AText) > 1) and (AText[0] = '0') then
+            LBase := 8;
+          end;
+        end;
+      end;
+      // a decimal's e / f are a float's (1e5, 1f is none); a hex one's digits run on
+      if (LBase <> 16) and ((IndexOf("e", LowerCase(AText), 0) >= 0) or
+        (IndexOf(".", AText, 0) >= 0)) then
+        return false;
+      end;
+      if (LBase = 16) and ((IndexOf(".", AText, 0) >= 0) or (IndexOf("p", LowerCase(AText), 0) >= 0)) then
+        return false;
+      end;
+      // the digits run to the suffix (u / l / ll / i64 in any case)
+      LEnd := LAt;
+      while (LEnd < len(AText)) and ((DoDigit(AText[LEnd], 16) >= 0) or (AText[LEnd] = '\'')) do
+        if (LBase <> 16) and (DoDigit(AText[LEnd], 10) < 0) and (AText[LEnd] <> '\'') then
+          leave;
+        end;
+        LEnd := LEnd + 1;
+      end;
+      if LEnd = LAt then
+        return false;
+      end;
+      LSuffix := LowerCase(Substring(AText, LEnd, len(AText) - LEnd));
+      LValue := 0u;
+      while LAt < LEnd do
+        if AText[LAt] = '\'' then
+          LAt := LAt + 1;
+          skip;
+        end;
+        LDigit := DoDigit(AText[LAt], LBase);
+        if LDigit < 0 then
+          return false;
+        end;
+        if LValue > (18446744073709551615u - uint64(LDigit)) div uint64(LBase) then
+          return self.DoFail(NoArgs().Str(AText).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_TOO_LARGE));
+        end;
+        LValue := LValue * uint64(LBase) + uint64(LDigit);
+        LAt := LAt + 1;
+      end;
+      LUnsigned := false;
+      LLongs := 0;
+      if LSuffix = "i64" then
+        LLongs := 2;
+      else
+        if LSuffix = "ui64" then
+          LUnsigned := true;
+          LLongs := 2;
+        else
+          if IndexOf("u", LSuffix, 0) >= 0 then
+            LUnsigned := true;
+            LSuffix := ReplaceStr(LSuffix, "u", "");
+          end;
+          if LSuffix = "l" then
+            LLongs := 1;
+          else
+            if LSuffix = "ll" then
+              LLongs := 2;
+            else
+              if LSuffix <> "" then
+                return false;
+              end;
+            end;
+          end;
+        end;
+      end;
+      // C's list of types for the constant, the first holding the value is its type
+      LCount := 0;
+      if LLongs = 0 then
+        if not LUnsigned then
+          LKinds[LCount] := CTypeKind.Int;
+          LCount := LCount + 1;
+        end;
+        if LUnsigned or (LBase <> 10) then
+          LKinds[LCount] := CTypeKind.UInt;
+          LCount := LCount + 1;
+        end;
+      end;
+      if LLongs <= 1 then
+        if not LUnsigned then
+          LKinds[LCount] := CTypeKind.Long;
+          LCount := LCount + 1;
+        end;
+        if LUnsigned or (LBase <> 10) then
+          LKinds[LCount] := CTypeKind.ULong;
+          LCount := LCount + 1;
+        end;
+      end;
+      if not LUnsigned then
+        LKinds[LCount] := CTypeKind.LongLong;
+        LCount := LCount + 1;
+      end;
+      // clang: a decimal past long long is unsigned long long (with a warning)
+      LKinds[LCount] := CTypeKind.ULongLong;
+      LCount := LCount + 1;
+      for LI := 0 to LCount - 1 do
+        if self.DoFitsKind(LValue, LKinds[LI]) then
+          AValue := self.DoInt(int64(LValue), LKinds[LI]);
+          return true;
+        end;
+      end;
+      return self.DoFail(NoArgs().Str(AText).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_TOO_LARGE));
+    end;
+
+    // A character constant: an int of its bytes (a multi-character one big-endian, as clang),
+    // a single byte by the target's char signedness; a prefixed one has no Adam const
+    hidden method DoCharConst(const AText: string; var AValue: MacroValue): bool;
+    var
+      LBytes: Int64Array;
+      LValue: int64;
+      LI: int64;
+    begin
+      if not StartsStr("'", AText) then
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_WIDE);
+      end;
+      if not DoDecode(Substring(AText, 1, len(AText) - 2), LBytes) or (len(LBytes) = 0) then
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+      end;
+      LValue := 0;
+      for LI := 0 to len(LBytes) - 1 do
+        LValue := ((LValue << 8) | (LBytes[LI] & 255)) & 4294967295;
+      end;
+      if len(LBytes) = 1 then
+        if self.FTarget.CharSigned() and (LValue > 127) then
+          LValue := LValue - 256;
+        end;
+      else
+        LValue := self.DoWrap(LValue, CTypeKind.Int);
+      end;
+      AValue := self.DoInt(LValue, CTypeKind.Int);
+      return true;
+    end;
+
+    // Adjacent string literals as one string's bytes (plain or u8; L / u / U have no Adam
+    // const)
+    hidden method DoStrings(var AValue: MacroValue): bool;
+    var
+      LBytes: Int64Array;
+      LAll: Int64Array;
+      LCount: int64;
+      LText: string;
+      LQuote: int64;
+      LI: int64;
+    begin
+      LCount := 0;
+      setlength(LAll, 0);
+      while self.DoTok().Kind = PpKind.StringLit do
+        LText := self.DoTok().Text;
+        LQuote := IndexOf("\"", LText, 0);
+        if (LQuote < 0) or ((LQuote > 0) and (Substring(LText, 0, LQuote) <> "u8")) then
+          return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_WIDE);
+        end;
+        if not DoDecode(Substring(LText, LQuote + 1, len(LText) - LQuote - 2), LBytes) then
+          return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+        end;
+        setlength(LAll, LCount + len(LBytes));
+        for LI := 0 to len(LBytes) - 1 do
+          LAll[LCount + LI] := LBytes[LI];
+        end;
+        LCount := LCount + len(LBytes);
+        self.DoNext();
+      end;
+      AValue := self.DoInt(0, CTypeKind.Char);
+      AValue.Kind := MacroValueKind.Text;
+      AValue.Text := DoStringText(LAll);
+      // sizeof's count: the bytes (the literal's text holds escapes)
+      AValue.Value := LCount;
+      return true;
+    end;
+
+    // A call of the bound routine ACallee (C name ACName) at its '(': each argument converted
+    // to its parameter's type (see the header)
+    hidden method DoCall(const ACallee: int64; const ACName: string; var AValue: MacroValue):
+      bool;
+    var
+      LType: CType;
+      LArgs: StringArray;
+      LArg: MacroValue;
+      LCount: int64;
+      LText: string;
+      LBool: bool;
+    begin
+      LType := self.FTypes.Item(self.FTypes.Resolved(self.FCalleeTypes[ACallee]));
+      self.DoNext();
+      LCount := 0;
+      setlength(LArgs, len(LType.Params) + 4);
+      while not self.DoIs(")") do
+        if not self.DoExpr(LArg) then
+          return false;
+        end;
+        if LCount >= len(LArgs) then
+          setlength(LArgs, LCount * 2);
+        end;
+        if LCount < len(LType.Params) then
+          LArgs[LCount] := self.DoArgText(LArg, LType.Params[LCount].TypeId);
+        else
+          if not LType.Variadic then
+            LArgs[LCount] := "";
+          else
+            LArgs[LCount] := self.DoVarArgText(LArg);
+          end;
+        end;
+        if (LArgs[LCount] = "") and (self.FWhy = "") and (LCount < len(LType.Params)) then
+          return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+        end;
+        LCount := LCount + 1;
+        if not self.DoIs(",") then
+          leave;
+        end;
+        self.DoNext();
+      end;
+      if not self.DoExpect(")") then
+        return false;
+      end;
+      if self.FWhy <> "" then
+        return false;
+      end;
+      if (LCount < len(LType.Params)) or ((LCount > len(LType.Params)) and not LType.Variadic) then
+        return self.DoFail(NoArgs().Str(ACName).Int(LCount).Int(len(LType.Params)).Fill(
+          ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_ARGS));
+      end;
+      setlength(LArgs, LCount);
+      LText := self.FCalleeNames[ACallee] + "(" + JoinStrings(LArgs, ", ") + ")";
+      LBool := self.DoKindOf(LType.Base) = CTypeKind.Bool;
+      AValue := self.DoRuntime(LText, LType.Base, LBool);
+      if self.FTypes.Item(self.FTypes.Resolved(LType.Base)).Kind = CTypeKind.Void then
+        AValue.Kind := MacroValueKind.Void;
+      end;
+      return true;
+    end;
+
+    // AArg as the argument of a parameter of type AParamId: a number converted to it, a
+    // pointer one the parameter's own type or nil (a constant 0), a string literal for a char
+    // pointer; "" (the reason kept) when C's conversion has no Adam form here
+    hidden method DoArgText(const AArg: MacroValue; const AParamId: int64): string;
+    var
+      LParam: CType;
+      LArg: CType;
+      LBase: CTypeKind;
+      LKind: CTypeKind;
+    begin
+      LParam := self.FTypes.Item(self.FTypes.Resolved(AParamId));
+      if LParam.Kind = CTypeKind.Pointer then
+        if (AArg.Kind = MacroValueKind.Int) and (AArg.Value = 0) then
+          return "nil";
+        end;
+        if AArg.Kind = MacroValueKind.Text then
+          LBase := self.DoKindOf(LParam.Base);
+          if (LBase = CTypeKind.Char) or (LBase = CTypeKind.SChar) or (LBase = CTypeKind.UChar) then
+            return AArg.Text;
+          end;
+          return "";
+        end;
+        if AArg.Kind <> MacroValueKind.Runtime then
+          return "";
+        end;
+        LArg := self.FTypes.Item(self.FTypes.Resolved(AArg.TypeId));
+        if (LArg.Kind = CTypeKind.Pointer) and self.DoSamePointee(LArg.Base, LParam.Base) then
+          return AArg.Text;
+        end;
+        return "";
+      end;
+      LKind := self.DoKindOf(AParamId);
+      if not (self.DoIsInteger(LKind) or self.DoIsFloat(LKind)) or not self.DoIsArithmetic(AArg) then
+        if (AArg.Kind = MacroValueKind.Runtime) and (AArg.TypeId = AParamId) then
+          return AArg.Text;
+        end;
+        return "";
+      end;
+      return self.DoArithText(AArg, LKind);
+    end;
+
+    // A variadic argument: C's default promotions (float to double, small integers to int)
+    hidden method DoVarArgText(const AArg: MacroValue): string;
+    var
+      LKind: CTypeKind;
+    begin
+      if AArg.Kind = MacroValueKind.Text then
+        return AArg.Text;
+      end;
+      if not self.DoIsArithmetic(AArg) then
+        if AArg.Kind = MacroValueKind.Runtime then
+          return AArg.Text;
+        end;
+        return "";
+      end;
+      LKind := self.DoValueKind(AArg);
+      if LKind = CTypeKind.Float then
+        LKind := CTypeKind.Double;
+      end;
+      if not self.DoIsFloat(LKind) then
+        LKind := self.DoPromote(LKind);
+      end;
+      return self.DoArithText(AArg, LKind);
+    end;
+
+    // True when pointees A and B are one type to Adam (typedefs looked through; a pointer to
+    // a non-const one passes for a pointer to its const one, as in C)
+    hidden method DoSamePointee(const A: int64; const B: int64): bool;
+    var
+      LA: CType;
+      LB: CType;
+    begin
+      LA := self.FTypes.Item(self.FTypes.Resolved(A));
+      LB := self.FTypes.Item(self.FTypes.Resolved(B));
+      if LA.IsConst and not LB.IsConst then
+        return false;
+      end;
+      if LA.Kind <> LB.Kind then
+        return false;
+      end;
+      match LA.Kind of
+        CTypeKind.Record, CTypeKind.Enum: return LA.Index = LB.Index;
+        CTypeKind.Pointer: return self.DoSamePointee(LA.Base, LB.Base);
+        CTypeKind.Array, CTypeKind.Function: return self.FTypes.Resolved(A) = self.FTypes.Resolved(B);
+      else
+      end;
+      return true;
+    end;
+
+    // ---- one macro -------------------------------------------------------------------------
+
+    // Each parameter passed whole (parentheses allowed) to a bound routine takes that
+    // parameter's type, its first such use
+    hidden method DoTypeParams();
+    var
+      LTok: PpToken;
+      LType: CType;
+      LCallee: int64;
+      LDepth: int64;
+      LArg: int64;
+      LStart: int64;
+      LFirst: int64;
+      LLast: int64;
+      LParam: int64;
+      LI: int64;
+      LJ: int64;
+    begin
+      for LI := 0 to len(self.FToks) - 2 do
+        LTok := self.FToks[LI];
+        LCallee := 0;
+        if LTok.Kind = PpKind.Identifier then
+          LCallee := self.FCalleeIds.Find(LTok.Text);
+        end;
+        if (LCallee = 0) or (self.FToks[LI + 1].Text <> "(") or
+          (self.FToks[LI + 1].Kind <> PpKind.Punct) then
+          skip;
+        end;
+        LType := self.FTypes.Item(self.FTypes.Resolved(self.FCalleeTypes[LCallee - 1]));
+        LDepth := 0;
+        LArg := 0;
+        LStart := LI + 2;
+        for LJ := LI + 2 to len(self.FToks) - 1 do
+          LTok := self.FToks[LJ];
+          if (LTok.Kind = PpKind.Punct) and ((LTok.Text = "(") or (LTok.Text = "[") or
+            (LTok.Text = "{")) then
+            LDepth := LDepth + 1;
+            skip;
+          end;
+          if (LTok.Kind = PpKind.Punct) and (LDepth > 0) and ((LTok.Text = ")") or
+            (LTok.Text = "]") or (LTok.Text = "}")) then
+            LDepth := LDepth - 1;
+            skip;
+          end;
+          if (LTok.Kind <> PpKind.Punct) or (LDepth > 0) or ((LTok.Text <> ",") and
+            (LTok.Text <> ")")) then
+            skip;
+          end;
+          // the argument LStart .. LJ - 1, its outer parentheses off
+          LFirst := LStart;
+          LLast := LJ - 1;
+          while (LLast - LFirst >= 2) and (self.FToks[LFirst].Text = "(") and
+            (self.FToks[LLast].Text = ")") do
+            LFirst := LFirst + 1;
+            LLast := LLast - 1;
+          end;
+          if (LFirst = LLast) and (LArg < len(LType.Params)) then
+            LParam := self.DoParamIndex(self.FToks[LFirst].Text);
+            if (LParam >= 0) and (self.FParamTypes[LParam] = ADAM_CIMPORT_NONE) then
+              self.FParamTypes[LParam] := LType.Params[LArg].TypeId;
+            end;
+          end;
+          LArg := LArg + 1;
+          LStart := LJ + 1;
+          if LTok.Text = ")" then
+            leave;
+          end;
+        end;
+      end;
+    end;
+
+    // What the macro in the preprocessor's slot AIndex is (see the header)
+    method Evaluate(const AIndex: int64): MacroResult;
+    var
+      LMacro: PpMacro;
+      LResult: MacroResult;
+      LValue: MacroValue;
+      LOk: bool;
+      LI: int64;
+    begin
+      LMacro := self.FPre.MacroAt(AIndex);
+      LResult.Bound := false;
+      LResult.Why := "";
+      LResult.IsRoutine := LMacro.Kind = MacroKind.Function;
+      LResult.Body := "";
+      setlength(LResult.Params, 0);
+      setlength(LResult.ParamTypes, 0);
+      self.FWhy := "";
+      self.FDead := 0;
+      self.FPos := 0;
+      self.FFunction := LResult.IsRoutine;
+      self.FParams := LMacro.Params;
+      setlength(self.FParamTypes, len(LMacro.Params));
+      for LI := 0 to len(LMacro.Params) - 1 do
+        self.FParamTypes[LI] := ADAM_CIMPORT_NONE;
+      end;
+      if LResult.IsRoutine and LMacro.Variadic then
+        LResult.Why := ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_VARIADIC;
+        return LResult;
+      end;
+      self.FToks := self.FPre.ExpandMacro(AIndex);
+      if len(self.FToks) = 0 then
+        return LResult;
+      end;
+      if LResult.IsRoutine then
+        self.DoTypeParams();
+      end;
+      LOk := self.DoExpr(LValue);
+      if LOk and (self.FPos < len(self.FToks)) then
+        LOk := self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+      end;
+      if LOk and not LResult.IsRoutine and ((LValue.Kind = MacroValueKind.Runtime) or
+        (LValue.Kind = MacroValueKind.Void)) then
+        LOk := self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+      end;
+      if LOk and LResult.IsRoutine then
+        LOk := self.DoRoutine(LValue, LResult);
+      end;
+      if LOk and not LResult.IsRoutine and (LValue.Kind <> MacroValueKind.Literal) and
+        (LValue.Kind <> MacroValueKind.Text) then
+        LValue.Text := self.DoConstText(LValue);
+        LOk := LValue.Text <> "";
+      end;
+      if not LOk then
+        LResult.Why := self.FWhy;
+        if LResult.Why = "" then
+          LResult.Why := ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR;
+        end;
+        return LResult;
+      end;
+      LResult.Bound := true;
+      LResult.Value := LValue;
+      return LResult;
+    end;
+
+    // A function-like macro's body AValue as its routine: every parameter typed, the body's
+    // Adam expression and its C type (a comparison's int)
+    hidden method DoRoutine(var AValue: MacroValue; var AResult: MacroResult): bool;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FParams) - 1 do
+        if self.FParamTypes[LI] = ADAM_CIMPORT_NONE then
+          return self.DoFail(NoArgs().Str(self.FParams[LI]).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_PARAM));
+        end;
+      end;
+      setlength(AResult.Params, len(self.FParams));
+      for LI := 0 to len(self.FParams) - 1 do
+        AResult.Params[LI] := DoLocalName(self.FParams[LI]);
+      end;
+      AResult.ParamTypes := self.FParamTypes;
+      match AValue.Kind of
+        MacroValueKind.Int, MacroValueKind.Float:
+          AResult.Body := self.DoConstText(AValue);
+        MacroValueKind.Runtime, MacroValueKind.Void:
+          AResult.Body := AValue.Text;
+          if AValue.IsBool and (self.DoKindOf(AValue.TypeId) <> CTypeKind.Bool) then
+            AResult.Body := BuiltinName(self.DoKindOf(AValue.TypeId)) + "(" + AValue.Text + ")";
+          end;
+      else
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+      end;
+      return AResult.Body <> "";
+    end;
+  end;
+
+end.
