@@ -1,0 +1,1000 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.CImport.Bodies.adam - `adam cimport`'s routine bodies (M9j3; DESIGN
+  sec 15): a header's static / inline C function as the Adam routine it
+  means
+
+  BodyTypes       what the binding writer says of a type for a body (its
+                  Adam text as a parameter, result or local holds it; a
+                  struct / union the body itself declares as the record /
+                  overlay of a type block): CUnitWriter implements it
+  BodyTranslator  one import's bodies, each translated by Translate over
+                  CParser.BodyOf and the expressions MacroEvaluator reads
+                  (its BeginBody / AddLocal / ExpressionAt API): the
+                  routine's head and its text, or the reason it is not
+                  bound (BodyResult)
+
+  A body is C's statements Adam can say: a compound statement (its own
+  scope), a declaration of locals (each with its initializer, as an
+  assignment where C declares it), if / else, while, do .. while (Adam's
+  repeat .. until, C's continue its skip: both go to the test), for (its
+  init before the loop, the loop an Adam while, its step after the body
+  and before each continue's skip), break (leave), continue, return and
+  expression statements (an assignment, a step or a call; one with no side
+  effect, such as (void)x, does nothing in C and is not written). Locals
+  are declared in the routine's var block under unique Adam names (Adam's
+  locals share their routine's scope); a static local only as a constant
+  (const, its initializer a constant), a const array with an initializer
+  list of constants (one per element, its size from the list when C gives
+  none) in the routine's const block; a struct or union the body declares
+  is a type of the routine's type block (its tag, or the variable's name
+  and _type). A parameter the body assigns, steps or takes the address of
+  is a value parameter, the others const. Statements after one that ends
+  the path (return, break, continue, an endless loop) never run and are
+  not written. A routine with a result whose end can be reached is not
+  bound (Adam requires the return). switch, goto, labels, asm, a variadic
+  routine and an initializer list other than a const array's are not
+  bound, each with its reason: never dropped silently.
+*******************************************************************************/
+
+module unit Adam.CImport.Bodies;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Core.Messages, Adam.Compiler.Diagnostics,
+  Adam.CImport.Lexer, Adam.CImport.CTypes, Adam.CImport.Parser, Adam.CImport.Macros;
+
+public const
+  // A body's statements are indented this much per level
+  ADAM_CIMPORT_BODIES_INDENT: string = "  ";
+  // An untagged struct / union a body declares: its variable's name and this
+  ADAM_CIMPORT_BODIES_TYPE_SUFFIX: string = "_type";
+  // An unnamed parameter's name: this and its number from 1 (the writer's own rule)
+  ADAM_CIMPORT_BODIES_PARAM: string = "p";
+  // A condition's truth: known only at run time, a constant false, a constant true
+  ADAM_CIMPORT_BODIES_RUNTIME: int64 = -1;
+  ADAM_CIMPORT_BODIES_FALSE: int64 = 0;
+  ADAM_CIMPORT_BODIES_TRUE: int64 = 1;
+
+public type
+  // What the binding writer says of a type for a body (see the header)
+  BodyTypes = interface
+    // The Adam text of the type ATypeId as a parameter, result or local holds it; "" with
+    // AWhy when Adam cannot say it
+    method BodyTypeText(const ATypeId: int64; var AWhy: string): string;
+    // The struct / union ARecord a body declares as `record .. end` / `overlay .. end`, its
+    // end at AIndent; "" with AWhy when Adam would not lay it out as C does
+    method BodyRecordText(const ARecord: int64; const AIndent: string; var AWhy: string): string;
+  end;
+
+  // One translated body: Bound with the routine's Head (its declaration line, for the
+  // writer to wrap) and Text (its type / const / var blocks and its block), Files the header
+  // files of the routines it calls; else Why the reason, Retry when the reason is in an
+  // expression (a routine translated later may be the one it calls)
+  BodyResult = record
+    Bound: bool;
+    Why: string;
+    Retry: bool;
+    Head: string;
+    Text: string;
+    Files: Int64Array;
+  end;
+
+  // One import's bodies (see the header)
+  BodyTranslator = object
+    hidden FParser: ref CParser;
+    hidden FEval: ref MacroEvaluator;
+    hidden FTypes: ref CTypeTable;
+    // the records from this index on are a body's own (declared by its locals)
+    hidden FFirstLocal: int64;
+    // one translation: the body's tokens, the cursor, the first reason it fails (Retry: one
+    // from an expression), the routine's result type (void: FVoid)
+    hidden FToks: PpTokenArray;
+    hidden FPos: int64;
+    hidden FWhy: string;
+    hidden FRetry: bool;
+    hidden FResultType: int64;
+    hidden FVoid: bool;
+    // the routine's type, const and var blocks' lines
+    hidden FTypeLines: ref TextBuilder;
+    hidden FConstLines: ref TextBuilder;
+    hidden FVarLines: ref TextBuilder;
+    // the body's own records: record index -> slot + 1 of its Adam type name
+    hidden FLocalTypes: ref Int64Map;
+    hidden FLocalTypeNames: StringArray;
+    hidden FLocalTypeCount: int64;
+    // the loops around the statement being read, innermost last: each one's continue lines
+    // (Adam statements, one per line) and whether a leave left it
+    hidden FContinues: StringArray;
+    hidden FLeaves: BoolArray;
+    hidden FLoopDepth: int64;
+
+    init(const AParser: ref CParser; const AEval: ref MacroEvaluator; const AFirstLocal: int64);
+    begin
+      self.FParser := AParser;
+      self.FEval := AEval;
+      self.FTypes := AParser.Types();
+      self.FFirstLocal := AFirstLocal;
+      self.FPos := 0;
+      self.FWhy := "";
+      self.FRetry := false;
+      self.FResultType := ADAM_CIMPORT_NONE;
+      self.FVoid := true;
+      self.FLocalTypeCount := 0;
+      self.FLoopDepth := 0;
+    end;
+
+    // The definition ADecl (a static / inline routine with a body) as the Adam routine
+    // AAdamName, its types said by ATypes (see the header)
+    method Translate(const ADecl: int64; const AAdamName: string; const ATypes: BodyTypes):
+      BodyResult;
+    var
+      LDecl: CDecl;
+      LFunc: CType;
+      LNames: StringArray;
+      LTypes: Int64Array;
+      LParams: StringArray;
+      LBody: ref TextBuilder;
+      LOut: ref TextBuilder;
+      LResult: BodyResult;
+      LText: string;
+      LType: string;
+      LWhy: string;
+      LEnds: bool;
+      LI: int64;
+    begin
+      LResult.Bound := false;
+      LResult.Why := "";
+      LResult.Retry := false;
+      LResult.Head := "";
+      LResult.Text := "";
+      setlength(LResult.Files, 0);
+      LDecl := self.FParser.Decl(ADecl);
+      LFunc := self.FTypes.Item(self.FTypes.Resolved(LDecl.TypeId));
+      if LFunc.Variadic then
+        LResult.Why := ADAM_MSG_CIMPORT_WRITER_WHY_BODY_VARIADIC;
+        return LResult;
+      end;
+      setlength(LNames, len(LFunc.Params));
+      setlength(LTypes, len(LFunc.Params));
+      for LI := 0 to len(LFunc.Params) - 1 do
+        LNames[LI] := LFunc.Params[LI].Name;
+        if LNames[LI] = "" then
+          LNames[LI] := ADAM_CIMPORT_BODIES_PARAM + IntToStr(LI + 1);
+        end;
+        LTypes[LI] := LFunc.Params[LI].TypeId;
+      end;
+      self.FToks := self.FParser.BodyOf(ADecl);
+      self.FPos := 0;
+      self.FWhy := "";
+      self.FRetry := false;
+      self.FResultType := LFunc.Base;
+      self.FVoid := self.FTypes.Item(self.FTypes.Resolved(LFunc.Base)).Kind = CTypeKind.Void;
+      self.FTypeLines := ref TextBuilder();
+      self.FConstLines := ref TextBuilder();
+      self.FVarLines := ref TextBuilder();
+      self.FLocalTypes := ref Int64Map(0);
+      self.FLocalTypeCount := 0;
+      self.FLoopDepth := 0;
+      self.FEval.BeginBody(LNames, LTypes);
+      LBody := ref TextBuilder();
+      LEnds := false;
+      if not self.DoStatements(ADAM_CIMPORT_BODIES_INDENT, LBody, ATypes, LEnds) or
+        ((self.FPos < len(self.FToks)) and not self.DoSyntax()) then
+        LResult.Why := self.FWhy;
+        LResult.Retry := self.FRetry;
+        return LResult;
+      end;
+      if not LEnds and not self.FVoid then
+        LResult.Why := ADAM_MSG_CIMPORT_WRITER_WHY_BODY_END;
+        return LResult;
+      end;
+      // the parameters once the body is read: one it writes is a value parameter
+      setlength(LParams, len(LNames));
+      for LI := 0 to len(LNames) - 1 do
+        LWhy := "";
+        LType := ATypes.BodyTypeText(LTypes[LI], LWhy);
+        if LType = "" then
+          LResult.Why := LWhy;
+          return LResult;
+        end;
+        if self.FEval.LocalWritten(LI) then
+          LParams[LI] := self.FEval.LocalName(LI) + ": " + LType;
+        else
+          LParams[LI] := "const " + self.FEval.LocalName(LI) + ": " + LType;
+        end;
+      end;
+      LText := "public routine " + AAdamName + "(" + JoinStrings(LParams, "; ") + ")";
+      if not self.FVoid then
+        LWhy := "";
+        LType := ATypes.BodyTypeText(LFunc.Base, LWhy);
+        if LType = "" then
+          LResult.Why := LWhy;
+          return LResult;
+        end;
+        LText := LText + ": " + LType;
+      end;
+      LResult.Head := LText + ";";
+      LOut := ref TextBuilder();
+      if self.FTypeLines.Count > 0 then
+        LOut.Add("type\n" + self.FTypeLines.Text());
+      end;
+      if self.FConstLines.Count > 0 then
+        LOut.Add("const\n" + self.FConstLines.Text());
+      end;
+      if self.FVarLines.Count > 0 then
+        LOut.Add("var\n" + self.FVarLines.Text());
+      end;
+      LOut.Add("begin\n" + LBody.Text() + "end;\n");
+      LResult.Text := LOut.Text();
+      LResult.Files := self.FEval.CalledFiles();
+      LResult.Bound := true;
+      return LResult;
+    end;
+
+    // ---- tokens ----------------------------------------------------------------------------
+
+    hidden const method DoTok(): PpToken;
+    var
+      LTok: PpToken;
+    begin
+      if self.FPos < len(self.FToks) then
+        return self.FToks[self.FPos];
+      end;
+      LTok.Kind := PpKind.EndOfFile;
+      LTok.Text := "";
+      LTok.File := -1;
+      LTok.Line := 0;
+      LTok.Column := 0;
+      LTok.Space := false;
+      LTok.LineStart := true;
+      LTok.Hide := 0;
+      return LTok;
+    end;
+
+    // True when the token at APos is the punctuator or word AText
+    hidden const method DoIsAt(const APos: int64; const AText: string): bool;
+    begin
+      if APos >= len(self.FToks) then
+        return false;
+      end;
+      return ((self.FToks[APos].Kind = PpKind.Punct) or
+        (self.FToks[APos].Kind = PpKind.Identifier)) and (self.FToks[APos].Text = AText);
+    end;
+
+    hidden const method DoIs(const AText: string): bool;
+    begin
+      return self.DoIsAt(self.FPos, AText);
+    end;
+
+    hidden method DoNext();
+    begin
+      if self.FPos < len(self.FToks) then
+        self.FPos := self.FPos + 1;
+      end;
+    end;
+
+    hidden method DoExpect(const AText: string): bool;
+    begin
+      if self.DoIs(AText) then
+        self.DoNext();
+        return true;
+      end;
+      return self.DoSyntax();
+    end;
+
+    // ---- failing ---------------------------------------------------------------------------
+
+    // AWhy kept as the reason (the first one stands); false
+    hidden method DoFail(const AWhy: string): bool;
+    begin
+      if self.FWhy = "" then
+        self.FWhy := AWhy;
+      end;
+      return false;
+    end;
+
+    // The expression reader's reason kept: an expression Adam cannot say (perhaps a call of a
+    // routine translated later); false
+    hidden method DoFailExpression(): bool;
+    begin
+      if self.FWhy = "" then
+        self.FWhy := self.FEval.Why();
+        self.FRetry := true;
+      end;
+      return false;
+    end;
+
+    // The token at the cursor is no C the body can have there; false
+    hidden method DoSyntax(): bool;
+    var
+      LText: string;
+    begin
+      LText := self.DoTok().Text;
+      if self.DoTok().Kind = PpKind.EndOfFile then
+        LText := "}";
+      end;
+      return self.DoFail(NoArgs().Str(LText).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_SYNTAX));
+    end;
+
+    // ---- text ------------------------------------------------------------------------------
+
+    // Each line of ALines (Adam statements, "\n" between) added at AIndent
+    hidden method DoLines(const AOut: ref TextBuilder; const AIndent: string; const ALines: string);
+    var
+      LParts: StringArray;
+      LI: int64;
+    begin
+      LParts := SplitString(ALines, "\n");
+      for LI := 0 to len(LParts) - 1 do
+        if LParts[LI] <> "" then
+          AOut.Add(AIndent + LParts[LI] + "\n");
+        end;
+      end;
+    end;
+
+    // A loop entered: its continue lines AContinue
+    hidden method DoPushLoop(const AContinue: string);
+    begin
+      if self.FLoopDepth = len(self.FContinues) then
+        setlength(self.FContinues, self.FLoopDepth * 2 + 4);
+        setlength(self.FLeaves, len(self.FContinues));
+      end;
+      self.FContinues[self.FLoopDepth] := AContinue;
+      self.FLeaves[self.FLoopDepth] := false;
+      self.FLoopDepth := self.FLoopDepth + 1;
+    end;
+
+    // The innermost loop left: true when a leave left it
+    hidden method DoPopLoop(): bool;
+    begin
+      self.FLoopDepth := self.FLoopDepth - 1;
+      return self.FLeaves[self.FLoopDepth];
+    end;
+
+    // ---- statements ------------------------------------------------------------------------
+
+    // The statements up to a '}' or the body's end at AIndent into AOut; AEnds when they end
+    // the path (what follows such a statement never runs: read, not written)
+    hidden method DoStatements(const AIndent: string; const AOut: ref TextBuilder;
+      const ATypes: BodyTypes; var AEnds: bool): bool;
+    var
+      LDead: ref TextBuilder;
+      LEnds: bool;
+    begin
+      AEnds := false;
+      LDead := ref TextBuilder();
+      while (self.FPos < len(self.FToks)) and not self.DoIs("}") do
+        LEnds := false;
+        if AEnds then
+          if not self.DoStatement(AIndent, LDead, ATypes, LEnds) then
+            return false;
+          end;
+          skip;
+        end;
+        if not self.DoStatement(AIndent, AOut, ATypes, LEnds) then
+          return false;
+        end;
+        AEnds := LEnds;
+      end;
+      return true;
+    end;
+
+    // One statement at AIndent into AOut; AEnds when it ends the path
+    hidden method DoStatement(const AIndent: string; const AOut: ref TextBuilder;
+      const ATypes: BodyTypes; var AEnds: bool): bool;
+    var
+      LTok: PpToken;
+      LMark: int64;
+    begin
+      AEnds := false;
+      LTok := self.DoTok();
+      if self.DoIs(";") then
+        self.DoNext();
+        return true;
+      end;
+      if self.DoIs("{") then
+        self.DoNext();
+        LMark := self.FEval.ScopeMark();
+        if not self.DoStatements(AIndent, AOut, ATypes, AEnds) then
+          return false;
+        end;
+        self.FEval.EndScope(LMark);
+        return self.DoExpect("}");
+      end;
+      if LTok.Kind = PpKind.Identifier then
+        match LTok.Text of
+          "if":
+            return self.DoIf(AIndent, AOut, ATypes, AEnds);
+          "while":
+            return self.DoWhile(AIndent, AOut, ATypes, AEnds);
+          "do":
+            return self.DoDo(AIndent, AOut, ATypes);
+          "for":
+            return self.DoFor(AIndent, AOut, ATypes, AEnds);
+          "return":
+            AEnds := true;
+            return self.DoReturn(AIndent, AOut);
+          "break":
+            AEnds := true;
+            return self.DoBreak(AIndent, AOut);
+          "continue":
+            AEnds := true;
+            return self.DoContinue(AIndent, AOut);
+          "switch", "case", "default", "goto", "asm", "__asm", "__asm__":
+            return self.DoFail(NoArgs().Str(LTok.Text).Fill(
+              ADAM_MSG_CIMPORT_WRITER_WHY_BODY_STATEMENT));
+        else
+        end;
+        // a label: `name:` (a ?:'s colon never follows a statement's first word)
+        if self.DoIsAt(self.FPos + 1, ":") then
+          return self.DoFail(NoArgs().Str("label").Fill(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_STATEMENT));
+        end;
+        if self.FParser.StartsDeclarationIn(self.FToks, self.FPos) then
+          return self.DoDeclaration(AIndent, AOut, ATypes);
+        end;
+      end;
+      if not self.DoExpressions(AIndent, AOut) then
+        return false;
+      end;
+      return self.DoExpect(";");
+    end;
+
+    // One statement as an arm (an if's, a loop's body) in its own scope
+    hidden method DoArm(const AIndent: string; const AOut: ref TextBuilder; const ATypes: BodyTypes;
+      var AEnds: bool): bool;
+    var
+      LMark: int64;
+    begin
+      LMark := self.FEval.ScopeMark();
+      if not self.DoStatement(AIndent, AOut, ATypes, AEnds) then
+        return false;
+      end;
+      self.FEval.EndScope(LMark);
+      return true;
+    end;
+
+    // ( condition ): AText its Adam bool, ATruth a constant's truth (ADAM_CIMPORT_BODIES_*)
+    hidden method DoCondition(var AText: string; var ATruth: int64): bool;
+    begin
+      if not self.DoExpect("(") then
+        return false;
+      end;
+      if not self.DoTest(AText, ATruth) then
+        return false;
+      end;
+      return self.DoExpect(")");
+    end;
+
+    // The expression at the cursor as a condition (see DoCondition)
+    hidden method DoTest(var AText: string; var ATruth: int64): bool;
+    var
+      LValue: MacroValue;
+    begin
+      if not self.FEval.ExpressionAt(self.FToks, self.FPos, LValue) then
+        return self.DoFailExpression();
+      end;
+      AText := self.FEval.TestText(LValue);
+      if AText = "" then
+        return self.DoFailExpression();
+      end;
+      ATruth := ADAM_CIMPORT_BODIES_RUNTIME;
+      if AText = "true" then
+        ATruth := ADAM_CIMPORT_BODIES_TRUE;
+      end;
+      if AText = "false" then
+        ATruth := ADAM_CIMPORT_BODIES_FALSE;
+      end;
+      return true;
+    end;
+
+    // if ( C ) S [ else S ]: Adam's if .. then .. [else ..] end; it ends the path when both
+    // arms do
+    hidden method DoIf(const AIndent: string; const AOut: ref TextBuilder; const ATypes: BodyTypes;
+      var AEnds: bool): bool;
+    var
+      LText: string;
+      LTruth: int64;
+      LThen: bool;
+      LElse: bool;
+    begin
+      self.DoNext();
+      if not self.DoCondition(LText, LTruth) then
+        return false;
+      end;
+      AOut.Add(AIndent + "if " + LText + " then\n");
+      LThen := false;
+      if not self.DoArm(AIndent + ADAM_CIMPORT_BODIES_INDENT, AOut, ATypes, LThen) then
+        return false;
+      end;
+      LElse := false;
+      if self.DoIs("else") then
+        self.DoNext();
+        AOut.Add(AIndent + "else\n");
+        if not self.DoArm(AIndent + ADAM_CIMPORT_BODIES_INDENT, AOut, ATypes, LElse) then
+          return false;
+        end;
+      end;
+      AOut.Add(AIndent + "end;\n");
+      AEnds := LThen and LElse;
+      return true;
+    end;
+
+    // while ( C ) S: Adam's while; an endless one no leave leaves ends the path
+    hidden method DoWhile(const AIndent: string; const AOut: ref TextBuilder;
+      const ATypes: BodyTypes; var AEnds: bool): bool;
+    var
+      LText: string;
+      LTruth: int64;
+      LBody: bool;
+      LLeft: bool;
+    begin
+      self.DoNext();
+      if not self.DoCondition(LText, LTruth) then
+        return false;
+      end;
+      AOut.Add(AIndent + "while " + LText + " do\n");
+      self.DoPushLoop("skip;");
+      LBody := false;
+      if not self.DoArm(AIndent + ADAM_CIMPORT_BODIES_INDENT, AOut, ATypes, LBody) then
+        return false;
+      end;
+      LLeft := self.DoPopLoop();
+      AOut.Add(AIndent + "end;\n");
+      AEnds := (LTruth = ADAM_CIMPORT_BODIES_TRUE) and not LLeft;
+      return true;
+    end;
+
+    // do S while ( C );: Adam's repeat S until not C (skip goes to the test, as C's continue);
+    // never taken to end the path (Adam judges only an endless while so)
+    hidden method DoDo(const AIndent: string; const AOut: ref TextBuilder;
+      const ATypes: BodyTypes): bool;
+    var
+      LText: string;
+      LUntil: string;
+      LTruth: int64;
+      LBody: bool;
+      LLeft: bool;
+    begin
+      self.DoNext();
+      AOut.Add(AIndent + "repeat\n");
+      self.DoPushLoop("skip;");
+      LBody := false;
+      if not self.DoArm(AIndent + ADAM_CIMPORT_BODIES_INDENT, AOut, ATypes, LBody) then
+        return false;
+      end;
+      // a leave changes nothing here: a repeat is never taken to end the path
+      LLeft := self.DoPopLoop();
+      if not self.DoExpect("while") or not self.DoCondition(LText, LTruth) or
+        not self.DoExpect(";") then
+        return false;
+      end;
+      match LTruth of
+        ADAM_CIMPORT_BODIES_TRUE: LUntil := "false";
+        ADAM_CIMPORT_BODIES_FALSE: LUntil := "true";
+      else
+        // a test text is a primary or parenthesized (TestText)
+        LUntil := "not " + LText;
+      end;
+      AOut.Add(AIndent + "until " + LUntil + ";\n");
+      return true;
+    end;
+
+    // for ( init ; C ; step ) S: the init before an Adam while (its locals scoped to the
+    // for), the step after the body and before each continue's skip; with no C an endless
+    // loop, which ends the path when no leave leaves it
+    hidden method DoFor(const AIndent: string; const AOut: ref TextBuilder;
+      const ATypes: BodyTypes; var AEnds: bool): bool;
+    var
+      LStep: ref TextBuilder;
+      LStepText: string;
+      LText: string;
+      LTruth: int64;
+      LMark: int64;
+      LBody: bool;
+      LLeft: bool;
+    begin
+      self.DoNext();
+      if not self.DoExpect("(") then
+        return false;
+      end;
+      LMark := self.FEval.ScopeMark();
+      if self.DoIs(";") then
+        self.DoNext();
+      else
+        if self.FParser.StartsDeclarationIn(self.FToks, self.FPos) then
+          if not self.DoDeclaration(AIndent, AOut, ATypes) then
+            return false;
+          end;
+        else
+          if not self.DoExpressions(AIndent, AOut) or not self.DoExpect(";") then
+            return false;
+          end;
+        end;
+      end;
+      LText := "true";
+      LTruth := ADAM_CIMPORT_BODIES_TRUE;
+      if not self.DoIs(";") then
+        if not self.DoTest(LText, LTruth) then
+          return false;
+        end;
+      end;
+      if not self.DoExpect(";") then
+        return false;
+      end;
+      LStep := ref TextBuilder();
+      if not self.DoIs(")") then
+        if not self.DoExpressions("", LStep) then
+          return false;
+        end;
+      end;
+      if not self.DoExpect(")") then
+        return false;
+      end;
+      LStepText := LStep.Text();
+      AOut.Add(AIndent + "while " + LText + " do\n");
+      self.DoPushLoop(LStepText + "skip;");
+      LBody := false;
+      if not self.DoArm(AIndent + ADAM_CIMPORT_BODIES_INDENT, AOut, ATypes, LBody) then
+        return false;
+      end;
+      if not LBody then
+        self.DoLines(AOut, AIndent + ADAM_CIMPORT_BODIES_INDENT, LStepText);
+      end;
+      LLeft := self.DoPopLoop();
+      AOut.Add(AIndent + "end;\n");
+      self.FEval.EndScope(LMark);
+      AEnds := (LTruth = ADAM_CIMPORT_BODIES_TRUE) and not LLeft;
+      return true;
+    end;
+
+    // return [ E ] ;: E converted to the result type as C converts it; a void call returned
+    // from a void routine is that call, then return
+    hidden method DoReturn(const AIndent: string; const AOut: ref TextBuilder): bool;
+    var
+      LValue: MacroValue;
+      LText: string;
+    begin
+      self.DoNext();
+      if self.DoIs(";") then
+        self.DoNext();
+        if not self.FVoid then
+          return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_RETURN);
+        end;
+        AOut.Add(AIndent + "return;\n");
+        return true;
+      end;
+      if not self.FEval.ExpressionAt(self.FToks, self.FPos, LValue) then
+        return self.DoFailExpression();
+      end;
+      if not self.DoExpect(";") then
+        return false;
+      end;
+      if self.FVoid then
+        if LValue.Kind <> MacroValueKind.Void then
+          return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_MACRO_EXPR);
+        end;
+        AOut.Add(AIndent + self.FEval.StatementText(LValue) + ";\n");
+        AOut.Add(AIndent + "return;\n");
+        return true;
+      end;
+      LText := self.FEval.ValueAs(LValue, self.FResultType);
+      if LText = "" then
+        return self.DoFailExpression();
+      end;
+      AOut.Add(AIndent + "return " + LText + ";\n");
+      return true;
+    end;
+
+    // break ;: leave (the innermost loop: a switch has no translation)
+    hidden method DoBreak(const AIndent: string; const AOut: ref TextBuilder): bool;
+    begin
+      self.DoNext();
+      if not self.DoExpect(";") then
+        return false;
+      end;
+      if self.FLoopDepth = 0 then
+        return self.DoFail(NoArgs().Str("break").Fill(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_STATEMENT));
+      end;
+      self.FLeaves[self.FLoopDepth - 1] := true;
+      AOut.Add(AIndent + "leave;\n");
+      return true;
+    end;
+
+    // continue ;: the innermost loop's continue lines (a for's step, then skip)
+    hidden method DoContinue(const AIndent: string; const AOut: ref TextBuilder): bool;
+    begin
+      self.DoNext();
+      if not self.DoExpect(";") then
+        return false;
+      end;
+      if self.FLoopDepth = 0 then
+        return self.DoFail(NoArgs().Str("continue").Fill(
+          ADAM_MSG_CIMPORT_WRITER_WHY_BODY_STATEMENT));
+      end;
+      self.DoLines(AOut, AIndent, self.FContinues[self.FLoopDepth - 1]);
+      return true;
+    end;
+
+    // E { , E } at the cursor (an expression statement's, a for's init or step), each with a
+    // side effect a statement at AIndent into AOut (one with none does nothing in C); the
+    // cursor at what follows
+    hidden method DoExpressions(const AIndent: string; const AOut: ref TextBuilder): bool;
+    var
+      LValue: MacroValue;
+      LBefore: int64;
+    begin
+      while true do
+        LBefore := self.FEval.Effects();
+        if not self.FEval.ExpressionAt(self.FToks, self.FPos, LValue) then
+          return self.DoFailExpression();
+        end;
+        if self.FEval.Effects() <> LBefore then
+          AOut.Add(AIndent + self.FEval.StatementText(LValue) + ";\n");
+        end;
+        if not self.DoIs(",") then
+          leave;
+        end;
+        self.DoNext();
+      end;
+      return true;
+    end;
+
+    // ---- locals ----------------------------------------------------------------------------
+
+    // A declaration of locals: each one (DoLocal) in order, its initializer read before it
+    // is known (C's scope begins after its declarator; an initializer naming it is rare)
+    hidden method DoDeclaration(const AIndent: string; const AOut: ref TextBuilder;
+      const ATypes: BodyTypes): bool;
+    var
+      LLocals: CLocalArray;
+      LPos: int64;
+      LI: int64;
+    begin
+      LPos := self.FPos;
+      if not self.FParser.LocalIn(self.FToks, LPos, LLocals) then
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_LOCAL);
+      end;
+      self.FPos := LPos;
+      for LI := 0 to len(LLocals) - 1 do
+        if not self.DoLocal(LLocals[LI], AIndent, AOut, ATypes) then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    // True when the type AId is const (itself or through the typedef names it is reached by)
+    hidden const method DoIsConst(const AId: int64): bool;
+    var
+      LId: int64;
+    begin
+      LId := AId;
+      while true do
+        if self.FTypes.Item(LId).IsConst then
+          return true;
+        end;
+        if self.FTypes.Item(LId).Kind <> CTypeKind.Named then
+          return false;
+        end;
+        LId := self.FTypes.Item(LId).Base;
+      end;
+    end;
+
+    // True when AValue is a constant number (an Int or a Float)
+    hidden const method DoIsConstant(const AValue: MacroValue): bool;
+    begin
+      return (AValue.Kind = MacroValueKind.Int) or (AValue.Kind = MacroValueKind.Float);
+    end;
+
+    // The initializer of ALocal (an expression, not a list) read: AValue; false when it is
+    // not one expression Adam can say
+    hidden method DoInitializer(const ALocal: CLocal; var AValue: MacroValue): bool;
+    var
+      LPos: int64;
+    begin
+      LPos := ALocal.InitFirst;
+      if not self.FEval.ExpressionAt(self.FToks, LPos, AValue) then
+        return self.DoFailExpression();
+      end;
+      if LPos <> ALocal.InitEnd then
+        self.FPos := LPos;
+        return self.DoSyntax();
+      end;
+      return true;
+    end;
+
+    // One local (see the header): a const array with a list in the const block, a static
+    // const constant there too, any other in the var block, its initializer an assignment
+    // where C declares it
+    hidden method DoLocal(const ALocal: CLocal; const AIndent: string; const AOut: ref TextBuilder;
+      const ATypes: BodyTypes): bool;
+    var
+      LType: CType;
+      LValue: MacroValue;
+      LConst: bool;
+      LInit: string;
+      LText: string;
+      LName: string;
+      LIndex: int64;
+    begin
+      LType := self.FTypes.Item(self.FTypes.Resolved(ALocal.TypeId));
+      LConst := self.DoIsConst(ALocal.TypeId) or
+        ((LType.Kind = CTypeKind.Array) and self.DoIsConst(LType.Base));
+      if (ALocal.InitFirst >= 0) and self.DoIsAt(ALocal.InitFirst, "{") then
+        if (LType.Kind <> CTypeKind.Array) or not LConst then
+          return self.DoFail(NoArgs().Str(ALocal.Name).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_INIT));
+        end;
+        return self.DoConstArray(ALocal, LType, ATypes);
+      end;
+      LInit := "";
+      if ALocal.InitFirst >= 0 then
+        if not self.DoInitializer(ALocal, LValue) then
+          return false;
+        end;
+        if ALocal.IsStatic and not self.DoIsConstant(LValue) then
+          return self.DoFail(NoArgs().Str(ALocal.Name).Fill(
+            ADAM_MSG_CIMPORT_WRITER_WHY_BODY_STATIC));
+        end;
+        LInit := self.FEval.ValueAs(LValue, ALocal.TypeId);
+        if LInit = "" then
+          return self.DoFailExpression();
+        end;
+      end;
+      if ALocal.IsStatic and (not LConst or (LInit = "")) then
+        return self.DoFail(NoArgs().Str(ALocal.Name).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_STATIC));
+      end;
+      LText := self.DoLocalTypeText(ALocal, ATypes);
+      if LText = "" then
+        return false;
+      end;
+      LIndex := self.FEval.AddLocal(ALocal.Name, ALocal.TypeId);
+      LName := self.FEval.LocalName(LIndex);
+      if ALocal.IsStatic then
+        self.FConstLines.Add(ADAM_CIMPORT_BODIES_INDENT + LName + ": " + LText + " = " + LInit +
+          ";\n");
+        return true;
+      end;
+      self.FVarLines.Add(ADAM_CIMPORT_BODIES_INDENT + LName + ": " + LText + ";\n");
+      if LInit <> "" then
+        AOut.Add(AIndent + LName + " := " + LInit + ";\n");
+      end;
+      return true;
+    end;
+
+    // The Adam type of ALocal: a struct / union the body declares by its type block's name,
+    // any other as the writer says it; "" (the reason kept) when Adam cannot say it
+    hidden method DoLocalTypeText(const ALocal: CLocal; const ATypes: BodyTypes): string;
+    var
+      LType: CType;
+      LText: string;
+      LWhy: string;
+    begin
+      LType := self.FTypes.Item(ALocal.TypeId);
+      if (LType.Kind = CTypeKind.Record) and (LType.Index >= self.FFirstLocal) then
+        return self.DoLocalRecord(LType.Index, ALocal.Name, ATypes);
+      end;
+      LWhy := "";
+      LText := ATypes.BodyTypeText(ALocal.TypeId, LWhy);
+      if LText = "" then
+        self.DoFail(NoArgs().Str(ALocal.Name).Str(LWhy).Fill(
+          ADAM_MSG_CIMPORT_WRITER_WHY_BODY_LOCAL_TYPE));
+      end;
+      return LText;
+    end;
+
+    // The struct / union ARecord the body declares, by the name of the type the routine's
+    // type block gives it (once): its tag, else the name of the local ACName it was declared
+    // for and _type; "" (the reason kept) when Adam would not lay it out as C does
+    hidden method DoLocalRecord(const ARecord: int64; const ACName: string;
+      const ATypes: BodyTypes): string;
+    var
+      LBase: string;
+      LName: string;
+      LText: string;
+      LWhy: string;
+      LSlot: int64;
+    begin
+      LSlot := self.FLocalTypes.Find(ARecord);
+      if LSlot > 0 then
+        return self.FLocalTypeNames[LSlot - 1];
+      end;
+      LBase := self.FTypes.RecordAt(ARecord).Tag;
+      if LBase = "" then
+        LBase := ACName + ADAM_CIMPORT_BODIES_TYPE_SUFFIX;
+      end;
+      LWhy := "";
+      LText := ATypes.BodyRecordText(ARecord, ADAM_CIMPORT_BODIES_INDENT, LWhy);
+      if LText = "" then
+        self.DoFail(NoArgs().Str(ACName).Str(LWhy).Fill(
+          ADAM_MSG_CIMPORT_WRITER_WHY_BODY_LOCAL_TYPE));
+        return "";
+      end;
+      LName := self.FEval.TakeName(LBase);
+      self.FTypeLines.Add(ADAM_CIMPORT_BODIES_INDENT + LName + " = " + LText + ";\n");
+      if self.FLocalTypeCount = len(self.FLocalTypeNames) then
+        setlength(self.FLocalTypeNames, self.FLocalTypeCount * 2 + 4);
+      end;
+      self.FLocalTypeNames[self.FLocalTypeCount] := LName;
+      self.FLocalTypeCount := self.FLocalTypeCount + 1;
+      self.FLocalTypes.Put(ARecord, self.FLocalTypeCount);
+      return LName;
+    end;
+
+    // A const array with an initializer list: every element a constant, one per element (the
+    // size from the list when C gives none), in the routine's const block
+    hidden method DoConstArray(const ALocal: CLocal; const AType: CType; const ATypes: BodyTypes):
+      bool;
+    var
+      LValue: MacroValue;
+      LTexts: StringArray;
+      LText: string;
+      LWhy: string;
+      LName: string;
+      LPos: int64;
+      LCount: int64;
+      LSize: int64;
+    begin
+      LPos := ALocal.InitFirst + 1;
+      LCount := 0;
+      while not self.DoIsAt(LPos, "}") do
+        if self.DoIsAt(LPos, "{") or self.DoIsAt(LPos, ".") or self.DoIsAt(LPos, "[") then
+          return self.DoFail(NoArgs().Str(ALocal.Name).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_INIT));
+        end;
+        if not self.FEval.ExpressionAt(self.FToks, LPos, LValue) then
+          return self.DoFailExpression();
+        end;
+        if not self.DoIsConstant(LValue) then
+          return self.DoFail(NoArgs().Str(ALocal.Name).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_INIT));
+        end;
+        LText := self.FEval.ValueAs(LValue, AType.Base);
+        if LText = "" then
+          return self.DoFailExpression();
+        end;
+        if LCount = len(LTexts) then
+          setlength(LTexts, LCount * 2 + 8);
+        end;
+        LTexts[LCount] := LText;
+        LCount := LCount + 1;
+        if not self.DoIsAt(LPos, ",") then
+          leave;
+        end;
+        LPos := LPos + 1;
+      end;
+      if not self.DoIsAt(LPos, "}") or (LPos + 1 <> ALocal.InitEnd) then
+        self.FPos := LPos;
+        return self.DoSyntax();
+      end;
+      LSize := AType.Count;
+      if LSize < 0 then
+        LSize := LCount;
+      end;
+      if (LCount = 0) or (LCount <> LSize) then
+        return self.DoFail(NoArgs().Str(ALocal.Name).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_INIT));
+      end;
+      setlength(LTexts, LCount);
+      LWhy := "";
+      LText := ATypes.BodyTypeText(AType.Base, LWhy);
+      if LText = "" then
+        return self.DoFail(NoArgs().Str(ALocal.Name).Str(LWhy).Fill(
+          ADAM_MSG_CIMPORT_WRITER_WHY_BODY_LOCAL_TYPE));
+      end;
+      LName := self.FEval.LocalName(self.FEval.AddLocal(ALocal.Name, ALocal.TypeId));
+      self.FConstLines.Add(ADAM_CIMPORT_BODIES_INDENT + LName + ": array[0.." +
+        IntToStr(LSize - 1) + "] of " + LText + " = [" + JoinStrings(LTexts, ", ") + "];\n");
+      return true;
+    end;
+  end;
+
+end.
