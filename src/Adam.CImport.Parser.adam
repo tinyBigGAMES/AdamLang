@@ -22,12 +22,14 @@
   CDecl       one file-scope declaration: its kind, name, type (Adam.CImport.
               CTypes' index), where its name is written, its storage class
               (static, extern), inline, and whether it is a definition with a
-              body (a static inline routine's body is skipped by balance)
+              body (a routine's body is skipped by balance, its span kept)
   CParser     one import's parse over a Preprocessor's tokens (Parse): every
               file-scope declaration in order (DeclCount, Decl) and the types
               they use (Types); after the parse, TypeNameIn reads a type name
               in other tokens (a macro's cast or sizeof, M9f) by the
-              typedefs and tags the headers declared. Reports into the
+              typedefs and tags the headers declared, BodyOf gives a
+              definition's body tokens and StartsDeclarationIn / LocalIn read
+              a block-scope declaration in them (M9j). Reports into the
               Diagnostics it is made with
               (CC codes, at the token's header file, line and column)
 
@@ -89,6 +91,8 @@ public const
 
   // A growable list's first storage, doubled each time it is full
   ADAM_CIMPORT_PARSER_FIRST: int64 = 64;
+  // Raised by a quiet read of other tokens started inside another (a broken invariant)
+  ADAM_CIMPORT_PARSER_FAULT_NESTED: string = "CParser: a token read nested in another";
 
 public type
   // What a declaration declares (see the header)
@@ -126,9 +130,28 @@ public type
     AsmName: string;
     Aligned: int64;
     Unknown: string;
+    // a definition's body: the token index of its '{' and one past its '}' (-1 none; BodyOf)
+    BodyFirst: int64;
+    BodyEnd: int64;
   end;
 
   CDeclArray = array of CDecl;
+
+  // One declarator of a block-scope declaration (CParser.LocalIn, M9j): its name and type,
+  // where its name is written, a static one (its value lives across calls), and its
+  // initializer's tokens: InitFirst .. InitEnd - 1 of the tokens read (-1 none)
+  CLocal = record
+    Name: string;
+    TypeId: int64;
+    File: int32;
+    Line: int32;
+    Column: int32;
+    IsStatic: bool;
+    InitFirst: int64;
+    InitEnd: int64;
+  end;
+
+  CLocalArray = array of CLocal;
 
   // What declaration specifiers say: the type, the storage class, inline, thread-local, the
   // attributes written among them; Ok false when they were not valid (reported)
@@ -504,6 +527,15 @@ public type
     hidden FPackStack: Int64Array;
     hidden FPackLabels: StringArray;
     hidden FPackDepth: int64;
+    // the parser's own state while it reads other tokens (DoEnterTokens / DoLeaveTokens:
+    // TypeNameIn, LocalIn; never nested)
+    hidden FEntered: bool;
+    hidden FSavedToks: PpTokenArray;
+    hidden FSavedCount: int64;
+    hidden FSavedPos: int64;
+    hidden FSavedBad: bool;
+    hidden FSavedReports: ref Diagnostics;
+    hidden FSavedAttrs: CAttrs;
 
     init(const AReports: ref Diagnostics; const APre: ref Preprocessor; const ATarget: ref Target);
     begin
@@ -523,6 +555,7 @@ public type
       self.FAttrs := NoAttrs();
       self.FPack := 0;
       self.FPackDepth := 0;
+      self.FEntered := false;
     end;
 
     // The types the declarations use
@@ -545,23 +578,151 @@ public type
     // the binding writer says why the macro is not bound)
     method TypeNameIn(const AToks: PpTokenArray; var APos: int64): int64;
     var
-      LSavedToks: PpTokenArray;
-      LSavedCount: int64;
-      LSavedPos: int64;
-      LSavedBad: bool;
-      LSavedReports: ref Diagnostics;
-      LSavedAttrs: CAttrs;
-      LEnd: PpToken;
       LTypeId: int64;
+    begin
+      self.DoEnterTokens(AToks, APos);
+      LTypeId := ADAM_CIMPORT_NONE;
+      if (APos < len(AToks)) and self.DoStartsTypeName() then
+        LTypeId := self.DoTypeName();
+        if self.FBad then
+          LTypeId := ADAM_CIMPORT_NONE;
+        end;
+        if LTypeId <> ADAM_CIMPORT_NONE then
+          APos := self.FPos;
+        end;
+      end;
+      self.DoLeaveTokens();
+      return LTypeId;
+    end;
+
+    // The tokens of the definition AIndex's body (Decl(AIndex).HasBody), between its braces;
+    // none for a declaration with no body (M9j: a static / inline routine translated)
+    const method BodyOf(const AIndex: int64): PpTokenArray;
+    var
+      LDecl: CDecl;
+      LToks: PpTokenArray;
       LI: int64;
     begin
-      LSavedToks := self.FToks;
-      LSavedCount := self.FTokCount;
-      LSavedPos := self.FPos;
-      LSavedBad := self.FBad;
-      LSavedReports := self.FReports;
-      LSavedAttrs := self.FAttrs;
-      // the tokens and an end of their own
+      LDecl := self.FDecls[AIndex];
+      if LDecl.BodyFirst < 0 then
+        setlength(LToks, 0);
+        return LToks;
+      end;
+      setlength(LToks, LDecl.BodyEnd - LDecl.BodyFirst - 2);
+      for LI := 0 to len(LToks) - 1 do
+        LToks[LI] := self.FToks[LDecl.BodyFirst + 1 + LI];
+      end;
+      return LToks;
+    end;
+
+    // True when AToks[APos] starts a declaration: a specifier, qualifier or storage word, or
+    // a typedef name the headers declared (a body's statement or a local declaration, M9j)
+    const method StartsDeclarationIn(const AToks: PpTokenArray; const APos: int64): bool;
+    begin
+      if (APos >= len(AToks)) or (AToks[APos].Kind <> PpKind.Identifier) then
+        return false;
+      end;
+      return DoIsSpecifierWord(AToks[APos].Text) or self.DoIsTypedefName(AToks[APos].Text);
+    end;
+
+    // The block-scope declaration at AToks[APos] (M9j): its declarators into ALocals (none
+    // for a bare struct / union / enum), APos past its ';'. Read by the typedefs and tags the
+    // headers declared (a struct / union / enum it defines joins the types); false with APos
+    // kept when it is not one Adam can say as locals (a typedef, an extern, an unnamed
+    // declarator) or not valid; nothing reported (the binding writer says why the routine is
+    // not bound)
+    method LocalIn(const AToks: PpTokenArray; var APos: int64; var ALocals: CLocalArray): bool;
+    var
+      LOk: bool;
+    begin
+      self.DoEnterTokens(AToks, APos);
+      LOk := self.DoLocals(ALocals);
+      if LOk then
+        APos := self.FPos;
+      end;
+      self.DoLeaveTokens();
+      return LOk;
+    end;
+
+    // LocalIn's work at the cursor
+    hidden method DoLocals(var ALocals: CLocalArray): bool;
+    var
+      LSpec: CSpecifiers;
+      LLocal: CLocal;
+      LName: string;
+      LNameTok: PpToken;
+      LTypeId: int64;
+      LCount: int64;
+    begin
+      setlength(ALocals, 0);
+      LSpec := self.DoSpecifiers();
+      if self.FBad or (not LSpec.Ok) or LSpec.IsTypedef or LSpec.IsExtern then
+        return false;
+      end;
+      LCount := 0;
+      if self.DoIs(";") then
+        self.DoNext();
+        return true;
+      end;
+      while true do
+        LName := "";
+        LNameTok := self.DoTok();
+        self.FAttrs := NoAttrs();
+        LTypeId := self.DoDeclarator(LSpec.TypeId, LName, LNameTok);
+        if (LTypeId = ADAM_CIMPORT_NONE) or self.FBad or (LName = "") then
+          return false;
+        end;
+        self.DoAttributes();
+        LLocal.Name := LName;
+        LLocal.TypeId := LTypeId;
+        LLocal.File := LNameTok.File;
+        LLocal.Line := LNameTok.Line;
+        LLocal.Column := LNameTok.Column;
+        LLocal.IsStatic := LSpec.IsStatic;
+        LLocal.InitFirst := -1;
+        LLocal.InitEnd := -1;
+        if self.DoIs("=") then
+          self.DoNext();
+          LLocal.InitFirst := self.FPos;
+          self.DoSkipInitializer();
+          LLocal.InitEnd := self.FPos;
+        end;
+        if LCount = len(ALocals) then
+          setlength(ALocals, LCount * 2 + 4);
+        end;
+        ALocals[LCount] := LLocal;
+        LCount := LCount + 1;
+        if self.DoIs(",") then
+          self.DoNext();
+          skip;
+        end;
+        leave;
+      end;
+      setlength(ALocals, LCount);
+      if not self.DoIs(";") then
+        return false;
+      end;
+      self.DoNext();
+      return not self.FBad;
+    end;
+
+    // The parser set to read AToks from APos, quietly (FReports nil), with an end token of
+    // their own; its own state saved for DoLeaveTokens (never nested: a broken invariant)
+    hidden method DoEnterTokens(const AToks: PpTokenArray; const APos: int64);
+    var
+      LEnd: PpToken;
+      LI: int64;
+    begin
+      if self.FEntered then
+        raise(ADAM_CIMPORT_PARSER_FAULT_NESTED);
+      end;
+      self.FEntered := true;
+      self.FSavedToks := self.FToks;
+      self.FSavedCount := self.FTokCount;
+      self.FSavedPos := self.FPos;
+      self.FSavedBad := self.FBad;
+      self.FSavedReports := self.FReports;
+      self.FSavedAttrs := self.FAttrs;
       self.FTokCount := len(AToks) + 1;
       setlength(self.FToks, self.FTokCount);
       for LI := 0 to len(AToks) - 1 do
@@ -580,23 +741,19 @@ public type
       self.FBad := false;
       self.FReports := nil;
       self.FAttrs := NoAttrs();
-      LTypeId := ADAM_CIMPORT_NONE;
-      if (APos < len(AToks)) and self.DoStartsTypeName() then
-        LTypeId := self.DoTypeName();
-        if self.FBad then
-          LTypeId := ADAM_CIMPORT_NONE;
-        end;
-        if LTypeId <> ADAM_CIMPORT_NONE then
-          APos := self.FPos;
-        end;
-      end;
-      self.FToks := LSavedToks;
-      self.FTokCount := LSavedCount;
-      self.FPos := LSavedPos;
-      self.FBad := LSavedBad;
-      self.FReports := LSavedReports;
-      self.FAttrs := LSavedAttrs;
-      return LTypeId;
+    end;
+
+    // The parser's own state as DoEnterTokens saved it
+    hidden method DoLeaveTokens();
+    begin
+      self.FToks := self.FSavedToks;
+      self.FTokCount := self.FSavedCount;
+      self.FPos := self.FSavedPos;
+      self.FBad := self.FSavedBad;
+      self.FReports := self.FSavedReports;
+      self.FAttrs := self.FSavedAttrs;
+      setlength(self.FSavedToks, 0);
+      self.FEntered := false;
     end;
 
     // ---- tokens ----------------------------------------------------------------------------
@@ -1163,6 +1320,8 @@ public type
       LDecl.AsmName := AAttrs.AsmName;
       LDecl.Aligned := AAttrs.Aligned;
       LDecl.Unknown := AAttrs.Unknown;
+      LDecl.BodyFirst := -1;
+      LDecl.BodyEnd := -1;
       if (AKind = CDeclKind.Typedef) and (self.FTypedefs.Find(AName) = 0) then
         self.FTypedefs.Put(AName, self.FDeclCount + 1);
       end;
@@ -2283,7 +2442,13 @@ public type
           if LType.Kind = CTypeKind.Function then
             if self.DoIs("{") then
               self.DoDeclare(CDeclKind.Routine, LName, LNameTok, LTypeId, LSpec, LAttrs, true);
-              return self.DoSkipBalanced();
+              // the body's span kept (BodyOf: a static / inline routine translated, M9j)
+              self.FDecls[self.FDeclCount - 1].BodyFirst := self.FPos;
+              if not self.DoSkipBalanced() then
+                return false;
+              end;
+              self.FDecls[self.FDeclCount - 1].BodyEnd := self.FPos;
+              return true;
             end;
             self.DoDeclare(CDeclKind.Routine, LName, LNameTok, LTypeId, LSpec, LAttrs, false);
           else
