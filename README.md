@@ -120,7 +120,7 @@ For contributors who want to change the compiler itself.
 - **Suggest features**: describe the use case first, then the behavior you have in mind.
 - **Submit pull requests** for bug fixes, new test cases and well-scoped features; open an issue first for substantial language or compiler changes.
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md) before you start. Join the [Discord](https://discord.gg/Wb6z8Wam7p) to talk development, ask questions, or show what you are building.
+Read [CONTRIBUTING](https://github.com/tinyBigGAMES/AdamLang?tab=contributing-ov-file) and the [Code of Conduct](https://github.com/tinyBigGAMES/AdamLang?tab=coc-ov-file) before you start. Join the [Discord](https://discord.gg/Wb6z8Wam7p) to talk development, ask questions, or show what you are building.
 
 ## 💖 Support the project
 
@@ -133,7 +133,7 @@ If Adam interests you or sparks something useful:
 
 ## 📜 License
 
-Adam is free and open source under the **Mozilla Public License 2.0**: see [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md). The runtime and standard library files that Adam builds into your programs carry an additional permission: see [RUNTIME-EXCEPTION.md](RUNTIME-EXCEPTION.md). The Adam name and marks: [TRADEMARK.md](TRADEMARK.md).
+Adam is free and open source under the **Mozilla Public License 2.0**: see [LICENSE](https://github.com/tinyBigGAMES/AdamLang?tab=MPL-2.0-1-ov-file) and [NOTICE](NOTICE.md). The runtime and standard library files that Adam builds into your programs carry an additional permission: see [RUNTIME-EXCEPTION](RUNTIME-EXCEPTION.md). The Adam name and marks: [TRADEMARK](TRADEMARK.md).
 
 ## 🔗 Links
 
