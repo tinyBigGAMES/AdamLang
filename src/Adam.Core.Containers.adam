@@ -13,148 +13,174 @@
   was not distributed with this file, You can obtain one
   at https://mozilla.org/MPL/2.0/.
 -------------------------------------------------------------------------------
-  Adam.Core.Containers.adam - hand-written containers (until M10's generics)
+  Adam.Core.Containers.adam - the compiler's containers, over System.Collections'
+  generic ones (PLAN-ADAM M10h, AD.8)
 
-  Int64List   a growable list of int64 values in the order added: the ids
-              the AST and the backend's IR hand out (nodes, instructions,
-              blocks, functions); the AST names it NodeList
-  StringIdMap a map from string keys to ids (0 is none): the backend's
-              names (sections, symbols, imports) found without a scan.
-              Open addressing over a power-of-two table, kept at most half
-              full; a key is never removed
-  Int64Map    a map from int64 keys (ids, never negative) to int64 values,
-              a value the map was made with standing for "none": the
-              backend's per-function facts keyed by a module-wide id (an
-              instruction's vreg, a block's machine block), sized to the
-              function, so a function's work never grows with the module.
-              Open addressing as StringIdMap's
+  Int64List   List<int64>: the ids the AST and the backend's IR hand out
+              (nodes, instructions, blocks, functions) in the order added;
+              the AST names it NodeList
+  IdMap<K>    a map from K (any type with hash(X) and '=', BNF sec 7) to an
+              int64 id or value, a value the map was made with (init)
+              standing for "none": Find answers it for a key the map does not
+              hold, so a caller asks once instead of Has then Get. Unlike
+              System.Collections' Map (insertion-ordered, keys removable, an
+              index over dense entries) it is one open-addressed table
+              (linear probing, a power-of-two size kept at most half full,
+              each key's hash stored), keys never removed: the backend's hot
+              lookups probe one place, not an index and then an entry
+  StringIdMap IdMap<string> made with 0: the backend's names (sections,
+              symbols, imports) found without a scan
+  Int64Map    IdMap<int64>: the backend's per-function facts keyed by a
+              module-wide id (an instruction's vreg, a block's machine
+              block), sized to the function, so a function's work never grows
+              with the module
+  TextBuilder a text built by appending in place, O(n) for n bytes
 *******************************************************************************/
 
 module unit Adam.Core.Containers;
 
-import System.SysUtils;
+import System.SysUtils, System.Collections;
 
 public const
-  // Raised (an invariant broken) by an index outside a list
-  ADAM_CONTAINERS_FAULT_INDEX: string = "Int64List: no index ";
-  // A list's first storage, doubled each time it is full
+  // A text builder's first storage, doubled each time it is full
   ADAM_CONTAINERS_FIRST_CAPACITY: int64 = 4;
-  // A map's first table, doubled each time it would be more than half full
+  // An id map's first table, doubled each time it would be more than half full
   ADAM_CONTAINERS_FIRST_TABLE: int64 = 16;
-  // Raised (an invariant broken) by an id of 0 put into a map (0 means none)
-  ADAM_CONTAINERS_FAULT_NO_ID: string = "StringIdMap: id 0 for key ";
-  // Raised (an invariant broken) by a negative key put into an Int64Map (-1 marks an
-  // empty place)
-  ADAM_CONTAINERS_FAULT_KEY: string = "Int64Map: negative key ";
-
-// The 64-bit hash of AKey's bytes: each byte xor-ed into a 5-bit rotation of the hash so
-// far, then the high bits folded down (the table index is taken from the low bits)
-public routine StringHash(const AKey: string): uint64;
-var
-  LHash: uint64;
-  LI: int64;
-begin
-  LHash := 0;
-  for LI := 0 to len(AKey) - 1 do
-    LHash := ((LHash shl uint64(5)) | (LHash shr uint64(59))) xor uint64(uint8(AKey[LI]));
-  end;
-  LHash := LHash xor (LHash shr uint64(31));
-  LHash := LHash xor (LHash shr uint64(17));
-  return LHash;
-end;
+  // The bit an id map sets in every stored key hash, so none is the empty place's 0
+  ADAM_CONTAINERS_HASH_TAKEN: uint64 = 0x8000000000000000;
 
 public type
   // A list of int64 values, in the order added
-  Int64List = object
-    hidden FItems: array of int64;
-    hidden FCount: int64;
+  Int64List = List<int64>;
 
-    init();
+  // A map from K to an int64 id or value; a key it does not hold reads as the missing value
+  // the map was made with (see the header)
+  IdMap<K> = object
+    hidden FKeys: array of K;
+    hidden FValues: array of int64;
+    // Each place's key hash with its top bit set (DoHash), 0 for an empty place: a probe
+    // compares a key only where its hash matches, a grow places the keys by their stored
+    // hashes (no key hashed again)
+    hidden FHashes: array of uint64;
+    hidden FCount: int64;
+    hidden FMissing: int64;
+
+    // An empty map whose Find answers AMissing for a key it does not hold
+    init(const AMissing: int64);
     begin
       self.FCount := 0;
+      self.FMissing := AMissing;
     end;
 
+    // How many keys the map holds
     property Count: int64 read FCount;
 
-    // No values (the storage kept for the values added next)
-    method Clear();
+    // AKey's hash as a place stores it: hash(X) (BNF sec 7) with the top bit set, so it is
+    // never the empty place's 0
+    hidden const method DoHash(const AKey: K): uint64;
     begin
-      self.FCount := 0;
+      return hash(AKey) | ADAM_CONTAINERS_HASH_TAKEN;
     end;
 
-    // The value at AIndex (0-based); raises outside 0 .. Count - 1
-    property Items[AIndex: int64]: int64
-      read
-      begin
-        if (AIndex < 0) or (AIndex >= self.FCount) then
-          raise(ADAM_CONTAINERS_FAULT_INDEX + IntToStr(AIndex));
+    // The place holding AKey (its stored hash AHash), or the empty one where it would go;
+    // the table is not empty and has an empty place (kept at most half full)
+    hidden const method DoPlace(const AKey: K; const AHash: uint64): int64;
+    var
+      LMask: int64;
+      LPlace: int64;
+    begin
+      LMask := len(self.FHashes) - 1;
+      LPlace := int64(AHash & uint64(LMask));
+      // linear probing: the next place until AKey's or an empty one
+      while self.FHashes[LPlace] <> uint64(0) do
+        if (self.FHashes[LPlace] = AHash) and (self.FKeys[LPlace] = AKey) then
+          return LPlace;
         end;
-        return self.FItems[AIndex];
+        LPlace := (LPlace + 1) & LMask;
       end;
-      default;
+      return LPlace;
+    end;
 
-    // Adds AValue at the end (the storage doubles when it is full)
-    method Add(const AValue: int64);
+    // The table at twice its size (the first table when there is none), every key moved to
+    // the place its stored hash gives
+    hidden method DoGrow();
+    var
+      LOldKeys: array of K;
+      LOldValues: array of int64;
+      LOldHashes: array of uint64;
+      LSize: int64;
+      LMask: int64;
+      LPlace: int64;
+      LI: int64;
     begin
-      if self.FCount = len(self.FItems) then
-        if self.FCount = 0 then
-          setlength(self.FItems, ADAM_CONTAINERS_FIRST_CAPACITY);
-        else
-          setlength(self.FItems, self.FCount * 2);
+      LOldKeys := self.FKeys;
+      LOldValues := self.FValues;
+      LOldHashes := self.FHashes;
+      LSize := len(LOldHashes) * 2;
+      if LSize < ADAM_CONTAINERS_FIRST_TABLE then
+        LSize := ADAM_CONTAINERS_FIRST_TABLE;
+      end;
+      setlength(self.FKeys, 0);
+      setlength(self.FValues, 0);
+      setlength(self.FHashes, 0);
+      setlength(self.FKeys, LSize);
+      setlength(self.FValues, LSize);
+      setlength(self.FHashes, LSize);
+      LMask := LSize - 1;
+      for LI := 0 to len(LOldHashes) - 1 do
+        if LOldHashes[LI] <> uint64(0) then
+          // the keys are distinct, so the first empty place of the probe line is the one
+          LPlace := int64(LOldHashes[LI] & uint64(LMask));
+          while self.FHashes[LPlace] <> uint64(0) do
+            LPlace := (LPlace + 1) & LMask;
+          end;
+          self.FKeys[LPlace] := LOldKeys[LI];
+          self.FValues[LPlace] := LOldValues[LI];
+          self.FHashes[LPlace] := LOldHashes[LI];
         end;
       end;
-      self.FItems[self.FCount] := AValue;
-      self.FCount := self.FCount + 1;
     end;
 
-    // Puts AValue at AIndex in place of the value there; raises outside the list
-    method Put(const AIndex: int64; const AValue: int64);
-    begin
-      if (AIndex < 0) or (AIndex >= self.FCount) then
-        raise(ADAM_CONTAINERS_FAULT_INDEX + IntToStr(AIndex));
-      end;
-      self.FItems[AIndex] := AValue;
-    end;
-
-    // Takes the last value off the list and returns it; raises when it is empty
-    method RemoveLast(): int64;
+    // The value of AKey; the map's missing value when it does not hold AKey
+    const method Find(const AKey: K): int64;
+    var
+      LPlace: int64;
     begin
       if self.FCount = 0 then
-        raise(ADAM_CONTAINERS_FAULT_INDEX + IntToStr(-1));
+        return self.FMissing;
       end;
-      self.FCount := self.FCount - 1;
-      return self.FItems[self.FCount];
+      LPlace := self.DoPlace(AKey, self.DoHash(AKey));
+      if self.FHashes[LPlace] = uint64(0) then
+        return self.FMissing;
+      end;
+      return self.FValues[LPlace];
     end;
 
-    // The index of the first AValue in the list; -1 when it is not there
-    const method IndexOf(const AValue: int64): int64;
+    // Maps AKey to AValue (in place of a value it had)
+    method Put(const AKey: K; const AValue: int64);
     var
-      LI: int64;
+      LHash: uint64;
+      LPlace: int64;
     begin
-      for LI := 0 to self.FCount - 1 do
-        if self.FItems[LI] = AValue then
-          return LI;
-        end;
+      if (self.FCount + 1) * 2 > len(self.FHashes) then
+        self.DoGrow();
       end;
-      return -1;
-    end;
-
-    // The values sorted ascending (SortInt64s: a stable merge sort, n log n)
-    method Sort();
-    var
-      LValues: Int64Array;
-      LI: int64;
-    begin
-      setlength(LValues, self.FCount);
-      for LI := 0 to self.FCount - 1 do
-        LValues[LI] := self.FItems[LI];
+      LHash := self.DoHash(AKey);
+      LPlace := self.DoPlace(AKey, LHash);
+      if self.FHashes[LPlace] = uint64(0) then
+        self.FKeys[LPlace] := AKey;
+        self.FHashes[LPlace] := LHash;
+        self.FCount := self.FCount + 1;
       end;
-      SortInt64s(LValues);
-      for LI := 0 to self.FCount - 1 do
-        self.FItems[LI] := LValues[LI];
-      end;
+      self.FValues[LPlace] := AValue;
     end;
   end;
+
+  // A map from string keys to ids, 0 for none (made with StringIdMap(0))
+  StringIdMap = IdMap<string>;
+
+  // A map from int64 keys to int64 values, its missing value given when it is made
+  Int64Map = IdMap<int64>;
 
   // A text built by appending, in place: the storage doubles when it is full, so building n
   // bytes costs O(n) (LText := LText + part copies the text so far on every part: O(n^2))
@@ -199,203 +225,6 @@ public type
     const method Text(): string;
     begin
       return Substring(self.FText, 0, self.FCount);
-    end;
-  end;
-
-  // A map from string keys to ids (see the header)
-  StringIdMap = object
-    hidden FKeys: array of string;
-    hidden FIds: array of int64;
-    hidden FCount: int64;
-
-    init();
-    begin
-      self.FCount := 0;
-    end;
-
-    // How many keys the map holds
-    property Count: int64 read FCount;
-
-    // The table index holding AKey, or the empty one where it would go; the table is not
-    // empty and has an empty place (it is kept at most half full). An empty place has id 0
-    hidden const method DoIndex(const AKey: string): int64;
-    var
-      LMask: int64;
-      LIndex: int64;
-    begin
-      LMask := len(self.FIds) - 1;
-      LIndex := int64(StringHash(AKey) & uint64(LMask));
-      // Linear probing: the next place until AKey or an empty place
-      while (self.FIds[LIndex] <> 0) and (self.FKeys[LIndex] <> AKey) do
-        LIndex := (LIndex + 1) & LMask;
-      end;
-      return LIndex;
-    end;
-
-    // The table at twice its size (the first table when there is none), every key moved
-    hidden method DoGrow();
-    var
-      LOldKeys: array of string;
-      LOldIds: array of int64;
-      LSize: int64;
-      LI: int64;
-      LIndex: int64;
-    begin
-      LOldKeys := self.FKeys;
-      LOldIds := self.FIds;
-      LSize := len(LOldIds) * 2;
-      if LSize < ADAM_CONTAINERS_FIRST_TABLE then
-        LSize := ADAM_CONTAINERS_FIRST_TABLE;
-      end;
-      setlength(self.FKeys, 0);
-      setlength(self.FIds, 0);
-      setlength(self.FKeys, LSize);
-      setlength(self.FIds, LSize);
-      for LI := 0 to len(LOldIds) - 1 do
-        if LOldIds[LI] <> 0 then
-          LIndex := self.DoIndex(LOldKeys[LI]);
-          self.FKeys[LIndex] := LOldKeys[LI];
-          self.FIds[LIndex] := LOldIds[LI];
-        end;
-      end;
-    end;
-
-    // The id of AKey; 0 when the map does not hold it
-    const method Find(const AKey: string): int64;
-    begin
-      if self.FCount = 0 then
-        return 0;
-      end;
-      return self.FIds[self.DoIndex(AKey)];
-    end;
-
-    // Maps AKey to AId (in place of an id it had); raises for AId 0 (0 means none)
-    method Put(const AKey: string; const AId: int64);
-    var
-      LIndex: int64;
-    begin
-      if AId = 0 then
-        raise(ADAM_CONTAINERS_FAULT_NO_ID + "'" + AKey + "'");
-      end;
-      if (self.FCount + 1) * 2 > len(self.FIds) then
-        self.DoGrow();
-      end;
-      LIndex := self.DoIndex(AKey);
-      if self.FIds[LIndex] = 0 then
-        self.FKeys[LIndex] := AKey;
-        self.FCount := self.FCount + 1;
-      end;
-      self.FIds[LIndex] := AId;
-    end;
-  end;
-
-  // A map from int64 keys to int64 values (see the header)
-  Int64Map = object
-    hidden FKeys: array of int64;
-    hidden FValues: array of int64;
-    hidden FCount: int64;
-    hidden FMissing: int64;
-
-    // An empty map whose Find answers AMissing for a key it does not hold
-    init(const AMissing: int64);
-    begin
-      self.FCount := 0;
-      self.FMissing := AMissing;
-    end;
-
-    // How many keys the map holds
-    property Count: int64 read FCount;
-
-    // The table index holding AKey, or the empty one where it would go; the table is not
-    // empty and has an empty place (it is kept at most half full). An empty place has key
-    // -1. The ids a map holds are mostly a run (a function's instructions), so the key is
-    // mixed (xorshift, every bit reaching the low ones) before its low bits index the
-    // table: a run indexed by its low bits as they are would fill one stretch of
-    // neighbouring places, and every key looked for that the map does not hold (an
-    // operand of another function) would probe to that stretch's end (SU2.8)
-    hidden const method DoIndex(const AKey: int64): int64;
-    var
-      LMask: int64;
-      LHash: uint64;
-      LIndex: int64;
-    begin
-      LMask := len(self.FKeys) - 1;
-      LHash := uint64(AKey);
-      LHash := LHash xor (LHash shl uint64(13));
-      LHash := LHash xor (LHash shr uint64(7));
-      LHash := LHash xor (LHash shl uint64(17));
-      LHash := LHash xor (LHash shr uint64(31));
-      LIndex := int64(LHash & uint64(LMask));
-      // Linear probing: the next place until AKey or an empty place
-      while (self.FKeys[LIndex] <> -1) and (self.FKeys[LIndex] <> AKey) do
-        LIndex := (LIndex + 1) & LMask;
-      end;
-      return LIndex;
-    end;
-
-    // The table at twice its size (the first table when there is none), every key moved
-    hidden method DoGrow();
-    var
-      LOldKeys: array of int64;
-      LOldValues: array of int64;
-      LSize: int64;
-      LI: int64;
-      LIndex: int64;
-    begin
-      LOldKeys := self.FKeys;
-      LOldValues := self.FValues;
-      LSize := len(LOldKeys) * 2;
-      if LSize < ADAM_CONTAINERS_FIRST_TABLE then
-        LSize := ADAM_CONTAINERS_FIRST_TABLE;
-      end;
-      setlength(self.FKeys, 0);
-      setlength(self.FValues, 0);
-      setlength(self.FKeys, LSize);
-      setlength(self.FValues, LSize);
-      for LI := 0 to LSize - 1 do
-        self.FKeys[LI] := -1;
-      end;
-      for LI := 0 to len(LOldKeys) - 1 do
-        if LOldKeys[LI] <> -1 then
-          LIndex := self.DoIndex(LOldKeys[LI]);
-          self.FKeys[LIndex] := LOldKeys[LI];
-          self.FValues[LIndex] := LOldValues[LI];
-        end;
-      end;
-    end;
-
-    // The value of AKey; the map's missing value when it does not hold AKey
-    const method Find(const AKey: int64): int64;
-    var
-      LIndex: int64;
-    begin
-      if (self.FCount = 0) or (AKey < 0) then
-        return self.FMissing;
-      end;
-      LIndex := self.DoIndex(AKey);
-      if self.FKeys[LIndex] = -1 then
-        return self.FMissing;
-      end;
-      return self.FValues[LIndex];
-    end;
-
-    // Maps AKey to AValue (in place of a value it had); raises for a negative key
-    method Put(const AKey: int64; const AValue: int64);
-    var
-      LIndex: int64;
-    begin
-      if AKey < 0 then
-        raise(ADAM_CONTAINERS_FAULT_KEY + IntToStr(AKey));
-      end;
-      if (self.FCount + 1) * 2 > len(self.FKeys) then
-        self.DoGrow();
-      end;
-      LIndex := self.DoIndex(AKey);
-      if self.FKeys[LIndex] = -1 then
-        self.FKeys[LIndex] := AKey;
-        self.FCount := self.FCount + 1;
-      end;
-      self.FValues[LIndex] := AValue;
     end;
   end;
 
