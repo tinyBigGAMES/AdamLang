@@ -1,0 +1,722 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Pdb.Msf.adam - the Multi-Stream File (MSF 7.00) a PDB is (M7c):
+  numbered streams of bytes laid in fixed-size blocks
+
+  Every layout fact is Microsoft's MSF as LLVM documents and writes it
+  (llvm/DebugInfo/MSF: MSFCommon.h, MSFBuilder.cpp; docs/PDB/MsfFile.rst).
+
+  The file      block 0 the superblock (the magic, the block size, the
+                active free block map's block (1), the block count, the
+                stream directory's byte count, the block map's block); in
+                every interval of BlockSize blocks the blocks 1 and 2 of the
+                interval hold the two free block maps (FPM1, FPM2), never a
+                stream's data; then the streams' data, each stream's blocks
+                in order, then the stream directory (the stream count, each
+                stream's byte count, each stream's block numbers), then the
+                block map (the directory's block numbers)
+  The free map  one bit per block (bit set = free), the bitmap's byte J in
+                interval J div BlockSize's map block at J mod BlockSize; the
+                writer lays out no free block, so the file's blocks are all
+                clear and every bit past them set; both maps alike
+  MsfBytes      bytes being built (a stream's content), little-endian
+  MsfWriter     the streams (index 0 up) as an MSF file; nothing in it
+                depends on time or addresses (AD.7)
+  MsfReader     an MSF file's streams read back; a file it cannot read gives
+                its Reason, never a raise (it reads what it is handed)
+  MsfText       a reader's layout as text (the rows' view): the block size,
+                the counts, and the checks a reader relies on (no block
+                used twice, none of them a free map's, none marked free)
+*******************************************************************************/
+
+module unit Adam.Pdb.Msf;
+
+import System.SysUtils, System.Collections, Adam.Core.Containers;
+
+public const
+  // The block size a PDB is written with (MSF allows 512, 1024, 2048 and 4096)
+  ADAM_MSF_BLOCK_SIZE: int64 = 4096;
+  // A stream directory's byte count meaning no stream (an unused stream number)
+  ADAM_MSF_NIL_STREAM: int64 = 0xFFFFFFFF;
+  // Raised (a compiler bug): a block size MSF does not have, a stream number never added,
+  // and a directory larger than one block map can number
+  ADAM_MSF_FAULT_BLOCK_SIZE: string = "Msf: not an MSF block size: ";
+  ADAM_MSF_FAULT_STREAM: string = "Msf: no such stream: ";
+  ADAM_MSF_FAULT_DIRECTORY: string = "Msf: the stream directory needs more blocks than one block map holds";
+  // A reader's reasons (the text a dump prints; "" = read)
+  ADAM_MSF_BAD_SIZE: string = "too short for a superblock";
+  ADAM_MSF_BAD_MAGIC: string = "no MSF 7.00 magic";
+  ADAM_MSF_BAD_BLOCK_SIZE: string = "not an MSF block size";
+  ADAM_MSF_BAD_LENGTH: string = "its length is not its block count times its block size";
+  ADAM_MSF_BAD_BLOCK: string = "a block number past the file";
+  ADAM_MSF_BAD_DIRECTORY: string = "a stream directory shorter than its streams need";
+
+const
+  // The magic's text, then the bytes after it (CR LF, 0x1A 'D' 'S', 3 zeros): 32 bytes
+  ADAM_MSF_MAGIC_TEXT: string = "Microsoft C/C++ MSF 7.00";
+  ADAM_MSF_MAGIC_SIZE: int64 = 32;
+  // The superblock's size: the magic and six 32-bit fields
+  ADAM_MSF_SUPERBLOCK_SIZE: int64 = 56;
+  // The active free block map's block in an interval, and the other one
+  ADAM_MSF_FPM1: int64 = 1;
+  ADAM_MSF_FPM2: int64 = 2;
+  // The first block a stream may use (after the superblock and the two maps)
+  ADAM_MSF_FIRST_DATA: int64 = 3;
+
+public type
+  // Bytes being built (a stream's content): appended little-endian, patched in place
+  MsfBytes = object
+    hidden FBytes: ByteArray;
+    hidden FCount: int64;
+
+    init();
+    begin
+      setlength(self.FBytes, 0);
+      self.FCount := 0;
+    end;
+
+    property Count: int64 read FCount;
+
+    // Room for ACount more bytes, the storage doubled (never grown one by one)
+    hidden method DoRoom(const ACount: int64);
+    var
+      LSize: int64;
+    begin
+      if self.FCount + ACount <= len(self.FBytes) then
+        return;
+      end;
+      LSize := len(self.FBytes) * 2 + 64;
+      if LSize < self.FCount + ACount then
+        LSize := self.FCount + ACount;
+      end;
+      setlength(self.FBytes, LSize);
+    end;
+
+    // Appends the low AWidth bytes of AValue, least significant first
+    method Put(const AValue: uint64; const AWidth: int64);
+    begin
+      self.DoRoom(AWidth);
+      PutLe(self.FBytes, self.FCount, AValue, AWidth);
+      self.FCount := self.FCount + AWidth;
+    end;
+
+    // Appends AText's bytes and a NUL
+    method PutText(const AText: string);
+    var
+      LCount: int64;
+    begin
+      LCount := len(AText);
+      self.DoRoom(LCount + 1);
+      if LCount > 0 then
+        CopyBytes(addr of self.FBytes[self.FCount], ptr to const uint8(ptr(addr of AText[0])),
+          LCount);
+      end;
+      self.FBytes[self.FCount + LCount] := 0;
+      self.FCount := self.FCount + LCount + 1;
+    end;
+
+    // Appends ACount bytes of ABytes from AAt (the caller keeps them inside ABytes)
+    method PutRange(const ABytes: ByteArray; const AAt: int64; const ACount: int64);
+    begin
+      if ACount <= 0 then
+        return;
+      end;
+      self.DoRoom(ACount);
+      CopyBytes(addr of self.FBytes[self.FCount], addr of ABytes[AAt], ACount);
+      self.FCount := self.FCount + ACount;
+    end;
+
+    // Appends every byte of ABytes
+    method PutBytes(const ABytes: ByteArray);
+    begin
+      self.PutRange(ABytes, 0, len(ABytes));
+    end;
+
+    // Appends ACount zero bytes
+    method PutZeros(const ACount: int64);
+    var
+      LI: int64;
+    begin
+      self.DoRoom(ACount);
+      for LI := 0 to ACount - 1 do
+        self.FBytes[self.FCount + LI] := 0;
+      end;
+      self.FCount := self.FCount + ACount;
+    end;
+
+    // Zero bytes up to a multiple of AAlign (a power of two)
+    method PadTo(const AAlign: int64);
+    begin
+      self.PutZeros(AlignUp(self.FCount, AAlign) - self.FCount);
+    end;
+
+    // Writes AValue's low AWidth bytes over the bytes at AAt
+    method Patch(const AAt: int64; const AValue: uint64; const AWidth: int64);
+    begin
+      PutLe(self.FBytes, AAt, AValue, AWidth);
+    end;
+
+    // The AWidth-byte value at AAt
+    const method ValueAt(const AAt: int64; const AWidth: int64): uint64;
+    begin
+      return GetLe(self.FBytes, AAt, AWidth);
+    end;
+
+    // The bytes appended, as an array of exactly that length
+    const method Bytes(): ByteArray;
+    var
+      LBytes: ByteArray;
+    begin
+      setlength(LBytes, self.FCount);
+      if self.FCount > 0 then
+        CopyBytes(addr of LBytes[0], addr of self.FBytes[0], self.FCount);
+      end;
+      return LBytes;
+    end;
+  end;
+
+// True when ASize is a block size MSF has
+routine DoIsBlockSize(const ASize: int64): bool;
+begin
+  return (ASize = 512) or (ASize = 1024) or (ASize = 2048) or (ASize = 4096);
+end;
+
+// True when ABlock holds one of the free block maps (blocks 1 and 2 of each interval)
+routine DoIsMapBlock(const ABlock: int64; const ABlockSize: int64): bool;
+var
+  LIn: int64;
+begin
+  LIn := ABlock mod ABlockSize;
+  return (LIn = ADAM_MSF_FPM1) or (LIn = ADAM_MSF_FPM2);
+end;
+
+// The block count ACount bytes take
+routine DoBlocksOf(const ACount: int64; const ABlockSize: int64): int64;
+begin
+  return (ACount + ABlockSize - 1) div ABlockSize;
+end;
+
+public type
+  // The streams of an MSF file being built, by number (0 up), and the file they make
+  MsfWriter = object
+    hidden FBlockSize: int64;
+    hidden FStreams: ref List<ByteArray>;
+
+    // An empty file of ABlockSize blocks (raises on a size MSF does not have)
+    init(const ABlockSize: int64);
+    begin
+      if not DoIsBlockSize(ABlockSize) then
+        raise(ADAM_MSF_FAULT_BLOCK_SIZE + IntToStr(ABlockSize));
+      end;
+      self.FBlockSize := ABlockSize;
+      self.FStreams := ref List<ByteArray>();
+    end;
+
+    property BlockSize: int64 read FBlockSize;
+
+    // The stream count
+    const method StreamCount(): int64;
+    begin
+      return self.FStreams.Count;
+    end;
+
+    // ABytes as the next stream; its number returned
+    method AddStream(const ABytes: ByteArray): int64;
+    begin
+      self.FStreams.Add(ABytes);
+      return self.FStreams.Count - 1;
+    end;
+
+    // The next stream, empty until SetStream fills it (a number another stream refers to
+    // before its content is made); its number returned
+    method ReserveStream(): int64;
+    var
+      LEmpty: ByteArray;
+    begin
+      setlength(LEmpty, 0);
+      return self.AddStream(LEmpty);
+    end;
+
+    // Stream AIndex's content made ABytes (raises on a number never added)
+    method SetStream(const AIndex: int64; const ABytes: ByteArray);
+    begin
+      if (AIndex < 0) or (AIndex >= self.FStreams.Count) then
+        raise(ADAM_MSF_FAULT_STREAM + IntToStr(AIndex));
+      end;
+      self.FStreams[AIndex] := ABytes;
+    end;
+
+    // Stream AIndex's content
+    const method StreamAt(const AIndex: int64): ByteArray;
+    begin
+      if (AIndex < 0) or (AIndex >= self.FStreams.Count) then
+        raise(ADAM_MSF_FAULT_STREAM + IntToStr(AIndex));
+      end;
+      return self.FStreams[AIndex];
+    end;
+
+    // The block after ABlock that a stream, the directory or the block map may use (the
+    // free maps' blocks passed over)
+    hidden const method DoNext(const ABlock: int64): int64;
+    var
+      LBlock: int64;
+    begin
+      LBlock := ABlock + 1;
+      while DoIsMapBlock(LBlock, self.FBlockSize) do
+        LBlock := LBlock + 1;
+      end;
+      return LBlock;
+    end;
+
+    // ACount bytes of ABytes from AAt into AFile's block ABlock (the rest of it stays 0)
+    hidden const method DoFill(var AFile: ByteArray; const ABlock: int64; const ABytes: ByteArray;
+      const AAt: int64; const ACount: int64);
+    begin
+      if ACount > 0 then
+        CopyBytes(addr of AFile[ABlock * self.FBlockSize], addr of ABytes[AAt], ACount);
+      end;
+    end;
+
+    // The file: every stream laid in blocks, the directory, the block map, the superblock
+    // and both free maps (see the header)
+    const method Write(): ByteArray;
+    var
+      LFile: ByteArray;
+      LData: ByteArray;
+      LDirectory: ref MsfBytes;
+      LMap: ref MsfBytes;
+      LBitmap: ByteArray;
+      LStreamBlocks: ref List<Int64Array>;
+      LBlocks: Int64Array;
+      LDirectoryBlocks: Int64Array;
+      LMapBlock: int64;
+      LLast: int64;
+      LBlockCount: int64;
+      LIntervals: int64;
+      LSize: int64;
+      LCount: int64;
+      LAt: int64;
+      LByte: int64;
+      LS: int64;
+      LI: int64;
+    begin
+      // Each stream's blocks, in stream order, the maps' blocks passed over
+      LLast := ADAM_MSF_FIRST_DATA - 1;
+      LStreamBlocks := ref List<Int64Array>();
+      for LS := 0 to self.FStreams.Count - 1 do
+        LCount := DoBlocksOf(len(self.FStreams[LS]), self.FBlockSize);
+        setlength(LBlocks, LCount);
+        for LI := 0 to LCount - 1 do
+          LLast := self.DoNext(LLast);
+          LBlocks[LI] := LLast;
+        end;
+        LStreamBlocks.Add(LBlocks);
+        // the next stream's numbers go in a block of its own
+        setlength(LBlocks, 0);
+      end;
+      // The directory: the stream count, each stream's byte count, each one's blocks
+      LDirectory := ref MsfBytes();
+      LDirectory.Put(uint64(self.FStreams.Count), 4);
+      for LS := 0 to self.FStreams.Count - 1 do
+        LDirectory.Put(uint64(len(self.FStreams[LS])), 4);
+      end;
+      for LS := 0 to self.FStreams.Count - 1 do
+        LBlocks := LStreamBlocks[LS];
+        for LI := 0 to len(LBlocks) - 1 do
+          LDirectory.Put(uint64(LBlocks[LI]), 4);
+        end;
+      end;
+      LCount := DoBlocksOf(LDirectory.Count, self.FBlockSize);
+      if LCount * 4 > self.FBlockSize then
+        raise(ADAM_MSF_FAULT_DIRECTORY);
+      end;
+      setlength(LDirectoryBlocks, LCount);
+      for LI := 0 to LCount - 1 do
+        LLast := self.DoNext(LLast);
+        LDirectoryBlocks[LI] := LLast;
+      end;
+      LLast := self.DoNext(LLast);
+      LMapBlock := LLast;
+      // The file ends after the block map; an interval it reaches has both maps' blocks
+      LBlockCount := LLast + 1;
+      if DoIsMapBlock(LBlockCount, self.FBlockSize) then
+        LBlockCount := LBlockCount - (LBlockCount mod self.FBlockSize) + ADAM_MSF_FPM2 + 1;
+      end;
+      setlength(LFile, LBlockCount * self.FBlockSize);
+      for LI := 0 to len(LFile) - 1 do
+        LFile[LI] := 0;
+      end;
+      // The superblock
+      for LI := 0 to len(ADAM_MSF_MAGIC_TEXT) - 1 do
+        LFile[LI] := uint8(ADAM_MSF_MAGIC_TEXT[LI]);
+      end;
+      LAt := len(ADAM_MSF_MAGIC_TEXT);
+      LFile[LAt] := 13;
+      LFile[LAt + 1] := 10;
+      LFile[LAt + 2] := 0x1A;
+      // "DS"
+      LFile[LAt + 3] := 0x44;
+      LFile[LAt + 4] := 0x53;
+      PutLe(LFile, ADAM_MSF_MAGIC_SIZE, uint64(self.FBlockSize), 4);
+      PutLe(LFile, ADAM_MSF_MAGIC_SIZE + 4, uint64(ADAM_MSF_FPM1), 4);
+      PutLe(LFile, ADAM_MSF_MAGIC_SIZE + 8, uint64(LBlockCount), 4);
+      PutLe(LFile, ADAM_MSF_MAGIC_SIZE + 12, uint64(LDirectory.Count), 4);
+      PutLe(LFile, ADAM_MSF_MAGIC_SIZE + 16, 0, 4);
+      PutLe(LFile, ADAM_MSF_MAGIC_SIZE + 20, uint64(LMapBlock), 4);
+      // Each stream's bytes into its blocks
+      for LS := 0 to self.FStreams.Count - 1 do
+        LData := self.FStreams[LS];
+        LBlocks := LStreamBlocks[LS];
+        for LI := 0 to len(LBlocks) - 1 do
+          LSize := len(LData) - LI * self.FBlockSize;
+          if LSize > self.FBlockSize then
+            LSize := self.FBlockSize;
+          end;
+          self.DoFill(LFile, LBlocks[LI], LData, LI * self.FBlockSize, LSize);
+        end;
+      end;
+      // The directory into its blocks, their numbers into the block map
+      LData := LDirectory.Bytes();
+      LMap := ref MsfBytes();
+      for LI := 0 to len(LDirectoryBlocks) - 1 do
+        LSize := len(LData) - LI * self.FBlockSize;
+        if LSize > self.FBlockSize then
+          LSize := self.FBlockSize;
+        end;
+        self.DoFill(LFile, LDirectoryBlocks[LI], LData, LI * self.FBlockSize, LSize);
+        LMap.Put(uint64(LDirectoryBlocks[LI]), 4);
+      end;
+      LData := LMap.Bytes();
+      self.DoFill(LFile, LMapBlock, LData, 0, len(LData));
+      // The free maps: every block of the file used (bit clear), every bit past it set; the
+      // bitmap's byte J in interval J div BlockSize's map blocks
+      LIntervals := DoBlocksOf(LBlockCount, self.FBlockSize);
+      setlength(LBitmap, LIntervals * self.FBlockSize);
+      for LI := 0 to len(LBitmap) - 1 do
+        LBitmap[LI] := 0xFF;
+      end;
+      for LI := 0 to LBlockCount - 1 do
+        LByte := LI div 8;
+        LBitmap[LByte] := uint8(int64(LBitmap[LByte]) & (255 - (1 shl (LI mod 8))));
+      end;
+      for LI := 0 to len(LBitmap) - 1 do
+        LAt := (LI div self.FBlockSize) * self.FBlockSize;
+        LByte := LI mod self.FBlockSize;
+        LFile[(LAt + ADAM_MSF_FPM1) * self.FBlockSize + LByte] := LBitmap[LI];
+        LFile[(LAt + ADAM_MSF_FPM2) * self.FBlockSize + LByte] := LBitmap[LI];
+      end;
+      return LFile;
+    end;
+  end;
+
+  // An MSF file's streams read back (see the header)
+  MsfReader = object
+    // "" when the file was read, else why not
+    Reason: string;
+    BlockSize: int64;
+    BlockCount: int64;
+    FreeMapBlock: int64;
+    DirectoryBytes: int64;
+    BlockMapBlock: int64;
+    hidden FFile: ByteArray;
+    // Per stream: its byte count (a nil stream 0), whether it is nil, its first block's
+    // place in FBlocks
+    hidden FSizes: Int64Array;
+    hidden FNil: array of bool;
+    hidden FFirsts: Int64Array;
+    hidden FBlocks: Int64Array;
+    hidden FDirectoryBlocks: Int64Array;
+
+    init(const AFile: ByteArray);
+    begin
+      self.FFile := AFile;
+      self.Reason := "";
+      self.BlockSize := 0;
+      self.BlockCount := 0;
+      self.FreeMapBlock := 0;
+      self.DirectoryBytes := 0;
+      self.BlockMapBlock := 0;
+      setlength(self.FSizes, 0);
+      setlength(self.FNil, 0);
+      setlength(self.FFirsts, 0);
+      setlength(self.FBlocks, 0);
+      setlength(self.FDirectoryBlocks, 0);
+      self.Reason := self.DoRead();
+    end;
+
+    // The AWidth-byte value at AAt of the file
+    hidden const method DoGet(const AAt: int64; const AWidth: int64): int64;
+    begin
+      return int64(GetLe(self.FFile, AAt, AWidth));
+    end;
+
+    // Reads the superblock and the directory; "" or why it cannot
+    hidden method DoRead(): string;
+    var
+      LDirectory: ByteArray;
+      LCount: int64;
+      LStreams: int64;
+      LTotal: int64;
+      LBlock: int64;
+      LSize: int64;
+      LAt: int64;
+      LS: int64;
+      LI: int64;
+    begin
+      if len(self.FFile) < ADAM_MSF_SUPERBLOCK_SIZE then
+        return ADAM_MSF_BAD_SIZE;
+      end;
+      for LI := 0 to len(ADAM_MSF_MAGIC_TEXT) - 1 do
+        if self.FFile[LI] <> uint8(ADAM_MSF_MAGIC_TEXT[LI]) then
+          return ADAM_MSF_BAD_MAGIC;
+        end;
+      end;
+      LAt := len(ADAM_MSF_MAGIC_TEXT);
+      if (self.FFile[LAt] <> 13) or (self.FFile[LAt + 1] <> 10) or (self.FFile[LAt + 2] <> 0x1A) then
+        return ADAM_MSF_BAD_MAGIC;
+      end;
+      self.BlockSize := self.DoGet(ADAM_MSF_MAGIC_SIZE, 4);
+      self.FreeMapBlock := self.DoGet(ADAM_MSF_MAGIC_SIZE + 4, 4);
+      self.BlockCount := self.DoGet(ADAM_MSF_MAGIC_SIZE + 8, 4);
+      self.DirectoryBytes := self.DoGet(ADAM_MSF_MAGIC_SIZE + 12, 4);
+      self.BlockMapBlock := self.DoGet(ADAM_MSF_MAGIC_SIZE + 20, 4);
+      if not DoIsBlockSize(self.BlockSize) then
+        return ADAM_MSF_BAD_BLOCK_SIZE;
+      end;
+      if self.BlockCount * self.BlockSize <> len(self.FFile) then
+        return ADAM_MSF_BAD_LENGTH;
+      end;
+      if self.BlockMapBlock >= self.BlockCount then
+        return ADAM_MSF_BAD_BLOCK;
+      end;
+      // The directory's blocks (from the block map), then its bytes
+      LCount := DoBlocksOf(self.DirectoryBytes, self.BlockSize);
+      if LCount * 4 > self.BlockSize then
+        return ADAM_MSF_BAD_DIRECTORY;
+      end;
+      setlength(self.FDirectoryBlocks, LCount);
+      setlength(LDirectory, LCount * self.BlockSize);
+      for LI := 0 to LCount - 1 do
+        LBlock := self.DoGet(self.BlockMapBlock * self.BlockSize + LI * 4, 4);
+        if LBlock >= self.BlockCount then
+          return ADAM_MSF_BAD_BLOCK;
+        end;
+        self.FDirectoryBlocks[LI] := LBlock;
+        CopyBytes(addr of LDirectory[LI * self.BlockSize], addr of self.FFile[LBlock * self.BlockSize],
+          self.BlockSize);
+      end;
+      if self.DirectoryBytes < 4 then
+        return ADAM_MSF_BAD_DIRECTORY;
+      end;
+      LStreams := int64(GetLe(LDirectory, 0, 4));
+      if 4 + LStreams * 4 > self.DirectoryBytes then
+        return ADAM_MSF_BAD_DIRECTORY;
+      end;
+      setlength(self.FSizes, LStreams);
+      setlength(self.FNil, LStreams);
+      setlength(self.FFirsts, LStreams);
+      LTotal := 0;
+      for LS := 0 to LStreams - 1 do
+        LSize := int64(GetLe(LDirectory, 4 + LS * 4, 4));
+        self.FNil[LS] := (LSize = ADAM_MSF_NIL_STREAM);
+        if self.FNil[LS] then
+          LSize := 0;
+        end;
+        self.FSizes[LS] := LSize;
+        self.FFirsts[LS] := LTotal;
+        LTotal := LTotal + DoBlocksOf(LSize, self.BlockSize);
+      end;
+      if 4 + LStreams * 4 + LTotal * 4 > self.DirectoryBytes then
+        return ADAM_MSF_BAD_DIRECTORY;
+      end;
+      setlength(self.FBlocks, LTotal);
+      for LI := 0 to LTotal - 1 do
+        LBlock := int64(GetLe(LDirectory, 4 + LStreams * 4 + LI * 4, 4));
+        if LBlock >= self.BlockCount then
+          return ADAM_MSF_BAD_BLOCK;
+        end;
+        self.FBlocks[LI] := LBlock;
+      end;
+      return "";
+    end;
+
+    // True when the file was read
+    const method IsRead(): bool;
+    begin
+      return self.Reason = "";
+    end;
+
+    // The stream count
+    const method StreamCount(): int64;
+    begin
+      return len(self.FSizes);
+    end;
+
+    // True when stream AIndex is a nil stream (or past the count)
+    const method IsNil(const AIndex: int64): bool;
+    begin
+      if (AIndex < 0) or (AIndex >= len(self.FSizes)) then
+        return true;
+      end;
+      return self.FNil[AIndex];
+    end;
+
+    // Stream AIndex's byte count (0 for a nil stream or one past the count)
+    const method StreamSize(const AIndex: int64): int64;
+    begin
+      if (AIndex < 0) or (AIndex >= len(self.FSizes)) then
+        return 0;
+      end;
+      return self.FSizes[AIndex];
+    end;
+
+    // Stream AIndex's block numbers
+    const method StreamBlocks(const AIndex: int64): Int64Array;
+    var
+      LBlocks: Int64Array;
+      LCount: int64;
+      LI: int64;
+    begin
+      LCount := DoBlocksOf(self.StreamSize(AIndex), self.BlockSize);
+      setlength(LBlocks, LCount);
+      for LI := 0 to LCount - 1 do
+        LBlocks[LI] := self.FBlocks[self.FFirsts[AIndex] + LI];
+      end;
+      return LBlocks;
+    end;
+
+    // Stream AIndex's bytes (empty for a nil stream or one past the count)
+    const method Stream(const AIndex: int64): ByteArray;
+    var
+      LBytes: ByteArray;
+      LBlocks: Int64Array;
+      LSize: int64;
+      LCount: int64;
+      LI: int64;
+    begin
+      LSize := self.StreamSize(AIndex);
+      setlength(LBytes, LSize);
+      LBlocks := self.StreamBlocks(AIndex);
+      for LI := 0 to len(LBlocks) - 1 do
+        LCount := LSize - LI * self.BlockSize;
+        if LCount > self.BlockSize then
+          LCount := self.BlockSize;
+        end;
+        CopyBytes(addr of LBytes[LI * self.BlockSize], addr of self.FFile[LBlocks[LI] * self.BlockSize],
+          LCount);
+      end;
+      return LBytes;
+    end;
+
+    // The directory's block numbers
+    const method DirectoryBlocks(): Int64Array;
+    begin
+      return self.FDirectoryBlocks;
+    end;
+
+    // True when the active free map marks ABlock free
+    const method IsFree(const ABlock: int64): bool;
+    var
+      LByte: int64;
+      LInterval: int64;
+    begin
+      LByte := ABlock div 8;
+      LInterval := LByte div self.BlockSize;
+      return (int64(self.FFile[(LInterval * self.BlockSize + self.FreeMapBlock) * self.BlockSize +
+        (LByte mod self.BlockSize)]) & (1 shl (ABlock mod 8))) <> 0;
+    end;
+  end;
+
+// One more use of ABlock counted in AUses; a free map's block or one used before is counted
+// in AWrong
+routine DoUse(var AUses: Int64Array; const ABlock: int64; const ABlockSize: int64;
+  var AWrong: int64);
+begin
+  if DoIsMapBlock(ABlock, ABlockSize) or (ABlock = 0) or (AUses[ABlock] <> 0) then
+    AWrong := AWrong + 1;
+  end;
+  AUses[ABlock] := AUses[ABlock] + 1;
+end;
+
+// A reader's layout as text (see the header): "msf block .. blocks .. directory .. streams
+// ..", then the checks (blocks used twice or in a map's place, blocks marked free, blocks no
+// stream uses), then a line per stream (its size, its block count; "nil" for a nil stream)
+public routine MsfText(const AReader: ref MsfReader): string;
+var
+  LText: ref TextBuilder;
+  LUses: Int64Array;
+  LBlocks: Int64Array;
+  LWrong: int64;
+  LFree: int64;
+  LUnused: int64;
+  LPast: string;
+  LS: int64;
+  LI: int64;
+begin
+  LText := ref TextBuilder();
+  if not AReader.IsRead() then
+    LText.Add("msf not read: " + AReader.Reason + "\n");
+    return LText.Text();
+  end;
+  LText.Add("msf block " + IntToStr(AReader.BlockSize) + " blocks " + IntToStr(AReader.BlockCount) +
+    " directory " + IntToStr(AReader.DirectoryBytes) + " streams " + IntToStr(AReader.StreamCount()) +
+    " map " + IntToStr(AReader.FreeMapBlock) + "\n");
+  setlength(LUses, AReader.BlockCount);
+  for LI := 0 to AReader.BlockCount - 1 do
+    LUses[LI] := 0;
+  end;
+  LWrong := 0;
+  for LS := 0 to AReader.StreamCount() - 1 do
+    LBlocks := AReader.StreamBlocks(LS);
+    for LI := 0 to len(LBlocks) - 1 do
+      DoUse(LUses, LBlocks[LI], AReader.BlockSize, LWrong);
+    end;
+  end;
+  LBlocks := AReader.DirectoryBlocks();
+  for LI := 0 to len(LBlocks) - 1 do
+    DoUse(LUses, LBlocks[LI], AReader.BlockSize, LWrong);
+  end;
+  DoUse(LUses, AReader.BlockMapBlock, AReader.BlockSize, LWrong);
+  // Every block not the superblock nor a map's is a stream's, the directory's or the map's
+  LFree := 0;
+  LUnused := 0;
+  for LI := 0 to AReader.BlockCount - 1 do
+    if AReader.IsFree(LI) then
+      LFree := LFree + 1;
+    end;
+    if (LI <> 0) and not DoIsMapBlock(LI, AReader.BlockSize) and (LUses[LI] = 0) then
+      LUnused := LUnused + 1;
+    end;
+  end;
+  // the first bit past the file: set (free) as every one after it
+  LPast := "clear";
+  if AReader.IsFree(AReader.BlockCount) then
+    LPast := "set";
+  end;
+  LText.Add("  wrong " + IntToStr(LWrong) + " free " + IntToStr(LFree) + " unused " +
+    IntToStr(LUnused) + " past " + LPast + "\n");
+  for LS := 0 to AReader.StreamCount() - 1 do
+    if AReader.IsNil(LS) then
+      LText.Add("  stream " + IntToStr(LS) + " nil\n");
+    else
+      LText.Add("  stream " + IntToStr(LS) + " size " + IntToStr(AReader.StreamSize(LS)) +
+        " blocks " + IntToStr(len(AReader.StreamBlocks(LS))) + "\n");
+    end;
+  end;
+  return LText.Text();
+end;
+
+end.
