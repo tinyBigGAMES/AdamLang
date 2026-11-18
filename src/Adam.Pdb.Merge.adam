@@ -1,0 +1,484 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Pdb.Merge.adam - one object's CodeView merged into a link's PdbInput
+
+  The linker (Adam.Coff.Linker) hands over, per object (one PDB module), its
+  .debug$T and its .debug$S sections with their relocations applied (every
+  address a section-relative offset and an image section number); this unit
+  reads the records Adam.Pdb.CodeView's WriteCodeView writes and nothing
+  else (the linker keeps only an object's CodeView IsAdamCodeView accepts):
+
+  PdbMerger      one link's type merge and every module's records:
+    types        an object's .debug$T records in order, each record's type
+                 indices remapped to the PDB's (a builtin below 0x1000 kept,
+                 an object's own index to the merged record it became), then
+                 deduplicated by content across the whole link (one record
+                 per distinct byte form, its first index kept): LF_POINTER,
+                 LF_PROCEDURE, LF_ARGLIST, LF_FIELDLIST (LF_MEMBER,
+                 LF_ENUMERATE, LF_INDEX), LF_BITFIELD, LF_ARRAY, LF_CLASS /
+                 LF_STRUCTURE / LF_UNION / LF_ENUM
+    files        the module section's string table and file checksums: a
+                 lines block's file (its checksum entry's offset) becomes
+                 the module's file of that name (PdbModule.AddFile)
+    symbols      every symbol record of every symbols subsection, in section
+                 order, its type index remapped (S_GPROC32 / S_LPROC32,
+                 S_REGREL32, S_GDATA32 / S_LDATA32 / S_GTHREAD32 /
+                 S_LTHREAD32, S_UDT; S_OBJNAME, S_COMPILE3, S_FRAMEPROC,
+                 S_END as they are); the PDB writer routes them and sets the
+                 scopes
+    lines        every lines subsection as a PdbLines (its section, offset
+                 and size from the applied relocations, statement lines, no
+                 columns)
+
+  Raised (a compiler bug: the bytes are Adam's own): a section without the
+  C13 signature, a subsection, record or type index past its end, a record
+  kind or subsection kind WriteCodeView never writes, a lines subsection
+  with columns.
+*******************************************************************************/
+
+module unit Adam.Pdb.Merge;
+
+import System.SysUtils, System.Collections, Adam.Core.Containers, Adam.Pdb.CodeView,
+  Adam.Pdb.Writer;
+
+public const
+  // Raised (a compiler bug, see the header)
+  ADAM_PDB_MERGE_FAULT_DAMAGED: string = "Pdb merge: damaged CodeView: ";
+  ADAM_PDB_MERGE_FAULT_KIND: string = "Pdb merge: a CodeView record Adam does not write: 0x";
+
+const
+  // A C13 lines subsection's flag for column entries
+  ADAM_PDB_MERGE_LINES_COLUMNS: int64 = 0x0001;
+
+// The AWidth-byte little-endian value at AAt of ABytes; raises past their end
+routine DoGet(const ABytes: ByteArray; const AAt: int64; const AWidth: int64): int64;
+begin
+  if (AAt < 0) or (AAt + AWidth > len(ABytes)) then
+    raise(ADAM_PDB_MERGE_FAULT_DAMAGED + "a field at " + IntToStr(AAt) + " past " +
+      IntToStr(len(ABytes)));
+  end;
+  return int64(GetLe(ABytes, AAt, AWidth));
+end;
+
+// The ACount bytes at AAt of ABytes; raises past their end
+routine DoSlice(const ABytes: ByteArray; const AAt: int64; const ACount: int64): ByteArray;
+var
+  LOut: ByteArray;
+  LI: int64;
+begin
+  if (AAt < 0) or (ACount < 0) or (AAt + ACount > len(ABytes)) then
+    raise(ADAM_PDB_MERGE_FAULT_DAMAGED + IntToStr(ACount) + " bytes at " + IntToStr(AAt) +
+      " past " + IntToStr(len(ABytes)));
+  end;
+  setlength(LOut, ACount);
+  for LI := 0 to ACount - 1 do
+    LOut[LI] := ABytes[AAt + LI];
+  end;
+  return LOut;
+end;
+
+// ABytes as a text of the same bytes (a map key)
+routine DoKeyOf(const ABytes: ByteArray): string;
+var
+  LText: string;
+  LI: int64;
+begin
+  setlength(LText, len(ABytes));
+  for LI := 0 to len(ABytes) - 1 do
+    LText[LI] := char(ABytes[LI]);
+  end;
+  return LText;
+end;
+
+// The NUL-ended text at AAt of ABytes
+routine DoTextAt(const ABytes: ByteArray; const AAt: int64): string;
+var
+  LText: string;
+  LStop: int64;
+  LI: int64;
+begin
+  LStop := AAt;
+  while (LStop < len(ABytes)) and (ABytes[LStop] <> 0) do
+    LStop := LStop + 1;
+  end;
+  if LStop >= len(ABytes) then
+    raise(ADAM_PDB_MERGE_FAULT_DAMAGED + "an unended name at " + IntToStr(AAt));
+  end;
+  setlength(LText, LStop - AAt);
+  for LI := 0 to LStop - AAt - 1 do
+    LText[LI] := char(ABytes[AAt + LI]);
+  end;
+  return LText;
+end;
+
+// The byte count of the numeric leaf at AAt of ABytes (its kind and its value)
+routine DoNumericSize(const ABytes: ByteArray; const AAt: int64): int64;
+var
+  LKind: int64;
+begin
+  LKind := DoGet(ABytes, AAt, 2);
+  if LKind < ADAM_CV_LF_NUMERIC then
+    return 2;
+  end;
+  if LKind = ADAM_CV_LF_CHAR then
+    return 3;
+  end;
+  if (LKind = ADAM_CV_LF_SHORT) or (LKind = ADAM_CV_LF_USHORT) then
+    return 4;
+  end;
+  if (LKind = ADAM_CV_LF_LONG) or (LKind = ADAM_CV_LF_ULONG) or (LKind = ADAM_CV_LF_REAL32) then
+    return 6;
+  end;
+  if (LKind = ADAM_CV_LF_QUADWORD) or (LKind = ADAM_CV_LF_UQUADWORD) or
+    (LKind = ADAM_CV_LF_REAL64) then
+    return 10;
+  end;
+  raise(ADAM_PDB_MERGE_FAULT_KIND + IntToHex(uint64(LKind), 4));
+end;
+
+// The offset past the NUL-ended name at AAt of ABytes
+routine DoPastName(const ABytes: ByteArray; const AAt: int64): int64;
+begin
+  return AAt + len(DoTextAt(ABytes, AAt)) + 1;
+end;
+
+public type
+  // One link's merge of its objects' CodeView into a PdbInput (see the header)
+  PdbMerger = object
+    hidden FInput: ref PdbInput;
+    // A merged type record's bytes -> its PDB index (deduplication across the link)
+    hidden FTypeOf: ref StringIdMap;
+    // The object being merged: each of its own type indices' PDB index (its index - 0x1000)
+    hidden FMap: Int64Array;
+    hidden FMapCount: int64;
+    // The object being merged: its string table and its file checksums (the module
+    // section's), and the module its records go to
+    hidden FStrings: ByteArray;
+    hidden FChecksums: ByteArray;
+    hidden FModule: ref PdbModule;
+
+    init(const AInput: ref PdbInput);
+    begin
+      self.FInput := AInput;
+      self.FTypeOf := ref StringIdMap(0);
+      setlength(self.FMap, 0);
+      self.FMapCount := 0;
+      setlength(self.FStrings, 0);
+      setlength(self.FChecksums, 0);
+      self.FModule := nil;
+    end;
+
+    // The PDB index of the object's type index AIndex (a builtin's its own)
+    hidden const method DoRemap(const AIndex: int64): int64;
+    begin
+      if AIndex < ADAM_CV_FIRST_TYPE then
+        return AIndex;
+      end;
+      if AIndex - ADAM_CV_FIRST_TYPE >= self.FMapCount then
+        raise(ADAM_PDB_MERGE_FAULT_DAMAGED + "type index 0x" + IntToHex(uint64(AIndex), 4) +
+          " past the object's types");
+      end;
+      return self.FMap[AIndex - ADAM_CV_FIRST_TYPE];
+    end;
+
+    // The 4-byte type index at AAt of ARecord remapped in place
+    hidden method DoRemapAt(var ARecord: ByteArray; const AAt: int64);
+    begin
+      PutLe(ARecord, AAt, uint64(self.DoRemap(DoGet(ARecord, AAt, 4))), 4);
+    end;
+
+    // The members of the field list ARecord (its leaf at 2) remapped in place
+    hidden method DoRemapFieldList(var ARecord: ByteArray);
+    var
+      LAt: int64;
+      LLeaf: int64;
+    begin
+      LAt := 4;
+      while LAt < len(ARecord) do
+        // LF_PAD bytes between members
+        if ARecord[LAt] >= uint8(ADAM_CV_LF_PAD) then
+          LAt := LAt + 1;
+          skip;
+        end;
+        LLeaf := DoGet(ARecord, LAt, 2);
+        if LLeaf = ADAM_CV_LF_MEMBER then
+          // attributes 2, type 4, offset, name
+          self.DoRemapAt(ARecord, LAt + 4);
+          LAt := DoPastName(ARecord, LAt + 8 + DoNumericSize(ARecord, LAt + 8));
+        else
+          if LLeaf = ADAM_CV_LF_ENUMERATE then
+            // attributes 2, value, name
+            LAt := DoPastName(ARecord, LAt + 4 + DoNumericSize(ARecord, LAt + 4));
+          else
+            if LLeaf = ADAM_CV_LF_INDEX then
+              // padding 2, the continuation's index
+              self.DoRemapAt(ARecord, LAt + 4);
+              LAt := LAt + 8;
+            else
+              raise(ADAM_PDB_MERGE_FAULT_KIND + IntToHex(uint64(LLeaf), 4));
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // The type record ARecord (its length at 0, its leaf at 2) with its type indices
+    // remapped in place
+    hidden method DoRemapType(var ARecord: ByteArray);
+    var
+      LLeaf: int64;
+      LCount: int64;
+      LI: int64;
+    begin
+      LLeaf := DoGet(ARecord, 2, 2);
+      if (LLeaf = ADAM_CV_LF_POINTER) or (LLeaf = ADAM_CV_LF_BITFIELD) then
+        self.DoRemapAt(ARecord, 4);
+        return;
+      end;
+      if LLeaf = ADAM_CV_LF_PROCEDURE then
+        // result 4, calling convention 1, attributes 1, parameters 2, arguments 4
+        self.DoRemapAt(ARecord, 4);
+        self.DoRemapAt(ARecord, 12);
+        return;
+      end;
+      if LLeaf = ADAM_CV_LF_ARGLIST then
+        LCount := DoGet(ARecord, 4, 4);
+        for LI := 0 to LCount - 1 do
+          self.DoRemapAt(ARecord, 8 + 4 * LI);
+        end;
+        return;
+      end;
+      if LLeaf = ADAM_CV_LF_FIELDLIST then
+        self.DoRemapFieldList(ARecord);
+        return;
+      end;
+      if LLeaf = ADAM_CV_LF_ARRAY then
+        // element 4, index 4
+        self.DoRemapAt(ARecord, 4);
+        self.DoRemapAt(ARecord, 8);
+        return;
+      end;
+      if (LLeaf = ADAM_CV_LF_CLASS) or (LLeaf = ADAM_CV_LF_STRUCTURE) then
+        // count 2, properties 2, fields 4, derived 4, vtable shape 4
+        self.DoRemapAt(ARecord, 8);
+        self.DoRemapAt(ARecord, 12);
+        self.DoRemapAt(ARecord, 16);
+        return;
+      end;
+      if LLeaf = ADAM_CV_LF_UNION then
+        self.DoRemapAt(ARecord, 8);
+        return;
+      end;
+      if LLeaf = ADAM_CV_LF_ENUM then
+        // count 2, properties 2, underlying 4, fields 4
+        self.DoRemapAt(ARecord, 8);
+        self.DoRemapAt(ARecord, 12);
+        return;
+      end;
+      raise(ADAM_PDB_MERGE_FAULT_KIND + IntToHex(uint64(LLeaf), 4));
+    end;
+
+    // The object's .debug$T bytes ATypes merged: FMap gets each record's PDB index
+    hidden method DoTypes(const ATypes: ByteArray);
+    var
+      LAt: int64;
+      LSize: int64;
+      LRecord: ByteArray;
+      LKey: string;
+      LIndex: int64;
+    begin
+      setlength(self.FMap, 0);
+      self.FMapCount := 0;
+      if len(ATypes) = 0 then
+        return;
+      end;
+      if DoGet(ATypes, 0, 4) <> ADAM_CV_SIGNATURE then
+        raise(ADAM_PDB_MERGE_FAULT_DAMAGED + "a .debug$T without its signature");
+      end;
+      LAt := 4;
+      while LAt < len(ATypes) do
+        LSize := DoGet(ATypes, LAt, 2) + 2;
+        LRecord := DoSlice(ATypes, LAt, LSize);
+        self.DoRemapType(LRecord);
+        LKey := DoKeyOf(LRecord);
+        LIndex := self.FTypeOf.Find(LKey);
+        if LIndex = 0 then
+          LIndex := self.FInput.AddType(LRecord);
+          self.FTypeOf.Put(LKey, LIndex);
+        end;
+        if self.FMapCount >= len(self.FMap) then
+          setlength(self.FMap, self.FMapCount * 2 + 64);
+        end;
+        self.FMap[self.FMapCount] := LIndex;
+        self.FMapCount := self.FMapCount + 1;
+        LAt := LAt + LSize;
+      end;
+    end;
+
+    // The symbol record ARecord with its type index remapped in place
+    hidden method DoRemapSymbol(var ARecord: ByteArray);
+    var
+      LKind: int64;
+    begin
+      LKind := DoGet(ARecord, 2, 2);
+      if (LKind = ADAM_CV_S_GPROC32) or (LKind = ADAM_CV_S_LPROC32) then
+        // parent, end, next, size, debug start, debug end (4 each), then the type
+        self.DoRemapAt(ARecord, 28);
+        return;
+      end;
+      if LKind = ADAM_CV_S_REGREL32 then
+        // offset 4, then the type
+        self.DoRemapAt(ARecord, 8);
+        return;
+      end;
+      if (LKind = ADAM_CV_S_GDATA32) or (LKind = ADAM_CV_S_LDATA32) or
+        (LKind = ADAM_CV_S_GTHREAD32) or (LKind = ADAM_CV_S_LTHREAD32) or
+        (LKind = ADAM_CV_S_UDT) then
+        self.DoRemapAt(ARecord, 4);
+        return;
+      end;
+      if (LKind = ADAM_CV_S_OBJNAME) or (LKind = ADAM_CV_S_COMPILE3) or
+        (LKind = ADAM_CV_S_FRAMEPROC) or (LKind = ADAM_CV_S_END) then
+        return;
+      end;
+      raise(ADAM_PDB_MERGE_FAULT_KIND + IntToHex(uint64(LKind), 4));
+    end;
+
+    // The symbols subsection AAt..AEnd of ABytes: each record remapped, into the module
+    hidden method DoSymbols(const ABytes: ByteArray; const AAt: int64; const AEnd: int64);
+    var
+      LAt: int64;
+      LSize: int64;
+      LRecord: ByteArray;
+    begin
+      LAt := AAt;
+      while LAt < AEnd do
+        LSize := DoGet(ABytes, LAt, 2) + 2;
+        if LAt + LSize > AEnd then
+          raise(ADAM_PDB_MERGE_FAULT_DAMAGED + "a symbol record past its subsection");
+        end;
+        LRecord := DoSlice(ABytes, LAt, LSize);
+        self.DoRemapSymbol(LRecord);
+        self.FModule.AddSymbol(LRecord);
+        LAt := LAt + LSize;
+      end;
+    end;
+
+    // The module file of the checksum entry at AOffset (the module section's tables)
+    hidden method DoFile(const AOffset: int64): int64;
+    begin
+      return self.FModule.AddFile(DoTextAt(self.FStrings, DoGet(self.FChecksums, AOffset, 4)));
+    end;
+
+    // The lines subsection AAt..AEnd of ABytes as a PdbLines of the module
+    hidden method DoLines(const ABytes: ByteArray; const AAt: int64; const AEnd: int64);
+    var
+      LLines: ref PdbLines;
+      LAt: int64;
+      LFile: int64;
+      LCount: int64;
+      LI: int64;
+    begin
+      // offset 4, section 2, flags 2, code size 4
+      if (DoGet(ABytes, AAt + 6, 2) & ADAM_PDB_MERGE_LINES_COLUMNS) <> 0 then
+        raise(ADAM_PDB_MERGE_FAULT_DAMAGED + "a lines subsection with columns");
+      end;
+      LLines := ref PdbLines(DoGet(ABytes, AAt + 4, 2), DoGet(ABytes, AAt, 4),
+        DoGet(ABytes, AAt + 8, 4));
+      LAt := AAt + ADAM_CV_LINES_HEADER;
+      while LAt < AEnd do
+        // the block: its file's checksum offset, its line count, its byte size
+        LFile := self.DoFile(DoGet(ABytes, LAt, 4));
+        LCount := DoGet(ABytes, LAt + 4, 4);
+        for LI := 0 to LCount - 1 do
+          LLines.Add(DoGet(ABytes, LAt + ADAM_CV_LINES_BLOCK + ADAM_CV_LINES_ENTRY * LI, 4),
+            DoGet(ABytes, LAt + ADAM_CV_LINES_BLOCK + ADAM_CV_LINES_ENTRY * LI + 4, 4) &
+            ADAM_CV_LINE_MASK, LFile);
+        end;
+        LAt := LAt + DoGet(ABytes, LAt + 8, 4);
+      end;
+      self.FModule.AddLines(LLines);
+    end;
+
+    // Each subsection of the .debug$S bytes ABytes: its kind, its content's start and end
+    // given to ATables (true: the string table and checksums only) or to the records
+    hidden method DoSubsections(const ABytes: ByteArray; const ATables: bool);
+    var
+      LAt: int64;
+      LKind: int64;
+      LEnd: int64;
+    begin
+      if DoGet(ABytes, 0, 4) <> ADAM_CV_SIGNATURE then
+        raise(ADAM_PDB_MERGE_FAULT_DAMAGED + "a .debug$S without its signature");
+      end;
+      LAt := 4;
+      while LAt < len(ABytes) do
+        LKind := DoGet(ABytes, LAt, 4);
+        LEnd := LAt + 8 + DoGet(ABytes, LAt + 4, 4);
+        if LEnd > len(ABytes) then
+          raise(ADAM_PDB_MERGE_FAULT_DAMAGED + "a subsection past its section");
+        end;
+        if ATables then
+          if LKind = ADAM_CV_SUB_STRINGS then
+            self.FStrings := DoSlice(ABytes, LAt + 8, LEnd - LAt - 8);
+          end;
+          if LKind = ADAM_CV_SUB_CHECKSUMS then
+            self.FChecksums := DoSlice(ABytes, LAt + 8, LEnd - LAt - 8);
+          end;
+        else
+          if LKind = ADAM_CV_SUB_SYMBOLS then
+            self.DoSymbols(ABytes, LAt + 8, LEnd);
+          else
+            if LKind = ADAM_CV_SUB_LINES then
+              self.DoLines(ABytes, LAt + 8, LEnd);
+            else
+              // the tables were read by the first pass
+              if (LKind <> ADAM_CV_SUB_STRINGS) and (LKind <> ADAM_CV_SUB_CHECKSUMS) then
+                raise(ADAM_PDB_MERGE_FAULT_KIND + IntToHex(uint64(LKind), 4));
+              end;
+            end;
+          end;
+        end;
+        // the next subsection at a 4-byte boundary
+        LAt := (LEnd + 3) & -4;
+      end;
+    end;
+
+    // One object's CodeView into AModule (see the header): ATypes its .debug$T (empty:
+    // none), ASymbols its .debug$S sections in the object's order, relocations applied
+    method AddObject(const AModule: ref PdbModule; const ATypes: ByteArray;
+      const ASymbols: ref List<ByteArray>);
+    var
+      LSection: ByteArray;
+      LI: int64;
+    begin
+      self.FModule := AModule;
+      setlength(self.FStrings, 0);
+      setlength(self.FChecksums, 0);
+      self.DoTypes(ATypes);
+      for LI := 0 to ASymbols.Count - 1 do
+        LSection := ASymbols.Items[LI];
+        self.DoSubsections(LSection, true);
+      end;
+      for LI := 0 to ASymbols.Count - 1 do
+        LSection := ASymbols.Items[LI];
+        self.DoSubsections(LSection, false);
+      end;
+      self.FModule := nil;
+    end;
+  end;
+
+end.
