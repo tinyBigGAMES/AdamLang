@@ -6,7 +6,7 @@ SPDX identifier: `AdditionRef-Adam-Runtime-Exception`
 
 ## Covered files
 
-This exception applies to the files of the Adam distribution in `bin/res/runtime/` and `bin/res/libs/std/` (folders relative to this file; the "Runtime Files"), and to any file that states in its header that it is covered by this exception. The Runtime Files are licensed under the Mozilla Public License, Version 2.0 (see [LICENSE](LICENSE)), with the additional permission below.
+This exception applies to the files of the Adam distribution in `bin/res/runtime/` and `bin/res/libs/std/` (folders relative to this file; the "Runtime Files"), and to any file that states in its header that it is covered by this exception. The Runtime Files are licensed under the Mozilla Public License, Version 2.0 (see [LICENSE](https://github.com/tinyBigGAMES/AdamLang?tab=MPL-2.0-1-ov-file)), with the additional permission below.
 
 ## Additional permission
 
@@ -16,7 +16,7 @@ You may distribute Runtime Output as part of that program, library or other outp
 
 ## What stays under MPL-2.0
 
-The Runtime Files themselves, modified or not, when distributed in Source Code Form, remain subject to MPL-2.0 without this permission. This exception does not grant any rights to Adam trademarks (see [TRADEMARK.md](TRADEMARK.md)).
+The Runtime Files themselves, modified or not, when distributed in Source Code Form, remain subject to MPL-2.0 without this permission. This exception does not grant any rights to Adam trademarks (see [TRADEMARK](TRADEMARK.md)).
 
 ## Removing the exception
 
