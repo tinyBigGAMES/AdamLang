@@ -1,0 +1,312 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Debug.Symbols.adam - what a program's debug information says about
+  it (M11a D2)
+
+  DebugSymbols is the debugger's one way to a program's debug information,
+  an abstract object each format fills in (Adam.Debug.Symbols.Win64 reads
+  Adam's PDB through DbgHelp today; a linux64 part over DWARF later, nothing
+  above the parts changed). Load takes the image a DebugTarget started (or
+  any module at its base); then, by Adam names and the PDB's own source
+  file names:
+    - lines: the source line an address is in, the address a file and line
+      start at (a line with no code: the next one that has), the files;
+    - routines: the one an address is in, one by name, each with the
+      address past its prologue (where a breakpoint on it stops);
+    - variables: a routine's parameters (self first) and locals at an
+      address, each at a register plus an offset; the module's globals at
+      their addresses; one global by name;
+    - types: a type id as a SymbolType (builtins by Adam name and size,
+      pointers, static arrays, records / overlays / objects with fields,
+      choices with values, routine types; Adam's managed types as records
+      by their Adam name, which Debug.Runtime (D3) formats);
+    - the stack: a stopped thread's frames from its DebugContext, each with
+      its routine, line and the registers it had (an outer frame's are the
+      ones unwinding gave back), read through the target (patches hidden).
+
+  A source file is matched as the PDB names it, or by its path's end
+  (MatchSourceFile): `$P:res/x.adam` (the compiler's folder) is found by
+  `C:\..\bin\res\x.adam`, `res\x.adam` or `x.adam` alike.
+
+  Everything that fails to load is reported on the Diagnostics (DB codes)
+  and the call says false; a lookup that finds nothing says false and
+  reports nothing (an address in no routine is no error). Nothing raises.
+*******************************************************************************/
+
+module unit Adam.Debug.Symbols;
+
+import System.SysUtils, Adam.Core.Messages, Adam.Compiler.SourceText, Adam.Compiler.Diagnostics,
+  Adam.Debug.Target;
+
+public const
+  ADAM_ERR_SYMBOLS_001: string = "DB0010";   // a module's debug information could not be loaded
+  ADAM_ERR_SYMBOLS_002: string = "DB0011";   // a stack walk made before any module was loaded
+  ADAM_ERR_SYMBOLS_003: string = "DB0012";   // registers not read from a thread of this target
+
+  // The lines after a file and line AddressOf looks at for one with code
+  ADAM_SYMBOLS_LINE_LOOKAHEAD: uint32 = 64;
+  // The frames StackWalk gives at most when the caller asks for 0
+  ADAM_SYMBOLS_FRAME_LIMIT: int64 = 256;
+
+public type
+  // A source line: the file as the debug information names it, its number, the address its
+  // code starts at, the module that holds it
+  SourceLine = record
+    FilePath: string;
+    Line: uint32;
+    Address: uint64;
+    Module: uint64;
+  end;
+
+  // A routine: its Adam name (module.Routine, a method Type.Method), where its code starts,
+  // its size in bytes, the address past its prologue, its type, the module that holds it
+  SymbolRoutine = record
+    Name: string;
+    Address: uint64;
+    Size: uint64;
+    BodyAddress: uint64;
+    TypeId: uint64;
+    Module: uint64;
+  end;
+
+  // Where a variable lives: a parameter / local at a register of its frame plus Offset; a
+  // global at Address; a threadvar at Offset in its module's thread block
+  VariableKind = choices(Param, Local, Global, ThreadGlobal);
+
+  // A variable: its name, kind, type (in Module), and where it lives (Register: a name of
+  // the target's RegisterNames, "" for a global)
+  SymbolVariable = record
+    Name: string;
+    Kind: VariableKind;
+    TypeId: uint64;
+    Module: uint64;
+    Register: string;
+    Offset: int64;
+    Address: uint64;
+  end;
+
+  SymbolVariableArray = array of SymbolVariable;
+
+  // What a type is (Unknown: the debug information names a kind Adam has none of)
+  SymbolTypeKind = choices(Unknown, Void, Signed, Unsigned, Float, Bool, Char, WideChar,
+    Pointer, StaticArray, Record, Choices, Routine);
+
+  // A record's field: its name, offset from the record's start, type
+  SymbolField = record
+    Name: string;
+    Offset: uint64;
+    TypeId: uint64;
+  end;
+
+  SymbolFieldArray = array of SymbolField;
+
+  // One value of a choices type: its name and number
+  SymbolChoice = record
+    Name: string;
+    Value: int64;
+  end;
+
+  SymbolChoiceArray = array of SymbolChoice;
+
+  // A type: its kind, Adam name (int32, Point, string ...; "" for a pointer / array, which
+  // name their element), size in bytes; a pointer's or array's element type (ElementTypeId)
+  // and an array's element count; a record's fields; a choices type's values
+  SymbolType = record
+    Kind: SymbolTypeKind;
+    Name: string;
+    Size: uint64;
+    ElementTypeId: uint64;
+    Count: uint64;
+    Fields: SymbolFieldArray;
+    Choices: SymbolChoiceArray;
+  end;
+
+  // One frame of a stack: the routine its code is in (Known false when the debug
+  // information has none there; its Name then "", Routine.Address 0), the line (HasLine),
+  // and the registers the frame had
+  StackFrame = record
+    Known: bool;
+    Routine: SymbolRoutine;
+    HasLine: bool;
+    Source: SourceLine;
+    Context: DebugContext;
+  end;
+
+  StackFrameArray = array of StackFrame;
+
+  // A program's debug information (see the header). Its modules are loaded first; the rest is
+  // the part's
+  DebugSymbols = object
+    hidden FReports: ref Diagnostics;
+
+    // The diagnostics every load failure is reported on (DB codes)
+    method SetDiagnostics(const AReports: ref Diagnostics);
+    begin
+      self.FReports := AReports;
+    end;
+
+    // The image ATarget started (after its ProcessStarted event): LoadModule of its path at
+    // its base
+    method Load(const ATarget: ref DebugTarget): bool;
+    begin
+      return self.LoadModule(ATarget.ImagePath(), ATarget.ImageBase());
+    end;
+
+    // The module at APath, loaded in the program at ABase, with its debug information. False
+    // (reported) when it or its debug information cannot be read
+    virtual method LoadModule(const APath: string; const ABase: uint64): bool; abstract;
+    // Every module and what was read for them dropped (Load starts again)
+    virtual method Close(); abstract;
+    // True once a module is loaded
+    virtual const method IsLoaded(): bool; abstract;
+
+    // The source files the modules' debug information names, as it names them, sorted
+    virtual method SourceFiles(): StringArray; abstract;
+    // The line AAddress is in: its file, number and the address the line starts at
+    virtual method LineAt(const AAddress: uint64; var ALine: SourceLine): bool; abstract;
+    // The address file AFile (MatchSourceFile's rule) and line ALine start at; a line with
+    // no code: the next of ADAM_SYMBOLS_LINE_LOOKAHEAD that has (ALine says which)
+    virtual method AddressOf(const AFile: string; const ALineNumber: uint32;
+      var ALine: SourceLine): bool; abstract;
+
+    // The routine AAddress is in
+    virtual method RoutineAt(const AAddress: uint64; var ARoutine: SymbolRoutine): bool;
+      abstract;
+    // The routine named AName (module.Routine, Type.Method)
+    virtual method RoutineByName(const AName: string; var ARoutine: SymbolRoutine): bool;
+      abstract;
+
+    // The parameters (self first, then in order) and the locals of the routine AAddress is in
+    virtual method Variables(const AAddress: uint64; var AVariables: SymbolVariableArray): bool;
+      abstract;
+    // The globals and threadvars of the modules
+    virtual method Globals(var AVariables: SymbolVariableArray): bool; abstract;
+    // The global or threadvar named AName (module.Name)
+    virtual method GlobalByName(const AName: string; var AVariable: SymbolVariable): bool;
+      abstract;
+
+    // The type ATypeId of the module at AModule
+    virtual method TypeOf(const AModule: uint64; const ATypeId: uint64;
+      var AType: SymbolType): bool; abstract;
+
+    // AThreadId's frames from AContext (read from it while ATarget is stopped), innermost
+    // first, at most AMaxFrames (0: ADAM_SYMBOLS_FRAME_LIMIT); the walk ends where the
+    // debug information can unwind no further. False when not even the first frame is there
+    virtual method StackWalk(const ATarget: ref DebugTarget; const AThreadId: uint32;
+      const AContext: DebugContext; const AMaxFrames: int64; var AFrames: StackFrameArray): bool;
+      abstract;
+
+    // The address AVariable is at in AFrame: a global's own, a parameter's / local's its
+    // register's value in AFrame.Context (by ANames, the target's RegisterNames) plus its
+    // offset. False for a threadvar (its block is the thread's) or a register ANames lacks
+    method AddressIn(const AVariable: SymbolVariable; const AFrame: StackFrame;
+      const ANames: StringArray; var AAddress: uint64): bool;
+    var
+      LI: int64;
+    begin
+      if AVariable.Kind = VariableKind.Global then
+        AAddress := AVariable.Address;
+        return true;
+      end;
+      if AVariable.Kind = VariableKind.ThreadGlobal then
+        return false;
+      end;
+      for LI := 0 to len(ANames) - 1 do
+        if (ANames[LI] = AVariable.Register) and (LI < len(AFrame.Context.Registers)) then
+          AAddress := uint64(int64(AFrame.Context.Registers[LI]) + AVariable.Offset);
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // Reports ATemplate filled with AArgs as an Error with ACode (no place: a debugger's
+    // failures belong to no source line)
+    hidden method DoError(const ACode: string; const ATemplate: string; const AArgs: MessageArgs);
+    begin
+      if self.FReports <> nil then
+        self.FReports.Add(Severity.Error, ACode, NoPlace(), ATemplate, AArgs);
+      end;
+    end;
+  end;
+
+// A path as MatchSourceFile compares it: lower case, forward slashes, no `$P:` before it
+routine DoMatchForm(const APath: string): string;
+var
+  LText: string;
+begin
+  LText := LowerCase(ReplaceStr(APath, "\\", "/"));
+  if StartsStr("$p:", LText) then
+    LText := Substring(LText, 3, len(LText) - 3);
+  end;
+  return LText;
+end;
+
+// True when AShort is ALong or the end of ALong after a "/" (a whole path segment)
+routine DoPathEnds(const ALong: string; const AShort: string): bool;
+begin
+  if ALong = AShort then
+    return true;
+  end;
+  return (len(ALong) > len(AShort)) and EndsStr("/" + AShort, ALong);
+end;
+
+// The one of AFiles (as debug information names them) that AFile means: the same path, or
+// one whose path ends with the other's (whole segments; case and slashes ignored, `$P:`
+// dropped); of several, the one sharing the longest end. "" when none matches
+public routine MatchSourceFile(const AFiles: StringArray; const AFile: string): string;
+var
+  LWanted: string;
+  LForm: string;
+  LBest: string;
+  LBestLength: int64;
+  LLength: int64;
+  LI: int64;
+begin
+  LWanted := DoMatchForm(AFile);
+  LBest := "";
+  LBestLength := 0;
+  for LI := 0 to len(AFiles) - 1 do
+    LForm := DoMatchForm(AFiles[LI]);
+    LLength := 0;
+    if DoPathEnds(LWanted, LForm) then
+      LLength := len(LForm);
+    else
+      if DoPathEnds(LForm, LWanted) then
+        LLength := len(LWanted);
+      end;
+    end;
+    if LLength > LBestLength then
+      LBest := AFiles[LI];
+      LBestLength := LLength;
+    end;
+  end;
+  return LBest;
+end;
+
+// The kind's name as a debugger prints it (param, local, global, threadvar)
+public routine VariableKindText(const AKind: VariableKind): string;
+begin
+  match AKind of
+    VariableKind.Param: return "param";
+    VariableKind.Local: return "local";
+    VariableKind.Global: return "global";
+  else
+    return "threadvar";
+  end;
+end;
+
+end.

@@ -1,0 +1,899 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Debug.Symbols.Win64.adam - DebugSymbols for x86_64-windows-gnu
+  (M11a D2): Adam's PDB read through DbgHelp
+
+  Win64DebugSymbols opens one DbgHelp session per object under a handle it
+  makes up (DbgHelp opens no process: each module is read from its file at
+  the base the program has it at, its PDB found beside it by the RSDS
+  entry's file name, as cdb finds it). Every lookup is DbgHelp's over std
+  System.Windows.Debug:
+    - lines: SymGetLineFromAddrW64 / SymGetLineFromNameW64, the files
+      SymEnumSourceFilesW; past a prologue: the first line entry after the
+      routine's own (Adam writes one entry per run of a line, the prologue
+      the routine line's);
+    - routines, globals: SymFromAddrW / SymFromNameW / SymEnumSymbolsW;
+    - a routine's variables: SymSetScopeFromAddr + SymEnumSymbolsW; each
+      is REGREL (Adam's S_LOCAL + frame-pointer-relative range over
+      S_FRAMEPROC's base): CodeView's register number named here as
+      DebugContext names it;
+    - types: SymGetTypeInfo, a record's fields and a choices type's values
+      by TI_FINDCHILDREN;
+    - the stack: StackWalk64 over a copy of the stopped thread's CONTEXT,
+      everything it reads given by this unit's own routines through the
+      DebugTarget (PeekMemory: patches hidden, a miss not reported): the
+      program's memory, and each loaded module's function table (its
+      exception directory, read from the image in the program once per
+      module and searched by address; DbgHelp's own SymFunctionTableAccess64
+      reads it through a real process handle, which a made-up session has
+      none of). Each frame's registers are the CONTEXT StackWalk64 left
+      (Win64ReadContext, the target part's one decoder). The walk ends at a
+      frame in no loaded module (no function table to unwind it by).
+
+  DbgHelp is not thread-safe: as the DebugTarget, one thread drives this.
+*******************************************************************************/
+
+module unit Adam.Debug.Symbols.Win64;
+
+import System.SysUtils, System.Windows, System.Windows.Debug, Adam.Core.Messages,
+  Adam.Compiler.Diagnostics, Adam.Debug.Target, Adam.Debug.Target.Win64, Adam.Debug.Symbols;
+
+const
+  // The first DbgHelp session handle (made up: no process is opened); each object takes the
+  // next
+  ADAM_SYMBOLS_WIN64_SESSION_BASE: uint64 = 0xADA40000;
+  // CodeView's AMD64 register numbers: rax .. r15 from 328 on, in this order (the names
+  // DebugContext gives them)
+  ADAM_SYMBOLS_WIN64_CV_FIRST: uint32 = 328;
+  ADAM_SYMBOLS_WIN64_CV_REGISTERS: string =
+    "rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15";
+  // SymSetOptions': undecorated names, lines, no error box, no _NT_SYMBOL_PATH, no prompt
+  // The PE facts a module's function table is found by: e_lfanew's place, then from the PE
+  // signature SizeOfImage and the exception directory (data directory 3)
+  ADAM_SYMBOLS_WIN64_PE_POINTER_AT: uint64 = 0x3C;
+  ADAM_SYMBOLS_WIN64_PE_HEADER_SIZE: int64 = 0x120;
+  ADAM_SYMBOLS_WIN64_IMAGE_SIZE_AT: int64 = 0x50;
+  ADAM_SYMBOLS_WIN64_EXCEPTION_DIR_AT: int64 = 0xA0;
+  // A RUNTIME_FUNCTION's bytes
+  ADAM_SYMBOLS_WIN64_FUNCTION_SIZE: int64 = 12;
+  ADAM_SYMBOLS_WIN64_OPTIONS: uint32 = ADAM_WINDOWS_SYMOPT_UNDNAME |
+    ADAM_WINDOWS_SYMOPT_LOAD_LINES | ADAM_WINDOWS_SYMOPT_FAIL_CRITICAL_ERRORS |
+    ADAM_WINDOWS_SYMOPT_IGNORE_NT_SYMPATH | ADAM_WINDOWS_SYMOPT_NO_PROMPTS;
+
+type
+  // What a DbgHelp enumeration callback collects: a scope's variables (Scope) or a module's
+  // globals, and the source files
+  Win64SymbolCollect = record
+    Scope: bool;
+    Variables: SymbolVariableArray;
+    Files: StringArray;
+  end;
+
+  // RUNTIME_FUNCTION (12 bytes): a function's code range and its unwind data, RVAs
+  Win64RuntimeFunction = record
+    BeginAddress: uint32;
+    EndAddress: uint32;
+    UnwindData: uint32;
+  end;
+
+  Win64RuntimeFunctionArray = array of Win64RuntimeFunction;
+
+  // One module's function table: where the module is in the program, its entries by address
+  Win64FunctionTable = record
+    Base: uint64;
+    Size: uint64;
+    Entries: Win64RuntimeFunctionArray;
+  end;
+
+  Win64FunctionTableArray = array of Win64FunctionTable;
+
+var
+  // The sessions made so far (each object's handle is the base plus its number)
+  GSessions: uint64;
+  // What StackWalk64's routines read, set for one walk (DbgHelp gives them only the session
+  // handle): the target, the modules' function tables, the entry the table routine hands out
+  GWalkTarget: ref DebugTarget;
+  GWalkTables: Win64FunctionTableArray;
+  GWalkEntry: Win64RuntimeFunction;
+
+// The little-endian uint32 at AAt of ABytes
+routine DoU32(const ABytes: ByteArray; const AAt: int64): uint32;
+begin
+  return uint32(ABytes[AAt]) | (uint32(ABytes[AAt + 1]) << 8) | (uint32(ABytes[AAt + 2]) << 16) |
+    (uint32(ABytes[AAt + 3]) << 24);
+end;
+
+// The index of the function table of GWalkTables holding AAddress; -1 when none does
+routine DoWalkTableOf(const AAddress: uint64): int64;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(GWalkTables) - 1 do
+    if (AAddress >= GWalkTables[LI].Base) and (AAddress - GWalkTables[LI].Base < GWalkTables[LI].Size) then
+      return LI;
+    end;
+  end;
+  return -1;
+end;
+
+// StackWalk64's function table routine: the RUNTIME_FUNCTION whose code holds AAddress (a
+// binary search of its module's sorted entries), nil for none
+routine clink DoFunctionTable(AProcess: uint64; AAddress: uint64): ptr;
+var
+  LTable: int64;
+  LRva: uint32;
+  LLow: int64;
+  LHigh: int64;
+  LMiddle: int64;
+begin
+  LTable := DoWalkTableOf(AAddress);
+  if LTable < 0 then
+    return nil;
+  end;
+  LRva := uint32(AAddress - GWalkTables[LTable].Base);
+  LLow := 0;
+  LHigh := len(GWalkTables[LTable].Entries) - 1;
+  while LLow <= LHigh do
+    LMiddle := LLow + (LHigh - LLow) div 2;
+    if LRva < GWalkTables[LTable].Entries[LMiddle].BeginAddress then
+      LHigh := LMiddle - 1;
+    else
+      if LRva >= GWalkTables[LTable].Entries[LMiddle].EndAddress then
+        LLow := LMiddle + 1;
+      else
+        GWalkEntry := GWalkTables[LTable].Entries[LMiddle];
+        return ptr(addr of GWalkEntry);
+      end;
+    end;
+  end;
+  return nil;
+end;
+
+// StackWalk64's module base routine: the base of the loaded module holding AAddress, 0 for
+// none
+routine clink DoModuleBase(AProcess: uint64; AAddress: uint64): uint64;
+var
+  LTable: int64;
+begin
+  LTable := DoWalkTableOf(AAddress);
+  if LTable < 0 then
+    return 0;
+  end;
+  return GWalkTables[LTable].Base;
+end;
+
+// The function table of the module at ABase in ATarget's program into ATable, read from its
+// image there: its size and exception directory from its PE header, then the entries. False
+// when they cannot be read
+routine DoReadFunctionTable(const ATarget: ref DebugTarget; const ABase: uint64;
+  var ATable: Win64FunctionTable): bool;
+var
+  LBytes: ByteArray;
+  LHeader: uint64;
+  LRva: uint32;
+  LSize: uint32;
+  LCount: int64;
+  LI: int64;
+begin
+  ATable.Base := ABase;
+  setlength(ATable.Entries, 0);
+  if not ATarget.PeekMemory(ABase + ADAM_SYMBOLS_WIN64_PE_POINTER_AT, 4, LBytes) then
+    return false;
+  end;
+  LHeader := ABase + uint64(DoU32(LBytes, 0));
+  if not ATarget.PeekMemory(LHeader, ADAM_SYMBOLS_WIN64_PE_HEADER_SIZE, LBytes) then
+    return false;
+  end;
+  ATable.Size := uint64(DoU32(LBytes, ADAM_SYMBOLS_WIN64_IMAGE_SIZE_AT));
+  LRva := DoU32(LBytes, ADAM_SYMBOLS_WIN64_EXCEPTION_DIR_AT);
+  LSize := DoU32(LBytes, ADAM_SYMBOLS_WIN64_EXCEPTION_DIR_AT + 4);
+  LCount := int64(LSize) div ADAM_SYMBOLS_WIN64_FUNCTION_SIZE;
+  if LCount = 0 then
+    return true;
+  end;
+  if not ATarget.PeekMemory(ABase + uint64(LRva), LCount * ADAM_SYMBOLS_WIN64_FUNCTION_SIZE,
+    LBytes) then
+    return false;
+  end;
+  setlength(ATable.Entries, LCount);
+  for LI := 0 to LCount - 1 do
+    ATable.Entries[LI].BeginAddress := DoU32(LBytes, LI * ADAM_SYMBOLS_WIN64_FUNCTION_SIZE);
+    ATable.Entries[LI].EndAddress := DoU32(LBytes, LI * ADAM_SYMBOLS_WIN64_FUNCTION_SIZE + 4);
+    ATable.Entries[LI].UnwindData := DoU32(LBytes, LI * ADAM_SYMBOLS_WIN64_FUNCTION_SIZE + 8);
+  end;
+  return true;
+end;
+
+// AText as UTF-16 in ABuffer, its first unit
+routine DoWide(const AText: string; var ABuffer: WideBuffer): ptr to const uint16;
+begin
+  Utf8ToWide(AText, ABuffer);
+  return ptr to const uint16(addr of ABuffer[0]);
+end;
+
+// CodeView's register number ARegister by DebugContext's name ("cv<n>" for one it has no
+// name for)
+routine DoRegisterName(const ARegister: uint32): string;
+var
+  LNames: StringArray;
+begin
+  LNames := SplitString(ADAM_SYMBOLS_WIN64_CV_REGISTERS, " ");
+  if (ARegister >= ADAM_SYMBOLS_WIN64_CV_FIRST) and
+    (ARegister - ADAM_SYMBOLS_WIN64_CV_FIRST < uint32(len(LNames))) then
+    return LNames[int64(ARegister - ADAM_SYMBOLS_WIN64_CV_FIRST)];
+  end;
+  return "cv" + UIntToStr(uint64(ARegister));
+end;
+
+// SymEnumSymbolsW's callback: a scope's parameter / local, or a module's global / threadvar,
+// added to the Win64SymbolCollect AContext points at; every other symbol passed over
+routine clink DoOnSymbol(ASymbol: ptr to const DebugSymbolInfo; ASymbolSize: uint32;
+  AContext: ptr): int32;
+var
+  LCollect: ptr to Win64SymbolCollect;
+  LVariable: SymbolVariable;
+  LInFrame: bool;
+  LCount: int64;
+begin
+  LCollect := ptr to Win64SymbolCollect(uint64(AContext));
+  LInFrame := (ASymbol->Flags & (ADAM_WINDOWS_SYMFLAG_PARAMETER | ADAM_WINDOWS_SYMFLAG_LOCAL)) <> 0;
+  if (ASymbol->Tag <> ADAM_WINDOWS_SYMTAG_DATA) or (LInFrame <> LCollect->Scope) then
+    return 1;
+  end;
+  LVariable.Name := DbgSymbolName(ASymbol^);
+  LVariable.TypeId := uint64(ASymbol->TypeIndex);
+  LVariable.Module := ASymbol->ModBase;
+  if LCollect->Scope then
+    LVariable.Kind := VariableKind.Local;
+    if (ASymbol->Flags & ADAM_WINDOWS_SYMFLAG_PARAMETER) <> 0 then
+      LVariable.Kind := VariableKind.Param;
+    end;
+    LVariable.Register := DoRegisterName(ASymbol->Register);
+    // A REGREL symbol's Address is its offset from the register, two's complement
+    LVariable.Offset := int64(ASymbol->Address);
+  else
+    if (ASymbol->Flags & ADAM_WINDOWS_SYMFLAG_TLSREL) <> 0 then
+      LVariable.Kind := VariableKind.ThreadGlobal;
+      LVariable.Offset := int64(ASymbol->Address);
+    else
+      LVariable.Kind := VariableKind.Global;
+      LVariable.Address := ASymbol->Address;
+    end;
+  end;
+  LCount := len(LCollect->Variables);
+  setlength(LCollect->Variables, LCount + 1);
+  LCollect->Variables[LCount] := LVariable;
+  return 1;
+end;
+
+// SymEnumSourceFilesW's callback: the file added to the Win64SymbolCollect AContext points at
+routine clink DoOnSourceFile(ASource: ptr to const DebugSourceFile; AContext: ptr): int32;
+var
+  LCollect: ptr to Win64SymbolCollect;
+  LCount: int64;
+begin
+  LCollect := ptr to Win64SymbolCollect(uint64(AContext));
+  LCount := len(LCollect->Files);
+  setlength(LCollect->Files, LCount + 1);
+  LCollect->Files[LCount] := DbgWideText(ASource->FileName);
+  return 1;
+end;
+
+// StackWalk64's memory routine: ASize bytes at AAddress of the walk's target into ABuffer,
+// patches hidden, a miss not reported (the unwinder probes)
+routine clink DoReadMemory(AProcess: uint64; AAddress: uint64; ABuffer: ptr; ASize: uint32;
+  ARead: ptr to uint32): int32;
+var
+  LBytes: ByteArray;
+begin
+  if ARead <> nil then
+    ARead^ := 0;
+  end;
+  if GWalkTarget = nil then
+    return 0;
+  end;
+  if ASize = 0 then
+    return 1;
+  end;
+  if not GWalkTarget.PeekMemory(AAddress, int64(ASize), LBytes) then
+    return 0;
+  end;
+  CopyBytes(ptr to uint8(uint64(ABuffer)), addr of LBytes[0], int64(ASize));
+  if ARead <> nil then
+    ARead^ := ASize;
+  end;
+  return 1;
+end;
+
+// An enum value TI_GET_VALUE wrote, by its VARIANT kind (signed kinds sign-extended)
+routine DoVariantValue(const AValue: DebugVariant): int64;
+var
+  LRaw: uint64;
+begin
+  if (AValue.Kind = ADAM_WINDOWS_VT_I1) or (AValue.Kind = ADAM_WINDOWS_VT_UI1) then
+    LRaw := AValue.Value & 0xFF;
+    if (AValue.Kind = ADAM_WINDOWS_VT_I1) and ((LRaw & 0x80) <> 0) then
+      return int64(LRaw) - 0x100;
+    end;
+    return int64(LRaw);
+  end;
+  if (AValue.Kind = ADAM_WINDOWS_VT_I2) or (AValue.Kind = ADAM_WINDOWS_VT_UI2) then
+    LRaw := AValue.Value & 0xFFFF;
+    if (AValue.Kind = ADAM_WINDOWS_VT_I2) and ((LRaw & 0x8000) <> 0) then
+      return int64(LRaw) - 0x10000;
+    end;
+    return int64(LRaw);
+  end;
+  if (AValue.Kind = ADAM_WINDOWS_VT_I4) or (AValue.Kind = ADAM_WINDOWS_VT_INT) or
+    (AValue.Kind = ADAM_WINDOWS_VT_UI4) or (AValue.Kind = ADAM_WINDOWS_VT_UINT) then
+    LRaw := AValue.Value & 0xFFFFFFFF;
+    if ((AValue.Kind = ADAM_WINDOWS_VT_I4) or (AValue.Kind = ADAM_WINDOWS_VT_INT)) and
+      ((LRaw & 0x80000000) <> 0) then
+      return int64(LRaw) - 0x100000000;
+    end;
+    return int64(LRaw);
+  end;
+  return int64(AValue.Value);
+end;
+
+// A builtin type by DbgHelp's kind AKind and AType.Size: its kind and Adam name
+routine DoBuiltin(const AKind: uint32; var AType: SymbolType);
+var
+  LBits: string;
+begin
+  LBits := UIntToStr(AType.Size * 8);
+  if AKind = ADAM_WINDOWS_BT_VOID then
+    AType.Kind := SymbolTypeKind.Void;
+    AType.Name := "void";
+    return;
+  end;
+  if AKind = ADAM_WINDOWS_BT_CHAR then
+    AType.Kind := SymbolTypeKind.Char;
+    AType.Name := "char";
+    return;
+  end;
+  if (AKind = ADAM_WINDOWS_BT_WCHAR) or (AKind = ADAM_WINDOWS_BT_CHAR16) or
+    (AKind = ADAM_WINDOWS_BT_CHAR32) then
+    AType.Kind := SymbolTypeKind.WideChar;
+    AType.Name := "wchar";
+    return;
+  end;
+  if (AKind = ADAM_WINDOWS_BT_INT) or (AKind = ADAM_WINDOWS_BT_LONG) then
+    AType.Kind := SymbolTypeKind.Signed;
+    AType.Name := "int" + LBits;
+    return;
+  end;
+  if (AKind = ADAM_WINDOWS_BT_UINT) or (AKind = ADAM_WINDOWS_BT_ULONG) then
+    AType.Kind := SymbolTypeKind.Unsigned;
+    AType.Name := "uint" + LBits;
+    return;
+  end;
+  if AKind = ADAM_WINDOWS_BT_FLOAT then
+    AType.Kind := SymbolTypeKind.Float;
+    AType.Name := "float" + LBits;
+    return;
+  end;
+  if AKind = ADAM_WINDOWS_BT_BOOL then
+    AType.Kind := SymbolTypeKind.Bool;
+    AType.Name := "bool";
+    return;
+  end;
+  AType.Kind := SymbolTypeKind.Unknown;
+  AType.Name := "basic " + UIntToStr(uint64(AKind));
+end;
+
+public type
+  // DebugSymbols over DbgHelp (see the header)
+  Win64DebugSymbols = object(DebugSymbols)
+    hidden FProcess: uint64;
+    hidden FModules: DebugWordArray;
+    hidden FBoxA: own DebugWideBox;
+    hidden FBoxB: own DebugWideBox;
+    hidden FSymbol: DebugSymbolInfo;
+    // The loaded modules' function tables, read at the first walk after a load
+    hidden FTables: Win64FunctionTableArray;
+
+    override method LoadModule(const APath: string; const ABase: uint64): bool;
+    var
+      LI: int64;
+      LBase: uint64;
+      LCollect: Win64SymbolCollect;
+      LCount: int64;
+    begin
+      for LI := 0 to len(self.FModules) - 1 do
+        if self.FModules[LI] = ABase then
+          return true;
+        end;
+      end;
+      if self.FProcess = 0 then
+        GSessions := GSessions + 1;
+        self.FBoxA := own DebugWideBox();
+        self.FBoxB := own DebugWideBox();
+        SymSetOptions(ADAM_SYMBOLS_WIN64_OPTIONS);
+        if SymInitializeW(ADAM_SYMBOLS_WIN64_SESSION_BASE + GSessions,
+          DoWide(ExtractFileDir(APath), self.FBoxA.Data), 0) = 0 then
+          self.DoError(ADAM_ERR_SYMBOLS_001, ADAM_MSG_SYMBOLS_LOAD_FAILED,
+            NoArgs().Str(APath).Str(WinLastErrorText()));
+          return false;
+        end;
+        self.FProcess := ADAM_SYMBOLS_WIN64_SESSION_BASE + GSessions;
+      end;
+      LBase := SymLoadModuleExW(self.FProcess, 0, DoWide(APath, self.FBoxA.Data), nil, ABase, 0,
+        nil, 0);
+      if LBase <> ABase then
+        self.DoError(ADAM_ERR_SYMBOLS_001, ADAM_MSG_SYMBOLS_LOAD_FAILED,
+          NoArgs().Str(APath).Str(WinLastErrorText()));
+        return false;
+      end;
+      // A module with no PDB loads with its exports alone: Adam's debug information names
+      // its source files
+      SymEnumSourceFilesW(self.FProcess, ABase, nil, DoOnSourceFile, ptr(addr of LCollect));
+      if len(LCollect.Files) = 0 then
+        SymUnloadModule64(self.FProcess, ABase);
+        self.DoError(ADAM_ERR_SYMBOLS_001, ADAM_MSG_SYMBOLS_NO_INFO, NoArgs().Str(APath));
+        return false;
+      end;
+      LCount := len(self.FModules);
+      setlength(self.FModules, LCount + 1);
+      self.FModules[LCount] := ABase;
+      // Its function table is read from the program at the next walk
+      setlength(self.FTables, 0);
+      return true;
+    end;
+
+    override method Close();
+    begin
+      if self.FProcess <> 0 then
+        SymCleanup(self.FProcess);
+        self.FProcess := 0;
+      end;
+      setlength(self.FModules, 0);
+      setlength(self.FTables, 0);
+    end;
+
+    override const method IsLoaded(): bool;
+    begin
+      return len(self.FModules) > 0;
+    end;
+
+    override method SourceFiles(): StringArray;
+    var
+      LCollect: Win64SymbolCollect;
+      LFiles: StringArray;
+      LCount: int64;
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FModules) - 1 do
+        SymEnumSourceFilesW(self.FProcess, self.FModules[LI], nil, DoOnSourceFile,
+          ptr(addr of LCollect));
+      end;
+      SortStrings(LCollect.Files);
+      // Each file once (a file two modules name, sorted next to itself)
+      LCount := 0;
+      setlength(LFiles, len(LCollect.Files));
+      for LI := 0 to len(LCollect.Files) - 1 do
+        if (LCount = 0) or (LFiles[LCount - 1] <> LCollect.Files[LI]) then
+          LFiles[LCount] := LCollect.Files[LI];
+          LCount := LCount + 1;
+        end;
+      end;
+      setlength(LFiles, LCount);
+      return LFiles;
+    end;
+
+    override method LineAt(const AAddress: uint64; var ALine: SourceLine): bool;
+    var
+      LLine: DebugLineInfo;
+      LDisplacement: uint32;
+    begin
+      if not self.IsLoaded() then
+        return false;
+      end;
+      LLine.StructSize := ADAM_WINDOWS_LINE_INFO_SIZE;
+      LDisplacement := 0;
+      if SymGetLineFromAddrW64(self.FProcess, AAddress, LDisplacement, LLine) = 0 then
+        return false;
+      end;
+      self.DoSourceLine(LLine, ALine);
+      return true;
+    end;
+
+    override method AddressOf(const AFile: string; const ALineNumber: uint32;
+      var ALine: SourceLine): bool;
+    var
+      LFile: string;
+      LLine: DebugLineInfo;
+      LTry: uint32;
+      LOffset: int32;
+    begin
+      if not self.IsLoaded() then
+        return false;
+      end;
+      LFile := MatchSourceFile(self.SourceFiles(), AFile);
+      if LFile = "" then
+        return false;
+      end;
+      for LTry := ALineNumber to ALineNumber + ADAM_SYMBOLS_LINE_LOOKAHEAD do
+        LLine.StructSize := ADAM_WINDOWS_LINE_INFO_SIZE;
+        LOffset := 0;
+        // DbgHelp may answer a line with no code by a nearby one: only an exact entry counts
+        if (SymGetLineFromNameW64(self.FProcess, nil, DoWide(LFile, self.FBoxA.Data), LTry,
+          LOffset, LLine) <> 0) and (LOffset = 0) and (LLine.LineNumber = LTry) then
+          self.DoSourceLine(LLine, ALine);
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    override method RoutineAt(const AAddress: uint64; var ARoutine: SymbolRoutine): bool;
+    var
+      LDisplacement: uint64;
+    begin
+      if not self.IsLoaded() then
+        return false;
+      end;
+      self.DoClearSymbol();
+      LDisplacement := 0;
+      if (SymFromAddrW(self.FProcess, AAddress, LDisplacement, self.FSymbol) = 0) or
+        (self.FSymbol.Tag <> ADAM_WINDOWS_SYMTAG_FUNCTION) then
+        return false;
+      end;
+      self.DoRoutine(ARoutine);
+      return true;
+    end;
+
+    override method RoutineByName(const AName: string; var ARoutine: SymbolRoutine): bool;
+    begin
+      if not self.IsLoaded() then
+        return false;
+      end;
+      self.DoClearSymbol();
+      if (SymFromNameW(self.FProcess, DoWide(AName, self.FBoxA.Data), self.FSymbol) = 0) or
+        (self.FSymbol.Tag <> ADAM_WINDOWS_SYMTAG_FUNCTION) then
+        return false;
+      end;
+      self.DoRoutine(ARoutine);
+      return true;
+    end;
+
+    override method Variables(const AAddress: uint64; var AVariables: SymbolVariableArray): bool;
+    var
+      LCollect: Win64SymbolCollect;
+    begin
+      setlength(AVariables, 0);
+      if (not self.IsLoaded()) or (SymSetScopeFromAddr(self.FProcess, AAddress) = 0) then
+        return false;
+      end;
+      LCollect.Scope := true;
+      if SymEnumSymbolsW(self.FProcess, 0, nil, DoOnSymbol, ptr(addr of LCollect)) = 0 then
+        return false;
+      end;
+      AVariables := LCollect.Variables;
+      return true;
+    end;
+
+    override method Globals(var AVariables: SymbolVariableArray): bool;
+    var
+      LCollect: Win64SymbolCollect;
+      LI: int64;
+    begin
+      setlength(AVariables, 0);
+      if not self.IsLoaded() then
+        return false;
+      end;
+      LCollect.Scope := false;
+      for LI := 0 to len(self.FModules) - 1 do
+        SymEnumSymbolsW(self.FProcess, self.FModules[LI], DoWide("*", self.FBoxA.Data),
+          DoOnSymbol, ptr(addr of LCollect));
+      end;
+      AVariables := LCollect.Variables;
+      return true;
+    end;
+
+    override method GlobalByName(const AName: string; var AVariable: SymbolVariable): bool;
+    var
+      LCollect: Win64SymbolCollect;
+    begin
+      if not self.IsLoaded() then
+        return false;
+      end;
+      self.DoClearSymbol();
+      if SymFromNameW(self.FProcess, DoWide(AName, self.FBoxA.Data), self.FSymbol) = 0 then
+        return false;
+      end;
+      // The one symbol through the enumeration's own rule (a global, not a frame's)
+      LCollect.Scope := false;
+      DoOnSymbol(addr of self.FSymbol, ADAM_WINDOWS_SYMBOL_INFO_SIZE, ptr(addr of LCollect));
+      if len(LCollect.Variables) <> 1 then
+        return false;
+      end;
+      AVariable := LCollect.Variables[0];
+      return true;
+    end;
+
+    override method TypeOf(const AModule: uint64; const ATypeId: uint64;
+      var AType: SymbolType): bool;
+    var
+      LEmpty: SymbolType;
+      LTag: uint32;
+      LKind: uint32;
+      LInner: uint32;
+      LCount: uint32;
+    begin
+      AType := LEmpty;
+      if not self.IsLoaded() then
+        return false;
+      end;
+      LTag := 0;
+      if not self.DoInfo(AModule, ATypeId, ADAM_WINDOWS_TI_GET_SYMTAG, ptr(addr of LTag)) then
+        return false;
+      end;
+      self.DoInfo(AModule, ATypeId, ADAM_WINDOWS_TI_GET_LENGTH, ptr(addr of AType.Size));
+      if LTag = ADAM_WINDOWS_SYMTAG_BASE_TYPE then
+        LKind := 0;
+        self.DoInfo(AModule, ATypeId, ADAM_WINDOWS_TI_GET_BASETYPE, ptr(addr of LKind));
+        DoBuiltin(LKind, AType);
+        return true;
+      end;
+      if (LTag = ADAM_WINDOWS_SYMTAG_POINTER_TYPE) or (LTag = ADAM_WINDOWS_SYMTAG_ARRAY_TYPE) then
+        LInner := 0;
+        self.DoInfo(AModule, ATypeId, ADAM_WINDOWS_TI_GET_TYPE, ptr(addr of LInner));
+        AType.ElementTypeId := uint64(LInner);
+        AType.Kind := SymbolTypeKind.Pointer;
+        if LTag = ADAM_WINDOWS_SYMTAG_ARRAY_TYPE then
+          AType.Kind := SymbolTypeKind.StaticArray;
+          LCount := 0;
+          self.DoInfo(AModule, ATypeId, ADAM_WINDOWS_TI_GET_COUNT, ptr(addr of LCount));
+          AType.Count := uint64(LCount);
+        end;
+        return true;
+      end;
+      if LTag = ADAM_WINDOWS_SYMTAG_FUNCTION_TYPE then
+        AType.Kind := SymbolTypeKind.Routine;
+        AType.Name := "routine";
+        return true;
+      end;
+      if LTag = ADAM_WINDOWS_SYMTAG_UDT then
+        AType.Kind := SymbolTypeKind.Record;
+        AType.Name := SymTypeName(self.FProcess, AModule, uint32(ATypeId));
+        self.DoChildren(AModule, ATypeId, AType);
+        return true;
+      end;
+      if LTag = ADAM_WINDOWS_SYMTAG_ENUM then
+        AType.Kind := SymbolTypeKind.Choices;
+        AType.Name := SymTypeName(self.FProcess, AModule, uint32(ATypeId));
+        self.DoChildren(AModule, ATypeId, AType);
+        return true;
+      end;
+      if LTag = ADAM_WINDOWS_SYMTAG_TYPEDEF then
+        // An alias: the type it names, under the alias's own name
+        LInner := 0;
+        if (not self.DoInfo(AModule, ATypeId, ADAM_WINDOWS_TI_GET_TYPE, ptr(addr of LInner))) or
+          (uint64(LInner) = ATypeId) or (not self.TypeOf(AModule, uint64(LInner), AType)) then
+          return false;
+        end;
+        AType.Name := SymTypeName(self.FProcess, AModule, uint32(ATypeId));
+        return true;
+      end;
+      AType.Name := "tag " + UIntToStr(uint64(LTag));
+      return true;
+    end;
+
+    override method StackWalk(const ATarget: ref DebugTarget; const AThreadId: uint32;
+      const AContext: DebugContext; const AMaxFrames: int64; var AFrames: StackFrameArray): bool;
+    var
+      LBuffer: Win64ContextBuffer;
+      LFrame: DebugStackFrame64;
+      LMax: int64;
+      LCount: int64;
+      LLookup: uint64;
+      LLastSp: uint64;
+      LItem: StackFrame;
+      LEmpty: StackFrame;
+      LNoTables: Win64FunctionTableArray;
+    begin
+      setlength(AFrames, 0);
+      if not self.IsLoaded() then
+        self.DoError(ADAM_ERR_SYMBOLS_002, ADAM_MSG_SYMBOLS_NOT_LOADED, NoArgs());
+        return false;
+      end;
+      if len(AContext.Raw) <> ADAM_WINDOWS_CONTEXT_SIZE then
+        self.DoError(ADAM_ERR_SYMBOLS_003, ADAM_MSG_SYMBOLS_CONTEXT_SHAPE,
+          NoArgs().Int(int64(AThreadId)));
+        return false;
+      end;
+      LMax := AMaxFrames;
+      if LMax <= 0 then
+        LMax := ADAM_SYMBOLS_FRAME_LIMIT;
+      end;
+      // StackWalk64 unwinds the CONTEXT in place: a copy, aligned as the API needs it
+      Win64MakeContextBuffer(LBuffer);
+      CopyBytes(ptr to uint8(uint64(LBuffer.Block)), addr of AContext.Raw[0],
+        ADAM_WINDOWS_CONTEXT_SIZE);
+      LFrame.AddrPC.Offset := AContext.Pc;
+      LFrame.AddrPC.Mode := ADAM_WINDOWS_ADDRESS_MODE_FLAT;
+      LFrame.AddrFrame.Offset := AContext.Fp;
+      LFrame.AddrFrame.Mode := ADAM_WINDOWS_ADDRESS_MODE_FLAT;
+      LFrame.AddrStack.Offset := AContext.Sp;
+      LFrame.AddrStack.Mode := ADAM_WINDOWS_ADDRESS_MODE_FLAT;
+      if len(self.FTables) <> len(self.FModules) then
+        setlength(self.FTables, len(self.FModules));
+        for LCount := 0 to len(self.FModules) - 1 do
+          DoReadFunctionTable(ATarget, self.FModules[LCount], self.FTables[LCount]);
+        end;
+      end;
+      GWalkTarget := ATarget;
+      GWalkTables := self.FTables;
+      LCount := 0;
+      LLastSp := 0;
+      while LCount < LMax do
+        if (StackWalk64(ADAM_WINDOWS_IMAGE_FILE_MACHINE_AMD64, self.FProcess, 0, LFrame,
+          ptr(LBuffer.Block), DoReadMemory, DoFunctionTable, DoModuleBase, nil) = 0) or
+          (LFrame.AddrPC.Offset = 0) then
+          leave;
+        end;
+        // A frame that did not move up the stack ends the walk (a broken unwind never loops)
+        if (LCount > 0) and (LFrame.AddrStack.Offset <= LLastSp) then
+          leave;
+        end;
+        LLastSp := LFrame.AddrStack.Offset;
+        LItem := LEmpty;
+        Win64ReadContext(LBuffer.Block, LItem.Context);
+        LItem.Context.Pc := LFrame.AddrPC.Offset;
+        // An outer frame's address is its return address, which may start the next line:
+        // its call is the byte before
+        LLookup := LFrame.AddrPC.Offset;
+        if LCount > 0 then
+          LLookup := LLookup - 1;
+        end;
+        LItem.Known := self.RoutineAt(LLookup, LItem.Routine);
+        LItem.HasLine := self.LineAt(LLookup, LItem.Source);
+        setlength(AFrames, LCount + 1);
+        AFrames[LCount] := LItem;
+        LCount := LCount + 1;
+        // A frame in no loaded module has no function table to be unwound by
+        if DoWalkTableOf(LLookup) < 0 then
+          leave;
+        end;
+      end;
+      GWalkTarget := nil;
+      GWalkTables := LNoTables;
+      return LCount > 0;
+    end;
+
+    // FSymbol made ready for a SymFrom* call
+    hidden method DoClearSymbol();
+    begin
+      self.FSymbol.StructSize := ADAM_WINDOWS_SYMBOL_INFO_SIZE;
+      self.FSymbol.MaxNameLen := ADAM_WINDOWS_SYMBOL_NAME_MAX;
+    end;
+
+    // ALine from DbgHelp's line ALineInfo
+    hidden method DoSourceLine(const ALineInfo: DebugLineInfo; var ALine: SourceLine);
+    begin
+      ALine.FilePath := DbgWideText(ALineInfo.FileName);
+      ALine.Line := ALineInfo.LineNumber;
+      ALine.Address := ALineInfo.Address;
+      ALine.Module := SymGetModuleBase64(self.FProcess, ALineInfo.Address);
+    end;
+
+    // The routine FSymbol holds into ARoutine, its body found by its lines
+    hidden method DoRoutine(var ARoutine: SymbolRoutine);
+    begin
+      ARoutine.Name := DbgSymbolName(self.FSymbol);
+      ARoutine.Address := self.FSymbol.Address;
+      ARoutine.Size := uint64(self.FSymbol.Size);
+      ARoutine.TypeId := uint64(self.FSymbol.TypeIndex);
+      ARoutine.Module := self.FSymbol.ModBase;
+      ARoutine.BodyAddress := self.DoBodyOf(ARoutine.Address, ARoutine.Size);
+    end;
+
+    // The address past the prologue of the routine at AStart (ASize bytes): its first line
+    // entry after the one it starts with (Adam's prologue is the routine line's); AStart when
+    // it has none
+    hidden method DoBodyOf(const AStart: uint64; const ASize: uint64): uint64;
+    var
+      LLine: DebugLineInfo;
+      LDisplacement: uint32;
+    begin
+      LLine.StructSize := ADAM_WINDOWS_LINE_INFO_SIZE;
+      LDisplacement := 0;
+      if SymGetLineFromAddrW64(self.FProcess, AStart, LDisplacement, LLine) = 0 then
+        return AStart;
+      end;
+      while SymGetLineNextW64(self.FProcess, LLine) <> 0 do
+        if LLine.Address >= AStart + ASize then
+          leave;
+        end;
+        if LLine.Address > AStart then
+          return LLine.Address;
+        end;
+      end;
+      return AStart;
+    end;
+
+    // SymGetTypeInfo's AKind of type ATypeId in AModule into AInfo
+    hidden method DoInfo(const AModule: uint64; const ATypeId: uint64; const AKind: uint32;
+      const AInfo: ptr): bool;
+    begin
+      return SymGetTypeInfo(self.FProcess, AModule, uint32(ATypeId), AKind, AInfo) <> 0;
+    end;
+
+    // A record's fields or a choices type's values: its children, every one in one
+    // TI_FINDCHILDREN_PARAMS made as big as they need (Count, Start 0, then the ids)
+    hidden method DoChildren(const AModule: uint64; const ATypeId: uint64;
+      var AType: SymbolType);
+    var
+      LTotal: uint32;
+      LBytes: ByteArray;
+      LHead: ptr to uint32;
+      LIds: ptr to uint32;
+      LI: int64;
+      LChild: uint32;
+      LTag: uint32;
+      LOffset: uint32;
+      LFieldType: uint32;
+      LValue: DebugVariant;
+      LField: SymbolField;
+      LChoice: SymbolChoice;
+      LCount: int64;
+    begin
+      LTotal := 0;
+      self.DoInfo(AModule, ATypeId, ADAM_WINDOWS_TI_GET_CHILDRENCOUNT, ptr(addr of LTotal));
+      if LTotal = 0 then
+        return;
+      end;
+      setlength(LBytes, 8 + 4 * int64(LTotal));
+      LHead := ptr to uint32(uint64(addr of LBytes[0]));
+      LHead[0] := LTotal;
+      LHead[1] := 0;
+      if not self.DoInfo(AModule, ATypeId, ADAM_WINDOWS_TI_FINDCHILDREN, ptr(LHead)) then
+        return;
+      end;
+      LIds := ptr to uint32(uint64(addr of LBytes[8]));
+      for LI := 0 to int64(LTotal) - 1 do
+        LChild := LIds[LI];
+        LTag := 0;
+        self.DoInfo(AModule, uint64(LChild), ADAM_WINDOWS_TI_GET_SYMTAG, ptr(addr of LTag));
+        if LTag = ADAM_WINDOWS_SYMTAG_DATA then
+          if AType.Kind = SymbolTypeKind.Choices then
+            LValue.Kind := 0;
+            LValue.Value := 0;
+            self.DoInfo(AModule, uint64(LChild), ADAM_WINDOWS_TI_GET_VALUE, ptr(addr of LValue));
+            LChoice.Name := SymTypeName(self.FProcess, AModule, LChild);
+            LChoice.Value := DoVariantValue(LValue);
+            LCount := len(AType.Choices);
+            setlength(AType.Choices, LCount + 1);
+            AType.Choices[LCount] := LChoice;
+          else
+            LOffset := 0;
+            LFieldType := 0;
+            self.DoInfo(AModule, uint64(LChild), ADAM_WINDOWS_TI_GET_OFFSET, ptr(addr of LOffset));
+            self.DoInfo(AModule, uint64(LChild), ADAM_WINDOWS_TI_GET_TYPE, ptr(addr of LFieldType));
+            LField.Name := SymTypeName(self.FProcess, AModule, LChild);
+            LField.Offset := uint64(LOffset);
+            LField.TypeId := uint64(LFieldType);
+            LCount := len(AType.Fields);
+            setlength(AType.Fields, LCount + 1);
+            AType.Fields[LCount] := LField;
+          end;
+        end;
+      end;
+    end;
+  end;
+
+end.
