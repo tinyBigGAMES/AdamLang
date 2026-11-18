@@ -1,0 +1,1644 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Pdb.CodeView.adam - a debug build's debug information as CodeView
+  (M7b), the form a COFF object's .debug$S / .debug$T sections hold and a
+  PDB's streams are made of
+
+  Every layout fact is Microsoft's CodeView as LLVM documents and writes it
+  (llvm/DebugInfo/CodeView: SymbolRecord.h, TypeRecord.h, the C13 debug
+  subsections; cvinfo.h's leaf, symbol and register numbers).
+
+  CvTarget        what CodeView records of an arch: its CPU number
+                  (S_COMPILE3) and its registers' numbers by the arch part's
+                  names (S_REGREL32, the stack pointer for a frame based on
+                  it); the object format's arch description holds one
+  WriteCodeView   a DebugModule into a SectionSet (Debug sections):
+    .debug$T      one section: the C13 signature, then every type record
+                  (index 0x1000 up, each referring only to lower ones): an
+                  integer / float / bool / char a builtin index; a pointer
+                  LF_POINTER (64-bit, a pointer to a builtin its builtin
+                  pointer index, to no type T_64PVOID); a static array
+                  LF_ARRAY; a record LF_STRUCTURE, an object LF_CLASS, an
+                  overlay LF_UNION, each with its LF_FIELDLIST (LF_MEMBER
+                  per field, a bitfield's type LF_BITFIELD; a list past
+                  ADAM_CV_FIELDLIST_LIMIT bytes continued by LF_INDEX) and
+                  its module-qualified unique name; a pointer to one of
+                  those refers to its forward record (fwdref, the same
+                  unique name), so a type reaching itself is finite; a
+                  choices type LF_ENUM over the signed builtin of its size
+                  with LF_ENUMERATE per value; any other type (a routine
+                  type, an Opaque one) an LF_STRUCTURE of its name and size
+                  with no fields; one LF_PROCEDURE (no result, no args)
+                  every routine symbol names
+    .debug$S      the module's section (not Removable): the signature, a
+                  symbols subsection (S_OBJNAME, S_COMPILE3), what goes with
+                  no Removable section, the S_UDT of every named aggregate,
+                  the string table (file names) and the file checksums (no
+                  checksum: kind none); and per Removable section a
+                  function's code or a variable's storage is in, a piece
+                  going with it (Removable, Associate: a removed function
+                  drops its debug records): the signature, per function a
+                  symbols subsection (S_GPROC32 / S_LPROC32 by the symbol's
+                  linkage, S_FRAMEPROC, S_REGREL32 per parameter / local
+                  from the frame base register, S_END) and a lines
+                  subsection (one block per run of a file, statement lines,
+                  no columns), per variable S_GDATA32 / S_LDATA32 or, a
+                  thread-local one, S_GTHREAD32 / S_LTHREAD32. A symbol's
+                  address is a SecRel32 and a Section relocation of its
+                  set symbol; a file is its checksum entry's offset
+  CodeViewText    the debug sections of an object as text, one line per
+                  record (the rows' view): each section given as a
+                  CvSectionView (its name, the section it goes with, its
+                  bytes and its relocations by target name); code offsets
+                  and sizes left out (they follow the code), files by name
+                  alone and the string table by its name count (a full
+                  path is the machine's), types by index
+*******************************************************************************/
+
+module unit Adam.Pdb.CodeView;
+
+import System.SysUtils, System.Collections, Adam.Core.Common, Adam.Core.Containers,
+  Adam.Backend.Sections, Adam.Backend.DebugInfo;
+
+public const
+  // The sections' names (CodeView in a COFF object)
+  ADAM_CV_SECTION_SYMBOLS: string = ".debug$S";
+  ADAM_CV_SECTION_TYPES: string = ".debug$T";
+  // Raised (a compiler bug): a function or variable of the debug information with no
+  // symbol in the set, and a type reaching itself other than through a pointer
+  ADAM_CV_FAULT_SYMBOL: string = "CodeView: no symbol ";
+  ADAM_CV_FAULT_CYCLE: string = "CodeView: a type reaching itself by value: ";
+
+const
+  // Between a piece's group and the set name of the section it goes with
+  ADAM_CV_PIECE_MARK: string = "#";
+  // A section's first 4 bytes (CV_SIGNATURE_C13)
+  ADAM_CV_SIGNATURE: int64 = 4;
+  // Debug subsection kinds
+  ADAM_CV_SUB_SYMBOLS: int64 = 0xF1;
+  ADAM_CV_SUB_LINES: int64 = 0xF2;
+  ADAM_CV_SUB_STRINGS: int64 = 0xF3;
+  ADAM_CV_SUB_CHECKSUMS: int64 = 0xF4;
+  // Symbol record kinds
+  ADAM_CV_S_END: int64 = 0x0006;
+  ADAM_CV_S_FRAMEPROC: int64 = 0x1012;
+  ADAM_CV_S_OBJNAME: int64 = 0x1101;
+  ADAM_CV_S_UDT: int64 = 0x1108;
+  ADAM_CV_S_LDATA32: int64 = 0x110C;
+  ADAM_CV_S_GDATA32: int64 = 0x110D;
+  ADAM_CV_S_LPROC32: int64 = 0x110F;
+  ADAM_CV_S_GPROC32: int64 = 0x1110;
+  ADAM_CV_S_REGREL32: int64 = 0x1111;
+  ADAM_CV_S_LTHREAD32: int64 = 0x1112;
+  ADAM_CV_S_GTHREAD32: int64 = 0x1113;
+  ADAM_CV_S_COMPILE3: int64 = 0x113C;
+  // Type leaf kinds
+  ADAM_CV_LF_POINTER: int64 = 0x1002;
+  ADAM_CV_LF_PROCEDURE: int64 = 0x1008;
+  ADAM_CV_LF_ARGLIST: int64 = 0x1201;
+  ADAM_CV_LF_FIELDLIST: int64 = 0x1203;
+  ADAM_CV_LF_BITFIELD: int64 = 0x1205;
+  ADAM_CV_LF_INDEX: int64 = 0x1404;
+  ADAM_CV_LF_ENUMERATE: int64 = 0x1502;
+  ADAM_CV_LF_ARRAY: int64 = 0x1503;
+  ADAM_CV_LF_CLASS: int64 = 0x1504;
+  ADAM_CV_LF_STRUCTURE: int64 = 0x1505;
+  ADAM_CV_LF_UNION: int64 = 0x1506;
+  ADAM_CV_LF_ENUM: int64 = 0x1507;
+  ADAM_CV_LF_MEMBER: int64 = 0x150D;
+  // Numeric leaves (a value from 0x8000, or below 0, as a kind and its bytes)
+  ADAM_CV_LF_NUMERIC: int64 = 0x8000;
+  ADAM_CV_LF_SHORT: int64 = 0x8001;
+  ADAM_CV_LF_USHORT: int64 = 0x8002;
+  ADAM_CV_LF_LONG: int64 = 0x8003;
+  ADAM_CV_LF_ULONG: int64 = 0x8004;
+  ADAM_CV_LF_QUADWORD: int64 = 0x8009;
+  ADAM_CV_LF_UQUADWORD: int64 = 0x800A;
+  // LF_PAD: 0xF0 plus the bytes left to the record's 4-byte end
+  ADAM_CV_LF_PAD: int64 = 0xF0;
+  // The first type record's index
+  ADAM_CV_FIRST_TYPE: int64 = 0x1000;
+  // Builtin type indices (cvinfo.h's TYPE_ENUM_e)
+  ADAM_CV_T_NOTYPE: int64 = 0x0000;
+  ADAM_CV_T_VOID: int64 = 0x0003;
+  ADAM_CV_T_REAL32: int64 = 0x0040;
+  ADAM_CV_T_REAL64: int64 = 0x0041;
+  ADAM_CV_T_REAL80: int64 = 0x0042;
+  ADAM_CV_T_BOOL08: int64 = 0x0030;
+  ADAM_CV_T_BOOL16: int64 = 0x0031;
+  ADAM_CV_T_BOOL32: int64 = 0x0032;
+  ADAM_CV_T_BOOL64: int64 = 0x0033;
+  ADAM_CV_T_RCHAR: int64 = 0x0070;
+  ADAM_CV_T_WCHAR: int64 = 0x0071;
+  ADAM_CV_T_CHAR32: int64 = 0x007B;
+  ADAM_CV_T_INT1: int64 = 0x0068;
+  ADAM_CV_T_UINT1: int64 = 0x0069;
+  ADAM_CV_T_INT2: int64 = 0x0072;
+  ADAM_CV_T_UINT2: int64 = 0x0073;
+  ADAM_CV_T_INT4: int64 = 0x0074;
+  ADAM_CV_T_UINT4: int64 = 0x0075;
+  ADAM_CV_T_INT8: int64 = 0x0076;
+  ADAM_CV_T_UINT8: int64 = 0x0077;
+  // A 64-bit pointer to a builtin: its mode bits over the builtin's index
+  ADAM_CV_T_64_POINTER: int64 = 0x0600;
+  // LF_POINTER's attributes: CV_PTR_64 (bits 0..4), its size 8 in bits 13..18
+  ADAM_CV_POINTER_64: int64 = 0x0C;
+  ADAM_CV_POINTER_SIZE_SHIFT: int64 = 13;
+  // A member's / enumerator's attributes: public access
+  ADAM_CV_ACCESS_PUBLIC: int64 = 3;
+  // A UDT record's properties: a forward reference, a unique name follows the name
+  ADAM_CV_PROP_FORWARD: int64 = 0x0080;
+  ADAM_CV_PROP_UNIQUE: int64 = 0x0200;
+  // A field list's content past which it is continued in another (LF_INDEX); a record's
+  // length field holds at most 0xFF00
+  ADAM_CV_FIELDLIST_LIMIT: int64 = 0xF000;
+  // S_FRAMEPROC flags: the encoded local / parameter base (1 the stack pointer, 2 the
+  // frame pointer) at bit 14 and bit 16
+  ADAM_CV_FRAME_BASE_SP: int64 = 1;
+  ADAM_CV_FRAME_BASE_FP: int64 = 2;
+  ADAM_CV_FRAME_LOCAL_SHIFT: int64 = 14;
+  ADAM_CV_FRAME_PARAM_SHIFT: int64 = 16;
+  // C13 line flags: a statement line (bit 31), its number in bits 0..23
+  ADAM_CV_LINE_STATEMENT: int64 = 0x80000000;
+  ADAM_CV_LINE_MASK: int64 = 0xFFFFFF;
+  // A lines subsection's header and file block header sizes, a line entry's size
+  ADAM_CV_LINES_HEADER: int64 = 12;
+  ADAM_CV_LINES_BLOCK: int64 = 12;
+  ADAM_CV_LINES_ENTRY: int64 = 8;
+  // A file checksum entry's size (name offset, checksum size 0, kind none, padded)
+  ADAM_CV_CHECKSUM_ENTRY: int64 = 8;
+  // S_COMPILE3's source language: CV_CFL_PASCAL (Adam is Pascal-family, no CodeView
+  // number of its own) and its version string's name
+  ADAM_CV_LANGUAGE: int64 = 0x04;
+  ADAM_CV_COMPILER_NAME: string = "Adam";
+
+public type
+  // What CodeView records of an arch (see the header)
+  CvTarget = object
+    Cpu: int64;
+    StackPointer: string;
+    hidden FNames: StringArray;
+    hidden FNumbers: Int64Array;
+
+    init(const ACpu: int64; const AStackPointer: string);
+    begin
+      self.Cpu := ACpu;
+      self.StackPointer := AStackPointer;
+      setlength(self.FNames, 0);
+      setlength(self.FNumbers, 0);
+    end;
+
+    // The register named AName (the arch part's name) is CodeView's ANumber
+    method AddRegister(const AName: string; const ANumber: int64);
+    begin
+      setlength(self.FNames, len(self.FNames) + 1);
+      setlength(self.FNumbers, len(self.FNumbers) + 1);
+      self.FNames[len(self.FNames) - 1] := AName;
+      self.FNumbers[len(self.FNumbers) - 1] := ANumber;
+    end;
+
+    // The CodeView number of the register AName; 0 when the arch names none so
+    const method RegisterOf(const AName: string): int64;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FNames) - 1 do
+        if self.FNames[LI] = AName then
+          return self.FNumbers[LI];
+        end;
+      end;
+      return 0;
+    end;
+  end;
+
+  // A relocation in a CvBytes: its offset there, its kind, its set symbol
+  CvSite = object
+    Offset: int64;
+    Kind: RelocKind;
+    Symbol: int64;
+
+    init(const AOffset: int64; const AKind: RelocKind; const ASymbol: int64);
+    begin
+      self.Offset := AOffset;
+      self.Kind := AKind;
+      self.Symbol := ASymbol;
+    end;
+  end;
+
+  // Bytes being built (a record, a section's content) and the relocations into them
+  CvBytes = object
+    hidden FBytes: ByteArray;
+    hidden FCount: int64;
+    hidden FSites: ref List<ref CvSite>;
+
+    init();
+    begin
+      setlength(self.FBytes, 0);
+      self.FCount := 0;
+      self.FSites := ref List<ref CvSite>();
+    end;
+
+    property Count: int64 read FCount;
+
+    // Appends the low AWidth bytes of AValue, least significant first
+    method Put(const AValue: uint64; const AWidth: int64);
+    begin
+      if self.FCount + AWidth > len(self.FBytes) then
+        setlength(self.FBytes, self.FCount * 2 + 64);
+      end;
+      PutLe(self.FBytes, self.FCount, AValue, AWidth);
+      self.FCount := self.FCount + AWidth;
+    end;
+
+    // Appends AText's bytes and a NUL
+    method PutText(const AText: string);
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(AText) - 1 do
+        self.Put(uint64(uint8(AText[LI])), 1);
+      end;
+      self.Put(0, 1);
+    end;
+
+    // Appends every byte of AOther and its relocations (moved by where it lands)
+    method PutAll(const AOther: ref CvBytes);
+    var
+      LBase: int64;
+      LSite: ref CvSite;
+      LI: int64;
+    begin
+      LBase := self.FCount;
+      for LI := 0 to AOther.FCount - 1 do
+        self.Put(uint64(AOther.FBytes[LI]), 1);
+      end;
+      for LI := 0 to AOther.FSites.Count - 1 do
+        LSite := AOther.FSites.Items[LI];
+        self.FSites.Add(ref CvSite(LBase + LSite.Offset, LSite.Kind, LSite.Symbol));
+      end;
+    end;
+
+    // Writes AValue's low AWidth bytes over the bytes at AAt
+    method Patch(const AAt: int64; const AValue: uint64; const AWidth: int64);
+    begin
+      PutLe(self.FBytes, AAt, AValue, AWidth);
+    end;
+
+    // A relocation of AKind naming the set symbol ASymbol at the end, its field zero
+    method PutSite(const AKind: RelocKind; const ASymbol: int64);
+    begin
+      self.FSites.Add(ref CvSite(self.FCount, AKind, ASymbol));
+      self.Put(0, RelocWidth(AKind));
+    end;
+
+    // Zero bytes up to a 4-byte boundary
+    method PadZeros();
+    begin
+      while (self.FCount & 3) <> 0 do
+        self.Put(0, 1);
+      end;
+    end;
+
+    // Every byte appended to the set's section ASection and every relocation added there
+    method AppendTo(const ASet: ref SectionSet; const ASection: int64);
+    var
+      LBase: int64;
+      LSite: ref CvSite;
+      LI: int64;
+    begin
+      LBase := ASet.SectionAt(ASection).Size();
+      setlength(self.FBytes, self.FCount);
+      ASet.SectionAt(ASection).PutBytes(self.FBytes);
+      for LI := 0 to self.FSites.Count - 1 do
+        LSite := self.FSites.Items[LI];
+        ASet.AddReloc(ASection, LBase + LSite.Offset, LSite.Kind, LSite.Symbol, 0);
+      end;
+    end;
+  end;
+
+// ABytes' subsection of AKind started: its kind and a length field patched by DoEndSub;
+// its start returned
+routine DoBeginSub(const ABytes: ref CvBytes; const AKind: int64): int64;
+var
+  LStart: int64;
+begin
+  LStart := ABytes.Count;
+  ABytes.Put(uint64(AKind), 4);
+  ABytes.Put(0, 4);
+  return LStart;
+end;
+
+// The subsection at AStart ended: its length (its content, the padding not counted), then
+// zeros to a 4-byte boundary
+routine DoEndSub(const ABytes: ref CvBytes; const AStart: int64);
+begin
+  ABytes.Patch(AStart + 4, uint64(ABytes.Count - AStart - 8), 4);
+  ABytes.PadZeros();
+end;
+
+// A symbol record of AKind started in ABytes (its length patched by DoEndSymbol)
+routine DoBeginSymbol(const ABytes: ref CvBytes; const AKind: int64): int64;
+var
+  LStart: int64;
+begin
+  LStart := ABytes.Count;
+  ABytes.Put(0, 2);
+  ABytes.Put(uint64(AKind), 2);
+  return LStart;
+end;
+
+// The symbol record at AStart ended: zeros to a 4-byte boundary, its length (all but the
+// length field)
+routine DoEndSymbol(const ABytes: ref CvBytes; const AStart: int64);
+begin
+  ABytes.PadZeros();
+  ABytes.Patch(AStart, uint64(ABytes.Count - AStart - 2), 2);
+end;
+
+// AValue as a numeric leaf: itself below 0x8000, else a kind and its bytes
+routine DoPutNumeric(const ABytes: ref CvBytes; const AValue: int64);
+begin
+  if (AValue >= 0) and (AValue < ADAM_CV_LF_NUMERIC) then
+    ABytes.Put(uint64(AValue), 2);
+    return;
+  end;
+  if AValue < 0 then
+    if AValue >= -32768 then
+      ABytes.Put(uint64(ADAM_CV_LF_SHORT), 2);
+      ABytes.Put(uint64(AValue), 2);
+      return;
+    end;
+    if AValue >= -2147483648 then
+      ABytes.Put(uint64(ADAM_CV_LF_LONG), 2);
+      ABytes.Put(uint64(AValue), 4);
+      return;
+    end;
+    ABytes.Put(uint64(ADAM_CV_LF_QUADWORD), 2);
+    ABytes.Put(uint64(AValue), 8);
+    return;
+  end;
+  if AValue <= 0xFFFF then
+    ABytes.Put(uint64(ADAM_CV_LF_USHORT), 2);
+    ABytes.Put(uint64(AValue), 2);
+    return;
+  end;
+  if AValue <= 0xFFFFFFFF then
+    ABytes.Put(uint64(ADAM_CV_LF_ULONG), 2);
+    ABytes.Put(uint64(AValue), 4);
+    return;
+  end;
+  ABytes.Put(uint64(ADAM_CV_LF_UQUADWORD), 2);
+  ABytes.Put(uint64(AValue), 8);
+end;
+
+// LF_PAD bytes up to a 4-byte boundary (inside a type record or a field list)
+routine DoPadType(const ABytes: ref CvBytes);
+begin
+  while (ABytes.Count & 3) <> 0 do
+    ABytes.Put(uint64(ADAM_CV_LF_PAD + (4 - (ABytes.Count & 3))), 1);
+  end;
+end;
+
+// The builtin index of a scalar of AKind and ASize bytes; -1 when CodeView has none
+routine DoBuiltin(const AKind: DebugTypeKind; const ASize: int64): int64;
+begin
+  match AKind of
+    DebugTypeKind.Signed:
+      if ASize = 1 then
+        return ADAM_CV_T_INT1;
+      end;
+      if ASize = 2 then
+        return ADAM_CV_T_INT2;
+      end;
+      if ASize = 4 then
+        return ADAM_CV_T_INT4;
+      end;
+      if ASize = 8 then
+        return ADAM_CV_T_INT8;
+      end;
+    DebugTypeKind.Unsigned:
+      if ASize = 1 then
+        return ADAM_CV_T_UINT1;
+      end;
+      if ASize = 2 then
+        return ADAM_CV_T_UINT2;
+      end;
+      if ASize = 4 then
+        return ADAM_CV_T_UINT4;
+      end;
+      if ASize = 8 then
+        return ADAM_CV_T_UINT8;
+      end;
+    DebugTypeKind.Float:
+      if ASize = 4 then
+        return ADAM_CV_T_REAL32;
+      end;
+      if ASize = 8 then
+        return ADAM_CV_T_REAL64;
+      end;
+      if ASize = 10 then
+        return ADAM_CV_T_REAL80;
+      end;
+    DebugTypeKind.Boolean:
+      if ASize = 1 then
+        return ADAM_CV_T_BOOL08;
+      end;
+      if ASize = 2 then
+        return ADAM_CV_T_BOOL16;
+      end;
+      if ASize = 4 then
+        return ADAM_CV_T_BOOL32;
+      end;
+      if ASize = 8 then
+        return ADAM_CV_T_BOOL64;
+      end;
+    DebugTypeKind.Char:
+      if ASize = 1 then
+        return ADAM_CV_T_RCHAR;
+      end;
+    DebugTypeKind.WideChar:
+      if ASize = 2 then
+        return ADAM_CV_T_WCHAR;
+      end;
+      if ASize = 4 then
+        return ADAM_CV_T_CHAR32;
+      end;
+  else
+    // no other kind is a builtin
+  end;
+  return -1;
+end;
+
+// True when a type of AKind gets a forward record a pointer refers to (a record, an
+// object, an overlay: the kinds that can reach themselves through a pointer)
+routine DoHasForward(const AKind: DebugTypeKind): bool;
+begin
+  return (AKind = DebugTypeKind.Record) or (AKind = DebugTypeKind.Object) or
+    (AKind = DebugTypeKind.Overlay);
+end;
+
+// The UDT leaf of a type of AKind (an Opaque or routine type: a structure)
+routine DoUdtLeaf(const AKind: DebugTypeKind): int64;
+begin
+  match AKind of
+    DebugTypeKind.Object: return ADAM_CV_LF_CLASS;
+    DebugTypeKind.Overlay: return ADAM_CV_LF_UNION;
+    DebugTypeKind.Choices: return ADAM_CV_LF_ENUM;
+  else
+    // a record, a routine type or an opaque type
+  end;
+  return ADAM_CV_LF_STRUCTURE;
+end;
+
+type
+  // Writes a DebugModule into a SectionSet (see the header)
+  CvWriter = object
+    hidden FSet: ref SectionSet;
+    hidden FModule: ref DebugModule;
+    hidden FTarget: ref CvTarget;
+    // The type records (after the signature) and the next record's index
+    hidden FTypes: ref CvBytes;
+    hidden FNextType: int64;
+    // Per debug type id: its record's index (0 not made yet, -1 being made), its forward
+    // record's index (0 not made yet)
+    hidden FFull: Int64Array;
+    hidden FForward: Int64Array;
+    // The LF_PROCEDURE every routine symbol names (0 not made yet)
+    hidden FProcType: int64;
+    // The module's .debug$S content and its set section
+    hidden FMain: ref CvBytes;
+    // Each piece's content, and the set section it goes with, by piece; a piece by the
+    // section it goes with (its index + 1)
+    hidden FPieces: ref List<ref CvBytes>;
+    hidden FPieceOwners: Int64Array;
+    hidden FPieceOf: ref Int64Map;
+
+    init(const ASet: ref SectionSet; const AModule: ref DebugModule; const ATarget: ref CvTarget);
+    var
+      LI: int64;
+    begin
+      self.FSet := ASet;
+      self.FModule := AModule;
+      self.FTarget := ATarget;
+      self.FTypes := ref CvBytes();
+      self.FNextType := ADAM_CV_FIRST_TYPE;
+      setlength(self.FFull, AModule.Types.Count);
+      setlength(self.FForward, AModule.Types.Count);
+      for LI := 0 to AModule.Types.Count - 1 do
+        self.FFull[LI] := 0;
+        self.FForward[LI] := 0;
+      end;
+      self.FProcType := 0;
+      self.FMain := ref CvBytes();
+      self.FPieces := ref List<ref CvBytes>();
+      setlength(self.FPieceOwners, 0);
+      self.FPieceOf := ref Int64Map(0);
+    end;
+
+    // ARecord (its leaf first) appended as the next type record: its length field, its
+    // bytes, LF_PAD to a 4-byte end; its index returned
+    hidden method DoEmitType(const ARecord: ref CvBytes): int64;
+    var
+      LStart: int64;
+      LIndex: int64;
+    begin
+      LStart := self.FTypes.Count;
+      self.FTypes.Put(0, 2);
+      self.FTypes.PutAll(ARecord);
+      DoPadType(self.FTypes);
+      self.FTypes.Patch(LStart, uint64(self.FTypes.Count - LStart - 2), 2);
+      LIndex := self.FNextType;
+      self.FNextType := self.FNextType + 1;
+      return LIndex;
+    end;
+
+    // The field list of AMembers (each a member record, padded): one LF_FIELDLIST, or a
+    // chain of them each continued by LF_INDEX when they pass ADAM_CV_FIELDLIST_LIMIT
+    // (the last part made first: a record refers only to lower indices); its first
+    // part's index
+    hidden method DoFieldList(const AMembers: ref List<ref CvBytes>): int64;
+    var
+      LStarts: Int64Array;
+      LSize: int64;
+      LNext: int64;
+      LRecord: ref CvBytes;
+      LPart: int64;
+      LI: int64;
+      LEnd: int64;
+    begin
+      // the parts: each starts at a member index, a new one when the current one is full
+      setlength(LStarts, 1);
+      LStarts[0] := 0;
+      LSize := 0;
+      for LI := 0 to AMembers.Count - 1 do
+        if (LSize > 0) and (LSize + AMembers.Items[LI].Count > ADAM_CV_FIELDLIST_LIMIT) then
+          setlength(LStarts, len(LStarts) + 1);
+          LStarts[len(LStarts) - 1] := LI;
+          LSize := 0;
+        end;
+        LSize := LSize + AMembers.Items[LI].Count;
+      end;
+      LNext := 0;
+      for LPart := len(LStarts) - 1 downto 0 do
+        LEnd := AMembers.Count;
+        if LPart + 1 < len(LStarts) then
+          LEnd := LStarts[LPart + 1];
+        end;
+        LRecord := ref CvBytes();
+        LRecord.Put(uint64(ADAM_CV_LF_FIELDLIST), 2);
+        for LI := LStarts[LPart] to LEnd - 1 do
+          LRecord.PutAll(AMembers.Items[LI]);
+        end;
+        if LNext <> 0 then
+          LRecord.Put(uint64(ADAM_CV_LF_INDEX), 2);
+          LRecord.Put(0, 2);
+          LRecord.Put(uint64(LNext), 4);
+        end;
+        LNext := self.DoEmitType(LRecord);
+      end;
+      return LNext;
+    end;
+
+    // A UDT record of ADebug's kind: AFields its field list (0 none), ACount its members,
+    // AForward a forward record (no fields, size 0); its index
+    hidden method DoUdt(const ADebug: ref DebugType; const AFields: int64; const ACount: int64;
+      const AForward: bool): int64;
+    var
+      LRecord: ref CvBytes;
+      LLeaf: int64;
+      LProperty: int64;
+      LSize: int64;
+    begin
+      LLeaf := DoUdtLeaf(ADebug.Kind);
+      LProperty := ADAM_CV_PROP_UNIQUE;
+      LSize := ADebug.Size;
+      if AForward then
+        LProperty := LProperty | ADAM_CV_PROP_FORWARD;
+        LSize := 0;
+      end;
+      LRecord := ref CvBytes();
+      LRecord.Put(uint64(LLeaf), 2);
+      LRecord.Put(uint64(ACount), 2);
+      LRecord.Put(uint64(LProperty), 2);
+      if LLeaf = ADAM_CV_LF_ENUM then
+        LRecord.Put(uint64(self.DoEnumBase(ADebug.Size)), 4);
+        LRecord.Put(uint64(AFields), 4);
+      else
+        LRecord.Put(uint64(AFields), 4);
+        if LLeaf <> ADAM_CV_LF_UNION then
+          // derived-from list and vtable shape: none
+          LRecord.Put(0, 4);
+          LRecord.Put(0, 4);
+        end;
+        DoPutNumeric(LRecord, LSize);
+      end;
+      LRecord.PutText(ADebug.TypeName);
+      LRecord.PutText(ADebug.UniqueName);
+      return self.DoEmitType(LRecord);
+    end;
+
+    // The signed builtin a choices type of ASize bytes is stored as
+    hidden const method DoEnumBase(const ASize: int64): int64;
+    var
+      LBase: int64;
+    begin
+      LBase := DoBuiltin(DebugTypeKind.Signed, ASize);
+      if LBase < 0 then
+        return ADAM_CV_T_INT4;
+      end;
+      return LBase;
+    end;
+
+    // The index a pointer to the debug type AId refers to: a record's, an object's or an
+    // overlay's forward record (made on its first ask), any other type's own
+    hidden method DoTargetIndex(const AId: int64): int64;
+    var
+      LDebug: ref DebugType;
+    begin
+      LDebug := self.FModule.Types.Items[AId];
+      if not DoHasForward(LDebug.Kind) then
+        return self.TypeIndex(AId);
+      end;
+      if self.FForward[AId] = 0 then
+        self.FForward[AId] := self.DoUdt(LDebug, 0, 0, true);
+      end;
+      return self.FForward[AId];
+    end;
+
+    // The member records of the aggregate ADebug (a field, its bitfield's type a
+    // LF_BITFIELD) into AMembers
+    hidden method DoMembers(const ADebug: ref DebugType; const AMembers: ref List<ref CvBytes>);
+    var
+      LField: ref DebugField;
+      LMember: ref CvBytes;
+      LBits: ref CvBytes;
+      LType: int64;
+      LI: int64;
+    begin
+      for LI := 0 to ADebug.Fields.Count - 1 do
+        LField := ADebug.Fields.Items[LI];
+        LType := self.TypeIndex(LField.TypeId);
+        if LField.BitWidth > 0 then
+          LBits := ref CvBytes();
+          LBits.Put(uint64(ADAM_CV_LF_BITFIELD), 2);
+          LBits.Put(uint64(LType), 4);
+          LBits.Put(uint64(LField.BitWidth), 1);
+          LBits.Put(uint64(LField.BitOffset), 1);
+          LType := self.DoEmitType(LBits);
+        end;
+        LMember := ref CvBytes();
+        LMember.Put(uint64(ADAM_CV_LF_MEMBER), 2);
+        LMember.Put(uint64(ADAM_CV_ACCESS_PUBLIC), 2);
+        LMember.Put(uint64(LType), 4);
+        DoPutNumeric(LMember, LField.Offset);
+        LMember.PutText(LField.FieldName);
+        DoPadType(LMember);
+        AMembers.Add(LMember);
+      end;
+    end;
+
+    // The enumerator records of the choices type ADebug into AMembers
+    hidden method DoEnumerators(const ADebug: ref DebugType; const AMembers: ref List<ref CvBytes>);
+    var
+      LMember: ref CvBytes;
+      LI: int64;
+    begin
+      for LI := 0 to ADebug.Values.Count - 1 do
+        LMember := ref CvBytes();
+        LMember.Put(uint64(ADAM_CV_LF_ENUMERATE), 2);
+        LMember.Put(uint64(ADAM_CV_ACCESS_PUBLIC), 2);
+        DoPutNumeric(LMember, ADebug.Values.Items[LI].Number);
+        LMember.PutText(ADebug.Values.Items[LI].ValueName);
+        DoPadType(LMember);
+        AMembers.Add(LMember);
+      end;
+    end;
+
+    // The record (or builtin) index of the debug type AId (0: no type), made on its first
+    // ask with every type it reaches before it (see the header)
+    method TypeIndex(const AId: int64): int64;
+    var
+      LDebug: ref DebugType;
+      LRecord: ref CvBytes;
+      LMembers: ref List<ref CvBytes>;
+      LTarget: int64;
+      LIndex: int64;
+    begin
+      if AId = 0 then
+        return ADAM_CV_T_NOTYPE;
+      end;
+      if self.FFull[AId] > 0 then
+        return self.FFull[AId];
+      end;
+      LDebug := self.FModule.Types.Items[AId];
+      if self.FFull[AId] < 0 then
+        raise(ADAM_CV_FAULT_CYCLE + LDebug.TypeName);
+      end;
+      LIndex := DoBuiltin(LDebug.Kind, LDebug.Size);
+      if LIndex >= 0 then
+        self.FFull[AId] := LIndex;
+        return LIndex;
+      end;
+      self.FFull[AId] := -1;
+      match LDebug.Kind of
+        DebugTypeKind.Pointer:
+          if LDebug.Target = 0 then
+            LIndex := ADAM_CV_T_64_POINTER | ADAM_CV_T_VOID;
+          else
+            LTarget := self.DoTargetIndex(LDebug.Target);
+            if LTarget < ADAM_CV_FIRST_TYPE then
+              LIndex := ADAM_CV_T_64_POINTER | LTarget;
+            else
+              LRecord := ref CvBytes();
+              LRecord.Put(uint64(ADAM_CV_LF_POINTER), 2);
+              LRecord.Put(uint64(LTarget), 4);
+              LRecord.Put(uint64(ADAM_CV_POINTER_64 | (LDebug.Size shl ADAM_CV_POINTER_SIZE_SHIFT)), 4);
+              LIndex := self.DoEmitType(LRecord);
+            end;
+          end;
+        DebugTypeKind.StaticArray:
+          LTarget := self.TypeIndex(LDebug.Target);
+          LRecord := ref CvBytes();
+          LRecord.Put(uint64(ADAM_CV_LF_ARRAY), 2);
+          LRecord.Put(uint64(LTarget), 4);
+          LRecord.Put(uint64(ADAM_CV_T_UINT8), 4);
+          DoPutNumeric(LRecord, LDebug.Size);
+          LRecord.PutText("");
+          LIndex := self.DoEmitType(LRecord);
+        DebugTypeKind.Record, DebugTypeKind.Object, DebugTypeKind.Overlay:
+          LMembers := ref List<ref CvBytes>();
+          self.DoMembers(LDebug, LMembers);
+          LIndex := self.DoUdt(LDebug, self.DoFieldList(LMembers), LMembers.Count, false);
+        DebugTypeKind.Choices:
+          LMembers := ref List<ref CvBytes>();
+          self.DoEnumerators(LDebug, LMembers);
+          LIndex := self.DoUdt(LDebug, self.DoFieldList(LMembers), LMembers.Count, false);
+      else
+        // a routine type, an opaque type, a scalar CodeView has no builtin for: a
+        // structure of its name and size, no fields
+        LMembers := ref List<ref CvBytes>();
+        LIndex := self.DoUdt(LDebug, self.DoFieldList(LMembers), 0, false);
+      end;
+      self.FFull[AId] := LIndex;
+      return LIndex;
+    end;
+
+    // The LF_PROCEDURE every routine symbol names (no result, no arguments: the debugger
+    // reads a routine's parameters from its S_REGREL32 records), made on its first ask
+    hidden method DoProcType(): int64;
+    var
+      LRecord: ref CvBytes;
+      LArgs: int64;
+    begin
+      if self.FProcType <> 0 then
+        return self.FProcType;
+      end;
+      LRecord := ref CvBytes();
+      LRecord.Put(uint64(ADAM_CV_LF_ARGLIST), 2);
+      LRecord.Put(0, 4);
+      LArgs := self.DoEmitType(LRecord);
+      LRecord := ref CvBytes();
+      LRecord.Put(uint64(ADAM_CV_LF_PROCEDURE), 2);
+      LRecord.Put(uint64(ADAM_CV_T_VOID), 4);
+      // calling convention near C, no attributes, no parameters
+      LRecord.Put(0, 1);
+      LRecord.Put(0, 1);
+      LRecord.Put(0, 2);
+      LRecord.Put(uint64(LArgs), 4);
+      self.FProcType := self.DoEmitType(LRecord);
+      return self.FProcType;
+    end;
+
+    // The set symbol named AName (a function's or a variable's); raises when there is none
+    hidden const method DoSymbol(const AName: string): int64;
+    var
+      LId: int64;
+    begin
+      LId := self.FSet.FindSymbol(AName);
+      if (LId = 0) or (self.FSet.SymbolAt(LId).Kind <> SymbolKind.Defined) then
+        raise(ADAM_CV_FAULT_SYMBOL + AName);
+      end;
+      return LId;
+    end;
+
+    // The content the records of what is in the set section ASection go to: the piece
+    // going with it (made on its first ask, its signature first), or the module's when
+    // ASection is not Removable (only a COMDAT section has associative ones)
+    hidden method DoPieceFor(const ASection: int64): ref CvBytes;
+    var
+      LIndex: int64;
+      LPiece: ref CvBytes;
+    begin
+      if not self.FSet.SectionAt(ASection).Removable then
+        return self.FMain;
+      end;
+      LIndex := self.FPieceOf.Find(ASection);
+      if LIndex <> 0 then
+        return self.FPieces.Items[LIndex - 1];
+      end;
+      LPiece := ref CvBytes();
+      LPiece.Put(uint64(ADAM_CV_SIGNATURE), 4);
+      self.FPieces.Add(LPiece);
+      setlength(self.FPieceOwners, len(self.FPieceOwners) + 1);
+      self.FPieceOwners[len(self.FPieceOwners) - 1] := ASection;
+      self.FPieceOf.Put(ASection, self.FPieces.Count);
+      return LPiece;
+    end;
+
+    // A symbol's section-relative address: a SecRel32 and a Section relocation of ASymbol
+    hidden method DoPutAddress(const ABytes: ref CvBytes; const ASymbol: int64);
+    begin
+      ABytes.PutSite(RelocKind.SecRel32, ASymbol);
+      ABytes.PutSite(RelocKind.Section, ASymbol);
+    end;
+
+    // The register a function whose frame base is AFrameBase ("" the stack pointer) reads
+    // its variables from, and the S_FRAMEPROC base code of it
+    hidden const method DoBaseRegister(const AFrameBase: string): int64;
+    begin
+      if AFrameBase = "" then
+        return self.FTarget.RegisterOf(self.FTarget.StackPointer);
+      end;
+      return self.FTarget.RegisterOf(AFrameBase);
+    end;
+
+    // AFunction's records into its piece (see the header): its symbols, then its lines
+    hidden method DoFunction(const AFunction: ref DebugFunction);
+    var
+      LSymbol: int64;
+      LPiece: ref CvBytes;
+      LSub: int64;
+      LRecord: int64;
+      LKind: int64;
+      LName: string;
+      LBase: int64;
+      LVariable: ref DebugVariable;
+      LI: int64;
+    begin
+      LSymbol := self.DoSymbol(AFunction.Symbol);
+      LPiece := self.DoPieceFor(self.FSet.SymbolAt(LSymbol).SectionId);
+      LKind := ADAM_CV_S_GPROC32;
+      if self.FSet.SymbolAt(LSymbol).Internal then
+        LKind := ADAM_CV_S_LPROC32;
+      end;
+      LName := AFunction.AdamName;
+      if LName = "" then
+        LName := AFunction.Symbol;
+      end;
+      LSub := DoBeginSub(LPiece, ADAM_CV_SUB_SYMBOLS);
+      LRecord := DoBeginSymbol(LPiece, LKind);
+      // parent, end, next: the linker's to fill in
+      LPiece.Put(0, 4);
+      LPiece.Put(0, 4);
+      LPiece.Put(0, 4);
+      LPiece.Put(uint64(AFunction.ByteCount), 4);
+      LPiece.Put(uint64(AFunction.PrologueEnd), 4);
+      LPiece.Put(uint64(AFunction.ByteCount), 4);
+      LPiece.Put(uint64(self.DoProcType()), 4);
+      self.DoPutAddress(LPiece, LSymbol);
+      LPiece.Put(0, 1);
+      LPiece.PutText(LName);
+      DoEndSymbol(LPiece, LRecord);
+      // the frame: its variables' base register as the encoded local and parameter base
+      LBase := ADAM_CV_FRAME_BASE_SP;
+      if AFunction.FrameBase <> "" then
+        LBase := ADAM_CV_FRAME_BASE_FP;
+      end;
+      LRecord := DoBeginSymbol(LPiece, ADAM_CV_S_FRAMEPROC);
+      LPiece.Put(0, 4);
+      LPiece.Put(0, 4);
+      LPiece.Put(0, 4);
+      LPiece.Put(0, 4);
+      LPiece.Put(0, 4);
+      LPiece.Put(0, 2);
+      LPiece.Put(uint64((LBase shl ADAM_CV_FRAME_LOCAL_SHIFT) | (LBase shl ADAM_CV_FRAME_PARAM_SHIFT)), 4);
+      DoEndSymbol(LPiece, LRecord);
+      for LI := 0 to AFunction.Variables.Count - 1 do
+        LVariable := AFunction.Variables.Items[LI];
+        LRecord := DoBeginSymbol(LPiece, ADAM_CV_S_REGREL32);
+        LPiece.Put(uint64(LVariable.Offset), 4);
+        LPiece.Put(uint64(self.TypeIndex(LVariable.TypeId)), 4);
+        LPiece.Put(uint64(self.DoBaseRegister(AFunction.FrameBase)), 2);
+        LPiece.PutText(LVariable.VariableName);
+        DoEndSymbol(LPiece, LRecord);
+      end;
+      LRecord := DoBeginSymbol(LPiece, ADAM_CV_S_END);
+      DoEndSymbol(LPiece, LRecord);
+      DoEndSub(LPiece, LSub);
+      self.DoLines(LPiece, AFunction, LSymbol);
+    end;
+
+    // AFunction's lines subsection into APiece (none when it has no rows): one block per
+    // run of rows of one file, its file the checksum entry's offset
+    hidden method DoLines(const APiece: ref CvBytes; const AFunction: ref DebugFunction;
+      const ASymbol: int64);
+    var
+      LSub: int64;
+      LBlock: int64;
+      LFile: int64;
+      LCount: int64;
+      LLine: ref DebugLine;
+      LI: int64;
+    begin
+      if AFunction.Lines.Count = 0 then
+        return;
+      end;
+      LSub := DoBeginSub(APiece, ADAM_CV_SUB_LINES);
+      self.DoPutAddress(APiece, ASymbol);
+      // flags: no columns
+      APiece.Put(0, 2);
+      APiece.Put(uint64(AFunction.ByteCount), 4);
+      LBlock := -1;
+      LFile := -1;
+      LCount := 0;
+      for LI := 0 to AFunction.Lines.Count - 1 do
+        LLine := AFunction.Lines.Items[LI];
+        if LLine.FileIndex <> LFile then
+          self.DoEndBlock(APiece, LBlock, LCount);
+          LFile := LLine.FileIndex;
+          LBlock := APiece.Count;
+          LCount := 0;
+          APiece.Put(uint64(LFile * ADAM_CV_CHECKSUM_ENTRY), 4);
+          APiece.Put(0, 4);
+          APiece.Put(0, 4);
+        end;
+        APiece.Put(uint64(LLine.Offset), 4);
+        APiece.Put(uint64((LLine.Line & ADAM_CV_LINE_MASK) | ADAM_CV_LINE_STATEMENT), 4);
+        LCount := LCount + 1;
+      end;
+      self.DoEndBlock(APiece, LBlock, LCount);
+      DoEndSub(APiece, LSub);
+    end;
+
+    // The file block at ABlock (-1: none) closed: its line count and byte size
+    hidden method DoEndBlock(const APiece: ref CvBytes; const ABlock: int64; const ACount: int64);
+    begin
+      if ABlock < 0 then
+        return;
+      end;
+      APiece.Patch(ABlock + 4, uint64(ACount), 4);
+      APiece.Patch(ABlock + 8, uint64(ADAM_CV_LINES_BLOCK + ADAM_CV_LINES_ENTRY * ACount), 4);
+    end;
+
+    // AGlobal's record into the piece going with its storage's section
+    hidden method DoGlobal(const AGlobal: ref DebugGlobal);
+    var
+      LSymbol: int64;
+      LPiece: ref CvBytes;
+      LSub: int64;
+      LRecord: int64;
+      LKind: int64;
+    begin
+      LSymbol := self.DoSymbol(AGlobal.Symbol);
+      LPiece := self.DoPieceFor(self.FSet.SymbolAt(LSymbol).SectionId);
+      if AGlobal.ThreadLocal then
+        LKind := ADAM_CV_S_GTHREAD32;
+        if self.FSet.SymbolAt(LSymbol).Internal then
+          LKind := ADAM_CV_S_LTHREAD32;
+        end;
+      else
+        LKind := ADAM_CV_S_GDATA32;
+        if self.FSet.SymbolAt(LSymbol).Internal then
+          LKind := ADAM_CV_S_LDATA32;
+        end;
+      end;
+      LSub := DoBeginSub(LPiece, ADAM_CV_SUB_SYMBOLS);
+      LRecord := DoBeginSymbol(LPiece, LKind);
+      LPiece.Put(uint64(self.TypeIndex(AGlobal.TypeId)), 4);
+      self.DoPutAddress(LPiece, LSymbol);
+      LPiece.PutText(AGlobal.AdamName);
+      DoEndSymbol(LPiece, LRecord);
+      DoEndSub(LPiece, LSub);
+    end;
+
+    // The module section's head: the signature, S_OBJNAME (no object file name: the
+    // object is the build's) and S_COMPILE3
+    hidden method DoHead();
+    var
+      LSub: int64;
+      LRecord: int64;
+    begin
+      self.FMain.Put(uint64(ADAM_CV_SIGNATURE), 4);
+      LSub := DoBeginSub(self.FMain, ADAM_CV_SUB_SYMBOLS);
+      LRecord := DoBeginSymbol(self.FMain, ADAM_CV_S_OBJNAME);
+      self.FMain.Put(0, 4);
+      self.FMain.PutText("");
+      DoEndSymbol(self.FMain, LRecord);
+      LRecord := DoBeginSymbol(self.FMain, ADAM_CV_S_COMPILE3);
+      self.FMain.Put(uint64(ADAM_CV_LANGUAGE), 4);
+      self.FMain.Put(uint64(self.FTarget.Cpu), 2);
+      // front end and back end versions: Adam's major, minor, patch, 0 each
+      self.FMain.Put(uint64(ADAM_MAJOR_VERSION), 2);
+      self.FMain.Put(uint64(ADAM_MINOR_VERSION), 2);
+      self.FMain.Put(uint64(ADAM_PATCH_VERSION), 2);
+      self.FMain.Put(0, 2);
+      self.FMain.Put(uint64(ADAM_MAJOR_VERSION), 2);
+      self.FMain.Put(uint64(ADAM_MINOR_VERSION), 2);
+      self.FMain.Put(uint64(ADAM_PATCH_VERSION), 2);
+      self.FMain.Put(0, 2);
+      self.FMain.PutText(ADAM_CV_COMPILER_NAME + " " + IntToStr(ADAM_MAJOR_VERSION) + "." +
+        IntToStr(ADAM_MINOR_VERSION) + "." + IntToStr(ADAM_PATCH_VERSION));
+      DoEndSymbol(self.FMain, LRecord);
+      DoEndSub(self.FMain, LSub);
+    end;
+
+    // The module section's tail: every type made (in id order), an S_UDT per named
+    // aggregate, the string table and the file checksums
+    hidden method DoTail();
+    var
+      LSub: int64;
+      LRecord: int64;
+      LDebug: ref DebugType;
+      LNames: ref CvBytes;
+      LOffsets: Int64Array;
+      LIndex: int64;
+      LI: int64;
+    begin
+      LSub := DoBeginSub(self.FMain, ADAM_CV_SUB_SYMBOLS);
+      for LI := 1 to self.FModule.Types.Count - 1 do
+        LDebug := self.FModule.Types.Items[LI];
+        // every type made, in id order (a pointer's, an array's too)
+        LIndex := self.TypeIndex(LI);
+        if (LDebug.Kind = DebugTypeKind.Record) or (LDebug.Kind = DebugTypeKind.Object) or
+          (LDebug.Kind = DebugTypeKind.Overlay) or (LDebug.Kind = DebugTypeKind.Choices) then
+          LRecord := DoBeginSymbol(self.FMain, ADAM_CV_S_UDT);
+          self.FMain.Put(uint64(LIndex), 4);
+          self.FMain.PutText(LDebug.TypeName);
+          DoEndSymbol(self.FMain, LRecord);
+        end;
+      end;
+      DoEndSub(self.FMain, LSub);
+      // the string table: a NUL, then each file's name
+      LNames := ref CvBytes();
+      LNames.Put(0, 1);
+      setlength(LOffsets, len(self.FModule.Files));
+      for LI := 0 to len(self.FModule.Files) - 1 do
+        LOffsets[LI] := LNames.Count;
+        LNames.PutText(self.FModule.Files[LI]);
+      end;
+      LSub := DoBeginSub(self.FMain, ADAM_CV_SUB_STRINGS);
+      self.FMain.PutAll(LNames);
+      DoEndSub(self.FMain, LSub);
+      LSub := DoBeginSub(self.FMain, ADAM_CV_SUB_CHECKSUMS);
+      for LI := 0 to len(self.FModule.Files) - 1 do
+        self.FMain.Put(uint64(LOffsets[LI]), 4);
+        // checksum size 0, kind none, 2 bytes of padding
+        self.FMain.Put(0, 4);
+      end;
+      DoEndSub(self.FMain, LSub);
+    end;
+
+    // The module's debug information into the set (see the header)
+    method Run();
+    var
+      LSection: int64;
+      LI: int64;
+    begin
+      self.DoHead();
+      for LI := 0 to self.FModule.Functions.Count - 1 do
+        self.DoFunction(self.FModule.Functions.Items[LI]);
+      end;
+      for LI := 0 to self.FModule.Globals.Count - 1 do
+        self.DoGlobal(self.FModule.Globals.Items[LI]);
+      end;
+      self.DoTail();
+      LSection := self.FSet.AddSection(ADAM_CV_SECTION_SYMBOLS, SectionKind.Debug, 4);
+      self.FMain.AppendTo(self.FSet, LSection);
+      for LI := 0 to self.FPieces.Count - 1 do
+        LSection := self.FSet.AddSection(ADAM_CV_SECTION_SYMBOLS + ADAM_CV_PIECE_MARK +
+          self.FSet.SectionAt(self.FPieceOwners[LI]).SectionName, SectionKind.Debug, 4);
+        self.FSet.SectionAt(LSection).GroupName := ADAM_CV_SECTION_SYMBOLS;
+        self.FSet.SectionAt(LSection).Removable := true;
+        self.FSet.SectionAt(LSection).Associate := self.FPieceOwners[LI];
+        self.FPieces.Items[LI].AppendTo(self.FSet, LSection);
+      end;
+      if self.FNextType > ADAM_CV_FIRST_TYPE then
+        LSection := self.FSet.AddSection(ADAM_CV_SECTION_TYPES, SectionKind.Debug, 4);
+        self.FSet.SectionAt(LSection).Put32(uint64(ADAM_CV_SIGNATURE));
+        self.FTypes.AppendTo(self.FSet, LSection);
+      end;
+    end;
+  end;
+
+// AModule written into ASections as CodeView for the arch ATarget describes (see the
+// header); deterministic: everything in the module's and the set's order
+public routine WriteCodeView(const ASections: ref SectionSet; const AModule: ref DebugModule;
+  const ATarget: ref CvTarget);
+var
+  LWriter: ref CvWriter;
+begin
+  LWriter := ref CvWriter(ASections, AModule, ATarget);
+  LWriter.Run();
+end;
+
+public type
+  // One debug section of an object as CodeViewText reads it (see the header): its name,
+  // the first symbol of the section it goes with ("" none), its bytes, and per relocation
+  // its offset and the name of the symbol it names
+  CvSectionView = object
+    SectionName: string;
+    Partner: string;
+    Bytes: ByteArray;
+    RelocOffsets: Int64Array;
+    RelocTargets: StringArray;
+
+    init(const ASectionName: string; const APartner: string; const ABytes: ByteArray);
+    begin
+      self.SectionName := ASectionName;
+      self.Partner := APartner;
+      self.Bytes := ABytes;
+      setlength(self.RelocOffsets, 0);
+      setlength(self.RelocTargets, 0);
+    end;
+
+    // A relocation at AOffset naming the symbol ATarget
+    method AddReloc(const AOffset: int64; const ATarget: string);
+    begin
+      setlength(self.RelocOffsets, len(self.RelocOffsets) + 1);
+      setlength(self.RelocTargets, len(self.RelocTargets) + 1);
+      self.RelocOffsets[len(self.RelocOffsets) - 1] := AOffset;
+      self.RelocTargets[len(self.RelocTargets) - 1] := ATarget;
+    end;
+
+    // The symbol the relocation at AOffset names; "?" when none is there
+    const method TargetAt(const AOffset: int64): string;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.RelocOffsets) - 1 do
+        if self.RelocOffsets[LI] = AOffset then
+          return self.RelocTargets[LI];
+        end;
+      end;
+      return "?";
+    end;
+  end;
+
+// The AWidth-byte little-endian value at AAt of AView's bytes
+routine DoGet(const AView: ref CvSectionView; const AAt: int64; const AWidth: int64): int64;
+begin
+  return int64(GetLe(AView.Bytes, AAt, AWidth));
+end;
+
+// The NUL-ended text at AAt of AView's bytes
+routine DoText(const AView: ref CvSectionView; const AAt: int64): string;
+var
+  LText: string;
+  LStop: int64;
+  LI: int64;
+begin
+  LStop := AAt;
+  while (LStop < len(AView.Bytes)) and (AView.Bytes[LStop] <> 0) do
+    LStop := LStop + 1;
+  end;
+  // sized once, then filled: no growing concatenation
+  setlength(LText, LStop - AAt);
+  for LI := 0 to LStop - AAt - 1 do
+    LText[LI] := char(AView.Bytes[AAt + LI]);
+  end;
+  return LText;
+end;
+
+// A type index as the text writes it
+routine DoIndexText(const AIndex: int64): string;
+begin
+  return "0x" + IntToHex(uint64(AIndex), 4);
+end;
+
+// The numeric leaf at AAt: its value, and in ASize its byte count
+routine DoNumeric(const AView: ref CvSectionView; const AAt: int64; var ASize: int64): int64;
+var
+  LKind: int64;
+begin
+  LKind := DoGet(AView, AAt, 2);
+  ASize := 2;
+  if LKind < ADAM_CV_LF_NUMERIC then
+    return LKind;
+  end;
+  if LKind = ADAM_CV_LF_SHORT then
+    ASize := 4;
+    return int64(int16(DoGet(AView, AAt + 2, 2)));
+  end;
+  if LKind = ADAM_CV_LF_USHORT then
+    ASize := 4;
+    return DoGet(AView, AAt + 2, 2);
+  end;
+  if LKind = ADAM_CV_LF_LONG then
+    ASize := 6;
+    return int64(int32(DoGet(AView, AAt + 2, 4)));
+  end;
+  if LKind = ADAM_CV_LF_ULONG then
+    ASize := 6;
+    return DoGet(AView, AAt + 2, 4);
+  end;
+  ASize := 10;
+  return DoGet(AView, AAt + 2, 8);
+end;
+
+// The member records of the field list in AView's bytes from AAt to AEnd as lines
+routine DoFieldListText(const AView: ref CvSectionView; const AAt: int64; const AEnd: int64;
+  const AText: ref TextBuilder);
+var
+  LAt: int64;
+  LLeaf: int64;
+  LSize: int64;
+  LValue: int64;
+  LName: string;
+  LType: int64;
+begin
+  LAt := AAt;
+  while LAt < AEnd do
+    LLeaf := DoGet(AView, LAt, 2);
+    if LLeaf = ADAM_CV_LF_MEMBER then
+      LType := DoGet(AView, LAt + 4, 4);
+      LValue := DoNumeric(AView, LAt + 8, LSize);
+      LName := DoText(AView, LAt + 8 + LSize);
+      AText.Add("    member " + LName + " " + DoIndexText(LType) + " at +" + IntToStr(LValue) + "\n");
+      LAt := LAt + 8 + LSize + len(LName) + 1;
+    else
+      if LLeaf = ADAM_CV_LF_ENUMERATE then
+        LValue := DoNumeric(AView, LAt + 4, LSize);
+        LName := DoText(AView, LAt + 4 + LSize);
+        AText.Add("    enumerate " + LName + " = " + IntToStr(LValue) + "\n");
+        LAt := LAt + 4 + LSize + len(LName) + 1;
+      else
+        if LLeaf = ADAM_CV_LF_INDEX then
+          AText.Add("    index " + DoIndexText(DoGet(AView, LAt + 4, 4)) + "\n");
+          LAt := LAt + 8;
+        else
+          AText.Add("    leaf 0x" + IntToHex(uint64(LLeaf), 4) + "\n");
+          return;
+        end;
+      end;
+    end;
+    // the LF_PAD bytes to the next member
+    while (LAt < AEnd) and (AView.Bytes[LAt] > uint8(ADAM_CV_LF_PAD)) do
+      LAt := LAt + 1;
+    end;
+  end;
+end;
+
+// A UDT record's text: ALeaf at AAt (its leaf's bytes), its kind word, its name
+routine DoUdtText(const AView: ref CvSectionView; const AAt: int64; const ALeaf: int64): string;
+var
+  LCount: int64;
+  LProperty: int64;
+  LFields: int64;
+  LSize: int64;
+  LValue: int64;
+  LName: string;
+  LWord: string;
+  LAt: int64;
+begin
+  LCount := DoGet(AView, AAt + 2, 2);
+  LProperty := DoGet(AView, AAt + 4, 2);
+  if ALeaf = ADAM_CV_LF_ENUM then
+    LName := DoText(AView, AAt + 14);
+    LWord := "enum " + LName + " of " + DoIndexText(DoGet(AView, AAt + 6, 4)) + " fields " +
+      DoIndexText(DoGet(AView, AAt + 10, 4)) + " count " + IntToStr(LCount);
+    LAt := AAt + 14 + len(LName) + 1;
+  else
+    LFields := DoGet(AView, AAt + 6, 4);
+    LAt := AAt + 10;
+    LWord := "union";
+    if ALeaf = ADAM_CV_LF_CLASS then
+      LWord := "class";
+      LAt := LAt + 8;
+    end;
+    if ALeaf = ADAM_CV_LF_STRUCTURE then
+      LWord := "structure";
+      LAt := LAt + 8;
+    end;
+    LValue := DoNumeric(AView, LAt, LSize);
+    LName := DoText(AView, LAt + LSize);
+    LAt := LAt + LSize + len(LName) + 1;
+    LWord := LWord + " " + LName + " fields " + DoIndexText(LFields) + " count " +
+      IntToStr(LCount) + " size " + IntToStr(LValue);
+  end;
+  if (LProperty & ADAM_CV_PROP_FORWARD) <> 0 then
+    LWord := LWord + " forward";
+  end;
+  if (LProperty & ADAM_CV_PROP_UNIQUE) <> 0 then
+    LWord := LWord + " unique " + DoText(AView, LAt);
+  end;
+  return LWord;
+end;
+
+// The type records of AView (a .debug$T) as lines
+routine DoTypesText(const AView: ref CvSectionView; const AText: ref TextBuilder);
+var
+  LAt: int64;
+  LLength: int64;
+  LLeaf: int64;
+  LIndex: int64;
+  LSize: int64;
+  LLine: string;
+  LBody: int64;
+begin
+  LAt := 4;
+  LIndex := ADAM_CV_FIRST_TYPE;
+  while LAt + 4 <= len(AView.Bytes) do
+    LLength := DoGet(AView, LAt, 2);
+    LBody := LAt + 2;
+    LLeaf := DoGet(AView, LBody, 2);
+    LLine := "  type " + DoIndexText(LIndex) + " ";
+    if LLeaf = ADAM_CV_LF_POINTER then
+      LLine := LLine + "pointer to " + DoIndexText(DoGet(AView, LBody + 2, 4)) + " attributes 0x" +
+        IntToHex(uint64(DoGet(AView, LBody + 6, 4)), 5);
+    else
+      if LLeaf = ADAM_CV_LF_ARRAY then
+        LLine := LLine + "array of " + DoIndexText(DoGet(AView, LBody + 2, 4)) + " index " +
+          DoIndexText(DoGet(AView, LBody + 6, 4)) + " size " +
+          IntToStr(DoNumeric(AView, LBody + 10, LSize));
+      else
+        if LLeaf = ADAM_CV_LF_BITFIELD then
+          LLine := LLine + "bitfield of " + DoIndexText(DoGet(AView, LBody + 2, 4)) + " width " +
+            IntToStr(DoGet(AView, LBody + 6, 1)) + " at " + IntToStr(DoGet(AView, LBody + 7, 1));
+        else
+          if LLeaf = ADAM_CV_LF_ARGLIST then
+            LLine := LLine + "arglist count " + IntToStr(DoGet(AView, LBody + 2, 4));
+          else
+            if LLeaf = ADAM_CV_LF_PROCEDURE then
+              LLine := LLine + "procedure returns " + DoIndexText(DoGet(AView, LBody + 2, 4)) +
+                " args " + DoIndexText(DoGet(AView, LBody + 10, 4));
+            else
+              if LLeaf = ADAM_CV_LF_FIELDLIST then
+                LLine := LLine + "fieldlist";
+              else
+                if (LLeaf = ADAM_CV_LF_STRUCTURE) or (LLeaf = ADAM_CV_LF_CLASS) or
+                  (LLeaf = ADAM_CV_LF_UNION) or (LLeaf = ADAM_CV_LF_ENUM) then
+                  LLine := LLine + DoUdtText(AView, LBody, LLeaf);
+                else
+                  LLine := LLine + "leaf 0x" + IntToHex(uint64(LLeaf), 4);
+                end;
+              end;
+            end;
+          end;
+        end;
+      end;
+    end;
+    AText.Add(LLine + "\n");
+    if LLeaf = ADAM_CV_LF_FIELDLIST then
+      DoFieldListText(AView, LBody + 2, LBody + LLength, AText);
+    end;
+    LAt := LBody + LLength;
+    LIndex := LIndex + 1;
+  end;
+end;
+
+// The file names of every view's checksum entries by their offset (the string table and
+// the checksums may be in another section of the object than the lines naming them)
+routine DoFileNames(const AViews: ref List<ref CvSectionView>; const ANames: ref Int64Map;
+  var AFiles: StringArray);
+var
+  LView: ref CvSectionView;
+  LStrings: int64;
+  LChecksums: int64;
+  LChecksumsEnd: int64;
+  LAt: int64;
+  LKind: int64;
+  LLength: int64;
+  LV: int64;
+begin
+  for LV := 0 to AViews.Count - 1 do
+    LView := AViews.Items[LV];
+    if LView.SectionName <> ADAM_CV_SECTION_SYMBOLS then
+      skip;
+    end;
+    LStrings := -1;
+    LChecksums := -1;
+    LChecksumsEnd := -1;
+    LAt := 4;
+    while LAt + 8 <= len(LView.Bytes) do
+      LKind := DoGet(LView, LAt, 4);
+      LLength := DoGet(LView, LAt + 4, 4);
+      if LKind = ADAM_CV_SUB_STRINGS then
+        LStrings := LAt + 8;
+      end;
+      if LKind = ADAM_CV_SUB_CHECKSUMS then
+        LChecksums := LAt + 8;
+        LChecksumsEnd := LAt + 8 + LLength;
+      end;
+      LAt := (LAt + 8 + LLength + 3) & (-4);
+    end;
+    if (LStrings < 0) or (LChecksums < 0) then
+      skip;
+    end;
+    LAt := LChecksums;
+    while LAt < LChecksumsEnd do
+      setlength(AFiles, len(AFiles) + 1);
+      AFiles[len(AFiles) - 1] := ExtractFileName(DoText(LView, LStrings + DoGet(LView, LAt, 4)));
+      ANames.Put(LAt - LChecksums, len(AFiles));
+      LAt := LAt + ADAM_CV_CHECKSUM_ENTRY;
+    end;
+  end;
+end;
+
+// The symbol records from AAt to AEnd of AView as lines (code offsets and sizes left out:
+// a routine says only whether its prologue ends inside it)
+routine DoSymbolsText(const AView: ref CvSectionView; const AAt: int64; const AEnd: int64;
+  const AText: ref TextBuilder);
+var
+  LAt: int64;
+  LLength: int64;
+  LKind: int64;
+  LBody: int64;
+  LLine: string;
+begin
+  LAt := AAt;
+  while LAt + 4 <= AEnd do
+    LLength := DoGet(AView, LAt, 2);
+    LKind := DoGet(AView, LAt + 2, 2);
+    LBody := LAt + 4;
+    LLine := "  ";
+    if LKind = ADAM_CV_S_OBJNAME then
+      LLine := LLine + "objname '" + DoText(AView, LBody + 4) + "'";
+    else
+      if LKind = ADAM_CV_S_COMPILE3 then
+        LLine := LLine + "compile language " + IntToStr(DoGet(AView, LBody, 4) & 0xFF) +
+          " cpu 0x" + IntToHex(uint64(DoGet(AView, LBody + 4, 2)), 2) + " '" +
+          DoText(AView, LBody + 22) + "'";
+      else
+        if (LKind = ADAM_CV_S_GPROC32) or (LKind = ADAM_CV_S_LPROC32) then
+          LLine := LLine + "gproc";
+          if LKind = ADAM_CV_S_LPROC32 then
+            LLine := "  lproc";
+          end;
+          LLine := LLine + " " + DoText(AView, LBody + 35) + " at " + AView.TargetAt(LBody + 28) +
+            " section " + AView.TargetAt(LBody + 32) + " type " +
+            DoIndexText(DoGet(AView, LBody + 24, 4)) + " prologue " +
+            BoolToStr(DoGet(AView, LBody + 16, 4) > 0) + " end " +
+            BoolToStr(DoGet(AView, LBody + 20, 4) = DoGet(AView, LBody + 12, 4));
+        else
+          if LKind = ADAM_CV_S_FRAMEPROC then
+            LLine := LLine + "frameproc base " +
+              IntToStr((DoGet(AView, LBody + 22, 4) shr ADAM_CV_FRAME_LOCAL_SHIFT) & 3);
+          else
+            if LKind = ADAM_CV_S_REGREL32 then
+              LLine := LLine + "regrel " + DoText(AView, LBody + 10) + " register " +
+                IntToStr(DoGet(AView, LBody + 8, 2)) + " +" + IntToStr(DoGet(AView, LBody, 4)) +
+                " type " + DoIndexText(DoGet(AView, LBody + 4, 4));
+            else
+              if LKind = ADAM_CV_S_END then
+                LLine := LLine + "end";
+              else
+                if (LKind = ADAM_CV_S_GDATA32) or (LKind = ADAM_CV_S_LDATA32) or
+                  (LKind = ADAM_CV_S_GTHREAD32) or (LKind = ADAM_CV_S_LTHREAD32) then
+                  if LKind = ADAM_CV_S_GDATA32 then
+                    LLine := LLine + "gdata";
+                  end;
+                  if LKind = ADAM_CV_S_LDATA32 then
+                    LLine := LLine + "ldata";
+                  end;
+                  if LKind = ADAM_CV_S_GTHREAD32 then
+                    LLine := LLine + "gthread";
+                  end;
+                  if LKind = ADAM_CV_S_LTHREAD32 then
+                    LLine := LLine + "lthread";
+                  end;
+                  LLine := LLine + " " + DoText(AView, LBody + 10) + " at " +
+                    AView.TargetAt(LBody + 4) + " section " + AView.TargetAt(LBody + 8) + " type " +
+                    DoIndexText(DoGet(AView, LBody, 4));
+                else
+                  if LKind = ADAM_CV_S_UDT then
+                    LLine := LLine + "udt " + DoText(AView, LBody + 4) + " type " +
+                      DoIndexText(DoGet(AView, LBody, 4));
+                  else
+                    LLine := LLine + "symbol 0x" + IntToHex(uint64(LKind), 4);
+                  end;
+                end;
+              end;
+            end;
+          end;
+        end;
+      end;
+    end;
+    AText.Add(LLine + "\n");
+    LAt := LAt + 2 + LLength;
+  end;
+end;
+
+// The lines subsection from AAt to AEnd of AView as lines: its function, then per file
+// block its file and each statement line's number (code offsets left out)
+routine DoLinesText(const AView: ref CvSectionView; const AAt: int64; const AEnd: int64;
+  const ANames: ref Int64Map; const AFiles: StringArray; const AText: ref TextBuilder);
+var
+  LAt: int64;
+  LCount: int64;
+  LFile: int64;
+  LName: string;
+  LFlags: int64;
+  LI: int64;
+begin
+  AText.Add("  lines " + AView.TargetAt(AAt) + " section " + AView.TargetAt(AAt + 4) + "\n");
+  LAt := AAt + ADAM_CV_LINES_HEADER;
+  while LAt + ADAM_CV_LINES_BLOCK <= AEnd do
+    LFile := ANames.Find(DoGet(AView, LAt, 4));
+    LName := "?";
+    if LFile > 0 then
+      LName := AFiles[LFile - 1];
+    end;
+    LCount := DoGet(AView, LAt + 4, 4);
+    AText.Add("    file " + LName + " count " + IntToStr(LCount) + "\n");
+    LAt := LAt + ADAM_CV_LINES_BLOCK;
+    for LI := 0 to LCount - 1 do
+      LFlags := DoGet(AView, LAt + 4, 4);
+      if (LFlags & ADAM_CV_LINE_STATEMENT) <> 0 then
+        AText.Add("      line " + IntToStr(LFlags & ADAM_CV_LINE_MASK) + "\n");
+      else
+        AText.Add("      line " + IntToStr(LFlags & ADAM_CV_LINE_MASK) + " expression\n");
+      end;
+      LAt := LAt + ADAM_CV_LINES_ENTRY;
+    end;
+  end;
+end;
+
+// The names in the string table from AAt to AEnd of AView (each NUL-ended after the
+// table's first NUL)
+routine DoNameCount(const AView: ref CvSectionView; const AAt: int64; const AEnd: int64): int64;
+var
+  LCount: int64;
+  LI: int64;
+begin
+  LCount := 0;
+  for LI := AAt + 1 to AEnd - 1 do
+    if AView.Bytes[LI] = 0 then
+      LCount := LCount + 1;
+    end;
+  end;
+  return LCount;
+end;
+
+// AViews (an object's debug sections, in its order) as text (see the header)
+public routine CodeViewText(const AViews: ref List<ref CvSectionView>): string;
+var
+  LText: ref TextBuilder;
+  LView: ref CvSectionView;
+  LNames: ref Int64Map;
+  LFiles: StringArray;
+  LAt: int64;
+  LKind: int64;
+  LLength: int64;
+  LV: int64;
+begin
+  LText := ref TextBuilder();
+  LNames := ref Int64Map(0);
+  setlength(LFiles, 0);
+  DoFileNames(AViews, LNames, LFiles);
+  for LV := 0 to AViews.Count - 1 do
+    LView := AViews.Items[LV];
+    if LView.Partner <> "" then
+      LText.Add("section " + LView.SectionName + " with " + LView.Partner + "\n");
+    else
+      LText.Add("section " + LView.SectionName + "\n");
+    end;
+    if (len(LView.Bytes) < 4) or (DoGet(LView, 0, 4) <> ADAM_CV_SIGNATURE) then
+      LText.Add("  no signature\n");
+      skip;
+    end;
+    if LView.SectionName = ADAM_CV_SECTION_TYPES then
+      DoTypesText(LView, LText);
+      skip;
+    end;
+    LAt := 4;
+    while LAt + 8 <= len(LView.Bytes) do
+      LKind := DoGet(LView, LAt, 4);
+      LLength := DoGet(LView, LAt + 4, 4);
+      if LKind = ADAM_CV_SUB_SYMBOLS then
+        DoSymbolsText(LView, LAt + 8, LAt + 8 + LLength, LText);
+      else
+        if LKind = ADAM_CV_SUB_LINES then
+          DoLinesText(LView, LAt + 8, LAt + 8 + LLength, LNames, LFiles, LText);
+        else
+          if LKind = ADAM_CV_SUB_STRINGS then
+            // its names counted, not its bytes (a file's full path is the machine's)
+            LText.Add("  strings " + IntToStr(DoNameCount(LView, LAt + 8, LAt + 8 + LLength)) + "\n");
+          else
+            if LKind = ADAM_CV_SUB_CHECKSUMS then
+              LText.Add("  checksums " + IntToStr(LLength div ADAM_CV_CHECKSUM_ENTRY) + "\n");
+            else
+              LText.Add("  subsection 0x" + IntToHex(uint64(LKind), 2) + "\n");
+            end;
+          end;
+        end;
+      end;
+      LAt := (LAt + 8 + LLength + 3) & (-4);
+    end;
+  end;
+  return LText.Text();
+end;
+
+end.
