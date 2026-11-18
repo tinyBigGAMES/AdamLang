@@ -1,0 +1,257 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Debug.Target.adam - the process under Adam's debugger (M11a D1)
+
+  DebugTarget is the debugger's one way to its program, an abstract object
+  each OS fills in (Adam.Debug.Target.Win64 today; a linux64 part over ptrace
+  later, nothing above the parts changed). It launches the program, hands
+  what happens to it to the caller as DebugEvents, one at a time, and lets
+  it be resumed, stepped, paused or ended; while it is stopped its threads'
+  registers (DebugContext) and its memory are read and written, and int3
+  patches (breakpoints, counted: two adds need two removes) put in or taken
+  out. Debug.Runtime (D3) builds breakpoints, steps and values on it.
+
+  The rules every part keeps:
+    - One caller thread drives it: Start, NextEvent, Resume (the OS ties a
+      debugged process to the thread that started it); only Pause may come
+      from another thread.
+    - Holding: ProcessStarted, ModuleLoaded and Stopped leave the program
+      held until Resume (a caller sets breakpoints at a module's load, reads
+      a stop's registers); every other event lets it run on at once.
+    - The first breakpoint the OS raises (the loader's, before any of the
+      program's code runs) is the Entry stop. A stop at a patch reports the
+      patch's address with the program counter put back on it; Resume steps
+      over the patch (its byte put back, one instruction with the other
+      threads held, the patch put in again) before going on, so a breakpoint
+      never has to be removed to get past it.
+    - A program's own first-chance exception goes to the program as it
+      would without a debugger; its second chance is the Exception stop,
+      after which the program ends as it would (D6 adds stopping at the
+      first chance).
+    - Memory read back hides the patches: a patched byte reads as it was.
+    - Output: Inherit hands the program this process's own stdin, stdout
+      and stderr; Pipes takes stdout and stderr into one pipe, given back
+      as Output events (whole UTF-8 characters, in the order written), stdin
+      the NUL device.
+    - Everything that fails is reported on the Diagnostics (DB codes) and
+      the call says false; nothing raises.
+*******************************************************************************/
+
+module unit Adam.Debug.Target;
+
+import System.SysUtils, Adam.Core.Messages, Adam.Compiler.SourceText, Adam.Compiler.Diagnostics;
+
+public const
+  ADAM_ERR_DEBUG_001: string = "DB0001";   // the program to debug does not exist
+  ADAM_ERR_DEBUG_002: string = "DB0002";   // the program could not be started under the debugger
+  ADAM_ERR_DEBUG_003: string = "DB0003";   // a call made in a state that does not allow it
+  ADAM_ERR_DEBUG_004: string = "DB0004";   // a thread id the program does not have
+  ADAM_ERR_DEBUG_005: string = "DB0005";   // a thread's registers could not be read or written
+  ADAM_ERR_DEBUG_006: string = "DB0006";   // the program's memory could not be read or written
+  ADAM_ERR_DEBUG_007: string = "DB0007";   // a breakpoint patch could not be put in
+  ADAM_ERR_DEBUG_008: string = "DB0008";   // the program could not be paused
+  ADAM_ERR_DEBUG_009: string = "DB0009";   // the debug loop failed (wait / continue)
+
+  // NextEvent's timeout that waits until an event comes
+  ADAM_DEBUG_WAIT_FOREVER: uint32 = 0xFFFFFFFF;
+  // The exit code of a program Terminate ends (pcpp's)
+  ADAM_DEBUG_TERMINATE_EXIT_CODE: uint32 = 1;
+
+public type
+  // What happened to the program (see the header for which ones hold it)
+  DebugEventKind = choices(ProcessStarted, ThreadStarted, ThreadExited, ModuleLoaded,
+    ModuleUnloaded, Stopped, Output, ProcessExited);
+
+  // Why a Stopped event stopped (None on every other event)
+  DebugStopReason = choices(None, Entry, Breakpoint, Step, Pause, Exception);
+
+  // How Resume lets a stopped program go on: run, or one instruction of the stopped thread
+  ResumeKind = choices(Continue, Step);
+
+  // Where the program's standard handles go (see the header)
+  DebugOutputMode = choices(Inherit, Pipes);
+
+  // One thing that happened. Kind always; the rest as the kind has it:
+  //   ProcessStarted  ThreadId (the main thread), Address (the image base), ModulePath
+  //   ThreadStarted / ThreadExited  ThreadId (ExitCode on an exit)
+  //   ModuleLoaded / ModuleUnloaded  Address (its base), ModulePath (a load's)
+  //   Stopped  Reason, ThreadId, Address (where), ExceptionCode + FirstChance (Exception)
+  //   Output  OutputText
+  //   ProcessExited  ExitCode
+  DebugEvent = record
+    Kind: DebugEventKind;
+    Reason: DebugStopReason;
+    ThreadId: uint32;
+    Address: uint64;
+    ExceptionCode: uint32;
+    FirstChance: bool;
+    ExitCode: uint32;
+    ModulePath: string;
+    OutputText: string;
+  end;
+
+  // A list of machine words (registers, addresses)
+  DebugWordArray = array of uint64;
+  // A list of thread ids
+  DebugThreadIdArray = array of uint32;
+
+  // One thread's registers: the four every machine has by role, then every general register
+  // in the part's RegisterNames order, and the OS's own register block, which only the part
+  // that read it reads (SetContext writes the named values over it)
+  DebugContext = record
+    Pc: uint64;
+    Sp: uint64;
+    Fp: uint64;
+    Flags: uint64;
+    Registers: DebugWordArray;
+    Raw: ByteArray;
+  end;
+
+  // The process under the debugger (see the header). The program and its mode are set
+  // before Start; the rest is the part's
+  DebugTarget = object
+    hidden FReports: ref Diagnostics;
+    hidden FProgramPath: string;
+    hidden FProgramArgs: StringArray;
+    hidden FOutputMode: DebugOutputMode;
+
+    // The diagnostics every failure is reported on (DB codes)
+    method SetDiagnostics(const AReports: ref Diagnostics);
+    begin
+      self.FReports := AReports;
+    end;
+
+    // The exe to debug (a path as System.IO resolves it) and its command line arguments
+    method SetProgram(const AExePath: string; const AArgs: StringArray);
+    begin
+      self.FProgramPath := AExePath;
+      self.FProgramArgs := AArgs;
+    end;
+
+    // Where the program's standard handles go (Inherit unless set)
+    method SetOutputMode(const AMode: DebugOutputMode);
+    begin
+      self.FOutputMode := AMode;
+    end;
+
+    property OutputMode: DebugOutputMode read FOutputMode;
+
+    // Launches the program under the debugger; its events come through NextEvent. False
+    // (reported) when it does not exist, cannot start, or was started already
+    virtual method Start(): bool; abstract;
+
+    // The next event into AEvent, waiting at most ATimeoutMs (ADAM_DEBUG_WAIT_FOREVER: until
+    // one comes). False when none came in time, while the program is held (until Resume),
+    // or once it has exited and every event was taken
+    virtual method NextEvent(var AEvent: DebugEvent; const ATimeoutMs: uint32): bool; abstract;
+
+    // Lets a held program go on: a stop as AKind says (Step: one instruction of the stopped
+    // thread, then a Step stop), any other hold as Continue. False (reported) when nothing
+    // holds it
+    virtual method Resume(const AKind: ResumeKind): bool; abstract;
+
+    // Asks a running program to stop: a Pause stop comes. The one call another thread may
+    // make. False when it is not running or held already, or the OS refused (reported)
+    virtual method Pause(): bool; abstract;
+
+    // Ends the program with ADAM_DEBUG_TERMINATE_EXIT_CODE (held or not); its ProcessExited
+    // still comes through NextEvent. Nothing when it is not running
+    virtual method Terminate(); abstract;
+
+    // True while an event holds the program (until Resume)
+    virtual const method IsHeld(): bool; abstract;
+    // True from Start until its ProcessExited is taken
+    virtual const method IsRunning(): bool; abstract;
+    // The program's threads, oldest first
+    virtual const method Threads(): DebugThreadIdArray; abstract;
+
+    // The registers' names in DebugContext.Registers' order
+    virtual const method RegisterNames(): StringArray; abstract;
+    // AThreadId's registers into AContext. False (reported) for a thread the program does
+    // not have or the OS refused
+    virtual method GetContext(const AThreadId: uint32; var AContext: DebugContext): bool;
+      abstract;
+    // AContext (read from AThreadId by GetContext, then changed) written back. False
+    // (reported) as GetContext, or when AContext was not read from such a thread
+    virtual method SetContext(const AThreadId: uint32; const AContext: DebugContext): bool;
+      abstract;
+
+    // ASize bytes at AAddress into ABytes, the patches hidden. False (reported) when not all
+    // of them can be read
+    virtual method ReadMemory(const AAddress: uint64; const ASize: int64;
+      var ABytes: ByteArray): bool; abstract;
+    // ABytes written at AAddress (code too); a patch inside keeps its int3, the byte written
+    // becoming what it hides. False (reported) when not all of them can be written
+    virtual method WriteMemory(const AAddress: uint64; const ABytes: ByteArray): bool; abstract;
+
+    // An int3 at AAddress (a second add only counts). False (reported) when it cannot be
+    // written
+    virtual method AddPatch(const AAddress: uint64): bool; abstract;
+    // One add at AAddress undone; the last one puts the byte back. False when there is no
+    // patch there, or the byte cannot be put back (reported)
+    virtual method RemovePatch(const AAddress: uint64): bool; abstract;
+    // True when a patch is at AAddress
+    virtual const method IsPatched(const AAddress: uint64): bool; abstract;
+
+    // The program's process id, its main thread's id, its image's base and entry address and
+    // its image's full path (0 / "" before the ProcessStarted event)
+    virtual const method ProcessId(): uint32; abstract;
+    virtual const method MainThreadId(): uint32; abstract;
+    virtual const method ImageBase(): uint64; abstract;
+    virtual const method EntryAddress(): uint64; abstract;
+    virtual const method ImagePath(): string; abstract;
+
+    // Reports ATemplate filled with AArgs as an Error with ACode (no place: a debugger's
+    // failures belong to no source line)
+    hidden method DoError(const ACode: string; const ATemplate: string; const AArgs: MessageArgs);
+    begin
+      if self.FReports <> nil then
+        self.FReports.Add(Severity.Error, ACode, NoPlace(), ATemplate, AArgs);
+      end;
+    end;
+  end;
+
+// The kind's name as a debugger prints it (process-started, stopped ...)
+public routine DebugEventKindText(const AKind: DebugEventKind): string;
+begin
+  match AKind of
+    DebugEventKind.ProcessStarted: return "process-started";
+    DebugEventKind.ThreadStarted: return "thread-started";
+    DebugEventKind.ThreadExited: return "thread-exited";
+    DebugEventKind.ModuleLoaded: return "module-loaded";
+    DebugEventKind.ModuleUnloaded: return "module-unloaded";
+    DebugEventKind.Stopped: return "stopped";
+    DebugEventKind.Output: return "output";
+  else
+    return "process-exited";
+  end;
+end;
+
+// The reason's name as a debugger prints it (entry, breakpoint ...; "" for None)
+public routine DebugStopReasonText(const AReason: DebugStopReason): string;
+begin
+  match AReason of
+    DebugStopReason.Entry: return "entry";
+    DebugStopReason.Breakpoint: return "breakpoint";
+    DebugStopReason.Step: return "step";
+    DebugStopReason.Pause: return "pause";
+    DebugStopReason.Exception: return "exception";
+  else
+    return "";
+  end;
+end;
+
+end.
