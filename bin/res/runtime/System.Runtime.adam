@@ -115,13 +115,36 @@ public var
   // code. Windows keeps all 32 bits, Linux the low 8 (0..255 is portable)
   ExitCode: int32;
 
+type
+  // One raise in flight on a thread (RaiseWith, B1): its code and its text (a reference the
+  // entry holds), the stack it was raised on (PlatformStackBase) and the place on it
+  // (RaiseWith's own frame). The raise keeps its text as pcpp's exception object did, so a
+  // raise caught inside a finally that another raise's unwind runs leaves the other's text
+  // as it was: a catch takes the newest entry raised below its frame (RaiseTaken)
+  RaiseEntry = record
+    Code: int32;
+    Text: ptr;
+    Stack: uint64;
+    Place: uint64;
+  end;
+
+const
+  // How many raises one thread keeps in flight at once (a raise inside a finally that an
+  // unwind runs, nested): past it the oldest entry is let go of to make room
+  ADAM_RUNTIME_RAISE_DEPTH: int64 = 64;
+
 threadstatic
-  // The raise in flight on this thread (RaiseWith): its code (PaskalCPP's: 1 for raise, 11
-  // for a set item out of range) and its text, a string value this holds one reference to
-  // (nil: the empty text); read by Unhandled. Each thread has its own (H4t2b), released as
-  // the thread ends (ThreadEnded; the main one's at Halt)
+  // The raise in flight on this thread (RaiseWith; an except part's start makes the raise
+  // it caught the one in flight, RaiseTaken): its code (PaskalCPP's: 1 for raise, 11 for a
+  // set item out of range) and its text, a string value this holds one reference to (nil:
+  // the empty text); read by Unhandled. Each thread has its own (H4t2b), released as the
+  // thread ends (ThreadEnded; the main one's at Halt)
   GRaiseCode: int32;
   GRaiseText: ptr;
+  // The raises in flight on this thread, the oldest first (RaiseEntry; GRaiseCount used),
+  // released with GRaiseText (DoDropRaises)
+  GRaises: array[0..ADAM_RUNTIME_RAISE_DEPTH - 1] of RaiseEntry;
+  GRaiseCount: int64;
   // True while MemoryFail builds its text on this thread: an allocation failing inside it
   // raises with the empty text (no block needed) instead of failing again without end
   GMemoryFailing: bool;
@@ -241,8 +264,10 @@ end;
 // entry's own ran before every teardown), so the counts are the whole program's. A debug
 // build lists under it each site still holding blocks (M4.L1, DoReportLeaks)
 forward routine TaskWait();
-// Declared below, with the strings (ReportHeap and Halt release the raise text)
+// Declared below, with the strings (ReportHeap and Halt release the raise text and the
+// raise entries)
 forward routine StrRelease(const AText: ptr);
+forward routine DoDropRaises();
 @ifdef DEBUG
 forward routine DoReportLeaks();
 @endif
@@ -254,6 +279,7 @@ begin
   // program ends (Halt, a C exit call, a dll's unload, M8c: a dll's end runs no Halt)
   StrRelease(GRaiseText);
   GRaiseText := nil;
+  DoDropRaises();
 @ifdef DEBUG
   if GHeapReport then
     println("[Heap] Allocs: {}, Frees: {}, Leaked: {}", atomicload(GAllocs),
@@ -323,6 +349,7 @@ public routine Halt(const ACode: int32); noreturn;
 begin
   StrRelease(GRaiseText);
   GRaiseText := nil;
+  DoDropRaises();
   ExitCode := ACode;
   if atomicswap(GExiting, 1) <> 0 then
     PlatformQuit(ACode);
@@ -5200,11 +5227,90 @@ end;
 // (PlatformRaise); it never returns. The entry's catching scope catches it, and its catch
 // block reports it (Unhandled)
 routine RaiseWith(const ACode: int32; const AText: ptr); noreturn;
+var
+  LPlace: uint8;
+  LI: int64;
 begin
   StrRelease(GRaiseText);
   GRaiseText := AText;
   GRaiseCode := ACode;
+  // Its own entry (a second reference to the text): where it is raised, so the catch that
+  // takes it finds it (RaiseTaken); a full list lets go of its oldest entry first
+  if GRaiseCount = ADAM_RUNTIME_RAISE_DEPTH then
+    StrRelease(GRaises[0].Text);
+    for LI := 1 to GRaiseCount - 1 do
+      GRaises[LI - 1] := GRaises[LI];
+    end;
+    GRaiseCount := GRaiseCount - 1;
+  end;
+  LPlace := 0;
+  StrAddRef(AText);
+  GRaises[GRaiseCount].Code := ACode;
+  GRaises[GRaiseCount].Text := AText;
+  GRaises[GRaiseCount].Stack := PlatformStackBase();
+  GRaises[GRaiseCount].Place := uint64(ptr(addr of LPlace));
+  GRaiseCount := GRaiseCount + 1;
   PlatformRaise();
+end;
+
+// Every raise entry of this thread let go of (its text released): the thread ends, or the
+// program does
+routine DoDropRaises();
+var
+  LI: int64;
+begin
+  for LI := 0 to GRaiseCount - 1 do
+    StrRelease(GRaises[LI].Text);
+    GRaises[LI].Text := nil;
+  end;
+  GRaiseCount := 0;
+end;
+
+// The raise entries a catch at the frame holding AMark (an address in the catching frame)
+// has unwound past: every entry raised on this stack below AMark (a frame the unwind left).
+// With ATake, the newest of them is the raise caught (any raised after it was caught on its
+// own, or it replaced this one, which would not be caught then) and becomes the raise in
+// flight, its reference moved there; every other one is let go of (a raise a finally's
+// raise replaced). An entry above AMark is a raise still unwinding (this catch runs inside
+// its finally), one on another stack a generator's: both stay
+routine DoUnwoundRaises(const AMark: ptr; const ATake: bool);
+var
+  LStack: uint64;
+  LMark: uint64;
+  LCaught: int64;
+  LKept: int64;
+  LI: int64;
+begin
+  if GRaiseCount = 0 then
+    return;
+  end;
+  LStack := PlatformStackBase();
+  LMark := uint64(AMark);
+  LCaught := -1;
+  if ATake then
+    for LI := GRaiseCount - 1 downto 0 do
+      if (GRaises[LI].Stack = LStack) and (GRaises[LI].Place < LMark) then
+        LCaught := LI;
+        leave;
+      end;
+    end;
+  end;
+  LKept := 0;
+  for LI := 0 to GRaiseCount - 1 do
+    if LI = LCaught then
+      StrRelease(GRaiseText);
+      GRaiseText := GRaises[LI].Text;
+      GRaiseCode := GRaises[LI].Code;
+      skip;
+    end;
+    if (GRaises[LI].Stack = LStack) and (GRaises[LI].Place < LMark) then
+      StrRelease(GRaises[LI].Text);
+      skip;
+    end;
+    GRaises[LKept] := GRaises[LI];
+    LKept := LKept + 1;
+  end;
+  GRaiseCount := LKept;
 end;
 
 // exccode(): the code of this thread's raise in flight (the last one raised, caught or not;
@@ -6770,6 +6876,27 @@ begin
   GRaiseCode := LCode;
 end;
 
+// A catch's first act (B1; Lowering's DoGuard for an except part, DoCatchAll for a last
+// catching scope), AMark an address in the catching frame: with ATake (every catch but a
+// generator's abort's), a raise the filter took becomes the raise in flight, the one this
+// catch caught (DoUnwoundRaises), and a hardware fault the filter took becomes it as in
+// FaultTaken; the raise entries the unwind left are let go of either way. FaultTaken is
+// what a compiler before B1 calls (the bootstrap: the installed adam builds the next
+// compiler over this runtime)
+routine RaiseTaken(const AMark: ptr; const ATake: bool);
+var
+  LCode: int32;
+begin
+  LCode := PlatformFaultTaken();
+  DoUnwoundRaises(AMark, ATake and (LCode = 0));
+  if LCode = 0 then
+    return;
+  end;
+  StrRelease(GRaiseText);
+  GRaiseText := TextOfC(FaultText(LCode));
+  GRaiseCode := LCode;
+end;
+
 // A hardware fault no guard took (the platform's last filter, PlatformAtFault), reported as
 // PaskalCPP's report_unguarded_fault does, the same on every target: `unhandled exception
 // <code>: <text>` and a newline to stderr in one system call, then the process ends at once
@@ -7014,6 +7141,7 @@ begin
   StrRelease(GRaiseText);
   GRaiseText := nil;
   GRaiseCode := 0;
+  DoDropRaises();
   LNode := ptr to ThreadReleaseNode(GThreadReleases);
   while LNode <> nil do
     LRelease := LNode^.Release;

@@ -449,13 +449,17 @@ type
     hidden FSource: int64;
     hidden FCurrent: int64;
     // The function's id; a funclet's generated parent (nil for any other function), each
-    // parent slot's offset in the parent's frame by its SSA id (-1: none), the parent slots
-    // the funclet uses, and the register its frame base is in (-1: none)
+    // parent slot's offset in its owner's frame by its SSA id (-1: none) and how far up the
+    // owner is (1: the parent, 2: the parent's parent ..), the parent slots the funclet
+    // uses, the deepest owner they need, and the register each owner's frame base is in
+    // (FFrameBases[depth - 1])
     hidden FFunctionId: int64;
     hidden FParent: ref FunctionCode;
     hidden FParentAt: ref Int64Map;
+    hidden FParentDepth: ref Int64Map;
     hidden FParentSlots: ref Int64List;
-    hidden FFrameBase: int64;
+    hidden FDeepest: int64;
+    hidden FFrameBases: ref Int64List;
     // True from a tail call's jump to the IR ret after it: the jump has left the function,
     // the ret makes nothing (DoTailJump, DoRet)
     hidden FTailDone: bool;
@@ -484,7 +488,8 @@ type
       self.FFunctionId := 0;
       self.FParent := AParent;
       self.FParentSlots := ref Int64List();
-      self.FFrameBase := -1;
+      self.FDeepest := 0;
+      self.FFrameBases := ref Int64List();
       self.FTailDone := false;
     end;
 
@@ -750,7 +755,7 @@ type
         LMemory := SlotMemory(self.FSlotOf.Find(APlan.Base), APlan.Disp);
       else
         if APlan.BaseKind = PlanBase.Parent then
-          LMemory := RegisterMemory(self.FFrameBase, true,
+          LMemory := RegisterMemory(self.DoBaseOf(APlan.Base), true,
             self.FParentAt.Find(APlan.Base) + APlan.Disp);
         else
           if APlan.BaseKind = PlanBase.Blob then
@@ -774,29 +779,56 @@ type
       return self.DoMemoryOf(self.DoPlanOf(AAddress));
     end;
 
-    // AOperand recorded once as a parent slot of a funclet (FParentAt, FParentSlots) when it
-    // is defined in another function (Verify lets a funclet use its parent's slots alone):
-    // its offset is the one the parent's frame gave it
+    // AOperand recorded once as a parent slot of a funclet (FParentAt, FParentDepth,
+    // FParentSlots) when it is defined in another function (Verify lets a funclet use the
+    // slots of the functions it is nested in alone): its owner found up the parent chain
+    // (the IR's Parent beside the generated FunctionCode.ParentCode), its offset the one
+    // the owner's frame gave it
     hidden method DoParentSlot(const AOperand: int64);
     var
+      LOwner: int64;
+      LAncestor: int64;
+      LCode: ref FunctionCode;
+      LDepth: int64;
       LOffset: int64;
     begin
       if not self.FModule.IsInstr(AOperand) then
         return;
       end;
-      if (self.FParentAt.Find(AOperand) >= 0) or
-        (self.FModule.BlockAt(self.FModule.InstrAt(AOperand).Block).Owner = self.FFunctionId) then
+      LOwner := self.FModule.BlockAt(self.FModule.InstrAt(AOperand).Block).Owner;
+      if (self.FParentAt.Find(AOperand) >= 0) or (LOwner = self.FFunctionId) then
         return;
       end;
       if (self.FParent = nil) or (self.FModule.InstrAt(AOperand).Kind <> IrOp.Slot) then
         raise(ADAM_X64_SELECT_FAULT_PARENT + IntToStr(AOperand) + " in " + self.FFunction.Symbol);
       end;
-      LOffset := self.FParent.SlotOffsetOf(AOperand);
+      LCode := self.FParent;
+      LAncestor := self.FFunction.Parent;
+      LDepth := 1;
+      while (LCode <> nil) and (LAncestor <> 0) and (LAncestor <> LOwner) do
+        LCode := LCode.ParentCode;
+        LAncestor := self.FModule.FunctionAt(LAncestor).Parent;
+        LDepth := LDepth + 1;
+      end;
+      if (LCode = nil) or (LAncestor <> LOwner) then
+        raise(ADAM_X64_SELECT_FAULT_PARENT + IntToStr(AOperand) + " in " + self.FFunction.Symbol);
+      end;
+      LOffset := LCode.SlotOffsetOf(AOperand);
       if LOffset < 0 then
         raise(ADAM_X64_SELECT_FAULT_PARENT + IntToStr(AOperand) + " in " + self.FFunction.Symbol);
       end;
       self.FParentAt.Put(AOperand, LOffset);
+      self.FParentDepth.Put(AOperand, LDepth);
       self.FParentSlots.Add(AOperand);
+      if LDepth > self.FDeepest then
+        self.FDeepest := LDepth;
+      end;
+    end;
+
+    // The register the frame base of parent slot AOperand's owner is in (DoFrameBase)
+    hidden const method DoBaseOf(const AOperand: int64): int64;
+    begin
+      return self.FFrameBases[self.FParentDepth.Find(AOperand) - 1];
     end;
 
     // Every slot of the function in SSA order, each value's references and last user, each
@@ -1354,29 +1386,65 @@ type
       end;
     end;
 
-    // A funclet's frame base (FFrameBase), after its parameters: its frame parameter
-    // (FrameValue) in a register of its own, rounded down as its parent's realigned frame
-    // rounds the stack pointer (FrameLayout.Realign), so the parent's slot at offset N is
-    // at base + N; then each parent slot used as a value gets that address
+    // A funclet's frame bases (FFrameBases), after its parameters. A funclet with funclets
+    // of its own first keeps its frame parameter (FrameValue) in a slot (FrameSaveSlot):
+    // the frame a funclet nested in it is handed is its own, so that one finds this
+    // funclet's parent's frame there. The parent's base: the frame parameter in a register
+    // of its own, rounded down as the parent's realigned frame rounds the stack pointer
+    // (FrameLayout.Realign), so the parent's slot at offset N is at base + N; each owner
+    // further up (as deep as the parent slots used need): the word its funclet below
+    // kept (at that funclet's FrameSaveOffset from its base), rounded down by its own
+    // Realign. Then each parent slot used as a value gets its address
     hidden method DoFrameBase();
     var
       LNode: int64;
+      LCode: ref FunctionCode;
+      LBase: int64;
+      LNext: int64;
+      LSave: int64;
       LId: int64;
+      LDepth: int64;
       LI: int64;
     begin
       LNode := self.FFunction.Node;
-      self.FFrameBase := self.FMachine.NewVReg(RegClass.General);
-      self.DoEmitPair(X64Op.Mov, DoWidth(IrType.Pointer, 0), VirtualOperand(self.FFrameBase),
+      if self.FModule.FuncletsOf(self.FFunctionId).Count > 0 then
+        LSave := self.FMachine.AddSlot(DoWidth(IrType.Pointer, 0), DoWidth(IrType.Pointer, 0));
+        self.FMachine.FrameSaveSlot := LSave;
+        self.DoEmitPair(X64Op.Mov, DoWidth(IrType.Pointer, 0), SlotMemory(LSave, 0),
+          self.DoVReg(self.FFunction.FrameValue), LNode);
+      end;
+      LCode := self.FParent;
+      LBase := self.FMachine.NewVReg(RegClass.General);
+      self.DoEmitPair(X64Op.Mov, DoWidth(IrType.Pointer, 0), VirtualOperand(LBase),
         self.DoVReg(self.FFunction.FrameValue), LNode);
-      if self.FParent.Frame.Realign > 0 then
-        self.DoEmitPair(X64Op.BitAnd, DoWidth(IrType.Pointer, 0), VirtualOperand(self.FFrameBase),
-          ImmediateOperand(0 - self.FParent.Frame.Realign), LNode);
+      if LCode.Frame.Realign > 0 then
+        self.DoEmitPair(X64Op.BitAnd, DoWidth(IrType.Pointer, 0), VirtualOperand(LBase),
+          ImmediateOperand(0 - LCode.Frame.Realign), LNode);
+      end;
+      self.FFrameBases.Add(LBase);
+      for LDepth := 2 to self.FDeepest do
+        // LCode is the owner one level down, a funclet that kept its frame parameter
+        if (LCode.FrameSaveOffset < 0) or (LCode.ParentCode = nil) or
+          (LCode.ParentCode.Frame = nil) then
+          raise(ADAM_X64_SELECT_FAULT_PARENT + "frame of depth " + IntToStr(LDepth) + " in " +
+            self.FFunction.Symbol);
+        end;
+        LNext := self.FMachine.NewVReg(RegClass.General);
+        self.DoEmitPair(X64Op.Mov, DoWidth(IrType.Pointer, 0), VirtualOperand(LNext),
+          RegisterMemory(LBase, true, LCode.FrameSaveOffset), LNode);
+        LCode := LCode.ParentCode;
+        if LCode.Frame.Realign > 0 then
+          self.DoEmitPair(X64Op.BitAnd, DoWidth(IrType.Pointer, 0), VirtualOperand(LNext),
+            ImmediateOperand(0 - LCode.Frame.Realign), LNode);
+        end;
+        self.FFrameBases.Add(LNext);
+        LBase := LNext;
       end;
       for LI := 0 to self.FParentSlots.Count - 1 do
         LId := self.FParentSlots[LI];
         if self.FVRegOf.Find(LId) >= 0 then
           self.DoEmitPair(X64Op.Lea, DoWidth(IrType.Pointer, LId), self.DoVReg(LId),
-            RegisterMemory(self.FFrameBase, true, self.FParentAt.Find(LId)), LNode);
+            RegisterMemory(self.DoBaseOf(LId), true, self.FParentAt.Find(LId)), LNode);
         end;
       end;
     end;
@@ -2967,6 +3035,7 @@ type
       self.FSlotOf := ref Int64Map(-1);
       self.FUsedAsValue := ref Int64Map(0);
       self.FParentAt := ref Int64Map(-1);
+      self.FParentDepth := ref Int64Map(0);
       self.FBlockOf := ref Int64Map(-1);
       self.FUseCount := ref Int64Map(0);
       self.FUserOf := ref Int64Map(-1);
