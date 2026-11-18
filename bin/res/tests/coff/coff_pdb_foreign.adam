@@ -1,0 +1,464 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  coff_pdb_foreign.adam - a C object's CodeView in a debug build's PDB
+  (M7f): the program calls the static lib fixtures\libcoffd.a (coffd_lib.c,
+  built by clang with -g -gcodeview, every function its own COMDAT) and
+  reads its own PDB back. The C object is a module of its own: its
+  procedures (clang's S_GPROC32_ID made S_GPROC32 of the function id's type,
+  lld-link's way) with their locals by C type name, the inline site of
+  coffd_squares inside coffd_area with its locals, the inlinee list, its
+  module-level static; its file checksum entry as clang wrote it (MD5, 16
+  bytes) and its source lines; the inlinee lines subsection with the
+  inlinee's id remapped (its name read from the IPI) and the file it names;
+  its global variable, typedefs and enum constant among the globals; the
+  C routines' local import slots public by their import names (__imp_),
+  their code by their own.
+  coffd_unused is never called: its COMDAT and the .debug$S piece that goes
+  with it are removed, so its name is nowhere in the PDB. Every hash table
+  of the PDB checked as coff_pdb_link does.
+*******************************************************************************/
+
+/*
+@@test
+  kind run
+  exitcode 0
+  | coffd_area 12 26 30
+  | coffd_swap 0x78563412
+  | coffd_calls_made 3
+  | module 'libcoffd.a(coffd_lib.o)' files 1
+  |   objname 'coffd_lib.o'
+  |   compile language 0
+  |   data coffd_calls 0x0074
+  |   buildinfo true
+  |   proc 'coffd_area' local false procedure
+  |     frameproc
+  |     inlinees 1 'coffd_squares' procedure
+  |     local p ptr to coffd_point
+  |     local s coffd_shade
+  |     local area 0x0074
+  |     inlinesite 'coffd_squares' procedure
+  |       local n 0x0074
+  |     end
+  |   end
+  |   proc 'coffd_swap' local false procedure
+  |     frameproc
+  |     local w 0x0075
+  |     local b coffd_bits
+  |     local r coffd_bits
+  |   end
+  |   proc 'coffd_calls_made' local false procedure
+  |     frameproc
+  |   end
+  |   inlinee lines signature 0
+  |     inlinee 'coffd_squares' procedure file +0 line 48
+  | checksum # '.\coffd_lib.c' kind 1
+  | record # pub '__imp_coffd_area' flags 0 at #
+  | record # pub '__imp_coffd_swap' flags 0 at #
+  | record # pub '__imp_coffd_calls_made' flags 0 at #
+  | record # pub 'coffd_area' flags 2 at #
+  | record # pub 'coffd_swap' flags 2 at #
+  | record # pub 'coffd_calls_made' flags 2 at #
+  | record # pub 'coffd_total' flags 0 at #
+  | record # gdata 'coffd_total' type # at #
+  | record # constant 'coffd_dark'
+  | record # ldata 'coffd_calls' type # at #
+  | record # udt 'coffd_point' type #
+  | record # udt 'coffd_bits' type #
+  | record # procref 'coffd_area' module 20 at #
+  | record # procref 'coffd_swap' module 20 at #
+  | record # procref 'coffd_calls_made' module 20 at #
+  | lines: 59 60 61 63 65 66 67 71 79 80 83 84
+  | unused 0 checks missing 0 differs 0 disorder 0 absolute 0
+  | done
+  | [Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+@@end
+*/
+
+module exe coff_pdb_foreign;
+
+@addmodulepath "$P:../src";
+@addlibrarypath "$P:res/tests/coff/fixtures";
+
+import System.SysUtils, System.IO, Adam.Pdb.Msf, Adam.Pdb.Writer;
+
+type
+  // coffd_lib.c's coffd_point
+  CPoint = record
+    X: int32;
+    Y: int32;
+  end;
+
+routine clink coffd_area(AP: ptr to CPoint; AShade: int32): int32; external "coffd";
+routine clink coffd_swap(AW: uint32): uint32; external "coffd";
+routine clink coffd_calls_made(): int32; external "coffd";
+
+// The AWidth-byte little-endian value at AAt of ABytes
+routine Get(const ABytes: ByteArray; const AAt: int64; const AWidth: int64): int64;
+begin
+  return int64(GetLe(ABytes, AAt, AWidth));
+end;
+
+// The NUL-ended text at AAt of ABytes
+routine TextAt(const ABytes: ByteArray; const AAt: int64): string;
+var
+  LText: string;
+  LStop: int64;
+  LI: int64;
+begin
+  LStop := AAt;
+  while (LStop < len(ABytes)) and (ABytes[LStop] <> 0) do
+    LStop := LStop + 1;
+  end;
+  setlength(LText, LStop - AAt);
+  for LI := 0 to LStop - AAt - 1 do
+    LText[LI] := char(ABytes[AAt + LI]);
+  end;
+  return LText;
+end;
+
+// ALine with every hex number (a word holding "0x": an offset, an address) written as #
+routine Stripped(const ALine: string): string;
+var
+  LWords: StringArray;
+  LOut: string;
+  LI: int64;
+begin
+  LWords := SplitString(ALine, " ");
+  LOut := "";
+  for LI := 0 to len(LWords) - 1 do
+    if LI > 0 then
+      LOut := LOut + " ";
+    end;
+    if IndexOf("0x", LWords[LI], 0) >= 0 then
+      LOut := LOut + "#";
+    else
+      LOut := LOut + LWords[LI];
+    end;
+  end;
+  return LOut;
+end;
+
+// The number after AKey in ALine (" stream 12" -> 12); -1 when AKey is not there
+routine NumberAfter(const ALine: string; const AKey: string): int64;
+var
+  LAt: int64;
+  LEnd: int64;
+begin
+  LAt := IndexOf(AKey, ALine, 0);
+  if LAt < 0 then
+    return -1;
+  end;
+  LAt := LAt + len(AKey);
+  LEnd := LAt;
+  while (LEnd < len(ALine)) and (ALine[LEnd] <> ' ') do
+    LEnd := LEnd + 1;
+  end;
+  return StrToIntDef(Substring(ALine, LAt, LEnd - LAt), -1);
+end;
+
+// The text in ALine between the quote after AKey and the next quote ("" when none)
+routine QuotedAfter(const ALine: string; const AKey: string): string;
+var
+  LAt: int64;
+  LEnd: int64;
+begin
+  LAt := IndexOf(AKey + "'", ALine, 0);
+  if LAt < 0 then
+    return "";
+  end;
+  LAt := LAt + len(AKey) + 1;
+  LEnd := IndexOf("'", ALine, LAt);
+  if LEnd < 0 then
+    return "";
+  end;
+  return Substring(ALine, LAt, LEnd - LAt);
+end;
+
+// AName after its last folder (an archive member's label may hold the library's path)
+routine LastPart(const AName: string): string;
+var
+  LI: int64;
+begin
+  for LI := len(AName) - 1 downto 0 do
+    if (AName[LI] = '/') or (AName[LI] = '\\') then
+      return Substring(AName, LI + 1, len(AName) - LI - 1);
+    end;
+  end;
+  return AName;
+end;
+
+// The PDB's TPI and IPI streams: each record's offset by its index - 0x1000
+var
+  GTypes: ByteArray;
+  GTypeAt: Int64Array;
+  GIds: ByteArray;
+  GIdAt: Int64Array;
+
+// The record offsets of the type stream AStream (its header's first index, end index and
+// header size)
+routine RecordOffsets(const AStream: ByteArray): Int64Array;
+var
+  LAt: int64;
+  LCount: int64;
+  LOut: Int64Array;
+  LI: int64;
+begin
+  LCount := Get(AStream, 12, 4) - Get(AStream, 8, 4);
+  setlength(LOut, LCount);
+  LAt := Get(AStream, 4, 4);
+  for LI := 0 to LCount - 1 do
+    LOut[LI] := LAt;
+    LAt := LAt + Get(AStream, LAt, 2) + 2;
+  end;
+  return LOut;
+end;
+
+// The type AIndex by its C name: a builtin its index, a struct / union / enum its name, a
+// pointer "ptr to" its target's, a procedure "procedure"
+routine TypeText(const AIndex: int64): string;
+var
+  LAt: int64;
+  LLeaf: int64;
+begin
+  if AIndex < 0x1000 then
+    return "0x" + IntToHex(uint64(AIndex), 4);
+  end;
+  LAt := GTypeAt[AIndex - 0x1000];
+  LLeaf := Get(GTypes, LAt + 2, 2);
+  if LLeaf = 0x1002 then
+    return "ptr to " + TypeText(Get(GTypes, LAt + 4, 4));
+  end;
+  if LLeaf = 0x1008 then
+    return "procedure";
+  end;
+  if (LLeaf = 0x1504) or (LLeaf = 0x1505) then
+    return TextAt(GTypes, LAt + 22);
+  end;
+  if LLeaf = 0x1506 then
+    return TextAt(GTypes, LAt + 14);
+  end;
+  if LLeaf = 0x1507 then
+    return TextAt(GTypes, LAt + 16);
+  end;
+  return "leaf 0x" + IntToHex(uint64(LLeaf), 4);
+end;
+
+// The id AIndex: a function id's name and its type, any other its leaf
+routine IdText(const AIndex: int64): string;
+var
+  LAt: int64;
+  LLeaf: int64;
+begin
+  if (AIndex < 0x1000) or (AIndex - 0x1000 >= len(GIdAt)) then
+    return "no id";
+  end;
+  LAt := GIdAt[AIndex - 0x1000];
+  LLeaf := Get(GIds, LAt + 2, 2);
+  if LLeaf = 0x1601 then
+    // parent scope 4, type 4, name
+    return "'" + TextAt(GIds, LAt + 12) + "' " + TypeText(Get(GIds, LAt + 8, 4));
+  end;
+  return "leaf 0x" + IntToHex(uint64(LLeaf), 4);
+end;
+
+// The symbols of module stream AStream (ASymbols bytes) by kind, nested by scope, then its
+// inlinee lines subsection (C13, ALines bytes after the symbols)
+routine PrintModule(const AReader: ref MsfReader; const AStream: int64; const ASymbols: int64;
+  const ALines: int64);
+var
+  LBytes: ByteArray;
+  LAt: int64;
+  LKind: int64;
+  LEnd: int64;
+  LIndent: string;
+begin
+  LBytes := AReader.Stream(AStream);
+  LIndent := "  ";
+  LAt := 4;
+  while LAt < ASymbols do
+    LKind := Get(LBytes, LAt + 2, 2);
+    if (LKind = 0x0006) or (LKind = 0x114E) then
+      LIndent := Substring(LIndent, 0, len(LIndent) - 2);
+    end;
+    if LKind = 0x1101 then
+      println("{}objname '{}'", LIndent, TextAt(LBytes, LAt + 8));
+    end;
+    if LKind = 0x113C then
+      println("{}compile language {}", LIndent, Get(LBytes, LAt + 4, 1));
+    end;
+    if (LKind = 0x110F) or (LKind = 0x1110) then
+      println("{}proc '{}' local {} {}", LIndent, TextAt(LBytes, LAt + 39), LKind = 0x110F,
+        TypeText(Get(LBytes, LAt + 28, 4)));
+    end;
+    if (LKind = 0x1146) or (LKind = 0x1147) or (LKind = 0x114F) then
+      println("{}an id symbol 0x{} left", LIndent, IntToHex(uint64(LKind), 4));
+    end;
+    if LKind = 0x1012 then
+      println("{}frameproc", LIndent);
+    end;
+    if LKind = 0x113E then
+      println("{}local {} {}", LIndent, TextAt(LBytes, LAt + 10), TypeText(Get(LBytes, LAt + 4, 4)));
+    end;
+    if LKind = 0x114D then
+      println("{}inlinesite {}", LIndent, IdText(Get(LBytes, LAt + 12, 4)));
+    end;
+    if LKind = 0x1168 then
+      println("{}inlinees {} {}", LIndent, Get(LBytes, LAt + 4, 4), IdText(Get(LBytes, LAt + 8, 4)));
+    end;
+    if (LKind = 0x110C) or (LKind = 0x110D) then
+      println("{}data {} {}", LIndent, TextAt(LBytes, LAt + 14), TypeText(Get(LBytes, LAt + 4, 4)));
+    end;
+    if LKind = 0x114C then
+      println("{}buildinfo {}", LIndent, Get(LBytes, LAt + 4, 4) >= 0x1000);
+    end;
+    if (LKind = 0x0006) or (LKind = 0x114E) then
+      println("{}end", LIndent);
+    end;
+    if (LKind = 0x110F) or (LKind = 0x1110) or (LKind = 0x114D) then
+      LIndent := LIndent + "  ";
+    end;
+    LAt := LAt + Get(LBytes, LAt, 2) + 2;
+  end;
+  // the C13 subsections: the inlinee lines decoded (no extra files: signature 0)
+  LAt := ASymbols;
+  while LAt + 8 <= ASymbols + ALines do
+    LKind := Get(LBytes, LAt, 4);
+    LEnd := LAt + 8 + Get(LBytes, LAt + 4, 4);
+    if LKind = 0xF6 then
+      println("  inlinee lines signature {}", Get(LBytes, LAt + 8, 4));
+      LAt := LAt + 12;
+      while LAt + 12 <= LEnd do
+        println("    inlinee {} file +{} line {}", IdText(Get(LBytes, LAt, 4)),
+          Get(LBytes, LAt + 4, 4), Get(LBytes, LAt + 8, 4));
+        LAt := LAt + 12;
+      end;
+    end;
+    LAt := (LEnd + 3) & -4;
+  end;
+end;
+
+var
+  LPoint: CPoint;
+  LPdb: ByteArray;
+  LReader: ref MsfReader;
+  LLines: StringArray;
+  LLine: string;
+  LModule: string;
+  LMissing: int64;
+  LDiffers: int64;
+  LDisorder: int64;
+  LAbsolute: int64;
+  LUnused: int64;
+  LInC: bool;
+  LHasLine: BoolArray;
+  LNumber: int64;
+  LText: string;
+  LI: int64;
+
+begin
+  // the C routines run: 3 x 4 light, 3 x 4 dark (+ 1 + 4 + 9), 5 x 6 light
+  LPoint.X := 3;
+  LPoint.Y := 4;
+  print("coffd_area {}", coffd_area(addr of LPoint, 1));
+  print(" {}", coffd_area(addr of LPoint, 2));
+  LPoint.X := 5;
+  LPoint.Y := 6;
+  println(" {}", coffd_area(addr of LPoint, 1));
+  println("coffd_swap 0x{}", IntToHex(uint64(coffd_swap(0x12345678)), 8));
+  println("coffd_calls_made {}", coffd_calls_made());
+  if not ReadAllBytes(ChangeFileExt(ProgramFilePath(), ".pdb"), LPdb) then
+    println("cannot read the pdb");
+    return 1;
+  end;
+  LReader := ref MsfReader(LPdb);
+  if not LReader.IsRead() then
+    println("pdb not read: {}", LReader.Reason);
+    return 1;
+  end;
+  GTypes := LReader.Stream(2);
+  GTypeAt := RecordOffsets(GTypes);
+  GIds := LReader.Stream(4);
+  GIdAt := RecordOffsets(GIds);
+  LLines := SplitString(PdbText(LPdb), "\n");
+  LMissing := 0;
+  LDiffers := 0;
+  LDisorder := 0;
+  LAbsolute := 0;
+  LUnused := 0;
+  LInC := false;
+  setlength(LHasLine, 200);
+  for LI := 0 to len(LHasLine) - 1 do
+    LHasLine[LI] := false;
+  end;
+  for LI := 0 to len(LLines) - 1 do
+    LLine := LLines[LI];
+    if EndsStr(" missing", LLine) then
+      LMissing := LMissing + 1;
+    end;
+    if EndsStr(" differs", LLine) then
+      LDiffers := LDiffers + 1;
+    end;
+    if StartsStr("  hash records ", LLine) and not EndsStr(" in order", LLine) then
+      LDisorder := LDisorder + 1;
+    end;
+    if IndexOf("coffd_unused", LLine, 0) >= 0 then
+      LUnused := LUnused + 1;
+    end;
+    if StartsStr("  name +", LLine) then
+      if (IndexOf(":/", LLine, 0) >= 0) or (IndexOf(":\\", LLine, 0) >= 0) or
+        (IndexOf("'/", LLine, 0) >= 0) then
+        if IndexOf("'$P:", LLine, 0) < 0 then
+          LAbsolute := LAbsolute + 1;
+        end;
+      end;
+    end;
+    // the C object's module (the DBI's line): its stream decoded
+    if StartsStr("  module ", LLine) and (IndexOf("coffd_lib", LLine, 0) >= 0) then
+      LModule := QuotedAfter(LLine, " module " + IntToStr(NumberAfter(LLine, "  module ")) + " ");
+      println("module '{}' files {}", LastPart(LModule), NumberAfter(LLine, " files "));
+      PrintModule(LReader, NumberAfter(LLine, " stream "), NumberAfter(LLine, " symbols "),
+        NumberAfter(LLine, " lines "));
+    end;
+    // PdbText's block of the C module: its checksums and its source lines
+    if StartsStr("module ", LLine) then
+      LInC := IndexOf("coffd_lib", LLine, 0) >= 0;
+    end;
+    if LInC and StartsStr("  checksum +", LLine) then
+      println("{}", Stripped(Trim(LLine)));
+    end;
+    if LInC and StartsStr("      +", LLine) then
+      LNumber := NumberAfter(LLine, " line ");
+      if (LNumber > 0) and (LNumber < len(LHasLine)) then
+        LHasLine[LNumber] := true;
+      end;
+    end;
+    // its globals among the globals, its routines' publics (a local import slot by its
+    // import name)
+    if StartsStr("  record ", LLine) and (IndexOf("coffd_", LLine, 0) >= 0) then
+      println("{}", Stripped(Trim(LLine)));
+    end;
+  end;
+  LText := "";
+  for LI := 1 to len(LHasLine) - 1 do
+    if LHasLine[LI] then
+      LText := LText + " " + IntToStr(LI);
+    end;
+  end;
+  println("lines:{}", LText);
+  println("unused {} checks missing {} differs {} disorder {} absolute {}", LUnused, LMissing,
+    LDiffers, LDisorder, LAbsolute);
+  println("done");
+end.

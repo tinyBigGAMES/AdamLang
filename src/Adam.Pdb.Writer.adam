@@ -44,8 +44,12 @@
                 (publics then globals), the section headers
      12 up      one symbol stream per module: the C13 signature, the
                 module's symbols (each scope's parent / end set to stream
-                offsets), the file checksums (by /names offset, no checksum)
-                and the lines, then no global refs
+                offsets), the file checksums (by /names offset, each with the
+                checksum its object gave, in its object's order: a foreign
+                object's inline sites and inlinee lines name a file by its
+                entry's offset), the lines (columns when its object had
+                them), the module's other subsections as its object had them
+                (inlinee lines), then no global refs
                 A module's symbol goes to its stream, to the globals, or both
                 (lld-link's rule): a procedure stays in the module and the
                 globals get an S_PROCREF / S_LPROCREF to it; S_GDATA32 /
@@ -65,7 +69,7 @@
 module unit Adam.Pdb.Writer;
 
 import System.SysUtils, System.Collections, Adam.Core.Containers, Adam.Pdb.Msf,
-  Adam.Pdb.CodeView;
+  Adam.Pdb.CodeView, Adam.Pdb.Refs;
 
 public const
   // The fixed stream numbers
@@ -85,6 +89,7 @@ public const
   ADAM_PDB_FAULT_SCOPE: string = "Pdb: unbalanced symbol scopes in module ";
   ADAM_PDB_FAULT_GUID: string = "Pdb: a GUID is 16 bytes, not ";
   ADAM_PDB_FAULT_LIMIT: string = "Pdb: more than the DBI numbers: ";
+  ADAM_PDB_FAULT_COLUMNS: string = "Pdb: a line run with columns for some rows only: ";
 
 const
   // PDB info stream: version VC70, feature VC140 (an IPI stream is there)
@@ -154,15 +159,19 @@ const
 
 public type
   // One function's line runs: its code's section (1 up), offset and size, then per row
-  // its code offset from the start, its line and its file (an index into its module's
-  // Files)
+  // its code offset from the start, its C13 line word (the line in bits 0..23, the delta
+  // to the statement's end in 24..30, a statement in 31) and its file (an index into its
+  // module's Files); with columns (HasColumns) each row's start and end column too
   PdbLines = object
     Section: int64;
     Offset: int64;
     CodeSize: int64;
     CodeOffsets: Int64Array;
-    LineNumbers: Int64Array;
+    LineWords: Int64Array;
     FileIndices: Int64Array;
+    HasColumns: bool;
+    ColumnStarts: Int64Array;
+    ColumnEnds: Int64Array;
 
     init(const ASection: int64; const AOffset: int64; const ACodeSize: int64);
     begin
@@ -170,22 +179,44 @@ public type
       self.Offset := AOffset;
       self.CodeSize := ACodeSize;
       setlength(self.CodeOffsets, 0);
-      setlength(self.LineNumbers, 0);
+      setlength(self.LineWords, 0);
       setlength(self.FileIndices, 0);
+      self.HasColumns := false;
+      setlength(self.ColumnStarts, 0);
+      setlength(self.ColumnEnds, 0);
     end;
 
-    // The row: code at ACodeOffset is line ALine of file AFile
+    // The row: code at ACodeOffset is the statement at line ALine of file AFile
     method Add(const ACodeOffset: int64; const ALine: int64; const AFile: int64);
+    begin
+      self.AddWord(ACodeOffset, (ALine & ADAM_CV_LINE_MASK) | ADAM_CV_LINE_STATEMENT, AFile);
+    end;
+
+    // The row: code at ACodeOffset is the C13 line word AWord of file AFile
+    method AddWord(const ACodeOffset: int64; const AWord: int64; const AFile: int64);
     var
       LCount: int64;
     begin
       LCount := len(self.CodeOffsets);
       setlength(self.CodeOffsets, LCount + 1);
-      setlength(self.LineNumbers, LCount + 1);
+      setlength(self.LineWords, LCount + 1);
       setlength(self.FileIndices, LCount + 1);
       self.CodeOffsets[LCount] := ACodeOffset;
-      self.LineNumbers[LCount] := ALine;
+      self.LineWords[LCount] := AWord;
       self.FileIndices[LCount] := AFile;
+    end;
+
+    // The last row's columns: AStart to AEnd (a run with columns gives every row its own)
+    method AddColumns(const AStart: int64; const AEnd: int64);
+    var
+      LCount: int64;
+    begin
+      self.HasColumns := true;
+      LCount := len(self.ColumnStarts);
+      setlength(self.ColumnStarts, LCount + 1);
+      setlength(self.ColumnEnds, LCount + 1);
+      self.ColumnStarts[LCount] := AStart;
+      self.ColumnEnds[LCount] := AEnd;
     end;
   end;
 
@@ -200,12 +231,18 @@ begin
 end;
 
 public type
-  // One module (one object) of the link (see the header)
+  // One module (one object) of the link (see the header): per source file its name, its
+  // checksum's kind and bytes (kind 0, none: no bytes); its other C13 subsections (each
+  // kind and contents, final)
   PdbModule = object
     ModuleName: string;
     ObjectName: string;
     Files: StringArray;
+    ChecksumKinds: Int64Array;
+    Checksums: ref List<ByteArray>;
     Lines: ref List<ref PdbLines>;
+    SubsectionKinds: Int64Array;
+    Subsections: ref List<ByteArray>;
     hidden FSymbols: ref MsfBytes;
 
     init(const AModuleName: string; const AObjectName: string);
@@ -213,23 +250,51 @@ public type
       self.ModuleName := AModuleName;
       self.ObjectName := AObjectName;
       setlength(self.Files, 0);
+      setlength(self.ChecksumKinds, 0);
+      self.Checksums := ref List<ByteArray>();
       self.Lines := ref List<ref PdbLines>();
+      setlength(self.SubsectionKinds, 0);
+      self.Subsections := ref List<ByteArray>();
       self.FSymbols := ref MsfBytes();
     end;
 
-    // The index of the source file AFileName, added when it is new
+    // The index of the source file AFileName (no checksum), added when it is new
     method AddFile(const AFileName: string): int64;
     var
       LI: int64;
+      LNone: ByteArray;
     begin
       for LI := 0 to len(self.Files) - 1 do
         if self.Files[LI] = AFileName then
           return LI;
         end;
       end;
-      setlength(self.Files, len(self.Files) + 1);
-      self.Files[len(self.Files) - 1] := AFileName;
-      return len(self.Files) - 1;
+      setlength(LNone, 0);
+      return self.AddFileEntry(AFileName, 0, LNone);
+    end;
+
+    // The source file AFileName with its checksum (AKind, AChecksum) as the next file,
+    // a name already there or not (an object's checksum table entry by entry); its index
+    method AddFileEntry(const AFileName: string; const AKind: int64; const AChecksum: ByteArray): int64;
+    var
+      LCount: int64;
+    begin
+      LCount := len(self.Files);
+      setlength(self.Files, LCount + 1);
+      setlength(self.ChecksumKinds, LCount + 1);
+      self.Files[LCount] := AFileName;
+      self.ChecksumKinds[LCount] := AKind;
+      self.Checksums.Add(AChecksum);
+      return LCount;
+    end;
+
+    // A C13 subsection of kind AKind and contents ABytes (final: its indices the PDB's,
+    // its files by this module's checksum offsets), written after the lines
+    method AddSubsection(const AKind: int64; const ABytes: ByteArray);
+    begin
+      setlength(self.SubsectionKinds, len(self.SubsectionKinds) + 1);
+      self.SubsectionKinds[len(self.SubsectionKinds) - 1] := AKind;
+      self.Subsections.Add(ABytes);
     end;
 
     // ARecord (one whole symbol record, its address final) appended to the module's symbols
@@ -490,25 +555,25 @@ begin
   return int64(GetLe(ABytes, AAt, AWidth));
 end;
 
-// The byte count of the numeric leaf at AAt of ABytes (its kind and its value)
+// The byte count of the numeric leaf at AAt of ABytes (its kind and its value; Refs'
+// CvNumericSize, a kind it does not know read as its 2 bytes alone)
 routine DoLeafSize(const ABytes: ByteArray; const AAt: int64): int64;
 var
-  LKind: int64;
+  LSize: int64;
 begin
-  LKind := DoGet(ABytes, AAt, 2);
-  if LKind < ADAM_CV_LF_NUMERIC then
+  LSize := CvNumericSize(ABytes, AAt, len(ABytes));
+  if LSize < 0 then
     return 2;
   end;
-  if LKind = ADAM_CV_LF_CHAR then
-    return 3;
-  end;
-  if (LKind = ADAM_CV_LF_SHORT) or (LKind = ADAM_CV_LF_USHORT) then
-    return 4;
-  end;
-  if (LKind = ADAM_CV_LF_LONG) or (LKind = ADAM_CV_LF_ULONG) or (LKind = ADAM_CV_LF_REAL32) then
-    return 6;
-  end;
-  return 10;
+  return LSize;
+end;
+
+// True when a record of AKind is a procedure (the globals get a reference to it)
+routine DoIsProcedure(const AKind: int64): bool;
+begin
+  return (AKind = ADAM_CV_S_GPROC32) or (AKind = ADAM_CV_S_LPROC32) or
+    (AKind = ADAM_CV_S_GPROC32_ID) or (AKind = ADAM_CV_S_LPROC32_ID) or
+    (AKind = ADAM_CV_S_LPROC32_DPC) or (AKind = ADAM_CV_S_LPROC32_DPC_ID);
 end;
 
 // The name of the symbol record at AAt of ABytes ("" for a kind that has none the PDB
@@ -525,8 +590,7 @@ begin
     (LKind = ADAM_CV_S_LTHREAD32) then
     return DoTextAt(ABytes, AAt + ADAM_PDB_REF_NAME, LEnd);
   end;
-  if (LKind = ADAM_CV_S_GPROC32) or (LKind = ADAM_CV_S_LPROC32) or
-    (LKind = ADAM_CV_S_GPROC32_ID) or (LKind = ADAM_CV_S_LPROC32_ID) then
+  if DoIsProcedure(LKind) then
     return DoTextAt(ABytes, AAt + ADAM_PDB_PROC_NAME, LEnd);
   end;
   if LKind = ADAM_CV_S_UDT then
@@ -536,29 +600,6 @@ begin
     return DoTextAt(ABytes, AAt + 8 + DoLeafSize(ABytes, AAt + 8), LEnd);
   end;
   return "";
-end;
-
-// True when a record of AKind opens a scope (its parent and end fields set by the writer)
-routine DoOpensScope(const AKind: int64): bool;
-begin
-  return (AKind = ADAM_CV_S_GPROC32) or (AKind = ADAM_CV_S_LPROC32) or
-    (AKind = ADAM_CV_S_GPROC32_ID) or (AKind = ADAM_CV_S_LPROC32_ID) or
-    (AKind = ADAM_CV_S_BLOCK32) or (AKind = ADAM_CV_S_THUNK32) or
-    (AKind = ADAM_CV_S_INLINESITE) or (AKind = ADAM_CV_S_SEPCODE);
-end;
-
-// True when a record of AKind closes the innermost scope
-routine DoClosesScope(const AKind: int64): bool;
-begin
-  return (AKind = ADAM_CV_S_END) or (AKind = ADAM_CV_S_PROC_ID_END) or
-    (AKind = ADAM_CV_S_INLINESITE_END);
-end;
-
-// True when a record of AKind is a procedure (the globals get a reference to it)
-routine DoIsProcedure(const AKind: int64): bool;
-begin
-  return (AKind = ADAM_CV_S_GPROC32) or (AKind = ADAM_CV_S_LPROC32) or
-    (AKind = ADAM_CV_S_GPROC32_ID) or (AKind = ADAM_CV_S_LPROC32_ID);
 end;
 
 // True when a byte of AText is past ASCII
@@ -940,6 +981,8 @@ type
       LModule: ref PdbModule;
       LLines: ref PdbLines;
       LSymbols: ByteArray;
+      // a file's checksum, then a subsection's contents
+      LChecksum: ByteArray;
       LOut: ref MsfBytes;
       LScopes: ref Int64List;
       LChecksums: Int64Array;
@@ -993,7 +1036,7 @@ type
         if LToModule then
           LOffset := LOut.Count;
           LOut.PutRange(LSymbols, LAt, LSize);
-          if DoOpensScope(LKind) then
+          if CvOpensScope(LKind) then
             LParent := 0;
             if LScopes.Count > 0 then
               LParent := LScopes[LScopes.Count - 1];
@@ -1005,7 +1048,7 @@ type
               self.DoProcRef(LKind, DoSymbolName(LSymbols, LAt), LOffset, AIndex);
             end;
           end;
-          if DoClosesScope(LKind) then
+          if CvClosesScope(LKind) then
             if LScopes.Count = 0 then
               raise(ADAM_PDB_FAULT_SCOPE + LModule.ModuleName);
             end;
@@ -1031,9 +1074,14 @@ type
         LOut.Put(uint64(ADAM_CV_SUB_CHECKSUMS), 4);
         LOut.Put(0, 4);
         for LI := 0 to len(LModule.Files) - 1 do
+          // its name, its checksum's size and kind, the checksum, to a 4-byte end
           LChecksums[LI] := LOut.Count - LSub - 8;
+          LChecksum := LModule.Checksums[LI];
           LOut.Put(uint64(self.DoName(LModule.Files[LI])), 4);
-          LOut.PutZeros(ADAM_CV_CHECKSUM_ENTRY - 4);
+          LOut.Put(uint64(len(LChecksum)), 1);
+          LOut.Put(uint64(LModule.ChecksumKinds[LI]), 1);
+          LOut.PutBytes(LChecksum);
+          LOut.PadTo(4);
         end;
         LOut.Patch(LSub + 4, uint64(LOut.Count - LSub - 8), 4);
       end;
@@ -1044,8 +1092,14 @@ type
         LOut.Put(0, 4);
         LOut.Put(uint64(LLines.Offset), 4);
         LOut.Put(uint64(LLines.Section), 2);
-        // no columns
-        LOut.Put(0, 2);
+        if LLines.HasColumns then
+          if len(LLines.ColumnStarts) <> len(LLines.CodeOffsets) then
+            raise(ADAM_PDB_FAULT_COLUMNS + LModule.ModuleName);
+          end;
+          LOut.Put(uint64(ADAM_CV_LINES_COLUMNS), 2);
+        else
+          LOut.Put(0, 2);
+        end;
         LOut.Put(uint64(LLines.CodeSize), 4);
         LFirst := 0;
         while LFirst < len(LLines.CodeOffsets) do
@@ -1054,17 +1108,35 @@ type
             (LLines.FileIndices[LFirst + LCount] = LLines.FileIndices[LFirst]) do
             LCount := LCount + 1;
           end;
-          LBlock := LOut.Count;
+          LBlock := ADAM_CV_LINES_BLOCK + LCount * ADAM_CV_LINES_ENTRY;
+          if LLines.HasColumns then
+            LBlock := LBlock + LCount * ADAM_CV_COLUMN_ENTRY;
+          end;
           LOut.Put(uint64(LChecksums[LLines.FileIndices[LFirst]]), 4);
           LOut.Put(uint64(LCount), 4);
-          LOut.Put(uint64(ADAM_CV_LINES_BLOCK + LCount * ADAM_CV_LINES_ENTRY), 4);
+          LOut.Put(uint64(LBlock), 4);
           for LI := LFirst to LFirst + LCount - 1 do
             LOut.Put(uint64(LLines.CodeOffsets[LI]), 4);
-            LOut.Put(uint64((LLines.LineNumbers[LI] & ADAM_CV_LINE_MASK) | ADAM_CV_LINE_STATEMENT), 4);
+            LOut.Put(uint64(LLines.LineWords[LI]), 4);
+          end;
+          // the block's columns after its lines
+          if LLines.HasColumns then
+            for LI := LFirst to LFirst + LCount - 1 do
+              LOut.Put(uint64(LLines.ColumnStarts[LI]), 2);
+              LOut.Put(uint64(LLines.ColumnEnds[LI]), 2);
+            end;
           end;
           LFirst := LFirst + LCount;
         end;
         LOut.Patch(LSub + 4, uint64(LOut.Count - LSub - 8), 4);
+      end;
+      // the module's other subsections, each to a 4-byte end
+      for LI := 0 to len(LModule.SubsectionKinds) - 1 do
+        LChecksum := LModule.Subsections[LI];
+        LOut.Put(uint64(LModule.SubsectionKinds[LI]), 4);
+        LOut.Put(uint64(len(LChecksum)), 4);
+        LOut.PutBytes(LChecksum);
+        LOut.PadTo(4);
       end;
       self.FLineSizes[AIndex] := LOut.Count - LC13;
       // no global refs
@@ -1072,12 +1144,18 @@ type
       self.FMsf.SetStream(self.FFirstModuleStream + AIndex, LOut.Bytes());
     end;
 
-    // The string table stream: header, the names, the hash table (each name's offset at
-    // its hash, probing on), the name count
+    // The string table stream (/names, DoStringTable of every name the streams use)
     hidden method DoNamesStream();
+    begin
+      self.FMsf.SetStream(self.FNamesStream, self.DoStringTable(self.FNames.Bytes(), self.FNameCount));
+    end;
+
+    // A PDB string table of the names ANames holds (the empty one at 0, ANameCount after
+    // it, each NUL-ended): header, the names, the hash table (each name's offset at its
+    // hash, probing on), the name count; /names and the DBI's EC names are one
+    hidden const method DoStringTable(const ANames: ByteArray; const ANameCount: int64): ByteArray;
     var
       LOut: ref MsfBytes;
-      LNames: ByteArray;
       LBuckets: Int64Array;
       LBucketCount: int64;
       LSeen: int64;
@@ -1087,11 +1165,10 @@ type
       LText: string;
       LI: int64;
     begin
-      LNames := self.FNames.Bytes();
       // the reference implementation's growth: past 3/4 full, 1.5 times plus 1
       LBucketCount := 1;
       LSeen := 0;
-      for LI := 1 to self.FNameCount do
+      for LI := 1 to ANameCount do
         LSeen := LSeen + 1;
         if LSeen > LBucketCount * 3 div 4 then
           LBucketCount := LBucketCount * 3 div 2 + 1;
@@ -1103,8 +1180,8 @@ type
       end;
       // every name, in offset order, at its hash's bucket or the next free one
       LAt := 1;
-      while LAt < len(LNames) do
-        LText := DoTextAt(LNames, LAt, len(LNames));
+      while LAt < len(ANames) do
+        LText := DoTextAt(ANames, LAt, len(ANames));
         LHash := PdbHashText(LText);
         for LI := 0 to LBucketCount - 1 do
           LSlot := int64((LHash + uint64(LI)) mod uint64(LBucketCount));
@@ -1118,14 +1195,14 @@ type
       LOut := ref MsfBytes();
       LOut.Put(uint64(ADAM_PDB_NAMES_SIGNATURE), 4);
       LOut.Put(uint64(ADAM_PDB_NAMES_VERSION), 4);
-      LOut.Put(uint64(len(LNames)), 4);
-      LOut.PutBytes(LNames);
+      LOut.Put(uint64(len(ANames)), 4);
+      LOut.PutBytes(ANames);
       LOut.Put(uint64(LBucketCount), 4);
       for LI := 0 to LBucketCount - 1 do
         LOut.Put(uint64(LBuckets[LI]), 4);
       end;
-      LOut.Put(uint64(self.FNameCount), 4);
-      self.FMsf.SetStream(self.FNamesStream, LOut.Bytes());
+      LOut.Put(uint64(ANameCount), 4);
+      return LOut.Bytes();
     end;
 
     // The symbol records stream (the publics' S_PUB32 records, then the globals), the
@@ -1267,7 +1344,9 @@ type
     end;
 
     // The DBI stream: its header, the module infos, the section contributions, the section
-    // map, the source file info, no type server map or EC names, the optional debug header
+    // map, the source file info, no type server map, the EC names (a string table of the
+    // empty name alone, as lld-link writes it: a module's PDB file name index 0 reads
+    // there), the optional debug header
     hidden method DoDbi();
     var
       LModules: ref MsfBytes;
@@ -1277,6 +1356,8 @@ type
       LFileNames: ref MsfBytes;
       LDebug: ref MsfBytes;
       LOut: ref MsfBytes;
+      LEcNames: ByteArray;
+      LNoName: ByteArray;
       LSorted: ref List<PdbContribution>;
       LFirsts: Int64Array;
       LFileOffsets: ref StringIdMap;
@@ -1419,6 +1500,10 @@ type
       end;
       LFiles.PutBytes(LFileNames.Bytes());
       LFiles.PadTo(4);
+      // The EC names: the empty name alone
+      setlength(LNoName, 1);
+      LNoName[0] := 0;
+      LEcNames := self.DoStringTable(LNoName, 0);
       // The optional debug header: only the section headers stream
       LDebug := ref MsfBytes();
       for LI := 0 to ADAM_PDB_DBI_DEBUG_STREAMS - 1 do
@@ -1443,11 +1528,11 @@ type
       LOut.Put(uint64(LContributions.Count), 4);
       LOut.Put(uint64(LMap.Count), 4);
       LOut.Put(uint64(LFiles.Count), 4);
-      // no type server map, no MFC type server, the optional header, no EC names
+      // no type server map, no MFC type server, the optional header, the EC names
       LOut.Put(0, 4);
       LOut.Put(0, 4);
       LOut.Put(uint64(LDebug.Count), 4);
-      LOut.Put(0, 4);
+      LOut.Put(uint64(len(LEcNames)), 4);
       LOut.Put(0, 2);
       LOut.Put(uint64(self.FInput.Machine), 2);
       LOut.Put(0, 4);
@@ -1455,6 +1540,7 @@ type
       LOut.PutBytes(LContributions.Bytes());
       LOut.PutBytes(LMap.Bytes());
       LOut.PutBytes(LFiles.Bytes());
+      LOut.PutBytes(LEcNames);
       LOut.PutBytes(LDebug.Bytes());
       self.FMsf.SetStream(ADAM_PDB_STREAM_DBI, LOut.Bytes());
     end;
@@ -1749,7 +1835,7 @@ var
   LKind: int64;
 begin
   LKind := DoGet(ABytes, AAt + 2, 2);
-  if DoOpensScope(LKind) then
+  if CvOpensScope(LKind) then
     return " parent +" + DoHex(DoGet(ABytes, AAt + ADAM_PDB_SCOPE_PARENT, 4)) + " end +" +
       DoHex(DoGet(ABytes, AAt + ADAM_PDB_SCOPE_END, 4));
   end;
