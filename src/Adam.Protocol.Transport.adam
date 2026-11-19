@@ -1,0 +1,264 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Protocol.Transport.adam - the base protocol LSP and DAP share (M11a D5)
+
+  A message is a header block, an empty line, then its body: the header's
+  fields are "Name: value" lines (names in any case) ended by CR LF;
+  Content-Length (the body's bytes) is required, a Content-Type's charset,
+  when it names one, must be utf-8 (utf8 taken too). The body is UTF-8 text,
+  JSON for both protocols (System.Json reads and writes it).
+
+    ProtocolChannel    where the bytes come from and go to: ReadBytes (0 at
+                       the end of the input), WriteBytes, HasPending (bytes
+                       wait, so a read would not block)
+    IOChannel          a channel over two System.CustomIO IOs (a row's
+                       memory IOs, a file's): pending while the input's place
+                       is before its size
+    ProtocolTransport  ReadMessage (Message / EndOfInput / Malformed: a bad
+                       header, its body skipped when its length is known),
+                       WriteMessage, HasPending
+
+  The process's own standard input and output are Adam.Protocol.Stdio's
+  channel. Prior art: PaskalCPP.LSP.Transport (CONCEPT and its limits;
+  GEOMETRY: a channel object in place of Delphi streams). Target-neutral.
+*******************************************************************************/
+
+module unit Adam.Protocol.Transport;
+
+import System.SysUtils, System.CustomIO;
+
+public const
+  // A header block this long without its empty line is malformed
+  ADAM_PROTOCOL_HEADER_LIMIT: int64 = 8192;
+  // The header fields read, in lower case, and a Content-Type's charset key
+  ADAM_PROTOCOL_LENGTH_FIELD: string = "content-length";
+  ADAM_PROTOCOL_TYPE_FIELD: string = "content-type";
+  ADAM_PROTOCOL_CHARSET_KEY: string = "charset=";
+
+// The header block AHeader's Content-Length into ALength (-1: none, or not a whole number of
+// at least 0) and whether its charset (when a Content-Type names one) is UTF-8
+routine DoParseHeader(const AHeader: string; var ALength: int64; var ACharsetOk: bool);
+var
+  LLines: StringArray;
+  LI: int64;
+  LColon: int64;
+  LName: string;
+  LValue: string;
+  LAt: int64;
+  LCharset: string;
+  LEnd: int64;
+begin
+  ALength := -1;
+  ACharsetOk := true;
+  LLines := SplitString(AHeader, "\r\n");
+  for LI := 0 to len(LLines) - 1 do
+    LColon := IndexOf(":", LLines[LI], 0);
+    if LColon < 0 then
+      skip;
+    end;
+    LName := LowerCase(Trim(Substring(LLines[LI], 0, LColon)));
+    LValue := Trim(Substring(LLines[LI], LColon + 1, len(LLines[LI]) - LColon - 1));
+    if LName = ADAM_PROTOCOL_LENGTH_FIELD then
+      if (not TryStrToInt(LValue, ALength)) or (ALength < 0) then
+        ALength := -1;
+      end;
+      skip;
+    end;
+    if LName = ADAM_PROTOCOL_TYPE_FIELD then
+      LAt := IndexOf(ADAM_PROTOCOL_CHARSET_KEY, LowerCase(LValue), 0);
+      if LAt >= 0 then
+        LCharset := Substring(LValue, LAt + len(ADAM_PROTOCOL_CHARSET_KEY),
+          len(LValue) - LAt - len(ADAM_PROTOCOL_CHARSET_KEY));
+        LEnd := IndexOf(";", LCharset, 0);
+        if LEnd >= 0 then
+          LCharset := Substring(LCharset, 0, LEnd);
+        end;
+        LCharset := LowerCase(ReplaceStr(Trim(LCharset), "\"", ""));
+        ACharsetOk := (LCharset = "utf-8") or (LCharset = "utf8");
+      end;
+    end;
+  end;
+end;
+
+public type
+  // What one ReadMessage found
+  ProtocolRead = choices(Message, EndOfInput, Malformed);
+
+  // Where a transport's bytes come from and go to (see the header)
+  ProtocolChannel = object
+    // Up to ASize bytes into ABuffer: how many (0: the input ended)
+    virtual method ReadBytes(const ABuffer: ptr; const ASize: int64): int64; abstract;
+    // ASize bytes from ABuffer, all of them; false when the output is gone
+    virtual method WriteBytes(const ABuffer: ptr to const; const ASize: int64): bool; abstract;
+    // True when input bytes wait (a read would not block); false when none is known to
+    virtual method HasPending(): bool; abstract;
+  end;
+
+  // A channel over two IOs (either nil when unused; neither closed here)
+  IOChannel = object(ProtocolChannel)
+    hidden FInput: IO;
+    hidden FOutput: IO;
+
+    init(const AInput: IO; const AOutput: IO);
+    begin
+      self.FInput := AInput;
+      self.FOutput := AOutput;
+    end;
+
+    override method ReadBytes(const ABuffer: ptr; const ASize: int64): int64;
+    var
+      LRead: int64;
+    begin
+      if self.FInput = nil then
+        return 0;
+      end;
+      LRead := IORead(self.FInput, ABuffer, ASize);
+      if LRead < 0 then
+        return 0;
+      end;
+      return LRead;
+    end;
+
+    override method WriteBytes(const ABuffer: ptr to const; const ASize: int64): bool;
+    begin
+      if self.FOutput = nil then
+        return false;
+      end;
+      return IOWriteFull(self.FOutput, ABuffer, ASize) = ASize;
+    end;
+
+    // An IO with a size (memory, a file): bytes before its end; one with none: unknown
+    override method HasPending(): bool;
+    var
+      LSize: int64;
+    begin
+      if self.FInput = nil then
+        return false;
+      end;
+      LSize := IOSize(self.FInput);
+      return (LSize > 0) and (IOTell(self.FInput) < LSize);
+    end;
+  end;
+
+  // Messages read from and written to a channel (see the header)
+  ProtocolTransport = object
+    hidden FChannel: ref ProtocolChannel;
+
+    init(const AChannel: ref ProtocolChannel);
+    begin
+      self.FChannel := AChannel;
+    end;
+
+    property Channel: ref ProtocolChannel read FChannel;
+
+    // True when the next message's bytes have begun to arrive
+    method HasPending(): bool;
+    begin
+      return self.FChannel.HasPending();
+    end;
+
+    // The next message's body into ABody: Message; EndOfInput when the input ended (before or
+    // inside a message); Malformed for a bad header (no length, a length past the limit of a
+    // string, a charset other than UTF-8, a body that is no UTF-8), its body skipped when its
+    // length was known
+    method ReadMessage(var ABody: string): ProtocolRead;
+    var
+      LHeader: string;
+      LLength: int64;
+      LCharsetOk: bool;
+      LResult: ProtocolRead;
+    begin
+      ABody := "";
+      LResult := self.DoReadHeader(LHeader);
+      if LResult <> ProtocolRead.Message then
+        return LResult;
+      end;
+      DoParseHeader(LHeader, LLength, LCharsetOk);
+      if LLength < 0 then
+        return ProtocolRead.Malformed;
+      end;
+      if not self.DoReadBody(LLength, ABody) then
+        return ProtocolRead.EndOfInput;
+      end;
+      if (not LCharsetOk) or not IsUtf8(ABody) then
+        ABody := "";
+        return ProtocolRead.Malformed;
+      end;
+      return ProtocolRead.Message;
+    end;
+
+    // ABody written as one message; false when the output is gone (the client left)
+    method WriteMessage(const ABody: string): bool;
+    var
+      LText: string;
+    begin
+      LText := "Content-Length: " + IntToStr(len(ABody)) + "\r\n\r\n" + ABody;
+      return self.FChannel.WriteBytes(addr of LText[0], len(LText));
+    end;
+
+    // The bytes up to the empty line (CR LF CR LF) into AHeader, that line left out
+    hidden method DoReadHeader(var AHeader: string): ProtocolRead;
+    var
+      LBytes: ByteArray;
+      LCount: int64;
+    begin
+      AHeader := "";
+      setlength(LBytes, ADAM_PROTOCOL_HEADER_LIMIT);
+      LCount := 0;
+      while true do
+        if LCount = ADAM_PROTOCOL_HEADER_LIMIT then
+          return ProtocolRead.Malformed;
+        end;
+        if self.FChannel.ReadBytes(addr of LBytes[LCount], 1) <> 1 then
+          return ProtocolRead.EndOfInput;
+        end;
+        LCount := LCount + 1;
+        if (LCount >= 4) and (LBytes[LCount - 4] = 13) and (LBytes[LCount - 3] = 10) and
+          (LBytes[LCount - 2] = 13) and (LBytes[LCount - 1] = 10) then
+          leave;
+        end;
+      end;
+      AHeader := StringFromC(ptr to const char(addr of LBytes[0]), LCount - 4);
+      return ProtocolRead.Message;
+    end;
+
+    // ALength bytes into ABody (a channel may give fewer than asked: read until all came);
+    // false when the input ends first
+    hidden method DoReadBody(const ALength: int64; var ABody: string): bool;
+    var
+      LBytes: ByteArray;
+      LDone: int64;
+      LRead: int64;
+    begin
+      ABody := "";
+      if ALength = 0 then
+        return true;
+      end;
+      setlength(LBytes, ALength);
+      LDone := 0;
+      while LDone < ALength do
+        LRead := self.FChannel.ReadBytes(addr of LBytes[LDone], ALength - LDone);
+        if LRead <= 0 then
+          return false;
+        end;
+        LDone := LDone + LRead;
+      end;
+      ABody := StringFromC(ptr to const char(addr of LBytes[0]), ALength);
+      return true;
+    end;
+  end;
+
+end.

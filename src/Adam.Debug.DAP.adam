@@ -1,0 +1,1183 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Debug.DAP.adam - Adam's debug adapter (M11a D5, adam dap)
+
+  Serves the Debug Adapter Protocol over a ProtocolTransport (LSP's base
+  protocol, Adam.Protocol.Transport: adam dap's is the process's stdin /
+  stdout, a row's two memory IOs) with one DebugRuntime, the engine the
+  console debugger drives too. RunDap serves until disconnect or the end of
+  the input.
+
+  launch takes "program": an .adam source is built for debugging first
+  (DapBuilder, Driver.CLI's: a debug build, its lines sent as output), an exe
+  is debugged as it is (its debug file beside it); "args" (strings),
+  "outputPath", "stopOnEntry". The program runs with its output through the
+  debugger (DebugOutputMode.Pipes: stdout is the protocol), each piece sent
+  as an output event as it comes. The program's @breakpoint marks are
+  announced as new breakpoints.
+
+  Requests: initialize, launch, setBreakpoints, setExceptionBreakpoints,
+  configurationDone, threads, stackTrace, scopes, variables, continue, next,
+  stepIn, stepOut, pause, evaluate, terminate, disconnect. Events:
+  initialized, stopped, output, breakpoint (new / changed), exited,
+  terminated.
+
+  One thread does everything. A request that runs the program is answered,
+  then the program runs to its next stop; while it runs, the runtime's pause
+  check (DapPauseCheck) sends its output and serves the requests that came
+  meanwhile: pause, terminate and disconnect end the run (the last two act
+  once it stopped), setBreakpoints and threads are served as usual, the
+  rest need the program stopped. Frame ids and variables references are
+  good until the program goes on. Prior art: PaskalCPP.Debug.DAP (CONCEPT:
+  its request set and replies; GEOMETRY rejected: no reader thread, the
+  runtime's pause check serves requests instead).
+*******************************************************************************/
+
+module unit Adam.Debug.DAP;
+
+import System.SysUtils, System.Json, Adam.Core.Common, Adam.Core.Messages,
+  Adam.Compiler.Diagnostics, Adam.Target.Registry, Adam.Protocol.Transport,
+  Adam.Debug.Target, Adam.Debug.Symbols, Adam.Debug.Runtime, Adam.Debug.Targets;
+
+public const
+  // RunDap's exit codes: the client disconnected / its input ended without a disconnect
+  ADAM_DAP_EXIT_DISCONNECTED: int32 = 0;
+  ADAM_DAP_EXIT_CLIENT_GONE: int32 = 1;
+  // output events' categories: the adapter's own lines, the program's output, problems
+  ADAM_DAP_CATEGORY_CONSOLE: string = "console";
+  ADAM_DAP_CATEGORY_STDOUT: string = "stdout";
+  ADAM_DAP_CATEGORY_STDERR: string = "stderr";
+  // How many reports a session keeps (they are sent as they come)
+  ADAM_DAP_REPORT_BUDGET: int64 = 1000000;
+
+// The string list AName of AArguments into AValues: absent = none; false when it is there and
+// not a list of strings
+routine DoStringsArg(const AArguments: Json; const AName: string;
+  var AValues: StringArray): bool;
+var
+  LList: Json;
+  LItems: array of Json;
+  LI: int64;
+begin
+  setlength(AValues, 0);
+  if not AArguments.Has(AName) then
+    return true;
+  end;
+  if not AArguments.TryGetArray(AName, LList) then
+    return false;
+  end;
+  LItems := LList.Items();
+  setlength(AValues, len(LItems));
+  for LI := 0 to len(LItems) - 1 do
+    if not LItems[LI].IsString() then
+      return false;
+    end;
+    AValues[LI] := LItems[LI].AsString();
+  end;
+  return true;
+end;
+
+public type
+  // Builds a source for debugging (Driver.CLI's: a debug build): AExePath the program it
+  // wrote, AText what the build said (lines); false when no program to debug was written
+  // (AText says why)
+  DapBuilder = object
+    virtual method Build(const ASource: string; const AOutputPath: string;
+      var AExePath: string; var AText: string): bool; abstract;
+  end;
+
+type
+  // The lines the client set in one file and the runtime's ids for them (0: not placed yet)
+  DapFile = record
+    Path: string;
+    Lines: Int64Array;
+    Ids: Int64Array;
+  end;
+
+  DapFileArray = array of DapFile;
+
+  // The adapter's session (see the header)
+  DapServer = object
+    hidden FTransport: ref ProtocolTransport;
+    hidden FBuilder: ref DapBuilder;
+    hidden FReports: ref Diagnostics;
+    hidden FReportsSent: int64;
+    hidden FSeq: int64;
+    hidden FCheck: ref RuntimePauseCheck;
+    hidden FRuntime: ref DebugRuntime;
+    hidden FFiles: DapFileArray;
+    hidden FFinished: bool;
+    hidden FClientGone: bool;
+    hidden FLaunched: bool;
+    hidden FExited: bool;
+    hidden FConfigured: bool;
+    hidden FStopOnEntry: bool;
+    // The program runs (a request's run is under way); what was asked meanwhile
+    hidden FRunning: bool;
+    hidden FPauseWanted: bool;
+    hidden FTerminateWanted: bool;
+    hidden FDisconnectWanted: bool;
+
+    init(const ATransport: ref ProtocolTransport; const ABuilder: ref DapBuilder);
+    begin
+      self.FTransport := ATransport;
+      self.FBuilder := ABuilder;
+      self.FReports := ref Diagnostics(ADAM_DAP_REPORT_BUDGET);
+      self.FReportsSent := 0;
+      self.FSeq := 0;
+      self.FFinished := false;
+      self.FClientGone := false;
+      self.FLaunched := false;
+      self.FExited := false;
+      self.FConfigured := false;
+      self.FStopOnEntry := false;
+      self.FRunning := false;
+      self.FPauseWanted := false;
+      self.FTerminateWanted := false;
+      self.FDisconnectWanted := false;
+    end;
+
+    // The pause check the runtime gets at launch (RunDap's, holding this server)
+    method SetCheck(const ACheck: ref RuntimePauseCheck);
+    begin
+      self.FCheck := ACheck;
+    end;
+
+    // Serves the transport until disconnect or the end of its input: an ADAM_DAP_EXIT_*
+    method Serve(): int32;
+    var
+      LBody: string;
+      LRead: ProtocolRead;
+    begin
+      while not self.FFinished do
+        LRead := self.FTransport.ReadMessage(LBody);
+        if LRead = ProtocolRead.EndOfInput then
+          self.FClientGone := true;
+          leave;
+        end;
+        if LRead = ProtocolRead.Malformed then
+          self.DoOutput(ADAM_DAP_CATEGORY_STDERR, NoArgs().Fill(ADAM_MSG_DAP_MALFORMED) + "\n");
+          skip;
+        end;
+        self.DoHandleMessage(LBody);
+      end;
+      self.DoEndSession();
+      if self.FClientGone then
+        return ADAM_DAP_EXIT_CLIENT_GONE;
+      end;
+      return ADAM_DAP_EXIT_DISCONNECTED;
+    end;
+
+    // The session ended and the pause check dropped (it holds this server)
+    method Close();
+    begin
+      self.DoEndSession();
+      self.FCheck := nil;
+    end;
+
+    // The pause check's work while the program runs (DapPauseCheck): its output sent, the
+    // requests that came meanwhile served; true when the run must stop now
+    method WhileRunning(): bool;
+    var
+      LBody: string;
+      LRead: ProtocolRead;
+      LWanted: bool;
+    begin
+      self.DoSendProgramOutput();
+      while (not self.FPauseWanted) and (not self.FFinished) and self.FTransport.HasPending() do
+        LRead := self.FTransport.ReadMessage(LBody);
+        if LRead = ProtocolRead.EndOfInput then
+          // The client is gone: the program does not outlive it
+          self.FClientGone := true;
+          self.FTerminateWanted := true;
+          self.FPauseWanted := true;
+          leave;
+        end;
+        if LRead = ProtocolRead.Malformed then
+          self.DoOutput(ADAM_DAP_CATEGORY_STDERR, NoArgs().Fill(ADAM_MSG_DAP_MALFORMED) + "\n");
+          skip;
+        end;
+        self.DoHandleMessage(LBody);
+      end;
+      LWanted := self.FPauseWanted;
+      self.FPauseWanted := false;
+      return LWanted;
+    end;
+
+    // -- Messages out
+
+    // AMessage sent with the next seq; a client that cannot be written to ends the session
+    hidden method DoSend(const AMessage: Json);
+    var
+      LMessage: Json;
+    begin
+      self.FSeq := self.FSeq + 1;
+      LMessage := AMessage;
+      LMessage.Add("seq", self.FSeq);
+      if not self.FTransport.WriteMessage(LMessage.ToString()) then
+        self.FFinished := true;
+      end;
+    end;
+
+    // The response to ARequest: ASuccess, AMessage (a failure's), ABody when AHasBody
+    hidden method DoResponse(const ARequest: Json; const ASuccess: bool; const AMessage: string;
+      const ABody: Json; const AHasBody: bool);
+    var
+      LMessage: Json;
+      LSeq: int64;
+      LCommand: string;
+    begin
+      LSeq := 0;
+      LCommand := "";
+      ARequest.TryGetInt64("seq", LSeq);
+      ARequest.TryGetString("command", LCommand);
+      LMessage.Add("type", "response");
+      LMessage.Add("request_seq", LSeq);
+      LMessage.Add("success", ASuccess);
+      LMessage.Add("command", LCommand);
+      if not ASuccess then
+        LMessage.Add("message", AMessage);
+      end;
+      if AHasBody then
+        LMessage.Add("body", ABody);
+      end;
+      self.DoSend(LMessage);
+    end;
+
+    // A success with no body / with ABody; a failure saying AMessage
+    hidden method DoOk(const ARequest: Json);
+    var
+      LNone: Json;
+    begin
+      self.DoResponse(ARequest, true, "", LNone, false);
+    end;
+
+    hidden method DoOkBody(const ARequest: Json; const ABody: Json);
+    begin
+      self.DoResponse(ARequest, true, "", ABody, true);
+    end;
+
+    hidden method DoFail(const ARequest: Json; const AMessage: string);
+    var
+      LNone: Json;
+    begin
+      self.DoResponse(ARequest, false, AMessage, LNone, false);
+    end;
+
+    // A bad or missing argument AName of request ACommand
+    hidden method DoBadArgument(const ARequest: Json; const ACommand: string;
+      const AName: string);
+    begin
+      self.DoFail(ARequest, NoArgs().Str(ACommand).Str(AName).Fill(ADAM_MSG_DAP_BAD_ARGUMENT));
+    end;
+
+    hidden method DoEvent(const AEvent: string; const ABody: Json; const AHasBody: bool);
+    var
+      LMessage: Json;
+    begin
+      LMessage.Add("type", "event");
+      LMessage.Add("event", AEvent);
+      if AHasBody then
+        LMessage.Add("body", ABody);
+      end;
+      self.DoSend(LMessage);
+    end;
+
+    // An output event of ACategory; nothing for an empty text
+    hidden method DoOutput(const ACategory: string; const AText: string);
+    var
+      LBody: Json;
+    begin
+      if len(AText) = 0 then
+        return;
+      end;
+      LBody.Add("category", ACategory);
+      LBody.Add("output", AText);
+      self.DoEvent("output", LBody, true);
+    end;
+
+    // The program's output taken so far
+    hidden method DoSendProgramOutput();
+    begin
+      if self.FRuntime <> nil then
+        self.DoOutput(ADAM_DAP_CATEGORY_STDOUT, self.FRuntime.TakeOutput());
+      end;
+    end;
+
+    // The reports made since the last send, each a line (errors and warnings on stderr)
+    hidden method DoSendReports();
+    var
+      LItem: ref Diagnostic;
+    begin
+      while self.FReportsSent < self.FReports.Count do
+        LItem := self.FReports.Items[self.FReportsSent];
+        self.FReportsSent := self.FReportsSent + 1;
+        if LItem.IsError() then
+          self.DoOutput(ADAM_DAP_CATEGORY_STDERR, LItem.Display() + "\n");
+        else
+          self.DoOutput(ADAM_DAP_CATEGORY_CONSOLE, LItem.Display() + "\n");
+        end;
+      end;
+    end;
+
+    // A failed request's message: the first error reported for it (the others go out as
+    // output, that one only as the message), else AFallback
+    hidden method DoFailureText(const AFallback: string): string;
+    var
+      LI: int64;
+      LText: string;
+      LItem: ref Diagnostic;
+    begin
+      LText := AFallback;
+      for LI := self.FReportsSent to self.FReports.Count - 1 do
+        LItem := self.FReports.Items[LI];
+        if (LText = AFallback) and LItem.IsError() then
+          LText := LItem.Text();
+          skip;
+        end;
+        if LItem.IsError() then
+          self.DoOutput(ADAM_DAP_CATEGORY_STDERR, LItem.Display() + "\n");
+        else
+          self.DoOutput(ADAM_DAP_CATEGORY_CONSOLE, LItem.Display() + "\n");
+        end;
+      end;
+      self.FReportsSent := self.FReports.Count;
+      return LText;
+    end;
+
+    // A source as the client names one: the file's name and its path
+    hidden const method DoSourceJson(const APath: string): Json;
+    var
+      LSource: Json;
+    begin
+      LSource.Add("name", ExtractFileName(APath));
+      LSource.Add("path", APath);
+      return LSource;
+    end;
+
+    // A breakpoint as the client reads it: where its code is when verified, else where it was
+    // asked for and why not; APath the client's spelling of its file
+    hidden const method DoBreakpointJson(const ABreakpoint: RuntimeBreakpoint;
+      const APath: string): Json;
+    var
+      LJson: Json;
+    begin
+      if ABreakpoint.Id > 0 then
+        LJson.Add("id", ABreakpoint.Id);
+      end;
+      LJson.Add("verified", ABreakpoint.Verified);
+      if ABreakpoint.Verified then
+        LJson.Add("line", ABreakpoint.Source.Line);
+      else
+        LJson.Add("line", ABreakpoint.Line);
+      end;
+      LJson.Add("source", self.DoSourceJson(APath));
+      if not ABreakpoint.Verified then
+        if self.FLaunched then
+          LJson.Add("message", NoArgs().Int(int64(ABreakpoint.Line)).Fill(ADAM_MSG_DAP_NO_CODE));
+        else
+          LJson.Add("message", NoArgs().Fill(ADAM_MSG_DAP_NOT_LAUNCHED));
+        end;
+      end;
+      return LJson;
+    end;
+
+    // -- Requests
+
+    hidden method DoHandleMessage(const ABody: string);
+    var
+      LRequest: Json;
+      LArguments: Json;
+      LType: string;
+      LCommand: string;
+    begin
+      if not Json.TryFromString(ABody, LRequest) then
+        self.DoOutput(ADAM_DAP_CATEGORY_STDERR, NoArgs().Fill(ADAM_MSG_DAP_NOT_REQUEST) + "\n");
+        return;
+      end;
+      if not (LRequest.IsObject() and LRequest.TryGetString("type", LType) and
+        (LType = "request") and LRequest.TryGetString("command", LCommand)) then
+        self.DoOutput(ADAM_DAP_CATEGORY_STDERR, NoArgs().Fill(ADAM_MSG_DAP_NOT_REQUEST) + "\n");
+        return;
+      end;
+      // No arguments: an empty object, every read of it false
+      LRequest.TryGetObject("arguments", LArguments);
+      if LCommand = "initialize" then
+        self.DoInitialize(LRequest);
+      else
+        if LCommand = "launch" then
+          self.DoLaunch(LRequest, LArguments);
+        else
+          if LCommand = "setBreakpoints" then
+            self.DoSetBreakpoints(LRequest, LArguments);
+          else
+            if LCommand = "setExceptionBreakpoints" then
+              self.DoOk(LRequest);
+            else
+              self.DoHandleMore(LRequest, LCommand, LArguments);
+            end;
+          end;
+        end;
+      end;
+      self.DoSendReports();
+    end;
+
+    hidden method DoHandleMore(const ARequest: Json; const ACommand: string;
+      const AArguments: Json);
+    begin
+      if ACommand = "configurationDone" then
+        self.DoConfigurationDone(ARequest);
+        return;
+      end;
+      if ACommand = "threads" then
+        self.DoThreads(ARequest);
+        return;
+      end;
+      if ACommand = "stackTrace" then
+        self.DoStackTrace(ARequest, AArguments);
+        return;
+      end;
+      if ACommand = "scopes" then
+        self.DoScopes(ARequest, AArguments);
+        return;
+      end;
+      if ACommand = "variables" then
+        self.DoVariables(ARequest, AArguments);
+        return;
+      end;
+      if (ACommand = "continue") or (ACommand = "next") or (ACommand = "stepIn") or
+        (ACommand = "stepOut") then
+        self.DoRunControl(ARequest, ACommand);
+        return;
+      end;
+      if ACommand = "pause" then
+        self.DoPause(ARequest);
+        return;
+      end;
+      if ACommand = "evaluate" then
+        self.DoEvaluate(ARequest, AArguments);
+        return;
+      end;
+      if ACommand = "terminate" then
+        self.DoTerminate(ARequest);
+        return;
+      end;
+      if ACommand = "disconnect" then
+        self.DoDisconnect(ARequest);
+        return;
+      end;
+      self.DoFail(ARequest, NoArgs().Str(ACommand).Fill(ADAM_MSG_DAP_UNKNOWN_COMMAND));
+    end;
+
+    // True when a program is being debugged; else the request fails
+    hidden method DoNeedLaunched(const ARequest: Json): bool;
+    begin
+      if (self.FRuntime <> nil) and self.FLaunched and not self.FExited then
+        return true;
+      end;
+      self.DoFail(ARequest, NoArgs().Fill(ADAM_MSG_DAP_NOT_LAUNCHED));
+      return false;
+    end;
+
+    // True when the program is being debugged and stopped; else the request fails
+    hidden method DoNeedStopped(const ARequest: Json): bool;
+    begin
+      if not self.DoNeedLaunched(ARequest) then
+        return false;
+      end;
+      if self.FRunning or not self.FRuntime.IsStopped() then
+        self.DoFail(ARequest, NoArgs().Fill(ADAM_MSG_DAP_RUNNING));
+        return false;
+      end;
+      return true;
+    end;
+
+    // What this adapter does: breakpoints by line, values read, nothing changed
+    hidden method DoInitialize(const ARequest: Json);
+    var
+      LBody: Json;
+    begin
+      LBody.Add("supportsConfigurationDoneRequest", true);
+      LBody.Add("supportsEvaluateForHovers", true);
+      LBody.Add("supportsTerminateRequest", true);
+      LBody.Add("supportsConditionalBreakpoints", false);
+      LBody.Add("supportsHitConditionalBreakpoints", false);
+      LBody.Add("supportsFunctionBreakpoints", false);
+      LBody.Add("supportsSetVariable", false);
+      LBody.Add("supportsStepBack", false);
+      LBody.Add("supportsRestartFrame", false);
+      LBody.BeginArray("exceptionBreakpointFilters");
+      LBody.EndArray();
+      self.DoOkBody(ARequest, LBody);
+    end;
+
+    // launch (see the header): the program held at its entry until configurationDone
+    hidden method DoLaunch(const ARequest: Json; const AArguments: Json);
+    var
+      LProgram: string;
+      LOutputPath: string;
+      LExePath: string;
+      LText: string;
+      LArgs: StringArray;
+      LTriple: string;
+      LTarget: ref DebugTarget;
+      LStop: RuntimeStop;
+      LBody: Json;
+    begin
+      if self.FLaunched then
+        self.DoFail(ARequest, NoArgs().Fill(ADAM_MSG_DAP_LAUNCH_TWICE));
+        return;
+      end;
+      if (not AArguments.TryGetString("program", LProgram)) or (len(Trim(LProgram)) = 0) then
+        self.DoFail(ARequest, NoArgs().Fill(ADAM_MSG_DAP_NO_PROGRAM));
+        return;
+      end;
+      LOutputPath := "";
+      if AArguments.Has("outputPath") and
+        not AArguments.TryGetString("outputPath", LOutputPath) then
+        self.DoBadArgument(ARequest, "launch", "outputPath");
+        return;
+      end;
+      if not DoStringsArg(AArguments, "args", LArgs) then
+        self.DoBadArgument(ARequest, "launch", "args");
+        return;
+      end;
+      self.FStopOnEntry := false;
+      if AArguments.Has("stopOnEntry") and
+        not AArguments.TryGetBoolean("stopOnEntry", self.FStopOnEntry) then
+        self.DoBadArgument(ARequest, "launch", "stopOnEntry");
+        return;
+      end;
+      // A source is built for debugging first; an exe is debugged as it is
+      LExePath := LProgram;
+      if LowerCase(ExtractFileExt(LProgram)) = ADAM_EXT_SOURCE then
+        if self.FBuilder = nil then
+          self.DoFail(ARequest, NoArgs().Str(LProgram).Fill(ADAM_MSG_DAP_NO_BUILDER));
+          return;
+        end;
+        LText := "";
+        LExePath := "";
+        if not self.FBuilder.Build(LProgram, LOutputPath, LExePath, LText) then
+          self.DoOutput(ADAM_DAP_CATEGORY_STDERR, LText);
+          self.DoFail(ARequest, NoArgs().Str(LProgram).Fill(ADAM_MSG_DAP_BUILD_FAILED));
+          return;
+        end;
+        self.DoOutput(ADAM_DAP_CATEGORY_CONSOLE, LText);
+      end;
+      LTriple := DefaultTriple();
+      LTarget := DebugTargetFor(LTriple);
+      if LTarget = nil then
+        self.DoFail(ARequest, NoArgs().Str(LTriple).Fill(ADAM_MSG_DAP_NO_DEBUGGER));
+        return;
+      end;
+      self.FRuntime := ref DebugRuntime(LTarget, DebugSymbolsFor(LTriple));
+      self.FRuntime.SetDiagnostics(self.FReports);
+      self.FRuntime.SetPauseCheck(self.FCheck);
+      // The client's breakpoints so far wait for the launch
+      self.DoPlaceAll();
+      if not self.FRuntime.Launch(LExePath, LArgs, DebugOutputMode.Pipes, LStop) then
+        self.DoSendProgramOutput();
+        LText := self.DoFailureText(NoArgs().Str(LExePath).Fill(ADAM_MSG_DAP_LAUNCH_FAILED));
+        self.FRuntime.SetPauseCheck(nil);
+        self.FRuntime := nil;
+        self.DoFail(ARequest, LText);
+        return;
+      end;
+      self.FLaunched := true;
+      self.FExited := false;
+      self.FConfigured := false;
+      self.DoSendReports();
+      self.DoOk(ARequest);
+      self.DoEvent("initialized", LBody, false);
+      self.DoAnnounce();
+    end;
+
+    // Every file's lines given to the runtime (before the launch: placed as it starts)
+    hidden method DoPlaceAll();
+    var
+      LI: int64;
+      LJ: int64;
+      LPlaced: RuntimeBreakpoint;
+    begin
+      for LI := 0 to len(self.FFiles) - 1 do
+        for LJ := 0 to len(self.FFiles[LI].Lines) - 1 do
+          LPlaced := self.FRuntime.SetBreakpoint(self.FFiles[LI].Path,
+            uint32(self.FFiles[LI].Lines[LJ]));
+          self.FFiles[LI].Ids[LJ] := LPlaced.Id;
+        end;
+      end;
+    end;
+
+    // After the launch: the program's @breakpoint marks as new breakpoints, the client's
+    // breakpoints placed at the start as changed ones
+    hidden method DoAnnounce();
+    var
+      LAll: RuntimeBreakpointArray;
+      LI: int64;
+      LBody: Json;
+      LPath: string;
+      LReason: string;
+      LFresh: Json;
+    begin
+      LAll := self.FRuntime.Breakpoints();
+      for LI := 0 to len(LAll) - 1 do
+        LReason := "changed";
+        LPath := self.DoClientPathOf(LAll[LI].Id);
+        if LAll[LI].IsMark then
+          LReason := "new";
+          LPath := LAll[LI].Source.FilePath;
+        end;
+        if len(LPath) = 0 then
+          skip;
+        end;
+        LBody.Add("reason", LReason);
+        LBody.Add("breakpoint", self.DoBreakpointJson(LAll[LI], LPath));
+        self.DoEvent("breakpoint", LBody, true);
+        LBody := LFresh;
+      end;
+    end;
+
+    // The client's path of the breakpoint the runtime numbered AId ("" none)
+    hidden const method DoClientPathOf(const AId: int64): string;
+    var
+      LI: int64;
+      LJ: int64;
+    begin
+      for LI := 0 to len(self.FFiles) - 1 do
+        for LJ := 0 to len(self.FFiles[LI].Ids) - 1 do
+          if self.FFiles[LI].Ids[LJ] = AId then
+            return self.FFiles[LI].Path;
+          end;
+        end;
+      end;
+      return "";
+    end;
+
+    // A file's whole set as the client has it now (its earlier one taken out)
+    hidden method DoSetBreakpoints(const ARequest: Json; const AArguments: Json);
+    var
+      LPath: string;
+      LList: Json;
+      LItems: array of Json;
+      LLine: int64;
+      LFile: DapFile;
+      LIndex: int64;
+      LI: int64;
+      LPlaced: RuntimeBreakpoint;
+      LBody: Json;
+    begin
+      if (not AArguments.TryGetString("source.path", LPath)) or (len(Trim(LPath)) = 0) then
+        self.DoBadArgument(ARequest, "setBreakpoints", "source.path");
+        return;
+      end;
+      LFile.Path := LPath;
+      setlength(LFile.Lines, 0);
+      if AArguments.TryGetArray("breakpoints", LList) then
+        LItems := LList.Items();
+        setlength(LFile.Lines, len(LItems));
+        for LI := 0 to len(LItems) - 1 do
+          if (not LItems[LI].TryGetInt64("line", LLine)) or (LLine < 1) or
+            (LLine > 0xFFFFFFFF) then
+            self.DoBadArgument(ARequest, "setBreakpoints", "breakpoints");
+            return;
+          end;
+          LFile.Lines[LI] := LLine;
+        end;
+      else
+        // A value that is no list must not clear the file's set
+        if AArguments.Has("breakpoints") then
+          self.DoBadArgument(ARequest, "setBreakpoints", "breakpoints");
+          return;
+        end;
+      end;
+      setlength(LFile.Ids, len(LFile.Lines));
+      LIndex := self.DoFileIndex(LPath);
+      if LIndex < 0 then
+        LIndex := len(self.FFiles);
+        setlength(self.FFiles, LIndex + 1);
+      else
+        if self.FRuntime <> nil then
+          for LI := 0 to len(self.FFiles[LIndex].Ids) - 1 do
+            if self.FFiles[LIndex].Ids[LI] > 0 then
+              self.FRuntime.RemoveBreakpoint(self.FFiles[LIndex].Ids[LI]);
+            end;
+          end;
+        end;
+      end;
+      LBody.BeginArray("breakpoints");
+      for LI := 0 to len(LFile.Lines) - 1 do
+        LPlaced.Id := 0;
+        LPlaced.FileName := LPath;
+        LPlaced.Line := uint32(LFile.Lines[LI]);
+        LPlaced.Verified := false;
+        if self.FRuntime <> nil then
+          LPlaced := self.FRuntime.SetBreakpoint(LPath, uint32(LFile.Lines[LI]));
+        end;
+        LFile.Ids[LI] := LPlaced.Id;
+        LBody.Add(self.DoBreakpointJson(LPlaced, LPath));
+      end;
+      LBody.EndArray();
+      self.FFiles[LIndex] := LFile;
+      self.DoOkBody(ARequest, LBody);
+    end;
+
+    hidden const method DoFileIndex(const APath: string): int64;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FFiles) - 1 do
+        if self.FFiles[LI].Path = APath then
+          return LI;
+        end;
+      end;
+      return -1;
+    end;
+
+    // The program let go from its entry (or held there: stopOnEntry)
+    hidden method DoConfigurationDone(const ARequest: Json);
+    var
+      LBody: Json;
+    begin
+      if not self.DoNeedStopped(ARequest) then
+        return;
+      end;
+      self.DoOk(ARequest);
+      if self.FConfigured then
+        return;
+      end;
+      self.FConfigured := true;
+      if self.FStopOnEntry then
+        LBody.Add("reason", "entry");
+        LBody.Add("threadId", self.FRuntime.LastStop().ThreadId);
+        LBody.Add("allThreadsStopped", true);
+        self.DoEvent("stopped", LBody, true);
+        return;
+      end;
+      self.DoRunProgram("continue");
+    end;
+
+    // The threads (none when no program runs: clients ask at any time)
+    hidden method DoThreads(const ARequest: Json);
+    var
+      LIds: DebugThreadIdArray;
+      LMain: uint32;
+      LI: int64;
+      LThread: Json;
+      LBody: Json;
+    begin
+      setlength(LIds, 0);
+      LMain := 0;
+      if (self.FRuntime <> nil) and self.FLaunched and not self.FExited then
+        LIds := self.FRuntime.Target.Threads();
+        LMain := self.FRuntime.Target.MainThreadId();
+      end;
+      LBody.BeginArray("threads");
+      for LI := 0 to len(LIds) - 1 do
+        LThread := Json.FromString("{}");
+        LThread.Add("id", LIds[LI]);
+        if LIds[LI] = LMain then
+          LThread.Add("name", NoArgs().Int(int64(LIds[LI])).Fill(ADAM_MSG_DAP_THREAD_MAIN));
+        else
+          LThread.Add("name", NoArgs().Int(int64(LIds[LI])).Fill(ADAM_MSG_DAP_THREAD));
+        end;
+        LBody.Add(LThread);
+      end;
+      LBody.EndArray();
+      self.DoOkBody(ARequest, LBody);
+    end;
+
+    // The stopped thread's frames, innermost first, cut after the program's entry routine;
+    // a frame's id is its index + 1 (good until the program goes on)
+    hidden method DoStackTrace(const ARequest: Json; const AArguments: Json);
+    var
+      LFrames: StackFrameArray;
+      LStart: int64;
+      LLevels: int64;
+      LI: int64;
+      LFrame: Json;
+      LBody: Json;
+    begin
+      if not self.DoNeedStopped(ARequest) then
+        return;
+      end;
+      if (not AArguments.TryGetInt64("startFrame", LStart)) or (LStart < 0) then
+        LStart := 0;
+      end;
+      // levels 0 or absent: every frame
+      if (not AArguments.TryGetInt64("levels", LLevels)) or (LLevels < 0) then
+        LLevels := 0;
+      end;
+      LFrames := self.DoFrames();
+      LBody.BeginArray("stackFrames");
+      for LI := LStart to len(LFrames) - 1 do
+        if (LLevels > 0) and (LI - LStart >= LLevels) then
+          leave;
+        end;
+        LFrame := Json.FromString("{}");
+        LFrame.Add("id", LI + 1);
+        if LFrames[LI].Known then
+          LFrame.Add("name", LFrames[LI].Routine.Name);
+        else
+          LFrame.Add("name", "0x" + IntToHex(LFrames[LI].Context.Pc, 1));
+        end;
+        if LFrames[LI].HasLine then
+          LFrame.Add("source", self.DoSourceJson(LFrames[LI].Source.FilePath));
+          LFrame.Add("line", LFrames[LI].Source.Line);
+          LFrame.Add("column", int32(1));
+        else
+          LFrame.Add("line", int32(0));
+          LFrame.Add("column", int32(0));
+          // runtime, C and system frames: shown dimmed
+          LFrame.Add("presentationHint", "subtle");
+        end;
+        LBody.Add(LFrame);
+      end;
+      LBody.EndArray();
+      LBody.Add("totalFrames", len(LFrames));
+      self.DoOkBody(ARequest, LBody);
+    end;
+
+    // The runtime's frames cut after the program's entry routine (what calls it is the OS's)
+    hidden method DoFrames(): StackFrameArray;
+    var
+      LFrames: StackFrameArray;
+      LEntry: uint64;
+      LI: int64;
+    begin
+      setlength(LFrames, 0);
+      if not self.FRuntime.StackTrace(LFrames) then
+        return LFrames;
+      end;
+      LEntry := self.FRuntime.Target.EntryAddress();
+      for LI := 0 to len(LFrames) - 1 do
+        if LFrames[LI].Known and (LFrames[LI].Routine.Address = LEntry) then
+          setlength(LFrames, LI + 1);
+          leave;
+        end;
+      end;
+      return LFrames;
+    end;
+
+    // A frame's scopes: Params, Locals, Globals, each a variables reference
+    hidden method DoScopes(const ARequest: Json; const AArguments: Json);
+    var
+      LFrameId: int64;
+      LScopes: RuntimeScopeArray;
+      LI: int64;
+      LScope: Json;
+      LBody: Json;
+    begin
+      if not self.DoNeedStopped(ARequest) then
+        return;
+      end;
+      if not AArguments.TryGetInt64("frameId", LFrameId) then
+        self.DoBadArgument(ARequest, "scopes", "frameId");
+        return;
+      end;
+      if not self.FRuntime.Scopes(LFrameId - 1, LScopes) then
+        self.DoFail(ARequest, NoArgs().Int(LFrameId).Fill(ADAM_MSG_DAP_BAD_FRAME));
+        return;
+      end;
+      LBody.BeginArray("scopes");
+      for LI := 0 to len(LScopes) - 1 do
+        LScope := Json.FromString("{}");
+        LScope.Add("name", LScopes[LI].Name);
+        if LScopes[LI].Name = ADAM_RUNTIME_SCOPE_PARAMS then
+          LScope.Add("presentationHint", "arguments");
+        end;
+        if LScopes[LI].Name = ADAM_RUNTIME_SCOPE_LOCALS then
+          LScope.Add("presentationHint", "locals");
+        end;
+        LScope.Add("variablesReference", LScopes[LI].Reference);
+        LScope.Add("expensive", false);
+        LBody.Add(LScope);
+      end;
+      LBody.EndArray();
+      self.DoOkBody(ARequest, LBody);
+    end;
+
+    // A scope's variables or a value's parts
+    hidden method DoVariables(const ARequest: Json; const AArguments: Json);
+    var
+      LReference: int64;
+      LValues: RuntimeValueArray;
+      LI: int64;
+      LVariable: Json;
+      LBody: Json;
+    begin
+      if not self.DoNeedStopped(ARequest) then
+        return;
+      end;
+      if not AArguments.TryGetInt64("variablesReference", LReference) then
+        self.DoBadArgument(ARequest, "variables", "variablesReference");
+        return;
+      end;
+      if not self.FRuntime.Variables(LReference, LValues) then
+        self.DoFail(ARequest, NoArgs().Int(LReference).Fill(ADAM_MSG_DAP_BAD_REFERENCE));
+        return;
+      end;
+      LBody.BeginArray("variables");
+      for LI := 0 to len(LValues) - 1 do
+        LVariable := Json.FromString("{}");
+        LVariable.Add("name", LValues[LI].Name);
+        LVariable.Add("value", LValues[LI].Value);
+        LVariable.Add("type", LValues[LI].TypeName);
+        LVariable.Add("variablesReference", LValues[LI].Reference);
+        LBody.Add(LVariable);
+      end;
+      LBody.EndArray();
+      self.DoOkBody(ARequest, LBody);
+    end;
+
+    // Watch, hover and the debug console: a name with fields, indexes and ^ (Evaluate);
+    // nothing runs, nothing changes. No frame: the top one
+    hidden method DoEvaluate(const ARequest: Json; const AArguments: Json);
+    var
+      LText: string;
+      LFrameId: int64;
+      LValue: RuntimeValue;
+      LBody: Json;
+    begin
+      if not self.DoNeedStopped(ARequest) then
+        return;
+      end;
+      if not AArguments.TryGetString("expression", LText) then
+        self.DoBadArgument(ARequest, "evaluate", "expression");
+        return;
+      end;
+      if not AArguments.TryGetInt64("frameId", LFrameId) then
+        LFrameId := 1;
+      end;
+      if not self.FRuntime.Evaluate(LFrameId - 1, Trim(LText), LValue) then
+        self.DoFail(ARequest, LValue.Value);
+        return;
+      end;
+      LBody.Add("result", LValue.Value);
+      LBody.Add("type", LValue.TypeName);
+      LBody.Add("variablesReference", LValue.Reference);
+      self.DoOkBody(ARequest, LBody);
+    end;
+
+    // continue / next / stepIn / stepOut: answered, then the program runs to its next stop
+    hidden method DoRunControl(const ARequest: Json; const ACommand: string);
+    var
+      LBody: Json;
+    begin
+      if not self.DoNeedStopped(ARequest) then
+        return;
+      end;
+      if ACommand = "continue" then
+        LBody.Add("allThreadsContinued", true);
+        self.DoOkBody(ARequest, LBody);
+      else
+        self.DoOk(ARequest);
+      end;
+      self.FConfigured := true;
+      self.DoRunProgram(ACommand);
+    end;
+
+    // The program run as ACommand says to its next stop, then that stop told to the client
+    hidden method DoRunProgram(const ACommand: string);
+    var
+      LStop: RuntimeStop;
+      LOk: bool;
+    begin
+      self.FRunning := true;
+      if ACommand = "continue" then
+        LOk := self.FRuntime.Continue(LStop);
+      else
+        if ACommand = "next" then
+          LOk := self.FRuntime.Step(RuntimeStepKind.Over, LStop);
+        else
+          if ACommand = "stepIn" then
+            LOk := self.FRuntime.Step(RuntimeStepKind.Into, LStop);
+          else
+            LOk := self.FRuntime.Step(RuntimeStepKind.Out, LStop);
+          end;
+        end;
+      end;
+      self.FRunning := false;
+      self.FPauseWanted := false;
+      self.DoSendProgramOutput();
+      if self.FDisconnectWanted then
+        // its response went out while the program ran
+        self.DoEndSession();
+        self.FFinished := true;
+        return;
+      end;
+      if self.FTerminateWanted then
+        self.FTerminateWanted := false;
+        self.DoTerminateProgram();
+        if self.FClientGone then
+          self.FFinished := true;
+        end;
+        return;
+      end;
+      self.DoSendReports();
+      if self.FRuntime.HasExited() then
+        self.DoExited(self.FRuntime.LastStop().ExitCode);
+        return;
+      end;
+      if LOk then
+        self.DoStopped(LStop);
+      end;
+    end;
+
+    // The stopped event for AStop
+    hidden method DoStopped(const AStop: RuntimeStop);
+    var
+      LBody: Json;
+    begin
+      LBody.Add("reason", RuntimeStopKindText(AStop.Kind));
+      if AStop.Kind = RuntimeStopKind.Exception then
+        LBody.Add("description", NoArgs().Str(IntToHex(uint64(AStop.ExceptionCode), 8))
+          .Fill(ADAM_MSG_DAP_EXCEPTION));
+      end;
+      if AStop.Kind = RuntimeStopKind.Breakpoint then
+        LBody.BeginArray("hitBreakpointIds");
+        LBody.Add(AStop.BreakpointId);
+        LBody.EndArray();
+      end;
+      LBody.Add("threadId", AStop.ThreadId);
+      LBody.Add("allThreadsStopped", true);
+      self.DoEvent("stopped", LBody, true);
+    end;
+
+    // The program ended with ACode: exited, then terminated
+    hidden method DoExited(const ACode: uint32);
+    var
+      LBody: Json;
+    begin
+      self.FExited := true;
+      self.DoSendReports();
+      LBody.Add("exitCode", ACode);
+      self.DoEvent("exited", LBody, true);
+      self.DoEvent("terminated", LBody, false);
+    end;
+
+    // The program ended now (held or not) and the client told
+    hidden method DoTerminateProgram();
+    begin
+      if not self.FRuntime.HasExited() then
+        self.FRuntime.Terminate();
+      end;
+      self.DoSendProgramOutput();
+      self.DoExited(self.FRuntime.LastStop().ExitCode);
+    end;
+
+    // pause: the running program stops (a stopped event follows)
+    hidden method DoPause(const ARequest: Json);
+    begin
+      if not self.DoNeedLaunched(ARequest) then
+        return;
+      end;
+      if not self.FRunning then
+        self.DoFail(ARequest, NoArgs().Fill(ADAM_MSG_DAP_NOT_RUNNING));
+        return;
+      end;
+      self.DoOk(ARequest);
+      self.FPauseWanted := true;
+    end;
+
+    // terminate: the program ends; exited and terminated follow
+    hidden method DoTerminate(const ARequest: Json);
+    begin
+      if not self.DoNeedLaunched(ARequest) then
+        return;
+      end;
+      self.DoOk(ARequest);
+      if self.FRunning then
+        self.FTerminateWanted := true;
+        self.FPauseWanted := true;
+        return;
+      end;
+      self.DoTerminateProgram();
+    end;
+
+    // disconnect: the program does not outlive the session (a launch's only behaviour)
+    hidden method DoDisconnect(const ARequest: Json);
+    begin
+      self.DoOk(ARequest);
+      if self.FRunning then
+        self.FDisconnectWanted := true;
+        self.FPauseWanted := true;
+        return;
+      end;
+      self.DoEndSession();
+      self.FFinished := true;
+    end;
+
+    // The program ended (when it runs) and the runtime dropped, with its hold on the check
+    hidden method DoEndSession();
+    begin
+      if self.FRuntime <> nil then
+        if self.FLaunched and not self.FRuntime.HasExited() then
+          self.FRuntime.Terminate();
+        end;
+        self.FRuntime.SetPauseCheck(nil);
+        self.FRuntime := nil;
+      end;
+      self.FLaunched := false;
+      self.FConfigured := false;
+      self.DoSendReports();
+    end;
+  end;
+
+  // The runtime's pause check while the program runs: the server's WhileRunning
+  DapPauseCheck = object(RuntimePauseCheck)
+    hidden FServer: ref DapServer;
+
+    init(const AServer: ref DapServer);
+    begin
+      self.FServer := AServer;
+    end;
+
+    // The server dropped (RunDap's end: it held the check through the runtime)
+    method Release();
+    begin
+      self.FServer := nil;
+    end;
+
+    override method PauseNow(): bool;
+    begin
+      if self.FServer = nil then
+        return false;
+      end;
+      return self.FServer.WhileRunning();
+    end;
+  end;
+
+// Serves the Debug Adapter Protocol over ATransport (see the header) until disconnect or the
+// end of its input, sources built by ABuilder (nil: only built programs are launched): an
+// ADAM_DAP_EXIT_* code
+public routine RunDap(const ATransport: ref ProtocolTransport;
+  const ABuilder: ref DapBuilder): int32;
+var
+  LServer: ref DapServer;
+  LCheck: ref DapPauseCheck;
+  LCode: int32;
+begin
+  LServer := ref DapServer(ATransport, ABuilder);
+  LCheck := ref DapPauseCheck(LServer);
+  LServer.SetCheck(LCheck);
+  LCode := LServer.Serve();
+  // the server and its check hold each other: both let go
+  LServer.Close();
+  LCheck.Release();
+  return LCode;
+end;
+
+end.
