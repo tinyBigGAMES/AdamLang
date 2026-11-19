@@ -1,0 +1,1161 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Compiler.Binding.adam - the binding unit of a dll or a lib (PLAN-ADAM
+  MO1b0 d2, BNF sec 4 MO1b)
+
+  WriteBinding writes <name>.adam's text from the AST alone: `module unit
+  <name>;` holding the main module's public declarations, in declaration
+  order, as an exe imports them in place of writing them out again:
+
+  - consts as written, each value its folded constant (ResolvedConst): an
+    integer, a float, a bool, a char, a string (escaped), nil, a choices
+    value as Type.Value; an array, record or set literal element by element;
+  - types as written: records and overlays (parent, packed / packed(N),
+    align(N), fields with their bitfield widths, anonymous and inline parts),
+    choices with every value's number, sets, aliases, arrays, pointers and
+    routine types; object types and interfaces as their headings (parent,
+    implements, every field and embed, hidden ones too: the layout; every
+    method, property, init / copy / done and operator heading with its
+    words: the vtable) followed by `external "<name>";`, their code the
+    library's (BNF sec 4 MO1b);
+  - forward types before the types that complete them;
+  - variables and routines the library exports (the Driver's rule) with
+    `external "<name>";` (and `name "sym"` where a C symbol is not the Adam
+    name), a routine with its linkage word (cpplink: the Itanium name its
+    library gave it, mangled under the unit's name, which is the library's
+    module name) and noreturn;
+  - `import` of the units the written declarations name (the main module's
+    own imports, in its order).
+
+  The library's machinery symbols are keyed apart from the binding unit's
+  (Lowering's ModuleSymbolKey, MO1b0 d1), so an exe holding both links.
+  What has no external form is a `//` comment in its place saying why: a
+  generic routine, type or method (its instances are made where they are
+  used, from its body: BNF sec 10), a record's operator (no record is
+  external), a type no Adam text names. The text is deterministic: no time,
+  no path, the AST's order.
+*******************************************************************************/
+
+module unit Adam.Compiler.Binding;
+
+import System.SysUtils, Adam.Core.Common, Adam.Core.Containers, Adam.Target, Adam.Compiler.AST,
+  Adam.Compiler.Scopes, Adam.Compiler.Types, Adam.Compiler.Layout;
+
+const
+  // How deep a type or a value is followed for its text (a deeper one has none)
+  ADAM_BINDING_MAX_DEPTH: int64 = 64;
+  // One indentation step of the written unit
+  ADAM_BINDING_INDENT: string = "  ";
+  // The int64 constant with no literal of its own (its magnitude is past int64)
+  ADAM_BINDING_INT64_MIN: uint64 = 0x8000000000000000u;
+  ADAM_BINDING_INT64_MIN_TEXT: string = "-9223372036854775807 - 1";
+  // The reasons a declaration is a comment in place of its text
+  ADAM_BINDING_WHY_GENERIC: string = "a generic declaration: its instances are made where it is used, from its body";
+  ADAM_BINDING_WHY_OPERATOR: string = "a record's operator: no record is external, its code is its library's";
+  ADAM_BINDING_WHY_TYPE: string = "a type no Adam text names here";
+  ADAM_BINDING_WHY_VALUE: string = "a value no Adam literal spells";
+  ADAM_BINDING_WHY_EXTERNAL: string = "another library's external type: import that library's binding";
+
+// The octal escape of the byte AByte (\ooo, three digits: never longer, as \x is)
+routine DoOctalEscape(const AByte: uint32): string;
+begin
+  return "\\" + IntToStr(int64((AByte shr 6) & 7)) + IntToStr(int64((AByte shr 3) & 7)) +
+    IntToStr(int64(AByte & 7));
+end;
+
+// The escape the byte AByte takes inside a literal closed by AQuote ("" when it stands as
+// itself): \\, the quote, \n \r \t, \ooo for any other control byte (UTF-8 bytes stay)
+routine DoEscapeOf(const AByte: uint32; const AQuote: uint32): string;
+begin
+  if AByte = 92 then
+    return "\\\\";
+  end;
+  if (AByte = AQuote) and (AQuote = 39) then
+    return "\\'";
+  end;
+  if AByte = AQuote then
+    return "\\\"";
+  end;
+  if AByte = 10 then
+    return "\\n";
+  end;
+  if AByte = 13 then
+    return "\\r";
+  end;
+  if AByte = 9 then
+    return "\\t";
+  end;
+  if (AByte < 32) or (AByte = 127) then
+    return DoOctalEscape(AByte);
+  end;
+  return "";
+end;
+
+// AText as an Adam string literal: "..." with DoEscapeOf's escapes
+routine DoStringLiteral(const AText: string): string;
+var
+  LOut: ref TextBuilder;
+  LI: int64;
+  LEscape: string;
+begin
+  LOut := ref TextBuilder();
+  LOut.Add("\"");
+  for LI := 0 to len(AText) - 1 do
+    LEscape := DoEscapeOf(uint32(uint8(AText[LI])), 34);
+    if LEscape <> "" then
+      LOut.Add(LEscape);
+    else
+      LOut.Add(Substring(AText, LI, 1));
+    end;
+  end;
+  LOut.Add("\"");
+  return LOut.Text();
+end;
+
+// The character ACode as an Adam char literal: printable ASCII as itself, a control or
+// narrow high byte (a char, not AWide) as \ooo, a wide one past ASCII as \uXXXX /
+// \UXXXXXXXX (C++'s universal character names)
+routine DoCharLiteral(const ACode: uint64; const AWide: bool): string;
+var
+  LEscape: string;
+begin
+  if ACode < 128 then
+    LEscape := DoEscapeOf(uint32(ACode), 39);
+    if LEscape <> "" then
+      return "'" + LEscape + "'";
+    end;
+    return "'" + StringOfChar(char(uint8(ACode)), 1) + "'";
+  end;
+  if not AWide then
+    return "'" + DoOctalEscape(uint32(ACode & 255)) + "'";
+  end;
+  if ACode <= 0xFFFF then
+    return "'\\u" + IntToHex(ACode, 4) + "'";
+  end;
+  return "'\\U" + IntToHex(ACode, 8) + "'";
+end;
+
+// The int64 two's complement ABits as an Adam constant expression (INT64_MIN has no
+// literal: ADAM_BINDING_INT64_MIN_TEXT)
+routine DoSignedText(const ABits: uint64): string;
+begin
+  if ABits = ADAM_BINDING_INT64_MIN then
+    return ADAM_BINDING_INT64_MIN_TEXT;
+  end;
+  return IntToStr(int64(ABits));
+end;
+
+// The unsigned ABits as an Adam literal: a value past int64 takes the u suffix (a decimal
+// literal takes signed types only, BNF sec 9)
+routine DoUnsignedText(const ABits: uint64): string;
+begin
+  if ABits > 0x7FFFFFFFFFFFFFFFu then
+    return UIntToStr(ABits) + "u";
+  end;
+  return UIntToStr(ABits);
+end;
+
+// The float AValue as an Adam float literal (AFloat32: the f suffix); "" for inf and nan,
+// which no literal spells
+routine DoFloatText(const AValue: float64; const AFloat32: bool): string;
+var
+  LText: string;
+begin
+  LText := FloatToStr(AValue);
+  if (IndexOf("inf", LText, 0) >= 0) or (IndexOf("nan", LText, 0) >= 0) then
+    return "";
+  end;
+  // a whole number reads as an integer literal: the fraction makes it a float
+  if (IndexOf(".", LText, 0) < 0) and (IndexOf("e", LText, 0) < 0) then
+    LText := LText + ".0";
+  end;
+  if AFloat32 then
+    LText := LText + "f";
+  end;
+  return LText;
+end;
+
+type
+  // One binding unit being written (see the header)
+  BindingWriter = object
+    hidden FTree: ref SyntaxTree;
+    hidden FTarget: ref Target;
+    // The main module, and its external clause's library text ("<name>" quoted)
+    hidden FModule: int64;
+    hidden FLibrary: string;
+    // The declarations' text, the block word open ("const", "type", "var"; "" none)
+    hidden FOut: ref TextBuilder;
+    hidden FBlock: string;
+    // Nothing written in the open block yet; the last type written was an object type or
+    // an interface (a blank line stands before and after one)
+    hidden FFirst: bool;
+    hidden FLastObject: bool;
+    // The modules a written declaration names (by node id: 1)
+    hidden FNamed: ref Int64Map;
+    // Why the declaration being written has no binding text ("" while it has)
+    hidden FWhy: string;
+
+    init(const ATree: ref SyntaxTree; const ATarget: ref Target; const AModule: int64);
+    begin
+      self.FTree := ATree;
+      self.FTarget := ATarget;
+      self.FModule := AModule;
+      self.FLibrary := DoStringLiteral(ATree[AModule].Text);
+      self.FOut := ref TextBuilder();
+      self.FBlock := "";
+      self.FFirst := true;
+      self.FLastObject := false;
+      self.FNamed := ref Int64Map(0);
+      self.FWhy := "";
+    end;
+
+    // AWhy kept as the reason the declaration being written has no text (the first one)
+    hidden method DoFail(const AWhy: string);
+    begin
+      if self.FWhy = "" then
+        self.FWhy := AWhy;
+      end;
+    end;
+
+    // The declared type ADecl named: its module noted for the imports (not the main
+    // module, whose types the binding declares itself)
+    hidden method DoNoteModule(const ADecl: int64);
+    var
+      LModule: int64;
+    begin
+      LModule := ModuleOf(self.FTree, ADecl);
+      if (LModule <> 0) and (LModule <> self.FModule) then
+        self.FNamed.Put(LModule, 1);
+      end;
+    end;
+
+    // The generic instance AInstance as its type is written: Name<A, B>
+    hidden method DoInstanceText(const AInstance: int64; const ADepth: int64): string;
+    var
+      LGeneric: int64;
+      LText: string;
+      LI: int64;
+    begin
+      LGeneric := self.FTree.FirstOf(AInstance, NodeRole.Instance);
+      self.DoNoteModule(LGeneric);
+      LText := self.FTree[LGeneric].Text + "<";
+      for LI := 0 to self.FTree.CountOf(AInstance, NodeRole.GenericParam) - 1 do
+        if LI > 0 then
+          LText := LText + ", ";
+        end;
+        LText := LText + self.DoTypeText(
+          self.FTree[self.FTree.NthOf(AInstance, NodeRole.GenericParam, LI)].ResolvedType, ADepth + 1);
+      end;
+      return LText + ">";
+    end;
+
+    // The canonical type AType as Adam writes it (DoFail for one no text names: unknown, an
+    // inline type, a method's routine type, past ADAM_BINDING_MAX_DEPTH)
+    hidden method DoTypeText(const AType: int64; const ADepth: int64): string;
+    var
+      LKind: NodeKind;
+      LSource: int64;
+      LOver: string;
+    begin
+      if (AType = 0) or (ADepth > ADAM_BINDING_MAX_DEPTH) then
+        self.DoFail(ADAM_BINDING_WHY_TYPE);
+        return "?";
+      end;
+      LKind := self.FTree[AType].Kind;
+      if LKind = NodeKind.BuiltinTypeDecl then
+        return self.FTree[AType].Text;
+      end;
+      if LKind = NodeKind.TypeDecl then
+        if InstanceOf(self.FTree, AType) <> 0 then
+          return self.DoInstanceText(InstanceOf(self.FTree, AType), ADepth);
+        end;
+        // an inline type (TODO 6) is named by its member path: no name reaches it
+        if IndexOf(".", self.FTree[AType].Text, 0) >= 0 then
+          self.DoFail(ADAM_BINDING_WHY_TYPE);
+          return "?";
+        end;
+        self.DoNoteModule(AType);
+        return self.FTree[AType].Text;
+      end;
+      if self.FTree.ParentOf(AType) <> ADAM_AST_DERIVED then
+        self.DoFail(ADAM_BINDING_WHY_TYPE);
+        return "?";
+      end;
+      LSource := self.FTree[AType].ResolvedDecl;
+      if LKind = NodeKind.NilLiteral then
+        return "nil";
+      end;
+      if LKind = NodeKind.RoutineType then
+        if self.FTree[AType].HasFlag(NodeFlag.TakesSelf) then
+          self.DoFail(ADAM_BINDING_WHY_TYPE);
+          return "?";
+        end;
+        return self.DoRoutineTypeText(LSource, ADepth + 1);
+      end;
+      if (LKind = NodeKind.TaskType) and (self.FTree[AType].ResolvedType = 0) then
+        return "task";
+      end;
+      if (LKind = NodeKind.PointerType) and (self.FTree[AType].ResolvedType = 0) then
+        return "ptr to const";
+      end;
+      LOver := self.DoTypeText(self.FTree[AType].ResolvedType, ADepth + 1);
+      if LKind = NodeKind.TaskType then
+        return "task " + LOver;
+      end;
+      if LKind = NodeKind.SequenceType then
+        return "sequence of " + LOver;
+      end;
+      if LKind = NodeKind.PointerType then
+        if IsConstTarget(self.FTree, AType) then
+          return "ptr to const " + LOver;
+        end;
+        return "ptr to " + LOver;
+      end;
+      if LKind = NodeKind.OwnType then
+        return "own " + LOver;
+      end;
+      if LKind = NodeKind.RefType then
+        return "ref " + LOver;
+      end;
+      if LKind = NodeKind.WeakType then
+        return "weak " + LOver;
+      end;
+      if ClassOf(self.FTree, AType) = TypeClass.DynamicArray then
+        return "array of " + LOver;
+      end;
+      if ClassOf(self.FTree, AType) = TypeClass.FlexibleArray then
+        return "array[0..] of " + LOver;
+      end;
+      // a static array: its bounds as folded (a choices bound by its value's name)
+      return "array[" + self.DoValueText(self.FTree.FirstOf(LSource, NodeRole.LowBound), 0, ADepth + 1) + ".." +
+        self.DoValueText(self.FTree.FirstOf(LSource, NodeRole.HighBound), 0, ADepth + 1) + "] of " + LOver;
+    end;
+
+    // The written type expression AExpr's text: a name of a declared type as written (an
+    // alias kept: Combine, StringArray), a routine type with its parameters' names, any
+    // other its canonical type's
+    hidden method DoWrittenText(const AExpr: int64; const ADepth: int64): string;
+    var
+      LDecl: int64;
+    begin
+      if (AExpr <> 0) and (self.FTree[AExpr].Kind = NodeKind.NamedType) and
+        (self.FTree.FirstOf(AExpr, NodeRole.TypeArgument) = 0) then
+        LDecl := self.FTree[AExpr].ResolvedDecl;
+        if (LDecl <> 0) and (self.FTree[LDecl].Kind = NodeKind.TypeDecl) and
+          (self.FTree.FirstOf(LDecl, NodeRole.GenericParam) = 0) and
+          (IndexOf(".", self.FTree[LDecl].Text, 0) < 0) then
+          self.DoNoteModule(LDecl);
+          return self.FTree[LDecl].Text;
+        end;
+      end;
+      if (AExpr <> 0) and (self.FTree[AExpr].Kind = NodeKind.RoutineType) then
+        return self.DoRoutineTypeText(AExpr, ADepth + 1);
+      end;
+      return self.DoTypeText(CanonicalOf(self.FTree, AExpr), ADepth);
+    end;
+
+    // The parameter list of the signature ASig (a routine, a method, a routine type, an
+    // init / copy, an operator): (var / const Name: T; ...; ...)
+    hidden method DoParamsText(const ASig: int64; const ADepth: int64): string;
+    var
+      LText: string;
+      LI: int64;
+      LParam: int64;
+    begin
+      LText := "(";
+      for LI := 0 to self.FTree.CountOf(ASig, NodeRole.Param) - 1 do
+        LParam := self.FTree.NthOf(ASig, NodeRole.Param, LI);
+        if LI > 0 then
+          LText := LText + "; ";
+        end;
+        if self.FTree[LParam].HasFlag(NodeFlag.VarParam) then
+          LText := LText + "var ";
+        end;
+        if self.FTree[LParam].HasFlag(NodeFlag.ConstParam) then
+          LText := LText + "const ";
+        end;
+        // a derived routine type's signature has no names: A1, A2 .. (a routine type's
+        // parameter names are only words)
+        if self.FTree[LParam].Text = "" then
+          LText := LText + "A" + IntToStr(LI + 1);
+        else
+          LText := LText + self.FTree[LParam].Text;
+        end;
+        LText := LText + ": " + self.DoWrittenText(self.FTree.FirstOf(LParam, NodeRole.TypeOf), ADepth + 1);
+      end;
+      if self.FTree[ASig].HasFlag(NodeFlag.Variadic) then
+        if self.FTree.CountOf(ASig, NodeRole.Param) > 0 then
+          LText := LText + "; ";
+        end;
+        LText := LText + "...";
+      end;
+      return LText + ")";
+    end;
+
+    // ": T" of the signature ASig's result ("" for none)
+    hidden method DoResultText(const ASig: int64; const ADepth: int64): string;
+    var
+      LReturn: int64;
+    begin
+      LReturn := self.FTree.FirstOf(ASig, NodeRole.ReturnType);
+      if LReturn = 0 then
+        return "";
+      end;
+      return ": " + self.DoWrittenText(LReturn, ADepth + 1);
+    end;
+
+    // The routine type of the signature ASig: routine [clink | cpplink](..)[: R] (cpplink
+    // whenever it has C++ linkage, Types' IsCppSignature; clink only as written)
+    hidden method DoRoutineTypeText(const ASig: int64; const ADepth: int64): string;
+    var
+      LText: string;
+    begin
+      LText := "routine";
+      if IsCppSignature(self.FTree, ASig) then
+        LText := LText + " cpplink";
+      else
+        if self.FTree[ASig].HasFlag(NodeFlag.Clink) then
+          LText := LText + " clink";
+        end;
+      end;
+      return LText + self.DoParamsText(ASig, ADepth) + self.DoResultText(ASig, ADepth);
+    end;
+
+    // The value of choices type AType whose number is ABits, as Type.Value
+    hidden method DoChoiceText(const AType: int64; const ABits: uint64): string;
+    var
+      LBody: int64;
+      LValue: int64;
+      LI: int64;
+    begin
+      LBody := BodyOf(self.FTree, AType);
+      for LI := 0 to self.FTree.CountOf(LBody, NodeRole.Member) - 1 do
+        LValue := self.FTree.NthOf(LBody, NodeRole.Member, LI);
+        if self.FTree[LValue].ResolvedConst.Bits = ABits then
+          return self.DoTypeText(AType, 0) + "." + self.FTree[LValue].Text;
+        end;
+      end;
+      self.DoFail(ADAM_BINDING_WHY_VALUE);
+      return "?";
+    end;
+
+    // The folded constant AValue of the canonical type AType as an Adam literal
+    hidden method DoConstText(const AValue: ConstValue; const AType: int64): string;
+    var
+      LClass: TypeClass;
+      LText: string;
+    begin
+      LClass := ClassOf(self.FTree, AType);
+      match AValue.Kind of
+        ConstKind.Signed, ConstKind.Unsigned:
+          if LClass = TypeClass.ChoicesType then
+            return self.DoChoiceText(AType, AValue.Bits);
+          end;
+          if AValue.Kind = ConstKind.Signed then
+            return DoSignedText(AValue.Bits);
+          end;
+          return DoUnsignedText(AValue.Bits);
+        ConstKind.Float:
+          LText := DoFloatText(AValue.Float, (AType <> 0) and (self.FTree[AType].Text = "float32"));
+          if LText = "" then
+            self.DoFail(ADAM_BINDING_WHY_VALUE);
+            return "?";
+          end;
+          return LText;
+        ConstKind.Boolean:
+          if AValue.Bits <> 0 then
+            return "true";
+          end;
+          return "false";
+        ConstKind.Char:
+          return DoCharLiteral(AValue.Bits, LClass = TypeClass.WideChar);
+        ConstKind.String:
+          return DoStringLiteral(AValue.Text);
+        ConstKind.Nil:
+          return "nil";
+      else
+        // a set and an unfolded value are spelled from their expression (DoValueText)
+      end;
+      self.DoFail(ADAM_BINDING_WHY_VALUE);
+      return "?";
+    end;
+
+    // The elements under AList (role Element) of an array or set literal, joined by ", ":
+    // a set element its bounds (a..b); an array literal Semantics made from set brackets
+    // keeps them as set elements of one value
+    hidden method DoElementsText(const AList: int64; const AElement: int64; const ADepth: int64): string;
+    var
+      LText: string;
+      LI: int64;
+      LItem: int64;
+      LHigh: int64;
+    begin
+      LText := "";
+      for LI := 0 to self.FTree.CountOf(AList, NodeRole.Element) - 1 do
+        LItem := self.FTree.NthOf(AList, NodeRole.Element, LI);
+        if LI > 0 then
+          LText := LText + ", ";
+        end;
+        if self.FTree[LItem].Kind = NodeKind.SetElement then
+          LText := LText + self.DoValueText(self.FTree.FirstOf(LItem, NodeRole.LowBound), AElement, ADepth + 1);
+          LHigh := self.FTree.FirstOf(LItem, NodeRole.HighBound);
+          if LHigh <> 0 then
+            LText := LText + ".." + self.DoValueText(LHigh, AElement, ADepth + 1);
+          end;
+        else
+          LText := LText + self.DoValueText(LItem, AElement, ADepth + 1);
+        end;
+      end;
+      return LText;
+    end;
+
+    // The constant expression AExpr (of the canonical type AType; 0: its own) as Adam
+    // spells its value: a folded one its literal (DoConstText), an array or set literal
+    // element by element, a record literal field by field, a parenthesis its inside
+    hidden method DoValueText(const AExpr: int64; const AType: int64; const ADepth: int64): string;
+    var
+      LType: int64;
+      LKind: NodeKind;
+      LText: string;
+      LI: int64;
+      LField: int64;
+      LElement: int64;
+    begin
+      if (AExpr = 0) or (ADepth > ADAM_BINDING_MAX_DEPTH) then
+        self.DoFail(ADAM_BINDING_WHY_VALUE);
+        return "?";
+      end;
+      LType := self.FTree[AExpr].ResolvedType;
+      if LType = 0 then
+        LType := AType;
+      end;
+      LKind := self.FTree[AExpr].Kind;
+      if (self.FTree[AExpr].ResolvedConst.Kind <> ConstKind.Unknown) and
+        (self.FTree[AExpr].ResolvedConst.Kind <> ConstKind.Set) then
+        return self.DoConstText(self.FTree[AExpr].ResolvedConst, LType);
+      end;
+      if LKind = NodeKind.ParenExpression then
+        return self.DoValueText(self.FTree.ChildAt(AExpr, 0), LType, ADepth + 1);
+      end;
+      if (LKind = NodeKind.ArrayLiteral) or (LKind = NodeKind.SetLiteral) then
+        // an array's element type, a set's member type (each element folded alone)
+        LElement := 0;
+        if (ClassOf(self.FTree, LType) = TypeClass.StaticArray) or (ClassOf(self.FTree, LType) = TypeClass.DynamicArray) then
+          LElement := TargetOf(self.FTree, LType);
+        end;
+        if ClassOf(self.FTree, LType) = TypeClass.SetType then
+          LElement := SetMemberOf(self.FTree, LType);
+        end;
+        return "[" + self.DoElementsText(AExpr, LElement, ADepth) + "]";
+      end;
+      if LKind = NodeKind.RecordLiteral then
+        LText := self.DoTypeText(LType, ADepth + 1) + "(";
+        for LI := 0 to self.FTree.CountOf(AExpr, NodeRole.Argument) - 1 do
+          LField := self.FTree.NthOf(AExpr, NodeRole.Argument, LI);
+          if LI > 0 then
+            LText := LText + ", ";
+          end;
+          LText := LText + self.FTree[LField].Text + ": " +
+            self.DoValueText(self.FTree.FirstOf(LField, NodeRole.Value), 0, ADepth + 1);
+        end;
+        return LText + ")";
+      end;
+      self.DoFail(ADAM_BINDING_WHY_VALUE);
+      return "?";
+    end;
+
+    // The comment written in place of the declaration (or member) named AName, at AIndent
+    hidden method DoLeftOut(const AIndent: string; const AName: string; const AWhy: string): string;
+    begin
+      return AIndent + "// " + AName + ": not bound, " + AWhy + "\n";
+    end;
+
+    // The packing and align(N) words of the record body (or part) ABody ("" for none),
+    // each after a space
+    hidden method DoPackingText(const ABody: int64): string;
+    var
+      LText: string;
+      LValue: int64;
+    begin
+      LText := "";
+      if self.FTree[ABody].HasFlag(NodeFlag.Packed) then
+        if self.FTree.FirstOf(ABody, NodeRole.Pack) <> 0 then
+          LText := " packed(" + IntToStr(PackLimit(self.FTree, self.FTarget, ABody)) + ")";
+        else
+          LText := " packed";
+        end;
+      end;
+      LValue := 0;
+      if BoundValue(self.FTree, self.FTarget, self.FTree.FirstOf(ABody, NodeRole.Align), LValue) then
+        LText := LText + " align(" + IntToStr(LValue) + ")";
+      end;
+      return LText;
+    end;
+
+    // The field AField's type: an inline record / overlay (TODO 6) written whole after
+    // AIndent, any other its canonical type's text
+    hidden method DoFieldTypeText(const AField: int64; const AIndent: string): string;
+    var
+      LWritten: int64;
+      LBody: int64;
+    begin
+      LWritten := self.FTree.FirstOf(AField, NodeRole.TypeOf);
+      if (LWritten <> 0) and (self.FTree[LWritten].Kind = NodeKind.TypeDecl) then
+        LBody := self.FTree.FirstOf(LWritten, NodeRole.TypeOf);
+        if self.FTree[LBody].Kind = NodeKind.OverlayType then
+          return "overlay\n" + self.DoAggregateMembers(LBody, AIndent + ADAM_BINDING_INDENT) + AIndent + "end";
+        end;
+        return "record" + self.DoPackingText(LBody) + "\n" +
+          self.DoAggregateMembers(LBody, AIndent + ADAM_BINDING_INDENT) + AIndent + "end";
+      end;
+      return self.DoWrittenText(LWritten, 0);
+    end;
+
+    // The field AField: [AWords]Name: T[ : width]; after AIndent (AWords: an object's
+    // `hidden `)
+    hidden method DoFieldText(const AField: int64; const AIndent: string; const AWords: string): string;
+    var
+      LText: string;
+    begin
+      LText := AIndent + AWords + self.FTree[AField].Text + ": " + self.DoFieldTypeText(AField, AIndent);
+      if self.FTree[AField].ResolvedBitWidth > 0 then
+        LText := LText + " : " + IntToStr(int64(self.FTree[AField].ResolvedBitWidth));
+      end;
+      // `_: T : 0;` (M9e0c) is written by its width too
+      if IsUnnamedField(self.FTree, AField) and (self.FTree[AField].ResolvedBitWidth = 0) then
+        LText := LText + " : 0";
+      end;
+      return LText + ";\n";
+    end;
+
+    // The members of the record or overlay body (or part) ABody, each after AIndent:
+    // fields, anonymous parts, a record's operators as comments (ADAM_BINDING_WHY_OPERATOR)
+    hidden method DoAggregateMembers(const ABody: int64; const AIndent: string): string;
+    var
+      LText: string;
+      LI: int64;
+      LMember: int64;
+      LKind: NodeKind;
+    begin
+      LText := "";
+      for LI := 0 to self.FTree.CountOf(ABody, NodeRole.Member) - 1 do
+        LMember := self.FTree.NthOf(ABody, NodeRole.Member, LI);
+        LKind := self.FTree[LMember].Kind;
+        if LKind = NodeKind.FieldDecl then
+          LText := LText + self.DoFieldText(LMember, AIndent, "");
+        end;
+        if LKind = NodeKind.AnonRecord then
+          LText := LText + AIndent + "record" + self.DoPackingText(LMember) + "\n" +
+            self.DoAggregateMembers(LMember, AIndent + ADAM_BINDING_INDENT) + AIndent + "end;\n";
+        end;
+        if LKind = NodeKind.AnonOverlay then
+          LText := LText + AIndent + "overlay\n" + self.DoAggregateMembers(LMember, AIndent + ADAM_BINDING_INDENT) +
+            AIndent + "end;\n";
+        end;
+        if LKind = NodeKind.OperatorDecl then
+          LText := LText + self.DoLeftOut(AIndent, "operator " + self.FTree[LMember].Text, ADAM_BINDING_WHY_OPERATOR);
+        end;
+      end;
+      return LText;
+    end;
+
+    // The record or overlay body ABody of a type declaration, after its '= ', its members
+    // at AIndent
+    hidden method DoAggregateText(const ABody: int64; const AIndent: string): string;
+    var
+      LText: string;
+      LParent: int64;
+    begin
+      if self.FTree[ABody].Kind = NodeKind.OverlayType then
+        return "overlay\n" + self.DoAggregateMembers(ABody, AIndent + ADAM_BINDING_INDENT) + AIndent + "end";
+      end;
+      LText := "record";
+      LParent := self.FTree.FirstOf(ABody, NodeRole.Parent);
+      if LParent <> 0 then
+        LText := LText + "(" + self.DoWrittenText(LParent, 0) + ")";
+      end;
+      return LText + self.DoPackingText(ABody) + "\n" +
+        self.DoAggregateMembers(ABody, AIndent + ADAM_BINDING_INDENT) + AIndent + "end";
+    end;
+
+    // The choices body ABody: choices(A = 0, B = 1) (every value's number as folded)
+    hidden method DoChoicesText(const ABody: int64): string;
+    var
+      LText: string;
+      LI: int64;
+      LValue: int64;
+    begin
+      LText := "choices(";
+      for LI := 0 to self.FTree.CountOf(ABody, NodeRole.Member) - 1 do
+        LValue := self.FTree.NthOf(ABody, NodeRole.Member, LI);
+        if LI > 0 then
+          LText := LText + ", ";
+        end;
+        LText := LText + self.FTree[LValue].Text + " = " + DoSignedText(self.FTree[LValue].ResolvedConst.Bits);
+      end;
+      return LText + ")";
+    end;
+
+    // The set body ABody: set of T, or set of lo..hi (its bounds as folded)
+    hidden method DoSetText(const ABody: int64): string;
+    var
+      LElement: int64;
+    begin
+      LElement := self.FTree.FirstOf(ABody, NodeRole.Element);
+      if LElement <> 0 then
+        return "set of " + self.DoWrittenText(LElement, 0);
+      end;
+      return "set of " + self.DoValueText(self.FTree.FirstOf(ABody, NodeRole.LowBound), 0, 0) + ".." +
+        self.DoValueText(self.FTree.FirstOf(ABody, NodeRole.HighBound), 0, 0);
+    end;
+
+    // The words a method or property AMember carries before its word (hidden virtual /
+    // override final const), each followed by a space
+    hidden const method DoMemberWords(const AMember: int64; const AHidden: bool): string;
+    var
+      LText: string;
+    begin
+      LText := "";
+      if AHidden and self.FTree[AMember].HasFlag(NodeFlag.Hidden) then
+        LText := LText + "hidden ";
+      end;
+      if self.FTree[AMember].HasFlag(NodeFlag.Virtual) then
+        LText := LText + "virtual ";
+      end;
+      if self.FTree[AMember].HasFlag(NodeFlag.Override) then
+        LText := LText + "override ";
+      end;
+      if self.FTree[AMember].HasFlag(NodeFlag.Final) then
+        LText := LText + "final ";
+      end;
+      if self.FTree[AMember].HasFlag(NodeFlag.ConstMethod) then
+        LText := LText + "const ";
+      end;
+      return LText;
+    end;
+
+    // The property accessor AAccessor (read / write; 0: none) of an external type's
+    // property: bound to a field `read F;`, `abstract;`, else its heading alone (`read;` /
+    // `write(AValue);`): the library's function (Lowering's IsExternalMemberCode)
+    hidden const method DoAccessorText(const AAccessor: int64; const AWord: string): string;
+    var
+      LText: string;
+      LParam: int64;
+    begin
+      if AAccessor = 0 then
+        return "";
+      end;
+      LText := " ";
+      if self.FTree[AAccessor].HasFlag(NodeFlag.Hidden) then
+        LText := LText + "hidden ";
+      end;
+      LText := LText + AWord;
+      if self.FTree[AAccessor].HasFlag(NodeFlag.Abstract) then
+        return LText + " abstract;";
+      end;
+      if self.FTree[AAccessor].Text <> "" then
+        return LText + " " + self.FTree[AAccessor].Text + ";";
+      end;
+      LParam := self.FTree.FirstOf(AAccessor, NodeRole.Param);
+      if LParam <> 0 then
+        return LText + "(" + self.FTree[LParam].Text + ");";
+      end;
+      return LText + ";";
+    end;
+
+    // The property AProp's heading: words, property Name[[const] AI: T]: T, its accessors,
+    // default;
+    hidden method DoPropertyText(const AProp: int64; const AInterface: bool): string;
+    var
+      LText: string;
+      LIndex: int64;
+    begin
+      LText := self.DoMemberWords(AProp, true) + "property " + self.FTree[AProp].Text;
+      LIndex := self.FTree.FirstOf(AProp, NodeRole.Param);
+      if LIndex <> 0 then
+        LText := LText + "[";
+        if self.FTree[LIndex].HasFlag(NodeFlag.ConstParam) then
+          LText := LText + "const ";
+        end;
+        LText := LText + self.FTree[LIndex].Text + ": " +
+          self.DoWrittenText(self.FTree.FirstOf(LIndex, NodeRole.TypeOf), 0) + "]";
+      end;
+      LText := LText + ": " + self.DoWrittenText(self.FTree.FirstOf(AProp, NodeRole.TypeOf), 0);
+      if AInterface then
+        LText := LText + " read;";
+        if self.FTree.FirstOf(AProp, NodeRole.Write) <> 0 then
+          LText := LText + " write;";
+        end;
+        return LText;
+      end;
+      LText := LText + self.DoAccessorText(self.FTree.FirstOf(AProp, NodeRole.Read), "read") +
+        self.DoAccessorText(self.FTree.FirstOf(AProp, NodeRole.Write), "write");
+      if self.FTree[AProp].HasFlag(NodeFlag.DefaultProperty) then
+        LText := LText + " default;";
+      end;
+      return LText;
+    end;
+
+    // The member AMember of an object type or interface (AInterface) as its heading after
+    // AIndent (see the header); a generic method a comment
+    hidden method DoObjectMember(const AMember: int64; const AIndent: string; const AInterface: bool): string;
+    var
+      LKind: NodeKind;
+      LText: string;
+    begin
+      LKind := self.FTree[AMember].Kind;
+      if self.FTree.FirstOf(AMember, NodeRole.GenericParam) <> 0 then
+        return self.DoLeftOut(AIndent, self.FTree[AMember].Text, ADAM_BINDING_WHY_GENERIC);
+      end;
+      match LKind of
+        NodeKind.FieldDecl:
+          LText := "";
+          if self.FTree[AMember].HasFlag(NodeFlag.Hidden) then
+            LText := "hidden ";
+          end;
+          return self.DoFieldText(AMember, AIndent, LText);
+        NodeKind.EmbedDecl:
+          LText := "";
+          if self.FTree[AMember].HasFlag(NodeFlag.Hidden) then
+            LText := "hidden ";
+          end;
+          return AIndent + LText + "embed " + self.FTree[AMember].Text + ": " +
+            self.DoWrittenText(self.FTree.FirstOf(AMember, NodeRole.TypeOf), 0) + ";\n";
+        NodeKind.MethodDecl:
+          LText := AIndent + self.DoMemberWords(AMember, true) + "method " + self.FTree[AMember].Text +
+            self.DoParamsText(AMember, 0) + self.DoResultText(AMember, 0) + ";";
+          if self.FTree[AMember].HasFlag(NodeFlag.Abstract) then
+            LText := LText + " abstract;";
+          end;
+          return LText + "\n";
+        NodeKind.PropertyDecl:
+          return AIndent + self.DoPropertyText(AMember, AInterface) + "\n";
+        NodeKind.InitDecl:
+          return AIndent + "init" + self.DoParamsText(AMember, 0) + ";\n";
+        NodeKind.CopyDecl:
+          return AIndent + "copy" + self.DoParamsText(AMember, 0) + ";\n";
+        NodeKind.DoneDecl:
+          return AIndent + "done;\n";
+        NodeKind.OperatorDecl:
+          return AIndent + "operator " + self.FTree[AMember].Text + self.DoParamsText(AMember, 0) +
+            self.DoResultText(AMember, 0) + ";\n";
+      else
+        // nothing else is an object's member
+      end;
+      return "";
+    end;
+
+    // The object type or interface body ABody of a type declaration after its '= ' (its
+    // members at AIndent): [final] object[(P)][ implements I, J] / interface[(P)], the
+    // members' headings, end
+    hidden method DoObjectText(const ABody: int64; const AIndent: string): string;
+    var
+      LText: string;
+      LParent: int64;
+      LInterface: bool;
+      LI: int64;
+    begin
+      LInterface := self.FTree[ABody].Kind = NodeKind.InterfaceType;
+      LText := "";
+      if LInterface then
+        LText := "interface";
+      else
+        if self.FTree[ABody].HasFlag(NodeFlag.Final) then
+          LText := "final ";
+        end;
+        LText := LText + "object";
+      end;
+      LParent := self.FTree.FirstOf(ABody, NodeRole.Parent);
+      if LParent <> 0 then
+        LText := LText + "(" + self.DoWrittenText(LParent, 0) + ")";
+      end;
+      for LI := 0 to self.FTree.CountOf(ABody, NodeRole.Implements) - 1 do
+        if LI = 0 then
+          LText := LText + " implements ";
+        else
+          LText := LText + ", ";
+        end;
+        LText := LText + self.DoWrittenText(self.FTree.NthOf(ABody, NodeRole.Implements, LI), 0);
+      end;
+      LText := LText + "\n";
+      for LI := 0 to self.FTree.CountOf(ABody, NodeRole.Member) - 1 do
+        LText := LText + self.DoObjectMember(self.FTree.NthOf(ABody, NodeRole.Member, LI),
+          AIndent + ADAM_BINDING_INDENT, LInterface);
+      end;
+      return LText + AIndent + "end";
+    end;
+
+    // The block word AWord opened ("public const" / "public type" / "public var" on a
+    // line of its own) unless it is the open one; "" closes any (a routine, a forward)
+    hidden method DoOpen(const AWord: string);
+    begin
+      if AWord = self.FBlock then
+        return;
+      end;
+      if self.FOut.Count > 0 then
+        self.FOut.Add("\n");
+      end;
+      if AWord <> "" then
+        self.FOut.Add("public " + AWord + "\n");
+      end;
+      self.FBlock := AWord;
+      self.FFirst := true;
+      self.FLastObject := false;
+    end;
+
+    // The text of the declaration ADecl inside its open block (its indentation included),
+    // its reason in a comment instead when it has none (FWhy)
+    hidden method DoPut(const ADecl: int64; const AText: string; const AIndent: string);
+    begin
+      if self.FWhy <> "" then
+        self.FOut.Add(self.DoLeftOut(AIndent, self.FTree[ADecl].Text, self.FWhy));
+      else
+        self.FOut.Add(AText);
+      end;
+      self.FWhy := "";
+    end;
+
+    // ` external "<name>"` and, when the symbol ASymbol is not what the declaration ADecl
+    // binds by its name (C linkage), ` name "sym"`; then ';'
+    hidden const method DoExternalText(const ADecl: int64): string;
+    var
+      LText: string;
+    begin
+      LText := " external " + self.FLibrary;
+      if (self.FTree[ADecl].ResolvedLinkage <> Linkage.Cpp) and
+        (self.FTree[ADecl].ResolvedSymbol <> self.FTree[ADecl].Text) then
+        LText := LText + " name " + DoStringLiteral(self.FTree[ADecl].ResolvedSymbol);
+      end;
+      return LText + ";";
+    end;
+
+    // The public constant ADecl: Name: T = value;
+    method DeclareConst(const ADecl: int64);
+    var
+      LType: int64;
+      LText: string;
+    begin
+      self.DoOpen("const");
+      LType := CanonicalOf(self.FTree, self.FTree.FirstOf(ADecl, NodeRole.TypeOf));
+      LText := ADAM_BINDING_INDENT + self.FTree[ADecl].Text + ": " +
+        self.DoWrittenText(self.FTree.FirstOf(ADecl, NodeRole.TypeOf), 0) + " = " +
+        self.DoValueText(self.FTree.FirstOf(ADecl, NodeRole.Initializer), LType, 0) + ";\n";
+      self.DoPut(ADecl, LText, ADAM_BINDING_INDENT);
+    end;
+
+    // The public type declaration ADecl as written (see the header)
+    method DeclareType(const ADecl: int64);
+    var
+      LBody: int64;
+      LKind: NodeKind;
+      LText: string;
+    begin
+      self.DoOpen("type");
+      if (self.FTree.FirstOf(ADecl, NodeRole.GenericParam) <> 0) or (InstanceAbove(self.FTree, ADecl) <> 0) then
+        self.DoFail(ADAM_BINDING_WHY_GENERIC);
+        self.DoPut(ADecl, "", ADAM_BINDING_INDENT);
+        return;
+      end;
+      if IsExternalType(self.FTree, ADecl) then
+        self.DoFail(ADAM_BINDING_WHY_EXTERNAL);
+        self.DoPut(ADecl, "", ADAM_BINDING_INDENT);
+        return;
+      end;
+      LBody := self.FTree.FirstOf(ADecl, NodeRole.TypeOf);
+      LKind := NodeKind.None;
+      if LBody <> 0 then
+        LKind := self.FTree[LBody].Kind;
+      end;
+      LText := ADAM_BINDING_INDENT + self.FTree[ADecl].Text + " = ";
+      match LKind of
+        NodeKind.RecordType, NodeKind.OverlayType:
+          LText := LText + self.DoAggregateText(LBody, ADAM_BINDING_INDENT) + ";\n";
+        NodeKind.ObjectType, NodeKind.InterfaceType:
+          LText := LText + self.DoObjectText(LBody, ADAM_BINDING_INDENT) + ";" + self.DoExternalTypeText() + "\n";
+        NodeKind.ChoicesType:
+          LText := LText + self.DoChoicesText(LBody) + ";\n";
+        NodeKind.SetType:
+          LText := LText + self.DoSetText(LBody) + ";\n";
+      else
+        // an alias, an array, a pointer or a routine type: its type's text
+        LText := LText + self.DoWrittenText(LBody, 0) + ";\n";
+      end;
+      // a blank line before and after an object type or an interface (its members stand
+      // apart), none at its block's start
+      if ((LKind = NodeKind.ObjectType) or (LKind = NodeKind.InterfaceType) or self.FLastObject) and
+        not self.FFirst then
+        self.FOut.Add("\n");
+      end;
+      self.FFirst := false;
+      self.FLastObject := (LKind = NodeKind.ObjectType) or (LKind = NodeKind.InterfaceType);
+      self.DoPut(ADecl, LText, ADAM_BINDING_INDENT);
+    end;
+
+    // ` external "<name>";` after an object type's or interface's end;
+    hidden const method DoExternalTypeText(): string;
+    begin
+      return " external " + self.FLibrary + ";";
+    end;
+
+    // The forward type ADecl (a type below completes it): forward type Name;
+    method DeclareForward(const ADecl: int64);
+    begin
+      self.DoOpen("");
+      self.FOut.Add("forward type " + self.FTree[ADecl].Text + ";\n");
+    end;
+
+    // The exported variable ADecl: Name: T; external "<name>";
+    method DeclareVar(const ADecl: int64);
+    var
+      LText: string;
+    begin
+      self.DoOpen("var");
+      LText := ADAM_BINDING_INDENT + self.FTree[ADecl].Text + ": " +
+        self.DoWrittenText(self.FTree.FirstOf(ADecl, NodeRole.TypeOf), 0) + ";" + self.DoExternalText(ADecl) + "\n";
+      self.DoPut(ADecl, LText, ADAM_BINDING_INDENT);
+    end;
+
+    // The exported routine ADecl (or a public generic one: a comment): public routine
+    // [cpplink] Name(..)[: R]; [noreturn;] external "<name>";
+    method DeclareRoutine(const ADecl: int64);
+    var
+      LText: string;
+    begin
+      self.DoOpen("");
+      if self.FTree.FirstOf(ADecl, NodeRole.GenericParam) <> 0 then
+        self.DoFail(ADAM_BINDING_WHY_GENERIC);
+        self.DoPut(ADecl, "", "");
+        return;
+      end;
+      LText := "public routine ";
+      if self.FTree[ADecl].ResolvedLinkage = Linkage.Cpp then
+        LText := LText + "cpplink ";
+      end;
+      LText := LText + self.FTree[ADecl].Text + self.DoParamsText(ADecl, 0) + self.DoResultText(ADecl, 0) + ";";
+      if self.FTree[ADecl].HasFlag(NodeFlag.NoReturn) then
+        LText := LText + " noreturn;";
+      end;
+      self.DoPut(ADecl, LText + self.DoExternalText(ADecl) + "\n", "");
+    end;
+
+    // The whole unit of the main module, its kind's word AKind (dll, lib)
+    const method Text(const AKind: string): string;
+    var
+      LOut: ref TextBuilder;
+      LName: string;
+      LImports: string;
+      LUnit: int64;
+      LI: int64;
+    begin
+      LName := self.FTree[self.FModule].Text;
+      LImports := "";
+      for LI := 0 to self.FTree.CountOf(self.FModule, NodeRole.Import) - 1 do
+        LUnit := self.FTree[self.FTree.NthOf(self.FModule, NodeRole.Import, LI)].ResolvedUnit;
+        if (LUnit = 0) or (self.FNamed.Find(LUnit) = 0) then
+          skip;
+        end;
+        if LImports <> "" then
+          LImports := LImports + ", ";
+        end;
+        LImports := LImports + self.FTree[LUnit].Text;
+      end;
+      LOut := ref TextBuilder();
+      LOut.Add("// " + LName + ADAM_EXT_SOURCE + " - the Adam binding of the Adam " + AKind + " " + LName +
+        ", written by adam: do not edit\n\n");
+      LOut.Add("module unit " + LName + ";\n\n");
+      if LImports <> "" then
+        LOut.Add("import " + LImports + ";\n\n");
+      end;
+      LOut.Add(self.FOut.Text());
+      if self.FOut.Count > 0 then
+        LOut.Add("\n");
+      end;
+      LOut.Add("end.\n");
+      return LOut.Text();
+    end;
+  end;
+
+// True when a public type declaration of the module AModule completes the forward type
+// AForward (its name): only such a forward is the binding's
+routine DoCompletesPublic(const ATree: ref SyntaxTree; const AModule: int64; const AForward: int64): bool;
+var
+  LDecl: int64;
+  LI: int64;
+begin
+  for LI := 0 to ATree.CountOf(AModule, NodeRole.Declaration) - 1 do
+    LDecl := ATree.NthOf(AModule, NodeRole.Declaration, LI);
+    if (ATree[LDecl].Kind = NodeKind.TypeDecl) and (ATree[LDecl].Text = ATree[AForward].Text) then
+      return ATree[LDecl].HasFlag(NodeFlag.Public);
+    end;
+  end;
+  return false;
+end;
+
+// The binding unit <name>.adam of the main module AModule (a dll when ADll, else a lib):
+// its public constants and types, its forward types, and ADecls (its exported routines
+// and variables and its public generic routines, the Driver's DoHeaderDecls set), in
+// declaration order (see the header)
+public routine WriteBinding(const ATree: ref SyntaxTree; const ATarget: ref Target; const AModule: int64;
+  const ADecls: Int64Array; const ADll: bool): string;
+var
+  LWriter: ref BindingWriter;
+  LKind: string;
+  LExported: ref Int64Map;
+  LDecl: int64;
+  LI: int64;
+begin
+  LWriter := ref BindingWriter(ATree, ATarget, AModule);
+  LExported := ref Int64Map(0);
+  for LI := 0 to len(ADecls) - 1 do
+    LExported.Put(ADecls[LI], 1);
+  end;
+  for LI := 0 to ATree.CountOf(AModule, NodeRole.Declaration) - 1 do
+    LDecl := ATree.NthOf(AModule, NodeRole.Declaration, LI);
+    if ATree[LDecl].HasFlag(NodeFlag.Recovered) then
+      skip;
+    end;
+    if LExported.Find(LDecl) <> 0 then
+      if ATree[LDecl].Kind = NodeKind.VarDecl then
+        LWriter.DeclareVar(LDecl);
+      else
+        LWriter.DeclareRoutine(LDecl);
+      end;
+      skip;
+    end;
+    if ATree[LDecl].Kind = NodeKind.ForwardType then
+      if DoCompletesPublic(ATree, AModule, LDecl) then
+        LWriter.DeclareForward(LDecl);
+      end;
+      skip;
+    end;
+    if not ATree[LDecl].HasFlag(NodeFlag.Public) then
+      skip;
+    end;
+    match ATree[LDecl].Kind of
+      NodeKind.ConstDecl: LWriter.DeclareConst(LDecl);
+      NodeKind.TypeDecl: LWriter.DeclareType(LDecl);
+    else
+      // a routine or variable the library does not export has no binding
+    end;
+  end;
+  LKind := "lib";
+  if ADll then
+    LKind := "dll";
+  end;
+  return LWriter.Text(LKind);
+end;
+
+end.
