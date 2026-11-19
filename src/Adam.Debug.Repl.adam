@@ -1,0 +1,1149 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Debug.Repl.adam - Adam's console debugger (M11a D4, adam build -d)
+
+  DebugRepl drives a DebugRuntime (Adam.Debug.Runtime) from a prompt,
+  `(dbg) `, one command a line, as pcpp's console debugger did (its command
+  set and its look, Adam's names):
+
+    b <file>:<line>  a breakpoint (the last ':' splits, so a drive letter
+                     may come first; a bare file name is a module of the
+                     program); b <line>: the selected frame's file, else the
+                     main module's
+    bl / bd <n> / bc the breakpoints listed / one deleted / all deleted
+    c n s finish     continue, step over / into / out, then wait for the
+                     next stop or the end
+    bt / f <n>       the stack, a frame selected (locals, p and src look at
+                     it)
+    locals / p <x>   the selected frame's scopes / one value (a name, .F,
+                     [N], ^ as Debug.Runtime's Evaluate reads it)
+    src / threads    the source around the frame / the program's threads
+    r / h / q        run again (a new process, the breakpoints kept) /
+                     the help / quit (the program ended); the end of input
+                     is q
+
+  A stop shows its reason, routine, file and line, then its source: two
+  lines above and below, `>>` on the stop's line. The program's own
+  @breakpoint lines are the first breakpoints (numbered as the REPL numbers
+  every one, kept across r; one deleted stays deleted). A program no
+  breakpoint would stop is held at its entry until c.
+
+  Input and output are a DebugReplIO: the console by default (the program
+  then shares it: its live output, the keyboard while it runs; the
+  console's Ctrl+C pauses a running program and is only a fresh prompt at
+  the prompt, Adam.Debug.Console); a row's own IO (a script of commands,
+  the transcript kept) makes the program's output come through the
+  debugger (DebugOutputMode.Pipes), printed in order with the REPL's lines.
+  Everything the runtime reports is shown after the command that made it.
+*******************************************************************************/
+
+module unit Adam.Debug.Repl;
+
+import System.SysUtils, System.IO, System.Console, Adam.Core.Common, Adam.Core.Messages,
+  Adam.Compiler.Diagnostics, Adam.Debug.Target, Adam.Debug.Symbols,
+  Adam.Debug.Runtime, Adam.Debug.Targets, Adam.Debug.Console;
+
+public const
+  ADAM_REPL_PROMPT: string = "(dbg) ";
+  // The source lines shown above and below a stop's line
+  ADAM_REPL_CONTEXT_LINES: int64 = 2;
+  // A source line's width for its number
+  ADAM_REPL_LINE_WIDTH: int64 = 4;
+  ADAM_REPL_MARK_CURRENT: string = ">>";
+  ADAM_REPL_MARK_OTHER: string = "  ";
+  ADAM_REPL_MARK_FRAME: string = ">";
+  ADAM_REPL_MARK_THREAD: string = "*";
+  ADAM_REPL_MARK_NONE: string = " ";
+  // How long a console read that ended with nothing waits for the Ctrl+C that may have
+  // ended it (the handler counts it on a thread of the OS's, a moment later)
+  ADAM_REPL_BREAK_WAIT_MS: int64 = 250;
+  ADAM_REPL_BREAK_POLL_MS: int32 = 10;
+  // The reports one session may make (each shown after its command)
+  ADAM_REPL_REPORT_BUDGET: int64 = 1000000;
+  // The exit code Run gives when the program never started
+  ADAM_REPL_EXIT_NOT_STARTED: int32 = 1;
+
+public type
+  // The debugger's input and output (see the header). This one is the console's; a row's
+  // own overrides ReadLine / Put and says false to IsConsole
+  DebugReplIO = object
+    // One line of input into ALine (its line break left out); false at the end of input
+    virtual method ReadLine(var ALine: string): bool;
+    begin
+      return ReadLn(ALine);
+    end;
+
+    // AText written as it is (no line break added), shown at once
+    virtual method Put(const AText: string);
+    begin
+      WriteText(AText);
+      FlushOutput();
+    end;
+
+    // True when the input and output are the console itself: the program shares it, its
+    // Ctrl+C is the debugger's, colors when the console takes them
+    virtual const method IsConsole(): bool;
+    begin
+      return IsDebugConsole();
+    end;
+  end;
+
+  // A breakpoint as the REPL keeps it: its number, the file and line asked for (a mark's:
+  // its @breakpoint's), whether it is a mark; Id the runtime's breakpoint in this run (0:
+  // not placed) and Placed what the runtime made of it
+  ReplBreakpoint = record
+    Number: int64;
+    FileName: string;
+    Line: uint32;
+    IsMark: bool;
+    Id: int64;
+    Placed: RuntimeBreakpoint;
+  end;
+
+  ReplBreakpointArray = array of ReplBreakpoint;
+
+  // A source file's lines (the stops' source)
+  ReplSourceLines = array of StringArray;
+
+  // Adam's console debugger (see the header)
+  DebugRepl = object
+    hidden FIO: ref DebugReplIO;
+    hidden FReports: ref Diagnostics;
+    hidden FShown: int64;
+    hidden FTriple: string;
+    hidden FExePath: string;
+    hidden FArgs: StringArray;
+    hidden FMainFile: string;
+    // The folder a `$P:` source name is under (the compiler's: adam's own by default)
+    hidden FProgramDir: string;
+    hidden FRuntime: ref DebugRuntime;
+    hidden FBreakpoints: ReplBreakpointArray;
+    hidden FNextNumber: int64;
+    // The @breakpoint lines deleted (file:line), kept out of every later run
+    hidden FDroppedMarks: StringArray;
+    hidden FMarksShown: bool;
+    hidden FSourceFiles: StringArray;
+    hidden FSourceTexts: ReplSourceLines;
+    hidden FFrame: int64;
+    hidden FAtEntry: bool;
+    hidden FExited: bool;
+    hidden FExitCode: uint32;
+    hidden FStarted: bool;
+    hidden FQuit: bool;
+    hidden FColor: bool;
+    hidden FConsole: bool;
+    hidden FAtLineStart: bool;
+
+    // The program: AExePath for ATriple (Adam.Debug.Targets picks its parts) with AArgs;
+    // AMainFile its main module's source (b <line>'s file before any stop)
+    init(const ATriple: string; const AExePath: string; const AArgs: StringArray;
+      const AMainFile: string);
+    begin
+      self.FIO := ref DebugReplIO();
+      self.FReports := ref Diagnostics(ADAM_REPL_REPORT_BUDGET);
+      self.FShown := 0;
+      self.FTriple := ATriple;
+      self.FExePath := AExePath;
+      self.FArgs := AArgs;
+      self.FMainFile := AMainFile;
+      self.FProgramDir := ExtractFileDir(ProgramFilePath());
+      self.FRuntime := nil;
+      self.FNextNumber := 1;
+      self.FMarksShown := false;
+      self.FFrame := 0;
+      self.FAtEntry := false;
+      self.FExited := true;
+      self.FExitCode := 0;
+      self.FStarted := false;
+      self.FQuit := false;
+      self.FColor := false;
+      self.FConsole := false;
+      self.FAtLineStart := true;
+    end;
+
+    // The input and output (the console's unless set)
+    method SetIO(const AIO: ref DebugReplIO);
+    begin
+      self.FIO := AIO;
+    end;
+
+    // The folder of the compiler that built the program: a source the debug information
+    // names under ADAM_DEBUG_PROGRAM_PREFIX (its std, its runtime) is read from there (this
+    // program's own folder unless set: adam debugging what it built)
+    method SetProgramFolder(const ADir: string);
+    begin
+      self.FProgramDir := ADir;
+    end;
+
+    // The exit code of the program's last run (ADAM_REPL_EXIT_NOT_STARTED when it never
+    // started; a run ended by q: the debugger's ADAM_DEBUG_TERMINATE_EXIT_CODE)
+    const method LastExitCode(): int32;
+    begin
+      if not self.FStarted then
+        return ADAM_REPL_EXIT_NOT_STARTED;
+      end;
+      return int32(self.FExitCode);
+    end;
+
+    // The session: the title, the program started (held at its entry, or run to its first
+    // stop), then a command a line until q or the end of input; the program ended. False
+    // when it could not be started
+    method Run(): bool;
+    var
+      LOk: bool;
+    begin
+      self.FConsole := self.FIO.IsConsole();
+      self.FColor := self.FConsole and EscapesEnabled();
+      self.DoLine(ADAM_MSG_REPL_TITLE, TextColor.Cyan);
+      self.DoLine(NoArgs().Str(self.FExePath).Fill(ADAM_MSG_REPL_PROGRAM), TextColor.White);
+      self.DoLine(ADAM_MSG_REPL_HINT, TextColor.White);
+      // The console's Ctrl+C is the debugger's for the session (a pause, never the end of
+      // adam); refused, the console keeps its own
+      if self.FConsole then
+        BreakKeysOn();
+      end;
+      LOk := self.DoSession();
+      if self.FConsole then
+        BreakKeysOff();
+      end;
+      return LOk;
+    end;
+
+    // The session's loop (Run)
+    hidden method DoSession(): bool;
+    var
+      LLine: string;
+    begin
+      self.DoNewRuntime();
+      if not self.DoStartSession() then
+        self.DoEndSession();
+        return false;
+      end;
+      while not self.FQuit do
+        if not self.FAtLineStart then
+          self.DoText("\n");
+        end;
+        self.DoColored(ADAM_REPL_PROMPT, TextColor.Cyan);
+        if not self.DoReadLine(LLine) then
+          leave;
+        end;
+        // The person's Enter ended the prompt's line
+        self.FAtLineStart := true;
+        self.DoCommand(Trim(LLine));
+      end;
+      self.DoEndSession();
+      return true;
+    end;
+
+    // One line of input; false at its end. On the console a read that ended with nothing
+    // may have been a Ctrl+C at the prompt: that is a fresh prompt, never the end
+    hidden method DoReadLine(var ALine: string): bool;
+    var
+      LStart: int64;
+    begin
+      TakeBreakKey();
+      if self.FIO.ReadLine(ALine) then
+        return true;
+      end;
+      if not self.FConsole then
+        return false;
+      end;
+      LStart := TickCountMs();
+      while TickCountMs() - LStart < ADAM_REPL_BREAK_WAIT_MS do
+        if TakeBreakKey() then
+          ALine := "";
+          self.DoText("\n");
+          return true;
+        end;
+        Delay(ADAM_REPL_BREAK_POLL_MS);
+      end;
+      return false;
+    end;
+
+    // Output: AText as it is; FAtLineStart kept (the prompt goes on a line of its own)
+    hidden method DoText(const AText: string);
+    begin
+      if AText = "" then
+        return;
+      end;
+      self.FIO.Put(AText);
+      self.FAtLineStart := EndsStr("\n", AText);
+    end;
+
+    // AText in AColor (when the console takes colors), no line break
+    hidden method DoColored(const AText: string; const AColor: TextColor);
+    begin
+      if self.FColor then
+        self.DoText(CsiForeground(AColor) + AText + CsiResetFormat);
+      else
+        self.DoText(AText);
+      end;
+    end;
+
+    // AText on a line of its own, in AColor (White: the console's own)
+    hidden method DoLine(const AText: string; const AColor: TextColor);
+    begin
+      if not self.FAtLineStart then
+        self.DoText("\n");
+      end;
+      if AColor = TextColor.White then
+        self.DoText(AText + "\n");
+      else
+        self.DoColored(AText, AColor);
+        self.DoText("\n");
+      end;
+    end;
+
+    // The reports made since the last show, each on its line
+    hidden method DoShowReports();
+    var
+      LI: int64;
+    begin
+      for LI := self.FShown to self.FReports.Count - 1 do
+        self.DoLine(self.FReports.Items[LI].DisplayIn(false), TextColor.Red);
+      end;
+      self.FShown := self.FReports.Count;
+    end;
+
+    // The program's output the runtime took (Pipes) shown, a line break after its last line
+    hidden method DoShowOutput();
+    var
+      LText: string;
+    begin
+      if self.FRuntime = nil then
+        return;
+      end;
+      LText := self.FRuntime.TakeOutput();
+      if LText = "" then
+        return;
+      end;
+      if not self.FAtLineStart then
+        self.DoText("\n");
+      end;
+      self.DoText(LText);
+      if not self.FAtLineStart then
+        self.DoText("\n");
+      end;
+    end;
+
+    // A file as the REPL names it: its name alone
+    hidden const method DoDisplayName(const AFile: string): string;
+    begin
+      return ExtractFileName(AFile);
+    end;
+
+    // A new runtime (the old one ended) with every breakpoint asked for in it, waiting for
+    // the launch; the marks come back with the launch (DoTakeMarks)
+    hidden method DoNewRuntime();
+    var
+      LI: int64;
+      LPlaced: RuntimeBreakpoint;
+    begin
+      self.DoEndSession();
+      self.FRuntime := ref DebugRuntime(DebugTargetFor(self.FTriple),
+        DebugSymbolsFor(self.FTriple));
+      self.FRuntime.SetDiagnostics(self.FReports);
+      if self.FConsole then
+        self.FRuntime.SetPauseCheck(TakeBreakKey);
+      end;
+      self.FExited := true;
+      self.FAtEntry := false;
+      self.FFrame := 0;
+      for LI := 0 to len(self.FBreakpoints) - 1 do
+        self.FBreakpoints[LI].Id := 0;
+        if not self.FBreakpoints[LI].IsMark then
+          LPlaced := self.FRuntime.SetBreakpoint(self.FBreakpoints[LI].FileName,
+            self.FBreakpoints[LI].Line);
+          self.FBreakpoints[LI].Id := LPlaced.Id;
+          self.FBreakpoints[LI].Placed := LPlaced;
+        end;
+      end;
+    end;
+
+    // The program started and held at its entry; then, when a breakpoint would stop it,
+    // run to its first stop. False (shown) when it could not start
+    hidden method DoStartSession(): bool;
+    var
+      LStop: RuntimeStop;
+      LMode: DebugOutputMode;
+    begin
+      LMode := DebugOutputMode.Pipes;
+      if self.FConsole then
+        LMode := DebugOutputMode.Inherit;
+      end;
+      if not self.FRuntime.Launch(self.FExePath, self.FArgs, LMode, LStop) then
+        self.DoShowOutput();
+        self.DoShowReports();
+        return false;
+      end;
+      self.FStarted := true;
+      self.FExited := false;
+      self.DoTakeMarks();
+      self.DoTakePlaced();
+      self.DoShowReports();
+      if len(self.FBreakpoints) = 0 then
+        self.FAtEntry := true;
+        self.DoLine(ADAM_MSG_REPL_HELD_AT_ENTRY, TextColor.Yellow);
+        return true;
+      end;
+      self.DoRunFromEntry();
+      return true;
+    end;
+
+    // The program let go from its entry, to its first stop or its end
+    hidden method DoRunFromEntry();
+    var
+      LStop: RuntimeStop;
+      LOk: bool;
+    begin
+      self.FAtEntry := false;
+      LOk := self.FRuntime.Continue(LStop);
+      self.DoAfterRun(LOk, LStop);
+    end;
+
+    // The program ended (when it runs) and the runtime dropped
+    hidden method DoEndSession();
+    begin
+      if self.FRuntime = nil then
+        return;
+      end;
+      if not self.FExited then
+        self.FRuntime.Terminate();
+        self.FExited := true;
+        self.FExitCode := ADAM_DEBUG_TERMINATE_EXIT_CODE;
+      end;
+      self.FAtEntry := false;
+      self.DoShowOutput();
+      self.FRuntime := nil;
+      self.DoShowReports();
+    end;
+
+    // What a run ended in (AOk false: it could not go on, reported): the program's output,
+    // the reports, then the stop (its source) or the exit
+    hidden method DoAfterRun(const AOk: bool; const AStop: RuntimeStop);
+    begin
+      self.DoShowOutput();
+      self.DoShowReports();
+      if not AOk then
+        return;
+      end;
+      if AStop.Kind = RuntimeStopKind.Exited then
+        self.FExited := true;
+        self.FExitCode := AStop.ExitCode;
+        self.DoLine(NoArgs().Int(int64(AStop.ExitCode)).Fill(ADAM_MSG_REPL_EXITED),
+          TextColor.Yellow);
+        return;
+      end;
+      self.FFrame := 0;
+      self.DoShowStop(AStop);
+    end;
+
+    // The runtime's marks (one per @breakpoint, added at the launch) matched to the REPL's:
+    // a known one takes its new id, a deleted one is taken out again, a new one is numbered
+    // (the first launch tells how many)
+    hidden method DoTakeMarks();
+    var
+      LPlaced: RuntimeBreakpointArray;
+      LI: int64;
+      LAt: int64;
+      LNew: int64;
+      LBreakpoint: ReplBreakpoint;
+      LMarks: ReplBreakpointArray;
+    begin
+      LPlaced := self.FRuntime.Breakpoints();
+      LNew := 0;
+      setlength(LMarks, 0);
+      for LI := 0 to len(LPlaced) - 1 do
+        if not LPlaced[LI].IsMark then
+          skip;
+        end;
+        if self.DoIsDroppedMark(LPlaced[LI].FileName, LPlaced[LI].Line) then
+          self.FRuntime.RemoveBreakpoint(LPlaced[LI].Id);
+          skip;
+        end;
+        LAt := self.DoFindMark(LPlaced[LI].FileName, LPlaced[LI].Line);
+        if LAt >= 0 then
+          self.FBreakpoints[LAt].Id := LPlaced[LI].Id;
+          skip;
+        end;
+        LBreakpoint.Number := 0;
+        LBreakpoint.FileName := LPlaced[LI].FileName;
+        LBreakpoint.Line := LPlaced[LI].Line;
+        LBreakpoint.IsMark := true;
+        LBreakpoint.Id := LPlaced[LI].Id;
+        LBreakpoint.Placed := LPlaced[LI];
+        setlength(LMarks, len(LMarks) + 1);
+        LMarks[len(LMarks) - 1] := LBreakpoint;
+        LNew := LNew + 1;
+      end;
+      // New marks are numbered first and listed first (the program's own before the asked)
+      if LNew > 0 then
+        for LI := 0 to len(LMarks) - 1 do
+          LMarks[LI].Number := self.FNextNumber;
+          self.FNextNumber := self.FNextNumber + 1;
+        end;
+        for LI := 0 to len(self.FBreakpoints) - 1 do
+          setlength(LMarks, len(LMarks) + 1);
+          LMarks[len(LMarks) - 1] := self.FBreakpoints[LI];
+        end;
+        self.FBreakpoints := LMarks;
+      end;
+      if not self.FMarksShown then
+        self.FMarksShown := true;
+        if LNew > 0 then
+          self.DoLine(NoArgs().Int(LNew).Fill(ADAM_MSG_REPL_MARKS), TextColor.White);
+        end;
+      end;
+    end;
+
+    // Each placed breakpoint's facts as the runtime has them now
+    hidden method DoTakePlaced();
+    var
+      LPlaced: RuntimeBreakpointArray;
+      LI: int64;
+      LJ: int64;
+    begin
+      LPlaced := self.FRuntime.Breakpoints();
+      for LI := 0 to len(self.FBreakpoints) - 1 do
+        for LJ := 0 to len(LPlaced) - 1 do
+          if (self.FBreakpoints[LI].Id <> 0) and (LPlaced[LJ].Id = self.FBreakpoints[LI].Id) then
+            self.FBreakpoints[LI].Placed := LPlaced[LJ];
+            leave;
+          end;
+        end;
+      end;
+    end;
+
+    // The index of the mark of AFile line ALine; -1 when the REPL has none
+    hidden const method DoFindMark(const AFile: string; const ALine: uint32): int64;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FBreakpoints) - 1 do
+        if self.FBreakpoints[LI].IsMark and (self.FBreakpoints[LI].Line = ALine) and
+          (self.FBreakpoints[LI].FileName = AFile) then
+          return LI;
+        end;
+      end;
+      return -1;
+    end;
+
+    // The key a deleted mark is kept by
+    hidden const method DoMarkKey(const AFile: string; const ALine: uint32): string;
+    begin
+      return AFile + ":" + UIntToStr(uint64(ALine));
+    end;
+
+    // True when the mark of AFile line ALine was deleted
+    hidden const method DoIsDroppedMark(const AFile: string; const ALine: uint32): bool;
+    var
+      LKey: string;
+      LI: int64;
+    begin
+      LKey := self.DoMarkKey(AFile, ALine);
+      for LI := 0 to len(self.FDroppedMarks) - 1 do
+        if self.FDroppedMarks[LI] = LKey then
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // True when the program runs (launched, not ended)
+    hidden const method DoIsAlive(): bool;
+    begin
+      return (self.FRuntime <> nil) and not self.FExited;
+    end;
+
+    // True when the program is stopped where it can be looked at; else says why
+    hidden method DoNeedStop(): bool;
+    begin
+      if not self.DoIsAlive() then
+        self.DoLine(ADAM_MSG_REPL_NOT_RUNNING, TextColor.Red);
+        return false;
+      end;
+      if self.FAtEntry then
+        self.DoLine(ADAM_MSG_REPL_AT_ENTRY, TextColor.Red);
+        return false;
+      end;
+      if not self.FRuntime.IsStopped() then
+        self.DoLine(ADAM_MSG_REPL_RUNNING, TextColor.Red);
+        return false;
+      end;
+      return true;
+    end;
+
+    // The stopped thread's frames (none when it is not stopped), the program's entry routine
+    // the last (the OS's own frames that start it are not the program's, as gdb's backtrace
+    // ends at main)
+    hidden method DoStack(): StackFrameArray;
+    var
+      LFrames: StackFrameArray;
+      LEntry: uint64;
+      LI: int64;
+    begin
+      setlength(LFrames, 0);
+      if self.DoIsAlive() and (not self.FAtEntry) and self.FRuntime.IsStopped() then
+        self.FRuntime.StackTrace(LFrames);
+      end;
+      LEntry := 0;
+      if len(LFrames) > 0 then
+        LEntry := self.FRuntime.Target.EntryAddress();
+      end;
+      for LI := 0 to len(LFrames) - 1 do
+        if LFrames[LI].Known and (LFrames[LI].Routine.Address = LEntry) then
+          setlength(LFrames, LI + 1);
+          leave;
+        end;
+      end;
+      return LFrames;
+    end;
+
+    // A stop's reason as the stop line says it
+    hidden const method DoReasonText(const AStop: RuntimeStop): string;
+    begin
+      if AStop.Kind = RuntimeStopKind.Exception then
+        return NoArgs().Str(IntToHex(uint64(AStop.ExceptionCode), 8))
+          .Fill(ADAM_MSG_REPL_REASON_EXCEPTION);
+      end;
+      return RuntimeStopKindText(AStop.Kind);
+    end;
+
+    // A routine's name as a line shows it; an address when it has none
+    hidden const method DoRoutineText(const AName: string; const AAddress: uint64): string;
+    begin
+      if AName <> "" then
+        return AName;
+      end;
+      return NoArgs().Str(IntToHex(AAddress, 1)).Fill(ADAM_MSG_REPL_NO_ROUTINE);
+    end;
+
+    // The stop line, then its source
+    hidden method DoShowStop(const AStop: RuntimeStop);
+    var
+      LRoutine: string;
+    begin
+      LRoutine := self.DoRoutineText(AStop.Routine, AStop.Address);
+      if not AStop.HasLine then
+        self.DoLine(NoArgs().Str(self.DoReasonText(AStop)).Str(LRoutine)
+          .Fill(ADAM_MSG_REPL_STOPPED_NO_LINE), TextColor.Yellow);
+        return;
+      end;
+      self.DoLine(NoArgs().Str(self.DoReasonText(AStop)).Str(LRoutine)
+        .Str(self.DoDisplayName(AStop.Source.FilePath)).Int(int64(AStop.Source.Line))
+        .Fill(ADAM_MSG_REPL_STOPPED), TextColor.Yellow);
+      self.DoShowSource(AStop.Source.FilePath, int64(AStop.Source.Line));
+    end;
+
+    // Frame AIndex's line (> on the selected one)
+    hidden method DoShowFrame(const AIndex: int64; const AFrame: StackFrame);
+    var
+      LMark: string;
+      LName: string;
+    begin
+      LMark := ADAM_REPL_MARK_NONE;
+      if AIndex = self.FFrame then
+        LMark := ADAM_REPL_MARK_FRAME;
+      end;
+      LName := self.DoRoutineText(AFrame.Routine.Name, AFrame.Context.Pc);
+      if AFrame.HasLine then
+        self.DoLine(NoArgs().Str(LMark).Int(AIndex).Str(LName)
+          .Str(self.DoDisplayName(AFrame.Source.FilePath)).Int(int64(AFrame.Source.Line))
+          .Fill(ADAM_MSG_REPL_FRAME), TextColor.White);
+      else
+        self.DoLine(NoArgs().Str(LMark).Int(AIndex).Str(LName).Fill(ADAM_MSG_REPL_FRAME_NO_LINE),
+          TextColor.White);
+      end;
+    end;
+
+    // AFile's lines into ALines, each file read once (one that cannot be read is said once,
+    // then shown without its text). False when it has none
+    hidden method DoSourceLines(const AFile: string; var ALines: StringArray): bool;
+    var
+      LText: string;
+      LI: int64;
+      LCount: int64;
+    begin
+      for LI := 0 to len(self.FSourceFiles) - 1 do
+        if self.FSourceFiles[LI] = AFile then
+          ALines := self.FSourceTexts[LI];
+          return len(ALines) > 0;
+        end;
+      end;
+      setlength(ALines, 0);
+      if ReadAllText(self.DoSourcePath(AFile), LText) then
+        // The line break ending the last line starts no line of its own
+        if EndsStr("\n", LText) then
+          LText := Substring(LText, 0, len(LText) - 1);
+        end;
+        ALines := SplitString(LText, "\n");
+        for LI := 0 to len(ALines) - 1 do
+          if EndsStr("\r", ALines[LI]) then
+            ALines[LI] := Substring(ALines[LI], 0, len(ALines[LI]) - 1);
+          end;
+        end;
+      else
+        self.DoLine(NoArgs().Str(AFile).Fill(ADAM_MSG_REPL_SOURCE_UNREADABLE), TextColor.Yellow);
+      end;
+      LCount := len(self.FSourceFiles);
+      setlength(self.FSourceFiles, LCount + 1);
+      setlength(self.FSourceTexts, LCount + 1);
+      self.FSourceFiles[LCount] := AFile;
+      self.FSourceTexts[LCount] := ALines;
+      return len(ALines) > 0;
+    end;
+
+    // Where the source file AFile (as the debug information names it) is on disk
+    hidden const method DoSourcePath(const AFile: string): string;
+    begin
+      if StartsStr(ADAM_DEBUG_PROGRAM_PREFIX, AFile) then
+        return ResolvePath(Substring(AFile, len(ADAM_DEBUG_PROGRAM_PREFIX),
+          len(AFile) - len(ADAM_DEBUG_PROGRAM_PREFIX)), self.FProgramDir);
+      end;
+      return AFile;
+    end;
+
+    // ANumber right-aligned in ADAM_REPL_LINE_WIDTH columns
+    hidden const method DoNumberText(const ANumber: int64): string;
+    var
+      LText: string;
+    begin
+      LText := IntToStr(ANumber);
+      while len(LText) < ADAM_REPL_LINE_WIDTH do
+        LText := " " + LText;
+      end;
+      return LText;
+    end;
+
+    // AFile's lines around ALine (ADAM_REPL_CONTEXT_LINES each side), >> on ALine
+    hidden method DoShowSource(const AFile: string; const ALine: int64);
+    var
+      LLines: StringArray;
+      LFirst: int64;
+      LLast: int64;
+      LIndex: int64;
+      LText: string;
+    begin
+      if not self.DoSourceLines(AFile, LLines) then
+        return;
+      end;
+      LFirst := ALine - ADAM_REPL_CONTEXT_LINES;
+      if LFirst < 1 then
+        LFirst := 1;
+      end;
+      LLast := ALine + ADAM_REPL_CONTEXT_LINES;
+      if LLast > len(LLines) then
+        LLast := len(LLines);
+      end;
+      for LIndex := LFirst to LLast do
+        if LIndex = ALine then
+          LText := NoArgs().Str(ADAM_REPL_MARK_CURRENT).Str(self.DoNumberText(LIndex))
+            .Str(LLines[LIndex - 1]).Fill(ADAM_MSG_REPL_SOURCE_LINE);
+          self.DoLine(LText, TextColor.Yellow);
+        else
+          LText := NoArgs().Str(ADAM_REPL_MARK_OTHER).Str(self.DoNumberText(LIndex))
+            .Str(LLines[LIndex - 1]).Fill(ADAM_MSG_REPL_SOURCE_LINE);
+          self.DoLine(LText, TextColor.White);
+        end;
+      end;
+    end;
+
+    // A breakpoint's line: where it is, moved, without code, or waiting for the next run
+    hidden method DoShowBreakpoint(const ABreakpoint: ReplBreakpoint);
+    var
+      LName: string;
+      LArgs: MessageArgs;
+    begin
+      LName := self.DoDisplayName(ABreakpoint.FileName);
+      LArgs := NoArgs().Int(ABreakpoint.Number).Str(LName).Int(int64(ABreakpoint.Line));
+      if ABreakpoint.Id = 0 then
+        self.DoLine(LArgs.Fill(ADAM_MSG_REPL_BP_NEXT_RUN), TextColor.White);
+        return;
+      end;
+      if not ABreakpoint.Placed.Verified then
+        self.DoLine(LArgs.Fill(ADAM_MSG_REPL_BP_NO_CODE), TextColor.Yellow);
+        return;
+      end;
+      if ABreakpoint.Placed.Source.Line <> ABreakpoint.Line then
+        self.DoLine(LArgs.Int(int64(ABreakpoint.Placed.Source.Line)).Fill(ADAM_MSG_REPL_BP_MOVED),
+          TextColor.White);
+        return;
+      end;
+      self.DoLine(LArgs.Fill(ADAM_MSG_REPL_BP_SET), TextColor.White);
+    end;
+
+    // One command line (see the header)
+    hidden method DoCommand(const ALine: string);
+    var
+      LSpace: int64;
+      LVerb: string;
+      LArg: string;
+    begin
+      if ALine = "" then
+        return;
+      end;
+      LSpace := IndexOf(" ", ALine, 0);
+      if LSpace < 0 then
+        LVerb := ALine;
+        LArg := "";
+      else
+        LVerb := Substring(ALine, 0, LSpace);
+        LArg := Trim(Substring(ALine, LSpace + 1, len(ALine) - LSpace - 1));
+      end;
+      match LVerb of
+        "h", "help": self.DoLine(ADAM_MSG_REPL_HELP, TextColor.White);
+        "b": self.DoCmdBreak(LArg);
+        "bl": self.DoCmdList();
+        "bd": self.DoCmdDelete(LArg);
+        "bc": self.DoCmdClear();
+        "c": self.DoCmdRun(false, RuntimeStepKind.Over);
+        "n": self.DoCmdRun(true, RuntimeStepKind.Over);
+        "s": self.DoCmdRun(true, RuntimeStepKind.Into);
+        "finish": self.DoCmdRun(true, RuntimeStepKind.Out);
+        "bt": self.DoCmdBacktrace();
+        "f": self.DoCmdFrame(LArg);
+        "locals": self.DoCmdLocals();
+        "p": self.DoCmdPrint(LArg);
+        "src": self.DoCmdSource();
+        "threads": self.DoCmdThreads();
+        "r":
+          // A new process with the same breakpoints (DoNewRuntime ends the old one)
+          self.DoNewRuntime();
+          self.DoStartSession();
+        "q", "quit": self.FQuit := true;
+      else
+        self.DoLine(NoArgs().Str(ALine).Fill(ADAM_MSG_REPL_UNKNOWN), TextColor.Red);
+      end;
+    end;
+
+    // The file AText names (a module of the program: MatchSourceFile over the debug
+    // information's files) into AFile; said and false when there is none. Before a run
+    // (none loaded) the text is kept as typed
+    hidden method DoResolveFile(const AText: string; var AFile: string): bool;
+    var
+      LFiles: StringArray;
+    begin
+      AFile := AText;
+      if not self.DoIsAlive() then
+        return true;
+      end;
+      LFiles := self.FRuntime.Symbols.SourceFiles();
+      AFile := MatchSourceFile(LFiles, AText);
+      if AFile = "" then
+        self.DoLine(NoArgs().Str(AText).Fill(ADAM_MSG_REPL_BP_UNKNOWN_FILE), TextColor.Red);
+        return false;
+      end;
+      return true;
+    end;
+
+    // b <file>:<line> or b <line> (see the header)
+    hidden method DoCmdBreak(const AArg: string);
+    var
+      LColon: int64;
+      LAt: int64;
+      LFileText: string;
+      LLineText: string;
+      LLine: int64;
+      LFile: string;
+      LFrames: StackFrameArray;
+      LBreakpoint: ReplBreakpoint;
+      LCount: int64;
+    begin
+      // The last ':' splits (a drive letter has one too)
+      LColon := -1;
+      LAt := IndexOf(":", AArg, 0);
+      while LAt >= 0 do
+        LColon := LAt;
+        LAt := IndexOf(":", AArg, LAt + 1);
+      end;
+      if LColon > 0 then
+        LFileText := Trim(Substring(AArg, 0, LColon));
+        LLineText := Trim(Substring(AArg, LColon + 1, len(AArg) - LColon - 1));
+      else
+        LFileText := "";
+        LLineText := Trim(AArg);
+      end;
+      LLine := StrToIntDef(LLineText, 0);
+      if (LLine <= 0) or (LLine > 0xFFFFFFFF) then
+        self.DoLine(ADAM_MSG_REPL_BP_USAGE, TextColor.Red);
+        return;
+      end;
+      if LFileText = "" then
+        // The selected frame's file while stopped on a line, else the main module's
+        LFileText := self.FMainFile;
+        LFrames := self.DoStack();
+        if (self.FFrame < len(LFrames)) and LFrames[self.FFrame].HasLine then
+          LFileText := LFrames[self.FFrame].Source.FilePath;
+        end;
+      end;
+      if not self.DoResolveFile(LFileText, LFile) then
+        return;
+      end;
+      LBreakpoint.Number := self.FNextNumber;
+      self.FNextNumber := self.FNextNumber + 1;
+      LBreakpoint.FileName := LFile;
+      LBreakpoint.Line := uint32(LLine);
+      LBreakpoint.IsMark := false;
+      LBreakpoint.Id := 0;
+      if self.DoIsAlive() then
+        LBreakpoint.Placed := self.FRuntime.SetBreakpoint(LFile, uint32(LLine));
+        LBreakpoint.Id := LBreakpoint.Placed.Id;
+      end;
+      LCount := len(self.FBreakpoints);
+      setlength(self.FBreakpoints, LCount + 1);
+      self.FBreakpoints[LCount] := LBreakpoint;
+      self.DoShowReports();
+      self.DoShowBreakpoint(LBreakpoint);
+    end;
+
+    // bl
+    hidden method DoCmdList();
+    var
+      LI: int64;
+    begin
+      if len(self.FBreakpoints) = 0 then
+        self.DoLine(ADAM_MSG_REPL_BP_NONE, TextColor.White);
+        return;
+      end;
+      for LI := 0 to len(self.FBreakpoints) - 1 do
+        self.DoShowBreakpoint(self.FBreakpoints[LI]);
+      end;
+    end;
+
+    // Breakpoint AIndex taken out of the program (a mark kept out of later runs too)
+    hidden method DoDrop(const AIndex: int64);
+    var
+      LCount: int64;
+    begin
+      if (self.FBreakpoints[AIndex].Id <> 0) and self.DoIsAlive() then
+        self.FRuntime.RemoveBreakpoint(self.FBreakpoints[AIndex].Id);
+      end;
+      if self.FBreakpoints[AIndex].IsMark then
+        LCount := len(self.FDroppedMarks);
+        setlength(self.FDroppedMarks, LCount + 1);
+        self.FDroppedMarks[LCount] := self.DoMarkKey(self.FBreakpoints[AIndex].FileName,
+          self.FBreakpoints[AIndex].Line);
+      end;
+    end;
+
+    // bd <n> (n or #n)
+    hidden method DoCmdDelete(const AArg: string);
+    var
+      LText: string;
+      LNumber: int64;
+      LI: int64;
+      LJ: int64;
+    begin
+      LText := AArg;
+      if StartsStr("#", LText) then
+        LText := Substring(LText, 1, len(LText) - 1);
+      end;
+      LNumber := StrToIntDef(LText, 0);
+      for LI := 0 to len(self.FBreakpoints) - 1 do
+        if self.FBreakpoints[LI].Number = LNumber then
+          self.DoDrop(LI);
+          for LJ := LI + 1 to len(self.FBreakpoints) - 1 do
+            self.FBreakpoints[LJ - 1] := self.FBreakpoints[LJ];
+          end;
+          setlength(self.FBreakpoints, len(self.FBreakpoints) - 1);
+          self.DoShowReports();
+          self.DoLine(NoArgs().Int(LNumber).Fill(ADAM_MSG_REPL_BP_DELETED), TextColor.White);
+          return;
+        end;
+      end;
+      self.DoLine(NoArgs().Str(AArg).Fill(ADAM_MSG_REPL_BP_NO_ID), TextColor.Red);
+    end;
+
+    // bc
+    hidden method DoCmdClear();
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FBreakpoints) - 1 do
+        self.DoDrop(LI);
+      end;
+      setlength(self.FBreakpoints, 0);
+      self.DoShowReports();
+      self.DoLine(ADAM_MSG_REPL_BP_CLEARED, TextColor.White);
+    end;
+
+    // c (AStep false), n / s / finish (AStep true, AKind), then the wait for the next stop
+    // or the end. Held at its entry the program has no line to step from: c starts it, a
+    // step is refused (DoNeedStop says why)
+    hidden method DoCmdRun(const AStep: bool; const AKind: RuntimeStepKind);
+    var
+      LStop: RuntimeStop;
+      LOk: bool;
+    begin
+      if self.FAtEntry and (not AStep) and self.DoIsAlive() then
+        self.DoRunFromEntry();
+        return;
+      end;
+      if not self.DoNeedStop() then
+        return;
+      end;
+      if AStep then
+        LOk := self.FRuntime.Step(AKind, LStop);
+      else
+        LOk := self.FRuntime.Continue(LStop);
+      end;
+      self.DoAfterRun(LOk, LStop);
+    end;
+
+    // bt
+    hidden method DoCmdBacktrace();
+    var
+      LFrames: StackFrameArray;
+      LI: int64;
+    begin
+      if not self.DoNeedStop() then
+        return;
+      end;
+      LFrames := self.DoStack();
+      self.DoShowReports();
+      if len(LFrames) = 0 then
+        self.DoLine(ADAM_MSG_REPL_NO_FRAMES, TextColor.White);
+        return;
+      end;
+      for LI := 0 to len(LFrames) - 1 do
+        self.DoShowFrame(LI, LFrames[LI]);
+      end;
+    end;
+
+    // f <n>
+    hidden method DoCmdFrame(const AArg: string);
+    var
+      LFrames: StackFrameArray;
+      LIndex: int64;
+    begin
+      if not self.DoNeedStop() then
+        return;
+      end;
+      LFrames := self.DoStack();
+      LIndex := StrToIntDef(AArg, -1);
+      if (LIndex < 0) or (LIndex >= len(LFrames)) then
+        self.DoLine(NoArgs().Str(AArg).Fill(ADAM_MSG_REPL_FRAME_BAD), TextColor.Red);
+        return;
+      end;
+      self.FFrame := LIndex;
+      self.DoShowFrame(LIndex, LFrames[LIndex]);
+      if LFrames[LIndex].HasLine then
+        self.DoShowSource(LFrames[LIndex].Source.FilePath, int64(LFrames[LIndex].Source.Line));
+      end;
+    end;
+
+    // locals: the selected frame's scopes and their values
+    hidden method DoCmdLocals();
+    var
+      LScopes: RuntimeScopeArray;
+      LValues: RuntimeValueArray;
+      LI: int64;
+      LJ: int64;
+    begin
+      if not self.DoNeedStop() then
+        return;
+      end;
+      if not self.FRuntime.Scopes(self.FFrame, LScopes) then
+        self.DoShowReports();
+        self.DoLine(ADAM_MSG_REPL_NO_FRAMES, TextColor.White);
+        return;
+      end;
+      for LI := 0 to len(LScopes) - 1 do
+        self.DoLine(NoArgs().Str(LScopes[LI].Name).Fill(ADAM_MSG_REPL_SCOPE), TextColor.White);
+        self.FRuntime.Variables(LScopes[LI].Reference, LValues);
+        if len(LValues) = 0 then
+          self.DoLine(ADAM_MSG_REPL_NO_VALUES, TextColor.White);
+        end;
+        for LJ := 0 to len(LValues) - 1 do
+          if LValues[LJ].TypeName <> "" then
+            self.DoLine(NoArgs().Str(LValues[LJ].Name).Str(LValues[LJ].TypeName)
+              .Str(LValues[LJ].Value).Fill(ADAM_MSG_REPL_VALUE), TextColor.White);
+          else
+            self.DoLine(NoArgs().Str(LValues[LJ].Name).Str(LValues[LJ].Value)
+              .Fill(ADAM_MSG_REPL_VALUE_NO_TYPE), TextColor.White);
+          end;
+        end;
+      end;
+      self.DoShowReports();
+    end;
+
+    // p <expr>: its value; a value that cannot be read says why
+    hidden method DoCmdPrint(const AArg: string);
+    var
+      LValue: RuntimeValue;
+    begin
+      if AArg = "" then
+        self.DoLine(ADAM_MSG_REPL_EVAL_USAGE, TextColor.Red);
+        return;
+      end;
+      if not self.DoNeedStop() then
+        return;
+      end;
+      if self.FRuntime.Evaluate(self.FFrame, AArg, LValue) then
+        self.DoLine(NoArgs().Str(AArg).Str(LValue.Value).Fill(ADAM_MSG_REPL_EVAL),
+          TextColor.White);
+      else
+        self.DoShowReports();
+        self.DoLine(LValue.Value, TextColor.Red);
+      end;
+      self.DoShowReports();
+    end;
+
+    // src
+    hidden method DoCmdSource();
+    var
+      LFrames: StackFrameArray;
+    begin
+      if not self.DoNeedStop() then
+        return;
+      end;
+      LFrames := self.DoStack();
+      if (self.FFrame < len(LFrames)) and LFrames[self.FFrame].HasLine then
+        self.DoShowSource(LFrames[self.FFrame].Source.FilePath,
+          int64(LFrames[self.FFrame].Source.Line));
+      else
+        self.DoLine(ADAM_MSG_REPL_NO_FRAMES, TextColor.White);
+      end;
+    end;
+
+    // threads: * on the stopped one, the main one named
+    hidden method DoCmdThreads();
+    var
+      LThreads: DebugThreadIdArray;
+      LMark: string;
+      LMain: string;
+      LI: int64;
+    begin
+      if not self.DoNeedStop() then
+        return;
+      end;
+      LThreads := self.FRuntime.Target.Threads();
+      for LI := 0 to len(LThreads) - 1 do
+        LMark := ADAM_REPL_MARK_NONE;
+        if LThreads[LI] = self.FRuntime.LastStop().ThreadId then
+          LMark := ADAM_REPL_MARK_THREAD;
+        end;
+        LMain := "";
+        if LThreads[LI] = self.FRuntime.Target.MainThreadId() then
+          LMain := ADAM_MSG_REPL_THREAD_MAIN;
+        end;
+        self.DoLine(NoArgs().Str(LMark).Int(int64(LThreads[LI])).Str(LMain)
+          .Fill(ADAM_MSG_REPL_THREAD), TextColor.White);
+      end;
+    end;
+  end;
+
+end.
