@@ -1,0 +1,1468 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.Json.adam - JSON documents in Adam, over yyjson's C API
+  (System.Json.C): StdApp.JSON's fluent surface. A Json is a value: a view
+  of one node of a document tree that every view of it shares (held by a
+  ref, so the tree lives while any view does; a view costs no copy). A
+  plain `LJ: Json;` is an empty object, its tree made at its first change;
+  a copy taken before that change is an empty object of its own.
+
+  Methods do not overload (BNF sec 4), so each kind has its own name.
+  Build: AddString / AddInt / AddFloat / AddBool / AddJson / AddNull /
+  AddRaw (JSON text) put a keyed value into an object, AppendString ..
+  AppendNull a value into an array; AddStrings / AddIntegers / AddDoubles
+  a key's array; BeginObject / BeginArray (keyed) and AppendObject /
+  AppendArray open a nested container the next calls go into, EndObject /
+  EndArray close it. Each returns the Json it was called on, so calls
+  chain; a call that does not fit the container (a keyed one in an array,
+  a bare one in an object) changes nothing. The open containers are the
+  tree's: a chain on a returned copy closes what it opened.
+
+  Read: Get / Has by path, keys joined by '.', each bare or "quoted" (\"
+  and \\ escaped), an item as [N] after a key or another item:
+  `servers[0].ports[1]`, `"a.b".c`, `[2]`; the empty path is the value
+  itself. A path that names nothing gives a missing value: IsNull, Count
+  0, every As* its default. Count / Keys / Items (for .. in walks them) /
+  First / Last / ContainsString / ContainsInt, JsonPairs, the As* getters
+  (each given its default), the As*Array forms, the Is* tests, ForEach,
+  Remove / Merge / Clone.
+
+  Text and files: ToString / ToPrettyString (the indent given), Parse /
+  LoadFromFile / LoadFromStream (false with ErrorText: "file(line,col):
+  message" for a text, "file: message (byte N)" for a file's, "file: the
+  file cannot be opened" when it cannot) and JsonFromString / JsonFromFile
+  / JsonFromStream (a missing value on a failure, its ErrorText set),
+  SaveToFile / SaveToStream (pretty, 2 spaces, or compact). The file forms
+  go through yyjson's own C file calls (fopen / fread / fwrite), never
+  System.IO: with System.HookIO imported, an io://<n>/<name> path (a
+  registered IO, a .rez / zip entry) loads and saves as a disk file does.
+  A stream is System.CustomIO's IO.
+  Every yyjson block is Adam's heap (getmem / resizemem / freemem through
+  one yyjson_alc), so a debug build's heap report covers it.
+  Target-neutral: no OS named.
+*******************************************************************************/
+
+module unit System.Json;
+
+import System.SysUtils, System.IO, System.CustomIO, System.Json.C;
+
+const
+  // The errors a failed read reports (after "file(line,col): " / "file: ")
+  ADAM_JSON_MSG_NO_ROOM: string = "out of memory";
+  ADAM_JSON_MSG_AT_BYTE: string = " (byte ";
+  ADAM_JSON_MSG_STREAM_FAILED: string = "the stream cannot be read";
+  // A file yyjson could not open or read: its own words for these name no cause
+  ADAM_JSON_MSG_OPEN_FAILED: string = "the file cannot be opened";
+  ADAM_JSON_MSG_READ_FAILED: string = "the file cannot be read";
+  ADAM_JSON_MSG_NO_STREAM: string = "no stream";
+  // The name errors carry for Parse's text and for a stream
+  ADAM_JSON_TEXT_NAME: string = "<text>";
+  ADAM_JSON_STREAM_NAME: string = "<stream>";
+  // The indent ToPrettyString uses when none is given (StdApp's), and yyjson's own
+  ADAM_JSON_INDENT: int32 = 2;
+  ADAM_JSON_YYJSON_INDENT: int64 = 4;
+  // How every text is read and written: NaN / infinity, which JSON has no form for, written
+  // as null so the text is always valid JSON
+  ADAM_JSON_READ_FLAGS: yyjson_read_flag = YYJSON_READ_NOFLAG;
+  ADAM_JSON_WRITE_FLAGS: yyjson_write_flag = YYJSON_WRITE_INF_AND_NAN_AS_NULL;
+  // The integer limits the As* getters check against; a real's range for int64 (2^63)
+  ADAM_JSON_INT32_MIN: int32 = -2147483648;
+  ADAM_JSON_INT32_MAX: int32 = 2147483647;
+  ADAM_JSON_UINT32_MAX: uint32 = 4294967295;
+  ADAM_JSON_INT64_MAX: int64 = 9223372036854775807;
+  ADAM_JSON_INT64_LOW: float64 = -9223372036854775808.0;
+  ADAM_JSON_INT64_HIGH: float64 = 9223372036854775808.0;
+  // The prefix of a HookIO path: not resolved as a disk path
+  ADAM_JSON_IO_PREFIX: string = "io://";
+
+var
+  // The allocator every yyjson call here is given: Adam's heap (initialize fills it)
+  GAlc: yyjson_alc;
+
+// yyjson's malloc / realloc / free on Adam's heap
+routine clink DoAlcMalloc(ACtx: ptr; ASize: uint64): ptr;
+begin
+  return getmem(int64(ASize));
+end;
+
+routine clink DoAlcRealloc(ACtx: ptr; APointer: ptr; AOldSize: uint64; ASize: uint64): ptr;
+begin
+  return resizemem(APointer, int64(ASize));
+end;
+
+routine clink DoAlcFree(ACtx: ptr; APointer: ptr);
+begin
+  if APointer <> nil then
+    freemem(APointer);
+  end;
+end;
+
+// AText's bytes for a C call that takes them with their count (no NUL needed); "" for none
+routine DoChars(const AText: string): ptr to const char;
+begin
+  if len(AText) = 0 then
+    return "";
+  end;
+  return addr of AText[0];
+end;
+
+// The text of a JSON string value (or a key)
+routine DoStringOf(const AValue: ptr to yyjson_mut_val): string;
+begin
+  return StringFromC(yyjson_mut_get_str(AValue), int64(yyjson_mut_get_len(AValue)));
+end;
+
+// APath as the file a C call opens: a HookIO path as written, any other resolved as every
+// Adam path is ($P: $D: $S:, relative to the working folder); nil when there is no room
+routine DoFilePath(const APath: string): ptr to char;
+begin
+  if (len(APath) >= len(ADAM_JSON_IO_PREFIX)) and
+    (Substring(APath, 0, len(ADAM_JSON_IO_PREFIX)) = ADAM_JSON_IO_PREFIX) then
+    return StringToC(APath);
+  end;
+  return StringToC(ResolvePath(APath));
+end;
+
+// AText written by yyjson with AIndent spaces a level (its own pretty form is 4): a line's
+// leading spaces are only indentation (a JSON string holds no raw line break)
+routine DoReindent(const AText: string; const AIndent: int64): string;
+var
+  LText: string;
+  LSize: int64;
+  LAt: int64;
+  LTo: int64;
+  LSpaces: int64;
+  LI: int64;
+begin
+  // First the size, then the bytes: one allocation
+  LSize := 0;
+  LAt := 0;
+  while LAt < len(AText) do
+    LSpaces := 0;
+    while (LAt < len(AText)) and (AText[LAt] = ' ') do
+      LSpaces := LSpaces + 1;
+      LAt := LAt + 1;
+    end;
+    LSize := LSize + (LSpaces div ADAM_JSON_YYJSON_INDENT) * AIndent;
+    while (LAt < len(AText)) and (AText[LAt] <> '\n') do
+      LSize := LSize + 1;
+      LAt := LAt + 1;
+    end;
+    if LAt < len(AText) then
+      LSize := LSize + 1;
+      LAt := LAt + 1;
+    end;
+  end;
+  setlength(LText, LSize);
+  LAt := 0;
+  LTo := 0;
+  while LAt < len(AText) do
+    LSpaces := 0;
+    while (LAt < len(AText)) and (AText[LAt] = ' ') do
+      LSpaces := LSpaces + 1;
+      LAt := LAt + 1;
+    end;
+    for LI := 1 to (LSpaces div ADAM_JSON_YYJSON_INDENT) * AIndent do
+      LText[LTo] := ' ';
+      LTo := LTo + 1;
+    end;
+    while (LAt < len(AText)) and (AText[LAt] <> '\n') do
+      LText[LTo] := AText[LAt];
+      LTo := LTo + 1;
+      LAt := LAt + 1;
+    end;
+    if LAt < len(AText) then
+      LText[LTo] := '\n';
+      LTo := LTo + 1;
+      LAt := LAt + 1;
+    end;
+  end;
+  return LText;
+end;
+
+// AValue as JSON text in AFlags; "" when yyjson cannot write it (no room)
+routine DoWrite(const AValue: ptr to yyjson_mut_val; const AFlags: yyjson_write_flag): string;
+var
+  LText: ptr to char;
+  LLength: uint64;
+  LResult: string;
+begin
+  LLength := 0;
+  LText := yyjson_mut_val_write_opts(AValue, AFlags | ADAM_JSON_WRITE_FLAGS, addr of GAlc,
+    addr of LLength, nil);
+  if LText = nil then
+    return "";
+  end;
+  LResult := StringFromC(ptr to const char(LText), int64(LLength));
+  freemem(ptr(LText));
+  return LResult;
+end;
+
+// A read error of the text AText as "AName(line,col): message"
+routine DoTextError(const AName: string; const AText: string; const AError: yyjson_read_err): string;
+var
+  LLine: uint64;
+  LCol: uint64;
+  LChar: uint64;
+begin
+  LLine := 0;
+  LCol := 0;
+  LChar := 0;
+  if not yyjson_locate_pos(DoChars(AText), uint64(len(AText)), AError.pos, addr of LLine,
+    addr of LCol, addr of LChar) then
+    return AName + ": " + StringFromC(AError.msg) + ADAM_JSON_MSG_AT_BYTE +
+      UIntToStr(AError.pos) + ")";
+  end;
+  return AName + "(" + UIntToStr(LLine) + "," + UIntToStr(LCol) + "): " + StringFromC(AError.msg);
+end;
+
+// A read error of a file as "APath: message (byte N)"; one that opened or read nothing as
+// "APath: the file cannot be opened / read"
+routine DoFileError(const APath: string; const AError: yyjson_read_err): string;
+begin
+  if AError.code = YYJSON_READ_ERROR_FILE_OPEN then
+    return APath + ": " + ADAM_JSON_MSG_OPEN_FAILED;
+  end;
+  if AError.code = YYJSON_READ_ERROR_FILE_READ then
+    return APath + ": " + ADAM_JSON_MSG_READ_FAILED;
+  end;
+  return APath + ": " + StringFromC(AError.msg) + ADAM_JSON_MSG_AT_BYTE + UIntToStr(AError.pos) + ")";
+end;
+
+type
+  // One document's tree, shared by every Json viewing it: yyjson's mutable document and
+  // the containers BeginObject / BeginArray opened (Base: the node the first was opened
+  // under; a view of another node adds to itself)
+  JsonTree = object
+    Doc: ptr to yyjson_mut_doc;
+    Open: array of ptr to yyjson_mut_val;
+    Depth: int64;
+    Base: ptr to yyjson_mut_val;
+
+    done;
+    begin
+      if self.Doc <> nil then
+        yyjson_mut_doc_free(self.Doc);
+      end;
+    end;
+  end;
+
+public forward type Json;
+
+public type
+  // ForEach's callback: each item of an array or value of an object, and the pointer given
+  JsonCallback = routine(const AItem: Json; const AUserData: ptr);
+
+  // A JSON value: a view of one node of a shared document tree (see the header)
+  Json = object
+    // The tree (nil: a fresh empty object, made at its first change, or a missing value)
+    hidden Tree: ref JsonTree;
+    // The node viewed (nil while Tree is)
+    hidden Node: ptr to yyjson_mut_val;
+    // A path or a read that named nothing
+    hidden Missing: bool;
+    // Why the last Parse / LoadFromFile / LoadFromStream failed ("" after a success)
+    hidden Error: string;
+
+    // A fresh value gets its tree: an empty object as the root; false for a missing value
+    // (nothing changes it) or when there is no room
+    hidden method DoEnsure(): bool;
+    var
+      LTree: ref JsonTree;
+    begin
+      if self.Missing then
+        return false;
+      end;
+      if self.Tree <> nil then
+        return true;
+      end;
+      LTree := ref JsonTree();
+      LTree.Doc := yyjson_mut_doc_new(addr of GAlc);
+      if LTree.Doc = nil then
+        return false;
+      end;
+      self.Node := yyjson_mut_obj(LTree.Doc);
+      if self.Node = nil then
+        return false;
+      end;
+      yyjson_mut_doc_set_root(LTree.Doc, self.Node);
+      self.Tree := LTree;
+      return true;
+    end;
+
+    // A view of ANode in this tree; a missing value for nil
+    hidden const method DoView(const ANode: ptr to yyjson_mut_val): Json;
+    var
+      LView: Json;
+    begin
+      if ANode = nil then
+        LView.Missing := true;
+        return LView;
+      end;
+      LView.Tree := self.Tree;
+      LView.Node := ANode;
+      return LView;
+    end;
+
+    // A missing value carrying AError
+    hidden const method DoFailed(const AError: string): Json;
+    var
+      LView: Json;
+    begin
+      LView.Missing := true;
+      LView.Error := AError;
+      return LView;
+    end;
+
+    // This value made a missing one carrying AError
+    hidden method DoFail(const AError: string);
+    begin
+      self.Tree := nil;
+      self.Node := nil;
+      self.Missing := true;
+      self.Error := AError;
+    end;
+
+    // The tree's document, made for a fresh value (nil for a missing one)
+    hidden method DoDoc(): ptr to yyjson_mut_doc;
+    begin
+      if not self.DoEnsure() then
+        return nil;
+      end;
+      return self.Tree.Doc;
+    end;
+
+    // Where the next Add goes: the innermost container opened from this node, else the node
+    hidden method DoContainer(): ptr to yyjson_mut_val;
+    begin
+      if (self.Tree.Depth > 0) and (self.Tree.Base = self.Node) then
+        return self.Tree.Open[self.Tree.Depth - 1];
+      end;
+      return self.Node;
+    end;
+
+    // AValue (made in this tree's document) added under AKey to the container when it is an
+    // object (AKeyed), or appended when it is an array (not AKeyed); false when it does not fit
+    hidden method DoAttach(const AKeyed: bool; const AKey: string;
+      const AValue: ptr to yyjson_mut_val): bool;
+    var
+      LContainer: ptr to yyjson_mut_val;
+      LKey: ptr to yyjson_mut_val;
+    begin
+      if AValue = nil then
+        return false;
+      end;
+      LContainer := self.DoContainer();
+      if AKeyed then
+        if not yyjson_mut_is_obj(LContainer) then
+          return false;
+        end;
+        LKey := yyjson_mut_strncpy(self.Tree.Doc, DoChars(AKey), uint64(len(AKey)));
+        return yyjson_mut_obj_add(LContainer, LKey, AValue);
+      end;
+      if not yyjson_mut_is_arr(LContainer) then
+        return false;
+      end;
+      return yyjson_mut_arr_append(LContainer, AValue);
+    end;
+
+    // The container AValue opened under the current one, pushed so the next Adds go into it
+    hidden method DoOpen(const AKeyed: bool; const AKey: string;
+      const AValue: ptr to yyjson_mut_val);
+    begin
+      if not self.DoAttach(AKeyed, AKey, AValue) then
+        return;
+      end;
+      if self.Tree.Depth = 0 then
+        self.Tree.Base := self.Node;
+      end;
+      if self.Tree.Depth >= len(self.Tree.Open) then
+        setlength(self.Tree.Open, self.Tree.Depth + 1);
+      end;
+      self.Tree.Open[self.Tree.Depth] := AValue;
+      self.Tree.Depth := self.Tree.Depth + 1;
+    end;
+
+    // The innermost open container closed, when it is of the kind AObject says
+    hidden method DoClose(const AObject: bool);
+    var
+      LTop: ptr to yyjson_mut_val;
+    begin
+      if self.Tree = nil then
+        return;
+      end;
+      if (self.Tree.Depth = 0) or (self.Tree.Base <> self.Node) then
+        return;
+      end;
+      LTop := self.Tree.Open[self.Tree.Depth - 1];
+      if yyjson_mut_is_obj(LTop) <> AObject then
+        return;
+      end;
+      self.Tree.Depth := self.Tree.Depth - 1;
+    end;
+
+    // The JSON text AText's root copied into this tree's document; nil when it is no JSON
+    hidden method DoCopyText(const AText: string): ptr to yyjson_mut_val;
+    var
+      LDoc: ptr to yyjson_doc;
+      LValue: ptr to yyjson_mut_val;
+    begin
+      LDoc := yyjson_read_opts(ptr to char(ptr(uint64(DoChars(AText)))), uint64(len(AText)),
+        ADAM_JSON_READ_FLAGS, addr of GAlc, nil);
+      if LDoc = nil then
+        return nil;
+      end;
+      LValue := yyjson_val_mut_copy(self.Tree.Doc, yyjson_doc_get_root(LDoc));
+      yyjson_doc_free(LDoc);
+      return LValue;
+    end;
+
+    // This value the root of the read document ADoc (freed here): a tree of its own
+    hidden method DoTake(const ADoc: ptr to yyjson_doc): bool;
+    var
+      LTree: ref JsonTree;
+    begin
+      LTree := ref JsonTree();
+      LTree.Doc := yyjson_doc_mut_copy(ADoc, addr of GAlc);
+      yyjson_doc_free(ADoc);
+      if LTree.Doc = nil then
+        self.DoFail(ADAM_JSON_MSG_NO_ROOM);
+        return false;
+      end;
+      self.Tree := LTree;
+      self.Node := yyjson_mut_doc_get_root(LTree.Doc);
+      self.Missing := false;
+      self.Error := "";
+      return true;
+    end;
+
+    // The key at APath[AAt] (bare or quoted) in AKey; false on a malformed one
+    hidden const method DoReadKey(const APath: string; var AAt: int64; var AKey: string): bool;
+    var
+      LFrom: int64;
+    begin
+      if (AAt < len(APath)) and (APath[AAt] = '"') then
+        AAt := AAt + 1;
+        LFrom := AAt;
+        // A quoted key: found to its closing quote (an escaped one passed), then unescaped
+        while (AAt < len(APath)) and (APath[AAt] <> '"') do
+          if (APath[AAt] = '\\') and (AAt + 1 < len(APath)) then
+            AAt := AAt + 1;
+          end;
+          AAt := AAt + 1;
+        end;
+        if AAt >= len(APath) then
+          return false;
+        end;
+        AKey := self.DoUnquote(Substring(APath, LFrom, AAt - LFrom));
+        AAt := AAt + 1;
+        return true;
+      end;
+      LFrom := AAt;
+      while (AAt < len(APath)) and (APath[AAt] <> '.') and (APath[AAt] <> '[') do
+        AAt := AAt + 1;
+      end;
+      AKey := Substring(APath, LFrom, AAt - LFrom);
+      return len(AKey) > 0;
+    end;
+
+    // A quoted key's text with its \" and \\ escapes taken
+    hidden const method DoUnquote(const AText: string): string;
+    var
+      LText: string;
+      LAt: int64;
+      LTo: int64;
+    begin
+      setlength(LText, len(AText));
+      LAt := 0;
+      LTo := 0;
+      while LAt < len(AText) do
+        if (AText[LAt] = '\\') and (LAt + 1 < len(AText)) then
+          LAt := LAt + 1;
+        end;
+        LText[LTo] := AText[LAt];
+        LTo := LTo + 1;
+        LAt := LAt + 1;
+      end;
+      setlength(LText, LTo);
+      return LText;
+    end;
+
+    // The node APath names from this one; nil when it names none (or is malformed)
+    hidden const method DoResolve(const APath: string): ptr to yyjson_mut_val;
+    var
+      LNode: ptr to yyjson_mut_val;
+      LAt: int64;
+      LKey: string;
+      LFrom: int64;
+      LIndex: int64;
+    begin
+      LNode := self.Node;
+      if LNode = nil then
+        return nil;
+      end;
+      LAt := 0;
+      while LAt < len(APath) do
+        if APath[LAt] = '[' then
+          LAt := LAt + 1;
+          LFrom := LAt;
+          while (LAt < len(APath)) and (APath[LAt] <> ']') do
+            LAt := LAt + 1;
+          end;
+          if (LAt >= len(APath)) or not TryStrToInt(Substring(APath, LFrom, LAt - LFrom), LIndex) then
+            return nil;
+          end;
+          LAt := LAt + 1;
+          if (not yyjson_mut_is_arr(LNode)) or (LIndex < 0) or
+            (LIndex >= int64(yyjson_mut_arr_size(LNode))) then
+            return nil;
+          end;
+          LNode := yyjson_mut_arr_get(LNode, uint64(LIndex));
+        else
+          if APath[LAt] = '.' then
+            LAt := LAt + 1;
+          end;
+          if not self.DoReadKey(APath, LAt, LKey) then
+            return nil;
+          end;
+          if not yyjson_mut_is_obj(LNode) then
+            return nil;
+          end;
+          LNode := yyjson_mut_obj_getn(LNode, DoChars(LKey), uint64(len(LKey)));
+          if LNode = nil then
+            return nil;
+          end;
+        end;
+      end;
+      return LNode;
+    end;
+
+    // -- Reading text, files and streams (a failure: a missing value, ErrorText set)
+
+    // The JSON text AText, this value's tree from now on; false with ErrorText when it is no
+    // valid JSON ("<text>(line,col): message")
+    method Parse(const AText: string): bool;
+    var
+      LError: yyjson_read_err;
+      LDoc: ptr to yyjson_doc;
+    begin
+      LDoc := yyjson_read_opts(ptr to char(ptr(uint64(DoChars(AText)))), uint64(len(AText)),
+        ADAM_JSON_READ_FLAGS, addr of GAlc, addr of LError);
+      if LDoc = nil then
+        self.DoFail(DoTextError(ADAM_JSON_TEXT_NAME, AText, LError));
+        return false;
+      end;
+      return self.DoTake(LDoc);
+    end;
+
+    // The JSON file at APath read through C's file calls (so a HookIO path reads its IO),
+    // this value's tree from now on; false with ErrorText ("APath: message (byte N)")
+    method LoadFromFile(const APath: string): bool;
+    var
+      LPath: ptr to char;
+      LError: yyjson_read_err;
+      LDoc: ptr to yyjson_doc;
+    begin
+      LPath := DoFilePath(APath);
+      if LPath = nil then
+        self.DoFail(APath + ": " + ADAM_JSON_MSG_NO_ROOM);
+        return false;
+      end;
+      LDoc := yyjson_read_file(ptr to const char(LPath), ADAM_JSON_READ_FLAGS, addr of GAlc,
+        addr of LError);
+      freemem(ptr(LPath));
+      if LDoc = nil then
+        self.DoFail(DoFileError(APath, LError));
+        return false;
+      end;
+      return self.DoTake(LDoc);
+    end;
+
+    // The JSON text the IO AStream holds from its place to its end, this value's tree from
+    // now on; false with ErrorText ("<stream>(line,col): message")
+    method LoadFromStream(const AStream: IO): bool;
+    var
+      LText: string;
+      LOk: bool;
+    begin
+      if AStream = nil then
+        self.DoFail(ADAM_JSON_STREAM_NAME + ": " + ADAM_JSON_MSG_NO_STREAM);
+        return false;
+      end;
+      if not IOReadAll(AStream, LText) then
+        self.DoFail(ADAM_JSON_STREAM_NAME + ": " + ADAM_JSON_MSG_STREAM_FAILED);
+        return false;
+      end;
+      LOk := self.Parse(LText);
+      if not LOk then
+        // The text's own errors, named for the stream it came from
+        self.Error := ADAM_JSON_STREAM_NAME + Substring(self.Error, len(ADAM_JSON_TEXT_NAME),
+          len(self.Error) - len(ADAM_JSON_TEXT_NAME));
+      end;
+      return LOk;
+    end;
+
+    // Why the last Parse / LoadFromFile / LoadFromStream (or JsonFrom*) failed; "" if it did not
+    const method ErrorText(): string;
+    begin
+      return self.Error;
+    end;
+
+    // -- Writing
+
+    // The value as compact JSON text ("{}" for a fresh one, "null" for a missing one)
+    const method ToString(): string;
+    begin
+      if self.Missing then
+        return "null";
+      end;
+      if self.Tree = nil then
+        return "{}";
+      end;
+      return DoWrite(self.Node, YYJSON_WRITE_NOFLAG);
+    end;
+
+    // The value as JSON text, a line per member, AIndent spaces a level
+    const method ToPrettyString(const AIndent: int32): string;
+    var
+      LText: string;
+    begin
+      if (self.Missing) or (self.Tree = nil) then
+        return self.ToString();
+      end;
+      if AIndent = ADAM_JSON_INDENT then
+        return DoWrite(self.Node, YYJSON_WRITE_PRETTY_TWO_SPACES);
+      end;
+      LText := DoWrite(self.Node, YYJSON_WRITE_PRETTY);
+      if int64(AIndent) = ADAM_JSON_YYJSON_INDENT then
+        return LText;
+      end;
+      if AIndent < 0 then
+        return DoReindent(LText, 0);
+      end;
+      return DoReindent(LText, int64(AIndent));
+    end;
+
+    // The value written to the file at APath through C's file calls (a HookIO path writes its
+    // IO), pretty (2 spaces) when APretty; false when it cannot be written
+    method SaveToFile(const APath: string; const APretty: bool): bool;
+    var
+      LPath: ptr to char;
+      LFlags: yyjson_write_flag;
+      LOk: bool;
+    begin
+      if self.Missing then
+        return false;
+      end;
+      if not self.DoEnsure() then
+        return false;
+      end;
+      LPath := DoFilePath(APath);
+      if LPath = nil then
+        return false;
+      end;
+      LFlags := ADAM_JSON_WRITE_FLAGS;
+      if APretty then
+        LFlags := LFlags | YYJSON_WRITE_PRETTY_TWO_SPACES;
+      end;
+      LOk := yyjson_mut_val_write_file(ptr to const char(LPath), self.Node, LFlags, addr of GAlc, nil);
+      freemem(ptr(LPath));
+      return LOk;
+    end;
+
+    // The value's text written to the IO AStream at its place, pretty when APretty; false when
+    // not all of it could be written
+    method SaveToStream(const AStream: IO; const APretty: bool): bool;
+    var
+      LText: string;
+    begin
+      if (AStream = nil) or self.Missing then
+        return false;
+      end;
+      if APretty then
+        LText := self.ToPrettyString(ADAM_JSON_INDENT);
+      else
+        LText := self.ToString();
+      end;
+      if len(LText) = 0 then
+        return true;
+      end;
+      return IOWriteFull(AStream, DoChars(LText), len(LText)) = len(LText);
+    end;
+
+    // -- Building (each returns this value, so calls chain)
+
+    method AddString(const AKey: string; const AValue: string): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoAttach(true, AKey, yyjson_mut_strncpy(self.Tree.Doc, DoChars(AValue), uint64(len(AValue))));
+      end;
+      return self;
+    end;
+
+    method AddInt(const AKey: string; const AValue: int64): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoAttach(true, AKey, yyjson_mut_sint(self.Tree.Doc, AValue));
+      end;
+      return self;
+    end;
+
+    method AddFloat(const AKey: string; const AValue: float64): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoAttach(true, AKey, yyjson_mut_real(self.Tree.Doc, AValue));
+      end;
+      return self;
+    end;
+
+    method AddBool(const AKey: string; const AValue: bool): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoAttach(true, AKey, yyjson_mut_bool(self.Tree.Doc, AValue));
+      end;
+      return self;
+    end;
+
+    // A copy of AValue's tree (a fresh one: an empty object; a missing one: null)
+    method AddJson(const AKey: string; const AValue: Json): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoAttach(true, AKey, self.DoCopyOf(AValue));
+      end;
+      return self;
+    end;
+
+    method AddNull(const AKey: string): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoAttach(true, AKey, yyjson_mut_null(self.Tree.Doc));
+      end;
+      return self;
+    end;
+
+    // AJsonText's value under AKey; nothing added when it is no valid JSON
+    method AddRaw(const AKey: string; const AJsonText: string): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoAttach(true, AKey, self.DoCopyText(AJsonText));
+      end;
+      return self;
+    end;
+
+    method AppendString(const AValue: string): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoAttach(false, "", yyjson_mut_strncpy(self.Tree.Doc, DoChars(AValue), uint64(len(AValue))));
+      end;
+      return self;
+    end;
+
+    method AppendInt(const AValue: int64): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoAttach(false, "", yyjson_mut_sint(self.Tree.Doc, AValue));
+      end;
+      return self;
+    end;
+
+    method AppendFloat(const AValue: float64): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoAttach(false, "", yyjson_mut_real(self.Tree.Doc, AValue));
+      end;
+      return self;
+    end;
+
+    method AppendBool(const AValue: bool): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoAttach(false, "", yyjson_mut_bool(self.Tree.Doc, AValue));
+      end;
+      return self;
+    end;
+
+    method AppendJson(const AValue: Json): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoAttach(false, "", self.DoCopyOf(AValue));
+      end;
+      return self;
+    end;
+
+    method AppendNull(): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoAttach(false, "", yyjson_mut_null(self.Tree.Doc));
+      end;
+      return self;
+    end;
+
+    method AddStrings(const AKey: string; const AValues: StringArray): Json;
+    var
+      LArray: ptr to yyjson_mut_val;
+      LI: int64;
+    begin
+      if self.DoEnsure() then
+        LArray := yyjson_mut_arr(self.Tree.Doc);
+        if self.DoAttach(true, AKey, LArray) then
+          for LI := 0 to len(AValues) - 1 do
+            yyjson_mut_arr_append(LArray, yyjson_mut_strncpy(self.Tree.Doc, DoChars(AValues[LI]),
+              uint64(len(AValues[LI]))));
+          end;
+        end;
+      end;
+      return self;
+    end;
+
+    method AddIntegers(const AKey: string; const AValues: Int64Array): Json;
+    var
+      LArray: ptr to yyjson_mut_val;
+      LI: int64;
+    begin
+      if self.DoEnsure() then
+        LArray := yyjson_mut_arr(self.Tree.Doc);
+        if self.DoAttach(true, AKey, LArray) then
+          for LI := 0 to len(AValues) - 1 do
+            yyjson_mut_arr_append(LArray, yyjson_mut_sint(self.Tree.Doc, AValues[LI]));
+          end;
+        end;
+      end;
+      return self;
+    end;
+
+    method AddDoubles(const AKey: string; const AValues: array of float64): Json;
+    var
+      LArray: ptr to yyjson_mut_val;
+      LI: int64;
+    begin
+      if self.DoEnsure() then
+        LArray := yyjson_mut_arr(self.Tree.Doc);
+        if self.DoAttach(true, AKey, LArray) then
+          for LI := 0 to len(AValues) - 1 do
+            yyjson_mut_arr_append(LArray, yyjson_mut_real(self.Tree.Doc, AValues[LI]));
+          end;
+        end;
+      end;
+      return self;
+    end;
+
+    // An object under AKey (AppendObject: appended to an array) the next Adds go into until
+    // EndObject; BeginArray / AppendArray the same for an array, closed by EndArray
+    method BeginObject(const AKey: string): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoOpen(true, AKey, yyjson_mut_obj(self.Tree.Doc));
+      end;
+      return self;
+    end;
+
+    method AppendObject(): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoOpen(false, "", yyjson_mut_obj(self.Tree.Doc));
+      end;
+      return self;
+    end;
+
+    method EndObject(): Json;
+    begin
+      self.DoClose(true);
+      return self;
+    end;
+
+    method BeginArray(const AKey: string): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoOpen(true, AKey, yyjson_mut_arr(self.Tree.Doc));
+      end;
+      return self;
+    end;
+
+    method AppendArray(): Json;
+    begin
+      if self.DoEnsure() then
+        self.DoOpen(false, "", yyjson_mut_arr(self.Tree.Doc));
+      end;
+      return self;
+    end;
+
+    method EndArray(): Json;
+    begin
+      self.DoClose(false);
+      return self;
+    end;
+
+    // AValue's node copied into this tree's document (a fresh one: an empty object; a missing
+    // one: null); nil when there is no room
+    hidden method DoCopyOf(const AValue: Json): ptr to yyjson_mut_val;
+    begin
+      if AValue.Missing then
+        return yyjson_mut_null(self.Tree.Doc);
+      end;
+      if AValue.Tree = nil then
+        return yyjson_mut_obj(self.Tree.Doc);
+      end;
+      return yyjson_mut_val_mut_copy(self.Tree.Doc, AValue.Node);
+    end;
+
+    // -- Navigating
+
+    // The value APath names (see the header); a missing value when it names none
+    const method Get(const APath: string): Json;
+    begin
+      if self.Tree = nil then
+        if len(APath) = 0 then
+          return self;
+        end;
+        return self.DoView(nil);
+      end;
+      return self.DoView(self.DoResolve(APath));
+    end;
+
+    // True when APath names a value
+    const method Has(const APath: string): bool;
+    begin
+      if self.Tree = nil then
+        return (len(APath) = 0) and not self.Missing;
+      end;
+      return self.DoResolve(APath) <> nil;
+    end;
+
+    // An array's items or an object's members; 0 for any other value
+    const method Count(): int64;
+    begin
+      if self.Tree = nil then
+        return 0;
+      end;
+      if yyjson_mut_is_arr(self.Node) then
+        return int64(yyjson_mut_arr_size(self.Node));
+      end;
+      if yyjson_mut_is_obj(self.Node) then
+        return int64(yyjson_mut_obj_size(self.Node));
+      end;
+      return 0;
+    end;
+
+    // An object's keys in order; none for any other value
+    const method Keys(): StringArray;
+    var
+      LKeys: StringArray;
+      LIter: yyjson_mut_obj_iter;
+      LKey: ptr to yyjson_mut_val;
+      LAt: int64;
+    begin
+      setlength(LKeys, 0);
+      if (self.Tree = nil) or not yyjson_mut_is_obj(self.Node) then
+        return LKeys;
+      end;
+      setlength(LKeys, int64(yyjson_mut_obj_size(self.Node)));
+      yyjson_mut_obj_iter_init(self.Node, addr of LIter);
+      LAt := 0;
+      LKey := yyjson_mut_obj_iter_next(addr of LIter);
+      while LKey <> nil do
+        LKeys[LAt] := DoStringOf(LKey);
+        LAt := LAt + 1;
+        LKey := yyjson_mut_obj_iter_next(addr of LIter);
+      end;
+      return LKeys;
+    end;
+
+    // An array's items or an object's values in order, each a view; none for any other value
+    const method Items(): array of Json;
+    var
+      LItems: array of Json;
+      LArrayIter: yyjson_mut_arr_iter;
+      LObjectIter: yyjson_mut_obj_iter;
+      LNode: ptr to yyjson_mut_val;
+      LAt: int64;
+    begin
+      setlength(LItems, self.Count());
+      LAt := 0;
+      if len(LItems) = 0 then
+        return LItems;
+      end;
+      if yyjson_mut_is_arr(self.Node) then
+        yyjson_mut_arr_iter_init(self.Node, addr of LArrayIter);
+        LNode := yyjson_mut_arr_iter_next(addr of LArrayIter);
+        while LNode <> nil do
+          LItems[LAt] := self.DoView(LNode);
+          LAt := LAt + 1;
+          LNode := yyjson_mut_arr_iter_next(addr of LArrayIter);
+        end;
+        return LItems;
+      end;
+      yyjson_mut_obj_iter_init(self.Node, addr of LObjectIter);
+      LNode := yyjson_mut_obj_iter_next(addr of LObjectIter);
+      while LNode <> nil do
+        LItems[LAt] := self.DoView(yyjson_mut_obj_iter_get_val(LNode));
+        LAt := LAt + 1;
+        LNode := yyjson_mut_obj_iter_next(addr of LObjectIter);
+      end;
+      return LItems;
+    end;
+
+    // An array's first / last item; a missing value for an empty array or any other value
+    const method First(): Json;
+    begin
+      if (self.Tree = nil) or not yyjson_mut_is_arr(self.Node) then
+        return self.DoView(nil);
+      end;
+      return self.DoView(yyjson_mut_arr_get_first(self.Node));
+    end;
+
+    const method Last(): Json;
+    begin
+      if (self.Tree = nil) or not yyjson_mut_is_arr(self.Node) then
+        return self.DoView(nil);
+      end;
+      return self.DoView(yyjson_mut_arr_get_last(self.Node));
+    end;
+
+    // True when the value is an array holding the string AValue
+    const method ContainsString(const AValue: string): bool;
+    var
+      LIter: yyjson_mut_arr_iter;
+      LNode: ptr to yyjson_mut_val;
+    begin
+      if (self.Tree = nil) or not yyjson_mut_is_arr(self.Node) then
+        return false;
+      end;
+      yyjson_mut_arr_iter_init(self.Node, addr of LIter);
+      LNode := yyjson_mut_arr_iter_next(addr of LIter);
+      while LNode <> nil do
+        if yyjson_mut_equals_strn(LNode, DoChars(AValue), uint64(len(AValue))) then
+          return true;
+        end;
+        LNode := yyjson_mut_arr_iter_next(addr of LIter);
+      end;
+      return false;
+    end;
+
+    // True when the value is an array holding the whole number AValue
+    const method ContainsInt(const AValue: int64): bool;
+    var
+      LIter: yyjson_mut_arr_iter;
+      LNode: ptr to yyjson_mut_val;
+    begin
+      if (self.Tree = nil) or not yyjson_mut_is_arr(self.Node) then
+        return false;
+      end;
+      yyjson_mut_arr_iter_init(self.Node, addr of LIter);
+      LNode := yyjson_mut_arr_iter_next(addr of LIter);
+      while LNode <> nil do
+        if yyjson_mut_is_sint(LNode) and (yyjson_mut_get_sint(LNode) = AValue) then
+          return true;
+        end;
+        if yyjson_mut_is_uint(LNode) and (AValue >= 0) and (yyjson_mut_get_uint(LNode) = uint64(AValue)) then
+          return true;
+        end;
+        LNode := yyjson_mut_arr_iter_next(addr of LIter);
+      end;
+      return false;
+    end;
+
+    // -- Values (a missing value, null, or one of no fitting kind gives the default)
+
+    // A string as itself, a number / true / false as its JSON text, an array / object as its
+    // compact text
+    const method AsString(const ADefault: string): string;
+    begin
+      if (self.Tree = nil) or yyjson_mut_is_null(self.Node) then
+        if (self.Tree = nil) and not self.Missing then
+          return "{}";
+        end;
+        return ADefault;
+      end;
+      if yyjson_mut_is_str(self.Node) then
+        return DoStringOf(self.Node);
+      end;
+      return DoWrite(self.Node, YYJSON_WRITE_NOFLAG);
+    end;
+
+    // true / false, a number (not 0), or the string "true" (any case)
+    const method AsBoolean(const ADefault: bool): bool;
+    begin
+      if self.Tree = nil then
+        return ADefault;
+      end;
+      if yyjson_mut_is_bool(self.Node) then
+        return yyjson_mut_get_bool(self.Node);
+      end;
+      if yyjson_mut_is_num(self.Node) then
+        return yyjson_mut_get_num(self.Node) <> 0.0;
+      end;
+      if yyjson_mut_is_str(self.Node) then
+        return LowerCase(DoStringOf(self.Node)) = "true";
+      end;
+      return ADefault;
+    end;
+
+    // A number (a real one truncated toward 0) or a decimal string, when int64 holds it
+    const method AsInt64(const ADefault: int64): int64;
+    var
+      LValue: int64;
+    begin
+      if self.DoWhole(LValue) then
+        return LValue;
+      end;
+      return ADefault;
+    end;
+
+    // AsInt64 when int32 holds it
+    const method AsInt32(const ADefault: int32): int32;
+    var
+      LValue: int64;
+    begin
+      if not self.DoWhole(LValue) then
+        return ADefault;
+      end;
+      if (LValue < int64(ADAM_JSON_INT32_MIN)) or (LValue > int64(ADAM_JSON_INT32_MAX)) then
+        return ADefault;
+      end;
+      return int32(LValue);
+    end;
+
+    // A whole number of 0 or more (an unsigned one beyond int64 too), when uint64 holds it
+    const method AsUInt64(const ADefault: uint64): uint64;
+    var
+      LValue: int64;
+    begin
+      if (self.Tree <> nil) and yyjson_mut_is_uint(self.Node) then
+        return yyjson_mut_get_uint(self.Node);
+      end;
+      if (not self.DoWhole(LValue)) or (LValue < 0) then
+        return ADefault;
+      end;
+      return uint64(LValue);
+    end;
+
+    // AsUInt64 when uint32 holds it
+    const method AsUInt32(const ADefault: uint32): uint32;
+    var
+      LValue: int64;
+    begin
+      if (not self.DoWhole(LValue)) or (LValue < 0) or (LValue > int64(ADAM_JSON_UINT32_MAX)) then
+        return ADefault;
+      end;
+      return uint32(LValue);
+    end;
+
+    // A number or a decimal string as a float64
+    const method AsDouble(const ADefault: float64): float64;
+    var
+      LValue: float64;
+    begin
+      if self.Tree = nil then
+        return ADefault;
+      end;
+      if yyjson_mut_is_num(self.Node) then
+        return yyjson_mut_get_num(self.Node);
+      end;
+      if yyjson_mut_is_str(self.Node) and TryStrToFloat(DoStringOf(self.Node), LValue) then
+        return LValue;
+      end;
+      return ADefault;
+    end;
+
+    // AsDouble as a float32 (past float32's range: an infinity, as a cast rounds)
+    const method AsSingle(const ADefault: float32): float32;
+    begin
+      return float32(self.AsDouble(float64(ADefault)));
+    end;
+
+    // The value as a whole number in AValue (AsInt64's rule); false when it gives none
+    hidden const method DoWhole(var AValue: int64): bool;
+    var
+      LReal: float64;
+    begin
+      if self.Tree = nil then
+        return false;
+      end;
+      if yyjson_mut_is_sint(self.Node) then
+        AValue := yyjson_mut_get_sint(self.Node);
+        return true;
+      end;
+      if yyjson_mut_is_uint(self.Node) then
+        if yyjson_mut_get_uint(self.Node) > uint64(ADAM_JSON_INT64_MAX) then
+          return false;
+        end;
+        AValue := int64(yyjson_mut_get_uint(self.Node));
+        return true;
+      end;
+      if yyjson_mut_is_real(self.Node) then
+        LReal := yyjson_mut_get_real(self.Node);
+        // Inside int64's range (NaN fails both tests)
+        if (LReal >= ADAM_JSON_INT64_LOW) and (LReal < ADAM_JSON_INT64_HIGH) then
+          AValue := int64(LReal);
+          return true;
+        end;
+        return false;
+      end;
+      if yyjson_mut_is_str(self.Node) then
+        return TryStrToInt(DoStringOf(self.Node), AValue);
+      end;
+      return false;
+    end;
+
+    // An array's items as strings (AsString each); none for any other value
+    const method AsStringArray(): StringArray;
+    var
+      LItems: array of Json;
+      LValues: StringArray;
+      LI: int64;
+    begin
+      LItems := self.DoArrayItems();
+      setlength(LValues, len(LItems));
+      for LI := 0 to len(LItems) - 1 do
+        LValues[LI] := LItems[LI].AsString("");
+      end;
+      return LValues;
+    end;
+
+    const method AsInt32Array(): array of int32;
+    var
+      LItems: array of Json;
+      LValues: array of int32;
+      LI: int64;
+    begin
+      LItems := self.DoArrayItems();
+      setlength(LValues, len(LItems));
+      for LI := 0 to len(LItems) - 1 do
+        LValues[LI] := LItems[LI].AsInt32(0);
+      end;
+      return LValues;
+    end;
+
+    const method AsInt64Array(): Int64Array;
+    var
+      LItems: array of Json;
+      LValues: Int64Array;
+      LI: int64;
+    begin
+      LItems := self.DoArrayItems();
+      setlength(LValues, len(LItems));
+      for LI := 0 to len(LItems) - 1 do
+        LValues[LI] := LItems[LI].AsInt64(0);
+      end;
+      return LValues;
+    end;
+
+    const method AsDoubleArray(): array of float64;
+    var
+      LItems: array of Json;
+      LValues: array of float64;
+      LI: int64;
+    begin
+      LItems := self.DoArrayItems();
+      setlength(LValues, len(LItems));
+      for LI := 0 to len(LItems) - 1 do
+        LValues[LI] := LItems[LI].AsDouble(0.0);
+      end;
+      return LValues;
+    end;
+
+    // Items, for an array only
+    hidden const method DoArrayItems(): array of Json;
+    var
+      LNone: array of Json;
+    begin
+      if (self.Tree = nil) or not yyjson_mut_is_arr(self.Node) then
+        setlength(LNone, 0);
+        return LNone;
+      end;
+      return self.Items();
+    end;
+
+    // -- Kinds (a fresh value is an empty object; a missing one is null)
+
+    const method IsNull(): bool;
+    begin
+      if self.Tree = nil then
+        return self.Missing;
+      end;
+      return yyjson_mut_is_null(self.Node);
+    end;
+
+    const method IsObject(): bool;
+    begin
+      if self.Tree = nil then
+        return not self.Missing;
+      end;
+      return yyjson_mut_is_obj(self.Node);
+    end;
+
+    const method IsArray(): bool;
+    begin
+      return (self.Tree <> nil) and yyjson_mut_is_arr(self.Node);
+    end;
+
+    const method IsNumber(): bool;
+    begin
+      return (self.Tree <> nil) and yyjson_mut_is_num(self.Node);
+    end;
+
+    const method IsString(): bool;
+    begin
+      return (self.Tree <> nil) and yyjson_mut_is_str(self.Node);
+    end;
+
+    const method IsBoolean(): bool;
+    begin
+      return (self.Tree <> nil) and yyjson_mut_is_bool(self.Node);
+    end;
+
+    // -- Walking and changing
+
+    // ACallback with each of Items and AUserData
+    method ForEach(const ACallback: JsonCallback; const AUserData: ptr): Json;
+    var
+      LItems: array of Json;
+      LI: int64;
+    begin
+      LItems := self.Items();
+      for LI := 0 to len(LItems) - 1 do
+        ACallback(LItems[LI], AUserData);
+      end;
+      return self;
+    end;
+
+    // An object's members of key AKey removed
+    method Remove(const AKey: string): Json;
+    begin
+      if (self.Tree <> nil) and yyjson_mut_is_obj(self.Node) then
+        yyjson_mut_obj_remove_keyn(self.Node, DoChars(AKey), uint64(len(AKey)));
+      end;
+      return self;
+    end;
+
+    // AOther's members (both objects) copied in, each replacing this one's of its key
+    method Merge(const AOther: Json): Json;
+    var
+      LIter: yyjson_mut_obj_iter;
+      LKey: ptr to yyjson_mut_val;
+    begin
+      if (AOther.Tree = nil) or not yyjson_mut_is_obj(AOther.Node) then
+        return self;
+      end;
+      if not self.DoEnsure() then
+        return self;
+      end;
+      if not yyjson_mut_is_obj(self.Node) then
+        return self;
+      end;
+      yyjson_mut_obj_iter_init(AOther.Node, addr of LIter);
+      LKey := yyjson_mut_obj_iter_next(addr of LIter);
+      while LKey <> nil do
+        yyjson_mut_obj_put(self.Node, yyjson_mut_val_mut_copy(self.Tree.Doc, LKey),
+          yyjson_mut_val_mut_copy(self.Tree.Doc, yyjson_mut_obj_iter_get_val(LKey)));
+        LKey := yyjson_mut_obj_iter_next(addr of LIter);
+      end;
+      return self;
+    end;
+
+    // The value copied into a tree of its own (a missing value stays missing)
+    const method Clone(): Json;
+    var
+      LCopy: Json;
+      LTree: ref JsonTree;
+    begin
+      if self.Tree = nil then
+        return self;
+      end;
+      LTree := ref JsonTree();
+      LTree.Doc := yyjson_mut_doc_new(addr of GAlc);
+      if LTree.Doc = nil then
+        return self.DoFailed(ADAM_JSON_MSG_NO_ROOM);
+      end;
+      LCopy.Tree := LTree;
+      LCopy.Node := yyjson_mut_val_mut_copy(LTree.Doc, self.Node);
+      if LCopy.Node = nil then
+        return self.DoFailed(ADAM_JSON_MSG_NO_ROOM);
+      end;
+      yyjson_mut_doc_set_root(LTree.Doc, LCopy.Node);
+      return LCopy;
+    end;
+  end;
+
+  // An object's member as Pairs gives it
+  JsonPair = object
+    NodeName: string;
+    Value: Json;
+  end;
+
+
+// An object's members in order: each key and a view of its value; none for any other value
+public routine JsonPairs(const AJson: Json): array of JsonPair;
+var
+  LPairs: array of JsonPair;
+  LKeys: StringArray;
+  LItems: array of Json;
+  LI: int64;
+begin
+  setlength(LPairs, 0);
+  if not AJson.IsObject() then
+    return LPairs;
+  end;
+  LKeys := AJson.Keys();
+  LItems := AJson.Items();
+  setlength(LPairs, len(LKeys));
+  for LI := 0 to len(LKeys) - 1 do
+    LPairs[LI].NodeName := LKeys[LI];
+    LPairs[LI].Value := LItems[LI];
+  end;
+  return LPairs;
+end;
+
+// The JSON text AText (a missing value with its ErrorText when it is no valid JSON)
+public routine JsonFromString(const AText: string): Json;
+var
+  LJson: Json;
+begin
+  LJson.Parse(AText);
+  return LJson;
+end;
+
+// The JSON file at APath, read through C's file calls (a HookIO path reads its IO)
+public routine JsonFromFile(const APath: string): Json;
+var
+  LJson: Json;
+begin
+  LJson.LoadFromFile(APath);
+  return LJson;
+end;
+
+// The JSON text the IO AStream holds from its place to its end
+public routine JsonFromStream(const AStream: IO): Json;
+var
+  LJson: Json;
+begin
+  LJson.LoadFromStream(AStream);
+  return LJson;
+end;
+
+initialize
+begin
+  GAlc.malloc := DoAlcMalloc;
+  GAlc.realloc := DoAlcRealloc;
+  GAlc.free := DoAlcFree;
+  GAlc.ctx := nil;
+end;
+
+end.
