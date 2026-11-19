@@ -417,6 +417,11 @@ public const
   // object's storage it is given (DoSetupBody), so an exe that builds an object of the type
   // declared external sets them through the library that owns the vtable
   ADAM_LOWERING_SETUP_SYMBOL: string = "__adam_setup";
+  // The prefix of a unit's type fix function's symbol (MO1b0; the module's name follows;
+  // internal): the words of its blobs that name an external type's TypeInfo (a library's
+  // data, reached only through its import slot) filled at run time, called from the
+  // unit's variable inits before anything else they do (DoTypeFixBody)
+  ADAM_LOWERING_TYPEFIX_SYMBOL: string = "__adam_typefix_";
   // The words of an itable before its slot 0 (DoItableData): the offset back from its
   // word to the object's start, then the interface's TypeInfo
   ADAM_LOWERING_ITABLE_HEADER: int64 = 2;
@@ -674,6 +679,34 @@ begin
     ATree[LProperty].HasFlag(NodeFlag.Abstract);
 end;
 
+// True when the member AMember of an external type (IsExternalType, MO1b0) is a function
+// its library defines (IsMemberCode there, where the member has its body): a method, init,
+// done, copy, operator or property accessor that is not abstract, an accessor unbound
+// (its library gave it a body) or of a dispatched property; a member heading names it
+public routine IsExternalMemberCode(const ATree: ref SyntaxTree; const AMember: int64): bool;
+var
+  LKind: NodeKind;
+  LProperty: int64;
+begin
+  LKind := ATree[AMember].Kind;
+  if ATree[AMember].HasFlag(NodeFlag.Abstract) then
+    return false;
+  end;
+  if (LKind = NodeKind.MethodDecl) or (LKind = NodeKind.InitDecl) or (LKind = NodeKind.DoneDecl) or
+    (LKind = NodeKind.CopyDecl) or (LKind = NodeKind.OperatorDecl) then
+    return true;
+  end;
+  if (LKind <> NodeKind.PropertyRead) and (LKind <> NodeKind.PropertyWrite) then
+    return false;
+  end;
+  if ATree[AMember].Text = "" then
+    return true;
+  end;
+  LProperty := ATree.ParentOf(AMember);
+  return ATree[LProperty].HasFlag(NodeFlag.Virtual) or ATree[LProperty].HasFlag(NodeFlag.Override) or
+    ATree[LProperty].HasFlag(NodeFlag.Abstract);
+end;
+
 // The members under AId (a type declaration or a node in its body) that get functions
 // (IsMemberCode) added to AMembers in source order, through properties and inline types as
 // DoTypeBodies walks them; a generic method adds none (its instances are made where they
@@ -696,6 +729,40 @@ begin
       DoMemberCode(ATree, LChild, AMembers);
     end;
   end;
+end;
+
+// The members under AId (an external type's declaration or a node in its body) its library
+// defines (IsExternalMemberCode) added to AMembers in source order, through properties as
+// DoMemberCode walks a type; a generic method adds none
+routine DoExternalMemberCode(const ATree: ref SyntaxTree; const AId: int64; const AMembers: ref Int64List);
+var
+  LChild: int64;
+  LI: int64;
+begin
+  for LI := 0 to ATree.ChildCount(AId) - 1 do
+    LChild := ATree.ChildAt(AId, LI);
+    if ATree.FirstOf(LChild, NodeRole.GenericParam) <> 0 then
+      skip;
+    end;
+    if IsExternalMemberCode(ATree, LChild) then
+      AMembers.Add(LChild);
+    else
+      DoExternalMemberCode(ATree, LChild, AMembers);
+    end;
+  end;
+end;
+
+// The members of the external type declaration AType its library defines
+// (DoExternalMemberCode, MO1b0), in source order: each a declared function of an
+// importer (Lowerer.DoLibraryMembers), a link report about its symbol at its heading
+// (the Driver's DoExternalNodes)
+public routine ExternalMemberCodeOf(const ATree: ref SyntaxTree; const AType: int64): ref Int64List;
+var
+  LMembers: ref Int64List;
+begin
+  LMembers := ref Int64List();
+  DoExternalMemberCode(ATree, AType, LMembers);
+  return LMembers;
 end;
 
 // The members of the type declaration AType that get functions (DoMemberCode), in source
@@ -1061,6 +1128,13 @@ public type
     // bodies lowered with the end bodies (DoSetupBody): by index, the function and its type
     hidden FSetupFunctions: ref Int64List;
     hidden FSetupTypes: ref Int64List;
+    // The unit's type fix function (DoTypeFixFunction, MO1b0; 0: no module it reaches
+    // declares an external type) and its fixes (DoAddInfoWord): by index, the blob, the
+    // byte offset of its word, the external type whose TypeInfo's address fills it
+    hidden FTypeFix: int64;
+    hidden FTypeFixData: ref Int64List;
+    hidden FTypeFixOffsets: ref Int64List;
+    hidden FTypeFixTypes: ref Int64List;
     // The task entries DoAsync made (DoTaskEntry), their bodies lowered last
     // (DoDeferredBodies): by index, the function and its async expression
     hidden FTaskEntries: ref Int64List;
@@ -1189,6 +1263,10 @@ public type
       self.FForwardsDone := 0;
       self.FSetupFunctions := ref Int64List();
       self.FSetupTypes := ref Int64List();
+      self.FTypeFix := 0;
+      self.FTypeFixData := ref Int64List();
+      self.FTypeFixOffsets := ref Int64List();
+      self.FTypeFixTypes := ref Int64List();
       self.FTaskEntries := ref Int64List();
       self.FTaskNodes := ref Int64List();
       self.FParallelEntries := ref Int64List();
@@ -2520,8 +2598,17 @@ public type
     hidden method DoSetVptr(const AAddress: int64; const AType: int64; const ANode: int64): bool;
     var
       LVtable: int64;
+      LCall: int64;
     begin
       if not IsPolymorphic(self.FTree, AType) then
+        return true;
+      end;
+      // an external type's vtable and itables are its library's: its setup writes them
+      // (MO1b0, DoLibrarySetup)
+      if IsExternalType(self.FTree, AType) then
+        LCall := self.DoEmit(IrOp.Call, IrType.Void, ANode);
+        self.FModule.InstrAt(LCall).Link := self.DoLibrarySetup(AType);
+        self.FModule.InstrAt(LCall).Operands.Add(AAddress);
         return true;
       end;
       LVtable := self.DoVtable(AType, ANode);
@@ -2708,11 +2795,7 @@ public type
       LInfo := self.DoTypeInfo(AInterface, ANode);
       LData := self.DoHelperData(ADAM_LOWERING_ITABLE_SYMBOL, self.FTarget.PointerAlign(), ANode);
       self.DoAddIntWord(LData, -AOffset);
-      if LInfo <> 0 then
-        self.FModule.DataAt(LData).AddAddress(self.FModule.DataAt(LInfo).Symbol, 0);
-      else
-        self.DoAddZeroWord(LData);
-      end;
+      self.DoAddInfoWord(LData, AInterface, LInfo);
       for LI := 0 to LFunctions.Count - 1 do
         self.FModule.DataAt(LData).AddAddress(self.FModule.FunctionAt(LFunctions[LI]).Symbol, 0);
       end;
@@ -2925,7 +3008,11 @@ public type
       if (self.FTree[AType].Kind <> NodeKind.TypeDecl) or (LSymbol = "") then
         return 0;
       end;
-      if (ModuleOf(self.FTree, AType) <> self.FUnit) and not self.DoIsInstanceHere(AType) then
+      // another unit's, or an external type's (its library's: code reaches it through its
+      // import slot, DoTypeInfoAddress; a blob's word naming it is fixed at run time,
+      // DoAddInfoWord)
+      if ((ModuleOf(self.FTree, AType) <> self.FUnit) and not self.DoIsInstanceHere(AType)) or
+        IsExternalType(self.FTree, AType) then
         LData := self.FModule.AddDataOfKind(LSymbol, IrDataKind.Zeroed, 1, AType);
         self.FModule.DataAt(LData).Declared := true;
         self.FTypeInfoOf[AType] := LData;
@@ -2947,11 +3034,7 @@ public type
       self.FTypeInfoOf[AType] := LData;
       // a generic instance's: every object using the instance defines it (M10f)
       self.FModule.DataAt(LData).Shared := InstanceAbove(self.FTree, AType) <> 0;
-      if LParentData <> 0 then
-        self.FModule.DataAt(LData).AddAddress(self.FModule.DataAt(LParentData).Symbol, 0);
-      else
-        self.DoAddZeroWord(LData);
-      end;
+      self.DoAddInfoWord(LData, LParent, LParentData);
       self.FModule.DataAt(LData).AddAddress(self.FModule.DataAt(LName).Symbol, 0);
       self.DoTypeInfoEntries(LData, AType, ANode);
       return LData;
@@ -2966,6 +3049,7 @@ public type
     hidden method DoTypeInfoEntries(const AData: int64; const AType: int64; const ANode: int64);
     var
       LInfos: ref Int64List;
+      LTypes: ref Int64List;
       LOffsets: ref Int64List;
       LLevel: int64;
       LDepth: int64;
@@ -2976,6 +3060,7 @@ public type
       LI: int64;
     begin
       LInfos := ref Int64List();
+      LTypes := ref Int64List();
       LOffsets := ref Int64List();
       if ClassOf(self.FTree, AType) = TypeClass.ObjectType then
         LLevel := AType;
@@ -2989,6 +3074,7 @@ public type
               LInfo := self.DoTypeInfo(LInterface, ANode);
               if LInfo <> 0 then
                 LInfos.Add(LInfo);
+                LTypes.Add(LInterface);
                 LOffsets.Add(self.DoPartOffset(AType, LLevel) + self.FTree[LNode].ResolvedOffset);
               end;
             end;
@@ -2999,9 +3085,53 @@ public type
       end;
       self.DoAddIntWord(AData, LInfos.Count);
       for LI := 0 to LInfos.Count - 1 do
-        self.FModule.DataAt(AData).AddAddress(self.FModule.DataAt(LInfos[LI]).Symbol, 0);
+        self.DoAddInfoWord(AData, LTypes[LI], LInfos[LI]);
         self.DoAddIntWord(AData, LOffsets[LI]);
       end;
+    end;
+
+    // The address word of the TypeInfo AInfo (DoTypeInfo) of the type AType at the end of
+    // the blob AData: a zero word for none (0); for an external type's (MO1b0: its
+    // library's data, which only its import slot reaches) a zero word fixed at run time
+    // (FTypeFix*, DoTypeFixBody), the blob made writable; else its symbol's address
+    hidden method DoAddInfoWord(const AData: int64; const AType: int64; const AInfo: int64);
+    begin
+      if AInfo = 0 then
+        self.DoAddZeroWord(AData);
+        return;
+      end;
+      if IsExternalType(self.FTree, AType) then
+        self.FTypeFixData.Add(AData);
+        self.FTypeFixOffsets.Add(self.FModule.DataAt(AData).ByteCount);
+        self.FTypeFixTypes.Add(AType);
+        self.FModule.DataAt(AData).Kind := IrDataKind.Variable;
+        self.DoAddZeroWord(AData);
+        return;
+      end;
+      self.FModule.DataAt(AData).AddAddress(self.FModule.DataAt(AInfo).Symbol, 0);
+    end;
+
+    // The external of the TypeInfo of the external type AType (MO1b0: its symbol, its
+    // clause's library; data, never called), made the first time (FExternalOf by the type's
+    // node); reached through its import slot (IrOp.ImportAddress) as an external
+    // variable's is (DoExternalVariable)
+    hidden method DoInfoExternal(const AType: int64): int64;
+    var
+      LClause: int64;
+      LLibrary: string;
+      LExternal: int64;
+    begin
+      if self.FExternalOf[AType] > 0 then
+        return self.FExternalOf[AType];
+      end;
+      LClause := self.FTree.FirstOf(AType, NodeRole.External);
+      LLibrary := "";
+      if self.FTree[LClause].ResolvedConst.Kind = ConstKind.String then
+        LLibrary := self.FTree[LClause].ResolvedConst.Text;
+      end;
+      LExternal := self.FModule.AddExternal(self.FTree[AType].ResolvedSymbol, LLibrary, IrType.Void, AType);
+      self.FExternalOf[AType] := LExternal;
+      return LExternal;
     end;
 
     // A zero address word (the target's pointer size) at the end of the blob AData
@@ -3025,6 +3155,12 @@ public type
       if LData = 0 then
         self.DoRefuse(ANode, "the type info of '" + TypeText(self.FTree, AType) + "'");
         return 0;
+      end;
+      // an external type's is its library's: its import slot's value (MO1b0)
+      if IsExternalType(self.FTree, AType) then
+        LAddress := self.DoEmit(IrOp.ImportAddress, IrType.Pointer, ANode);
+        self.FModule.InstrAt(LAddress).Link := self.DoInfoExternal(AType);
+        return LAddress;
       end;
       LAddress := self.DoEmit(IrOp.Address, IrType.Pointer, ANode);
       self.FModule.InstrAt(LAddress).Link := LData;
@@ -3433,11 +3569,7 @@ public type
       LInfo := self.DoTypeInfo(AType, ANode);
       LData := self.DoHelperData(ADAM_LOWERING_VTABLE_SYMBOL,
         self.FTarget.PointerAlign(), ANode);
-      if LInfo <> 0 then
-        self.FModule.DataAt(LData).AddAddress(self.FModule.DataAt(LInfo).Symbol, 0);
-      else
-        self.DoAddZeroWord(LData);
-      end;
+      self.DoAddInfoWord(LData, AType, LInfo);
       for LI := 0 to LFunctions.Count - 1 do
         self.FModule.DataAt(LData).AddAddress(self.FModule.FunctionAt(LFunctions[LI]).Symbol, 0);
       end;
@@ -11734,6 +11866,120 @@ public type
       self.FEndTypes.Add(AType);
       self.FEndNodes.Add(ANode);
       return LFunction;
+    end;
+
+    // Every member of the external type AType its library defines (ExternalMemberCodeOf)
+    // given its declared function (DoLibraryMember, MO1b0)
+    hidden method DoLibraryMembers(const AType: int64);
+    var
+      LMembers: ref Int64List;
+      LI: int64;
+    begin
+      LMembers := ExternalMemberCodeOf(self.FTree, AType);
+      for LI := 0 to LMembers.Count - 1 do
+        self.DoLibraryMember(LMembers[LI]);
+      end;
+    end;
+
+    // The member AMember of an external type given its function, declared: its library
+    // defines it under the member's symbol (Symbols mangles it in the library's namespace),
+    // which the link binds through the library (DoLinkLibraries adds the type's); no body,
+    // no inline copy (its code is the library's alone)
+    hidden method DoLibraryMember(const AMember: int64);
+    var
+      LResult: IrType;
+      LFunction: int64;
+    begin
+      if self.FFunctionOf[AMember] <> 0 then
+        return;
+      end;
+      if not self.DoPlainRoutine(AMember) or not self.DoResultIr(AMember, LResult) or
+        not self.DoParamsFit(AMember) then
+        return;
+      end;
+      LFunction := self.FModule.AddFunction(self.FTree[AMember].ResolvedSymbol, LResult, AMember);
+      self.FModule.FunctionAt(LFunction).NoReturn := self.FTree[AMember].HasFlag(NodeFlag.NoReturn);
+      self.DoFillSignature(AMember, self.FModule.FunctionAt(LFunction).Signature);
+      self.FModule.FunctionAt(LFunction).Declared := true;
+      self.FFunctionOf[AMember] := LFunction;
+    end;
+
+    // The library setup function of the external polymorphic object type AType (MO1b0:
+    // LibrarySetupSymbol, its library's), declared the first time (FFunctionOf by the
+    // type's node): one parameter, the object's storage
+    hidden method DoLibrarySetup(const AType: int64): int64;
+    var
+      LFunction: int64;
+    begin
+      if self.FFunctionOf[AType] <> 0 then
+        return self.FFunctionOf[AType];
+      end;
+      LFunction := self.FModule.AddFunction(LibrarySetupSymbol(self.FTree, AType), IrType.Void, AType);
+      self.FModule.FunctionAt(LFunction).Signature.AddParam(IrType.Pointer);
+      self.FModule.FunctionAt(LFunction).Declared := true;
+      self.FFunctionOf[AType] := LFunction;
+      return LFunction;
+    end;
+
+    // True when a module the unit reaches (itself and its imports, theirs too) declares an
+    // external type (MO1b0): its blobs may name such a type's TypeInfo (DoAddInfoWord)
+    hidden const method DoReachesExternalType(): bool;
+    var
+      LReached: BoolArray;
+      LModule: int64;
+      LI: int64;
+      LJ: int64;
+    begin
+      setlength(LReached, self.FTree.Count);
+      DoReach(self.FTree, self.FUnit, LReached);
+      for LI := 0 to self.FTree.ChildCount(ADAM_AST_PROGRAM) - 1 do
+        LModule := self.FTree.ChildAt(ADAM_AST_PROGRAM, LI);
+        if not LReached[LModule] then
+          skip;
+        end;
+        for LJ := 0 to self.FTree.CountOf(LModule, NodeRole.Declaration) - 1 do
+          if IsExternalType(self.FTree, self.FTree.NthOf(LModule, NodeRole.Declaration, LJ)) then
+            return true;
+          end;
+        end;
+      end;
+      return false;
+    end;
+
+    // The unit's type fix function (FTypeFix, MO1b0: internal, no parameters), made when a
+    // module it reaches declares an external type and called at ANode; its body lowered
+    // last (DoTypeFixBody), when every blob is made
+    hidden method DoTypeFixFunction(const ANode: int64);
+    begin
+      if not self.DoReachesExternalType() then
+        return;
+      end;
+      self.FTypeFix := self.FModule.AddFunction(ADAM_LOWERING_TYPEFIX_SYMBOL + self.FTree[self.FUnit].Text,
+        IrType.Void, self.FUnit);
+      self.FModule.FunctionAt(self.FTypeFix).Internal := true;
+      self.DoCallPlain(self.FTypeFix, ANode);
+    end;
+
+    // The body of the type fix function (DoTypeFixFunction) in a fresh function state: each
+    // fix's word (its blob's address plus its offset) given the address of its external
+    // type's TypeInfo (its import slot's value, DoInfoExternal), then the return
+    hidden method DoTypeFixBody();
+    var
+      LWord: int64;
+      LValue: int64;
+      LI: int64;
+    begin
+      self.FFunction := self.FTypeFix;
+      self.FBlock := self.FModule.AddBlock(self.FFunction);
+      self.DoStartManaged();
+      for LI := 0 to self.FTypeFixData.Count - 1 do
+        LWord := self.DoByteOffset(self.DoBlobAddress(self.FTypeFixData[LI], self.FUnit),
+          self.FTypeFixOffsets[LI], self.FUnit);
+        LValue := self.DoEmit(IrOp.ImportAddress, IrType.Pointer, self.FUnit);
+        self.FModule.InstrAt(LValue).Link := self.DoInfoExternal(self.FTypeFixTypes[LI]);
+        self.DoStore(LWord, LValue, self.FUnit);
+      end;
+      self.DoEmit(IrOp.Ret, IrType.Void, self.FUnit);
     end;
 
     // The library setup function of the type declaration AType (IsLibrarySetupType, MO1b0):
@@ -22290,6 +22536,11 @@ public type
         if not self.FDeclaring then
           self.DoTypeInfo(ADecl, ADecl);
         end;
+        // an external type's members are its library's functions (MO1b0)
+        if IsExternalType(self.FTree, ADecl) then
+          self.DoLibraryMembers(ADecl);
+          return;
+        end;
         self.DoTypeBodies(ADecl);
         // a dll's / lib's public polymorphic object type: its setup, for an exe that
         // builds one declared external (MO1b0)
@@ -22777,6 +23028,8 @@ public type
       // once per process, however many program starts call it (M8d; after the temporaries'
       // slots, which stay in the function's first block)
       self.DoOnceGuard(ADAM_LOWERING_ONCE_VARINIT_SYMBOL + self.FTree[self.FUnit].Text);
+      // the words naming an external type's TypeInfo first: an init may build or test one
+      self.DoTypeFixFunction(self.FUnit);
       for LJ := 0 to self.FTree.CountOf(self.FUnit, NodeRole.Declaration) - 1 do
         self.DoGlobalInit(self.FTree.NthOf(self.FUnit, NodeRole.Declaration, LJ));
       end;
@@ -23543,6 +23796,8 @@ public type
     var
       LDirective: int64;
       LArg: int64;
+      LDecl: int64;
+      LClause: int64;
       LI: int64;
     begin
       for LI := 0 to self.FTree.CountOf(AModule, NodeRole.Directive) - 1 do
@@ -23551,6 +23806,17 @@ public type
           (self.FTree.CountOf(LDirective, NodeRole.Argument) > 0) then
           LArg := self.FTree.NthOf(LDirective, NodeRole.Argument, 0);
           self.FModule.AddLinkLibrary(self.FTree[LArg].Decoded, LArg);
+        end;
+      end;
+      // an external type's library (MO1b0): its members' and setup's symbols are bound
+      // there, as an @linklibrary's are
+      for LI := 0 to self.FTree.CountOf(AModule, NodeRole.Declaration) - 1 do
+        LDecl := self.FTree.NthOf(AModule, NodeRole.Declaration, LI);
+        if IsExternalType(self.FTree, LDecl) then
+          LClause := self.FTree.FirstOf(LDecl, NodeRole.External);
+          if self.FTree[LClause].ResolvedConst.Kind = ConstKind.String then
+            self.FModule.AddLinkLibrary(self.FTree[LClause].ResolvedConst.Text, LClause);
+          end;
         end;
       end;
     end;
@@ -24154,6 +24420,10 @@ public type
         self.DoInlineCopies();
         // a copy's itable may have asked for a forward (I4)
         self.DoForwardBodies();
+      end;
+      // every blob made: the words naming an external type's TypeInfo (MO1b0)
+      if self.FTypeFix <> 0 then
+        self.DoTypeFixBody();
       end;
       // every function lowered: the sites take their ids in source order (M3.12b)
       if self.DoSitesOn() then
