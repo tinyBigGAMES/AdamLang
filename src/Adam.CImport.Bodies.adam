@@ -119,6 +119,9 @@ public type
     hidden FContinues: StringArray;
     hidden FLeaves: BoolArray;
     hidden FLoopDepth: int64;
+    // the loop depth at the innermost switch around the statement (a break at that depth
+    // leaves the switch); -1 outside every switch
+    hidden FSwitchLoop: int64;
 
     init(const AParser: ref CParser; const AEval: ref MacroEvaluator; const AFirstLocal: int64);
     begin
@@ -133,6 +136,7 @@ public type
       self.FVoid := true;
       self.FLocalTypeCount := 0;
       self.FLoopDepth := 0;
+      self.FSwitchLoop := -1;
     end;
 
     // The definition ADecl (a static / inline routine with a body) as the Adam routine
@@ -187,6 +191,7 @@ public type
       self.FLocalTypes := ref Int64Map(0);
       self.FLocalTypeCount := 0;
       self.FLoopDepth := 0;
+      self.FSwitchLoop := -1;
       self.FEval.BeginBody(LNames, LTypes);
       LBody := ref TextBuilder();
       LEnds := false;
@@ -432,7 +437,9 @@ public type
           "continue":
             AEnds := true;
             return self.DoContinue(AIndent, AOut);
-          "switch", "case", "default", "goto", "asm", "__asm", "__asm__":
+          "switch":
+            return self.DoSwitch(AIndent, AOut, ATypes, AEnds);
+          "case", "default", "goto", "asm", "__asm", "__asm__":
             return self.DoFail(NoArgs().Str(LTok.Text).Fill(
               ADAM_MSG_CIMPORT_WRITER_WHY_BODY_STATEMENT));
         else
@@ -697,12 +704,162 @@ public type
       return true;
     end;
 
-    // break ;: leave (the innermost loop: a switch has no translation)
+    // switch ( E ) { .. }: Adam's match (BNF sec 6) when no case falls through to the next.
+    // Each case group is an arm, its labels comma-separated, each converted to the subject's
+    // type as C converts it (the subject is E after integer promotion); a break at the group's
+    // own level ends the arm (Adam's arms never fall through), what follows it is never run
+    // (read, not written); default is the else, written last (C allows it anywhere, and with
+    // no fall-through the order of the groups changes nothing). The switch ends the path when
+    // it has a default and every group ends the path by itself (not by its break)
+    hidden method DoSwitch(const AIndent: string; const AOut: ref TextBuilder;
+      const ATypes: BodyTypes; var AEnds: bool): bool;
+    var
+      LSubject: MacroValue;
+      LLabel: MacroValue;
+      LSubjectType: int64;
+      LSubjectText: string;
+      LLabelText: string;
+      LLabels: ref TextBuilder;
+      LArms: ref TextBuilder;
+      LElse: ref TextBuilder;
+      LArm: ref TextBuilder;
+      LDead: ref TextBuilder;
+      LArmIndent: string;
+      LIndent: string;
+      LIsDefault: bool;
+      LHasDefault: bool;
+      LAllEnd: bool;
+      LGroupEnds: bool;
+      LClosed: bool;
+      LEnds: bool;
+      LMark: int64;
+      LOuterSwitch: int64;
+    begin
+      self.DoNext();
+      if not self.DoExpect("(") then
+        return false;
+      end;
+      if not self.FEval.ExpressionAt(self.FToks, self.FPos, LSubject) then
+        return self.DoFailExpression();
+      end;
+      if not self.DoExpect(")") or not self.DoExpect("{") then
+        return false;
+      end;
+      LSubjectType := self.FEval.PromotedType(LSubject.TypeId);
+      if LSubjectType = ADAM_CIMPORT_NONE then
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_SWITCH);
+      end;
+      LSubjectText := self.FEval.ValueAs(LSubject, LSubjectType);
+      if LSubjectText = "" then
+        return self.DoFailExpression();
+      end;
+      LArmIndent := AIndent + ADAM_CIMPORT_BODIES_INDENT + ADAM_CIMPORT_BODIES_INDENT;
+      LArms := ref TextBuilder();
+      LElse := ref TextBuilder();
+      LDead := ref TextBuilder();
+      LHasDefault := false;
+      LAllEnd := true;
+      LOuterSwitch := self.FSwitchLoop;
+      self.FSwitchLoop := self.FLoopDepth;
+      while (self.FPos < len(self.FToks)) and not self.DoIs("}") do
+        // the group's labels (a statement before the first one is never reached: no C here)
+        if not self.DoIs("case") and not self.DoIs("default") then
+          return self.DoSyntax();
+        end;
+        LLabels := ref TextBuilder();
+        LIsDefault := false;
+        while self.DoIs("case") or self.DoIs("default") do
+          self.DoNext();
+          if self.DoIsAt(self.FPos - 1, "default") then
+            LIsDefault := true;
+          else
+            if not self.FEval.ExpressionAt(self.FToks, self.FPos, LLabel) then
+              return self.DoFailExpression();
+            end;
+            if LLabel.Kind <> MacroValueKind.Int then
+              return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_CASE);
+            end;
+            LLabelText := self.FEval.ValueAs(LLabel, LSubjectType);
+            if LLabelText = "" then
+              return self.DoFailExpression();
+            end;
+            if LLabels.Count > 0 then
+              LLabels.Add(", ");
+            end;
+            LLabels.Add(LLabelText);
+          end;
+          if not self.DoExpect(":") then
+            return false;
+          end;
+        end;
+        // the group's statements, up to the next label or the switch's end (an arm's under
+        // its labels, the else's under the else)
+        LIndent := LArmIndent;
+        if LIsDefault then
+          LIndent := AIndent + ADAM_CIMPORT_BODIES_INDENT;
+        end;
+        LArm := ref TextBuilder();
+        LMark := self.FEval.ScopeMark();
+        LGroupEnds := false;
+        LClosed := false;
+        while (self.FPos < len(self.FToks)) and not self.DoIs("}") and not self.DoIs("case") and
+          not self.DoIs("default") do
+          LEnds := false;
+          if LGroupEnds then
+            if not self.DoStatement(LIndent, LDead, ATypes, LEnds) then
+              return false;
+            end;
+            skip;
+          end;
+          if self.DoIs("break") and self.DoIsAt(self.FPos + 1, ";") then
+            self.DoNext();
+            self.DoNext();
+            LGroupEnds := true;
+            LClosed := true;
+            skip;
+          end;
+          if not self.DoStatement(LIndent, LArm, ATypes, LEnds) then
+            return false;
+          end;
+          LGroupEnds := LEnds;
+        end;
+        self.FEval.EndScope(LMark);
+        if not LGroupEnds and not self.DoIs("}") then
+          return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_FALLTHROUGH);
+        end;
+        if not LGroupEnds or LClosed then
+          LAllEnd := false;
+        end;
+        if LIsDefault then
+          LHasDefault := true;
+          LElse.Add(LArm.Text());
+        else
+          LArms.Add(AIndent + ADAM_CIMPORT_BODIES_INDENT + LLabels.Text() + ":\n" + LArm.Text());
+        end;
+      end;
+      self.FSwitchLoop := LOuterSwitch;
+      if not self.DoExpect("}") then
+        return false;
+      end;
+      AOut.Add(AIndent + "match " + LSubjectText + " of\n" + LArms.Text());
+      if LHasDefault then
+        AOut.Add(AIndent + "else\n" + LElse.Text());
+      end;
+      AOut.Add(AIndent + "end;\n");
+      AEnds := LHasDefault and LAllEnd;
+      return true;
+    end;
+
+    // break ;: leave (the innermost loop; a switch's case closes by its own break, DoSwitch)
     hidden method DoBreak(const AIndent: string; const AOut: ref TextBuilder): bool;
     begin
       self.DoNext();
       if not self.DoExpect(";") then
         return false;
+      end;
+      if self.FLoopDepth = self.FSwitchLoop then
+        // a switch is the innermost: only a case's own closing break has an Adam form
+        return self.DoFail(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_SWITCH_BREAK);
       end;
       if self.FLoopDepth = 0 then
         return self.DoFail(NoArgs().Str("break").Fill(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_STATEMENT));
