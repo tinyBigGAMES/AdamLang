@@ -22,16 +22,22 @@
   entry's file name, as cdb finds it). Every lookup is DbgHelp's over std
   System.Windows.Debug:
     - lines: SymGetLineFromAddrW64 / SymGetLineFromNameW64, the files
-      SymEnumSourceFilesW; past a prologue: the first line entry after the
-      routine's own (Adam writes one entry per run of a line, the prologue
-      the routine line's);
+      SymEnumSourceFilesW; past a prologue: the first line entry by address
+      after the routine's own (Adam writes one entry per run of a line, the
+      prologue and the locals' setup the routine line's: the first
+      statement);
     - routines, globals: SymFromAddrW / SymFromNameW / SymEnumSymbolsW;
     - a routine's variables: SymSetScopeFromAddr + SymEnumSymbolsW; each
       is REGREL (Adam's S_LOCAL + frame-pointer-relative range over
       S_FRAMEPROC's base): CodeView's register number named here as
       DebugContext names it;
-    - types: SymGetTypeInfo, a record's fields and a choices type's values
-      by TI_FINDCHILDREN;
+    - types: SymGetTypeInfo, a record's fields (a bitfield's bit by
+      TI_GET_BITPOSITION, its width TI_GET_LENGTH) and a choices type's
+      values by TI_FINDCHILDREN; an Adam form read back (ReadForm);
+    - marks: the labels named @breakpoint, found three ways (DbgHelp's
+      readers differ): SymSearchW over each module's labels, and per routine
+      its scope's symbols and its children (TI_FINDCHILDREN), each label's
+      address TI_GET_ADDRESS;
     - the stack: StackWalk64 over a copy of the stopped thread's CONTEXT,
       everything it reads given by this unit's own routines through the
       DebugTarget (PeekMemory: patches hidden, a miss not reported): the
@@ -48,8 +54,9 @@
 
 module unit Adam.Debug.Symbols.Win64;
 
-import System.SysUtils, System.Windows, System.Windows.Debug, Adam.Core.Messages,
-  Adam.Compiler.Diagnostics, Adam.Debug.Target, Adam.Debug.Target.Win64, Adam.Debug.Symbols;
+import System.SysUtils, System.Windows, System.Windows.Debug, Adam.Core.Common,
+  Adam.Core.Messages, Adam.Compiler.Diagnostics, Adam.Debug.Target, Adam.Debug.Target.Win64,
+  Adam.Debug.Symbols;
 
 const
   // The first DbgHelp session handle (made up: no process is opened); each object takes the
@@ -80,6 +87,10 @@ type
     Scope: bool;
     Variables: SymbolVariableArray;
     Files: StringArray;
+    Marks: DebugWordArray;
+    // A module's routines (MarkedLines' walk): their addresses and symbol indexes
+    Routines: DebugWordArray;
+    RoutineIds: DebugWordArray;
   end;
 
   // RUNTIME_FUNCTION (12 bytes): a function's code range and its unwind data, RVAs
@@ -276,6 +287,45 @@ begin
   LCount := len(LCollect->Variables);
   setlength(LCollect->Variables, LCount + 1);
   LCollect->Variables[LCount] := LVariable;
+  return 1;
+end;
+
+// SymSearchW's callback over labels: an @breakpoint's address added to the
+// Win64SymbolCollect AContext points at; any other label passed over
+routine clink DoOnLabel(ASymbol: ptr to const DebugSymbolInfo; ASymbolSize: uint32;
+  AContext: ptr): int32;
+var
+  LCollect: ptr to Win64SymbolCollect;
+  LCount: int64;
+begin
+  LCollect := ptr to Win64SymbolCollect(uint64(AContext));
+  if (ASymbol->Tag <> ADAM_WINDOWS_SYMTAG_LABEL) or
+    (DbgSymbolName(ASymbol^) <> ADAM_DEBUG_BREAKPOINT_LABEL) then
+    return 1;
+  end;
+  LCount := len(LCollect->Marks);
+  setlength(LCollect->Marks, LCount + 1);
+  LCollect->Marks[LCount] := ASymbol->Address;
+  return 1;
+end;
+
+// SymEnumSymbolsW's callback over a module: each routine's address and index added to the
+// Win64SymbolCollect AContext points at
+routine clink DoOnRoutine(ASymbol: ptr to const DebugSymbolInfo; ASymbolSize: uint32;
+  AContext: ptr): int32;
+var
+  LCollect: ptr to Win64SymbolCollect;
+  LCount: int64;
+begin
+  LCollect := ptr to Win64SymbolCollect(uint64(AContext));
+  if ASymbol->Tag <> ADAM_WINDOWS_SYMTAG_FUNCTION then
+    return 1;
+  end;
+  LCount := len(LCollect->Routines);
+  setlength(LCollect->Routines, LCount + 1);
+  setlength(LCollect->RoutineIds, LCount + 1);
+  LCollect->Routines[LCount] := ASymbol->Address;
+  LCollect->RoutineIds[LCount] := uint64(ASymbol->Index);
   return 1;
 end;
 
@@ -625,6 +675,61 @@ public type
       return true;
     end;
 
+    override method MarkedLines(var ALines: SourceLineArray): bool;
+    var
+      LCollect: Win64SymbolCollect;
+      LLine: SourceLine;
+      LAddress: uint64;
+      LCount: int64;
+      LI: int64;
+      LJ: int64;
+    begin
+      setlength(ALines, 0);
+      if not self.IsLoaded() then
+        return false;
+      end;
+      LCollect.Scope := false;
+      for LI := 0 to len(self.FModules) - 1 do
+        SymSearchW(self.FProcess, self.FModules[LI], 0, ADAM_WINDOWS_SYMTAG_LABEL, nil, 0,
+          DoOnLabel, ptr(addr of LCollect), ADAM_WINDOWS_SYMSEARCH_ALLITEMS);
+        setlength(LCollect.Routines, 0);
+        setlength(LCollect.RoutineIds, 0);
+        SymEnumSymbolsW(self.FProcess, self.FModules[LI], DoWide("*", self.FBoxA.Data),
+          DoOnRoutine, ptr(addr of LCollect));
+        for LJ := 0 to len(LCollect.Routines) - 1 do
+          if SymSetScopeFromAddr(self.FProcess, LCollect.Routines[LJ]) <> 0 then
+            SymEnumSymbolsW(self.FProcess, 0, nil, DoOnLabel, ptr(addr of LCollect));
+          end;
+          self.DoChildLabels(self.FModules[LI], LCollect.RoutineIds[LJ], LCollect);
+        end;
+      end;
+      // by address (an insertion sort: a program has few marks), each once
+      for LI := 1 to len(LCollect.Marks) - 1 do
+        LAddress := LCollect.Marks[LI];
+        LJ := LI - 1;
+        while (LJ >= 0) and (LCollect.Marks[LJ] > LAddress) do
+          LCollect.Marks[LJ + 1] := LCollect.Marks[LJ];
+          LJ := LJ - 1;
+        end;
+        LCollect.Marks[LJ + 1] := LAddress;
+      end;
+      setlength(ALines, len(LCollect.Marks));
+      LCount := 0;
+      for LI := 0 to len(LCollect.Marks) - 1 do
+        if (LI > 0) and (LCollect.Marks[LI] = LCollect.Marks[LI - 1]) then
+          skip;
+        end;
+        if self.LineAt(LCollect.Marks[LI], LLine) then
+          // the mark's own address, which its line's row starts at
+          LLine.Address := LCollect.Marks[LI];
+          ALines[LCount] := LLine;
+          LCount := LCount + 1;
+        end;
+      end;
+      setlength(ALines, LCount);
+      return true;
+    end;
+
     override method TypeOf(const AModule: uint64; const ATypeId: uint64;
       var AType: SymbolType): bool;
     var
@@ -671,6 +776,7 @@ public type
         AType.Kind := SymbolTypeKind.Record;
         AType.Name := SymTypeName(self.FProcess, AModule, uint32(ATypeId));
         self.DoChildren(AModule, ATypeId, AType);
+        self.ReadForm(AModule, AType);
         return true;
       end;
       if LTag = ADAM_WINDOWS_SYMTAG_ENUM then
@@ -803,27 +909,78 @@ public type
     end;
 
     // The address past the prologue of the routine at AStart (ASize bytes): its first line
-    // entry after the one it starts with (Adam's prologue is the routine line's); AStart when
-    // it has none
+    // entry by address after the one it starts with (Adam's prologue and locals' setup are
+    // the routine line's: its first statement); AStart when it has none
     hidden method DoBodyOf(const AStart: uint64; const ASize: uint64): uint64;
     var
       LLine: DebugLineInfo;
       LDisplacement: uint32;
+      LFirst: uint64;
+      LAt: uint64;
     begin
       LLine.StructSize := ADAM_WINDOWS_LINE_INFO_SIZE;
       LDisplacement := 0;
       if SymGetLineFromAddrW64(self.FProcess, AStart, LDisplacement, LLine) = 0 then
         return AStart;
       end;
-      while SymGetLineNextW64(self.FProcess, LLine) <> 0 do
-        if LLine.Address >= AStart + ASize then
-          leave;
-        end;
-        if LLine.Address > AStart then
+      // by address: DbgHelp's next line is the next by line number (a routine's cleanup on
+      // its begin line comes before its first statement there), so the bytes after the
+      // first entry are looked up until one is in another entry (the prologue and the
+      // locals' setup are short)
+      LFirst := LLine.Address;
+      LAt := AStart + 1;
+      while LAt < AStart + ASize do
+        LDisplacement := 0;
+        if (SymGetLineFromAddrW64(self.FProcess, LAt, LDisplacement, LLine) <> 0) and
+          (LLine.Address <> LFirst) then
           return LLine.Address;
         end;
+        LAt := LAt + 1;
       end;
       return AStart;
+    end;
+
+    // The @breakpoint labels among the children of the routine symbol ARoutine (of module
+    // AModule) added to ACollect's marks
+    hidden method DoChildLabels(const AModule: uint64; const ARoutine: uint64;
+      var ACollect: Win64SymbolCollect);
+    var
+      LTotal: uint32;
+      LBytes: ByteArray;
+      LHead: ptr to uint32;
+      LIds: ptr to uint32;
+      LTag: uint32;
+      LAddress: uint64;
+      LCount: int64;
+      LI: int64;
+    begin
+      LTotal := 0;
+      if (not self.DoInfo(AModule, ARoutine, ADAM_WINDOWS_TI_GET_CHILDRENCOUNT,
+        ptr(addr of LTotal))) or (LTotal = 0) then
+        return;
+      end;
+      setlength(LBytes, 8 + 4 * int64(LTotal));
+      LHead := ptr to uint32(uint64(addr of LBytes[0]));
+      LHead[0] := LTotal;
+      LHead[1] := 0;
+      if not self.DoInfo(AModule, ARoutine, ADAM_WINDOWS_TI_FINDCHILDREN, ptr(LHead)) then
+        return;
+      end;
+      LIds := ptr to uint32(uint64(addr of LBytes[8]));
+      for LI := 0 to int64(LTotal) - 1 do
+        LTag := 0;
+        LAddress := 0;
+        if self.DoInfo(AModule, uint64(LIds[LI]), ADAM_WINDOWS_TI_GET_SYMTAG,
+          ptr(addr of LTag)) and
+          (LTag = ADAM_WINDOWS_SYMTAG_LABEL) and
+          (SymTypeName(self.FProcess, AModule, LIds[LI]) = ADAM_DEBUG_BREAKPOINT_LABEL) and
+          self.DoInfo(AModule, uint64(LIds[LI]), ADAM_WINDOWS_TI_GET_ADDRESS,
+          ptr(addr of LAddress)) then
+          LCount := len(ACollect.Marks);
+          setlength(ACollect.Marks, LCount + 1);
+          ACollect.Marks[LCount] := LAddress;
+        end;
+      end;
     end;
 
     // SymGetTypeInfo's AKind of type ATypeId in AModule into AInfo
@@ -850,6 +1007,8 @@ public type
       LValue: DebugVariant;
       LField: SymbolField;
       LChoice: SymbolChoice;
+      LBit: uint32;
+      LBits: uint64;
       LCount: int64;
     begin
       LTotal := 0;
@@ -887,6 +1046,16 @@ public type
             LField.Name := SymTypeName(self.FProcess, AModule, LChild);
             LField.Offset := uint64(LOffset);
             LField.TypeId := uint64(LFieldType);
+            LField.BitOffset := 0;
+            LField.BitWidth := 0;
+            LBit := 0;
+            LBits := 0;
+            if self.DoInfo(AModule, uint64(LChild), ADAM_WINDOWS_TI_GET_BITPOSITION,
+              ptr(addr of LBit)) and self.DoInfo(AModule, uint64(LChild),
+              ADAM_WINDOWS_TI_GET_LENGTH, ptr(addr of LBits)) and (LBits > 0) then
+              LField.BitOffset := LBit;
+              LField.BitWidth := uint32(LBits);
+            end;
             LCount := len(AType.Fields);
             setlength(AType.Fields, LCount + 1);
             AType.Fields[LCount] := LField;

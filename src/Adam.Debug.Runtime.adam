@@ -1,0 +1,1780 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Debug.Runtime.adam - Adam's debugger engine (M11a D3)
+
+  DebugRuntime drives one program through a DebugTarget and reads it through
+  its DebugSymbols (both the caller's, picked for the triple by
+  Adam.Debug.Targets); the REPL (D4) and DAP (D5) are its two faces. It is
+  target-neutral: every machine fact comes from the target (CallReturn) or
+  the symbols, every layout it reads is the runtime's (DESIGN sec 8, the
+  same on every 64-bit target).
+
+    - Launch starts the program, loads its debug information at its start,
+      puts in every breakpoint asked for before and one per @breakpoint
+      (its mark, MarkedLines), and stops at the Entry.
+    - Breakpoints by file and line (MatchSourceFile's rule; a line with no
+      code moves to the next with code), each with an id; asked for before
+      Launch they wait (not verified) until the program starts.
+    - Continue, Step (Into / Over / Out) and the stops they end in: a
+      breakpoint, a step done, a pause, an exception, the exit. Pause comes
+      from another thread while one of those waits.
+    - Steps are by source line: one instruction at a time until a line
+      starts that is not the one stepped from. A call is stepped over by a
+      patch at its return address (taken only at that frame's depth, so a
+      recursion does not stop it early), into by a patch at the routine's
+      first statement (past its prologue and its locals' setup: his word
+      2026-11-18) when it has source and is no runtime routine (the
+      compiler's own calls are not the program's). A step that leaves the
+      routine stops in its caller; Out runs to the caller. A step from code
+      with no line (the Entry) runs to the program's first statement.
+    - While stopped: the thread's stack, each frame's scopes (Params,
+      Locals, Globals: the program module's own), their variables and the
+      children of a value (fields, elements, a pointer's target, an
+      object), each child list a reference valid until the program goes
+      on; Evaluate reads a name with fields (.F), indexes ([N]) and ^
+      after it. Values are written as Adam writes them: numbers, chars,
+      bools, choices by name, strings quoted, sets as [members], records
+      {F: v}, arrays [v, ...], pointers and owners 0x.. or nil.
+
+  Everything that fails is reported on the Diagnostics (DB codes) and the
+  call says false; an Evaluate that finds nothing says why in its value.
+  Nothing raises.
+*******************************************************************************/
+
+module unit Adam.Debug.Runtime;
+
+import System.SysUtils, Adam.Core.Messages, Adam.Core.Containers, Adam.Compiler.SourceText,
+  Adam.Compiler.Diagnostics, Adam.Debug.Target, Adam.Debug.Symbols;
+
+public const
+  ADAM_ERR_RUNTIME_001: string = "DB0013";   // a call made while the program is not stopped
+  ADAM_ERR_RUNTIME_002: string = "DB0014";   // a call made with no program being debugged
+  ADAM_ERR_RUNTIME_003: string = "DB0015";   // the program ended before reaching its entry
+
+  // The source files of the runtime: a step into one of its routines steps over it
+  ADAM_RUNTIME_RUNTIME_SOURCE: string = "$P:res/runtime/";
+  // A text's bytes (a wstring's units) shown at most
+  ADAM_RUNTIME_TEXT_LIMIT: int64 = 1024;
+  // An array's elements listed as children at most
+  ADAM_RUNTIME_ELEMENT_LIMIT: int64 = 1000;
+  // A value's one-line form: its characters and the depth of the parts it shows at most,
+  // and an array's elements in it
+  ADAM_RUNTIME_SUMMARY_LIMIT: int64 = 160;
+  ADAM_RUNTIME_SUMMARY_DEPTH: int64 = 2;
+  ADAM_RUNTIME_SUMMARY_ELEMENTS: int64 = 8;
+  // The runtime's blocks (DESIGN sec 8): a string's / dynamic array's length and data,
+  // a ref block's object, and a ref block's count
+  ADAM_RUNTIME_BLOCK_COUNT_AT: uint64 = 0;
+  ADAM_RUNTIME_BLOCK_LENGTH_AT: uint64 = 8;
+  ADAM_RUNTIME_BLOCK_DATA_AT: uint64 = 16;
+  ADAM_RUNTIME_REF_OBJECT_AT: uint64 = 24;
+  // The names of a frame's scopes
+  ADAM_RUNTIME_SCOPE_PARAMS: string = "Params";
+  ADAM_RUNTIME_SCOPE_LOCALS: string = "Locals";
+  ADAM_RUNTIME_SCOPE_GLOBALS: string = "Globals";
+  // The name a pointer's target goes by as its child
+  ADAM_RUNTIME_TARGET_NAME: string = "^";
+
+// AWord's low ASize bytes as a signed number
+routine DoSigned(const AWord: uint64; const ASize: int64): int64;
+begin
+  if (ASize >= 8) or (ASize < 1) then
+    return int64(AWord);
+  end;
+  if (AWord & (uint64(1) << uint64(ASize * 8 - 1))) <> 0 then
+    return int64(AWord) - int64(uint64(1) << uint64(ASize * 8));
+  end;
+  return int64(AWord);
+end;
+
+// A word as an address: nil, or 0x and its hex digits
+routine DoAddressText(const AWord: uint64): string;
+begin
+  if AWord = 0 then
+    return "nil";
+  end;
+  return "0x" + IntToHex(AWord, 1);
+end;
+
+// What a value that cannot be read at AAddress shows
+routine DoUnreadable(const AAddress: uint64): string;
+begin
+  return NoArgs().Str(IntToHex(AAddress, 1)).Fill(ADAM_MSG_RUNTIME_UNREADABLE);
+end;
+
+// AText cut to ADAM_RUNTIME_SUMMARY_LIMIT characters, "..." after a cut
+routine DoCut(const AText: string): string;
+begin
+  if len(AText) <= ADAM_RUNTIME_SUMMARY_LIMIT then
+    return AText;
+  end;
+  return Substring(AText, 0, ADAM_RUNTIME_SUMMARY_LIMIT) + "...";
+end;
+
+// AText with its quote, backslash and control characters written as an Adam string
+// literal writes them (\", \\, \n, \r, \t, \xNN)
+routine DoEscape(const AText: string): string;
+var
+  LText: ref TextBuilder;
+  LCode: uint8;
+  LI: int64;
+begin
+  LText := ref TextBuilder();
+  for LI := 0 to len(AText) - 1 do
+    LCode := uint8(AText[LI]);
+    if LCode = 34 then
+      LText.Add("\\\"");
+    else
+      if LCode = 92 then
+        LText.Add("\\\\");
+      else
+        if LCode = 10 then
+          LText.Add("\\n");
+        else
+          if LCode = 13 then
+            LText.Add("\\r");
+          else
+            if LCode = 9 then
+              LText.Add("\\t");
+            else
+              if LCode < 32 then
+                LText.Add("\\x" + IntToHex(uint64(LCode), 2));
+              else
+                LText.Add(StringOfChar(AText[LI], 1));
+              end;
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
+  return LText.Text();
+end;
+
+// The first ACount UTF-16 units of ABytes as UTF-8 (a pair one code point, a lone surrogate
+// U+FFFD)
+routine DoUtf16Text(const ABytes: ByteArray; const ACount: int64): string;
+var
+  LText: string;
+  LAt: int64;
+  LUnit: uint32;
+  LNext: uint32;
+  LCode: uint32;
+  LI: int64;
+begin
+  setlength(LText, ACount * 3 + 4);
+  LAt := 0;
+  LI := 0;
+  while LI < ACount do
+    LUnit := uint32(ABytes[LI * 2]) | (uint32(ABytes[LI * 2 + 1]) << 8);
+    LCode := LUnit;
+    if (LUnit >= 0xD800) and (LUnit <= 0xDFFF) then
+      LCode := 0xFFFD;
+      if (LUnit <= 0xDBFF) and (LI + 1 < ACount) then
+        LNext := uint32(ABytes[LI * 2 + 2]) | (uint32(ABytes[LI * 2 + 3]) << 8);
+        if (LNext >= 0xDC00) and (LNext <= 0xDFFF) then
+          LCode := 0x10000 + ((LUnit - 0xD800) << 10) + (LNext - 0xDC00);
+          LI := LI + 1;
+        end;
+      end;
+    end;
+    EncodeUtf8Char(LText, LAt, LCode);
+    LI := LI + 1;
+  end;
+  setlength(LText, LAt);
+  return LText;
+end;
+
+// True when AStep is a ".Name" step (a name a module-qualified global may hold)
+routine DoIsName(const AStep: string): bool;
+begin
+  return StartsStr(".", AStep) and (len(AStep) > 1);
+end;
+
+// True when ACode is a byte of an Adam name (letter, digit, _)
+routine DoIsNameByte(const ACode: uint8): bool;
+begin
+  return ((ACode >= 65) and (ACode <= 90)) or ((ACode >= 97) and (ACode <= 122)) or
+    ((ACode >= 48) and (ACode <= 57)) or (ACode = 95);
+end;
+
+// AText split into its first name and the steps after it (".Name", "[N]" with a decimal N,
+// "^"); spaces between steps allowed. False when it is not that shape
+routine DoSplitPath(const AText: string; var APath: StringArray): bool;
+var
+  LParts: StringArray;
+  LCount: int64;
+  LStart: int64;
+  LI: int64;
+  LCode: uint8;
+begin
+  setlength(LParts, len(AText) + 1);
+  LCount := 0;
+  LI := 0;
+  while LI < len(AText) do
+    LCode := uint8(AText[LI]);
+    if LCode = 32 then
+      LI := LI + 1;
+      skip;
+    end;
+    LStart := LI;
+    if DoIsNameByte(LCode) and (LCount = 0) then
+      while (LI < len(AText)) and DoIsNameByte(uint8(AText[LI])) do
+        LI := LI + 1;
+      end;
+    else
+      if (LCode = 46) and (LCount > 0) then
+        LI := LI + 1;
+        while (LI < len(AText)) and DoIsNameByte(uint8(AText[LI])) do
+          LI := LI + 1;
+        end;
+        if LI = LStart + 1 then
+          return false;
+        end;
+      else
+        if (LCode = 91) and (LCount > 0) then
+          LI := LI + 1;
+          while (LI < len(AText)) and (uint8(AText[LI]) >= 48) and (uint8(AText[LI]) <= 57) do
+            LI := LI + 1;
+          end;
+          if (LI = LStart + 1) or (LI >= len(AText)) or (uint8(AText[LI]) <> 93) then
+            return false;
+          end;
+          LI := LI + 1;
+        else
+          if (LCode = 94) and (LCount > 0) then
+            LI := LI + 1;
+          else
+            return false;
+          end;
+        end;
+      end;
+    end;
+    LParts[LCount] := Substring(AText, LStart, LI - LStart);
+    LCount := LCount + 1;
+  end;
+  setlength(LParts, LCount);
+  APath := LParts;
+  return LCount > 0;
+end;
+
+public type
+  // Why the program stopped (Exited: it ended; ExitCode says how)
+  RuntimeStopKind = choices(Entry, Breakpoint, Step, Pause, Exception, Exited);
+
+  // A stop: its kind, the thread, the breakpoint's id (Breakpoint; 0 a patch no breakpoint
+  // of this runtime made), where (HasLine: its line; Routine its Adam name, "" none; Address
+  // the program counter), the exception's code, the exit code
+  RuntimeStop = record
+    Kind: RuntimeStopKind;
+    ThreadId: uint32;
+    BreakpointId: int64;
+    Address: uint64;
+    HasLine: bool;
+    Source: SourceLine;
+    Routine: string;
+    ExceptionCode: uint32;
+    ExitCode: uint32;
+  end;
+
+  // How a step goes: into a call, over it, out of the routine
+  RuntimeStepKind = choices(Into, Over, Out);
+
+  // A breakpoint: its id, the file and line asked for, whether it is in (Verified), where
+  // (Source: the file as the debug information names it, the line its code starts on, the
+  // address); IsMark: an @breakpoint's
+  RuntimeBreakpoint = record
+    Id: int64;
+    FileName: string;
+    Line: uint32;
+    Verified: bool;
+    Source: SourceLine;
+    IsMark: bool;
+  end;
+
+  RuntimeBreakpointArray = array of RuntimeBreakpoint;
+
+  // A scope of a frame: its name and the reference its variables are read by
+  RuntimeScope = record
+    Name: string;
+    Reference: int64;
+  end;
+
+  RuntimeScopeArray = array of RuntimeScope;
+
+  // A variable or a part of one: its name, its value as one line, its type's Adam name, and
+  // the reference its children are read by (0: none)
+  RuntimeValue = record
+    Name: string;
+    Value: string;
+    TypeName: string;
+    Reference: int64;
+  end;
+
+  RuntimeValueArray = array of RuntimeValue;
+
+  // What a reference reads: a frame's scope, a record's fields (an object's too), an
+  // array's elements, a pointer's target
+  RuntimeHandleKind = choices(Params, Locals, Globals, Fields, Elements, Target);
+
+  RuntimeHandle = record
+    Kind: RuntimeHandleKind;
+    Frame: int64;
+    Module: uint64;
+    TypeId: uint64;
+    Address: uint64;
+    Count: int64;
+    Stride: uint64;
+  end;
+
+  RuntimeHandleArray = array of RuntimeHandle;
+
+  // Where a step's patch takes it: a call's return, a routine's first statement
+  RuntimeLanding = choices(Return, Body);
+
+  // Adam's debugger engine (see the header)
+  DebugRuntime = object
+    hidden FReports: ref Diagnostics;
+    hidden FTarget: ref DebugTarget;
+    hidden FSymbols: ref DebugSymbols;
+    hidden FBreakpoints: RuntimeBreakpointArray;
+    hidden FNextId: int64;
+    hidden FProgramModule: string;
+    hidden FOutput: ref TextBuilder;
+    hidden FLaunched: bool;
+    hidden FExited: bool;
+    hidden FStopped: bool;
+    hidden FStop: RuntimeStop;
+    hidden FFrames: StackFrameArray;
+    hidden FFramesRead: bool;
+    hidden FHandles: RuntimeHandleArray;
+    hidden FHandleCount: int64;
+    // The step under way: its kind and thread, the line and routine it started in (the
+    // routine's first statement), the stack pointer its caller has, the registers before
+    // the instruction just stepped
+    hidden FStepping: bool;
+    hidden FStepKind: RuntimeStepKind;
+    hidden FStepThread: uint32;
+    hidden FStepHasLine: bool;
+    hidden FStepLine: SourceLine;
+    hidden FStepRoutine: uint64;
+    hidden FStepBody: uint64;
+    hidden FStepCallerSp: uint64;
+    hidden FBefore: DebugContext;
+    // The step's own patch (Active), where it is, the stack pointer it is taken at (or
+    // above), where it lands
+    hidden FTempActive: bool;
+    hidden FTempAddress: uint64;
+    hidden FTempSp: uint64;
+    hidden FTempLanding: RuntimeLanding;
+
+    init(const ATarget: ref DebugTarget; const ASymbols: ref DebugSymbols);
+    begin
+      self.FTarget := ATarget;
+      self.FSymbols := ASymbols;
+      self.FNextId := 1;
+      self.FOutput := ref TextBuilder();
+      self.FLaunched := false;
+      self.FExited := false;
+      self.FStopped := false;
+      self.FFramesRead := false;
+      self.FHandleCount := 0;
+      self.FStepping := false;
+      self.FTempActive := false;
+    end;
+
+    // The diagnostics every failure is reported on (DB codes); the target's and the
+    // symbols' too
+    method SetDiagnostics(const AReports: ref Diagnostics);
+    begin
+      self.FReports := AReports;
+      self.FTarget.SetDiagnostics(AReports);
+      self.FSymbols.SetDiagnostics(AReports);
+    end;
+
+    property Target: ref DebugTarget read FTarget;
+    property Symbols: ref DebugSymbols read FSymbols;
+
+    // True while the program is stopped at a stop this runtime reported
+    const method IsStopped(): bool;
+    begin
+      return self.FStopped;
+    end;
+
+    // True once the program has ended
+    const method HasExited(): bool;
+    begin
+      return self.FExited;
+    end;
+
+    // The last stop reported
+    const method LastStop(): RuntimeStop;
+    begin
+      return self.FStop;
+    end;
+
+    // The program's output so far that the target took (DebugOutputMode.Pipes), taken
+    method TakeOutput(): string;
+    var
+      LText: string;
+    begin
+      LText := self.FOutput.Text();
+      self.FOutput := ref TextBuilder();
+      return LText;
+    end;
+
+    // Starts AExePath with AArgs under the debugger (its handles as AMode says) and stops it
+    // at its Entry (AStop): its debug information loaded, the breakpoints asked for so far
+    // put in, one per @breakpoint added. False (reported) when it cannot start or ends first
+    method Launch(const AExePath: string; const AArgs: StringArray; const AMode: DebugOutputMode;
+      var AStop: RuntimeStop): bool;
+    var
+      LEvent: DebugEvent;
+    begin
+      self.FTarget.SetProgram(AExePath, AArgs);
+      self.FTarget.SetOutputMode(AMode);
+      if not self.FTarget.Start() then
+        return false;
+      end;
+      self.FLaunched := true;
+      while self.DoNext(LEvent) do
+        if LEvent.Kind = DebugEventKind.ProcessStarted then
+          self.FProgramModule := ChangeFileExt(ExtractFileName(self.FTarget.ImagePath()), "");
+          if self.FSymbols.Load(self.FTarget) then
+            self.DoAddMarks();
+            self.DoResolveAll();
+          end;
+          self.FTarget.Resume(ResumeKind.Continue);
+          skip;
+        end;
+        if LEvent.Kind = DebugEventKind.ProcessExited then
+          self.FExited := true;
+          self.DoError(ADAM_ERR_RUNTIME_003, ADAM_MSG_RUNTIME_NO_ENTRY, NoArgs().Str(AExePath));
+          return false;
+        end;
+        if (LEvent.Kind = DebugEventKind.Stopped) and (LEvent.Reason = DebugStopReason.Entry) then
+          self.DoReport(RuntimeStopKind.Entry, LEvent, 0, AStop);
+          return true;
+        end;
+        // anything else before the entry (a stop of no kind asked for) goes on
+        if self.FTarget.IsHeld() then
+          self.FTarget.Resume(ResumeKind.Continue);
+        end;
+      end;
+      return false;
+    end;
+
+    // Ends the program (held or not) and waits for its end; nothing when it is not running
+    method Terminate();
+    var
+      LEvent: DebugEvent;
+    begin
+      if (not self.FLaunched) or self.FExited then
+        return;
+      end;
+      self.FTarget.Terminate();
+      while self.DoNext(LEvent) do
+        if LEvent.Kind = DebugEventKind.ProcessExited then
+          self.FExited := true;
+          leave;
+        end;
+        if self.FTarget.IsHeld() then
+          self.FTarget.Resume(ResumeKind.Continue);
+        end;
+      end;
+      self.FStopped := false;
+      self.FSymbols.Close();
+    end;
+
+    // A breakpoint on file AFile, line ALine: put in now when the program runs (Verified
+    // when that line or one after it has code), else when Launch starts it
+    method SetBreakpoint(const AFile: string; const ALine: uint32): RuntimeBreakpoint;
+    var
+      LBreakpoint: RuntimeBreakpoint;
+      LCount: int64;
+    begin
+      LBreakpoint.Id := self.FNextId;
+      self.FNextId := self.FNextId + 1;
+      LBreakpoint.FileName := AFile;
+      LBreakpoint.Line := ALine;
+      LBreakpoint.Verified := false;
+      LBreakpoint.IsMark := false;
+      if self.FLaunched and (not self.FExited) and self.FSymbols.IsLoaded() then
+        self.DoResolve(LBreakpoint);
+      end;
+      LCount := len(self.FBreakpoints);
+      setlength(self.FBreakpoints, LCount + 1);
+      self.FBreakpoints[LCount] := LBreakpoint;
+      return LBreakpoint;
+    end;
+
+    // The breakpoint AId taken out. False when there is none
+    method RemoveBreakpoint(const AId: int64): bool;
+    var
+      LI: int64;
+      LJ: int64;
+    begin
+      for LI := 0 to len(self.FBreakpoints) - 1 do
+        if self.FBreakpoints[LI].Id = AId then
+          if self.FBreakpoints[LI].Verified and (not self.FExited) then
+            self.FTarget.RemovePatch(self.FBreakpoints[LI].Source.Address);
+          end;
+          for LJ := LI + 1 to len(self.FBreakpoints) - 1 do
+            self.FBreakpoints[LJ - 1] := self.FBreakpoints[LJ];
+          end;
+          setlength(self.FBreakpoints, len(self.FBreakpoints) - 1);
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // The breakpoints, in the order they were made (the marks first, at Launch)
+    const method Breakpoints(): RuntimeBreakpointArray;
+    begin
+      return self.FBreakpoints;
+    end;
+
+    // Lets the stopped program run to its next stop (AStop). False (reported) when it is not
+    // stopped
+    method Continue(var AStop: RuntimeStop): bool;
+    begin
+      if not self.DoRequireStopped("continue") then
+        return false;
+      end;
+      self.DoGoOn();
+      self.FTarget.Resume(ResumeKind.Continue);
+      return self.DoRun(AStop);
+    end;
+
+    // One source line of the stopped thread as AKind says (see the header), to its stop
+    // (AStop: a Step, or what came first). False (reported) when it is not stopped
+    method Step(const AKind: RuntimeStepKind; var AStop: RuntimeStop): bool;
+    var
+      LContext: DebugContext;
+      LRoutine: SymbolRoutine;
+      LFrames: StackFrameArray;
+    begin
+      if not self.DoRequireStopped("step") then
+        return false;
+      end;
+      LFrames := self.DoFrames();
+      self.DoGoOn();
+      self.FStepping := true;
+      self.FStepKind := AKind;
+      self.FStepThread := self.FStop.ThreadId;
+      if not self.FTarget.GetContext(self.FStepThread, LContext) then
+        self.FStepping := false;
+        return false;
+      end;
+      self.FStepCallerSp := 0xFFFFFFFFFFFFFFFFu;
+      if len(LFrames) > 1 then
+        self.FStepCallerSp := LFrames[1].Context.Sp;
+      end;
+      if AKind = RuntimeStepKind.Out then
+        if len(LFrames) < 2 then
+          // nothing to return to: the program runs on
+          self.FStepping := false;
+          self.FTarget.Resume(ResumeKind.Continue);
+          return self.DoRun(AStop);
+        end;
+        self.DoSetTemp(LFrames[1].Context.Pc, LFrames[1].Context.Sp, RuntimeLanding.Return);
+        self.FTarget.Resume(ResumeKind.Continue);
+        return self.DoRun(AStop);
+      end;
+      self.FStepHasLine := self.FSymbols.LineAt(LContext.Pc, self.FStepLine);
+      if not self.FStepHasLine then
+        // no line here (the Entry): to the program's first statement
+        if self.FSymbols.RoutineByName(self.FProgramModule, LRoutine) then
+          self.DoSetTemp(LRoutine.BodyAddress, 0, RuntimeLanding.Body);
+        else
+          self.FStepping := false;
+        end;
+        self.FTarget.Resume(ResumeKind.Continue);
+        return self.DoRun(AStop);
+      end;
+      self.FStepRoutine := 0;
+      self.FStepBody := 0;
+      if self.FSymbols.RoutineAt(LContext.Pc, LRoutine) then
+        self.FStepRoutine := LRoutine.Address;
+        self.FStepBody := LRoutine.BodyAddress;
+      end;
+      self.FBefore := LContext;
+      self.FTarget.Resume(ResumeKind.Step);
+      return self.DoRun(AStop);
+    end;
+
+    // Asks the running program to stop (a Pause stop ends the Continue / Step waiting); the
+    // one call another thread may make. False when it is not running
+    method Pause(): bool;
+    begin
+      return self.FTarget.Pause();
+    end;
+
+    // The stopped thread's frames, innermost first. False (reported) when it is not stopped
+    method StackTrace(var AFrames: StackFrameArray): bool;
+    begin
+      if not self.DoRequireStopped("show its stack") then
+        setlength(AFrames, 0);
+        return false;
+      end;
+      AFrames := self.DoFrames();
+      return len(AFrames) > 0;
+    end;
+
+    // Frame AFrame's scopes: Params, Locals, Globals. False (reported) when it is not stopped,
+    // false for a frame the stack lacks
+    method Scopes(const AFrame: int64; var AScopes: RuntimeScopeArray): bool;
+    var
+      LFrames: StackFrameArray;
+      LHandle: RuntimeHandle;
+    begin
+      setlength(AScopes, 0);
+      if not self.DoRequireStopped("show its scopes") then
+        return false;
+      end;
+      LFrames := self.DoFrames();
+      if (AFrame < 0) or (AFrame >= len(LFrames)) then
+        return false;
+      end;
+      setlength(AScopes, 3);
+      LHandle.Frame := AFrame;
+      LHandle.Kind := RuntimeHandleKind.Params;
+      AScopes[0].Name := ADAM_RUNTIME_SCOPE_PARAMS;
+      AScopes[0].Reference := self.DoAddHandle(LHandle);
+      LHandle.Kind := RuntimeHandleKind.Locals;
+      AScopes[1].Name := ADAM_RUNTIME_SCOPE_LOCALS;
+      AScopes[1].Reference := self.DoAddHandle(LHandle);
+      LHandle.Kind := RuntimeHandleKind.Globals;
+      AScopes[2].Name := ADAM_RUNTIME_SCOPE_GLOBALS;
+      AScopes[2].Reference := self.DoAddHandle(LHandle);
+      return true;
+    end;
+
+    // The variables or parts AReference reads (a scope's, a value's children). False for a
+    // reference that is no current one (they end when the program goes on)
+    method Variables(const AReference: int64; var AValues: RuntimeValueArray): bool;
+    var
+      LHandle: RuntimeHandle;
+    begin
+      setlength(AValues, 0);
+      if (not self.FStopped) or (AReference < 1) or (AReference > self.FHandleCount) then
+        return false;
+      end;
+      LHandle := self.FHandles[AReference - 1];
+      match LHandle.Kind of
+        RuntimeHandleKind.Params, RuntimeHandleKind.Locals:
+          self.DoFrameVariables(LHandle, AValues);
+        RuntimeHandleKind.Globals:
+          self.DoGlobalVariables(AValues);
+        RuntimeHandleKind.Fields:
+          self.DoFieldValues(LHandle, AValues);
+        RuntimeHandleKind.Elements:
+          self.DoElementValues(LHandle, AValues);
+      else
+        setlength(AValues, 1);
+        AValues[0] := self.DoValue(ADAM_RUNTIME_TARGET_NAME, LHandle.Module, LHandle.TypeId,
+          LHandle.Address);
+      end;
+      return true;
+    end;
+
+    // AText (a name, then .Field, [Index] and ^ in any order) read in frame AFrame into AValue
+    // (named AText). False when it names nothing readable: AValue.Value says why; reported
+    // only when the program is not stopped
+    method Evaluate(const AFrame: int64; const AText: string; var AValue: RuntimeValue): bool;
+    var
+      LPath: StringArray;
+      LModule: uint64;
+      LTypeId: uint64;
+      LAddress: uint64;
+      LWhy: string;
+      LStart: int64;
+      LI: int64;
+    begin
+      AValue.Name := AText;
+      AValue.TypeName := "";
+      AValue.Reference := 0;
+      if not self.DoRequireStopped("evaluate") then
+        AValue.Value := NoArgs().Fill(ADAM_MSG_RUNTIME_NO_PROGRAM);
+        return false;
+      end;
+      if not DoSplitPath(Trim(AText), LPath) then
+        AValue.Value := NoArgs().Str(AText).Fill(ADAM_MSG_RUNTIME_EVAL_SYNTAX);
+        return false;
+      end;
+      LStart := 0;
+      if not self.DoFindName(AFrame, LPath, LStart, LModule, LTypeId, LAddress) then
+        AValue.Value := NoArgs().Str(LPath[0]).Fill(ADAM_MSG_RUNTIME_EVAL_UNKNOWN);
+        return false;
+      end;
+      for LI := LStart to len(LPath) - 1 do
+        if not self.DoPathStep(LPath[LI], LModule, LTypeId, LAddress, LWhy) then
+          AValue.Value := LWhy;
+          return false;
+        end;
+      end;
+      AValue := self.DoValue(AText, LModule, LTypeId, LAddress);
+      return true;
+    end;
+
+    // AValue's one-line form and its type's name for the value of type ATypeId (of module
+    // AModule) at AAddress, named AName; a reference to its children when it has any
+    hidden method DoValue(const AName: string; const AModule: uint64; const ATypeId: uint64;
+      const AAddress: uint64): RuntimeValue;
+    var
+      LValue: RuntimeValue;
+      LType: SymbolType;
+      LElement: SymbolType;
+      LHandle: RuntimeHandle;
+      LWord: uint64;
+      LBlock: uint64;
+      LOk: bool;
+    begin
+      LValue.Name := AName;
+      LValue.Reference := 0;
+      if not self.FSymbols.TypeOf(AModule, ATypeId, LType) then
+        LValue.Value := "?";
+        LValue.TypeName := "?";
+        return LValue;
+      end;
+      LValue.TypeName := self.DoTypeText(AModule, LType);
+      LValue.Value := self.DoText(AModule, LType, AAddress, ADAM_RUNTIME_SUMMARY_DEPTH);
+      LHandle.Module := AModule;
+      LHandle.Frame := 0;
+      LHandle.Count := 0;
+      LHandle.Stride := 0;
+      match LType.Kind of
+        SymbolTypeKind.Pointer:
+          LWord := self.DoWord(AAddress, 8, LOk);
+          if LOk and (LWord <> 0) and (LType.ElementTypeId <> 0) then
+            LHandle.Kind := RuntimeHandleKind.Target;
+            LHandle.TypeId := LType.ElementTypeId;
+            LHandle.Address := LWord;
+            LValue.Reference := self.DoAddHandle(LHandle);
+          end;
+        SymbolTypeKind.StaticArray:
+          if (LType.Count > 0) and self.FSymbols.TypeOf(AModule, LType.ElementTypeId, LElement) then
+            LHandle.Kind := RuntimeHandleKind.Elements;
+            LHandle.TypeId := LType.ElementTypeId;
+            LHandle.Address := AAddress;
+            LHandle.Count := int64(LType.Count);
+            LHandle.Stride := LElement.Size;
+            LValue.Reference := self.DoAddHandle(LHandle);
+          end;
+        SymbolTypeKind.Record:
+          if len(LType.Fields) > 0 then
+            LHandle.Kind := RuntimeHandleKind.Fields;
+            LHandle.TypeId := ATypeId;
+            LHandle.Address := AAddress;
+            LValue.Reference := self.DoAddHandle(LHandle);
+          end;
+        SymbolTypeKind.DynamicArray:
+          LBlock := self.DoWord(AAddress, 8, LOk);
+          if LOk and (LBlock <> 0) and
+            self.FSymbols.TypeOf(AModule, LType.ElementTypeId, LElement) then
+            LHandle.Kind := RuntimeHandleKind.Elements;
+            LHandle.TypeId := LType.ElementTypeId;
+            LHandle.Address := LBlock + ADAM_RUNTIME_BLOCK_DATA_AT;
+            LHandle.Count := int64(self.DoWord(LBlock + ADAM_RUNTIME_BLOCK_LENGTH_AT, 8, LOk));
+            LHandle.Stride := LElement.Size;
+            if LOk and (LHandle.Count > 0) then
+              LValue.Reference := self.DoAddHandle(LHandle);
+            end;
+          end;
+        SymbolTypeKind.Ref, SymbolTypeKind.Own, SymbolTypeKind.Weak:
+          LBlock := self.DoObjectBlock(AAddress, LType.Kind);
+          if (LBlock <> 0) and (LType.ElementTypeId <> 0) then
+            LHandle.Kind := RuntimeHandleKind.Fields;
+            LHandle.TypeId := LType.ElementTypeId;
+            LHandle.Address := LBlock + ADAM_RUNTIME_REF_OBJECT_AT;
+            LValue.Reference := self.DoAddHandle(LHandle);
+          end;
+      else
+        // a scalar, a text, a set, a choices value: no parts
+      end;
+      return LValue;
+    end;
+
+    // The one-line form of the value of type AType at AAddress (see the header), its parts
+    // shown down to ADepth more levels
+    hidden method DoText(const AModule: uint64; const AType: SymbolType; const AAddress: uint64;
+      const ADepth: int64): string;
+    var
+      LElement: SymbolType;
+      LWord: uint64;
+      LBlock: uint64;
+      LCount: int64;
+      LOk: bool;
+    begin
+      match AType.Kind of
+        SymbolTypeKind.Signed, SymbolTypeKind.Unsigned, SymbolTypeKind.Float,
+          SymbolTypeKind.Bool, SymbolTypeKind.Char, SymbolTypeKind.WideChar,
+          SymbolTypeKind.Choices:
+          LWord := self.DoWord(AAddress, int64(AType.Size), LOk);
+          if not LOk then
+            return DoUnreadable(AAddress);
+          end;
+          return self.DoScalarText(AType, LWord);
+        SymbolTypeKind.Pointer, SymbolTypeKind.Interface, SymbolTypeKind.Task,
+          SymbolTypeKind.Sequence, SymbolTypeKind.Routine, SymbolTypeKind.Opaque:
+          LWord := self.DoWord(AAddress, 8, LOk);
+          if not LOk then
+            return DoUnreadable(AAddress);
+          end;
+          return DoAddressText(LWord);
+        SymbolTypeKind.String, SymbolTypeKind.WideString:
+          return self.DoStringText(AAddress, AType.Kind = SymbolTypeKind.WideString);
+        SymbolTypeKind.Set:
+          return self.DoSetText(AType, AAddress);
+        SymbolTypeKind.StaticArray:
+          if not self.FSymbols.TypeOf(AModule, AType.ElementTypeId, LElement) then
+            return "[?]";
+          end;
+          return self.DoElementsText(AModule, LElement, AAddress, int64(AType.Count), ADepth);
+        SymbolTypeKind.DynamicArray:
+          LBlock := self.DoWord(AAddress, 8, LOk);
+          if not LOk then
+            return DoUnreadable(AAddress);
+          end;
+          if LBlock = 0 then
+            return "[]";
+          end;
+          LCount := int64(self.DoWord(LBlock + ADAM_RUNTIME_BLOCK_LENGTH_AT, 8, LOk));
+          if (not LOk) or (not self.FSymbols.TypeOf(AModule, AType.ElementTypeId, LElement)) then
+            return DoUnreadable(LBlock);
+          end;
+          return self.DoElementsText(AModule, LElement, LBlock + ADAM_RUNTIME_BLOCK_DATA_AT,
+            LCount, ADepth);
+        SymbolTypeKind.Record:
+          return self.DoFieldsText(AModule, AType, AAddress, ADepth);
+        SymbolTypeKind.Ref, SymbolTypeKind.Own, SymbolTypeKind.Weak:
+          LWord := self.DoWord(AAddress, 8, LOk);
+          if not LOk then
+            return DoUnreadable(AAddress);
+          end;
+          if LWord = 0 then
+            return "nil";
+          end;
+          LBlock := self.DoObjectBlock(AAddress, AType.Kind);
+          if LBlock = 0 then
+            // a weak whose object has ended
+            return "nil (ended)";
+          end;
+          if (ADepth <= 0) or
+            (not self.FSymbols.TypeOf(AModule, AType.ElementTypeId, LElement)) then
+            return DoAddressText(LWord);
+          end;
+          return self.DoFieldsText(AModule, LElement, LBlock + ADAM_RUNTIME_REF_OBJECT_AT, ADepth);
+      else
+        // Unknown, Void
+      end;
+      return "?";
+    end;
+
+    // A scalar's form from its bits AWord (AType.Size bytes, zero-extended)
+    hidden method DoScalarText(const AType: SymbolType; const AWord: uint64): string;
+    var
+      LFloat64: float64;
+      LFloat32: float32;
+      LBits64: ptr to uint64;
+      LBits32: ptr to uint32;
+      LI: int64;
+    begin
+      match AType.Kind of
+        SymbolTypeKind.Signed:
+          return IntToStr(DoSigned(AWord, int64(AType.Size)));
+        SymbolTypeKind.Unsigned:
+          return UIntToStr(AWord);
+        SymbolTypeKind.Float:
+          // the bits put into a float variable of the size
+          if AType.Size = 4 then
+            LBits32 := ptr to uint32(uint64(addr of LFloat32));
+            LBits32^ := uint32(AWord);
+            return FloatToStr(float64(LFloat32));
+          end;
+          LBits64 := ptr to uint64(uint64(addr of LFloat64));
+          LBits64^ := AWord;
+          return FloatToStr(LFloat64);
+        SymbolTypeKind.Bool:
+          return BoolToStr(AWord <> 0);
+        SymbolTypeKind.Char, SymbolTypeKind.WideChar:
+          // a printable ASCII code quoted, any other by its number
+          if (AWord >= 32) and (AWord < 127) and (AWord <> 39) then
+            return "'" + StringOfChar(char(uint8(AWord)), 1) + "'";
+          end;
+          return "#" + UIntToStr(AWord);
+        SymbolTypeKind.Choices:
+          for LI := 0 to len(AType.Choices) - 1 do
+            if AType.Choices[LI].Value = DoSigned(AWord, int64(AType.Size)) then
+              return AType.Choices[LI].Name;
+            end;
+          end;
+          return IntToStr(DoSigned(AWord, int64(AType.Size)));
+      else
+        // no other kind is a scalar
+      end;
+      return UIntToStr(AWord);
+    end;
+
+    // The text (a string's UTF-8 bytes, a wstring's UTF-16 units: AWide) whose value is at
+    // AAddress, quoted; at most ADAM_RUNTIME_TEXT_LIMIT of it, "..." after a cut
+    hidden method DoStringText(const AAddress: uint64; const AWide: bool): string;
+    var
+      LBytes: ByteArray;
+      LText: string;
+      LBlock: uint64;
+      LLength: int64;
+      LShown: int64;
+      LUnit: int64;
+      LOk: bool;
+    begin
+      LBlock := self.DoWord(AAddress, 8, LOk);
+      if not LOk then
+        return DoUnreadable(AAddress);
+      end;
+      if LBlock = 0 then
+        return "\"\"";
+      end;
+      LLength := int64(self.DoWord(LBlock + ADAM_RUNTIME_BLOCK_LENGTH_AT, 8, LOk));
+      if (not LOk) or (LLength < 0) then
+        return DoUnreadable(LBlock);
+      end;
+      LShown := LLength;
+      if LShown > ADAM_RUNTIME_TEXT_LIMIT then
+        LShown := ADAM_RUNTIME_TEXT_LIMIT;
+      end;
+      LUnit := 1;
+      if AWide then
+        LUnit := 2;
+      end;
+      if LShown = 0 then
+        return "\"\"";
+      end;
+      if not self.FTarget.PeekMemory(LBlock + ADAM_RUNTIME_BLOCK_DATA_AT, LShown * LUnit,
+        LBytes) then
+        return DoUnreadable(LBlock + ADAM_RUNTIME_BLOCK_DATA_AT);
+      end;
+      if AWide then
+        LText := DoUtf16Text(LBytes, LShown);
+      else
+        LText := StringFromC(ptr to const char(uint64(addr of LBytes[0])), LShown);
+      end;
+      LText := "\"" + DoEscape(LText) + "\"";
+      if LShown < LLength then
+        LText := LText + "...";
+      end;
+      return LText;
+    end;
+
+    // A set's members (its fields, one bit each) that are in the set at AAddress, [A, B]
+    hidden method DoSetText(const AType: SymbolType; const AAddress: uint64): string;
+    var
+      LBytes: ByteArray;
+      LNames: StringArray;
+      LCount: int64;
+      LByte: int64;
+      LI: int64;
+    begin
+      if (AType.Size = 0) or (not self.FTarget.PeekMemory(AAddress, int64(AType.Size), LBytes)) then
+        return DoUnreadable(AAddress);
+      end;
+      if len(AType.Fields) = 0 then
+        // members past the debug information's limit: the bits alone
+        return "set of " + IntToStr(int64(AType.Size)) + " bytes";
+      end;
+      setlength(LNames, len(AType.Fields));
+      LCount := 0;
+      for LI := 0 to len(AType.Fields) - 1 do
+        LByte := int64(AType.Fields[LI].Offset);
+        if (LByte < len(LBytes)) and
+          (((uint64(LBytes[LByte]) >> uint64(AType.Fields[LI].BitOffset)) & 1) <> 0) then
+          LNames[LCount] := AType.Fields[LI].Name;
+          LCount := LCount + 1;
+        end;
+      end;
+      setlength(LNames, LCount);
+      return "[" + JoinStrings(LNames, ", ") + "]";
+    end;
+
+    // The first elements of an array of ACount AElement values at AAddress, [a, b, ...]
+    hidden method DoElementsText(const AModule: uint64; const AElement: SymbolType;
+      const AAddress: uint64; const ACount: int64; const ADepth: int64): string;
+    var
+      LParts: StringArray;
+      LShown: int64;
+      LI: int64;
+    begin
+      if ADepth <= 0 then
+        return "[" + IntToStr(ACount) + "]";
+      end;
+      LShown := ACount;
+      if LShown > ADAM_RUNTIME_SUMMARY_ELEMENTS then
+        LShown := ADAM_RUNTIME_SUMMARY_ELEMENTS;
+      end;
+      if LShown < 0 then
+        LShown := 0;
+      end;
+      setlength(LParts, LShown);
+      for LI := 0 to LShown - 1 do
+        LParts[LI] := self.DoText(AModule, AElement, AAddress + uint64(LI) * AElement.Size,
+          ADepth - 1);
+      end;
+      if LShown < ACount then
+        setlength(LParts, LShown + 1);
+        LParts[LShown] := "...";
+      end;
+      return DoCut("[" + JoinStrings(LParts, ", ") + "]");
+    end;
+
+    // A record's fields at AAddress, {F: v, ...}
+    hidden method DoFieldsText(const AModule: uint64; const AType: SymbolType;
+      const AAddress: uint64; const ADepth: int64): string;
+    var
+      LParts: StringArray;
+      LField: SymbolType;
+      LI: int64;
+    begin
+      if ADepth <= 0 then
+        return "{...}";
+      end;
+      setlength(LParts, len(AType.Fields));
+      for LI := 0 to len(AType.Fields) - 1 do
+        if not self.FSymbols.TypeOf(AModule, AType.Fields[LI].TypeId, LField) then
+          LParts[LI] := AType.Fields[LI].Name + ": ?";
+          skip;
+        end;
+        if AType.Fields[LI].BitWidth > 0 then
+          LParts[LI] := AType.Fields[LI].Name + ": " + self.DoBitsText(LField, AType.Fields[LI],
+            AAddress);
+        else
+          LParts[LI] := AType.Fields[LI].Name + ": " + self.DoText(AModule, LField,
+            AAddress + AType.Fields[LI].Offset, ADepth - 1);
+        end;
+      end;
+      return DoCut("{" + JoinStrings(LParts, ", ") + "}");
+    end;
+
+    // A bitfield AField (of type AType) of the record at AAddress, as its type writes it
+    hidden method DoBitsText(const AType: SymbolType; const AField: SymbolField;
+      const AAddress: uint64): string;
+    var
+      LWord: uint64;
+      LValue: uint64;
+      LSize: int64;
+      LOk: bool;
+    begin
+      LSize := int64(AType.Size);
+      if (LSize < 1) or (LSize > 8) then
+        LSize := 8;
+      end;
+      LWord := self.DoWord(AAddress + AField.Offset, LSize, LOk);
+      if not LOk then
+        return DoUnreadable(AAddress + AField.Offset);
+      end;
+      LValue := LWord >> uint64(AField.BitOffset);
+      if AField.BitWidth < 64 then
+        LValue := LValue & ((uint64(1) << uint64(AField.BitWidth)) - 1);
+      end;
+      if (AType.Kind = SymbolTypeKind.Signed) or (AType.Kind = SymbolTypeKind.Choices) then
+        // sign-extended from the field's own width
+        if (AField.BitWidth < 64) and
+          ((LValue & (uint64(1) << uint64(AField.BitWidth - 1))) <> 0) then
+          LValue := LValue | (0xFFFFFFFFFFFFFFFFu << uint64(AField.BitWidth));
+        end;
+        if AType.Kind = SymbolTypeKind.Signed then
+          return IntToStr(int64(LValue));
+        end;
+      end;
+      return self.DoScalarText(AType, LValue);
+    end;
+
+    // The block of the owner at AAddress (of AKind: Ref / Own / Weak) whose object is alive:
+    // 0 for nil, an unreadable one, or a weak's ended object
+    hidden method DoObjectBlock(const AAddress: uint64; const AKind: SymbolTypeKind): uint64;
+    var
+      LBlock: uint64;
+      LCount: uint64;
+      LOk: bool;
+    begin
+      LBlock := self.DoWord(AAddress, 8, LOk);
+      if (not LOk) or (LBlock = 0) then
+        return 0;
+      end;
+      if AKind = SymbolTypeKind.Weak then
+        LCount := self.DoWord(LBlock + ADAM_RUNTIME_BLOCK_COUNT_AT, 8, LOk);
+        if (not LOk) or (int64(LCount) <= 0) then
+          return 0;
+        end;
+      end;
+      return LBlock;
+    end;
+
+    // The Adam name of the type AType (of module AModule)
+    hidden method DoTypeText(const AModule: uint64; const AType: SymbolType): string;
+    var
+      LElement: SymbolType;
+      LName: string;
+    begin
+      if (AType.Kind <> SymbolTypeKind.Pointer) and (AType.Kind <> SymbolTypeKind.StaticArray) then
+        return AType.Name;
+      end;
+      LName := "?";
+      if self.FSymbols.TypeOf(AModule, AType.ElementTypeId, LElement) then
+        LName := self.DoTypeText(AModule, LElement);
+      end;
+      if AType.Kind = SymbolTypeKind.Pointer then
+        if AType.ElementTypeId = 0 then
+          return "ptr";
+        end;
+        return "ptr to " + LName;
+      end;
+      return "array[0.." + IntToStr(int64(AType.Count) - 1) + "] of " + LName;
+    end;
+
+    // A frame's parameters or locals (AHandle.Kind) as values
+    hidden method DoFrameVariables(const AHandle: RuntimeHandle; var AValues: RuntimeValueArray);
+    var
+      LFrames: StackFrameArray;
+      LVariables: SymbolVariableArray;
+      LWanted: VariableKind;
+      LAddress: uint64;
+      LLookup: uint64;
+      LCount: int64;
+      LI: int64;
+    begin
+      LFrames := self.DoFrames();
+      if AHandle.Frame >= len(LFrames) then
+        return;
+      end;
+      // an outer frame's program counter is a return address: look up the call before it
+      LLookup := LFrames[AHandle.Frame].Context.Pc;
+      if AHandle.Frame > 0 then
+        LLookup := LLookup - 1;
+      end;
+      if not self.FSymbols.Variables(LLookup, LVariables) then
+        return;
+      end;
+      LWanted := VariableKind.Local;
+      if AHandle.Kind = RuntimeHandleKind.Params then
+        LWanted := VariableKind.Param;
+      end;
+      setlength(AValues, len(LVariables));
+      LCount := 0;
+      for LI := 0 to len(LVariables) - 1 do
+        if (LVariables[LI].Kind <> LWanted) or (not self.FSymbols.AddressIn(LVariables[LI],
+          LFrames[AHandle.Frame], self.FTarget.RegisterNames(), LAddress)) then
+          skip;
+        end;
+        AValues[LCount] := self.DoValue(LVariables[LI].Name, LVariables[LI].Module,
+          LVariables[LI].TypeId, LAddress);
+        LCount := LCount + 1;
+      end;
+      setlength(AValues, LCount);
+    end;
+
+    // The program module's own globals, by their short names, sorted
+    hidden method DoGlobalVariables(var AValues: RuntimeValueArray);
+    var
+      LVariables: SymbolVariableArray;
+      LNames: StringArray;
+      LPrefix: string;
+      LVariable: SymbolVariable;
+      LCount: int64;
+      LI: int64;
+    begin
+      if not self.FSymbols.Globals(LVariables) then
+        return;
+      end;
+      LPrefix := self.FProgramModule + ".";
+      setlength(LNames, len(LVariables));
+      LCount := 0;
+      for LI := 0 to len(LVariables) - 1 do
+        if (LVariables[LI].Kind = VariableKind.Global) and
+          StartsStr(LPrefix, LVariables[LI].Name) then
+          LNames[LCount] := LVariables[LI].Name;
+          LCount := LCount + 1;
+        end;
+      end;
+      setlength(LNames, LCount);
+      SortStrings(LNames);
+      setlength(AValues, LCount);
+      for LI := 0 to LCount - 1 do
+        self.FSymbols.GlobalByName(LNames[LI], LVariable);
+        AValues[LI] := self.DoValue(Substring(LNames[LI], len(LPrefix),
+          len(LNames[LI]) - len(LPrefix)), LVariable.Module, LVariable.TypeId, LVariable.Address);
+      end;
+    end;
+
+    // A record's (or an object's) fields at AHandle.Address as values
+    hidden method DoFieldValues(const AHandle: RuntimeHandle; var AValues: RuntimeValueArray);
+    var
+      LType: SymbolType;
+      LField: SymbolType;
+      LI: int64;
+    begin
+      if not self.FSymbols.TypeOf(AHandle.Module, AHandle.TypeId, LType) then
+        return;
+      end;
+      setlength(AValues, len(LType.Fields));
+      for LI := 0 to len(LType.Fields) - 1 do
+        if (LType.Fields[LI].BitWidth > 0) and
+          self.FSymbols.TypeOf(AHandle.Module, LType.Fields[LI].TypeId, LField) then
+          AValues[LI].Name := LType.Fields[LI].Name;
+          AValues[LI].TypeName := LField.Name;
+          AValues[LI].Value := self.DoBitsText(LField, LType.Fields[LI], AHandle.Address);
+          AValues[LI].Reference := 0;
+          skip;
+        end;
+        AValues[LI] := self.DoValue(LType.Fields[LI].Name, AHandle.Module, LType.Fields[LI].TypeId,
+          AHandle.Address + LType.Fields[LI].Offset);
+      end;
+    end;
+
+    // An array's elements at AHandle.Address as values named [i], at most
+    // ADAM_RUNTIME_ELEMENT_LIMIT of them
+    hidden method DoElementValues(const AHandle: RuntimeHandle; var AValues: RuntimeValueArray);
+    var
+      LShown: int64;
+      LI: int64;
+    begin
+      LShown := AHandle.Count;
+      if LShown > ADAM_RUNTIME_ELEMENT_LIMIT then
+        LShown := ADAM_RUNTIME_ELEMENT_LIMIT;
+      end;
+      setlength(AValues, LShown);
+      for LI := 0 to LShown - 1 do
+        AValues[LI] := self.DoValue("[" + IntToStr(LI) + "]", AHandle.Module, AHandle.TypeId,
+          AHandle.Address + uint64(LI) * AHandle.Stride);
+      end;
+    end;
+
+    // APath's first names in frame AFrame: a parameter or local, the program module's global
+    // by its short name, a global by its module-qualified name (it takes two or more of
+    // APath's parts: AStart says how many were used)
+    hidden method DoFindName(const AFrame: int64; const APath: StringArray; var AStart: int64;
+      var AModule: uint64; var ATypeId: uint64; var AAddress: uint64): bool;
+    var
+      LFrames: StackFrameArray;
+      LVariables: SymbolVariableArray;
+      LVariable: SymbolVariable;
+      LName: string;
+      LLookup: uint64;
+      LI: int64;
+    begin
+      LFrames := self.DoFrames();
+      if (AFrame >= 0) and (AFrame < len(LFrames)) then
+        LLookup := LFrames[AFrame].Context.Pc;
+        if AFrame > 0 then
+          LLookup := LLookup - 1;
+        end;
+        if self.FSymbols.Variables(LLookup, LVariables) then
+          for LI := 0 to len(LVariables) - 1 do
+            if (LVariables[LI].Name = APath[0]) and self.FSymbols.AddressIn(LVariables[LI],
+              LFrames[AFrame], self.FTarget.RegisterNames(), AAddress) then
+              AModule := LVariables[LI].Module;
+              ATypeId := LVariables[LI].TypeId;
+              AStart := 1;
+              return true;
+            end;
+          end;
+        end;
+      end;
+      if self.FSymbols.GlobalByName(self.FProgramModule + "." + APath[0], LVariable) and
+        (LVariable.Kind = VariableKind.Global) then
+        AModule := LVariable.Module;
+        ATypeId := LVariable.TypeId;
+        AAddress := LVariable.Address;
+        AStart := 1;
+        return true;
+      end;
+      // a module's name has dots of its own: the longest run of names that is a global
+      LName := APath[0];
+      for LI := 1 to len(APath) - 1 do
+        if not DoIsName(APath[LI]) then
+          leave;
+        end;
+        LName := LName + APath[LI];
+        if self.FSymbols.GlobalByName(LName, LVariable) and
+          (LVariable.Kind = VariableKind.Global) then
+          AModule := LVariable.Module;
+          ATypeId := LVariable.TypeId;
+          AAddress := LVariable.Address;
+          AStart := LI + 1;
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // One step of a path (.Name, [N] or ^) from the value of type ATypeId at AAddress to its
+    // part (the three changed). False with AWhy when the value has no such part
+    hidden method DoPathStep(const AStep: string; const AModule: uint64; var ATypeId: uint64;
+      var AAddress: uint64; var AWhy: string): bool;
+    var
+      LType: SymbolType;
+      LElement: SymbolType;
+      LName: string;
+      LIndex: int64;
+      LCount: int64;
+      LBlock: uint64;
+      LOk: bool;
+      LI: int64;
+    begin
+      if not self.FSymbols.TypeOf(AModule, ATypeId, LType) then
+        AWhy := "?";
+        return false;
+      end;
+      if AStep = ADAM_RUNTIME_TARGET_NAME then
+        if (LType.Kind <> SymbolTypeKind.Pointer) or (LType.ElementTypeId = 0) then
+          AWhy := NoArgs().Str(self.DoTypeText(AModule, LType)).Fill(
+            ADAM_MSG_RUNTIME_EVAL_NO_TARGET);
+          return false;
+        end;
+        AAddress := self.DoWord(AAddress, 8, LOk);
+        if (not LOk) or (AAddress = 0) then
+          AWhy := NoArgs().Str(self.DoTypeText(AModule, LType)).Fill(ADAM_MSG_RUNTIME_EVAL_NIL);
+          return false;
+        end;
+        ATypeId := LType.ElementTypeId;
+        return true;
+      end;
+      if StartsStr("[", AStep) then
+        LIndex := StrToIntDef(Substring(AStep, 1, len(AStep) - 2), -1);
+        LCount := 0;
+        LBlock := AAddress;
+        if LType.Kind = SymbolTypeKind.StaticArray then
+          LCount := int64(LType.Count);
+        else
+          if LType.Kind = SymbolTypeKind.DynamicArray then
+            LBlock := self.DoWord(AAddress, 8, LOk);
+            if LOk and (LBlock <> 0) then
+              LCount := int64(self.DoWord(LBlock + ADAM_RUNTIME_BLOCK_LENGTH_AT, 8, LOk));
+              LBlock := LBlock + ADAM_RUNTIME_BLOCK_DATA_AT;
+            end;
+          else
+            AWhy := NoArgs().Str(self.DoTypeText(AModule, LType)).Fill(
+              ADAM_MSG_RUNTIME_EVAL_NO_INDEX);
+            return false;
+          end;
+        end;
+        if (LIndex < 0) or (LIndex >= LCount) then
+          AWhy := NoArgs().Int(LIndex).Str(self.DoTypeText(AModule, LType)).Int(LCount - 1).Fill(
+            ADAM_MSG_RUNTIME_EVAL_RANGE);
+          return false;
+        end;
+        if not self.FSymbols.TypeOf(AModule, LType.ElementTypeId, LElement) then
+          AWhy := "?";
+          return false;
+        end;
+        ATypeId := LType.ElementTypeId;
+        AAddress := LBlock + uint64(LIndex) * LElement.Size;
+        return true;
+      end;
+      // .Name: a record's field, an owner's object's (through every parent part)
+      LName := Substring(AStep, 1, len(AStep) - 1);
+      if (LType.Kind = SymbolTypeKind.Ref) or (LType.Kind = SymbolTypeKind.Own) or
+        (LType.Kind = SymbolTypeKind.Weak) then
+        LBlock := self.DoObjectBlock(AAddress, LType.Kind);
+        if (LBlock = 0) or (not self.FSymbols.TypeOf(AModule, LType.ElementTypeId, LElement)) then
+          AWhy := NoArgs().Str(self.DoTypeText(AModule, LType)).Fill(ADAM_MSG_RUNTIME_EVAL_NIL);
+          return false;
+        end;
+        ATypeId := LType.ElementTypeId;
+        AAddress := LBlock + ADAM_RUNTIME_REF_OBJECT_AT;
+        LType := LElement;
+      end;
+      while LType.Kind = SymbolTypeKind.Record do
+        for LI := 0 to len(LType.Fields) - 1 do
+          if (LType.Fields[LI].Name = LName) and (LType.Fields[LI].BitWidth = 0) then
+            ATypeId := LType.Fields[LI].TypeId;
+            AAddress := AAddress + LType.Fields[LI].Offset;
+            return true;
+          end;
+        end;
+        // an object's own fields lack it: its parent part's
+        if (len(LType.Fields) = 0) or (LType.Fields[0].Name <> "parent") or
+          (not self.FSymbols.TypeOf(AModule, LType.Fields[0].TypeId, LElement)) then
+          leave;
+        end;
+        AAddress := AAddress + LType.Fields[0].Offset;
+        ATypeId := LType.Fields[0].TypeId;
+        LType := LElement;
+      end;
+      AWhy := NoArgs().Str(self.DoTypeText(AModule, LType)).Str(LName).Fill(
+        ADAM_MSG_RUNTIME_EVAL_NO_FIELD);
+      return false;
+    end;
+
+    // The little-endian word of ASize bytes (1 .. 8) at AAddress, zero-extended; AOk false
+    // when it cannot be read
+    hidden method DoWord(const AAddress: uint64; const ASize: int64; var AOk: bool): uint64;
+    var
+      LBytes: ByteArray;
+      LValue: uint64;
+      LI: int64;
+    begin
+      AOk := (ASize >= 1) and (ASize <= 8) and self.FTarget.PeekMemory(AAddress, ASize, LBytes);
+      if not AOk then
+        return 0;
+      end;
+      LValue := 0;
+      for LI := ASize - 1 downto 0 do
+        LValue := (LValue << 8) | uint64(LBytes[LI]);
+      end;
+      return LValue;
+    end;
+
+    // The stopped thread's frames, read once per stop
+    hidden method DoFrames(): StackFrameArray;
+    var
+      LContext: DebugContext;
+    begin
+      if not self.FFramesRead then
+        setlength(self.FFrames, 0);
+        if self.FTarget.GetContext(self.FStop.ThreadId, LContext) then
+          self.FSymbols.StackWalk(self.FTarget, self.FStop.ThreadId, LContext, 0, self.FFrames);
+        end;
+        self.FFramesRead := true;
+      end;
+      return self.FFrames;
+    end;
+
+    // AHandle kept; its reference (1 up)
+    hidden method DoAddHandle(const AHandle: RuntimeHandle): int64;
+    begin
+      if self.FHandleCount >= len(self.FHandles) then
+        setlength(self.FHandles, self.FHandleCount * 2 + 16);
+      end;
+      self.FHandles[self.FHandleCount] := AHandle;
+      self.FHandleCount := self.FHandleCount + 1;
+      return self.FHandleCount;
+    end;
+
+    // The stop's facts dropped (frames, references): the program goes on
+    hidden method DoGoOn();
+    begin
+      self.FStopped := false;
+      self.FFramesRead := false;
+      self.FHandleCount := 0;
+    end;
+
+    // True when the program is stopped; else reported (DB0013, or DB0014 with none) for
+    // AWhat (what the caller would do)
+    hidden method DoRequireStopped(const AWhat: string): bool;
+    begin
+      if self.FStopped then
+        return true;
+      end;
+      if (not self.FLaunched) or self.FExited then
+        self.DoError(ADAM_ERR_RUNTIME_002, ADAM_MSG_RUNTIME_NO_PROGRAM, NoArgs());
+      else
+        self.DoError(ADAM_ERR_RUNTIME_001, ADAM_MSG_RUNTIME_NOT_STOPPED, NoArgs().Str(AWhat));
+      end;
+      return false;
+    end;
+
+    // One breakpoint per @breakpoint of the program (its marks), before the ones asked for
+    hidden method DoAddMarks();
+    var
+      LLines: SourceLineArray;
+      LMarks: RuntimeBreakpointArray;
+      LI: int64;
+    begin
+      if not self.FSymbols.MarkedLines(LLines) then
+        return;
+      end;
+      setlength(LMarks, len(LLines));
+      for LI := 0 to len(LLines) - 1 do
+        LMarks[LI].Id := self.FNextId;
+        self.FNextId := self.FNextId + 1;
+        LMarks[LI].FileName := LLines[LI].FilePath;
+        LMarks[LI].Line := LLines[LI].Line;
+        LMarks[LI].Source := LLines[LI];
+        LMarks[LI].IsMark := true;
+        LMarks[LI].Verified := self.FTarget.AddPatch(LLines[LI].Address);
+      end;
+      for LI := 0 to len(self.FBreakpoints) - 1 do
+        setlength(LMarks, len(LMarks) + 1);
+        LMarks[len(LMarks) - 1] := self.FBreakpoints[LI];
+      end;
+      self.FBreakpoints := LMarks;
+    end;
+
+    // Every breakpoint asked for before the program started put in
+    hidden method DoResolveAll();
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FBreakpoints) - 1 do
+        if not self.FBreakpoints[LI].IsMark then
+          self.DoResolve(self.FBreakpoints[LI]);
+        end;
+      end;
+    end;
+
+    // ABreakpoint's line found and its patch put in (Verified when both are)
+    hidden method DoResolve(var ABreakpoint: RuntimeBreakpoint);
+    begin
+      ABreakpoint.Verified := self.FSymbols.AddressOf(ABreakpoint.FileName, ABreakpoint.Line,
+        ABreakpoint.Source) and self.FTarget.AddPatch(ABreakpoint.Source.Address);
+    end;
+
+    // The id of the verified breakpoint at AAddress (0: none)
+    hidden const method DoBreakpointAt(const AAddress: uint64): int64;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FBreakpoints) - 1 do
+        if self.FBreakpoints[LI].Verified and (self.FBreakpoints[LI].Source.Address = AAddress) then
+          return self.FBreakpoints[LI].Id;
+        end;
+      end;
+      return 0;
+    end;
+
+    // The step's own patch put at AAddress, taken at stack pointer ASp or above, landing as
+    // ALanding says
+    hidden method DoSetTemp(const AAddress: uint64; const ASp: uint64;
+      const ALanding: RuntimeLanding);
+    begin
+      self.DoDropTemp();
+      if self.FTarget.AddPatch(AAddress) then
+        self.FTempActive := true;
+        self.FTempAddress := AAddress;
+        self.FTempSp := ASp;
+        self.FTempLanding := ALanding;
+      end;
+    end;
+
+    // The step's own patch taken out
+    hidden method DoDropTemp();
+    begin
+      if self.FTempActive then
+        self.FTarget.RemovePatch(self.FTempAddress);
+        self.FTempActive := false;
+      end;
+    end;
+
+    // The step ended: its patch out
+    hidden method DoEndStep();
+    begin
+      self.DoDropTemp();
+      self.FStepping := false;
+    end;
+
+    // The next event a stop is made of into AEvent: output kept (AddOutput), a module load
+    // let go on, thread starts and ends passed over. False when the program is gone
+    hidden method DoNext(var AEvent: DebugEvent): bool;
+    begin
+      while self.FTarget.NextEvent(AEvent, ADAM_DEBUG_WAIT_FOREVER) do
+        match AEvent.Kind of
+          DebugEventKind.Output:
+            self.FOutput.Add(AEvent.OutputText);
+          DebugEventKind.ModuleLoaded:
+            self.FTarget.Resume(ResumeKind.Continue);
+          DebugEventKind.ThreadStarted, DebugEventKind.ThreadExited,
+            DebugEventKind.ModuleUnloaded:
+            // nothing to do
+        else
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // The program run (it was resumed) to the next stop this runtime reports, into AStop
+    hidden method DoRun(var AStop: RuntimeStop): bool;
+    var
+      LEvent: DebugEvent;
+      LContext: DebugContext;
+      LId: int64;
+    begin
+      while self.DoNext(LEvent) do
+        if LEvent.Kind = DebugEventKind.ProcessExited then
+          self.DoEndStep();
+          self.FExited := true;
+          self.DoReport(RuntimeStopKind.Exited, LEvent, 0, AStop);
+          self.FStopped := false;
+          self.FSymbols.Close();
+          return true;
+        end;
+        if LEvent.Kind <> DebugEventKind.Stopped then
+          if self.FTarget.IsHeld() then
+            self.FTarget.Resume(ResumeKind.Continue);
+          end;
+          skip;
+        end;
+        match LEvent.Reason of
+          DebugStopReason.Breakpoint:
+            LId := self.DoBreakpointAt(LEvent.Address);
+            if self.FTempActive and (LEvent.Address = self.FTempAddress) then
+              if (LEvent.ThreadId = self.FStepThread) and
+                self.FTarget.GetContext(LEvent.ThreadId, LContext) and
+                (LContext.Sp >= self.FTempSp) then
+                self.DoDropTemp();
+                if (self.FTempLanding = RuntimeLanding.Body) or
+                  (self.FStepKind = RuntimeStepKind.Out) then
+                  self.DoEndStep();
+                  self.DoReport(RuntimeStopKind.Step, LEvent, 0, AStop);
+                  return true;
+                end;
+                // back from a call stepped over: on through the line
+                self.FBefore := LContext;
+                self.FTarget.Resume(ResumeKind.Step);
+                skip;
+              end;
+              // the same patch reached deeper (a recursion) or by another thread: not the
+              // step's
+              if LId = 0 then
+                self.FTarget.Resume(ResumeKind.Continue);
+                skip;
+              end;
+            end;
+            self.DoEndStep();
+            self.DoReport(RuntimeStopKind.Breakpoint, LEvent, LId, AStop);
+            return true;
+          DebugStopReason.Step:
+            if self.FStepping and (LEvent.ThreadId = self.FStepThread) and
+              self.FTarget.GetContext(LEvent.ThreadId, LContext) then
+              if self.DoStepped(LContext) then
+                self.DoEndStep();
+                self.DoReport(RuntimeStopKind.Step, LEvent, 0, AStop);
+                return true;
+              end;
+              skip;
+            end;
+            self.DoEndStep();
+            self.DoReport(RuntimeStopKind.Step, LEvent, 0, AStop);
+            return true;
+          DebugStopReason.Pause:
+            self.DoEndStep();
+            self.DoReport(RuntimeStopKind.Pause, LEvent, 0, AStop);
+            return true;
+          DebugStopReason.Exception:
+            self.DoEndStep();
+            self.DoReport(RuntimeStopKind.Exception, LEvent, 0, AStop);
+            return true;
+        else
+          self.DoEndStep();
+          self.DoReport(RuntimeStopKind.Entry, LEvent, 0, AStop);
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // One instruction of a step done, the thread now at AContext: true when the step ends
+    // here; else it goes on (resumed: the next instruction, or to a patch)
+    hidden method DoStepped(const AContext: DebugContext): bool;
+    var
+      LRoutine: SymbolRoutine;
+      LLine: SourceLine;
+      LReturn: uint64;
+    begin
+      if self.FTarget.CallReturn(self.FBefore, AContext, LReturn) then
+        if (self.FStepKind = RuntimeStepKind.Into) and self.DoStepsInto(AContext.Pc, LRoutine) then
+          self.DoSetTemp(LRoutine.BodyAddress, 0, RuntimeLanding.Body);
+        else
+          self.DoSetTemp(LReturn, self.FBefore.Sp, RuntimeLanding.Return);
+        end;
+        self.FTarget.Resume(ResumeKind.Continue);
+        return false;
+      end;
+      // the routine returned: its caller's line
+      if AContext.Sp >= self.FStepCallerSp then
+        return true;
+      end;
+      // a line starts here that is no part of the routine's setup and not the one left
+      if (AContext.Pc >= self.FStepBody) and self.FSymbols.LineAt(AContext.Pc, LLine) and
+        (LLine.Address = AContext.Pc) and ((LLine.Line <> self.FStepLine.Line) or
+        (LLine.FilePath <> self.FStepLine.FilePath)) then
+        return true;
+      end;
+      self.FBefore := AContext;
+      self.FTarget.Resume(ResumeKind.Step);
+      return false;
+    end;
+
+    // True when a step into the routine at AAddress stops in it (ARoutine): it has a first
+    // statement past its start, a line there, and is no runtime routine
+    hidden method DoStepsInto(const AAddress: uint64; var ARoutine: SymbolRoutine): bool;
+    var
+      LLine: SourceLine;
+    begin
+      if (not self.FSymbols.RoutineAt(AAddress, ARoutine)) or (ARoutine.Address <> AAddress) or
+        (ARoutine.BodyAddress <= ARoutine.Address) or
+        (not self.FSymbols.LineAt(ARoutine.BodyAddress, LLine)) then
+        return false;
+      end;
+      return not StartsText(ADAM_RUNTIME_RUNTIME_SOURCE, LLine.FilePath);
+    end;
+
+    // The stop AEvent is reported as (of AKind, breakpoint AId) into AStop and kept
+    hidden method DoReport(const AKind: RuntimeStopKind; const AEvent: DebugEvent; const AId: int64;
+      var AStop: RuntimeStop);
+    var
+      LContext: DebugContext;
+      LRoutine: SymbolRoutine;
+      LStop: RuntimeStop;
+    begin
+      LStop.Kind := AKind;
+      LStop.ThreadId := AEvent.ThreadId;
+      LStop.BreakpointId := AId;
+      LStop.Address := AEvent.Address;
+      LStop.ExceptionCode := AEvent.ExceptionCode;
+      LStop.ExitCode := AEvent.ExitCode;
+      LStop.HasLine := false;
+      LStop.Routine := "";
+      if AKind <> RuntimeStopKind.Exited then
+        if self.FTarget.GetContext(AEvent.ThreadId, LContext) then
+          LStop.Address := LContext.Pc;
+        end;
+        LStop.HasLine := self.FSymbols.LineAt(LStop.Address, LStop.Source);
+        if self.FSymbols.RoutineAt(LStop.Address, LRoutine) then
+          LStop.Routine := LRoutine.Name;
+        end;
+      end;
+      self.DoGoOn();
+      self.FStopped := AKind <> RuntimeStopKind.Exited;
+      self.FStop := LStop;
+      AStop := LStop;
+    end;
+
+    // Reports ATemplate filled with AArgs as an Error with ACode (no place)
+    hidden method DoError(const ACode: string; const ATemplate: string; const AArgs: MessageArgs);
+    begin
+      if self.FReports <> nil then
+        self.FReports.Add(Severity.Error, ACode, NoPlace(), ATemplate, AArgs);
+      end;
+    end;
+  end;
+
+// The kind's name as a debugger prints it (entry, breakpoint, step, pause, exception, exited)
+public routine RuntimeStopKindText(const AKind: RuntimeStopKind): string;
+begin
+  match AKind of
+    RuntimeStopKind.Entry: return "entry";
+    RuntimeStopKind.Breakpoint: return "breakpoint";
+    RuntimeStopKind.Step: return "step";
+    RuntimeStopKind.Pause: return "pause";
+    RuntimeStopKind.Exception: return "exception";
+  else
+    return "exited";
+  end;
+end;
+
+end.
