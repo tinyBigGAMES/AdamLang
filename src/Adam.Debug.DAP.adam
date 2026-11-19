@@ -24,14 +24,19 @@
   launch takes "program": an .adam source is built for debugging first
   (DapBuilder, Driver.CLI's: a debug build, its lines sent as output), an exe
   is debugged as it is (its debug file beside it); "args" (strings),
-  "outputPath", "stopOnEntry". The program runs with its output through the
-  debugger (DebugOutputMode.Pipes: stdout is the protocol), each piece sent
-  as an output event as it comes. The program's @breakpoint marks are
-  announced as new breakpoints.
+  "outputPath", "stopOnEntry", "terminal" (default true), "terminalCols" /
+  "terminalRows". The program runs on a terminal of its own the client
+  shows (DebugOutputMode.Terminal: its text, VT sequences kept, comes as
+  stdout output events; the client's keys and its pane's size go back as
+  Adam's own requests adamTerminalInput {text} / adamTerminalResize {cols,
+  rows}); "terminal": false runs it with stdout / stderr through a pipe
+  and stdin NUL (DebugOutputMode.Pipes). Either way stdout is the protocol.
+  The program's @breakpoint marks are announced as new breakpoints.
 
   Requests: initialize, launch, setBreakpoints, setExceptionBreakpoints,
   configurationDone, threads, stackTrace, scopes, variables, continue, next,
-  stepIn, stepOut, pause, evaluate, terminate, disconnect. Events:
+  stepIn, stepOut, pause, evaluate, terminate, disconnect, adamTerminalInput,
+  adamTerminalResize. Events:
   initialized, stopped, output, breakpoint (new / changed), exited,
   terminated.
 
@@ -60,6 +65,10 @@ public const
   ADAM_DAP_CATEGORY_CONSOLE: string = "console";
   ADAM_DAP_CATEGORY_STDOUT: string = "stdout";
   ADAM_DAP_CATEGORY_STDERR: string = "stderr";
+  // Adam's own requests (DAP has no stdin request): keys typed in the client's terminal pane,
+  // and its size
+  ADAM_DAP_TERMINAL_INPUT: string = "adamTerminalInput";
+  ADAM_DAP_TERMINAL_RESIZE: string = "adamTerminalResize";
   // How many reports a session keeps (they are sent as they come)
   ADAM_DAP_REPORT_BUDGET: int64 = 1000000;
 
@@ -88,6 +97,18 @@ begin
     AValues[LI] := LItems[LI].AsString();
   end;
   return true;
+end;
+
+// A terminal size argument AName into AValue: absent 0 (the default size); false when it is
+// there and not a whole number 1 .. ADAM_DEBUG_TERMINAL_SIDE_MAX
+routine DoSizeArg(const AArguments: Json; const AName: string; var AValue: int64): bool;
+begin
+  AValue := 0;
+  if not AArguments.Has(AName) then
+    return true;
+  end;
+  return AArguments.TryGetInt64(AName, AValue) and (AValue >= 1) and
+    (AValue <= int64(ADAM_DEBUG_TERMINAL_SIDE_MAX));
 end;
 
 public type
@@ -479,6 +500,14 @@ type
         self.DoDisconnect(ARequest);
         return;
       end;
+      if ACommand = ADAM_DAP_TERMINAL_INPUT then
+        self.DoTerminalInput(ARequest, AArguments);
+        return;
+      end;
+      if ACommand = ADAM_DAP_TERMINAL_RESIZE then
+        self.DoTerminalResize(ARequest, AArguments);
+        return;
+      end;
       self.DoFail(ARequest, NoArgs().Str(ACommand).Fill(ADAM_MSG_DAP_UNKNOWN_COMMAND));
     end;
 
@@ -536,6 +565,10 @@ type
       LTarget: ref DebugTarget;
       LStop: RuntimeStop;
       LBody: Json;
+      LTerminal: bool;
+      LCols: int64;
+      LRows: int64;
+      LMode: DebugOutputMode;
     begin
       if self.FLaunched then
         self.DoFail(ARequest, NoArgs().Fill(ADAM_MSG_DAP_LAUNCH_TWICE));
@@ -559,6 +592,19 @@ type
       if AArguments.Has("stopOnEntry") and
         not AArguments.TryGetBoolean("stopOnEntry", self.FStopOnEntry) then
         self.DoBadArgument(ARequest, "launch", "stopOnEntry");
+        return;
+      end;
+      LTerminal := true;
+      if AArguments.Has("terminal") and not AArguments.TryGetBoolean("terminal", LTerminal) then
+        self.DoBadArgument(ARequest, "launch", "terminal");
+        return;
+      end;
+      if not DoSizeArg(AArguments, "terminalCols", LCols) then
+        self.DoBadArgument(ARequest, "launch", "terminalCols");
+        return;
+      end;
+      if not DoSizeArg(AArguments, "terminalRows", LRows) then
+        self.DoBadArgument(ARequest, "launch", "terminalRows");
         return;
       end;
       // A source is built for debugging first; an exe is debugged as it is
@@ -588,7 +634,12 @@ type
       self.FRuntime.SetPauseCheck(self.FCheck);
       // The client's breakpoints so far wait for the launch
       self.DoPlaceAll();
-      if not self.FRuntime.Launch(LExePath, LArgs, DebugOutputMode.Pipes, LStop) then
+      LMode := DebugOutputMode.Pipes;
+      if LTerminal then
+        LMode := DebugOutputMode.Terminal;
+        self.FRuntime.Target.SetTerminalSize(int32(LCols), int32(LRows));
+      end;
+      if not self.FRuntime.Launch(LExePath, LArgs, LMode, LStop) then
         self.DoSendProgramOutput();
         LText := self.DoFailureText(NoArgs().Str(LExePath).Fill(ADAM_MSG_DAP_LAUNCH_FAILED));
         self.FRuntime.SetPauseCheck(nil);
@@ -1076,6 +1127,52 @@ type
       end;
       self.DoSendProgramOutput();
       self.DoExited(self.FRuntime.LastStop().ExitCode);
+    end;
+
+    // adamTerminalInput: keys typed in the client's terminal pane (as the terminal spells
+    // them, Enter a CR), to the program, running or stopped
+    hidden method DoTerminalInput(const ARequest: Json; const AArguments: Json);
+    var
+      LText: string;
+    begin
+      if not self.DoNeedLaunched(ARequest) then
+        return;
+      end;
+      if not AArguments.TryGetString("text", LText) then
+        self.DoBadArgument(ARequest, ADAM_DAP_TERMINAL_INPUT, "text");
+        return;
+      end;
+      if not self.FRuntime.Target.WriteInput(LText) then
+        self.DoFail(ARequest,
+          NoArgs().Str(ADAM_DAP_TERMINAL_INPUT).Fill(ADAM_MSG_DAP_REQUEST_FAILED));
+        return;
+      end;
+      self.DoOk(ARequest);
+    end;
+
+    // adamTerminalResize: the client's pane has a new size; the program's terminal follows
+    hidden method DoTerminalResize(const ARequest: Json; const AArguments: Json);
+    var
+      LCols: int64;
+      LRows: int64;
+    begin
+      if not self.DoNeedLaunched(ARequest) then
+        return;
+      end;
+      if (not AArguments.Has("cols")) or not DoSizeArg(AArguments, "cols", LCols) then
+        self.DoBadArgument(ARequest, ADAM_DAP_TERMINAL_RESIZE, "cols");
+        return;
+      end;
+      if (not AArguments.Has("rows")) or not DoSizeArg(AArguments, "rows", LRows) then
+        self.DoBadArgument(ARequest, ADAM_DAP_TERMINAL_RESIZE, "rows");
+        return;
+      end;
+      if not self.FRuntime.Target.ResizeTerminal(int32(LCols), int32(LRows)) then
+        self.DoFail(ARequest,
+          NoArgs().Str(ADAM_DAP_TERMINAL_RESIZE).Fill(ADAM_MSG_DAP_REQUEST_FAILED));
+        return;
+      end;
+      self.DoOk(ARequest);
     end;
 
     // pause: the running program stops (a stopped event follows)

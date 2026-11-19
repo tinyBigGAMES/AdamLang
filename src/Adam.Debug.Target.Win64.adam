@@ -28,6 +28,14 @@
   slices of ADAM_DEBUG_WIN64_SLICE_MS while a pipe is open), so the program
   never blocks on a full pipe.
 
+  Terminal mode: a pseudo console (CreatePseudoConsole over two plain
+  pipes, nothing inherited) is the program's console, named by a
+  STARTUPINFOEXW attribute list; its output pipe is read as Pipes' is
+  (VT text), WriteInput writes its input pipe, ResizeTerminal resizes it.
+  At the program's end it is closed on a task while this thread reads its
+  output to the pipe's break (an older Windows' ClosePseudoConsole waits
+  for that drain), so its last screen comes before ProcessExited.
+
   Steps: the trap flag (EFlags TF) gives one instruction, then a single-step
   exception on that thread. Getting past a patch: its byte put back, the
   other threads suspended, TF; the single step puts the int3 in again and
@@ -191,6 +199,12 @@ begin
   return WinResolvePath(LPath);
 end;
 
+// ClosePseudoConsole as a task runs it (DoCloseTerminal)
+routine DoClosePseudoConsole(const AConsole: uint64);
+begin
+  ClosePseudoConsole(AConsole);
+end;
+
 // A module file handle Windows gave the debugger, closed (0 / invalid: none)
 routine DoCloseFile(const AFile: uint64);
 begin
@@ -236,6 +250,9 @@ public type
     hidden FSuspended: DebugWordArray;
     // The output pipe's read end (0 = none) and the bytes read that end mid character
     hidden FPipeRead: uint64;
+    // Terminal mode: the pseudo console (an HPCON, 0 = none) and its input pipe's write end
+    hidden FPseudoConsole: uint64;
+    hidden FTerminalInput: uint64;
     hidden FPending: string;
     // Events taken and not yet handed out, FQueueHead the next
     hidden FQueue: Win64EventArray;
@@ -257,6 +274,9 @@ public type
       LI: int64;
       LStarted: bool;
       LError: uint32;
+      LStartupEx: STARTUPINFOEXW;
+      LList: ByteArray;
+      LFlags: uint32;
     begin
       if self.FRunning or self.FExited then
         self.DoError(ADAM_ERR_DEBUG_003, ADAM_MSG_DEBUG_STARTED, NoArgs());
@@ -314,17 +334,37 @@ public type
         LStartup.hStdOutput := LWrite;
         LStartup.hStdError := LWrite;
       else
-        // This process's own standard handles, handed on as the program's
-        LStartup.hStdInput := GetStdHandle(STD_INPUT_HANDLE);
-        LStartup.hStdOutput := GetStdHandle(STD_OUTPUT_HANDLE);
-        LStartup.hStdError := GetStdHandle(STD_ERROR_HANDLE);
+        if self.FOutputMode = DebugOutputMode.Inherit then
+          // This process's own standard handles, handed on as the program's
+          LStartup.hStdInput := GetStdHandle(STD_INPUT_HANDLE);
+          LStartup.hStdOutput := GetStdHandle(STD_OUTPUT_HANDLE);
+          LStartup.hStdError := GetStdHandle(STD_ERROR_HANDLE);
+        end;
+        // Terminal: no standard handles of this process's (stdout may be a protocol): the
+        // pseudo console is the program's console
       end;
 
-      LStarted := CreateProcessW(LApplication.Data, LCommandLine.Data, nil, nil, 1,
-        DEBUG_ONLY_THIS_PROCESS | NORMAL_PRIORITY_CLASS |
-        CREATE_NEW_PROCESS_GROUP, nil,
-        LDirectory.Data, LStartup, LInfo) <> 0;
-      LError := GetLastError();
+      LFlags := DEBUG_ONLY_THIS_PROCESS | NORMAL_PRIORITY_CLASS | CREATE_NEW_PROCESS_GROUP;
+      if self.FOutputMode = DebugOutputMode.Terminal then
+        if not self.DoCreateTerminal(LList) then
+          return false;
+        end;
+        LStartupEx.StartupInfo := LStartup;
+        LStartupEx.StartupInfo.cb := uint32(size(STARTUPINFOEXW));
+        LStartupEx.lpAttributeList := ptr(addr of LList[0]);
+        LStarted := CreateProcessW(LApplication.Data, LCommandLine.Data, nil, nil, 0,
+          LFlags | EXTENDED_STARTUPINFO_PRESENT, nil, LDirectory.Data, LStartupEx.StartupInfo,
+          LInfo) <> 0;
+        LError := GetLastError();
+        DeleteProcThreadAttributeList(ptr(addr of LList[0]));
+        if not LStarted then
+          self.DoCloseTerminal();
+        end;
+      else
+        LStarted := CreateProcessW(LApplication.Data, LCommandLine.Data, nil, nil, 1, LFlags,
+          nil, LDirectory.Data, LStartup, LInfo) <> 0;
+        LError := GetLastError();
+      end;
       // Only the program holds the pipe's write end and NUL now
       if LWrite <> 0 then
         CloseHandle(LWrite);
@@ -843,6 +883,7 @@ public type
       self.DoContinueEvent(ARaw.dwThreadId, DBG_CONTINUE);
       // Gone for good once continued: the pipe's write end with it, so the rest is read whole
       WaitForSingleObject(self.FProcess, INFINITE);
+      self.DoCloseTerminal();
       self.DoDrainOutput(true);
       LEvent.Kind := DebugEventKind.ProcessExited;
       LEvent.ExitCode := ARaw.u.ExitProcess.dwExitCode;
@@ -862,6 +903,7 @@ public type
       WaitForSingleObject(self.FProcess, INFINITE);
       LExitCode := ADAM_DEBUG_TERMINATE_EXIT_CODE;
       GetExitCodeProcess(self.FProcess, LExitCode);
+      self.DoCloseTerminal();
       self.DoDrainOutput(true);
       LEvent.Kind := DebugEventKind.ProcessExited;
       LEvent.ExitCode := LExitCode;
@@ -872,6 +914,7 @@ public type
     // Everything of the ended process closed and forgotten (its events still queued)
     hidden method DoFinish();
     begin
+      self.DoCloseTerminal();
       self.DoClosePipe();
       if self.FProcess <> 0 then
         CloseHandle(self.FProcess);
@@ -1267,6 +1310,135 @@ public type
       if AAll then
         self.DoClosePipe();
       end;
+    end;
+
+    // Terminal mode's pseudo console made (FPseudoConsole, FTerminalInput, FPipeRead its
+    // output) and AList the attribute list naming it. False (reported, nothing left open) when
+    // the OS refuses
+    hidden method DoCreateTerminal(var AList: ByteArray): bool;
+    var
+      LSecurity: SECURITY_ATTRIBUTES;
+      LInputRead: uint64;
+      LOutputWrite: uint64;
+      LSize: COORD;
+      LResult: int32;
+      LListSize: uint64;
+    begin
+      // Two plain pipes, nothing inheritable: the program reaches only the pseudo console,
+      // which keeps its own copies of the ends it is given
+      LSecurity.nLength := uint32(size(SECURITY_ATTRIBUTES));
+      LSecurity.bInheritHandle := 0;
+      LInputRead := 0;
+      LOutputWrite := 0;
+      if (CreatePipe(LInputRead, self.FTerminalInput, LSecurity, 0) = 0) or
+        (CreatePipe(self.FPipeRead, LOutputWrite, LSecurity, 0) = 0) then
+        self.DoError(ADAM_ERR_DEBUG_002, ADAM_MSG_DEBUG_START_FAILED,
+          NoArgs().Str(self.FProgramPath).Str(WinLastErrorText()));
+        DoCloseFile(LInputRead);
+        self.DoCloseTerminal();
+        self.DoClosePipe();
+        return false;
+      end;
+      LSize.X := int16(TerminalSide(self.FTerminalCols, ADAM_DEBUG_TERMINAL_COLS));
+      LSize.Y := int16(TerminalSide(self.FTerminalRows, ADAM_DEBUG_TERMINAL_ROWS));
+      LResult := CreatePseudoConsole(LSize, LInputRead, LOutputWrite, 0, self.FPseudoConsole);
+      CloseHandle(LInputRead);
+      CloseHandle(LOutputWrite);
+      if LResult <> 0 then
+        self.FPseudoConsole := 0;
+        self.DoError(ADAM_ERR_DEBUG_002, ADAM_MSG_DEBUG_START_FAILED,
+          NoArgs().Str(self.FProgramPath).Str(WinErrorText(uint32(LResult))));
+        self.DoCloseTerminal();
+        self.DoClosePipe();
+        return false;
+      end;
+      LListSize := 0;
+      InitializeProcThreadAttributeList(nil, 1, 0, LListSize);
+      setlength(AList, int64(LListSize));
+      if (len(AList) = 0) or
+        (InitializeProcThreadAttributeList(ptr(addr of AList[0]), 1, 0, LListSize) = 0) or
+        (UpdateProcThreadAttribute(ptr(addr of AList[0]), 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+        ptr(self.FPseudoConsole), 8, nil, nil) = 0) then
+        self.DoError(ADAM_ERR_DEBUG_002, ADAM_MSG_DEBUG_START_FAILED,
+          NoArgs().Str(self.FProgramPath).Str(WinLastErrorText()));
+        self.DoCloseTerminal();
+        self.DoClosePipe();
+        return false;
+      end;
+      return true;
+    end;
+
+    // The pseudo console closed: on a task, while this thread reads its output to the pipe's
+    // break (it writes out what it holds first), the bytes kept for the last drain; then its
+    // input pipe. Nothing when there is none
+    hidden method DoCloseTerminal();
+    var
+      LConsole: uint64;
+      LCloser: task;
+      LBuffer: ByteArray;
+      LRead: uint32;
+      LOld: int64;
+      LI: int64;
+    begin
+      if self.FPseudoConsole <> 0 then
+        LConsole := self.FPseudoConsole;
+        self.FPseudoConsole := 0;
+        LCloser := async DoClosePseudoConsole(LConsole);
+        if self.FPipeRead <> 0 then
+          setlength(LBuffer, int64(ADAM_DEBUG_WIN64_PIPE_CHUNK));
+          while true do
+            LRead := 0;
+            if (ReadFile(self.FPipeRead, ptr(addr of LBuffer[0]), ADAM_DEBUG_WIN64_PIPE_CHUNK,
+              LRead, nil) = 0) or (LRead = 0) then
+              leave;
+            end;
+            LOld := len(self.FPending);
+            setlength(self.FPending, LOld + int64(LRead));
+            for LI := 0 to int64(LRead) - 1 do
+              self.FPending[LOld + LI] := char(LBuffer[LI]);
+            end;
+          end;
+        end;
+        await LCloser;
+      end;
+      if self.FTerminalInput <> 0 then
+        CloseHandle(self.FTerminalInput);
+        self.FTerminalInput := 0;
+      end;
+    end;
+
+    override method WriteInput(const AText: string): bool;
+    var
+      LDone: int64;
+      LWritten: uint32;
+    begin
+      if (self.FTerminalInput = 0) or (self.FPseudoConsole = 0) then
+        return false;
+      end;
+      LDone := 0;
+      while LDone < len(AText) do
+        LWritten := 0;
+        if (WriteFile(self.FTerminalInput, ptr(addr of AText[LDone]),
+          uint32(len(AText) - LDone), LWritten, nil) = 0) or (LWritten = 0) then
+          return false;
+        end;
+        LDone := LDone + int64(LWritten);
+      end;
+      return true;
+    end;
+
+    override method ResizeTerminal(const ACols: int32; const ARows: int32): bool;
+    var
+      LSize: COORD;
+    begin
+      if self.FPseudoConsole = 0 then
+        return false;
+      end;
+      self.FTerminalCols := TerminalSide(ACols, ADAM_DEBUG_TERMINAL_COLS);
+      self.FTerminalRows := TerminalSide(ARows, ADAM_DEBUG_TERMINAL_ROWS);
+      LSize.X := int16(self.FTerminalCols);
+      LSize.Y := int16(self.FTerminalRows);
+      return ResizePseudoConsole(self.FPseudoConsole, LSize) = 0;
     end;
 
     hidden method DoClosePipe();
