@@ -61,8 +61,10 @@ let gForceClose = false;
 // explorerOpen = open explorer folders (roots included, the explorer's keys).
 // null = never saved: defaults apply (explorerOpen: every root opens).
 // debugHosts = the host exe picked per dll source (dap-host.js debugHostKey).
+// breakpoints = the user's breakpoints: [{ path, lines }] (src/debug.js persist),
+// kept across runs of the editor.
 let gState = { folders: [], lastDialogDir: '', openFiles: [], activeFile: '', showExamples: true,
-  window: null, layout: null, build: null, explorerOpen: null, debugHosts: {} };
+  window: null, layout: null, build: null, explorerOpen: null, debugHosts: {}, breakpoints: [] };
 
 // Build mode / target lists: ADAM_BUILD_MODES / ADAM_RETIRED_BUILD_MODES /
 // ADAM_BUILD_TARGETS (build:start section below; validBuild and savedBuild run
@@ -151,9 +153,30 @@ function loadState() {
     gState.explorerOpen = validExplorerOpen(LData.explorerOpen);
     // Missing or malformed in older state files: none remembered
     gState.debugHosts = validDebugHosts(LData.debugHosts);
+    gState.breakpoints = validBreakpoints(LData.breakpoints);
   } catch (AErr) {
     // First launch or unreadable file: start with no remembered paths
   }
+}
+
+// [{ path, lines }] with a path string and whole line numbers >= 1, sorted, each
+// once; anything else dropped (an older or hand-edited state.json)
+function validBreakpoints(AValue) {
+  const LResult = [];
+
+  if (!Array.isArray(AValue)) {
+    return LResult;
+  }
+  for (const LItem of AValue) {
+    if (!LItem || typeof LItem.path !== 'string' || LItem.path === '' || !Array.isArray(LItem.lines)) {
+      continue;
+    }
+    const LLines = [...new Set(LItem.lines.filter((ALine) => Number.isInteger(ALine) && ALine >= 1))];
+    if (LLines.length > 0) {
+      LResult.push({ path: LItem.path, lines: LLines.sort((AA, AB) => AA - AB) });
+    }
+  }
+  return LResult;
 }
 
 // state.json is written crash-safely: always the whole old or the whole new
@@ -628,6 +651,29 @@ ipcMain.on('session:save', (AEvent, AFiles, AActive) => {
   gState.openFiles = Array.isArray(AFiles) ? AFiles.filter((AItem) => typeof AItem === 'string') : [];
   gState.activeFile = typeof AActive === 'string' ? AActive : '';
   saveState();
+});
+
+// The user's breakpoints, the whole set, whenever it changes (src/debug.js)
+ipcMain.on('breakpoints:save', (AEvent, AList) => {
+  gState.breakpoints = validBreakpoints(AList);
+  saveState();
+});
+
+// The saved breakpoints of files that still exist; a gone file's are
+// forgotten from the state too
+ipcMain.handle('breakpoints:load', async () => {
+  const LKept = gState.breakpoints.filter((AItem) => {
+    try {
+      return fs.statSync(AItem.path).isFile();
+    } catch (AErr) {
+      return false;
+    }
+  });
+  if (LKept.length !== gState.breakpoints.length) {
+    gState.breakpoints = LKept;
+    saveState();
+  }
+  return LKept;
 });
 
 // Tabs of the previous session that still exist on disk; the active tab

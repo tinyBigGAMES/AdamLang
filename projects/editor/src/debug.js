@@ -63,6 +63,11 @@ var AdamDebug = (function () {
   // right before requests()): from then on a toggle sends its file at once
   // (sendLive); False when the session ends
   var gLive = false;
+  // The breakpoints last written to the editor's state (persist): the same
+  // set is not written again; the debounce of an edit's write
+  var gPersisted = '';
+  var gPersistTimer = null;
+  var ADAM_BP_PERSIST_DELAY = 500;
 
   var ADAM_BP_CLASS = 'adam-bp';
   var ADAM_BP_HOLLOW_CLASS = 'adam-bp-hollow';
@@ -416,6 +421,12 @@ var AdamDebug = (function () {
     }
     gAttached[LKey] = { model: AModel, ids: [] };
     render(LKey);
+    // An edit that moves a breakpoint's line is kept too (persistSoon)
+    AModel.onDidChangeContent(function () {
+      if (gStore[LKey] && gStore[LKey].marks.length > 0) {
+        persistSoon();
+      }
+    });
     AModel.onWillDispose(function () {
       if (gAttached[LKey] && gAttached[LKey].model === AModel) {
         harvest(LKey);
@@ -1188,7 +1199,62 @@ var AdamDebug = (function () {
   function toggleAt(AModel, ALine) {
     if (toggle(AModel, ALine)) {
       sendLive(modelPath(AModel));
+      persist();
     }
+  }
+
+  // --- kept across runs of the editor ----------------------------------------
+
+  // The user's breakpoints (requests(): lines as edits moved them) written
+  // to the editor's state when they differ from the last write
+  function persist() {
+    var LList;
+    var LText;
+
+    if (gPersistTimer) {
+      clearTimeout(gPersistTimer);
+      gPersistTimer = null;
+    }
+    LList = requests();
+    LText = JSON.stringify(LList);
+    if (LText !== gPersisted) {
+      gPersisted = LText;
+      window.host.saveBreakpoints(LList);
+    }
+  }
+
+  // An edit may move a file's breakpoints: written once the typing pauses
+  function persistSoon() {
+    if (gPersistTimer) {
+      clearTimeout(gPersistTimer);
+    }
+    gPersistTimer = setTimeout(persist, ADAM_BP_PERSIST_DELAY);
+  }
+
+  // The saved breakpoints back into the store ([{ path, lines }]); a file's
+  // marks this run already has win (a toggle before the load came back)
+  function restore(AList) {
+    var LIndex;
+    var LItem;
+    var LKey;
+    var LEntry;
+
+    if (!Array.isArray(AList)) {
+      return;
+    }
+    for (LIndex = 0; LIndex < AList.length; LIndex++) {
+      LItem = AList[LIndex];
+      LKey = keyOf(LItem.path);
+      if (!LKey || (gStore[LKey] && gStore[LKey].marks.length > 0)) {
+        continue;
+      }
+      LEntry = entryOf(LKey, gStore[LKey] ? '' : LItem.path);
+      LEntry.marks = LItem.lines.map(function (ALine) {
+        return { line: ALine, verified: true, dapId: null };
+      });
+      render(LKey);
+    }
+    gPersisted = JSON.stringify(requests());
   }
 
   // --- the program's terminal (e7 t4) --------------------------------------
@@ -1266,6 +1332,9 @@ var AdamDebug = (function () {
     });
     // Beside the LSP's hover: Monaco shows both (declaration, value)
     gMonaco.languages.registerHoverProvider('adam', { provideHover: provideHover });
+    // The previous runs' breakpoints; written again before the window goes
+    window.host.loadBreakpoints().then(restore);
+    window.addEventListener('beforeunload', persist);
   }
 
   return {

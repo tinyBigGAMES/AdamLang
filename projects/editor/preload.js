@@ -58,6 +58,8 @@ contextBridge.exposeInMainWorld('host', {
   },
   saveSession: (AFiles, AActive) => ipcRenderer.send('session:save', AFiles, AActive),
   loadSession: () => ipcRenderer.invoke('session:load'),
+  saveBreakpoints: (AList) => ipcRenderer.send('breakpoints:save', AList),
+  loadBreakpoints: () => ipcRenderer.invoke('breakpoints:load'),
   setDocState: (AState) => ipcRenderer.send('doc:state', AState),
   // About box data; an http(s) link opened in the default browser
   appInfo: () => ipcRenderer.invoke('app:info'),
