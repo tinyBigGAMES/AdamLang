@@ -458,6 +458,11 @@ var AdamDebug = (function () {
   var gCurrent = null;
   // What the status shows when the session ends ('' = ended)
   var gEndStatus = '';
+  // The program has ended (the adapter sent exited): a request racing the end, sent
+  // before the exited event came (a terminal resize as the panel shows, keys typed),
+  // fails with 'no program is being debugged' and is no one's fault, so it is not
+  // shown; nothing more goes to the program
+  var gProgramEnded = false;
 
   // True for a Run session (noDebug): set by startSession, kept to its end
   var gNoDebug = false;
@@ -822,6 +827,7 @@ var AdamDebug = (function () {
     if (gState === 'idle') {
       return;
     }
+    gProgramEnded = true;
     gDeps.outputLine('[exited ' + LCode + ']');
     gEndStatus = 'exited ' + LCode;
   }
@@ -967,6 +973,7 @@ var AdamDebug = (function () {
     LSession = gSession;
     gStopSeq++;
     gEndStatus = '';
+    gProgramEnded = false;
     setState('starting');
     gDeps.setStatus(gNoDebug ? 'run: starting' : 'debug: starting');
     try {
@@ -1050,6 +1057,11 @@ var AdamDebug = (function () {
       await AdamDap.request('configurationDone', {});
     } catch (AError) {
       if (LSession !== gSession) {
+        return;
+      }
+      // The program already ended (a very short one can end before configurationDone is
+      // answered): the session ends by its own terminated event, nothing failed
+      if (gProgramEnded) {
         return;
       }
       gDeps.outputLine(who() + ': ' + AError.message);
@@ -1303,9 +1315,9 @@ var AdamDebug = (function () {
   // --- the program's terminal (e7 t4) --------------------------------------
 
   // The session's program is there to take them: launched (running or
-  // stopped; keys typed while stopped wait in its terminal)
+  // stopped; keys typed while stopped wait in its terminal) and not ended
   function hasProgram() {
-    return (gState === 'running') || (gState === 'stopped');
+    return !gProgramEnded && ((gState === 'running') || (gState === 'stopped'));
   }
 
   // Keys typed in the TERMINAL tab (AdamTerminal): to the program

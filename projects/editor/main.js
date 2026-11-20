@@ -442,8 +442,9 @@ function buildMenu() {
     {
       label: 'Help',
       submenu: [
-        // main owns the reporter window: it handles the click itself
-        { label: 'Report Issue...', click: () => openIssueReporter('') },
+        // main owns the reporter window: it handles the click itself. Disabled for now
+        // (his word 2026-11-20: shown, grayed out, not removed)
+        { label: 'Report Issue...', enabled: false, click: () => openIssueReporter('') },
         { type: 'separator' },
         { label: 'About Adam', click: () => sendMenu('about') }
       ]
