@@ -401,6 +401,12 @@ public type
     hidden FCheckedAt: int64;
     // False for a run with no debugging (DAP noDebug): Launch loads no debug information
     hidden FWithSymbols: bool;
+    // DLL mode (SetHosted): the library whose lines are the program's ("" = the exe's own),
+    // its base while it is loaded (0: not yet / unloaded); the breakpoints changed since
+    // TakeBreakpointsChanged (a module load put them in or took them out)
+    hidden FHostedImage: string;
+    hidden FHostedBase: uint64;
+    hidden FBreakpointsChanged: bool;
 
     init(const ATarget: ref DebugTarget; const ASymbols: ref DebugSymbols);
     begin
@@ -418,6 +424,9 @@ public type
       self.FPauseCheck := nil;
       self.FCheckedAt := 0;
       self.FWithSymbols := true;
+      self.FHostedImage := "";
+      self.FHostedBase := 0;
+      self.FBreakpointsChanged := false;
     end;
 
     // The diagnostics every failure is reported on (DB codes); the target's and the
@@ -437,6 +446,42 @@ public type
     method SetWithSymbols(const AWith: bool);
     begin
       self.FWithSymbols := AWith;
+    end;
+
+    // DLL mode (before Launch): ALibraryPath is the program (its lines, its marks, its
+    // breakpoints) and Launch's exe only hosts it: its debug information is loaded when the
+    // host loads it (statically before the Entry, or later by a LoadLibrary) and dropped when
+    // it is unloaded, its breakpoints put in and taken out with it ("" = an exe's own lines)
+    method SetHosted(const ALibraryPath: string);
+    begin
+      self.FHostedImage := ALibraryPath;
+    end;
+
+    // DLL mode: true when set (SetHosted); its library; true while that library is loaded
+    const method IsHosted(): bool;
+    begin
+      return self.FHostedImage <> "";
+    end;
+
+    const method HostedImage(): string;
+    begin
+      return self.FHostedImage;
+    end;
+
+    const method IsHostedLoaded(): bool;
+    begin
+      return self.FHostedBase <> 0;
+    end;
+
+    // True when the breakpoints changed since the last call (the hosted library loaded or
+    // unloaded: verified ones, marks added or gone); the flag cleared
+    method TakeBreakpointsChanged(): bool;
+    var
+      LChanged: bool;
+    begin
+      LChanged := self.FBreakpointsChanged;
+      self.FBreakpointsChanged := false;
+      return LChanged;
     end;
 
     // ACheck asked at least every ADAM_RUNTIME_PAUSE_SLICE_MS while the program runs
@@ -493,10 +538,15 @@ public type
       self.FLaunched := true;
       while self.DoNext(LEvent) do
         if LEvent.Kind = DebugEventKind.ProcessStarted then
-          self.FProgramModule := ChangeFileExt(ExtractFileName(self.FTarget.ImagePath()), "");
-          if self.FWithSymbols and self.FSymbols.Load(self.FTarget) then
-            self.DoAddMarks();
-            self.DoResolveAll();
+          if self.FHostedImage = "" then
+            self.FProgramModule := ChangeFileExt(ExtractFileName(self.FTarget.ImagePath()), "");
+            if self.FWithSymbols and self.FSymbols.Load(self.FTarget) then
+              self.DoAddMarks();
+              self.DoResolveAll();
+            end;
+          else
+            // the host only runs it: the library's own module loads give its lines (DoNext)
+            self.FProgramModule := ChangeFileExt(ExtractFileName(self.FHostedImage), "");
           end;
           self.FTarget.Resume(ResumeKind.Continue);
           skip;
@@ -1652,14 +1702,72 @@ public type
           DebugEventKind.Output:
             self.FOutput.Add(AEvent.OutputText);
           DebugEventKind.ModuleLoaded:
+            self.DoModuleLoaded(AEvent);
             self.FTarget.Resume(ResumeKind.Continue);
-          DebugEventKind.ThreadStarted, DebugEventKind.ThreadExited,
-            DebugEventKind.ModuleUnloaded:
+          DebugEventKind.ModuleUnloaded:
+            self.DoModuleUnloaded(AEvent);
+          DebugEventKind.ThreadStarted, DebugEventKind.ThreadExited:
             // nothing to do
         else
           return true;
         end;
       end;
+    end;
+
+    // DLL mode: the hosted library loading (held until its debug information is in, so its
+    // breakpoints are in before any of its code runs: its initialize too)
+    hidden method DoModuleLoaded(const AEvent: DebugEvent);
+    begin
+      if (self.FHostedImage = "") or (not self.FWithSymbols) or (self.FHostedBase <> 0) or
+        (AEvent.ModulePath = "") or not self.FTarget.SameFile(AEvent.ModulePath, self.FHostedImage) then
+        return;
+      end;
+      if not self.FSymbols.LoadModule(AEvent.ModulePath, AEvent.Address) then
+        return;
+      end;
+      self.FHostedBase := AEvent.Address;
+      self.DoAddMarks();
+      self.DoResolveAll();
+      self.FBreakpointsChanged := true;
+    end;
+
+    // DLL mode: the hosted library unloaded: its patches forgotten (its code is gone), its
+    // marks dropped, the breakpoints asked for waiting again (not verified) for a next load,
+    // its debug information closed
+    hidden method DoModuleUnloaded(const AEvent: DebugEvent);
+    var
+      LKept: RuntimeBreakpointArray;
+      LI: int64;
+      LCount: int64;
+      LRoutine: SymbolRoutine;
+    begin
+      if (self.FHostedBase = 0) or (AEvent.Address <> self.FHostedBase) then
+        return;
+      end;
+      // A step's own patch in the library's code (only its routines are known in DLL mode)
+      // has nowhere to land: forgotten, the step ended. One in the host (a step over the
+      // FreeLibrary call) stays
+      if self.FTempActive and self.FSymbols.RoutineAt(self.FTempAddress, LRoutine) then
+        self.FTarget.ForgetPatch(self.FTempAddress);
+        self.FTempActive := false;
+        self.FStepping := false;
+      end;
+      setlength(LKept, 0);
+      for LI := 0 to len(self.FBreakpoints) - 1 do
+        if self.FBreakpoints[LI].Verified then
+          self.FTarget.ForgetPatch(self.FBreakpoints[LI].Source.Address);
+        end;
+        if not self.FBreakpoints[LI].IsMark then
+          LCount := len(LKept);
+          setlength(LKept, LCount + 1);
+          LKept[LCount] := self.FBreakpoints[LI];
+          LKept[LCount].Verified := false;
+        end;
+      end;
+      self.FBreakpoints := LKept;
+      self.FSymbols.Close();
+      self.FHostedBase := 0;
+      self.FBreakpointsChanged := true;
     end;
 
     // The pause check asked (its time kept); the program paused when it says so

@@ -24,7 +24,7 @@
   launch takes "program": an .adam source is built for debugging first
   (DapBuilder, Driver.CLI's: a debug build, its lines sent as output), an exe
   is debugged as it is (its debug file beside it); "args" (strings),
-  "outputPath", "stopOnEntry", "terminal" (default true), "terminalCols" /
+  "outputPath", "host" (DLL mode, below), "stopOnEntry", "terminal" (default true), "terminalCols" /
   "terminalRows", "noDebug" (DAP's: the program only runs, an editor's Run)
   and "optimize" (a level's name, noDebug only: the level of a source's
   build where its @optimize names none). Under noDebug a source is built at
@@ -39,6 +39,13 @@
   rows}); "terminal": false runs it with stdout / stderr through a pipe
   and stdin NUL (DebugOutputMode.Pipes). Either way stdout is the protocol.
   The program's @breakpoint marks are announced as new breakpoints.
+
+  DLL mode (D6): a dll ("program" a dll's source, or a built .dll) runs in
+  "host", the exe that loads it (pcpp's: error id 1 a dll with no host, 2 a
+  host for an exe). Its debug information, marks and breakpoints come in
+  when the host loads it (statically before the entry, or later) and go
+  when it unloads: breakpoint events tell the client (marks new / removed,
+  its own changed); until then its breakpoints wait unverified.
 
   Requests: initialize, launch, setBreakpoints, setExceptionBreakpoints,
   configurationDone, threads, stackTrace, scopes, variables, continue, next,
@@ -78,6 +85,10 @@ public const
   ADAM_DAP_TERMINAL_RESIZE: string = "adamTerminalResize";
   // How many reports a session keeps (they are sent as they come)
   ADAM_DAP_REPORT_BUDGET: int64 = 1000000;
+  // A failed launch's error ids (the response's body.error.id; pcpp's, so a client tells
+  // them apart): a dll with no "host", a "host" given for an exe
+  ADAM_DAP_ERROR_DLL_NO_HOST: int64 = 1;
+  ADAM_DAP_ERROR_HOST_ON_EXE: int64 = 2;
 
 // The string list AName of AArguments into AValues: absent = none; false when it is there and
 // not a list of strings
@@ -121,13 +132,13 @@ end;
 public type
   // Builds a source for a launch (Driver.CLI's): ADebug a debug build (a debug session),
   // else a build at ALevel where its @optimize names none (ALevelGiven; else its own level:
-  // noDebug); AExePath the program it wrote, ASourceRoot the folder its debug information
-  // names its sources from (M7d's stable names: the project root, else the main module's
-  // folder), AText what the build said (lines); false when no program to launch was written
-  // (AText says why)
+  // noDebug); AExePath the program it wrote (AIsDll: a dll, debugged in its host), ASourceRoot
+  // the folder its debug information names its sources from (M7d's stable names: the project
+  // root, else the main module's folder), AText what the build said (lines); false when
+  // nothing to launch was written (AText says why)
   DapBuilder = object
     virtual method Build(const ASource: string; const AOutputPath: string; const ADebug: bool;
-      const ALevel: OptLevel; const ALevelGiven: bool; var AExePath: string;
+      const ALevel: OptLevel; const ALevelGiven: bool; var AExePath: string; var AIsDll: bool;
       var ASourceRoot: string; var AText: string): bool; abstract;
   end;
 
@@ -168,6 +179,9 @@ type
     hidden FPauseWanted: bool;
     hidden FTerminateWanted: bool;
     hidden FDisconnectWanted: bool;
+    // The ids of the @breakpoint marks told as new (a later announce tells them changed, a
+    // gone one removed: a hosted dll's load and unload)
+    hidden FAnnounced: Int64Array;
 
     init(const ATransport: ref ProtocolTransport; const ABuilder: ref DapBuilder);
     begin
@@ -236,6 +250,9 @@ type
       LWanted: bool;
     begin
       self.DoSendProgramOutput();
+      if (self.FRuntime <> nil) and self.FRuntime.TakeBreakpointsChanged() then
+        self.DoAnnounce();
+      end;
       while (not self.FPauseWanted) and (not self.FFinished) and self.FTransport.HasPending() do
         LRead := self.FTransport.ReadMessage(LBody);
         if LRead = ProtocolRead.EndOfInput then
@@ -314,6 +331,19 @@ type
       LNone: Json;
     begin
       self.DoResponse(ARequest, false, AMessage, LNone, false);
+    end;
+
+    // A failure saying AMessage with DAP's error body (body.error: id AId, format AMessage)
+    hidden method DoFailId(const ARequest: Json; const AId: int64; const AMessage: string);
+    var
+      LBody: Json;
+      LError: Json;
+    begin
+      LError.Add("id", AId);
+      LError.Add("format", AMessage);
+      LError.Add("showUser", true);
+      LBody.Add("error", LError);
+      self.DoResponse(ARequest, false, AMessage, LBody, true);
     end;
 
     // A bad or missing argument AName of request ACommand
@@ -444,6 +474,12 @@ type
       if not ABreakpoint.Verified then
         if self.FNoDebug then
           LJson.Add("message", NoArgs().Fill(ADAM_MSG_DAP_NO_DEBUG));
+          return LJson;
+        end;
+        if self.FLaunched and (self.FRuntime <> nil) and self.FRuntime.IsHosted() and
+          not self.FRuntime.IsHostedLoaded() then
+          LJson.Add("message", NoArgs().Str(ExtractFileName(self.FRuntime.HostedImage()))
+            .Fill(ADAM_MSG_DAP_NOT_LOADED));
           return LJson;
         end;
         if self.FLaunched then
@@ -612,6 +648,9 @@ type
       LLevelName: string;
       LLevel: OptLevel;
       LLevelGiven: bool;
+      LHost: string;
+      LIsDll: bool;
+      LLaunchPath: string;
     begin
       if self.FLaunched then
         self.DoFail(ARequest, NoArgs().Fill(ADAM_MSG_DAP_LAUNCH_TWICE));
@@ -631,6 +670,13 @@ type
         self.DoBadArgument(ARequest, "launch", "args");
         return;
       end;
+      // "host": the exe that loads the dll debugged (DLL mode, D6)
+      LHost := "";
+      if AArguments.Has("host") and not AArguments.TryGetString("host", LHost) then
+        self.DoBadArgument(ARequest, "launch", "host");
+        return;
+      end;
+      LHost := Trim(LHost);
       self.FStopOnEntry := false;
       if AArguments.Has("stopOnEntry") and
         not AArguments.TryGetBoolean("stopOnEntry", self.FStopOnEntry) then
@@ -667,7 +713,14 @@ type
       end;
       // A source is built for debugging first; an exe is debugged as it is
       LExePath := LProgram;
+      LIsDll := false;
       self.FSourceRoot := "";
+      LTriple := DefaultTriple();
+      LTarget := DebugTargetFor(LTriple);
+      if LTarget = nil then
+        self.DoFail(ARequest, NoArgs().Str(LTriple).Fill(ADAM_MSG_DAP_NO_DEBUGGER));
+        return;
+      end;
       if LowerCase(ExtractFileExt(LProgram)) = ADAM_EXT_SOURCE then
         if self.FBuilder = nil then
           self.DoFail(ARequest, NoArgs().Str(LProgram).Fill(ADAM_MSG_DAP_NO_BUILDER));
@@ -676,17 +729,28 @@ type
         LText := "";
         LExePath := "";
         if not self.FBuilder.Build(LProgram, LOutputPath, not LNoDebug, LLevel, LLevelGiven,
-          LExePath, self.FSourceRoot, LText) then
+          LExePath, LIsDll, self.FSourceRoot, LText) then
           self.DoOutput(ADAM_DAP_CATEGORY_STDERR, LText);
           self.DoFail(ARequest, NoArgs().Str(LProgram).Fill(ADAM_MSG_DAP_BUILD_FAILED));
           return;
         end;
         self.DoOutput(ADAM_DAP_CATEGORY_CONSOLE, LText);
+      else
+        LIsDll := LTarget.IsLibraryImage(LProgram);
       end;
-      LTriple := DefaultTriple();
-      LTarget := DebugTargetFor(LTriple);
-      if LTarget = nil then
-        self.DoFail(ARequest, NoArgs().Str(LTriple).Fill(ADAM_MSG_DAP_NO_DEBUGGER));
+      // An exe runs on its own; a dll runs in the exe that loads it ("host")
+      if LIsDll and (len(LHost) = 0) then
+        self.DoFailId(ARequest, ADAM_DAP_ERROR_DLL_NO_HOST,
+          NoArgs().Str(LExePath).Fill(ADAM_MSG_DAP_DLL_NO_HOST));
+        return;
+      end;
+      if (not LIsDll) and (len(LHost) > 0) then
+        self.DoFailId(ARequest, ADAM_DAP_ERROR_HOST_ON_EXE,
+          NoArgs().Str(LExePath).Fill(ADAM_MSG_DAP_HOST_ON_EXE));
+        return;
+      end;
+      if LIsDll and LTarget.IsLibraryImage(LHost) then
+        self.DoFail(ARequest, NoArgs().Str(LHost).Fill(ADAM_MSG_DAP_HOST_NOT_PROGRAM));
         return;
       end;
       self.FRuntime := ref DebugRuntime(LTarget, DebugSymbolsFor(LTriple));
@@ -706,9 +770,14 @@ type
         LMode := DebugOutputMode.Terminal;
         self.FRuntime.Target.SetTerminalSize(int32(LCols), int32(LRows));
       end;
-      if not self.FRuntime.Launch(LExePath, LArgs, LMode, LStop) then
+      LLaunchPath := LExePath;
+      if LIsDll then
+        self.FRuntime.SetHosted(LExePath);
+        LLaunchPath := LHost;
+      end;
+      if not self.FRuntime.Launch(LLaunchPath, LArgs, LMode, LStop) then
         self.DoSendProgramOutput();
-        LText := self.DoFailureText(NoArgs().Str(LExePath).Fill(ADAM_MSG_DAP_LAUNCH_FAILED));
+        LText := self.DoFailureText(NoArgs().Str(LLaunchPath).Fill(ADAM_MSG_DAP_LAUNCH_FAILED));
         self.FRuntime.SetPauseCheck(nil);
         self.FRuntime := nil;
         self.DoFail(ARequest, LText);
@@ -741,24 +810,58 @@ type
       end;
     end;
 
-    // After the launch: the program's @breakpoint marks as new breakpoints, the client's
-    // breakpoints placed at the start as changed ones
+    // After the launch, and whenever the runtime's breakpoints changed (a hosted dll loaded or
+    // unloaded): the program's @breakpoint marks not told yet as new ones, every mark told
+    // before and now gone as removed, the client's breakpoints as changed ones
     hidden method DoAnnounce();
     var
       LAll: RuntimeBreakpointArray;
       LI: int64;
+      LJ: int64;
       LBody: Json;
       LPath: string;
       LReason: string;
       LFresh: Json;
+      LGone: Json;
+      LKept: Int64Array;
+      LFound: bool;
     begin
+      self.FRuntime.TakeBreakpointsChanged();
       LAll := self.FRuntime.Breakpoints();
+      // marks told before and gone (their library unloaded)
+      setlength(LKept, 0);
+      for LJ := 0 to len(self.FAnnounced) - 1 do
+        LFound := false;
+        for LI := 0 to len(LAll) - 1 do
+          if LAll[LI].Id = self.FAnnounced[LJ] then
+            LFound := true;
+            leave;
+          end;
+        end;
+        if LFound then
+          setlength(LKept, len(LKept) + 1);
+          LKept[len(LKept) - 1] := self.FAnnounced[LJ];
+          skip;
+        end;
+        LGone := LFresh;
+        LGone.Add("id", self.FAnnounced[LJ]);
+        LGone.Add("verified", false);
+        LBody.Add("reason", "removed");
+        LBody.Add("breakpoint", LGone);
+        self.DoEvent("breakpoint", LBody, true);
+        LBody := LFresh;
+      end;
+      self.FAnnounced := LKept;
       for LI := 0 to len(LAll) - 1 do
         LReason := "changed";
         LPath := self.DoClientPathOf(LAll[LI].Id);
         if LAll[LI].IsMark then
-          LReason := "new";
           LPath := self.DoRuntimeSource(LAll[LI].Source.FilePath);
+          if not self.DoWasAnnounced(LAll[LI].Id) then
+            LReason := "new";
+            setlength(self.FAnnounced, len(self.FAnnounced) + 1);
+            self.FAnnounced[len(self.FAnnounced) - 1] := LAll[LI].Id;
+          end;
         end;
         if len(LPath) = 0 then
           skip;
@@ -768,6 +871,19 @@ type
         self.DoEvent("breakpoint", LBody, true);
         LBody := LFresh;
       end;
+    end;
+
+    // True when the mark AId was told as new before
+    hidden const method DoWasAnnounced(const AId: int64): bool;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FAnnounced) - 1 do
+        if self.FAnnounced[LI] = AId then
+          return true;
+        end;
+      end;
+      return false;
     end;
 
     // The client's path of the breakpoint the runtime numbered AId ("" none)
@@ -1152,6 +1268,9 @@ type
           self.FFinished := true;
         end;
         return;
+      end;
+      if (not self.FNoDebug) and self.FRuntime.TakeBreakpointsChanged() then
+        self.DoAnnounce();
       end;
       self.DoSendReports();
       if self.FRuntime.HasExited() then
