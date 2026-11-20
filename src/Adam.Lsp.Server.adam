@@ -107,6 +107,14 @@
   The item is found again by its data (else by its selectionRange start);
   an item with neither: -32602.
 
+  formatting / rangeFormatting (Adam.Lsp.Format; checked first as
+  semanticTokens): the TextEdits that format the buffer (the options' LSP
+  keys and the editor's adam.* ones over the defaults), a range only those
+  whose gap starts in it. A buffer the check found a lexer / conditional /
+  parser error in, or one whose result would not read back the same, is
+  not formatted: an empty list and a window/showMessage warning. Not open,
+  or no tree: null; no URI (no range for a range request): -32602.
+
   Prior art: PaskalCPP.LSP.Server / Diagnostics (CONCEPT: the lifecycle,
   the request rules, the owner-based publish; GEOMETRY rejected: Adam's
   types, System.Json).
@@ -117,7 +125,8 @@ module unit Adam.Lsp.Server;
 import System.SysUtils, System.IO, System.Json, Adam.Core.Common, Adam.Core.Messages,
   Adam.Compiler.Diagnostics, Adam.Protocol.Transport, Adam.Driver.Compiler, Adam.Lsp.Uri,
   Adam.Lsp.Document, Adam.Compiler.Lexer, Adam.Lsp.Tokens, Adam.Compiler.AST, Adam.Lsp.Find,
-  Adam.Lsp.Hover, Adam.Lsp.Outline, Adam.Lsp.Complete, Adam.Lsp.Hints, Adam.Lsp.Calls;
+  Adam.Lsp.Hover, Adam.Lsp.Outline, Adam.Lsp.Complete, Adam.Lsp.Hints, Adam.Lsp.Calls,
+  Adam.Lsp.Format;
 
 public const
   // RunLsp's exit codes: "exit" after shutdown / any other end
@@ -136,6 +145,7 @@ public const
   ADAM_LSP_SEVERITY_HINT: int64 = 4;
   // MessageType (window/logMessage)
   ADAM_LSP_MESSAGE_ERROR: int64 = 1;
+  ADAM_LSP_MESSAGE_WARNING: int64 = 2;
   // TextDocumentSyncKind
   ADAM_LSP_SYNC_INCREMENTAL: int64 = 2;
   // A diagnostic's source, the server's name
@@ -156,6 +166,7 @@ public const
   ADAM_LSP_DID_CLOSE: string = "textDocument/didClose";
   ADAM_LSP_PUBLISH_DIAGNOSTICS: string = "textDocument/publishDiagnostics";
   ADAM_LSP_LOG_MESSAGE: string = "window/logMessage";
+  ADAM_LSP_SHOW_MESSAGE: string = "window/showMessage";
   ADAM_LSP_SEMANTIC_FULL: string = "textDocument/semanticTokens/full";
   ADAM_LSP_HOVER: string = "textDocument/hover";
   ADAM_LSP_DEFINITION: string = "textDocument/definition";
@@ -166,6 +177,13 @@ public const
   ADAM_LSP_PREPARE_CALLS: string = "textDocument/prepareCallHierarchy";
   ADAM_LSP_INCOMING_CALLS: string = "callHierarchy/incomingCalls";
   ADAM_LSP_OUTGOING_CALLS: string = "callHierarchy/outgoingCalls";
+  ADAM_LSP_FORMATTING: string = "textDocument/formatting";
+  ADAM_LSP_RANGE_FORMATTING: string = "textDocument/rangeFormatting";
+  // The report code prefixes of the phases a formatting needs clean (the Lexer, the
+  // conditional filter, the Parser: a Semantics report does not stop it)
+  ADAM_LSP_FORMAT_LEXER: string = "LX";
+  ADAM_LSP_FORMAT_CONDITIONALS: string = "CD";
+  ADAM_LSP_FORMAT_PARSER: string = "PR";
   // InlayHintKind of a parameter name
   ADAM_LSP_HINT_PARAMETER: int64 = 2;
   // completion's trigger characters ('>' for '->'), and the InsertTextFormat of a snippet
@@ -367,6 +385,17 @@ begin
   return LJson;
 end;
 
+// The bytes [AStart, AEnd) of ADocument as an LSP Range object
+routine DoRangeOf(const ADocument: ref LspDocument; const AStart: int64; const AEnd: int64;
+  const AEncoding: LspEncoding): Json;
+var
+  LJson: Json;
+begin
+  LJson.Add("start", DoPosition(ADocument, AStart, AEncoding));
+  LJson.Add("end", DoPosition(ADocument, AEnd, AEncoding));
+  return LJson;
+end;
+
 // The LSP Diagnostic of AReport, placed in ADocument's text: its range from its place over the
 // word there (DoRangeLength), severity, code, source and message
 routine DoDiagnostic(const ADocument: ref LspDocument; const AReport: ref Diagnostic;
@@ -533,6 +562,20 @@ type
       self.DoSend(LMessage);
     end;
 
+    // A warning window/showMessage saying AMessage (the user sees it)
+    hidden method DoShowWarning(const AMessage: string);
+    var
+      LMessage: Json;
+      LParams: Json;
+    begin
+      LMessage := DoNewMessage();
+      LMessage.Add("method", ADAM_LSP_SHOW_MESSAGE);
+      LParams.Add("type", ADAM_LSP_MESSAGE_WARNING);
+      LParams.Add("message", AMessage);
+      LMessage.Add("params", LParams);
+      self.DoSend(LMessage);
+    end;
+
     // The notification AMethod's params were not what it takes
     hidden method DoBadParams(const AMethod: string);
     begin
@@ -668,6 +711,10 @@ type
         self.DoCalls(AId, AMethod, AParams);
         return;
       end;
+      if (AMethod = ADAM_LSP_FORMATTING) or (AMethod = ADAM_LSP_RANGE_FORMATTING) then
+        self.DoFormatting(AId, AMethod, AParams);
+        return;
+      end;
       // Unknown requests, $/ ones too, fail
       self.DoError(AId, true, ADAM_LSP_ERROR_METHOD_NOT_FOUND,
         NoArgs().Str(AMethod).Fill(ADAM_MSG_LSP_METHOD_NOT_FOUND));
@@ -730,6 +777,8 @@ type
       LResult.EndObject();
       LResult.Add("inlayHintProvider", true);
       LResult.Add("callHierarchyProvider", true);
+      LResult.Add("documentFormattingProvider", true);
+      LResult.Add("documentRangeFormattingProvider", true);
       LResult.BeginObject("experimental");
       LResult.BeginObject(ADAM_LSP_WORDS_KEY);
       DoAddList(LResult, "keywords", ReservedWords(false));
@@ -1553,6 +1602,171 @@ type
         LItems.Add("label", LHints[LI].Text);
         LItems.Add("kind", ADAM_LSP_HINT_PARAMETER);
         LItems.Add("paddingRight", true);
+        LItems.EndObject();
+      end;
+      LItems.EndArray();
+      self.DoResult(AId, LItems.Get(ADAM_LSP_ITEMS_KEY), false);
+    end;
+
+    // -- Formatting
+
+    // The FormattingOptions of AParams (LSP's keys + the editor's adam.* ones) over the
+    // defaults: a missing or mistyped key keeps its default, the numbers clamped
+    hidden const method DoFormatOptions(const AParams: Json): LspFormatOptions;
+    var
+      LOptions: LspFormatOptions;
+      LPairs: array of JsonPair;
+      LKey: string;
+      LValue: Json;
+      LI: int64;
+    begin
+      LOptions := FormatDefaults();
+      LPairs := AParams.Get("options").Pairs();
+      for LI := 0 to len(LPairs) - 1 do
+        LKey := LPairs[LI].NodeName;
+        LValue := LPairs[LI].Value;
+        if LValue.IsNumber() then
+          if LKey = "tabSize" then
+            LOptions.IndentSize := LValue.AsInt64();
+          else
+            if LKey = "adam.maxBlankLines" then
+              LOptions.MaxBlankLines := LValue.AsInt64();
+            else
+              if LKey = "adam.maxLineLength" then
+                LOptions.MaxLineLength := LValue.AsInt64();
+              end;
+            end;
+          end;
+          skip;
+        end;
+        if not LValue.IsBoolean() then
+          skip;
+        end;
+        if LKey = "insertSpaces" then
+          LOptions.UseTabs := not LValue.AsBoolean();
+        else
+          if LKey = "trimTrailingWhitespace" then
+            LOptions.TrimTrailingWhitespace := LValue.AsBoolean();
+          else
+            if LKey = "insertFinalNewline" then
+              LOptions.FinalNewline := LValue.AsBoolean();
+            else
+              if LKey = "adam.spaceAroundAssign" then
+                LOptions.SpaceAroundAssign := LValue.AsBoolean();
+              else
+                if LKey = "adam.spaceAroundOperators" then
+                  LOptions.SpaceAroundOperators := LValue.AsBoolean();
+                else
+                  if LKey = "adam.spaceAfterComma" then
+                    LOptions.SpaceAfterComma := LValue.AsBoolean();
+                  else
+                    if LKey = "adam.spaceBeforeColon" then
+                      LOptions.SpaceBeforeColon := LValue.AsBoolean();
+                    else
+                      if LKey = "adam.spaceAfterColon" then
+                        LOptions.SpaceAfterColon := LValue.AsBoolean();
+                      end;
+                    end;
+                  end;
+                end;
+              end;
+            end;
+          end;
+        end;
+      end;
+      ClampFormat(LOptions);
+      return LOptions;
+    end;
+
+    // True when ACheck reported no lexer / conditional / parser error about APath's file
+    // (a report with no file is the document's)
+    hidden const method DoSyntaxClean(const ACheck: ref Compiler; const APath: string): bool;
+    var
+      LReport: ref Diagnostic;
+      LI: int64;
+    begin
+      for LI := 0 to ACheck.Reports.Count - 1 do
+        LReport := ACheck.Reports.Items[LI];
+        if not LReport.IsError() then
+          skip;
+        end;
+        if (LReport.FileName <> "") and not SamePath(LReport.FileName, APath) then
+          skip;
+        end;
+        if StartsStr(ADAM_LSP_FORMAT_LEXER, LReport.Code) or
+          StartsStr(ADAM_LSP_FORMAT_CONDITIONALS, LReport.Code) or
+          StartsStr(ADAM_LSP_FORMAT_PARSER, LReport.Code) then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    // textDocument/formatting and /rangeFormatting (see the header)
+    hidden method DoFormatting(const AId: Json; const AMethod: string; const AParams: Json);
+    var
+      LUri: string;
+      LDocument: ref LspDocument;
+      LCheck: ref Compiler;
+      LFrom: int64;
+      LTo: int64;
+      LRange: bool;
+      LResult: LspFormatResult;
+      LEdit: LspFormatEdit;
+      LItems: Json;
+      LNone: Json;
+      LI: int64;
+    begin
+      LFrom := 0;
+      LTo := 0;
+      LRange := AMethod = ADAM_LSP_RANGE_FORMATTING;
+      if not AParams.TryGetString("textDocument.uri", LUri) then
+        self.DoError(AId, true, ADAM_LSP_ERROR_INVALID_PARAMS,
+          NoArgs().Str(AMethod).Fill(ADAM_MSG_LSP_BAD_PARAMS));
+        return;
+      end;
+      LDocument := self.DoFind(LUri);
+      if LDocument = nil then
+        self.DoResult(AId, LNone, true);
+        return;
+      end;
+      if LRange then
+        if not (self.DoOffsetAt(LDocument, AParams, "range.start", LFrom) and
+          self.DoOffsetAt(LDocument, AParams, "range.end", LTo)) then
+          self.DoError(AId, true, ADAM_LSP_ERROR_INVALID_PARAMS,
+            NoArgs().Str(AMethod).Fill(ADAM_MSG_LSP_BAD_PARAMS));
+          return;
+        end;
+      else
+        LTo := len(LDocument.Text) + 1;
+      end;
+      // The tree of this buffer as it stands (no file: no tree)
+      LCheck := self.DoCurrentCheck(LDocument);
+      if (LCheck = nil) or (LCheck.MainModule = 0) then
+        self.DoResult(AId, LNone, true);
+        return;
+      end;
+      LResult := FormatSource(LDocument.Text, LCheck.Tree, LCheck.MainModule,
+        self.DoSyntaxClean(LCheck, LDocument.Path), self.DoFormatOptions(AParams));
+      // A refusal is an empty result and a warning the user sees, not an error
+      if LResult.Refusal = LspFormatRefusal.Syntax then
+        self.DoShowWarning(NoArgs().Fill(ADAM_MSG_LSP_FORMAT_SYNTAX));
+      else
+        if LResult.Refusal = LspFormatRefusal.Verify then
+          self.DoShowWarning(NoArgs().Fill(ADAM_MSG_LSP_FORMAT_VERIFY));
+        end;
+      end;
+      // A range keeps the edits whose gap starts inside it
+      LItems.BeginArray(ADAM_LSP_ITEMS_KEY);
+      for LI := 0 to len(LResult.Edits) - 1 do
+        LEdit := LResult.Edits[LI];
+        if (LEdit.StartOffset < LFrom) or (LEdit.StartOffset >= LTo) then
+          skip;
+        end;
+        LItems.BeginObject();
+        LItems.Add("range", DoRangeOf(LDocument, LEdit.StartOffset, LEdit.EndOffset,
+          self.FEncoding));
+        LItems.Add("newText", LEdit.NewText);
         LItems.EndObject();
       end;
       LItems.EndArray();
