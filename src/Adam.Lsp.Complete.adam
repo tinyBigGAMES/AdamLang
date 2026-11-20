@@ -1,0 +1,793 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Lsp.Complete.adam - the completion items at a place (M11b L5)
+
+  The context comes from the Lexer's tokens of the document's text: the
+  word the cursor is in or just after (the part before the cursor is the
+  prefix), a '.' or '->' before it (a member list; `^.` ends in '.'); no
+  list inside a literal, an operator or a comment. The names come from the
+  last check's tree (AA.2: read as Semantics wrote it, no list kept):
+    a bare word: the declarations of every scope enclosing the place made
+      before it, innermost first, an inner name hiding an outer one (Adam.
+      Compiler.Scopes' rule: locals, parameters, the module's own), then the
+      system scope (builtin types, intrinsics), the units imported (their
+      names and public declarations), System.Runtime's public names, the
+      keywords and the statement snippets (if, while, for, for in, repeat,
+      match, guard);
+    after '.' / '->': the left side as the check resolved it (the
+      expression ending at the '.'): a unit's public declarations; a type's
+      choice values and static methods; a value's type (through a pointer,
+      ref, own or weak) its fields, embeds and what they bring, properties
+      and methods, its parents' too; a hidden member only inside the type's
+      own methods.
+  One item per name (an overload set is one), its prefix matched case aside.
+  The order is the rank: the place's names, the imports', the runtime's,
+  the type words, the keywords and snippets (SortText). A routine is a call
+  snippet, a tab stop per parameter.
+
+  Prior art: PaskalCPP.LSP.Completion (CONCEPT: the context, the order, the
+  kinds, the call snippets; GEOMETRY rejected: node ids of Adam's tree, the
+  Lexer's tokens).
+*******************************************************************************/
+
+module unit Adam.Lsp.Complete;
+
+import System.SysUtils, Adam.Compiler.SourceText, Adam.Compiler.Diagnostics,
+  Adam.Compiler.Lexer, Adam.Compiler.AST, Adam.Compiler.Scopes, Adam.Compiler.Types,
+  Adam.Lsp.Document;
+
+public const
+  // LSP's CompletionItemKind values the items use
+  ADAM_LSP_COMPLETION_METHOD: int64 = 2;
+  ADAM_LSP_COMPLETION_FUNCTION: int64 = 3;
+  ADAM_LSP_COMPLETION_FIELD: int64 = 5;
+  ADAM_LSP_COMPLETION_VARIABLE: int64 = 6;
+  ADAM_LSP_COMPLETION_CLASS: int64 = 7;
+  ADAM_LSP_COMPLETION_INTERFACE: int64 = 8;
+  ADAM_LSP_COMPLETION_MODULE: int64 = 9;
+  ADAM_LSP_COMPLETION_PROPERTY: int64 = 10;
+  ADAM_LSP_COMPLETION_ENUM: int64 = 13;
+  ADAM_LSP_COMPLETION_KEYWORD: int64 = 14;
+  ADAM_LSP_COMPLETION_SNIPPET: int64 = 15;
+  ADAM_LSP_COMPLETION_ENUM_MEMBER: int64 = 20;
+  ADAM_LSP_COMPLETION_CONSTANT: int64 = 21;
+  ADAM_LSP_COMPLETION_STRUCT: int64 = 22;
+  ADAM_LSP_COMPLETION_TYPE_PARAMETER: int64 = 25;
+
+const
+  // The report budget of the scratch Diagnostics the Lexer reports into (dropped here)
+  ADAM_LSP_COMPLETE_BUDGET: int64 = 1000;
+  // How deep embeds and parents are followed for members
+  ADAM_LSP_COMPLETE_DEPTH: int64 = 16;
+  // SortText's rank groups (then the item's place in the list, ADAM_LSP_COMPLETE_DIGITS wide)
+  ADAM_LSP_COMPLETE_RANK_PLACE: string = "1";
+  ADAM_LSP_COMPLETE_RANK_IMPORT: string = "2";
+  ADAM_LSP_COMPLETE_RANK_RUNTIME: string = "3";
+  ADAM_LSP_COMPLETE_RANK_TYPE: string = "8";
+  ADAM_LSP_COMPLETE_RANK_KEYWORD: string = "9";
+  ADAM_LSP_COMPLETE_DIGITS: int64 = 5;
+
+public type
+  // One completion item: Text its label (and what is inserted when InsertText is ""),
+  // Kind a CompletionItemKind, Detail its type or signature, InsertText an LSP snippet
+  // when IsSnippet (insertTextFormat 2), SortText its rank
+  LspCompletion = record
+    Text: string;
+    Kind: int64;
+    Detail: string;
+    InsertText: string;
+    IsSnippet: bool;
+    SortText: string;
+  end;
+
+  LspCompletions = array of LspCompletion;
+
+  // Where completion asks from (CompletionContextAt): HasList false for no list; Prefix the
+  // word's part before the cursor; HasQualifier for a '.' / '->' before it, at
+  // QualifierOffset
+  LspCompletionContext = record
+    HasList: bool;
+    Prefix: string;
+    HasQualifier: bool;
+    QualifierOffset: int64;
+  end;
+
+// True when AText from AStart to AEnd opens a comment it does not close (a gap between
+// tokens: only comments and blanks lie there)
+routine DoInComment(const AText: string; const AStart: int64; const AEnd: int64): bool;
+var
+  LAt: int64;
+  LInLine: bool;
+  LInBlock: bool;
+begin
+  LAt := AStart;
+  LInLine := false;
+  LInBlock := false;
+  while LAt < AEnd do
+    if LInLine then
+      if (AText[LAt] = '\n') or (AText[LAt] = '\r') then
+        LInLine := false;
+      end;
+    else
+      if LInBlock then
+        if (AText[LAt] = '*') and (LAt + 1 < len(AText)) and (AText[LAt + 1] = '/') then
+          LInBlock := false;
+          LAt := LAt + 1;
+        end;
+      else
+        if (AText[LAt] = '/') and (LAt + 1 < len(AText)) and (AText[LAt + 1] = '/') then
+          LInLine := true;
+        end;
+        if (AText[LAt] = '/') and (LAt + 1 < len(AText)) and (AText[LAt + 1] = '*') then
+          LInBlock := true;
+          LAt := LAt + 1;
+        end;
+      end;
+    end;
+    LAt := LAt + 1;
+  end;
+  return LInLine or LInBlock;
+end;
+
+// True for a token a word is: a name, a keyword, a builtin type word
+routine DoIsWord(const AKind: TokenKind): bool;
+begin
+  return (AKind = TokenKind.Identifier) or IsKeywordKind(AKind) or IsTypeWordKind(AKind);
+end;
+
+// Where completion at the byte AOffset of ADocument asks from (see the header)
+public routine CompletionContextAt(const ADocument: ref LspDocument;
+  const AOffset: int64): LspCompletionContext;
+var
+  LContext: LspCompletionContext;
+  LSource: ref SourceText;
+  LScratch: ref Diagnostics;
+  LLexer: ref Lexer;
+  LTokens: TokenList;
+  LIndex: int64;
+  LQualifier: int64;
+  LGapStart: int64;
+  LI: int64;
+  LToken: ref Token;
+begin
+  LContext.HasList := true;
+  LContext.Prefix := "";
+  LContext.HasQualifier := false;
+  LContext.QualifierOffset := 0;
+  LSource := ref SourceText(ADocument.Path, ADocument.Text);
+  LScratch := ref Diagnostics(ADAM_LSP_COMPLETE_BUDGET);
+  LLexer := ref Lexer(LSource, LScratch);
+  LTokens := LLexer.ReadAll();
+  // The last token starting before the cursor (the end of file is none)
+  LIndex := -1;
+  for LI := 0 to LTokens.Count - 1 do
+    LToken := LTokens[LI];
+    if (LToken.Kind = TokenKind.EndOfFile) or (LToken.StartOffset >= AOffset) then
+      leave;
+    end;
+    LIndex := LI;
+  end;
+  LQualifier := LIndex;
+  LGapStart := 0;
+  if LIndex >= 0 then
+    LToken := LTokens[LIndex];
+    LGapStart := LToken.EndOffset;
+    if DoIsWord(LToken.Kind) and (AOffset <= LToken.EndOffset) then
+      // A word the cursor is in or just after: its part before the cursor
+      LContext.Prefix := Substring(ADocument.Text, LToken.StartOffset, AOffset - LToken.StartOffset);
+      LQualifier := LIndex - 1;
+      LGapStart := AOffset;
+    else
+      if AOffset < LToken.EndOffset then
+        // Inside any other token: a literal, an operator, a directive
+        LContext.HasList := false;
+        return LContext;
+      end;
+    end;
+  end;
+  // Between tokens the cursor may be in a comment
+  if (LGapStart < AOffset) and DoInComment(ADocument.Text, LGapStart, AOffset) then
+    LContext.HasList := false;
+    return LContext;
+  end;
+  if LQualifier >= 0 then
+    LToken := LTokens[LQualifier];
+    if (LToken.Kind = TokenKind.Dot) or (LToken.Kind = TokenKind.Arrow) then
+      LContext.HasQualifier := true;
+      LContext.QualifierOffset := LToken.StartOffset;
+    end;
+  end;
+  return LContext;
+end;
+
+type
+  // One completion's list (see the header)
+  LspCompleter = object
+    hidden FDocument: ref LspDocument;
+    hidden FTree: ref SyntaxTree;
+    hidden FModule: int64;
+    hidden FFile: string;
+    hidden FOffset: int64;
+    hidden FPrefix: string;
+    hidden FItems: LspCompletions;
+    // The names given an item so far (lowercase is no key: Adam names are case-sensitive)
+    hidden FNames: StringArray;
+    // The best node so far of a search (DoAnchor / DoLeft) and its range's length
+    hidden FBest: int64;
+    hidden FBestLength: int64;
+
+    init(const ADocument: ref LspDocument; const ATree: ref SyntaxTree; const AModule: int64;
+      const AOffset: int64; const APrefix: string);
+    begin
+      self.FDocument := ADocument;
+      self.FTree := ATree;
+      self.FModule := AModule;
+      self.FFile := ATree[AModule].Place.FileName;
+      self.FOffset := AOffset;
+      self.FPrefix := APrefix;
+      self.FBest := 0;
+      self.FBestLength := 0;
+    end;
+
+    // The list for a bare word (AQualified false) or the members after the '.' / '->' at
+    // AQualifier (see the header)
+    method Run(const AQualified: bool; const AQualifier: int64): LspCompletions;
+    begin
+      if AQualified then
+        self.DoMembers(AQualifier);
+      else
+        self.DoScopes();
+      end;
+      self.DoRank();
+      return self.FItems;
+    end;
+
+    // -- Nodes at the place
+
+    // [AStart, AEnd) of AId in the document; false when it is not of its file
+    hidden const method DoRangeOf(const AId: int64; var AStart: int64; var AEnd: int64): bool;
+    var
+      LNode: ref Node;
+    begin
+      LNode := self.FTree[AId];
+      AStart := 0;
+      AEnd := 0;
+      if LNode.Place.IsNone() or (LNode.Place.FileName <> self.FFile) then
+        return false;
+      end;
+      AStart := self.FDocument.OffsetOfPlace(int64(LNode.Place.Line), int64(LNode.Place.Column));
+      AEnd := AStart + (LNode.EndOffset - LNode.StartOffset);
+      return true;
+    end;
+
+    // AId and every node below it walked by AVisit's kind: 0 the smallest node holding the
+    // cursor (DoAnchor), 1 the largest expression ending at AAt (DoLeft); a generic's
+    // instances and a write summary are not walked
+    hidden method DoWalk(const AId: int64; const AVisit: int64; const AAt: int64);
+    var
+      LStart: int64;
+      LEnd: int64;
+      LI: int64;
+      LChild: int64;
+      LRole: NodeRole;
+    begin
+      LStart := 0;
+      LEnd := 0;
+      if self.DoRangeOf(AId, LStart, LEnd) then
+        if AVisit = 0 then
+          if (LStart <= self.FOffset) and (self.FOffset <= LEnd) and
+            ((self.FBest = 0) or (LEnd - LStart <= self.FBestLength)) then
+            self.FBest := AId;
+            self.FBestLength := LEnd - LStart;
+          end;
+        else
+          if (LEnd = AAt) and (LStart < AAt) and self.DoResolvesSomething(AId) and
+            ((self.FBest = 0) or (LEnd - LStart > self.FBestLength)) then
+            self.FBest := AId;
+            self.FBestLength := LEnd - LStart;
+          end;
+        end;
+      end;
+      for LI := 0 to self.FTree.ChildCount(AId) - 1 do
+        LChild := self.FTree.ChildAt(AId, LI);
+        LRole := self.FTree.RoleOf(LChild);
+        if (LRole <> NodeRole.Instance) and (LRole <> NodeRole.Effects) and
+          (self.FTree[LChild].Kind <> NodeKind.GenericInstance) then
+          self.DoWalk(LChild, AVisit, AAt);
+        end;
+      end;
+    end;
+
+    // True when the check resolved AId to something a member list starts from
+    hidden const method DoResolvesSomething(const AId: int64): bool;
+    var
+      LNode: ref Node;
+    begin
+      LNode := self.FTree[AId];
+      return (LNode.ResolvedUnit <> 0) or (LNode.ResolvedType <> 0) or
+        ((LNode.ResolvedDecl <> 0) and (self.FTree[LNode.ResolvedDecl].Kind = NodeKind.TypeDecl));
+    end;
+
+    // The smallest node holding the cursor (the module when none is smaller)
+    hidden method DoAnchor(): int64;
+    begin
+      self.FBest := 0;
+      self.FBestLength := 0;
+      self.DoWalk(self.FModule, 0, 0);
+      if self.FBest = 0 then
+        return self.FModule;
+      end;
+      return self.FBest;
+    end;
+
+    // The left side of the '.' / '->' at AQualifier: the largest expression ending there
+    // that the check resolved; 0 when none
+    hidden method DoLeft(const AQualifier: int64): int64;
+    var
+      LAt: int64;
+    begin
+      // Blanks may stand between the left side and its '.'
+      LAt := AQualifier;
+      while (LAt > 0) and ((self.FDocument.Text[LAt - 1] = ' ') or
+        (self.FDocument.Text[LAt - 1] = '\t') or (self.FDocument.Text[LAt - 1] = '\n') or
+        (self.FDocument.Text[LAt - 1] = '\r')) do
+        LAt := LAt - 1;
+      end;
+      self.FBest := 0;
+      self.FBestLength := 0;
+      self.DoWalk(self.FModule, 1, LAt);
+      return self.FBest;
+    end;
+
+    // -- Items
+
+    // An item named AText of AKind with ADetail, inserting AInsertText (a snippet when it
+    // holds a '$'; "" inserts AText), ranked ARank: kept when the prefix matches and no
+    // item has the name yet
+    hidden method DoAdd(const AText: string; const AKind: int64; const ADetail: string;
+      const AInsertText: string; const ARank: string);
+    var
+      LCount: int64;
+      LI: int64;
+    begin
+      if (AText = "") or not StartsText(self.FPrefix, AText) then
+        return;
+      end;
+      for LI := 0 to len(self.FNames) - 1 do
+        if self.FNames[LI] = AText then
+          return;
+        end;
+      end;
+      LCount := len(self.FNames);
+      setlength(self.FNames, LCount + 1);
+      self.FNames[LCount] := AText;
+      LCount := len(self.FItems);
+      setlength(self.FItems, LCount + 1);
+      self.FItems[LCount].Text := AText;
+      self.FItems[LCount].Kind := AKind;
+      self.FItems[LCount].Detail := ADetail;
+      self.FItems[LCount].InsertText := AInsertText;
+      self.FItems[LCount].IsSnippet := IndexOf("$", AInsertText, 0) >= 0;
+      self.FItems[LCount].SortText := ARank;
+    end;
+
+    // The kind of the type declaration ADecl by its type's form
+    hidden const method DoTypeKind(const ADecl: int64): int64;
+    var
+      LBody: int64;
+    begin
+      LBody := self.FTree.FirstOf(ADecl, NodeRole.TypeOf);
+      if LBody = 0 then
+        return ADAM_LSP_COMPLETION_TYPE_PARAMETER;
+      end;
+      match self.FTree[LBody].Kind of
+        NodeKind.ObjectType:
+          return ADAM_LSP_COMPLETION_CLASS;
+        NodeKind.InterfaceType:
+          return ADAM_LSP_COMPLETION_INTERFACE;
+        NodeKind.RecordType, NodeKind.OverlayType:
+          return ADAM_LSP_COMPLETION_STRUCT;
+        NodeKind.ChoicesType:
+          return ADAM_LSP_COMPLETION_ENUM;
+      else
+      end;
+      return ADAM_LSP_COMPLETION_TYPE_PARAMETER;
+    end;
+
+    // The CompletionItemKind of the declaration ADecl
+    hidden const method DoKindOf(const ADecl: int64): int64;
+    begin
+      match self.FTree[ADecl].Kind of
+        NodeKind.VarDecl, NodeKind.Param:
+          return ADAM_LSP_COMPLETION_VARIABLE;
+        NodeKind.ConstDecl:
+          return ADAM_LSP_COMPLETION_CONSTANT;
+        NodeKind.TypeDecl:
+          return self.DoTypeKind(ADecl);
+        NodeKind.ForwardType:
+          if (self.FTree[ADecl].ResolvedDecl <> 0) and
+            (self.FTree[self.FTree[ADecl].ResolvedDecl].Kind = NodeKind.TypeDecl) then
+            return self.DoTypeKind(self.FTree[ADecl].ResolvedDecl);
+          end;
+          return ADAM_LSP_COMPLETION_TYPE_PARAMETER;
+        NodeKind.GenericParam, NodeKind.BuiltinTypeDecl:
+          return ADAM_LSP_COMPLETION_TYPE_PARAMETER;
+        NodeKind.RoutineDecl, NodeKind.ForwardRoutine, NodeKind.IntrinsicDecl:
+          return ADAM_LSP_COMPLETION_FUNCTION;
+        NodeKind.MethodDecl, NodeKind.OperatorDecl:
+          return ADAM_LSP_COMPLETION_METHOD;
+        NodeKind.FieldDecl, NodeKind.EmbedDecl:
+          return ADAM_LSP_COMPLETION_FIELD;
+        NodeKind.PropertyDecl:
+          return ADAM_LSP_COMPLETION_PROPERTY;
+        NodeKind.ChoiceValue:
+          return ADAM_LSP_COMPLETION_ENUM_MEMBER;
+        NodeKind.Module:
+          return ADAM_LSP_COMPLETION_MODULE;
+      else
+      end;
+      return ADAM_LSP_COMPLETION_VARIABLE;
+    end;
+
+    // True for a declaration called with an argument list
+    hidden const method DoIsRoutine(const ADecl: int64): bool;
+    begin
+      match self.FTree[ADecl].Kind of
+        NodeKind.RoutineDecl, NodeKind.ForwardRoutine, NodeKind.MethodDecl:
+          return true;
+      else
+      end;
+      return false;
+    end;
+
+    // The text of the type the check gave AId ("" for none)
+    hidden const method DoTypeOf(const AId: int64): string;
+    begin
+      if AId = 0 then
+        return "";
+      end;
+      if self.FTree[AId].ResolvedType = 0 then
+        return "";
+      end;
+      return TypeText(self.FTree, self.FTree[AId].ResolvedType);
+    end;
+
+    // The detail of ADecl: a routine's parameters and result as the check typed them, a
+    // typed declaration's type
+    hidden const method DoDetailOf(const ADecl: int64): string;
+    var
+      LText: string;
+      LI: int64;
+      LParam: int64;
+      LReturn: string;
+    begin
+      if not self.DoIsRoutine(ADecl) then
+        return self.DoTypeOf(ADecl);
+      end;
+      LText := "(";
+      for LI := 0 to self.FTree.CountOf(ADecl, NodeRole.Param) - 1 do
+        LParam := self.FTree.NthOf(ADecl, NodeRole.Param, LI);
+        if LI > 0 then
+          LText := LText + "; ";
+        end;
+        if self.FTree[LParam].HasFlag(NodeFlag.VarParam) then
+          LText := LText + "var ";
+        end;
+        if self.FTree[LParam].HasFlag(NodeFlag.ConstParam) then
+          LText := LText + "const ";
+        end;
+        LText := LText + self.FTree[LParam].Text + ": " + self.DoTypeOf(LParam);
+      end;
+      LText := LText + ")";
+      LReturn := self.DoTypeOf(self.FTree.FirstOf(ADecl, NodeRole.ReturnType));
+      if LReturn <> "" then
+        LText := LText + ": " + LReturn;
+      end;
+      return LText;
+    end;
+
+    // The call snippet of the routine ADecl: a tab stop per parameter (none: `Name()`)
+    hidden const method DoCallSnippet(const ADecl: int64): string;
+    var
+      LText: string;
+      LCount: int64;
+      LI: int64;
+    begin
+      LCount := self.FTree.CountOf(ADecl, NodeRole.Param);
+      if LCount = 0 then
+        return self.FTree[ADecl].Text + "()";
+      end;
+      LText := self.FTree[ADecl].Text + "(";
+      for LI := 0 to LCount - 1 do
+        if LI > 0 then
+          LText := LText + ", ";
+        end;
+        LText := LText + "${" + IntToStr(LI + 1) + ":" +
+          self.FTree[self.FTree.NthOf(ADecl, NodeRole.Param, LI)].Text + "}";
+      end;
+      return LText + ")";
+    end;
+
+    // The declaration ADecl as an item ranked ARank
+    hidden method DoAddDecl(const ADecl: int64; const ARank: string);
+    var
+      LInsert: string;
+    begin
+      LInsert := "";
+      if self.DoIsRoutine(ADecl) then
+        LInsert := self.DoCallSnippet(ADecl);
+      end;
+      self.DoAdd(self.FTree[ADecl].Text, self.DoKindOf(ADecl), self.DoDetailOf(ADecl), LInsert,
+        ARank);
+    end;
+
+    // The public declarations of the unit module AUnit as items ranked ARank
+    hidden method DoAddPublic(const AUnit: int64; const ARank: string);
+    var
+      LI: int64;
+      LChild: int64;
+    begin
+      for LI := 0 to self.FTree.ChildCount(AUnit) - 1 do
+        LChild := self.FTree.ChildAt(AUnit, LI);
+        if (self.FTree.RoleOf(LChild) = NodeRole.Declaration) and
+          IsDeclarationKind(self.FTree[LChild].Kind) and
+          self.FTree[LChild].HasFlag(NodeFlag.Public) then
+          self.DoAddDecl(LChild, ARank);
+        end;
+      end;
+    end;
+
+    // -- A bare word
+
+    // The words a bare name may be at the place (see the header)
+    hidden method DoScopes();
+    var
+      LAt: int64;
+      LI: int64;
+      LChild: int64;
+      LStart: int64;
+      LEnd: int64;
+      LImport: int64;
+      LUnit: int64;
+      LWords: StringArray;
+    begin
+      LStart := 0;
+      LEnd := 0;
+      // The scopes enclosing the place, innermost first: what each declares before it
+      LAt := self.DoAnchor();
+      while LAt <> 0 do
+        for LI := 0 to self.FTree.ChildCount(LAt) - 1 do
+          LChild := self.FTree.ChildAt(LAt, LI);
+          if IsScopeDeclaration(self.FTree, LChild) and self.DoRangeOf(LChild, LStart, LEnd) and
+            (LStart < self.FOffset) then
+            self.DoAddDecl(LChild, ADAM_LSP_COMPLETE_RANK_PLACE);
+          end;
+        end;
+        if self.FTree[LAt].Kind = NodeKind.Module then
+          leave;
+        end;
+        LAt := self.FTree.ParentOf(LAt);
+      end;
+      // The system scope: builtin types and intrinsics
+      for LI := 0 to self.FTree.ChildCount(ADAM_AST_SYSTEM) - 1 do
+        LChild := self.FTree.ChildAt(ADAM_AST_SYSTEM, LI);
+        if self.FTree[LChild].Kind = NodeKind.BuiltinTypeDecl then
+          self.DoAdd(self.FTree[LChild].Text, ADAM_LSP_COMPLETION_TYPE_PARAMETER, "", "",
+            ADAM_LSP_COMPLETE_RANK_TYPE);
+        else
+          self.DoAdd(self.FTree[LChild].Text, ADAM_LSP_COMPLETION_FUNCTION, "",
+            self.FTree[LChild].Text + "($0)", ADAM_LSP_COMPLETE_RANK_PLACE);
+        end;
+      end;
+      // The units imported: their names, then their public declarations
+      for LI := 0 to self.FTree.CountOf(self.FModule, NodeRole.Import) - 1 do
+        LImport := self.FTree.NthOf(self.FModule, NodeRole.Import, LI);
+        self.DoAdd(self.FTree[LImport].Text, ADAM_LSP_COMPLETION_MODULE, "", "",
+          ADAM_LSP_COMPLETE_RANK_IMPORT);
+      end;
+      for LI := 0 to self.FTree.CountOf(self.FModule, NodeRole.Import) - 1 do
+        LUnit := self.FTree[self.FTree.NthOf(self.FModule, NodeRole.Import, LI)].ResolvedUnit;
+        if LUnit <> 0 then
+          self.DoAddPublic(LUnit, ADAM_LSP_COMPLETE_RANK_IMPORT);
+        end;
+      end;
+      // System.Runtime's public names, in scope in every module
+      if (self.FTree.Runtime <> 0) and (self.FTree.Runtime <> self.FModule) then
+        self.DoAddPublic(self.FTree.Runtime, ADAM_LSP_COMPLETE_RANK_RUNTIME);
+      end;
+      // The type words and keywords, then the statement snippets
+      LWords := ReservedWords(true);
+      for LI := 0 to len(LWords) - 1 do
+        self.DoAdd(LWords[LI], ADAM_LSP_COMPLETION_TYPE_PARAMETER, "", "",
+          ADAM_LSP_COMPLETE_RANK_TYPE);
+      end;
+      LWords := ReservedWords(false);
+      for LI := 0 to len(LWords) - 1 do
+        self.DoAdd(LWords[LI], ADAM_LSP_COMPLETION_KEYWORD, "", "", ADAM_LSP_COMPLETE_RANK_KEYWORD);
+      end;
+      self.DoSnippets();
+    end;
+
+    // The statement snippets (named apart from their keywords: "if ... end")
+    hidden method DoSnippets();
+    begin
+      self.DoAdd("if ... end", ADAM_LSP_COMPLETION_SNIPPET, "if statement",
+        "if ${1:condition} then\n\t$0\nend;", ADAM_LSP_COMPLETE_RANK_KEYWORD);
+      self.DoAdd("if ... else ... end", ADAM_LSP_COMPLETION_SNIPPET, "if else statement",
+        "if ${1:condition} then\n\t$2\nelse\n\t$0\nend;", ADAM_LSP_COMPLETE_RANK_KEYWORD);
+      self.DoAdd("while ... end", ADAM_LSP_COMPLETION_SNIPPET, "while statement",
+        "while ${1:condition} do\n\t$0\nend;", ADAM_LSP_COMPLETE_RANK_KEYWORD);
+      self.DoAdd("for ... to ... end", ADAM_LSP_COMPLETION_SNIPPET, "for statement",
+        "for ${1:LI} := ${2:0} to ${3:LCount - 1} do\n\t$0\nend;", ADAM_LSP_COMPLETE_RANK_KEYWORD);
+      self.DoAdd("for ... in ... end", ADAM_LSP_COMPLETION_SNIPPET, "for in statement",
+        "for ${1:LItem} in ${2:LItems} do\n\t$0\nend;", ADAM_LSP_COMPLETE_RANK_KEYWORD);
+      self.DoAdd("repeat ... until", ADAM_LSP_COMPLETION_SNIPPET, "repeat statement",
+        "repeat\n\t$0\nuntil ${1:condition};", ADAM_LSP_COMPLETE_RANK_KEYWORD);
+      self.DoAdd("match ... end", ADAM_LSP_COMPLETION_SNIPPET, "match statement",
+        "match ${1:value} of\n\t${2:label}:\n\t\t$0\nend;", ADAM_LSP_COMPLETE_RANK_KEYWORD);
+      self.DoAdd("guard ... end", ADAM_LSP_COMPLETION_SNIPPET, "guard statement",
+        "guard\n\t$1\nexcept\n\t$0\nend;", ADAM_LSP_COMPLETE_RANK_KEYWORD);
+    end;
+
+    // -- Members
+
+    // The members after the '.' / '->' at AQualifier (see the header)
+    hidden method DoMembers(const AQualifier: int64);
+    var
+      LLeft: int64;
+      LNode: ref Node;
+      LType: int64;
+      LDepth: int64;
+    begin
+      LLeft := self.DoLeft(AQualifier);
+      if LLeft = 0 then
+        return;
+      end;
+      LNode := self.FTree[LLeft];
+      if LNode.ResolvedUnit <> 0 then
+        self.DoAddPublic(LNode.ResolvedUnit, ADAM_LSP_COMPLETE_RANK_PLACE);
+        return;
+      end;
+      if (LNode.ResolvedDecl <> 0) and (self.FTree[LNode.ResolvedDecl].Kind = NodeKind.TypeDecl) then
+        // A type named: its choice values and static methods
+        self.DoTypeMembers(LNode.ResolvedDecl, LLeft, true, 0);
+        return;
+      end;
+      // A value: its type's members, through a pointer, ref, own or weak
+      LType := LNode.ResolvedType;
+      LDepth := 0;
+      while (LType <> 0) and (LDepth < ADAM_LSP_COMPLETE_DEPTH) and
+        (self.FTree[LType].Kind <> NodeKind.TypeDecl) and (TargetOf(self.FTree, LType) <> 0) do
+        match ClassOf(self.FTree, LType) of
+          TypeClass.Pointer, TypeClass.RefType, TypeClass.OwnType, TypeClass.WeakType:
+            LType := TargetOf(self.FTree, LType);
+        else
+          LType := 0;
+        end;
+        LDepth := LDepth + 1;
+      end;
+      if (LType <> 0) and (self.FTree[LType].Kind = NodeKind.TypeDecl) then
+        self.DoTypeMembers(LType, LLeft, false, 0);
+      end;
+    end;
+
+    // The members of the declared type AType (its parents' after it) as items: AStatic for a
+    // type named (its choice values and static methods), else a value's (no static method);
+    // a hidden member only when AUse is in the type's own methods
+    hidden method DoTypeMembers(const AType: int64; const AUse: int64; const AStatic: bool;
+      const ADepth: int64);
+    var
+      LBody: int64;
+    begin
+      if ADepth > ADAM_LSP_COMPLETE_DEPTH then
+        return;
+      end;
+      LBody := BodyOf(self.FTree, AType);
+      if LBody = 0 then
+        return;
+      end;
+      self.DoBodyMembers(LBody, LBody, AUse, AStatic, ADepth);
+      if ParentTypeOf(self.FTree, AType) <> 0 then
+        self.DoTypeMembers(ParentTypeOf(self.FTree, AType), AUse, AStatic, ADepth + 1);
+      end;
+    end;
+
+    // The members under AOwner (the body ABody or an anonymous aggregate in it) as items
+    // (see DoTypeMembers); an embed's type's members follow it
+    hidden method DoBodyMembers(const AOwner: int64; const ABody: int64; const AUse: int64;
+      const AStatic: bool; const ADepth: int64);
+    var
+      LI: int64;
+      LChild: int64;
+      LKind: NodeKind;
+      LOwn: bool;
+    begin
+      LOwn := MethodOwnerOf(self.FTree, AUse) = ABody;
+      for LI := 0 to self.FTree.ChildCount(AOwner) - 1 do
+        LChild := self.FTree.ChildAt(AOwner, LI);
+        LKind := self.FTree[LChild].Kind;
+        if self.FTree.RoleOf(LChild) = NodeRole.Member then
+          if (LKind = NodeKind.AnonRecord) or (LKind = NodeKind.AnonOverlay) then
+            self.DoBodyMembers(LChild, ABody, AUse, AStatic, ADepth);
+          else
+            if (LOwn or not self.FTree[LChild].HasFlag(NodeFlag.Hidden)) and
+              not IsUnnamedField(self.FTree, LChild) and self.DoMemberFits(LChild, AStatic) then
+              self.DoAddDecl(LChild, ADAM_LSP_COMPLETE_RANK_PLACE);
+              if (LKind = NodeKind.EmbedDecl) and (self.FTree[LChild].ResolvedType <> 0) then
+                self.DoTypeMembers(self.FTree[LChild].ResolvedType, AUse, false, ADepth + 1);
+              end;
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // True when the member AMember is listed for a type named (AStatic: choice values,
+    // static methods) or a value (fields, embeds, properties, methods that are not static)
+    hidden const method DoMemberFits(const AMember: int64; const AStatic: bool): bool;
+    var
+      LNode: ref Node;
+    begin
+      LNode := self.FTree[AMember];
+      if AStatic then
+        return (LNode.Kind = NodeKind.ChoiceValue) or
+          ((LNode.Kind = NodeKind.MethodDecl) and LNode.HasFlag(NodeFlag.Static));
+      end;
+      match LNode.Kind of
+        NodeKind.FieldDecl, NodeKind.EmbedDecl, NodeKind.PropertyDecl:
+          return true;
+        NodeKind.MethodDecl:
+          return not LNode.HasFlag(NodeFlag.Static);
+      else
+      end;
+      return false;
+    end;
+
+    // -- The order
+
+    // Each item's SortText: its rank group, then its place in the list
+    hidden method DoRank();
+    var
+      LI: int64;
+      LPlace: string;
+    begin
+      for LI := 0 to len(self.FItems) - 1 do
+        LPlace := IntToStr(LI);
+        while len(LPlace) < ADAM_LSP_COMPLETE_DIGITS do
+          LPlace := "0" + LPlace;
+        end;
+        self.FItems[LI].SortText := self.FItems[LI].SortText + LPlace;
+      end;
+    end;
+  end;
+
+// The completion items at the byte AOffset of ADocument (see the header): AContext from
+// CompletionContextAt, ATree / AModule the document's last check (its module read from
+// ADocument's text); none without a list or a tree
+public routine CompletionsAt(const ADocument: ref LspDocument; const ATree: ref SyntaxTree;
+  const AModule: int64; const AOffset: int64; const AContext: LspCompletionContext): LspCompletions;
+var
+  LCompleter: ref LspCompleter;
+  LNone: LspCompletions;
+begin
+  if (not AContext.HasList) or (ATree = nil) or (AModule = 0) then
+    return LNone;
+  end;
+  LCompleter := ref LspCompleter(ADocument, ATree, AModule, AOffset, AContext.Prefix);
+  return LCompleter.Run(AContext.HasQualifier, AContext.QualifierOffset);
+end;
+
+end.
