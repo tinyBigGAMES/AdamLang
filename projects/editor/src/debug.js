@@ -1163,7 +1163,50 @@ var AdamDebug = (function () {
       stopSession();
       return true;
     }
+    if (ACommand === 'debugClearFile') {
+      clearFile(gEditor.getModel());
+      return true;
+    }
+    if (ACommand === 'debugClearAll') {
+      clearAll();
+      return true;
+    }
     return false;
+  }
+
+  // The user's breakpoints of one file entry go (the @breakpoint lines are
+  // the source's and stay); a session hears the file's empty set
+  function clearEntry(AKey) {
+    var LEntry = gStore[AKey];
+
+    if (!LEntry || LEntry.marks.length === 0) {
+      return false;
+    }
+    LEntry.marks = [];
+    render(AKey);
+    sendLive(LEntry.path);
+    return true;
+  }
+
+  // Debug > Remove Breakpoints in This File (and the editor's context menu):
+  // the file AModel shows
+  function clearFile(AModel) {
+    if (clearEntry(keyOfModel(AModel))) {
+      persist();
+    }
+  }
+
+  // Debug > Remove All Breakpoints: every file's, open or not
+  function clearAll() {
+    var LKey;
+    var LAny = false;
+
+    for (LKey in gStore) {
+      LAny = clearEntry(LKey) || LAny;
+    }
+    if (LAny) {
+      persist();
+    }
   }
 
   // Pause a running program: the stop comes as a stopped event (reason
@@ -1332,6 +1375,21 @@ var AdamDebug = (function () {
     });
     // Beside the LSP's hover: Monaco shows both (declaration, value)
     gMonaco.languages.registerHoverProvider('adam', { provideHover: provideHover });
+    // The editor's right-click menu: the same two removes as the Debug menu
+    gEditor.addAction({
+      id: 'adam.removeFileBreakpoints',
+      label: 'Remove Breakpoints in This File',
+      contextMenuGroupId: 'adam-breakpoints',
+      contextMenuOrder: 1,
+      run: function (AEd) { clearFile(AEd.getModel()); }
+    });
+    gEditor.addAction({
+      id: 'adam.removeAllBreakpoints',
+      label: 'Remove All Breakpoints',
+      contextMenuGroupId: 'adam-breakpoints',
+      contextMenuOrder: 2,
+      run: function () { clearAll(); }
+    });
     // The previous runs' breakpoints; written again before the window goes
     window.host.loadBreakpoints().then(restore);
     window.addEventListener('beforeunload', persist);

@@ -417,7 +417,10 @@ function buildMenu() {
         { label: 'Pause', accelerator: 'F6', click: () => sendMenu('debugPause') },
         { type: 'separator' },
         // Shift+F5 is Build > Stop's: it stops the session when one runs
-        { label: 'Stop Debugging', click: () => sendMenu('debugStop') }
+        { label: 'Stop Debugging', click: () => sendMenu('debugStop') },
+        { type: 'separator' },
+        { label: 'Remove Breakpoints in This File', click: () => sendMenu('debugClearFile') },
+        { label: 'Remove All Breakpoints', click: () => sendMenu('debugClearAll') }
       ]
     },
     {
