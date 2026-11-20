@@ -733,6 +733,8 @@ type
     hidden FName: string;
     hidden FIsMain: bool;
     hidden FTokens: TokenList;
+    // The file's text: the place of an offset no token starts at (DoNoSemicolon)
+    hidden FText: ref SourceText;
     hidden FAt: int64;
     hidden FLastEnd: int64;
     hidden FModule: int64;
@@ -755,10 +757,11 @@ type
     hidden FBodiless: ref Int64List;
     hidden FBodilessWhy: ref Int64List;
 
-    init(const AState: ref ParseState; const ATokens: TokenList; const APath: string;
-      const AName: string; const AIsMain: bool);
+    init(const AState: ref ParseState; const AText: ref SourceText; const ATokens: TokenList;
+      const APath: string; const AName: string; const AIsMain: bool);
     begin
       self.FState := AState;
+      self.FText := AText;
       self.FTokens := ATokens;
       self.FPath := APath;
       self.FName := AName;
@@ -854,14 +857,52 @@ type
     // already reported it, what it broke is that fault's (one fault, one error)
     hidden method DoExpected(const AWhat: string);
     begin
+      self.DoExpectedAt(self.DoToken().Place, AWhat);
+    end;
+
+    // PR0001 at APlace: AWhat was expected, the token at the cursor found (DoExpected's
+    // silences)
+    hidden method DoExpectedAt(const APlace: SourcePlace; const AWhat: string);
+    begin
       if self.FTooDeep then
         return;
       end;
       if (self.DoKind() = TokenKind.Invalid) or self.FLexFault then
         return;
       end;
-      self.DoReport(ADAM_ERR_PARSER_001, self.DoToken().Place, ADAM_MSG_PARSER_EXPECTED,
+      self.DoReport(ADAM_ERR_PARSER_001, APlace, ADAM_MSG_PARSER_EXPECTED,
         NoArgs().Str(AWhat).Str(self.DoFound()));
+    end;
+
+    // PR0001 for a ';' missing at the cursor, where it belongs (pcpp's Expect): at the end
+    // of the last token moved past, with the token found instead; at the cursor when
+    // nothing was moved past yet
+    hidden method DoNoSemicolon();
+    var
+      LPlace: SourcePlace;
+    begin
+      if self.FLastEnd > 0 then
+        LPlace := self.FText.PlaceOf(self.FLastEnd);
+      else
+        LPlace := self.DoToken().Place;
+      end;
+      self.DoExpectedAt(LPlace, DoQuoted(";"));
+    end;
+
+    // True when the ';' missing at the cursor is only missing, so nothing is skipped: the
+    // part that wants it (starting at AStart) moved past a token, and the token at the
+    // cursor starts a later line than that token ends on (the line before was complete:
+    // the case typed while editing). On the same line, what follows is that part's fault
+    // and is skipped (one fault, one error, AA.4)
+    hidden const method DoSemicolonOnlyMissing(const AStart: int64): bool;
+    begin
+      if self.FLastEnd <= AStart then
+        return false;
+      end;
+      if self.DoKind() = TokenKind.EndOfFile then
+        return true;
+      end;
+      return self.DoToken().Line > self.FText.LineOf(self.FLastEnd);
     end;
 
     // True when the file ends inside a token the lexer reported (a raw string or a block
@@ -892,13 +933,18 @@ type
         NoArgs().Str(AOpener));
     end;
 
-    // Moves past a token of AKind; anything else is PR0001 (AWhat expected) and stays
+    // Moves past a token of AKind; anything else is PR0001 (AWhat expected) and stays. A
+    // missing ';' is reported where it belongs (DoNoSemicolon)
     hidden method DoRequire(const AKind: TokenKind; const AWhat: string);
     begin
       if self.DoKind() = AKind then
         self.DoAdvance();
       else
-        self.DoExpected(AWhat);
+        if AKind = TokenKind.Semicolon then
+          self.DoNoSemicolon();
+        else
+          self.DoExpected(AWhat);
+        end;
       end;
     end;
 
@@ -1321,8 +1367,9 @@ type
     end;
 
     // An expression statement: ExpressionStatement (its expression as Value) then ';'; a
-    // missing ';' is PR0001 and the rest up to the next ';' skipped; one whose operator is
-    // '=' is PR0048
+    // missing ';' is PR0001 after the last token (DoNoSemicolon), the rest of its line up to
+    // the next ';' skipped unless the ';' is only missing (DoSemicolonOnlyMissing); one
+    // whose operator is '=' is PR0048
     hidden method DoExpressionStatement(const AParent: int64; const ARole: NodeRole);
     var
       LNode: int64;
@@ -1341,8 +1388,9 @@ type
       if self.DoKind() = TokenKind.Semicolon then
         self.DoAdvance();
       else
-        self.DoExpected(DoQuoted(";"));
-        if not self.FTooDeep then
+        self.DoNoSemicolon();
+        if not self.FTooDeep and
+          not self.DoSemicolonOnlyMissing(self.FState.Ast[LNode].StartOffset) then
           self.DoSkipStatement(LNode, NodeRole.Value);
         end;
       end;
@@ -2113,7 +2161,7 @@ type
         return true;
       end;
       if DoIsSync(self.DoKind()) then
-        self.DoExpected(DoQuoted(";"));
+        self.DoNoSemicolon();
         return false;
       end;
       return self.DoShapeError(ADirective, ASpelling, AShape);
@@ -2308,8 +2356,10 @@ type
             self.DoAdvance();
             return;
           end;
-          self.DoExpected(DoQuoted(";"));
-          self.DoSkip(self.FModule, NodeRole.Import, true, false);
+          self.DoNoSemicolon();
+          if not self.DoSemicolonOnlyMissing(self.FState.Ast[LImport].StartOffset) then
+            self.DoSkip(self.FModule, NodeRole.Import, true, false);
+          end;
           return;
         end;
       end;
@@ -4108,15 +4158,19 @@ type
       end;
     end;
 
-    // The ';' that ends a declaration: moved past; missing, PR0001 and the tokens up to the
-    // next ';' or part of a module are skipped as an Error node under AParent playing ARole
+    // The ';' that ends the declaration AParent: moved past; missing, PR0001 after the last
+    // token (DoNoSemicolon) and, unless the ';' is only missing (DoSemicolonOnlyMissing),
+    // the tokens up to the next ';' or part of a module skipped as an Error node under
+    // AParent playing ARole
     hidden method DoSemicolon(const AParent: int64; const ARole: NodeRole);
     begin
       if self.DoKind() = TokenKind.Semicolon then
         self.DoAdvance();
       else
-        self.DoExpected(DoQuoted(";"));
-        self.DoSkip(AParent, ARole, true, false);
+        self.DoNoSemicolon();
+        if not self.DoSemicolonOnlyMissing(self.FState.Ast[AParent].StartOffset) then
+          self.DoSkip(AParent, ARole, true, false);
+        end;
       end;
     end;
 
@@ -5619,15 +5673,17 @@ type
       self.DoLeave();
     end;
 
-    // The ';' after a member: moved past; missing, PR0001 and the member's tokens up to its
-    // ';' / 'end' skipped (an Error node under ANode, role Member)
+    // The ';' after the member ANode: moved past; missing, PR0001 after the last token
+    // (DoNoSemicolon) and, unless the ';' is only missing (DoSemicolonOnlyMissing), the
+    // member's tokens up to its ';' / 'end' skipped (an Error node under ANode, role Member)
     hidden method DoMemberSemicolon(const ANode: int64);
     begin
       if self.DoKind() = TokenKind.Semicolon then
         self.DoAdvance();
       else
-        self.DoExpected(DoQuoted(";"));
-        if (self.DoKind() <> TokenKind.KwEnd) and (self.DoKind() <> TokenKind.EndOfFile) then
+        self.DoNoSemicolon();
+        if (self.DoKind() <> TokenKind.KwEnd) and (self.DoKind() <> TokenKind.EndOfFile) and
+          not self.DoSemicolonOnlyMissing(self.FState.Ast[ANode].StartOffset) then
           self.DoSkipMember(ANode);
         end;
       end;
@@ -6070,8 +6126,10 @@ type
       if self.DoKind() = TokenKind.Semicolon then
         self.DoAdvance();
       else
-        self.DoExpected(DoQuoted(";"));
-        self.DoSkip(self.FModule, NodeRole.Declaration, true, false);
+        self.DoNoSemicolon();
+        if not self.DoSemicolonOnlyMissing(self.FState.Ast[self.FModule].StartOffset) then
+          self.DoSkip(self.FModule, NodeRole.Declaration, true, false);
+        end;
       end;
 
       // The parts in their order: prologue, import clause, declarations, sections. The
@@ -6269,7 +6327,7 @@ begin
     LTokens := LFilter.Filter(LLexer.ReadAll(), AState.Target, AState.OverrideTarget, "",
       AState.Ast.Level, true, OptLevel.Debug, false);
   end;
-  LParser := ref FileParser(AState, LTokens, APath, AName, AIsMain);
+  LParser := ref FileParser(AState, AState.Sources[AIndex], LTokens, APath, AName, AIsMain);
   AState.Push(AName);
   LId := LParser.ParseModule();
   AState.Pop();
@@ -6678,7 +6736,7 @@ begin
     return 0;
   end;
   LLexer := ref Lexer(ASources[LIndex], ADiagnostics);
-  LParser := ref FileParser(LState, LLexer.ReadAll(), APath, "", false);
+  LParser := ref FileParser(LState, ASources[LIndex], LLexer.ReadAll(), APath, "", false);
   return LParser.ParseFragment(AType);
 end;
 
