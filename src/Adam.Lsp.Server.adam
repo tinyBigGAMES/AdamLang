@@ -55,6 +55,16 @@
   DoSameFile). A report's range starts at its
   place and runs over the word there (one character else).
 
+  Watched files: with a client that takes registrations
+  (capabilities.workspace.didChangeWatchedFiles.dynamicRegistration), the
+  server watches what on the disk its checks read (Compiler.DiskPaths: the
+  modules' files, the paths their directives name, project.toml), the open
+  documents' files left out: one client/registerCapability of
+  workspace/didChangeWatchedFiles, a watcher per path (its globPattern the
+  path itself), sent again whenever the set changes (the new one before the
+  old one's client/unregisterCapability). didChangeWatchedFiles marks every
+  open document, checked again at the next idle.
+
   hover / definition (Adam.Lsp.Find, Adam.Lsp.Hover; checked first as
   semanticTokens): the name at the position in the last check's tree; a
   hover is its declaration's heading and doc comment as Markdown over the
@@ -194,6 +204,17 @@ public const
   ADAM_LSP_ITEMS_KEY: string = "items";
   // A hover's MarkupKind
   ADAM_LSP_MARKUP_MARKDOWN: string = "markdown";
+
+  // The watched files (client/registerCapability): the client's capability that says it
+  // takes them, and the ids of the server's registrations and of its requests
+  ADAM_LSP_DID_CHANGE_WATCHED: string = "workspace/didChangeWatchedFiles";
+  ADAM_LSP_REGISTER_CAPABILITY: string = "client/registerCapability";
+  ADAM_LSP_UNREGISTER_CAPABILITY: string = "client/unregisterCapability";
+  ADAM_LSP_WATCH_CAPABILITY: string =
+    "capabilities.workspace.didChangeWatchedFiles.dynamicRegistration";
+  ADAM_LSP_WATCH_ID: string = "adam-watch-";
+  ADAM_LSP_WATCH_REGISTER_ID: string = "adam-watch-reg-";
+  ADAM_LSP_WATCH_UNREGISTER_ID: string = "adam-watch-unreg-";
 
 type
   // Where the session is: before initialize, serving, after shutdown
@@ -464,6 +485,11 @@ type
     hidden FChecks: array of ref Compiler;
     hidden FExitWanted: bool;
     hidden FExitCode: int32;
+    // The watched files: the client takes registrations (initialize), the set registered
+    // last (its paths one per line, "" for none) and its registration's number
+    hidden FWatchCanRegister: bool;
+    hidden FWatchText: string;
+    hidden FWatchSerial: int64;
 
     init(const ATransport: ref ProtocolTransport; const AModulePaths: StringArray);
     begin
@@ -473,6 +499,9 @@ type
       self.FEncoding := LspEncoding.Utf16;
       self.FExitWanted := false;
       self.FExitCode := ADAM_LSP_EXIT_NO_SHUTDOWN;
+      self.FWatchCanRegister := false;
+      self.FWatchText := "";
+      self.FWatchSerial := 0;
     end;
 
     // Serves the transport until "exit" or the end of its input: an ADAM_LSP_EXIT_* code
@@ -627,7 +656,8 @@ type
         return;
       end;
       if not LMessage.TryGetString("method", LMethod, true) then
-        // A response to a request of the server's: it sends none yet, nothing to match
+        // A response to a request of the server's (the watchers' registrations): taken
+        // quietly, nothing waits for it
         if LHasId and (LMessage.Has("result", true) or LMessage.Has("error", true)) then
           return;
         end;
@@ -740,6 +770,10 @@ type
       end;
       if AMethod = ADAM_LSP_DID_CLOSE then
         self.DoDidClose(AParams);
+        return;
+      end;
+      if AMethod = ADAM_LSP_DID_CHANGE_WATCHED then
+        self.DoDidChangeWatched();
       end;
       // "initialized", $/ notifications and unknown ones need nothing
     end;
@@ -751,6 +785,11 @@ type
       LResult: Json;
     begin
       self.FEncoding := self.DoNegotiateEncoding(AParams);
+      // Watchers are registered only with a client that says it takes them (a value that
+      // is no boolean reads as no)
+      if not AParams.TryGetBoolean(ADAM_LSP_WATCH_CAPABILITY, self.FWatchCanRegister) then
+        self.FWatchCanRegister := false;
+      end;
       LResult.BeginObject("capabilities");
       LResult.Add("positionEncoding", DoEncodingText(self.FEncoding));
       LResult.BeginObject("textDocumentSync");
@@ -1009,6 +1048,117 @@ type
         DoRemoveAt(self.FPublishedUris, LAt);
         DoRemoveAt(self.FPublishedOwners, LAt);
       end;
+      // Its file is no buffer now: watched when a check still reads it
+      self.DoUpdateWatchers();
+    end;
+
+    // -- Watched files
+
+    // workspace/didChangeWatchedFiles: a file a check read changed on the disk, so every
+    // open document is checked again at the next idle (each check replaces what it
+    // published before)
+    hidden method DoDidChangeWatched();
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FDocuments) - 1 do
+        self.DoMarkDirty(self.FDocuments[LI].Uri);
+      end;
+    end;
+
+    // The watched set: every kept check's DiskPaths once (SamePath), the open documents'
+    // files left out (their buffers speak), sorted, so the same set reads as the same text.
+    // A changed set is registered (one watcher per path, its globPattern the path itself:
+    // a file, or a folder and what is under it) BEFORE the old one is unregistered: a path
+    // in both keeps its running watcher, so a change between the two is not missed. Only
+    // with a client that takes registrations (initialize)
+    hidden method DoUpdateWatchers();
+    var
+      LSet: StringArray;
+      LPaths: StringArray;
+      LText: string;
+      LOldSerial: int64;
+      LHadOld: bool;
+      LParams: Json;
+      LUnregister: Json;
+      LI: int64;
+      LJ: int64;
+      LK: int64;
+      LSeen: bool;
+    begin
+      if not self.FWatchCanRegister then
+        return;
+      end;
+      setlength(LSet, 0);
+      for LI := 0 to len(self.FChecks) - 1 do
+        LPaths := self.FChecks[LI].DiskPaths();
+        for LJ := 0 to len(LPaths) - 1 do
+          if self.DoOpenFor(LPaths[LJ]) = nil then
+            LSeen := false;
+            for LK := 0 to len(LSet) - 1 do
+              if SamePath(LSet[LK], LPaths[LJ]) then
+                LSeen := true;
+                leave;
+              end;
+            end;
+            if not LSeen then
+              DoAppend(LSet, LPaths[LJ]);
+            end;
+          end;
+        end;
+      end;
+      SortStrings(LSet);
+      LText := JoinStrings(LSet, "\n");
+      if LText = self.FWatchText then
+        return;
+      end;
+      LOldSerial := self.FWatchSerial;
+      LHadOld := self.FWatchText <> "";
+      self.FWatchText := LText;
+      if len(LSet) > 0 then
+        self.FWatchSerial := self.FWatchSerial + 1;
+        LParams.BeginArray("registrations");
+        LParams.BeginObject();
+        LParams.Add("id", ADAM_LSP_WATCH_ID + IntToStr(self.FWatchSerial));
+        LParams.Add("method", ADAM_LSP_DID_CHANGE_WATCHED);
+        LParams.BeginObject("registerOptions");
+        LParams.BeginArray("watchers");
+        for LI := 0 to len(LSet) - 1 do
+          LParams.BeginObject();
+          LParams.Add("globPattern", LSet[LI]);
+          LParams.EndObject();
+        end;
+        LParams.EndArray();
+        LParams.EndObject();
+        LParams.EndObject();
+        LParams.EndArray();
+        self.DoSendRequest(ADAM_LSP_WATCH_REGISTER_ID + IntToStr(self.FWatchSerial),
+          ADAM_LSP_REGISTER_CAPABILITY, LParams);
+      end;
+      if LHadOld then
+        // "unregisterations" is the protocol's own spelling (LSP 3.17)
+        LUnregister.BeginArray("unregisterations");
+        LUnregister.BeginObject();
+        LUnregister.Add("id", ADAM_LSP_WATCH_ID + IntToStr(LOldSerial));
+        LUnregister.Add("method", ADAM_LSP_DID_CHANGE_WATCHED);
+        LUnregister.EndObject();
+        LUnregister.EndArray();
+        self.DoSendRequest(ADAM_LSP_WATCH_UNREGISTER_ID + IntToStr(LOldSerial),
+          ADAM_LSP_UNREGISTER_CAPABILITY, LUnregister);
+      end;
+    end;
+
+    // A request of the server's own, AMethod with AParams under the id AId (the client's
+    // response is taken quietly: DoHandleMessage)
+    hidden method DoSendRequest(const AId: string; const AMethod: string; const AParams: Json);
+    var
+      LMessage: Json;
+    begin
+      LMessage := DoNewMessage();
+      LMessage.Add("id", AId);
+      LMessage.Add("method", AMethod);
+      LMessage.Add("params", AParams);
+      self.DoSend(LMessage);
     end;
 
     // -- Diagnostics
@@ -1028,6 +1178,7 @@ type
           self.DoCheckRun(LDocument);
         end;
       end;
+      self.DoUpdateWatchers();
     end;
 
     // ADocument checked and its diagnostics published (see the header)
@@ -1179,6 +1330,7 @@ type
       if LAt >= 0 then
         DoRemoveAt(self.FDirty, LAt);
         self.DoCheckRun(ADocument);
+        self.DoUpdateWatchers();
       end;
       return self.DoCheckOf(ADocument.Uri);
     end;

@@ -1354,8 +1354,7 @@ function refreshProjects(ARoots) {
   }
 }
 
-// LSP: one server for the editor's lifetime (lsp-host.js runs `adam lsp`
-// once it exists, M11b; until then the host starts nothing); every message
+// LSP: one server for the editor's lifetime (lsp-host.js runs `adam lsp`); every message
 // and state change is relayed to the renderer as it happens
 let gLsp = null;
 // The server's file watchers (lsp-watch.js): main answers its

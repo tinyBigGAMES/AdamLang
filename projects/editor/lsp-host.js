@@ -20,9 +20,7 @@
   Runs `adam.exe lsp` and speaks JSON-RPC 2.0 with Content-Length
   framing over its stdio. The host restarts the server after a crash. A
   running server locks adam.exe: the compiler is rebuilt with the editor
-  closed. Adam's language server comes with M11b: until then
-  ADAM_LSP_COMMAND is empty and start() spawns nothing (state 'off'); the
-  framer is already the DAP host's.
+  closed. The framer is the DAP host's.
 */
 'use strict';
 
@@ -31,9 +29,8 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 const ADAM_LSP_EXE = 'adam.exe';
-// The server's command line after the exe; [] = no server yet (M11b adds
-// `adam lsp`: then ['lsp'])
-const ADAM_LSP_COMMAND = [];
+// The server's command line after the exe: `adam lsp`
+const ADAM_LSP_COMMAND = ['lsp'];
 // ms before a crashed server is started again
 const ADAM_LSP_RESTART_DELAY = 1000;
 // this many crashes inside ADAM_LSP_CRASH_WINDOW ms = give up (state failed)
@@ -115,10 +112,6 @@ function createLspHost(AOpts) {
     let LNew;
 
     if (LProc || LStopping) {
-      return;
-    }
-    if (ADAM_LSP_COMMAND.length === 0) {
-      setState('off', 'adam lsp comes with M11b');
       return;
     }
     // A missing exe is not a crash: fail now, no restart loop
