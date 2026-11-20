@@ -49,8 +49,11 @@ var AdamEditor = (function () {
   }
 
   // Windows paths compare case-insensitively
+  // One file as Windows tells paths apart: no case, '/' and '\' alike (a
+  // path from the debug adapter or the LSP may use either)
   function samePath(AA, AB) {
-    return !!AA && !!AB && AA.toLowerCase() === AB.toLowerCase();
+    return !!AA && !!AB &&
+      AA.replace(/\//g, '\\').toLowerCase() === AB.replace(/\//g, '\\').toLowerCase();
   }
 
   function tabLabel(ATab) {
