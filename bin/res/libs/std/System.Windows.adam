@@ -69,7 +69,6 @@ public type
   // A NUL-terminated UTF-16 text as Win32 reads and writes it
   WideBuffer = array[0..32767] of uint16;
 
-type
   // A WideBuffer on the heap: a routine's 64 KB buffer kept off its stack frame, freed on
   // every way out (return or raise) by its own
   WideBox = final object
@@ -86,6 +85,14 @@ public const
   // (ProcThreadAttributeValue(22, FALSE, TRUE, FALSE))
   EXTENDED_STARTUPINFO_PRESENT: uint32 = 0x00080000;
   PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: uint64 = 0x00020016;
+  // The handles a child inherits, only these (ProcThreadAttributeValue(2, FALSE, TRUE, FALSE))
+  PROC_THREAD_ATTRIBUTE_HANDLE_LIST: uint64 = 0x00020002;
+  // DuplicateHandle: the copy has the source's access
+  DUPLICATE_SAME_ACCESS: uint32 = 0x2;
+  // WaitForSingleObject: the wait ran out with the object not signaled
+  WAIT_TIMEOUT: uint32 = 0x102;
+  // The OEM code page (MultiByteToWideChar): what a console tool writes when it is not UTF-8
+  CP_OEMCP: uint32 = 1;
   // GetFileType's answers
   FILE_TYPE_UNKNOWN: uint32 = 0;
   FILE_TYPE_DISK: uint32 = 1;
@@ -312,6 +319,22 @@ public type
     Y: int16;
   end;
 
+  // wincontypes.h: CONSOLE_SCREEN_BUFFER_INFO with its SMALL_RECT
+  SMALL_RECT = record
+    Left: int16;
+    Top: int16;
+    Right: int16;
+    Bottom: int16;
+  end;
+
+  CONSOLE_SCREEN_BUFFER_INFO = record
+    dwSize: COORD;
+    dwCursorPosition: COORD;
+    wAttributes: uint16;
+    srWindow: SMALL_RECT;
+    dwMaximumWindowSize: COORD;
+  end;
+
   PROCESS_INFORMATION = record
     hProcess: uint64;
     hThread: uint64;
@@ -404,6 +427,15 @@ public routine clink InitializeProcThreadAttributeList(AList: ptr; ACount: uint3
 public routine clink UpdateProcThreadAttribute(AList: ptr; AFlags: uint32; AAttribute: uint64;
   AValue: ptr; ASize: uint64; APrevious: ptr; AReturnSize: ptr): int32; external "kernel32";
 public routine clink DeleteProcThreadAttributeList(AList: ptr); external "kernel32";
+public routine clink GetCurrentProcess(): uint64; external "kernel32";
+public routine clink DuplicateHandle(ASourceProcess: uint64; ASource: uint64; ATargetProcess: uint64;
+  var ATarget: uint64; AAccess: uint32; AInherit: int32; AOptions: uint32): int32;
+  external "kernel32";
+public routine clink MultiByteToWideChar(ACodePage: uint32; AFlags: uint32; ASource: ptr to const;
+  ASourceSize: int32; AWide: ptr; AWideSize: int32): int32; external "kernel32";
+public routine clink IsDBCSLeadByteEx(ACodePage: uint32; AByte: uint8): int32; external "kernel32";
+public routine clink GetConsoleScreenBufferInfo(AConsole: uint64;
+  var AInfo: CONSOLE_SCREEN_BUFFER_INFO): int32; external "kernel32";
 public routine clink WaitForSingleObject(AHandle: uint64; AMilliseconds: uint32): uint32;
   external "kernel32";
 public routine clink GetExitCodeProcess(AProcess: uint64; var AExitCode: uint32): int32;
@@ -1667,7 +1699,7 @@ end;
 
 // What CreateProcessW takes for AExe run with AArgs in AWorkDir ("" = this process's folder):
 // the application, the command line and the folder, as UTF-16. False when one cannot be made
-routine DoProcessTexts(const AExe: string; const AArgs: StringArray; const AWorkDir: string;
+public routine WinProcessTexts(const AExe: string; const AArgs: StringArray; const AWorkDir: string;
   var AApplication: WideBuffer; var ACommandLine: WideBuffer; var ADirectory: WideBuffer): bool;
 var
   LCommand: string;
@@ -1714,7 +1746,7 @@ begin
   LCommandLine := own WideBox();
   LDirectory := own WideBox();
   AExitCode := 0;
-  if not DoProcessTexts(AExe, AArgs, AWorkDir, LApplication.Data, LCommandLine.Data,
+  if not WinProcessTexts(AExe, AArgs, AWorkDir, LApplication.Data, LCommandLine.Data,
     LDirectory.Data) then
     return false;
   end;
@@ -1739,6 +1771,330 @@ begin
   return LOk;
 end;
 
+// What the pipe APipe holds now appended to AText (no wait: an empty pipe adds nothing), in
+// reads of ADAM_WINDOWS_IO_SIZE bytes. False when the pipe is closed or broken (every writer
+// gone and nothing left in it)
+public routine WinReadAvailable(const APipe: uint64; var AText: string): bool;
+var
+  LBuffer: ByteBuffer;
+  LAvailable: uint32;
+  LWant: uint32;
+  LRead: uint32;
+  LOld: int64;
+  LI: int64;
+begin
+  while true do
+    LAvailable := 0;
+    if PeekNamedPipe(APipe, nil, 0, nil, LAvailable, nil) = 0 then
+      return false;
+    end;
+    if LAvailable = 0 then
+      return true;
+    end;
+    LWant := LAvailable;
+    if LWant > ADAM_WINDOWS_IO_SIZE then
+      LWant := ADAM_WINDOWS_IO_SIZE;
+    end;
+    LRead := 0;
+    if ReadFile(APipe, addr of LBuffer, LWant, LRead, nil) = 0 then
+      return false;
+    end;
+    // Grown once per read, then filled (no append per byte)
+    LOld := len(AText);
+    setlength(AText, LOld + int64(LRead));
+    for LI := 0 to int64(LRead) - 1 do
+      AText[LOld + LI] := char(LBuffer[LI]);
+    end;
+  end;
+end;
+
+// One read of the pipe APipe (waits until it holds bytes) appended to AText. False when the
+// pipe is closed or broken: every writer gone, nothing left (the end of a child's output)
+public routine WinReadSome(const APipe: uint64; var AText: string): bool;
+var
+  LBuffer: ByteBuffer;
+  LRead: uint32;
+  LOld: int64;
+  LI: int64;
+begin
+  LRead := 0;
+  if (ReadFile(APipe, addr of LBuffer, ADAM_WINDOWS_IO_SIZE, LRead, nil) = 0) or
+    (LRead = 0) then
+    return false;
+  end;
+  LOld := len(AText);
+  setlength(AText, LOld + int64(LRead));
+  for LI := 0 to int64(LRead) - 1 do
+    AText[LOld + LI] := char(LBuffer[LI]);
+  end;
+  return true;
+end;
+
+// The bytes ABytes in the OEM code page (CP_OEMCP: what a console tool writes that does not
+// write UTF-8) as UTF-8 text. Converted in pieces of at most ADAM_WINDOWS_WIDE_MAX bytes (one
+// OEM byte gives at most one UTF-16 unit), a piece never ending inside a double-byte character
+public routine WinOemToUtf8(const ABytes: string): string;
+var
+  LWide: own WideBox;
+  LText: string;
+  LAt: int64;
+  LEnd: int64;
+  LNext: int64;
+  LUnits: int32;
+begin
+  LWide := own WideBox();
+  LText := "";
+  LAt := 0;
+  while LAt < len(ABytes) do
+    // The piece: whole characters (a lead byte takes its trail byte along) up to the cap
+    LEnd := LAt;
+    while LEnd < len(ABytes) do
+      LNext := LEnd + 1;
+      if (IsDBCSLeadByteEx(CP_OEMCP, uint8(ABytes[LEnd])) <> 0) and (LNext < len(ABytes)) then
+        LNext := LNext + 1;
+      end;
+      if LNext - LAt > int64(ADAM_WINDOWS_WIDE_MAX) then
+        leave;
+      end;
+      LEnd := LNext;
+    end;
+    LUnits := MultiByteToWideChar(CP_OEMCP, 0, ptr to const(addr of ABytes[LAt]),
+      int32(LEnd - LAt), ptr(addr of LWide.Data[0]), int32(ADAM_WINDOWS_WIDE_MAX));
+    if LUnits > 0 then
+      LText := LText + WideToUtf8(LWide.Data, LUnits);
+    end;
+    LAt := LEnd;
+  end;
+  return LText;
+end;
+
+// ClosePseudoConsole as a task runs it (PseudoConsole.Close)
+routine DoClosePseudoConsole(const AConsole: uint64);
+begin
+  ClosePseudoConsole(AConsole);
+end;
+
+// A pseudo console's side: ASide held to 1..32767 (COORD's int16)
+routine DoConsoleSide(const ASide: int32): int32;
+begin
+  if ASide < 1 then
+    return 1;
+  end;
+  if ASide > 32767 then
+    return 32767;
+  end;
+  return ASide;
+end;
+
+// A handle this unit opened, closed (0 / INVALID_HANDLE_VALUE: none)
+routine DoCloseOpened(const AHandle: uint64);
+begin
+  if (AHandle <> 0) and (AHandle <> INVALID_HANDLE_VALUE) then
+    CloseHandle(AHandle);
+  end;
+end;
+
+public type
+  // A pseudo console (ConPTY) a started program takes as its console (StdApp.Utils'
+  // CaptureConsolePTY; System.IO's captured runs and the debugger's Terminal mode both use
+  // it): CreatePseudoConsole over two plain pipes, nothing inheritable, so the program reaches
+  // only the pseudo console. Open makes it; AttributeList names it (and a standard input of
+  // the program's own) for STARTUPINFOEXW; Output is its output pipe's read end (VT text,
+  // UTF-8), WriteKeys writes its input pipe, Resize sizes it. Close closes it on a task while
+  // this thread reads its output to the pipe's break: it writes out what it still holds first
+  // (an older Windows waits in ClosePseudoConsole for that drain), so nothing is lost to timing
+  PseudoConsole = object
+    // The HPCON (0 = none), its input pipe's write end and output pipe's read end
+    hidden FConsole: uint64;
+    hidden FInput: uint64;
+    hidden FOutput: uint64;
+    // The attribute list AttributeList made and the handle its handle list names (kept here:
+    // the list points at it until CreateProcessW returned)
+    hidden FList: ByteArray;
+    hidden FListMade: bool;
+    hidden FStdin: uint64;
+
+    // Made at ACols x ARows (each held to 1..32767); 0, else Windows' reason (a GetLastError
+    // code, or CreatePseudoConsole's HRESULT); nothing is left open when it fails. One still
+    // open is closed first (its last output dropped)
+    method Open(const ACols: int32; const ARows: int32): uint32;
+    var
+      LSecurity: SECURITY_ATTRIBUTES;
+      LInputRead: uint64;
+      LOutputWrite: uint64;
+      LSize: COORD;
+      LResult: int32;
+      LError: uint32;
+      LDropped: string;
+    begin
+      if self.FConsole <> 0 then
+        self.Close(LDropped);
+      end;
+      // Two plain pipes, nothing inheritable; the pseudo console keeps its own copies of the
+      // ends it is given, closed here
+      LSecurity.nLength := uint32(size(SECURITY_ATTRIBUTES));
+      LSecurity.bInheritHandle := 0;
+      LInputRead := 0;
+      LOutputWrite := 0;
+      if CreatePipe(LInputRead, self.FInput, LSecurity, 0) = 0 then
+        LError := GetLastError();
+        self.FInput := 0;
+        return LError;
+      end;
+      if CreatePipe(self.FOutput, LOutputWrite, LSecurity, 0) = 0 then
+        LError := GetLastError();
+        self.FOutput := 0;
+        CloseHandle(LInputRead);
+        DoCloseOpened(self.FInput);
+        self.FInput := 0;
+        return LError;
+      end;
+      LSize.X := int16(DoConsoleSide(ACols));
+      LSize.Y := int16(DoConsoleSide(ARows));
+      LResult := CreatePseudoConsole(LSize, LInputRead, LOutputWrite, 0, self.FConsole);
+      CloseHandle(LInputRead);
+      CloseHandle(LOutputWrite);
+      if LResult <> 0 then
+        self.FConsole := 0;
+        DoCloseOpened(self.FInput);
+        DoCloseOpened(self.FOutput);
+        self.FInput := 0;
+        self.FOutput := 0;
+        return uint32(LResult);
+      end;
+      return 0;
+    end;
+
+    // Made and not yet closed
+    method IsOpen(): bool;
+    begin
+      return self.FConsole <> 0;
+    end;
+
+    // The output pipe's read end (0 when not open): read with WinReadAvailable / WinReadSome
+    method Output(): uint64;
+    begin
+      return self.FOutput;
+    end;
+
+    // The list for STARTUPINFOEXW.lpAttributeList: this pseudo console, and with AStdin <> 0
+    // that handle as the only one the program inherits (CreateProcessW's bInheritHandles 1
+    // then, AStdin inheritable and open until it returned). nil when not open or Windows
+    // refuses. ReleaseList frees it after CreateProcessW
+    method AttributeList(const AStdin: uint64): ptr;
+    var
+      LCount: uint32;
+      LSize: uint64;
+    begin
+      self.ReleaseList();
+      if self.FConsole = 0 then
+        return nil;
+      end;
+      self.FStdin := AStdin;
+      LCount := 1;
+      if AStdin <> 0 then
+        LCount := 2;
+      end;
+      LSize := 0;
+      InitializeProcThreadAttributeList(nil, LCount, 0, LSize);
+      setlength(self.FList, int64(LSize));
+      if (len(self.FList) = 0) or
+        (InitializeProcThreadAttributeList(ptr(addr of self.FList[0]), LCount, 0, LSize) = 0) then
+        return nil;
+      end;
+      self.FListMade := true;
+      if UpdateProcThreadAttribute(ptr(addr of self.FList[0]), 0,
+        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, ptr(self.FConsole), 8, nil, nil) = 0 then
+        self.ReleaseList();
+        return nil;
+      end;
+      if (AStdin <> 0) and (UpdateProcThreadAttribute(ptr(addr of self.FList[0]), 0,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, ptr(addr of self.FStdin), 8, nil, nil) = 0) then
+        self.ReleaseList();
+        return nil;
+      end;
+      return ptr(addr of self.FList[0]);
+    end;
+
+    // AttributeList's list freed (nothing when there is none)
+    method ReleaseList();
+    begin
+      if self.FListMade then
+        DeleteProcThreadAttributeList(ptr(addr of self.FList[0]));
+        self.FListMade := false;
+      end;
+      setlength(self.FList, 0);
+      self.FStdin := 0;
+    end;
+
+    // AText (UTF-8 keys) written whole into the program's terminal. False when not open or
+    // the pipe is gone
+    method WriteKeys(const AText: string): bool;
+    var
+      LDone: int64;
+      LWritten: uint32;
+    begin
+      if (self.FConsole = 0) or (self.FInput = 0) then
+        return false;
+      end;
+      LDone := 0;
+      while LDone < len(AText) do
+        LWritten := 0;
+        if (WriteFile(self.FInput, ptr to const(addr of AText[LDone]),
+          uint32(len(AText) - LDone), LWritten, nil) = 0) or (LWritten = 0) then
+          return false;
+        end;
+        LDone := LDone + int64(LWritten);
+      end;
+      return true;
+    end;
+
+    // The terminal's new size (each side held to 1..32767). False when not open or refused
+    method Resize(const ACols: int32; const ARows: int32): bool;
+    var
+      LSize: COORD;
+    begin
+      if self.FConsole = 0 then
+        return false;
+      end;
+      LSize.X := int16(DoConsoleSide(ACols));
+      LSize.Y := int16(DoConsoleSide(ARows));
+      return ResizePseudoConsole(self.FConsole, LSize) = 0;
+    end;
+
+    // Closed (see the type): what it still writes out appended to ATail, then both pipe ends
+    // and the list. Nothing when it is not open (its pipe ends still closed)
+    method Close(var ATail: string);
+    var
+      LConsole: uint64;
+      LCloser: task;
+    begin
+      if self.FConsole <> 0 then
+        LConsole := self.FConsole;
+        self.FConsole := 0;
+        LCloser := async DoClosePseudoConsole(LConsole);
+        if self.FOutput <> 0 then
+          while WinReadSome(self.FOutput, ATail) do
+          end;
+        end;
+        await LCloser;
+      end;
+      self.ReleaseList();
+      DoCloseOpened(self.FInput);
+      DoCloseOpened(self.FOutput);
+      self.FInput := 0;
+      self.FOutput := 0;
+    end;
+
+    // One still open at the end is closed (its last output dropped)
+    done;
+    var
+      LDropped: string;
+    begin
+      self.Close(LDropped);
+    end;
+  end;
+
 // StdApp.Utils' RunPE: runs AExe (the path of the exe file itself, its extension included: the
 // application named in full, no PATH search; it goes through WinResolvePath) with AArgs, in
 // AWorkDir ("" = this process's folder), shown as AShowCmd (SW_*), no handle inherited, a
@@ -1759,7 +2115,7 @@ begin
   LCommandLine := own WideBox();
   LDirectory := own WideBox();
   AExitCode := 0;
-  if not DoProcessTexts(AExe, AArgs, AWorkDir, LApplication.Data, LCommandLine.Data,
+  if not WinProcessTexts(AExe, AArgs, AWorkDir, LApplication.Data, LCommandLine.Data,
     LDirectory.Data) then
     return false;
   end;
@@ -1807,7 +2163,7 @@ begin
   LNulName := own WideBox();
   AOutput := "";
   AExitCode := 0;
-  if not DoProcessTexts(AExe, AArgs, AWorkDir, LApplication.Data, LCommandLine.Data,
+  if not WinProcessTexts(AExe, AArgs, AWorkDir, LApplication.Data, LCommandLine.Data,
     LDirectory.Data) then
     return false;
   end;

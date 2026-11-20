@@ -1,0 +1,436 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.Process.Win64.adam - System.Process's platform unit for
+  x86_64-windows-gnu, over System.Windows.
+
+  The ProcessPlatform* routines are System.Windows' Win* routines of the
+  same job. ProcessPlatformRun is the one run a captured RunPE / RunElf
+  drives (StdApp.Utils' CaptureConsoleOutput / CaptureConsolePTY): Prepare
+  makes its output channel (pipes: one pipe stdout and stderr share, the
+  read end private; terminal: System.Windows' PseudoConsole) and its
+  standard input (NUL, or an inheritable copy of a host's handle), Launch
+  starts the program on them, Next hands over its output as it comes,
+  ExitCode waits for it. Terminal output is read while the program runs in
+  waits of ADAM_PROCESS_WIN64_SLICE_MS; once it ended the pseudo console is
+  closed while its last output is read (PseudoConsole.Close: no sleeps, no
+  "empty now = the end").
+
+  ProcessPlatformElfCommand is RunElf's launch on win64: the ELF run by
+  WSL (System32's wsl.exe -e), made executable first (chmod +x, its exit
+  code checked); with pipes stderr is joined to stdout inside Linux (sh
+  execs the program with 2>&1, the program and its arguments sh's
+  positional parameters, never parsed by it). A linux64 target adds
+  System.Process.Linux64 with the same names (an ELF there runs natively).
+*******************************************************************************/
+
+module unit System.Process.Win64;
+
+import System.SysUtils, System.Windows;
+
+const
+  // How long a terminal run waits for its program between reads of its output (ms)
+  ADAM_PROCESS_WIN64_SLICE_MS: uint32 = 50;
+  // A pseudo console's size when neither the host nor this process's console gives one
+  ADAM_PROCESS_WIN64_COLS: int32 = 120;
+  ADAM_PROCESS_WIN64_ROWS: int32 = 30;
+  // The long-path spellings WinResolvePath may return (a drive path, a share)
+  ADAM_PROCESS_WIN64_LONG_PREFIX: string = "\\\\?\\";
+  ADAM_PROCESS_WIN64_LONG_UNC_PREFIX: string = "\\\\?\\UNC\\";
+  // WSL's launcher in the system folder, and the script RunElf's pipes run under sh
+  ADAM_PROCESS_WIN64_WSL: string = "/wsl.exe";
+  ADAM_PROCESS_WIN64_ELF_MERGE: string = "exec \"$0\" \"$@\" 2>&1";
+
+// System.Process's RunProcess: System.Windows' Win* routine of the same job
+public routine ProcessPlatformRunProcess(const AExe: string; const AArgs: StringArray;
+  const AWorkDir: string; var AOutput: string; var AExitCode: uint32): bool;
+begin
+  return WinRunProcess(AExe, AArgs, AWorkDir, AOutput, AExitCode);
+end;
+
+// System.Process's RunAttached: System.Windows' Win* routine of the same job
+public routine ProcessPlatformRunAttached(const AExe: string; const AArgs: StringArray;
+  const AWorkDir: string; var AExitCode: uint32): bool;
+begin
+  return WinRunAttached(AExe, AArgs, AWorkDir, AExitCode);
+end;
+
+// System.Process's RunPE (the launch form): System.Windows' Win* routine of the same job, shown
+// normally
+public routine ProcessPlatformRunPE(const AExe: string; const AArgs: StringArray;
+  const AWorkDir: string; const AWait: bool; var AExitCode: uint32): bool;
+begin
+  return WinRunPE(AExe, AArgs, AWorkDir, AWait, SW_SHOWNORMAL, AExitCode);
+end;
+
+// One output line's bytes as text: as they are when they are UTF-8, else read as the OEM code
+// page (a console tool that does not write UTF-8 writes that)
+public routine ProcessPlatformDecodeLine(const ABytes: string): string;
+begin
+  if IsUtf8(ABytes) then
+    return ABytes;
+  end;
+  return WinOemToUtf8(ABytes);
+end;
+
+// This process's console window size into ACols x ARows; false when its stdout is no console
+routine DoOwnConsoleSize(var ACols: int32; var ARows: int32): bool;
+var
+  LOutput: uint64;
+  LInfo: CONSOLE_SCREEN_BUFFER_INFO;
+begin
+  LOutput := GetStdHandle(STD_OUTPUT_HANDLE);
+  if (LOutput = 0) or (LOutput = INVALID_HANDLE_VALUE) or
+    (GetConsoleScreenBufferInfo(LOutput, LInfo) = 0) then
+    return false;
+  end;
+  ACols := int32(LInfo.srWindow.Right) - int32(LInfo.srWindow.Left) + 1;
+  ARows := int32(LInfo.srWindow.Bottom) - int32(LInfo.srWindow.Top) + 1;
+  return (ACols > 0) and (ARows > 0);
+end;
+
+// A handle this unit opened, closed (0 / INVALID_HANDLE_VALUE: none)
+routine DoCloseOwned(const AHandle: uint64);
+begin
+  if (AHandle <> 0) and (AHandle <> INVALID_HANDLE_VALUE) then
+    CloseHandle(AHandle);
+  end;
+end;
+
+public type
+  // One captured run (see the header). Its handles are closed by Close or at its end
+  ProcessPlatformRun = object
+    // A terminal run (a pseudo console) or a pipes run
+    hidden FTerminal: bool;
+    hidden FConsole: ref PseudoConsole;
+    // Pipes: the read end (private) and the write end the program gets (closed once it has it)
+    hidden FRead: uint64;
+    hidden FWrite: uint64;
+    // The program's standard input (0: a terminal run's pseudo console)
+    hidden FStdin: uint64;
+    // The program once started, and a terminal run's progress: ended, its console drained
+    hidden FProcess: uint64;
+    hidden FThread: uint64;
+    hidden FExited: bool;
+    hidden FDrained: bool;
+
+    // The output channel and standard input made. ATerminal: a pseudo console of ACols x ARows
+    // (0 x 0: this process's console window's size, else 120 x 30); else pipes. Standard input:
+    // AStdin (a host's handle, copied inheritable: the host's own need not be) when not 0; else
+    // NUL, except a terminal run with a host (AHasHost): its pseudo console's (the keys the host
+    // types). False when Windows refuses (nothing left open)
+    method Prepare(const ATerminal: bool; const ACols: int32; const ARows: int32;
+      const AHasHost: bool; const AStdin: uint64): bool;
+    var
+      LAttributes: SECURITY_ATTRIBUTES;
+      LNulName: own WideBox;
+      LCols: int32;
+      LRows: int32;
+    begin
+      self.Close();
+      self.FTerminal := ATerminal;
+      LAttributes.nLength := uint32(size(SECURITY_ATTRIBUTES));
+      LAttributes.lpSecurityDescriptor := nil;
+      LAttributes.bInheritHandle := 1;
+      if AStdin <> 0 then
+        if DuplicateHandle(GetCurrentProcess(), AStdin, GetCurrentProcess(), self.FStdin, 0, 1,
+          DUPLICATE_SAME_ACCESS) = 0 then
+          self.FStdin := 0;
+          return false;
+        end;
+      else
+        if (not ATerminal) or (not AHasHost) then
+          LNulName := own WideBox();
+          if not Utf8ToWide("NUL", LNulName.Data) then
+            return false;
+          end;
+          self.FStdin := CreateFileW(LNulName.Data, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, LAttributes, OPEN_EXISTING, 0, 0);
+          if self.FStdin = INVALID_HANDLE_VALUE then
+            self.FStdin := 0;
+            return false;
+          end;
+        end;
+      end;
+      if not ATerminal then
+        // stdout and stderr share one pipe (the order written kept); its read end stays here: a
+        // child holding it could read its own output
+        if CreatePipe(self.FRead, self.FWrite, LAttributes, 0) = 0 then
+          self.FRead := 0;
+          self.FWrite := 0;
+          self.Close();
+          return false;
+        end;
+        if SetHandleInformation(self.FRead, HANDLE_FLAG_INHERIT, 0) = 0 then
+          self.Close();
+          return false;
+        end;
+        return true;
+      end;
+      LCols := ACols;
+      LRows := ARows;
+      if (LCols <= 0) or (LRows <= 0) then
+        if not DoOwnConsoleSize(LCols, LRows) then
+          LCols := ADAM_PROCESS_WIN64_COLS;
+          LRows := ADAM_PROCESS_WIN64_ROWS;
+        end;
+      end;
+      self.FConsole := ref PseudoConsole();
+      if self.FConsole.Open(LCols, LRows) <> 0 then
+        self.Close();
+        return false;
+      end;
+      return true;
+    end;
+
+    // AExe (named in full, no PATH search) started with AArgs in AWorkDir ("" = this process's
+    // folder) on what Prepare made, hidden for a pipes run. False when it does not start
+    method Launch(const AExe: string; const AArgs: StringArray; const AWorkDir: string): bool;
+    var
+      LApplication: own WideBox;
+      LCommandLine: own WideBox;
+      LDirectory: own WideBox;
+      LStartup: STARTUPINFOW;
+      LStartupEx: STARTUPINFOEXW;
+      LInfo: PROCESS_INFORMATION;
+      LList: ptr;
+      LStarted: bool;
+      LInherit: int32;
+    begin
+      if self.FProcess <> 0 then
+        return false;
+      end;
+      LApplication := own WideBox();
+      LCommandLine := own WideBox();
+      LDirectory := own WideBox();
+      if not WinProcessTexts(AExe, AArgs, AWorkDir, LApplication.Data, LCommandLine.Data,
+        LDirectory.Data) then
+        return false;
+      end;
+      if self.FTerminal then
+        if (self.FConsole = nil) or (not self.FConsole.IsOpen()) then
+          return false;
+        end;
+        LList := self.FConsole.AttributeList(self.FStdin);
+        if LList = nil then
+          return false;
+        end;
+        // The program reaches the pseudo console only: with this process's stdio redirected
+        // (an editor, a pipe) a handle left to the default would be inherited and written
+        // around it. 0 = the pseudo console's; stdin the one Prepare decided
+        LStartupEx.StartupInfo.cb := uint32(size(STARTUPINFOEXW));
+        LStartupEx.StartupInfo.dwFlags := STARTF_USESTDHANDLES;
+        LStartupEx.StartupInfo.hStdInput := self.FStdin;
+        LStartupEx.StartupInfo.hStdOutput := 0;
+        LStartupEx.StartupInfo.hStdError := 0;
+        LStartupEx.lpAttributeList := LList;
+        // Inheriting is on only for a stdin of its own; the handle list limits it to that one
+        LInherit := 0;
+        if self.FStdin <> 0 then
+          LInherit := 1;
+        end;
+        LStarted := CreateProcessW(LApplication.Data, LCommandLine.Data, nil, nil, LInherit,
+          EXTENDED_STARTUPINFO_PRESENT, nil, LDirectory.Data, LStartupEx.StartupInfo,
+          LInfo) <> 0;
+        self.FConsole.ReleaseList();
+      else
+        LStartup.cb := uint32(size(STARTUPINFOW));
+        LStartup.dwFlags := STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+        LStartup.wShowWindow := SW_HIDE;
+        LStartup.hStdInput := self.FStdin;
+        LStartup.hStdOutput := self.FWrite;
+        LStartup.hStdError := self.FWrite;
+        LStarted := CreateProcessW(LApplication.Data, LCommandLine.Data, nil, nil, 1,
+          NORMAL_PRIORITY_CLASS, nil, LDirectory.Data, LStartup, LInfo) <> 0;
+        // Only the program holds the write end now: the pipe breaks when it ends, so Next ends
+        // on the pipe's end, never on a buffer size
+        DoCloseOwned(self.FWrite);
+        self.FWrite := 0;
+      end;
+      if not LStarted then
+        return false;
+      end;
+      self.FProcess := LInfo.hProcess;
+      self.FThread := LInfo.hThread;
+      return true;
+    end;
+
+    // The program's output appended to ABytes as it comes (pipes: one read, waiting for it;
+    // terminal: what came within one wait, maybe nothing). False once all of it was handed over
+    method Next(var ABytes: string): bool;
+    var
+      LState: uint32;
+    begin
+      if self.FProcess = 0 then
+        return false;
+      end;
+      if not self.FTerminal then
+        return WinReadSome(self.FRead, ABytes);
+      end;
+      if self.FDrained then
+        return false;
+      end;
+      if self.FExited then
+        // Ended: the console closed while what it still holds is read to the pipe's break
+        self.FConsole.Close(ABytes);
+        self.FDrained := true;
+        return true;
+      end;
+      LState := WaitForSingleObject(self.FProcess, ADAM_PROCESS_WIN64_SLICE_MS);
+      WinReadAvailable(self.FConsole.Output(), ABytes);
+      if LState <> WAIT_TIMEOUT then
+        self.FExited := true;
+      end;
+      return true;
+    end;
+
+    // A terminal run's program has ended (its last output may still come from Next)
+    method Exited(): bool;
+    begin
+      return self.FExited;
+    end;
+
+    // AText typed into a terminal run's program. False for a pipes run or when it is gone
+    method WriteKeys(const AText: string): bool;
+    begin
+      if (not self.FTerminal) or (self.FConsole = nil) then
+        return false;
+      end;
+      return self.FConsole.WriteKeys(AText);
+    end;
+
+    // A terminal run's new size. False for a pipes run or when refused
+    method Resize(const ACols: int32; const ARows: int32): bool;
+    begin
+      if (not self.FTerminal) or (self.FConsole = nil) then
+        return false;
+      end;
+      return self.FConsole.Resize(ACols, ARows);
+    end;
+
+    // Waits for the program and takes its exit code into ACode. False when it never started or
+    // its exit code cannot be read
+    method ExitCode(var ACode: uint32): bool;
+    begin
+      if self.FProcess = 0 then
+        return false;
+      end;
+      WaitForSingleObject(self.FProcess, INFINITE);
+      return GetExitCodeProcess(self.FProcess, ACode) <> 0;
+    end;
+
+    // Every handle closed (a pseudo console still open closed with its last output dropped);
+    // it may be prepared again
+    method Close();
+    var
+      LDropped: string;
+    begin
+      if self.FConsole <> nil then
+        self.FConsole.Close(LDropped);
+        self.FConsole := nil;
+      end;
+      DoCloseOwned(self.FRead);
+      DoCloseOwned(self.FWrite);
+      DoCloseOwned(self.FStdin);
+      DoCloseOwned(self.FProcess);
+      DoCloseOwned(self.FThread);
+      self.FRead := 0;
+      self.FWrite := 0;
+      self.FStdin := 0;
+      self.FProcess := 0;
+      self.FThread := 0;
+      self.FExited := false;
+      self.FDrained := false;
+    end;
+
+    done;
+    begin
+      self.Close();
+    end;
+  end;
+
+// RunElf's launch on win64 (see the header): AExe and AArgsOut start AElf with AArgs through
+// WSL (APipes: stderr joined to stdout in Linux). False when there is no WSL, AElf is no file or
+// has no drive path WSL can name (a share), or chmod +x fails
+public routine ProcessPlatformElfCommand(const AElf: string; const AArgs: StringArray;
+  const AWorkDir: string; const APipes: bool; var AExe: string; var AArgsOut: StringArray): bool;
+var
+  LPath: string;
+  LWslPath: string;
+  LOutput: string;
+  LExit: uint32;
+  LChmod: StringArray;
+  LAt: int64;
+  LI: int64;
+begin
+  AExe := WinSystemDir();
+  if AExe = "" then
+    return false;
+  end;
+  AExe := AExe + ADAM_PROCESS_WIN64_WSL;
+  if (not WinFileExists(AExe)) or (not WinFileExists(AElf)) then
+    return false;
+  end;
+  // The ELF's drive path, plain ('\'), as WSL names it ("" for a share: refused)
+  LPath := ReplaceStr(WinResolvePath(AElf), "/", "\\");
+  if StartsStr(ADAM_PROCESS_WIN64_LONG_UNC_PREFIX, LPath) then
+    return false;
+  end;
+  if StartsStr(ADAM_PROCESS_WIN64_LONG_PREFIX, LPath) then
+    LPath := Substring(LPath, len(ADAM_PROCESS_WIN64_LONG_PREFIX),
+      len(LPath) - len(ADAM_PROCESS_WIN64_LONG_PREFIX));
+  end;
+  LWslPath := WindowsPathToWSL(LPath);
+  if LWslPath = "" then
+    return false;
+  end;
+
+  // Executable first: wsl -e runs chmod itself (no shell: the path one literal argument)
+  setlength(LChmod, 4);
+  LChmod[0] := "-e";
+  LChmod[1] := "chmod";
+  LChmod[2] := "+x";
+  LChmod[3] := LWslPath;
+  LExit := 0;
+  if (not WinRunProcess(AExe, LChmod, AWorkDir, LOutput, LExit)) or (LExit <> 0) then
+    return false;
+  end;
+
+  // The program and its own arguments after it, quoted by the Windows argv rule as for a
+  // Windows program (wsl splits them by it), never through bash
+  if APipes then
+    setlength(AArgsOut, 5 + len(AArgs));
+    AArgsOut[0] := "-e";
+    AArgsOut[1] := "sh";
+    AArgsOut[2] := "-c";
+    AArgsOut[3] := ADAM_PROCESS_WIN64_ELF_MERGE;
+    AArgsOut[4] := LWslPath;
+    LAt := 5;
+  else
+    setlength(AArgsOut, 2 + len(AArgs));
+    AArgsOut[0] := "-e";
+    AArgsOut[1] := LWslPath;
+    LAt := 2;
+  end;
+  for LI := 0 to len(AArgs) - 1 do
+    AArgsOut[LAt + LI] := AArgs[LI];
+  end;
+  return true;
+end;
+
+end.
