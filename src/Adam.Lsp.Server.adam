@@ -55,6 +55,13 @@
   DoSameFile). A report's range starts at its
   place and runs over the word there (one character else).
 
+  semanticTokens/full (Adam.Lsp.Tokens): a document changed since its last
+  check is checked first (its diagnostics published), so the colours are of
+  the text the client holds; each document keeps its last check's tree. A
+  document that is not open has none (null). initialize names the legend
+  and, in capabilities.experimental.adamWords, the Lexer's keyword and
+  builtin type words (an editor's instant colouring).
+
   Prior art: PaskalCPP.LSP.Server / Diagnostics (CONCEPT: the lifecycle,
   the request rules, the owner-based publish; GEOMETRY rejected: Adam's
   types, System.Json).
@@ -64,7 +71,7 @@ module unit Adam.Lsp.Server;
 
 import System.SysUtils, System.IO, System.Json, Adam.Core.Common, Adam.Core.Messages,
   Adam.Compiler.Diagnostics, Adam.Protocol.Transport, Adam.Driver.Compiler, Adam.Lsp.Uri,
-  Adam.Lsp.Document;
+  Adam.Lsp.Document, Adam.Compiler.Lexer, Adam.Lsp.Tokens;
 
 public const
   // RunLsp's exit codes: "exit" after shutdown / any other end
@@ -75,6 +82,7 @@ public const
   ADAM_LSP_ERROR_PARSE: int64 = -32700;
   ADAM_LSP_ERROR_INVALID_REQUEST: int64 = -32600;
   ADAM_LSP_ERROR_METHOD_NOT_FOUND: int64 = -32601;
+  ADAM_LSP_ERROR_INVALID_PARAMS: int64 = -32602;
   ADAM_LSP_ERROR_NOT_INITIALIZED: int64 = -32002;
   // DiagnosticSeverity
   ADAM_LSP_SEVERITY_ERROR: int64 = 1;
@@ -87,6 +95,8 @@ public const
   // A diagnostic's source, the server's name
   ADAM_LSP_SOURCE: string = "adam";
   ADAM_LSP_SERVER_NAME: string = "adam";
+  // capabilities.experimental's key of Adam's word lists
+  ADAM_LSP_WORDS_KEY: string = "adamWords";
   // PositionEncodingKind
   ADAM_LSP_ENCODING_UTF8: string = "utf-8";
   ADAM_LSP_ENCODING_UTF16: string = "utf-16";
@@ -100,6 +110,7 @@ public const
   ADAM_LSP_DID_CLOSE: string = "textDocument/didClose";
   ADAM_LSP_PUBLISH_DIAGNOSTICS: string = "textDocument/publishDiagnostics";
   ADAM_LSP_LOG_MESSAGE: string = "window/logMessage";
+  ADAM_LSP_SEMANTIC_FULL: string = "textDocument/semanticTokens/full";
 
 type
   // Where the session is: before initialize, serving, after shutdown
@@ -186,6 +197,18 @@ begin
   end;
   LCode := DecodeUtf8Char(AText, LAt);
   return LAt - AOffset;
+end;
+
+// AList as a JSON array under AKey of AJson
+routine DoAddList(var AJson: Json; const AKey: string; const AList: StringArray);
+var
+  LI: int64;
+begin
+  AJson.BeginArray(AKey);
+  for LI := 0 to len(AList) - 1 do
+    AJson.Add(AList[LI]);
+  end;
+  AJson.EndArray();
 end;
 
 // The PositionEncodingKind AEncoding is written as
@@ -297,6 +320,9 @@ type
     // What the checks published, by URI: the document whose check did (its owner)
     hidden FPublishedUris: StringArray;
     hidden FPublishedOwners: StringArray;
+    // Each checked document's last check, by URI (its tree for the requests on positions)
+    hidden FCheckUris: StringArray;
+    hidden FChecks: array of ref Compiler;
     hidden FExitWanted: bool;
     hidden FExitCode: int32;
 
@@ -500,6 +526,10 @@ type
         self.DoResult(AId, LNone, true);
         return;
       end;
+      if AMethod = ADAM_LSP_SEMANTIC_FULL then
+        self.DoSemanticTokens(AId, AParams);
+        return;
+      end;
       // Unknown requests, $/ ones too, fail
       self.DoError(AId, true, ADAM_LSP_ERROR_METHOD_NOT_FOUND,
         NoArgs().Str(AMethod).Fill(ADAM_MSG_LSP_METHOD_NOT_FOUND));
@@ -541,6 +571,19 @@ type
       LResult.BeginObject("textDocumentSync");
       LResult.Add("openClose", true);
       LResult.Add("change", ADAM_LSP_SYNC_INCREMENTAL);
+      LResult.EndObject();
+      LResult.BeginObject("semanticTokensProvider");
+      LResult.BeginObject("legend");
+      DoAddList(LResult, "tokenTypes", TokenTypeNames());
+      DoAddList(LResult, "tokenModifiers", TokenModifierNames());
+      LResult.EndObject();
+      LResult.Add("full", true);
+      LResult.EndObject();
+      LResult.BeginObject("experimental");
+      LResult.BeginObject(ADAM_LSP_WORDS_KEY);
+      DoAddList(LResult, "keywords", ReservedWords(false));
+      DoAddList(LResult, "types", ReservedWords(true));
+      LResult.EndObject();
       LResult.EndObject();
       LResult.EndObject();
       LResult.BeginObject("serverInfo");
@@ -755,6 +798,7 @@ type
       if LAt >= 0 then
         DoRemoveAt(self.FDirty, LAt);
       end;
+      self.DoDropCheck(LUri);
       // What the closed document's checks published goes, its own URI too (an import that
       // was this buffer is read from its file again at the next check)
       setlength(LNone, 0);
@@ -871,6 +915,109 @@ type
       for LI := 0 to len(LSeen) - 1 do
         self.DoSetOwner(LSeen[LI], ADocument.Uri);
       end;
+      // The tree a document that names a file got: the requests on it read this one
+      if ADocument.Path <> "" then
+        self.DoKeepCheck(ADocument.Uri, LCompiler);
+      end;
+    end;
+
+    // -- The kept checks
+
+    // ACompiler kept as the last check of AUri (one before it dropped)
+    hidden method DoKeepCheck(const AUri: string; const ACompiler: ref Compiler);
+    var
+      LAt: int64;
+      LCount: int64;
+    begin
+      LAt := DoIndexOf(self.FCheckUris, AUri);
+      if LAt >= 0 then
+        self.FChecks[LAt] := ACompiler;
+        return;
+      end;
+      DoAppend(self.FCheckUris, AUri);
+      LCount := len(self.FChecks);
+      setlength(self.FChecks, LCount + 1);
+      self.FChecks[LCount] := ACompiler;
+    end;
+
+    // The last check of AUri; nil when it has none
+    hidden const method DoCheckOf(const AUri: string): ref Compiler;
+    var
+      LAt: int64;
+    begin
+      LAt := DoIndexOf(self.FCheckUris, AUri);
+      if LAt < 0 then
+        return nil;
+      end;
+      return self.FChecks[LAt];
+    end;
+
+    // AUri's last check dropped (its document closed)
+    hidden method DoDropCheck(const AUri: string);
+    var
+      LAt: int64;
+      LI: int64;
+    begin
+      LAt := DoIndexOf(self.FCheckUris, AUri);
+      if LAt < 0 then
+        return;
+      end;
+      DoRemoveAt(self.FCheckUris, LAt);
+      for LI := LAt to len(self.FChecks) - 2 do
+        self.FChecks[LI] := self.FChecks[LI + 1];
+      end;
+      setlength(self.FChecks, len(self.FChecks) - 1);
+    end;
+
+    // ADocument as its last check left it: checked now when it changed since (the
+    // diagnostics published as at an idle)
+    hidden method DoCurrentCheck(const ADocument: ref LspDocument): ref Compiler;
+    var
+      LAt: int64;
+    begin
+      LAt := DoIndexOf(self.FDirty, ADocument.Uri);
+      if LAt >= 0 then
+        DoRemoveAt(self.FDirty, LAt);
+        self.DoCheckRun(ADocument);
+      end;
+      return self.DoCheckOf(ADocument.Uri);
+    end;
+
+    // -- Requests on documents
+
+    // textDocument/semanticTokens/full (see the header)
+    hidden method DoSemanticTokens(const AId: Json; const AParams: Json);
+    var
+      LUri: string;
+      LDocument: ref LspDocument;
+      LCheck: ref Compiler;
+      LData: Int64Array;
+      LResult: Json;
+      LNone: Json;
+      LI: int64;
+    begin
+      if not AParams.TryGetString("textDocument.uri", LUri) then
+        self.DoError(AId, true, ADAM_LSP_ERROR_INVALID_PARAMS,
+          NoArgs().Str(ADAM_LSP_SEMANTIC_FULL).Fill(ADAM_MSG_LSP_BAD_PARAMS));
+        return;
+      end;
+      LDocument := self.DoFind(LUri);
+      if LDocument = nil then
+        self.DoResult(AId, LNone, true);
+        return;
+      end;
+      LCheck := self.DoCurrentCheck(LDocument);
+      if LCheck = nil then
+        LData := SemanticTokens(LDocument, nil, 0, self.FEncoding);
+      else
+        LData := SemanticTokens(LDocument, LCheck.Tree, LCheck.MainModule, self.FEncoding);
+      end;
+      LResult.BeginArray("data");
+      for LI := 0 to len(LData) - 1 do
+        LResult.Add(LData[LI]);
+      end;
+      LResult.EndArray();
+      self.DoResult(AId, LResult, false);
     end;
 
     // The index of the published entry for the same file as AUri (DoSameFile); -1 when none

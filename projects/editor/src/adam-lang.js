@@ -176,6 +176,8 @@ var AdamLang = (function () {
       { token: 'struct', foreground: '4EC9B0' },
       { token: 'class', foreground: '4EC9B0' },
       { token: 'enum', foreground: '4EC9B0' },
+      { token: 'interface', foreground: 'B8D7A3' },
+      { token: 'typeParameter', foreground: '4EC9B0' },
       { token: 'enumMember', foreground: '4FC1FF' },
       { token: 'parameter', foreground: '9CDCFE' },
       { token: 'variable', foreground: '9CDCFE' },
