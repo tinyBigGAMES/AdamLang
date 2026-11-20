@@ -45,9 +45,20 @@
       exception directory, read from the image in the program once per
       module and searched by address; DbgHelp's own SymFunctionTableAccess64
       reads it through a real process handle, which a made-up session has
-      none of). Each frame's registers are the CONTEXT StackWalk64 left
-      (Win64ReadContext, the target part's one decoder). The walk ends at a
-      frame in no loaded module (no function table to unwind it by).
+      none of), the program's other code images' (AddImage: the OS's
+      libraries) as well, so a walk from inside the OS (a raise's first
+      chance in RaiseException) reaches the program's frames. Each frame's
+      registers are the CONTEXT StackWalk64 left (Win64ReadContext, the
+      target part's one decoder). The walk ends at a frame in no module or
+      image (no function table to unwind it by).
+    - catches (CatchTargets): the frame's RUNTIME_FUNCTION (a chained one
+      followed to the function's own), its UNWIND_INFO; with
+      UNW_FLAG_EHANDLER its handler data is the scope table (Adam's frame
+      handler is C's __C_specific_handler, whose table C's own __try uses
+      too): each catching scope (a jump target) whose range holds the
+      address gives its jump target, where the except part starts. Read
+      only in the modules (the program's own code, C's and Adam's): the OS's
+      images keep handlers whose data has other shapes.
 
   DbgHelp is not thread-safe: as the DebugTarget, one thread drives this.
 *******************************************************************************/
@@ -76,6 +87,16 @@ const
   ADAM_SYMBOLS_WIN64_EXCEPTION_DIR_AT: int64 = 0xA0;
   // A RUNTIME_FUNCTION's bytes
   ADAM_SYMBOLS_WIN64_FUNCTION_SIZE: int64 = 12;
+  // UNWIND_INFO's fixed head (version / flags, prologue, code count, frame register), a
+  // code slot's bytes, the most chained entries followed before the data counts as broken
+  ADAM_SYMBOLS_WIN64_UNWIND_HEAD: int64 = 4;
+  ADAM_SYMBOLS_WIN64_UNWIND_SLOT: int64 = 2;
+  ADAM_SYMBOLS_WIN64_CHAIN_MOST: int64 = 32;
+  // A scope table's count and one scope's bytes (begin, end, handler, jump target), and the
+  // most scopes read before the table counts as broken
+  ADAM_SYMBOLS_WIN64_SCOPE_COUNT_SIZE: int64 = 4;
+  ADAM_SYMBOLS_WIN64_SCOPE_SIZE: int64 = 16;
+  ADAM_SYMBOLS_WIN64_SCOPE_MOST: int64 = 65536;
   ADAM_SYMBOLS_WIN64_OPTIONS: uint32 = SYMOPT_UNDNAME |
     SYMOPT_LOAD_LINES | SYMOPT_FAIL_CRITICAL_ERRORS |
     SYMOPT_IGNORE_NT_SYMPATH | SYMOPT_NO_PROMPTS;
@@ -140,37 +161,64 @@ begin
   return -1;
 end;
 
-// StackWalk64's function table routine: the RUNTIME_FUNCTION whose code holds AAddress (a
-// binary search of its module's sorted entries), nil for none
-routine clink DoFunctionTable(AProcess: uint64; AAddress: uint64): ptr;
+// The entry of ATable whose code holds ARva into AEntry (a binary search of its sorted
+// entries); false for none (a leaf function has none)
+routine DoFindEntry(const ATable: Win64FunctionTable; const ARva: uint32;
+  var AEntry: Win64RuntimeFunction): bool;
 var
-  LTable: int64;
-  LRva: uint32;
   LLow: int64;
   LHigh: int64;
   LMiddle: int64;
+begin
+  LLow := 0;
+  LHigh := len(ATable.Entries) - 1;
+  while LLow <= LHigh do
+    LMiddle := LLow + (LHigh - LLow) div 2;
+    if ARva < ATable.Entries[LMiddle].BeginAddress then
+      LHigh := LMiddle - 1;
+    else
+      if ARva >= ATable.Entries[LMiddle].EndAddress then
+        LLow := LMiddle + 1;
+      else
+        AEntry := ATable.Entries[LMiddle];
+        return true;
+      end;
+    end;
+  end;
+  return false;
+end;
+
+// StackWalk64's function table routine: the RUNTIME_FUNCTION whose code holds AAddress, nil
+// for none
+routine clink DoFunctionTable(AProcess: uint64; AAddress: uint64): ptr;
+var
+  LTable: int64;
 begin
   LTable := DoWalkTableOf(AAddress);
   if LTable < 0 then
     return nil;
   end;
-  LRva := uint32(AAddress - GWalkTables[LTable].Base);
-  LLow := 0;
-  LHigh := len(GWalkTables[LTable].Entries) - 1;
-  while LLow <= LHigh do
-    LMiddle := LLow + (LHigh - LLow) div 2;
-    if LRva < GWalkTables[LTable].Entries[LMiddle].BeginAddress then
-      LHigh := LMiddle - 1;
-    else
-      if LRva >= GWalkTables[LTable].Entries[LMiddle].EndAddress then
-        LLow := LMiddle + 1;
-      else
-        GWalkEntry := GWalkTables[LTable].Entries[LMiddle];
-        return ptr(addr of GWalkEntry);
-      end;
-    end;
+  if not DoFindEntry(GWalkTables[LTable], uint32(AAddress - GWalkTables[LTable].Base),
+    GWalkEntry) then
+    return nil;
   end;
-  return nil;
+  return ptr(addr of GWalkEntry);
+end;
+
+// The RUNTIME_FUNCTION in ATarget's program at AAddress into AEntry; false when it cannot be
+// read
+routine DoReadEntry(const ATarget: ref DebugTarget; const AAddress: uint64;
+  var AEntry: Win64RuntimeFunction): bool;
+var
+  LBytes: ByteArray;
+begin
+  if not ATarget.PeekMemory(AAddress, ADAM_SYMBOLS_WIN64_FUNCTION_SIZE, LBytes) then
+    return false;
+  end;
+  AEntry.BeginAddress := DoU32(LBytes, 0);
+  AEntry.EndAddress := DoU32(LBytes, 4);
+  AEntry.UnwindData := DoU32(LBytes, 8);
+  return true;
 end;
 
 // StackWalk64's module base routine: the base of the loaded module holding AAddress, 0 for
@@ -453,8 +501,10 @@ public type
     hidden FBoxA: own DebugWideBox;
     hidden FBoxB: own DebugWideBox;
     hidden FSymbol: DebugSymbolInfo;
-    // The loaded modules' function tables, read at the first walk after a load
+    // The function tables of the modules, then of the code images that are no module, read
+    // at the first walk after either changed (FTablesRead false)
     hidden FTables: Win64FunctionTableArray;
+    hidden FTablesRead: bool;
 
     override method LoadModule(const APath: string; const ABase: uint64): bool;
     var
@@ -500,7 +550,7 @@ public type
       setlength(self.FModules, LCount + 1);
       self.FModules[LCount] := ABase;
       // Its function table is read from the program at the next walk
-      setlength(self.FTables, 0);
+      self.FTablesRead := false;
       return true;
     end;
 
@@ -511,7 +561,151 @@ public type
         self.FProcess := 0;
       end;
       setlength(self.FModules, 0);
-      setlength(self.FTables, 0);
+      self.FTablesRead := false;
+    end;
+
+    hidden override method DoImagesChanged();
+    begin
+      self.FTablesRead := false;
+    end;
+
+    override method CatchTargets(const ATarget: ref DebugTarget; const ALookup: uint64;
+      var ATargets: DebugWordArray): bool;
+    var
+      LTable: int64;
+      LBase: uint64;
+      LRva: uint32;
+      LEntry: Win64RuntimeFunction;
+      LBytes: ByteArray;
+      LFlags: uint8;
+      LAt: uint64;
+      LChain: int64;
+      LCount: int64;
+      LI: int64;
+      LCountNow: int64;
+      LBegin: uint32;
+      LEnd: uint32;
+      LJump: uint32;
+    begin
+      setlength(ATargets, 0);
+      self.DoReadTables(ATarget);
+      LTable := self.DoModuleTableOf(ALookup);
+      if LTable < 0 then
+        // not the program's own code: no guard of its is known there
+        return true;
+      end;
+      LBase := self.FTables[LTable].Base;
+      LRva := uint32(ALookup - LBase);
+      if not DoFindEntry(self.FTables[LTable], LRva, LEntry) then
+        // a leaf function: no handler
+        return true;
+      end;
+      // UnwindData's low bit: the entry points at another RUNTIME_FUNCTION (the function's)
+      if (LEntry.UnwindData & 1) <> 0 then
+        if not DoReadEntry(ATarget, LBase + uint64(LEntry.UnwindData & 0xFFFFFFFE), LEntry) then
+          return false;
+        end;
+      end;
+      // A chained UNWIND_INFO (a function's later part) goes on in its function's entry,
+      // which holds the handler
+      LChain := 0;
+      while true do
+        if not ATarget.PeekMemory(LBase + uint64(LEntry.UnwindData), ADAM_SYMBOLS_WIN64_UNWIND_HEAD,
+          LBytes) then
+          return false;
+        end;
+        LFlags := uint8(LBytes[0] >> 3);
+        // the code slots, an even number of them: the handler (or the chained entry) after
+        LAt := LBase + uint64(LEntry.UnwindData) + uint64(ADAM_SYMBOLS_WIN64_UNWIND_HEAD) +
+          uint64(((int64(LBytes[2]) + 1) div 2) * 2 * ADAM_SYMBOLS_WIN64_UNWIND_SLOT);
+        if (LFlags & UNW_FLAG_CHAININFO) = 0 then
+          leave;
+        end;
+        LChain := LChain + 1;
+        if (LChain > ADAM_SYMBOLS_WIN64_CHAIN_MOST) or not DoReadEntry(ATarget, LAt, LEntry) then
+          return false;
+        end;
+      end;
+      if (LFlags & UNW_FLAG_EHANDLER) = 0 then
+        // no handler that catches (a finally's alone, or none)
+        return true;
+      end;
+      // The handler's RVA, then its data: the scope table's count and its scopes
+      if not ATarget.PeekMemory(LAt + 4, ADAM_SYMBOLS_WIN64_SCOPE_COUNT_SIZE, LBytes) then
+        return false;
+      end;
+      LCount := int64(DoU32(LBytes, 0));
+      if LCount > ADAM_SYMBOLS_WIN64_SCOPE_MOST then
+        return false;
+      end;
+      if LCount = 0 then
+        return true;
+      end;
+      if not ATarget.PeekMemory(LAt + 4 + uint64(ADAM_SYMBOLS_WIN64_SCOPE_COUNT_SIZE),
+        LCount * ADAM_SYMBOLS_WIN64_SCOPE_SIZE, LBytes) then
+        return false;
+      end;
+      for LI := 0 to LCount - 1 do
+        LBegin := DoU32(LBytes, LI * ADAM_SYMBOLS_WIN64_SCOPE_SIZE);
+        LEnd := DoU32(LBytes, LI * ADAM_SYMBOLS_WIN64_SCOPE_SIZE + 4);
+        LJump := DoU32(LBytes, LI * ADAM_SYMBOLS_WIN64_SCOPE_SIZE + 12);
+        // a finally's jump target is 0: it never resumes the frame
+        if (LJump <> 0) and (LRva >= LBegin) and (LRva < LEnd) then
+          LCountNow := len(ATargets);
+          setlength(ATargets, LCountNow + 1);
+          ATargets[LCountNow] := LBase + uint64(LJump);
+        end;
+      end;
+      return true;
+    end;
+
+    // The function tables of the modules, then of each code image that is no module, read
+    // from the program when either changed
+    hidden method DoReadTables(const ATarget: ref DebugTarget);
+    var
+      LImages: DebugWordArray;
+      LI: int64;
+      LJ: int64;
+      LCount: int64;
+      LModule: bool;
+    begin
+      if self.FTablesRead then
+        return;
+      end;
+      setlength(self.FTables, len(self.FModules));
+      for LI := 0 to len(self.FModules) - 1 do
+        DoReadFunctionTable(ATarget, self.FModules[LI], self.FTables[LI]);
+      end;
+      LImages := self.Images();
+      for LI := 0 to len(LImages) - 1 do
+        LModule := false;
+        for LJ := 0 to len(self.FModules) - 1 do
+          if self.FModules[LJ] = LImages[LI] then
+            LModule := true;
+          end;
+        end;
+        if not LModule then
+          LCount := len(self.FTables);
+          setlength(self.FTables, LCount + 1);
+          DoReadFunctionTable(ATarget, LImages[LI], self.FTables[LCount]);
+        end;
+      end;
+      self.FTablesRead := true;
+    end;
+
+    // The index of the module's function table (FTables' first len(FModules)) holding
+    // AAddress; -1 when no module holds it (an image's, or none)
+    hidden const method DoModuleTableOf(const AAddress: uint64): int64;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FModules) - 1 do
+        if (LI < len(self.FTables)) and (AAddress >= self.FTables[LI].Base) and
+          (AAddress - self.FTables[LI].Base < self.FTables[LI].Size) then
+          return LI;
+        end;
+      end;
+      return -1;
     end;
 
     override const method IsLoaded(): bool;
@@ -836,12 +1030,7 @@ public type
       LFrame.AddrFrame.Mode := AddrModeFlat;
       LFrame.AddrStack.Offset := AContext.Sp;
       LFrame.AddrStack.Mode := AddrModeFlat;
-      if len(self.FTables) <> len(self.FModules) then
-        setlength(self.FTables, len(self.FModules));
-        for LCount := 0 to len(self.FModules) - 1 do
-          DoReadFunctionTable(ATarget, self.FModules[LCount], self.FTables[LCount]);
-        end;
-      end;
+      self.DoReadTables(ATarget);
       GWalkTarget := ATarget;
       GWalkTables := self.FTables;
       LCount := 0;
@@ -871,7 +1060,7 @@ public type
         setlength(AFrames, LCount + 1);
         AFrames[LCount] := LItem;
         LCount := LCount + 1;
-        // A frame in no loaded module has no function table to be unwound by
+        // A frame in no module or image has no function table to be unwound by
         if DoWalkTableOf(LLookup) < 0 then
           leave;
         end;

@@ -42,6 +42,16 @@
       compiler's own calls are not the program's). A step that leaves the
       routine stops in its caller; Out runs to the caller. A step from code
       with no line (the Entry) runs to the program's first statement.
+    - First chances (M11a D6b): SetBreakOnFirstChance stops every
+      exception at its first chance (an Exception stop, FirstChance true),
+      before the program's guards see it. A step watches its own thread's
+      first chances even so: one it was not asked to stop at may unwind the
+      step's frame past every patch it placed, so the except parts that
+      may take it (the symbols' CatchTargets of each frame from the step's
+      own up) get patches, and the program goes on to its handlers; the
+      first one reached ends the step at its line (or steps on to the next
+      line start from there). A raise caught below the step's frame
+      returns as any call does.
     - While stopped: the thread's stack, each frame's scopes (Params,
       Locals, Globals: the program module's own), their variables and the
       children of a value (fields, elements, a pointer's target, an
@@ -293,6 +303,9 @@ public type
     Source: SourceLine;
     Routine: string;
     ExceptionCode: uint32;
+    // An Exception stop at the exception's first chance (SetBreakOnFirstChance), before the
+    // program's handlers
+    FirstChance: bool;
     ExitCode: uint32;
   end;
 
@@ -348,8 +361,19 @@ public type
 
   RuntimeHandleArray = array of RuntimeHandle;
 
-  // Where a step's patch takes it: a call's return, a routine's first statement
-  RuntimeLanding = choices(Return, Body);
+  // Where a step's patch takes it: a call's return, a routine's first statement, an except
+  // part's start an unwind resumes the program at
+  RuntimeLanding = choices(Return, Body, Catch);
+
+  // One of a step's own patches: where, the stack pointer it is taken at (or above), where
+  // it lands
+  RuntimeTemp = record
+    Address: uint64;
+    Sp: uint64;
+    Landing: RuntimeLanding;
+  end;
+
+  RuntimeTempArray = array of RuntimeTemp;
 
   // Asked while the program runs (SetPauseCheck), on the thread that waits for it: PauseNow
   // true = pause it now. The REPL's says whether the console's Ctrl+C was pressed
@@ -388,13 +412,15 @@ public type
     hidden FStepRoutine: uint64;
     hidden FStepBody: uint64;
     hidden FStepCallerSp: uint64;
+    // The stack pointer the step started at (the frames from its own up are the ones an
+    // unwind may resume it in), and whether its unwind watch has its patches in
+    hidden FStepSp: uint64;
+    hidden FStepUnwound: bool;
     hidden FBefore: DebugContext;
-    // The step's own patch (Active), where it is, the stack pointer it is taken at (or
-    // above), where it lands
-    hidden FTempActive: bool;
-    hidden FTempAddress: uint64;
-    hidden FTempSp: uint64;
-    hidden FTempLanding: RuntimeLanding;
+    // The step's own patches (one per address)
+    hidden FTemps: RuntimeTempArray;
+    // Every exception stops at its first chance (SetBreakOnFirstChance)
+    hidden FBreakOnFirstChance: bool;
     // Asked at least every ADAM_RUNTIME_PAUSE_SLICE_MS while the program runs (nil: the waits
     // never end on their own), and when it was last asked
     hidden FPauseCheck: ref RuntimePauseCheck;
@@ -420,7 +446,9 @@ public type
       self.FFramesRead := false;
       self.FHandleCount := 0;
       self.FStepping := false;
-      self.FTempActive := false;
+      self.FStepUnwound := false;
+      setlength(self.FTemps, 0);
+      self.FBreakOnFirstChance := false;
       self.FPauseCheck := nil;
       self.FCheckedAt := 0;
       self.FWithSymbols := true;
@@ -532,12 +560,17 @@ public type
     begin
       self.FTarget.SetProgram(AExePath, AArgs);
       self.FTarget.SetOutputMode(AMode);
+      self.FTarget.SetBreakOnFirstChance(self.FBreakOnFirstChance);
+      self.FSymbols.ClearImages();
       if not self.FTarget.Start() then
         return false;
       end;
       self.FLaunched := true;
       while self.DoNext(LEvent) do
         if LEvent.Kind = DebugEventKind.ProcessStarted then
+          // the exe's code is walked through even with no debug information of its own (a
+          // dll's host)
+          self.FSymbols.AddImage(LEvent.Address);
           if self.FHostedImage = "" then
             self.FProgramModule := ChangeFileExt(ExtractFileName(self.FTarget.ImagePath()), "");
             if self.FWithSymbols and self.FSymbols.Load(self.FTarget) then
@@ -590,7 +623,18 @@ public type
       end;
       self.FStopped := false;
       self.FSymbols.Close();
+      self.FSymbols.ClearImages();
     end;
+
+    // Every exception stops at its first chance (AOn: an Exception stop, FirstChance true)
+    // or only at its second (see the header); may be set at any time
+    method SetBreakOnFirstChance(const AOn: bool);
+    begin
+      self.FBreakOnFirstChance := AOn;
+      self.FTarget.SetBreakOnFirstChance(AOn);
+    end;
+
+    property BreakOnFirstChance: bool read FBreakOnFirstChance;
 
     // A breakpoint on file AFile, line ALine: put in now when the program runs (Verified
     // when that line or one after it has code), else when Launch starts it
@@ -677,6 +721,14 @@ public type
       if len(LFrames) > 1 then
         self.FStepCallerSp := LFrames[1].Context.Sp;
       end;
+      // An exception on the thread may unwind the step's frame: its first chances watched. Out
+      // leaves the routine: only its callers' except parts are where it would go
+      self.FStepSp := LContext.Sp;
+      if AKind = RuntimeStepKind.Out then
+        self.FStepSp := self.FStepCallerSp;
+      end;
+      self.FStepUnwound := false;
+      self.FTarget.SetFirstChanceThread(self.FStepThread);
       if AKind = RuntimeStepKind.Out then
         if len(LFrames) < 2 then
           // nothing to return to: the program runs on
@@ -1639,34 +1691,131 @@ public type
       return 0;
     end;
 
-    // The step's own patch put at AAddress, taken at stack pointer ASp or above, landing as
-    // ALanding says
+    // The step's one patch put at AAddress (its others out), taken at stack pointer ASp or
+    // above, landing as ALanding says
     hidden method DoSetTemp(const AAddress: uint64; const ASp: uint64;
       const ALanding: RuntimeLanding);
     begin
       self.DoDropTemp();
-      if self.FTarget.AddPatch(AAddress) then
-        self.FTempActive := true;
-        self.FTempAddress := AAddress;
-        self.FTempSp := ASp;
-        self.FTempLanding := ALanding;
-      end;
+      self.DoAddTemp(AAddress, ASp, ALanding);
     end;
 
-    // The step's own patch taken out
-    hidden method DoDropTemp();
+    // A patch of the step's added at AAddress (taken at ASp or above, landing as ALanding
+    // says); nothing when the step has one there
+    hidden method DoAddTemp(const AAddress: uint64; const ASp: uint64;
+      const ALanding: RuntimeLanding);
+    var
+      LCount: int64;
     begin
-      if self.FTempActive then
-        self.FTarget.RemovePatch(self.FTempAddress);
-        self.FTempActive := false;
+      if (self.DoTempIndex(AAddress) >= 0) or not self.FTarget.AddPatch(AAddress) then
+        return;
       end;
+      LCount := len(self.FTemps);
+      setlength(self.FTemps, LCount + 1);
+      self.FTemps[LCount].Address := AAddress;
+      self.FTemps[LCount].Sp := ASp;
+      self.FTemps[LCount].Landing := ALanding;
     end;
 
-    // The step ended: its patch out
+    // The index of the step's patch at AAddress; -1 when it has none there
+    hidden const method DoTempIndex(const AAddress: uint64): int64;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FTemps) - 1 do
+        if self.FTemps[LI].Address = AAddress then
+          return LI;
+        end;
+      end;
+      return -1;
+    end;
+
+    // The step's own patches taken out
+    hidden method DoDropTemp();
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FTemps) - 1 do
+        self.FTarget.RemovePatch(self.FTemps[LI].Address);
+      end;
+      setlength(self.FTemps, 0);
+    end;
+
+    // The step ended: its patches out, its thread's first chances no longer watched
     hidden method DoEndStep();
     begin
       self.DoDropTemp();
       self.FStepping := false;
+      self.FStepUnwound := false;
+      self.FTarget.SetFirstChanceThread(0);
+    end;
+
+    // A first chance on the step's thread AThreadId it was not asked to stop at: a patch at
+    // each except part that may take it in the frames from the step's own up (the frames
+    // the unwind may resume the program in), each taken at its frame's stack pointer
+    hidden method DoArmUnwind(const AThreadId: uint32);
+    var
+      LContext: DebugContext;
+      LFrames: StackFrameArray;
+      LTargets: DebugWordArray;
+      LLookup: uint64;
+      LI: int64;
+      LJ: int64;
+    begin
+      self.FStepUnwound := true;
+      if (not self.FTarget.GetContext(AThreadId, LContext)) or
+        not self.FSymbols.StackWalk(self.FTarget, AThreadId, LContext, 0, LFrames) then
+        return;
+      end;
+      for LI := 0 to len(LFrames) - 1 do
+        if LFrames[LI].Context.Sp >= self.FStepSp then
+          // an outer frame's address is its return address: its call is the byte before
+          LLookup := LFrames[LI].Context.Pc;
+          if LI > 0 then
+            LLookup := LLookup - 1;
+          end;
+          if self.FSymbols.CatchTargets(self.FTarget, LLookup, LTargets) then
+            for LJ := 0 to len(LTargets) - 1 do
+              self.DoAddTemp(LTargets[LJ], LFrames[LI].Context.Sp, RuntimeLanding.Catch);
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // The unwind resumed the step's thread at an except part (AContext): true when the step
+    // ends there (a line starts there); else it steps on from there, as a step over, to the
+    // first line start it meets (the except part's entry takes the exception before its
+    // first statement's line starts), resumed
+    hidden method DoCatchLanded(const AContext: DebugContext): bool;
+    var
+      LLine: SourceLine;
+      LEmpty: SourceLine;
+      LRoutine: SymbolRoutine;
+      LFrames: StackFrameArray;
+    begin
+      self.FStepUnwound := false;
+      if self.FSymbols.LineAt(AContext.Pc, LLine) and (LLine.Address = AContext.Pc) then
+        return true;
+      end;
+      self.FStepKind := RuntimeStepKind.Over;
+      self.FStepHasLine := false;
+      self.FStepLine := LEmpty;
+      self.FStepRoutine := 0;
+      self.FStepBody := 0;
+      if self.FSymbols.RoutineAt(AContext.Pc, LRoutine) then
+        self.FStepRoutine := LRoutine.Address;
+        self.FStepBody := LRoutine.BodyAddress;
+      end;
+      self.FStepCallerSp := 0xFFFFFFFFFFFFFFFFu;
+      if self.FSymbols.StackWalk(self.FTarget, self.FStepThread, AContext, 2, LFrames) and
+        (len(LFrames) > 1) then
+        self.FStepCallerSp := LFrames[1].Context.Sp;
+      end;
+      self.FStepSp := AContext.Sp;
+      self.FBefore := AContext;
+      self.FTarget.Resume(ResumeKind.Step);
+      return false;
     end;
 
     // The next event a stop is made of into AEvent: output kept (AddOutput), a module load
@@ -1702,9 +1851,11 @@ public type
           DebugEventKind.Output:
             self.FOutput.Add(AEvent.OutputText);
           DebugEventKind.ModuleLoaded:
+            self.FSymbols.AddImage(AEvent.Address);
             self.DoModuleLoaded(AEvent);
             self.FTarget.Resume(ResumeKind.Continue);
           DebugEventKind.ModuleUnloaded:
+            self.FSymbols.RemoveImage(AEvent.Address);
             self.DoModuleUnloaded(AEvent);
           DebugEventKind.ThreadStarted, DebugEventKind.ThreadExited:
             // nothing to do
@@ -1737,6 +1888,7 @@ public type
     hidden method DoModuleUnloaded(const AEvent: DebugEvent);
     var
       LKept: RuntimeBreakpointArray;
+      LTemps: RuntimeTempArray;
       LI: int64;
       LCount: int64;
       LRoutine: SymbolRoutine;
@@ -1745,12 +1897,22 @@ public type
         return;
       end;
       // A step's own patch in the library's code (only its routines are known in DLL mode)
-      // has nowhere to land: forgotten, the step ended. One in the host (a step over the
-      // FreeLibrary call) stays
-      if self.FTempActive and self.FSymbols.RoutineAt(self.FTempAddress, LRoutine) then
-        self.FTarget.ForgetPatch(self.FTempAddress);
-        self.FTempActive := false;
-        self.FStepping := false;
+      // has nowhere to land: forgotten, and the step ended with it. One in the host (a step
+      // over the FreeLibrary call) stays
+      LTemps := self.FTemps;
+      setlength(self.FTemps, 0);
+      for LI := 0 to len(LTemps) - 1 do
+        if self.FSymbols.RoutineAt(LTemps[LI].Address, LRoutine) then
+          self.FTarget.ForgetPatch(LTemps[LI].Address);
+          self.FStepping := false;
+        else
+          LCount := len(self.FTemps);
+          setlength(self.FTemps, LCount + 1);
+          self.FTemps[LCount] := LTemps[LI];
+        end;
+      end;
+      if not self.FStepping then
+        self.DoEndStep();
       end;
       setlength(LKept, 0);
       for LI := 0 to len(self.FBreakpoints) - 1 do
@@ -1785,6 +1947,8 @@ public type
       LEvent: DebugEvent;
       LContext: DebugContext;
       LId: int64;
+      LTemp: int64;
+      LLanding: RuntimeLanding;
     begin
       while self.DoNext(LEvent) do
         if LEvent.Kind = DebugEventKind.ProcessExited then
@@ -1793,6 +1957,7 @@ public type
           self.DoReport(RuntimeStopKind.Exited, LEvent, 0, AStop);
           self.FStopped := false;
           self.FSymbols.Close();
+          self.FSymbols.ClearImages();
           return true;
         end;
         if LEvent.Kind <> DebugEventKind.Stopped then
@@ -1804,18 +1969,35 @@ public type
         match LEvent.Reason of
           DebugStopReason.Breakpoint:
             LId := self.DoBreakpointAt(LEvent.Address);
-            if self.FTempActive and (LEvent.Address = self.FTempAddress) then
+            LTemp := self.DoTempIndex(LEvent.Address);
+            if LTemp >= 0 then
               if (LEvent.ThreadId = self.FStepThread) and
                 self.FTarget.GetContext(LEvent.ThreadId, LContext) and
-                (LContext.Sp >= self.FTempSp) then
+                (LContext.Sp >= self.FTemps[LTemp].Sp) then
+                LLanding := self.FTemps[LTemp].Landing;
                 self.DoDropTemp();
-                if (self.FTempLanding = RuntimeLanding.Body) or
+                if LLanding = RuntimeLanding.Catch then
+                  // the unwind's resume: the step ends at the except part, or goes on in it
+                  if self.DoCatchLanded(LContext) then
+                    self.DoEndStep();
+                    self.DoReport(RuntimeStopKind.Step, LEvent, 0, AStop);
+                    return true;
+                  end;
+                  skip;
+                end;
+                if (LLanding = RuntimeLanding.Body) or
                   (self.FStepKind = RuntimeStepKind.Out) then
                   self.DoEndStep();
                   self.DoReport(RuntimeStopKind.Step, LEvent, 0, AStop);
                   return true;
                 end;
-                // back from a call stepped over: on through the line
+                // back from a call stepped over: the step ends when a line starts at the
+                // return (the call was its line's last code), else on through the line
+                if self.DoNewLineAt(LContext) then
+                  self.DoEndStep();
+                  self.DoReport(RuntimeStopKind.Step, LEvent, 0, AStop);
+                  return true;
+                end;
                 self.FBefore := LContext;
                 self.FTarget.Resume(ResumeKind.Step);
                 skip;
@@ -1831,6 +2013,12 @@ public type
             self.DoReport(RuntimeStopKind.Breakpoint, LEvent, LId, AStop);
             return true;
           DebugStopReason.Step:
+            // a single step an exception took the place of, met while the step runs to the
+            // except parts' patches: nothing of the step's
+            if self.FStepping and self.FStepUnwound and (LEvent.ThreadId = self.FStepThread) then
+              self.FTarget.Resume(ResumeKind.Continue);
+              skip;
+            end;
             if self.FStepping and (LEvent.ThreadId = self.FStepThread) and
               self.FTarget.GetContext(LEvent.ThreadId, LContext) then
               if self.DoStepped(LContext) then
@@ -1848,6 +2036,13 @@ public type
             self.DoReport(RuntimeStopKind.Pause, LEvent, 0, AStop);
             return true;
           DebugStopReason.Exception:
+            // the step's own watch: its frame may unwind; the program's handlers take it
+            if LEvent.FirstChance and self.FStepping and (LEvent.ThreadId = self.FStepThread) and
+              not self.FBreakOnFirstChance then
+              self.DoArmUnwind(LEvent.ThreadId);
+              self.FTarget.Resume(ResumeKind.Continue);
+              skip;
+            end;
             self.DoEndStep();
             self.DoReport(RuntimeStopKind.Exception, LEvent, 0, AStop);
             return true;
@@ -1865,7 +2060,6 @@ public type
     hidden method DoStepped(const AContext: DebugContext): bool;
     var
       LRoutine: SymbolRoutine;
-      LLine: SourceLine;
       LReturn: uint64;
     begin
       if self.FTarget.CallReturn(self.FBefore, AContext, LReturn) then
@@ -1881,15 +2075,23 @@ public type
       if AContext.Sp >= self.FStepCallerSp then
         return true;
       end;
-      // a line starts here that is no part of the routine's setup and not the one left
-      if (AContext.Pc >= self.FStepBody) and self.FSymbols.LineAt(AContext.Pc, LLine) and
-        (LLine.Address = AContext.Pc) and ((LLine.Line <> self.FStepLine.Line) or
-        (LLine.FilePath <> self.FStepLine.FilePath)) then
+      if self.DoNewLineAt(AContext) then
         return true;
       end;
       self.FBefore := AContext;
       self.FTarget.Resume(ResumeKind.Step);
       return false;
+    end;
+
+    // True when a line starts at AContext's address that is no part of the routine's setup
+    // and not the one the step left
+    hidden method DoNewLineAt(const AContext: DebugContext): bool;
+    var
+      LLine: SourceLine;
+    begin
+      return (AContext.Pc >= self.FStepBody) and self.FSymbols.LineAt(AContext.Pc, LLine) and
+        (LLine.Address = AContext.Pc) and ((LLine.Line <> self.FStepLine.Line) or
+        (LLine.FilePath <> self.FStepLine.FilePath));
     end;
 
     // True when a step into the routine at AAddress stops in it (ARoutine): it has a first
@@ -1919,6 +2121,7 @@ public type
       LStop.BreakpointId := AId;
       LStop.Address := AEvent.Address;
       LStop.ExceptionCode := AEvent.ExceptionCode;
+      LStop.FirstChance := (AKind = RuntimeStopKind.Exception) and AEvent.FirstChance;
       LStop.ExitCode := AEvent.ExitCode;
       LStop.HasLine := false;
       LStop.Routine := "";
