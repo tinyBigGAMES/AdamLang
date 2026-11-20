@@ -1,0 +1,979 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Lsp.Server.adam - Adam's language server (M11b, adam lsp)
+
+  Serves the Language Server Protocol over a ProtocolTransport (adam lsp's
+  is the process's stdin / stdout, a row's a channel of its own). RunLsp
+  serves until "exit" or the end of the input: exit code 0 after shutdown,
+  else 1.
+
+  JSON-RPC 2.0, one message at a time on one thread (pcpp's). Every request
+  gets one response. Before initialize a request is refused
+  (ServerNotInitialized), a notification dropped ("exit" kept); a second
+  initialize, and any request after shutdown, is InvalidRequest; an unknown
+  request MethodNotFound ($/ ones too), an unknown notification ignored.
+  A message that is no JSON is a ParseError, one that is no JSON-RPC
+  message an InvalidRequest (id null when its id cannot be read); a
+  response to a request of the server's own is taken quietly. A
+  notification's bad params, and a message with a bad header, are told to
+  the client as an error window/logMessage.
+
+  initialize: positionEncoding the first of the client's
+  capabilities.general.positionEncodings it takes (utf-16, utf-8, utf-32),
+  utf-16 without a list (LSP's default); textDocumentSync open / close and
+  incremental changes.
+
+  Documents (didOpen / didChange / didClose): the buffers the client holds,
+  each an LspDocument; its path is the URI's file resolved as the front end
+  reads it ("" for a URI naming no file: never checked).
+
+  Diagnostics on idle: a document that changed is marked; once no message
+  is waiting (the transport's HasPending) every marked one is checked, so a
+  run of changes is one check. A check is the build's own front end
+  (Compiler.CheckDocument: module paths, project, target) on the document
+  as its main module, every open buffer given in place of its file
+  (Compiler.GiveText). The document gets its own file's reports (and those
+  with no place); an imported file that is not open gets its errors (a
+  unit's hints and warnings are not the user's to act on there); an open
+  one speaks for itself through its own check. What a document's check
+  published before and not now is cleared; what was published is kept by
+  file, not by the URI's spelling (a closed import goes out under the
+  server's URI of its path, the client's own once it is open: one file,
+  DoSameFile). A report's range starts at its
+  place and runs over the word there (one character else).
+
+  Prior art: PaskalCPP.LSP.Server / Diagnostics (CONCEPT: the lifecycle,
+  the request rules, the owner-based publish; GEOMETRY rejected: Adam's
+  types, System.Json).
+*******************************************************************************/
+
+module unit Adam.Lsp.Server;
+
+import System.SysUtils, System.IO, System.Json, Adam.Core.Common, Adam.Core.Messages,
+  Adam.Compiler.Diagnostics, Adam.Protocol.Transport, Adam.Driver.Compiler, Adam.Lsp.Uri,
+  Adam.Lsp.Document;
+
+public const
+  // RunLsp's exit codes: "exit" after shutdown / any other end
+  ADAM_LSP_EXIT_SHUTDOWN: int32 = 0;
+  ADAM_LSP_EXIT_NO_SHUTDOWN: int32 = 1;
+  ADAM_LSP_JSONRPC: string = "2.0";
+  // JSON-RPC's and LSP's error codes
+  ADAM_LSP_ERROR_PARSE: int64 = -32700;
+  ADAM_LSP_ERROR_INVALID_REQUEST: int64 = -32600;
+  ADAM_LSP_ERROR_METHOD_NOT_FOUND: int64 = -32601;
+  ADAM_LSP_ERROR_NOT_INITIALIZED: int64 = -32002;
+  // DiagnosticSeverity
+  ADAM_LSP_SEVERITY_ERROR: int64 = 1;
+  ADAM_LSP_SEVERITY_WARNING: int64 = 2;
+  ADAM_LSP_SEVERITY_HINT: int64 = 4;
+  // MessageType (window/logMessage)
+  ADAM_LSP_MESSAGE_ERROR: int64 = 1;
+  // TextDocumentSyncKind
+  ADAM_LSP_SYNC_INCREMENTAL: int64 = 2;
+  // A diagnostic's source, the server's name
+  ADAM_LSP_SOURCE: string = "adam";
+  ADAM_LSP_SERVER_NAME: string = "adam";
+  // PositionEncodingKind
+  ADAM_LSP_ENCODING_UTF8: string = "utf-8";
+  ADAM_LSP_ENCODING_UTF16: string = "utf-16";
+  ADAM_LSP_ENCODING_UTF32: string = "utf-32";
+  // The methods
+  ADAM_LSP_INITIALIZE: string = "initialize";
+  ADAM_LSP_SHUTDOWN: string = "shutdown";
+  ADAM_LSP_EXIT: string = "exit";
+  ADAM_LSP_DID_OPEN: string = "textDocument/didOpen";
+  ADAM_LSP_DID_CHANGE: string = "textDocument/didChange";
+  ADAM_LSP_DID_CLOSE: string = "textDocument/didClose";
+  ADAM_LSP_PUBLISH_DIAGNOSTICS: string = "textDocument/publishDiagnostics";
+  ADAM_LSP_LOG_MESSAGE: string = "window/logMessage";
+
+type
+  // Where the session is: before initialize, serving, after shutdown
+  LspState = choices(Uninitialized, Running, Shutdown);
+
+  // The reports of one check about one file (indexes into the check's reports)
+  LspReportGroup = record
+    FileName: string;
+    Reports: Int64Array;
+  end;
+
+  LspReportGroupArray = array of LspReportGroup;
+
+// AText added at the end of AList
+routine DoAppend(var AList: StringArray; const AText: string);
+var
+  LCount: int64;
+begin
+  LCount := len(AList);
+  setlength(AList, LCount + 1);
+  AList[LCount] := AText;
+end;
+
+// AValue added at the end of AList
+routine DoAppendIndex(var AList: Int64Array; const AValue: int64);
+var
+  LCount: int64;
+begin
+  LCount := len(AList);
+  setlength(AList, LCount + 1);
+  AList[LCount] := AValue;
+end;
+
+// The index of AText in AList (exact text); -1 when it is not there
+routine DoIndexOf(const AList: StringArray; const AText: string): int64;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(AList) - 1 do
+    if AList[LI] = AText then
+      return LI;
+    end;
+  end;
+  return -1;
+end;
+
+// AList without its item at AIndex, the others in their order
+routine DoRemoveAt(var AList: StringArray; const AIndex: int64);
+var
+  LI: int64;
+begin
+  for LI := AIndex to len(AList) - 2 do
+    AList[LI] := AList[LI + 1];
+  end;
+  setlength(AList, len(AList) - 1);
+end;
+
+// True when AChar is part of a word (a name, a number): what a report's range runs over
+routine DoIsWordByte(const AChar: char): bool;
+begin
+  return ((AChar >= 'A') and (AChar <= 'Z')) or ((AChar >= 'a') and (AChar <= 'z')) or
+    ((AChar >= '0') and (AChar <= '9')) or (AChar = '_');
+end;
+
+// The bytes a report's range covers from the byte offset AOffset of AText: the word there,
+// else the one character there; 0 at a line's end or the text's
+routine DoRangeLength(const AText: string; const AOffset: int64): int64;
+var
+  LAt: int64;
+  LCode: uint32;
+begin
+  if (AOffset < 0) or (AOffset >= len(AText)) then
+    return 0;
+  end;
+  if (AText[AOffset] = '\n') or (AText[AOffset] = '\r') then
+    return 0;
+  end;
+  LAt := AOffset;
+  if DoIsWordByte(AText[LAt]) then
+    while (LAt < len(AText)) and DoIsWordByte(AText[LAt]) do
+      LAt := LAt + 1;
+    end;
+    return LAt - AOffset;
+  end;
+  LCode := DecodeUtf8Char(AText, LAt);
+  return LAt - AOffset;
+end;
+
+// The PositionEncodingKind AEncoding is written as
+routine DoEncodingText(const AEncoding: LspEncoding): string;
+begin
+  if AEncoding = LspEncoding.Utf8 then
+    return ADAM_LSP_ENCODING_UTF8;
+  end;
+  if AEncoding = LspEncoding.Utf32 then
+    return ADAM_LSP_ENCODING_UTF32;
+  end;
+  return ADAM_LSP_ENCODING_UTF16;
+end;
+
+// True when the URIs AFirst and ASecond name the same file: the same text, or file URIs whose
+// paths the OS takes for one file (a client's file:///c%3A/x and the server's file:///C:/x)
+routine DoSameFile(const AFirst: string; const ASecond: string): bool;
+var
+  LFirst: string;
+  LSecond: string;
+begin
+  if AFirst = ASecond then
+    return true;
+  end;
+  if not (UriToPath(AFirst, LFirst) and UriToPath(ASecond, LSecond)) then
+    return false;
+  end;
+  return SamePath(LFirst, LSecond);
+end;
+
+// The DiagnosticSeverity of ALevel
+routine DoSeverity(const ALevel: Severity): int64;
+begin
+  if ALevel = Severity.Hint then
+    return ADAM_LSP_SEVERITY_HINT;
+  end;
+  if ALevel = Severity.Warning then
+    return ADAM_LSP_SEVERITY_WARNING;
+  end;
+  return ADAM_LSP_SEVERITY_ERROR;
+end;
+
+// No reports (a clear's)
+routine DoNoIndexes(): Int64Array;
+var
+  LNone: Int64Array;
+begin
+  setlength(LNone, 0);
+  return LNone;
+end;
+
+// A message to send: jsonrpc first, the rest added by the caller
+routine DoNewMessage(): Json;
+var
+  LMessage: Json;
+begin
+  LMessage.Add("jsonrpc", ADAM_LSP_JSONRPC);
+  return LMessage;
+end;
+
+// The position AOffset of ADocument as an LSP Position object
+routine DoPosition(const ADocument: ref LspDocument; const AOffset: int64;
+  const AEncoding: LspEncoding): Json;
+var
+  LJson: Json;
+  LLine: int64;
+  LCharacter: int64;
+begin
+  ADocument.PositionAt(AOffset, AEncoding, LLine, LCharacter);
+  LJson.Add("line", LLine);
+  LJson.Add("character", LCharacter);
+  return LJson;
+end;
+
+// The LSP Diagnostic of AReport, placed in ADocument's text: its range from its place over the
+// word there (DoRangeLength), severity, code, source and message
+routine DoDiagnostic(const ADocument: ref LspDocument; const AReport: ref Diagnostic;
+  const AEncoding: LspEncoding): Json;
+var
+  LItem: Json;
+  LRange: Json;
+  LOffset: int64;
+begin
+  LOffset := ADocument.OffsetOfPlace(int64(AReport.Line), int64(AReport.Column));
+  LRange.Add("start", DoPosition(ADocument, LOffset, AEncoding));
+  LRange.Add("end", DoPosition(ADocument, LOffset + DoRangeLength(ADocument.Text, LOffset),
+    AEncoding));
+  LItem.Add("range", LRange);
+  LItem.Add("severity", DoSeverity(AReport.Level));
+  if AReport.Code <> "" then
+    LItem.Add("code", AReport.Code);
+  end;
+  LItem.Add("source", ADAM_LSP_SOURCE);
+  LItem.Add("message", AReport.Text());
+  return LItem;
+end;
+
+type
+  // The server's session (see the header)
+  LspServer = object
+    hidden FTransport: ref ProtocolTransport;
+    // Module paths every check adds after the compiler's own (a row's: the std beside it)
+    hidden FModulePaths: StringArray;
+    hidden FState: LspState;
+    hidden FEncoding: LspEncoding;
+    hidden FDocuments: array of ref LspDocument;
+    // The URIs of the documents changed since their last check
+    hidden FDirty: StringArray;
+    // What the checks published, by URI: the document whose check did (its owner)
+    hidden FPublishedUris: StringArray;
+    hidden FPublishedOwners: StringArray;
+    hidden FExitWanted: bool;
+    hidden FExitCode: int32;
+
+    init(const ATransport: ref ProtocolTransport; const AModulePaths: StringArray);
+    begin
+      self.FTransport := ATransport;
+      self.FModulePaths := AModulePaths;
+      self.FState := LspState.Uninitialized;
+      self.FEncoding := LspEncoding.Utf16;
+      self.FExitWanted := false;
+      self.FExitCode := ADAM_LSP_EXIT_NO_SHUTDOWN;
+    end;
+
+    // Serves the transport until "exit" or the end of its input: an ADAM_LSP_EXIT_* code
+    method Serve(): int32;
+    var
+      LBody: string;
+      LRead: ProtocolRead;
+    begin
+      while not self.FExitWanted do
+        LRead := self.FTransport.ReadMessage(LBody);
+        if LRead = ProtocolRead.Message then
+          self.DoHandleMessage(LBody);
+        else
+          if LRead = ProtocolRead.Malformed then
+            self.DoLog(NoArgs().Fill(ADAM_MSG_LSP_MALFORMED));
+          else
+            // The input ended with no "exit": the client is gone
+            self.DoRequestExit();
+          end;
+        end;
+        // Idle: the documents changed are checked once no message waits
+        if (not self.FExitWanted) and (self.FState = LspState.Running) and
+          (len(self.FDirty) > 0) and not self.FTransport.HasPending() then
+          self.DoFlushDiagnostics();
+        end;
+      end;
+      return self.FExitCode;
+    end;
+
+    // -- Messages out
+
+    // AMessage (made by DoNewMessage) sent; a client that cannot be written to ends the
+    // session
+    hidden method DoSend(const AMessage: Json);
+    begin
+      if not self.FTransport.WriteMessage(AMessage.ToString()) then
+        self.DoRequestExit();
+      end;
+    end;
+
+    // The response to the request AId with AResult (null when AIsNull)
+    hidden method DoResult(const AId: Json; const AResult: Json; const AIsNull: bool);
+    var
+      LMessage: Json;
+    begin
+      LMessage := DoNewMessage();
+      LMessage.Add("id", AId);
+      if AIsNull then
+        LMessage.AddNull("result");
+      else
+        LMessage.Add("result", AResult);
+      end;
+      self.DoSend(LMessage);
+    end;
+
+    // An error response of ACode saying AMessage to the request AId (id null when not
+    // AHasId: an id that could not be read)
+    hidden method DoError(const AId: Json; const AHasId: bool; const ACode: int64;
+      const AMessage: string);
+    var
+      LMessage: Json;
+      LError: Json;
+    begin
+      LMessage := DoNewMessage();
+      if AHasId then
+        LMessage.Add("id", AId);
+      else
+        LMessage.AddNull("id");
+      end;
+      LError.Add("code", ACode);
+      LError.Add("message", AMessage);
+      LMessage.Add("error", LError);
+      self.DoSend(LMessage);
+    end;
+
+    // An error window/logMessage saying AMessage
+    hidden method DoLog(const AMessage: string);
+    var
+      LMessage: Json;
+      LParams: Json;
+    begin
+      LMessage := DoNewMessage();
+      LMessage.Add("method", ADAM_LSP_LOG_MESSAGE);
+      LParams.Add("type", ADAM_LSP_MESSAGE_ERROR);
+      LParams.Add("message", AMessage);
+      LMessage.Add("params", LParams);
+      self.DoSend(LMessage);
+    end;
+
+    // The notification AMethod's params were not what it takes
+    hidden method DoBadParams(const AMethod: string);
+    begin
+      self.DoLog(NoArgs().Str(AMethod).Fill(ADAM_MSG_LSP_BAD_PARAMS));
+    end;
+
+    hidden method DoRequestExit();
+    begin
+      self.FExitWanted := true;
+      if self.FState = LspState.Shutdown then
+        self.FExitCode := ADAM_LSP_EXIT_SHUTDOWN;
+      else
+        self.FExitCode := ADAM_LSP_EXIT_NO_SHUTDOWN;
+      end;
+    end;
+
+    // -- Messages in
+
+    hidden method DoHandleMessage(const ABody: string);
+    var
+      LMessage: Json;
+      LId: Json;
+      LParams: Json;
+      LHasId: bool;
+      LIdGood: bool;
+      LVersion: string;
+      LMethod: string;
+      LNone: Json;
+    begin
+      if not Json.TryFromString(ABody, LMessage) then
+        self.DoError(LNone, false, ADAM_LSP_ERROR_PARSE, NoArgs().Fill(ADAM_MSG_LSP_PARSE_ERROR));
+        return;
+      end;
+      // A batch (an array) is not LSP's
+      if not LMessage.IsObject() then
+        self.DoError(LNone, false, ADAM_LSP_ERROR_INVALID_REQUEST,
+          NoArgs().Fill(ADAM_MSG_LSP_INVALID_REQUEST));
+        return;
+      end;
+      // An id that is neither a number nor a string is answered with id null
+      LHasId := LMessage.Has("id", true);
+      LId := LMessage.Get("id", true);
+      LIdGood := LHasId and (LId.IsNumber() or LId.IsString());
+      LVersion := "";
+      if not (LMessage.TryGetString("jsonrpc", LVersion, true) and
+        (LVersion = ADAM_LSP_JSONRPC)) then
+        self.DoError(LId, LIdGood, ADAM_LSP_ERROR_INVALID_REQUEST,
+          NoArgs().Fill(ADAM_MSG_LSP_INVALID_REQUEST));
+        return;
+      end;
+      if not LMessage.TryGetString("method", LMethod, true) then
+        // A response to a request of the server's: it sends none yet, nothing to match
+        if LHasId and (LMessage.Has("result", true) or LMessage.Has("error", true)) then
+          return;
+        end;
+        self.DoError(LId, LIdGood, ADAM_LSP_ERROR_INVALID_REQUEST,
+          NoArgs().Fill(ADAM_MSG_LSP_INVALID_REQUEST));
+        return;
+      end;
+      // No params: a missing value, every read of it false
+      LParams := LMessage.Get("params", true);
+      if not LHasId then
+        self.DoNotification(LMethod, LParams);
+        return;
+      end;
+      if not LIdGood then
+        self.DoError(LId, false, ADAM_LSP_ERROR_INVALID_REQUEST,
+          NoArgs().Fill(ADAM_MSG_LSP_INVALID_REQUEST));
+        return;
+      end;
+      self.DoRequest(LId, LMethod, LParams);
+    end;
+
+    hidden method DoRequest(const AId: Json; const AMethod: string; const AParams: Json);
+    var
+      LNone: Json;
+    begin
+      // The lifecycle's rules first
+      if self.FState = LspState.Shutdown then
+        self.DoError(AId, true, ADAM_LSP_ERROR_INVALID_REQUEST,
+          NoArgs().Fill(ADAM_MSG_LSP_SHUT_DOWN));
+        return;
+      end;
+      if (AMethod = ADAM_LSP_INITIALIZE) and (self.FState <> LspState.Uninitialized) then
+        self.DoError(AId, true, ADAM_LSP_ERROR_INVALID_REQUEST,
+          NoArgs().Fill(ADAM_MSG_LSP_ALREADY_INITIALIZED));
+        return;
+      end;
+      if (AMethod <> ADAM_LSP_INITIALIZE) and (self.FState = LspState.Uninitialized) then
+        self.DoError(AId, true, ADAM_LSP_ERROR_NOT_INITIALIZED,
+          NoArgs().Fill(ADAM_MSG_LSP_NOT_INITIALIZED));
+        return;
+      end;
+      if AMethod = ADAM_LSP_INITIALIZE then
+        self.DoResult(AId, self.DoInitialize(AParams), false);
+        self.FState := LspState.Running;
+        return;
+      end;
+      if AMethod = ADAM_LSP_SHUTDOWN then
+        self.FState := LspState.Shutdown;
+        self.DoResult(AId, LNone, true);
+        return;
+      end;
+      // Unknown requests, $/ ones too, fail
+      self.DoError(AId, true, ADAM_LSP_ERROR_METHOD_NOT_FOUND,
+        NoArgs().Str(AMethod).Fill(ADAM_MSG_LSP_METHOD_NOT_FOUND));
+    end;
+
+    hidden method DoNotification(const AMethod: string; const AParams: Json);
+    begin
+      if AMethod = ADAM_LSP_EXIT then
+        self.DoRequestExit();
+        return;
+      end;
+      // Dropped before initialize and after shutdown
+      if self.FState <> LspState.Running then
+        return;
+      end;
+      if AMethod = ADAM_LSP_DID_OPEN then
+        self.DoDidOpen(AParams);
+        return;
+      end;
+      if AMethod = ADAM_LSP_DID_CHANGE then
+        self.DoDidChange(AParams);
+        return;
+      end;
+      if AMethod = ADAM_LSP_DID_CLOSE then
+        self.DoDidClose(AParams);
+      end;
+      // "initialized", $/ notifications and unknown ones need nothing
+    end;
+
+    // -- Lifecycle
+
+    hidden method DoInitialize(const AParams: Json): Json;
+    var
+      LResult: Json;
+    begin
+      self.FEncoding := self.DoNegotiateEncoding(AParams);
+      LResult.BeginObject("capabilities");
+      LResult.Add("positionEncoding", DoEncodingText(self.FEncoding));
+      LResult.BeginObject("textDocumentSync");
+      LResult.Add("openClose", true);
+      LResult.Add("change", ADAM_LSP_SYNC_INCREMENTAL);
+      LResult.EndObject();
+      LResult.EndObject();
+      LResult.BeginObject("serverInfo");
+      LResult.Add("name", ADAM_LSP_SERVER_NAME);
+      LResult.Add("version", AdamVersionText());
+      LResult.EndObject();
+      return LResult;
+    end;
+
+    // The client lists encodings by preference: the first one taken; without a list UTF-16,
+    // which every client takes
+    hidden const method DoNegotiateEncoding(const AParams: Json): LspEncoding;
+    var
+      LList: Json;
+      LItems: array of Json;
+      LI: int64;
+      LName: string;
+    begin
+      if not AParams.TryGetArray("capabilities.general.positionEncodings", LList) then
+        return LspEncoding.Utf16;
+      end;
+      LItems := LList.Items();
+      for LI := 0 to len(LItems) - 1 do
+        // An entry that is no string names no encoding
+        if LItems[LI].IsString() then
+          LName := LItems[LI].AsString();
+          if LName = ADAM_LSP_ENCODING_UTF16 then
+            return LspEncoding.Utf16;
+          end;
+          if LName = ADAM_LSP_ENCODING_UTF8 then
+            return LspEncoding.Utf8;
+          end;
+          if LName = ADAM_LSP_ENCODING_UTF32 then
+            return LspEncoding.Utf32;
+          end;
+        end;
+      end;
+      return LspEncoding.Utf16;
+    end;
+
+    // -- Documents
+
+    // The open document of the URI AUri; nil when none is
+    hidden const method DoFind(const AUri: string): ref LspDocument;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FDocuments) - 1 do
+        if self.FDocuments[LI].Uri = AUri then
+          return self.FDocuments[LI];
+        end;
+      end;
+      return nil;
+    end;
+
+    // The open document whose file is APath (as the OS compares paths); nil when none is
+    hidden const method DoOpenFor(const APath: string): ref LspDocument;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FDocuments) - 1 do
+        if (self.FDocuments[LI].Path <> "") and SamePath(self.FDocuments[LI].Path, APath) then
+          return self.FDocuments[LI];
+        end;
+      end;
+      return nil;
+    end;
+
+    // The document of AUri is checked at the next idle
+    hidden method DoMarkDirty(const AUri: string);
+    begin
+      if DoIndexOf(self.FDirty, AUri) < 0 then
+        DoAppend(self.FDirty, AUri);
+      end;
+    end;
+
+    hidden method DoDidOpen(const AParams: Json);
+    var
+      LUri: string;
+      LText: string;
+      LVersion: int64;
+      LPath: string;
+      LDocument: ref LspDocument;
+      LI: int64;
+      LCount: int64;
+    begin
+      if not (AParams.TryGetString("textDocument.uri", LUri) and
+        AParams.TryGetString("textDocument.text", LText)) then
+        self.DoBadParams(ADAM_LSP_DID_OPEN);
+        return;
+      end;
+      // Optional here: none is version 0
+      LVersion := 0;
+      AParams.TryGetInt64("textDocument.version", LVersion);
+      // The path the front end reads it as; a URI that names no file has none (never checked)
+      LPath := "";
+      if UriToPath(LUri, LPath) then
+        LPath := ResolvePath(LPath);
+      end;
+      LDocument := ref LspDocument(LUri, LPath, LVersion, LText);
+      // A second didOpen of the same URI replaces the buffer
+      for LI := 0 to len(self.FDocuments) - 1 do
+        if self.FDocuments[LI].Uri = LUri then
+          self.FDocuments[LI] := LDocument;
+          self.DoMarkDirty(LUri);
+          return;
+        end;
+      end;
+      LCount := len(self.FDocuments);
+      setlength(self.FDocuments, LCount + 1);
+      self.FDocuments[LCount] := LDocument;
+      self.DoMarkDirty(LUri);
+    end;
+
+    // The byte offset of the position at APath of AValue in ADocument into AOffset; false when
+    // it is no position
+    hidden const method DoOffsetAt(const ADocument: ref LspDocument; const AValue: Json;
+      const APath: string; var AOffset: int64): bool;
+    var
+      LLine: int64;
+      LCharacter: int64;
+    begin
+      AOffset := 0;
+      if not (AValue.TryGetInt64(APath + ".line", LLine) and
+        AValue.TryGetInt64(APath + ".character", LCharacter)) then
+        return false;
+      end;
+      AOffset := ADocument.OffsetAt(LLine, LCharacter, self.FEncoding);
+      return true;
+    end;
+
+    hidden method DoDidChange(const AParams: Json);
+    var
+      LUri: string;
+      LDocument: ref LspDocument;
+      LChanges: Json;
+      LItems: array of Json;
+      LRange: Json;
+      LText: string;
+      LStart: int64;
+      LEnd: int64;
+      LVersion: int64;
+      LBad: bool;
+      LI: int64;
+    begin
+      LUri := "";
+      LDocument := nil;
+      if AParams.TryGetString("textDocument.uri", LUri) then
+        LDocument := self.DoFind(LUri);
+      end;
+      if LDocument = nil then
+        self.DoBadParams(ADAM_LSP_DID_CHANGE);
+        return;
+      end;
+      // Changes apply in order, each to the text the one before left. One that cannot be read
+      // (no text, a range whose ends are no positions) stops the list: the changes after it
+      // are relative to a text the buffer no longer holds, so neither they nor the new version
+      // are taken
+      LBad := false;
+      if AParams.TryGetArray("contentChanges", LChanges) then
+        LItems := LChanges.Items();
+        for LI := 0 to len(LItems) - 1 do
+          if not LItems[LI].TryGetString("text", LText) then
+            LBad := true;
+            leave;
+          end;
+          if not LItems[LI].TryGetObject("range", LRange) then
+            LDocument.ReplaceAll(LText);
+          else
+            // Both ends from the text before this change
+            if not (self.DoOffsetAt(LDocument, LRange, "start", LStart) and
+              self.DoOffsetAt(LDocument, LRange, "end", LEnd)) then
+              LBad := true;
+              leave;
+            end;
+            LDocument.Replace(LStart, LEnd, LText);
+          end;
+        end;
+      end;
+      // The text changed whatever the version says
+      self.DoMarkDirty(LUri);
+      if LBad then
+        self.DoBadParams(ADAM_LSP_DID_CHANGE);
+        return;
+      end;
+      if AParams.TryGetInt64("textDocument.version", LVersion) then
+        LDocument.SetVersion(LVersion);
+      end;
+    end;
+
+    hidden method DoDidClose(const AParams: Json);
+    var
+      LUri: string;
+      LI: int64;
+      LCount: int64;
+      LNone: StringArray;
+      LAt: int64;
+    begin
+      if not AParams.TryGetString("textDocument.uri", LUri) then
+        self.DoBadParams(ADAM_LSP_DID_CLOSE);
+        return;
+      end;
+      LCount := 0;
+      for LI := 0 to len(self.FDocuments) - 1 do
+        if self.FDocuments[LI].Uri <> LUri then
+          self.FDocuments[LCount] := self.FDocuments[LI];
+          LCount := LCount + 1;
+        end;
+      end;
+      setlength(self.FDocuments, LCount);
+      LAt := DoIndexOf(self.FDirty, LUri);
+      if LAt >= 0 then
+        DoRemoveAt(self.FDirty, LAt);
+      end;
+      // What the closed document's checks published goes, its own URI too (an import that
+      // was this buffer is read from its file again at the next check)
+      setlength(LNone, 0);
+      self.DoClearOwned(LUri, LNone);
+      LAt := self.DoPublishedIndex(LUri);
+      if LAt >= 0 then
+        self.DoPublish(LUri, -1, nil, nil, DoNoIndexes());
+        DoRemoveAt(self.FPublishedUris, LAt);
+        DoRemoveAt(self.FPublishedOwners, LAt);
+      end;
+    end;
+
+    // -- Diagnostics
+
+    // Every document changed since its last check, checked (the marks cleared first)
+    hidden method DoFlushDiagnostics();
+    var
+      LUris: StringArray;
+      LI: int64;
+      LDocument: ref LspDocument;
+    begin
+      LUris := self.FDirty;
+      setlength(self.FDirty, 0);
+      for LI := 0 to len(LUris) - 1 do
+        LDocument := self.DoFind(LUris[LI]);
+        if LDocument <> nil then
+          self.DoCheckRun(LDocument);
+        end;
+      end;
+    end;
+
+    // ADocument checked and its diagnostics published (see the header)
+    hidden method DoCheckRun(const ADocument: ref LspDocument);
+    var
+      LCompiler: ref Compiler;
+      LMain: Int64Array;
+      LGroups: LspReportGroupArray;
+      LKept: Int64Array;
+      LSeen: StringArray;
+      LFile: string;
+      LText: string;
+      LTarget: ref LspDocument;
+      LI: int64;
+      LJ: int64;
+      LGroup: int64;
+    begin
+      LCompiler := ref Compiler();
+      setlength(LMain, 0);
+      setlength(LGroups, 0);
+      setlength(LSeen, 0);
+      if ADocument.Path <> "" then
+        for LI := 0 to len(self.FModulePaths) - 1 do
+          LCompiler.AddModulePath(self.FModulePaths[LI]);
+        end;
+        // Every open buffer stands in for its file
+        for LI := 0 to len(self.FDocuments) - 1 do
+          if self.FDocuments[LI].Path <> "" then
+            LCompiler.GiveText(self.FDocuments[LI].Path, self.FDocuments[LI].Text);
+          end;
+        end;
+        LCompiler.CheckDocument(ADocument.Path);
+        // The reports by file: one with no file is the document's
+        for LI := 0 to LCompiler.Reports.Count - 1 do
+          LFile := LCompiler.Reports.Items[LI].FileName;
+          if (LFile = "") or SamePath(LFile, ADocument.Path) then
+            DoAppendIndex(LMain, LI);
+          else
+            LGroup := -1;
+            for LJ := 0 to len(LGroups) - 1 do
+              if SamePath(LGroups[LJ].FileName, LFile) then
+                LGroup := LJ;
+                leave;
+              end;
+            end;
+            if LGroup < 0 then
+              LGroup := len(LGroups);
+              setlength(LGroups, LGroup + 1);
+              LGroups[LGroup].FileName := LFile;
+              setlength(LGroups[LGroup].Reports, 0);
+            end;
+            DoAppendIndex(LGroups[LGroup].Reports, LI);
+          end;
+        end;
+      end;
+      // The document itself
+      self.DoPublish(ADocument.Uri, ADocument.Version, ADocument, LCompiler.Reports, LMain);
+      DoAppend(LSeen, ADocument.Uri);
+      // The imported files that are not open: their errors
+      for LI := 0 to len(LGroups) - 1 do
+        if self.DoOpenFor(LGroups[LI].FileName) = nil then
+          setlength(LKept, 0);
+          for LJ := 0 to len(LGroups[LI].Reports) - 1 do
+            if LCompiler.Reports.Items[LGroups[LI].Reports[LJ]].IsError() then
+              DoAppendIndex(LKept, LGroups[LI].Reports[LJ]);
+            end;
+          end;
+          if len(LKept) > 0 then
+            LText := "";
+            LCompiler.LoadedText(LGroups[LI].FileName, LText);
+            // A client never shows a file's BOM: positions count from after it
+            if StartsStr(ADAM_LSP_DOCUMENT_BOM, LText) then
+              LText := Substring(LText, len(ADAM_LSP_DOCUMENT_BOM),
+                len(LText) - len(ADAM_LSP_DOCUMENT_BOM));
+            end;
+            LTarget := ref LspDocument(PathToUri(LGroups[LI].FileName), LGroups[LI].FileName, -1,
+              LText);
+            self.DoPublish(LTarget.Uri, -1, LTarget, LCompiler.Reports, LKept);
+            DoAppend(LSeen, LTarget.Uri);
+          end;
+        end;
+      end;
+      // What this owner published before and not now is cleared
+      self.DoClearOwned(ADocument.Uri, LSeen);
+      for LI := 0 to len(LSeen) - 1 do
+        self.DoSetOwner(LSeen[LI], ADocument.Uri);
+      end;
+    end;
+
+    // The index of the published entry for the same file as AUri (DoSameFile); -1 when none
+    hidden const method DoPublishedIndex(const AUri: string): int64;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FPublishedUris) - 1 do
+        if DoSameFile(self.FPublishedUris[LI], AUri) then
+          return LI;
+        end;
+      end;
+      return -1;
+    end;
+
+    // AUri is published by AOwner's check: it takes the place of an entry for the same file
+    // under another spelling (a closed import's URI, then the client's own once it is open)
+    hidden method DoSetOwner(const AUri: string; const AOwner: string);
+    var
+      LAt: int64;
+    begin
+      LAt := self.DoPublishedIndex(AUri);
+      if LAt >= 0 then
+        self.FPublishedUris[LAt] := AUri;
+        self.FPublishedOwners[LAt] := AOwner;
+        return;
+      end;
+      DoAppend(self.FPublishedUris, AUri);
+      DoAppend(self.FPublishedOwners, AOwner);
+    end;
+
+    // True when ASeen holds a URI of the same file as AUri
+    hidden const method DoSeenFile(const ASeen: StringArray; const AUri: string): bool;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(ASeen) - 1 do
+        if DoSameFile(ASeen[LI], AUri) then
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // Every file AOwner's checks published that is not in ASeen cleared and forgotten
+    hidden method DoClearOwned(const AOwner: string; const ASeen: StringArray);
+    var
+      LI: int64;
+    begin
+      LI := 0;
+      while LI < len(self.FPublishedUris) do
+        if (self.FPublishedOwners[LI] = AOwner) and
+          not self.DoSeenFile(ASeen, self.FPublishedUris[LI]) then
+          self.DoPublish(self.FPublishedUris[LI], -1, nil, nil, DoNoIndexes());
+          DoRemoveAt(self.FPublishedUris, LI);
+          DoRemoveAt(self.FPublishedOwners, LI);
+        else
+          LI := LI + 1;
+        end;
+      end;
+    end;
+
+    // textDocument/publishDiagnostics for AUri: the reports AIndexes of AReports, placed in
+    // ADocument's text; AVersion < 0 no version (a file that is not open, a clear); ADocument
+    // nil a clear (no diagnostics)
+    hidden method DoPublish(const AUri: string; const AVersion: int64;
+      const ADocument: ref LspDocument; const AReports: ref Diagnostics;
+      const AIndexes: Int64Array);
+    var
+      LMessage: Json;
+      LItem: Json;
+      LI: int64;
+    begin
+      LMessage := DoNewMessage();
+      LMessage.Add("method", ADAM_LSP_PUBLISH_DIAGNOSTICS);
+      LMessage.BeginObject("params");
+      LMessage.Add("uri", AUri);
+      if AVersion >= 0 then
+        LMessage.Add("version", AVersion);
+      end;
+      LMessage.BeginArray("diagnostics");
+      if ADocument <> nil then
+        for LI := 0 to len(AIndexes) - 1 do
+          LItem := DoDiagnostic(ADocument, AReports.Items[AIndexes[LI]], self.FEncoding);
+          LMessage.Add(LItem);
+        end;
+      end;
+      LMessage.EndArray();
+      LMessage.EndObject();
+      self.DoSend(LMessage);
+    end;
+  end;
+
+// Serves the Language Server Protocol over ATransport (see the header) until "exit" or the end
+// of its input, each check adding AModulePaths after the compiler's own: an ADAM_LSP_EXIT_*
+// code
+public routine RunLsp(const ATransport: ref ProtocolTransport;
+  const AModulePaths: StringArray): int32;
+var
+  LServer: ref LspServer;
+begin
+  LServer := ref LspServer(ATransport, AModulePaths);
+  return LServer.Serve();
+end;
+
+end.
