@@ -89,6 +89,24 @@
   from the last check's tree; triggered by '.' and '>' (a '>' that is no
   '->' gives none). Not open: null; nothing to list: an empty list.
 
+  inlayHint (Adam.Lsp.Hints; checked first as semanticTokens): a `name:`
+  Parameter hint before each call argument starting in the range (its end
+  exclusive), the names of the signature the check bound the call to.
+  Not open, or no tree: null; no range: -32602.
+
+  call hierarchy (Adam.Lsp.Calls): prepareCallHierarchy the routine
+  declared or used at the position (definition's rule, a forward its full
+  routine, a generic instance the template) as one CallHierarchyItem (the
+  outline's name, kind, detail and ranges; data its key: file, line and
+  byte column of its name's place), null when none; incomingCalls /
+  outgoingCalls over every module of the open documents' last checks (each
+  file once, as workspace/symbol): the item's callers grouped by caller (a
+  call outside every routine: its module) / the routines it calls grouped
+  by routine, each with the callee names' ranges in the caller's file
+  (one per place: a generic's instances repeat their template's calls).
+  The item is found again by its data (else by its selectionRange start);
+  an item with neither: -32602.
+
   Prior art: PaskalCPP.LSP.Server / Diagnostics (CONCEPT: the lifecycle,
   the request rules, the owner-based publish; GEOMETRY rejected: Adam's
   types, System.Json).
@@ -99,7 +117,7 @@ module unit Adam.Lsp.Server;
 import System.SysUtils, System.IO, System.Json, Adam.Core.Common, Adam.Core.Messages,
   Adam.Compiler.Diagnostics, Adam.Protocol.Transport, Adam.Driver.Compiler, Adam.Lsp.Uri,
   Adam.Lsp.Document, Adam.Compiler.Lexer, Adam.Lsp.Tokens, Adam.Compiler.AST, Adam.Lsp.Find,
-  Adam.Lsp.Hover, Adam.Lsp.Outline, Adam.Lsp.Complete;
+  Adam.Lsp.Hover, Adam.Lsp.Outline, Adam.Lsp.Complete, Adam.Lsp.Hints, Adam.Lsp.Calls;
 
 public const
   // RunLsp's exit codes: "exit" after shutdown / any other end
@@ -144,6 +162,12 @@ public const
   ADAM_LSP_DOCUMENT_SYMBOL: string = "textDocument/documentSymbol";
   ADAM_LSP_WORKSPACE_SYMBOL: string = "workspace/symbol";
   ADAM_LSP_COMPLETION: string = "textDocument/completion";
+  ADAM_LSP_INLAY_HINT: string = "textDocument/inlayHint";
+  ADAM_LSP_PREPARE_CALLS: string = "textDocument/prepareCallHierarchy";
+  ADAM_LSP_INCOMING_CALLS: string = "callHierarchy/incomingCalls";
+  ADAM_LSP_OUTGOING_CALLS: string = "callHierarchy/outgoingCalls";
+  // InlayHintKind of a parameter name
+  ADAM_LSP_HINT_PARAMETER: int64 = 2;
   // completion's trigger characters ('>' for '->'), and the InsertTextFormat of a snippet
   ADAM_LSP_TRIGGER_DOT: string = ".";
   ADAM_LSP_TRIGGER_ARROW: string = ">";
@@ -164,6 +188,25 @@ type
   end;
 
   LspReportGroupArray = array of LspReportGroup;
+
+  // One entry of a call hierarchy answer: the other end's key and item, the calls' callee
+  // ranges [Starts, Ends) in Document (the caller's file)
+  LspCallGroup = object
+    Key: string;
+    Item: Json;
+    Document: ref LspDocument;
+    Starts: Int64Array;
+    Ends: Int64Array;
+
+    init(const AKey: string; const AItem: Json; const ADocument: ref LspDocument);
+    begin
+      self.Key := AKey;
+      self.Item := AItem;
+      self.Document := ADocument;
+    end;
+  end;
+
+  LspCallGroupArray = array of ref LspCallGroup;
 
 // AText added at the end of AList
 routine DoAppend(var AList: StringArray; const AText: string);
@@ -345,6 +388,32 @@ begin
   LItem.Add("source", ADAM_LSP_SOURCE);
   LItem.Add("message", AReport.Text());
   return LItem;
+end;
+
+// The index of the group of AGroups keyed AKey; -1 when none is
+routine DoGroupIndex(const AGroups: LspCallGroupArray; const AKey: string): int64;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(AGroups) - 1 do
+    if AGroups[LI].Key = AKey then
+      return LI;
+    end;
+  end;
+  return -1;
+end;
+
+// True when AValue is in AList
+routine DoHasIndex(const AList: Int64Array; const AValue: int64): bool;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(AList) - 1 do
+    if AList[LI] = AValue then
+      return true;
+    end;
+  end;
+  return false;
 end;
 
 type
@@ -587,6 +656,18 @@ type
         self.DoCompletion(AId, AParams);
         return;
       end;
+      if AMethod = ADAM_LSP_INLAY_HINT then
+        self.DoInlayHint(AId, AParams);
+        return;
+      end;
+      if AMethod = ADAM_LSP_PREPARE_CALLS then
+        self.DoPrepareCalls(AId, AParams);
+        return;
+      end;
+      if (AMethod = ADAM_LSP_INCOMING_CALLS) or (AMethod = ADAM_LSP_OUTGOING_CALLS) then
+        self.DoCalls(AId, AMethod, AParams);
+        return;
+      end;
       // Unknown requests, $/ ones too, fail
       self.DoError(AId, true, ADAM_LSP_ERROR_METHOD_NOT_FOUND,
         NoArgs().Str(AMethod).Fill(ADAM_MSG_LSP_METHOD_NOT_FOUND));
@@ -647,6 +728,8 @@ type
       LResult.EndArray();
       LResult.Add("resolveProvider", false);
       LResult.EndObject();
+      LResult.Add("inlayHintProvider", true);
+      LResult.Add("callHierarchyProvider", true);
       LResult.BeginObject("experimental");
       LResult.BeginObject(ADAM_LSP_WORDS_KEY);
       DoAddList(LResult, "keywords", ReservedWords(false));
@@ -1422,6 +1505,327 @@ type
       end;
       LResult.EndArray();
       self.DoResult(AId, LResult, false);
+    end;
+
+    // -- Inlay hints
+
+    // textDocument/inlayHint (see the header)
+    hidden method DoInlayHint(const AId: Json; const AParams: Json);
+    var
+      LUri: string;
+      LDocument: ref LspDocument;
+      LCheck: ref Compiler;
+      LFirst: int64;
+      LLast: int64;
+      LHints: LspHints;
+      LItems: Json;
+      LNone: Json;
+      LI: int64;
+    begin
+      LFirst := 0;
+      LLast := 0;
+      if not AParams.TryGetString("textDocument.uri", LUri) then
+        self.DoError(AId, true, ADAM_LSP_ERROR_INVALID_PARAMS,
+          NoArgs().Str(ADAM_LSP_INLAY_HINT).Fill(ADAM_MSG_LSP_BAD_PARAMS));
+        return;
+      end;
+      LDocument := self.DoFind(LUri);
+      if LDocument = nil then
+        self.DoResult(AId, LNone, true);
+        return;
+      end;
+      if not (self.DoOffsetAt(LDocument, AParams, "range.start", LFirst) and
+        self.DoOffsetAt(LDocument, AParams, "range.end", LLast)) then
+        self.DoError(AId, true, ADAM_LSP_ERROR_INVALID_PARAMS,
+          NoArgs().Str(ADAM_LSP_INLAY_HINT).Fill(ADAM_MSG_LSP_BAD_PARAMS));
+        return;
+      end;
+      LCheck := self.DoCurrentCheck(LDocument);
+      if (LCheck = nil) or (LCheck.MainModule = 0) then
+        self.DoResult(AId, LNone, true);
+        return;
+      end;
+      LHints := CallHints(LDocument, LCheck.Tree, LCheck.MainModule, LFirst, LLast);
+      LItems.BeginArray(ADAM_LSP_ITEMS_KEY);
+      for LI := 0 to len(LHints) - 1 do
+        LItems.BeginObject();
+        LItems.Add("position", DoPosition(LDocument, LHints[LI].Offset, self.FEncoding));
+        LItems.Add("label", LHints[LI].Text);
+        LItems.Add("kind", ADAM_LSP_HINT_PARAMETER);
+        LItems.Add("paddingRight", true);
+        LItems.EndObject();
+      end;
+      LItems.EndArray();
+      self.DoResult(AId, LItems.Get(ADAM_LSP_ITEMS_KEY), false);
+    end;
+
+    // -- Call hierarchy
+
+    // The CallHierarchyItem of the routine (or module) AId of ACheck's tree into AItem (see
+    // the header); false when it has no place in a text that can be had
+    hidden method DoCallItem(const ACheck: ref Compiler; const AId: int64; var AItem: Json): bool;
+    var
+      LKey: string;
+      LDocument: ref LspDocument;
+      LStart: int64;
+      LEnd: int64;
+      LNameStart: int64;
+      LNameEnd: int64;
+      LDetail: string;
+    begin
+      LStart := 0;
+      LEnd := 0;
+      LNameStart := 0;
+      LNameEnd := 0;
+      LKey := CallKey(ACheck.Tree, AId);
+      if LKey = "" then
+        return false;
+      end;
+      LDocument := self.DoDocumentFor(ACheck, ACheck.Tree[AId].Place.FileName);
+      if LDocument = nil then
+        return false;
+      end;
+      if not OutlineRanges(ACheck.Tree, AId, LDocument, LStart, LEnd, LNameStart, LNameEnd) then
+        return false;
+      end;
+      AItem.Add("name", OutlineName(ACheck.Tree, AId));
+      AItem.Add("kind", OutlineKind(ACheck.Tree, AId));
+      LDetail := OutlineDetail(ACheck.Tree, AId, LDocument);
+      if LDetail <> "" then
+        AItem.Add("detail", LDetail);
+      end;
+      AItem.Add("uri", LDocument.Uri);
+      AItem.Add("range", self.DoRange(LDocument, LStart, LEnd));
+      AItem.Add("selectionRange", self.DoRange(LDocument, LNameStart, LNameEnd));
+      AItem.BeginObject("data");
+      AItem.Add("key", LKey);
+      AItem.EndObject();
+      return true;
+    end;
+
+    // textDocument/prepareCallHierarchy (see the header)
+    hidden method DoPrepareCalls(const AId: Json; const AParams: Json);
+    var
+      LUri: string;
+      LDocument: ref LspDocument;
+      LCheck: ref Compiler;
+      LOffset: int64;
+      LTarget: LspTarget;
+      LRoutine: int64;
+      LItem: Json;
+      LItems: Json;
+      LNone: Json;
+    begin
+      LOffset := 0;
+      if not AParams.TryGetString("textDocument.uri", LUri) then
+        self.DoError(AId, true, ADAM_LSP_ERROR_INVALID_PARAMS,
+          NoArgs().Str(ADAM_LSP_PREPARE_CALLS).Fill(ADAM_MSG_LSP_BAD_PARAMS));
+        return;
+      end;
+      LDocument := self.DoFind(LUri);
+      if LDocument = nil then
+        self.DoResult(AId, LNone, true);
+        return;
+      end;
+      if not self.DoOffsetAt(LDocument, AParams, "position", LOffset) then
+        self.DoError(AId, true, ADAM_LSP_ERROR_INVALID_PARAMS,
+          NoArgs().Str(ADAM_LSP_PREPARE_CALLS).Fill(ADAM_MSG_LSP_BAD_PARAMS));
+        return;
+      end;
+      LCheck := self.DoCurrentCheck(LDocument);
+      if LCheck = nil then
+        self.DoResult(AId, LNone, true);
+        return;
+      end;
+      LTarget := FindAt(LDocument, LCheck.Tree, LCheck.MainModule, LOffset);
+      LRoutine := 0;
+      if LTarget.Found then
+        LRoutine := CallRoutineOf(LCheck.Tree, LTarget.Decl);
+      end;
+      if (LRoutine = 0) or not self.DoCallItem(LCheck, LRoutine, LItem) then
+        self.DoResult(AId, LNone, true);
+        return;
+      end;
+      LItems.BeginArray(ADAM_LSP_ITEMS_KEY);
+      LItems.Add(LItem);
+      LItems.EndArray();
+      self.DoResult(AId, LItems.Get(ADAM_LSP_ITEMS_KEY), false);
+    end;
+
+    // The key of the item of a call hierarchy request's AParams into AKey: its data's, else
+    // the place of its selectionRange's start in its file ("" when that is no file a text
+    // can be had of: nothing matches); false when the item has neither
+    hidden method DoCallKeyOf(const AParams: Json; var AKey: string): bool;
+    var
+      LUri: string;
+      LPath: string;
+      LText: string;
+      LLine: int64;
+      LCharacter: int64;
+      LOffset: int64;
+      LDocument: ref LspDocument;
+    begin
+      AKey := "";
+      LLine := 0;
+      LCharacter := 0;
+      LPath := "";
+      if AParams.TryGetString("item.data.key", AKey) and (AKey <> "") then
+        return true;
+      end;
+      AKey := "";
+      if not (AParams.TryGetString("item.uri", LUri) and
+        AParams.TryGetInt64("item.selectionRange.start.line", LLine) and
+        AParams.TryGetInt64("item.selectionRange.start.character", LCharacter)) then
+        return false;
+      end;
+      if not UriToPath(LUri, LPath) then
+        return true;
+      end;
+      LPath := ResolvePath(LPath);
+      // The client counted the position over the open buffer, else the disk text
+      LDocument := self.DoOpenFor(LPath);
+      if LDocument = nil then
+        LText := "";
+        if not ReadAllText(LPath, LText) then
+          return true;
+        end;
+        if StartsStr(ADAM_LSP_DOCUMENT_BOM, LText) then
+          LText := Substring(LText, len(ADAM_LSP_DOCUMENT_BOM), len(LText) - len(ADAM_LSP_DOCUMENT_BOM));
+        end;
+        LDocument := ref LspDocument(LUri, LPath, -1, LText);
+      end;
+      LOffset := LDocument.OffsetAt(LLine, LCharacter, self.FEncoding);
+      // A place's line and byte column, 1-based
+      LDocument.PositionAt(LOffset, LspEncoding.Utf8, LLine, LCharacter);
+      AKey := CallKeyAt(LDocument.Path, LLine + 1, LCharacter + 1);
+      return true;
+    end;
+
+    // A new group of AGroups for the other end AEnd (key AKey) of calls in the file ACallFile
+    // of ACheck: its index; -1 when its item or its file's text cannot be had
+    hidden method DoAddGroup(var AGroups: LspCallGroupArray; const ACheck: ref Compiler;
+      const AEnd: int64; const AKey: string; const ACallFile: string): int64;
+    var
+      LItem: Json;
+      LDocument: ref LspDocument;
+      LCount: int64;
+    begin
+      if not self.DoCallItem(ACheck, AEnd, LItem) then
+        return -1;
+      end;
+      LDocument := self.DoDocumentFor(ACheck, ACallFile);
+      if LDocument = nil then
+        return -1;
+      end;
+      LCount := len(AGroups);
+      setlength(AGroups, LCount + 1);
+      AGroups[LCount] := ref LspCallGroup(AKey, LItem, LDocument);
+      return LCount;
+    end;
+
+    // callHierarchy/incomingCalls and callHierarchy/outgoingCalls (see the header)
+    hidden method DoCalls(const AId: Json; const AMethod: string; const AParams: Json);
+    var
+      LKey: string;
+      LIncoming: bool;
+      LUris: StringArray;
+      // The modules' files done, as URIs (DoSeenFile)
+      LSeen: StringArray;
+      LDocument: ref LspDocument;
+      LCheck: ref Compiler;
+      LModule: int64;
+      LFile: string;
+      LSites: LspCallSites;
+      LEnd: int64;
+      LEndKey: string;
+      LGroups: LspCallGroupArray;
+      LAt: int64;
+      LStart: int64;
+      LStop: int64;
+      LCount: int64;
+      LItems: Json;
+      LI: int64;
+      LJ: int64;
+      LK: int64;
+    begin
+      LKey := "";
+      LStart := 0;
+      LStop := 0;
+      if not self.DoCallKeyOf(AParams, LKey) then
+        self.DoError(AId, true, ADAM_LSP_ERROR_INVALID_PARAMS,
+          NoArgs().Str(AMethod).Fill(ADAM_MSG_LSP_BAD_PARAMS));
+        return;
+      end;
+      LIncoming := AMethod = ADAM_LSP_INCOMING_CALLS;
+      // The open documents of a file, by URI: an answer does not depend on the open order
+      for LI := 0 to len(self.FDocuments) - 1 do
+        if self.FDocuments[LI].Path <> "" then
+          DoAppend(LUris, self.FDocuments[LI].Uri);
+        end;
+      end;
+      SortStrings(LUris);
+      for LI := 0 to len(LUris) - 1 do
+        LDocument := self.DoFind(LUris[LI]);
+        LCheck := self.DoCurrentCheck(LDocument);
+        if (LCheck <> nil) and (LKey <> "") then
+          for LJ := 0 to LCheck.Tree.ChildCount(ADAM_AST_PROGRAM) - 1 do
+            LModule := LCheck.Tree.ChildAt(ADAM_AST_PROGRAM, LJ);
+            LFile := LCheck.Tree[LModule].Place.FileName;
+            if (LCheck.Tree[LModule].Kind = NodeKind.Module) and (LFile <> "") and
+              not self.DoSeenFile(LSeen, PathToUri(LFile)) then
+              DoAppend(LSeen, PathToUri(LFile));
+              LSites := CallSites(LCheck.Tree, LModule);
+              for LK := 0 to len(LSites) - 1 do
+                // Incoming: the item's callers, by caller; outgoing: its calls, by routine
+                if LIncoming then
+                  if CallKey(LCheck.Tree, LSites[LK].Target) <> LKey then
+                    skip;
+                  end;
+                  LEnd := LSites[LK].Caller;
+                else
+                  if CallKey(LCheck.Tree, LSites[LK].Caller) <> LKey then
+                    skip;
+                  end;
+                  LEnd := LSites[LK].Target;
+                end;
+                LEndKey := CallKey(LCheck.Tree, LEnd);
+                LAt := DoGroupIndex(LGroups, LEndKey);
+                if LAt < 0 then
+                  LAt := self.DoAddGroup(LGroups, LCheck, LEnd, LEndKey,
+                    LCheck.Tree[LSites[LK].Call].Place.FileName);
+                end;
+                // One range per place: a generic's instances repeat their template's calls
+                if (LAt >= 0) and CallSiteRange(LCheck.Tree, LSites[LK].Call, LGroups[LAt].Document,
+                  LStart, LStop) and not DoHasIndex(LGroups[LAt].Starts, LStart) then
+                  LCount := len(LGroups[LAt].Starts);
+                  setlength(LGroups[LAt].Starts, LCount + 1);
+                  setlength(LGroups[LAt].Ends, LCount + 1);
+                  LGroups[LAt].Starts[LCount] := LStart;
+                  LGroups[LAt].Ends[LCount] := LStop;
+                end;
+              end;
+            end;
+          end;
+        end;
+      end;
+      LItems.BeginArray(ADAM_LSP_ITEMS_KEY);
+      for LI := 0 to len(LGroups) - 1 do
+        LItems.BeginObject();
+        if LIncoming then
+          LItems.Add("from", LGroups[LI].Item);
+        else
+          LItems.Add("to", LGroups[LI].Item);
+        end;
+        LItems.BeginArray("fromRanges");
+        for LJ := 0 to len(LGroups[LI].Starts) - 1 do
+          LItems.Add(self.DoRange(LGroups[LI].Document, LGroups[LI].Starts[LJ],
+            LGroups[LI].Ends[LJ]));
+        end;
+        LItems.EndArray();
+        LItems.EndObject();
+      end;
+      LItems.EndArray();
+      self.DoResult(AId, LItems.Get(ADAM_LSP_ITEMS_KEY), false);
     end;
 
     // The index of the published entry for the same file as AUri (DoSameFile); -1 when none
