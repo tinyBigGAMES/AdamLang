@@ -1,0 +1,973 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.HookIO.Core.adam - what every HookIO platform unit shares
+
+  The registry (io://<n> prefixes over an IO or an IOSource, RegisterIO's
+  and RegisterIOSource's work), the path sources (the program's and a
+  thread's), the stream locks every handle on one IO shares, the uses of
+  source entries (the D share rules), the IO-level opens a hooked fopen
+  makes (a registered IO shared at 0, a source entry opened and owned, w
+  emptying, the existence check of x) and the path query the access / stat
+  family answers. A handle's neutral part is a HookStream; each platform
+  unit (System.HookIO.Win64 for x86_64-windows-gnu) builds its handles,
+  its C runtime's FILE model and the hooked C names on these routines, and
+  places an appending handle by its C runtime's rule. Target-neutral: no
+  C runtime fact, no OS call. System.HookIO is the public surface.
+*******************************************************************************/
+
+module unit System.HookIO.Core;
+
+import System.SysUtils, System.Runtime, System.CustomIO;
+
+public const
+  // C's EOF: what the hooked stream calls return on a failure or at the end
+  ADAM_HOOKIO_EOF: int32 = -1;
+  // C's fseek origins (SEEK_SET, SEEK_CUR, SEEK_END)
+  ADAM_HOOKIO_SEEK_SET: int32 = 0;
+  ADAM_HOOKIO_SEEK_CUR: int32 = 1;
+  ADAM_HOOKIO_SEEK_END: int32 = 2;
+
+const
+  // The scheme every virtual path starts with, and its length
+  ADAM_HOOKIO_SCHEME: string = "io://";
+  ADAM_HOOKIO_SCHEME_LENGTH: int64 = 5;
+
+public type
+  // The lock every handle on one stream shares: a registered IO's (Listed: one per IO in
+  // GStreamLocks however often the IO is registered) or a source entry's handle's own. Users:
+  // the entries and handles that hold it; it goes with its last user
+  HookStreamLock = record
+    Stream: IO;
+    Listed: bool;
+    Users: int64;
+    Lock: mutex;
+  end;
+  // A registered prefix: exactly one of Stream (RegisterIO, with its stream lock) and Source
+  // (RegisterIOSource)
+  HookEntry = record
+    Id: uint64;
+    Stream: IO;
+    Source: IOSource;
+    Lock: ptr to HookStreamLock;
+  end;
+  // What a query found at a virtual path (DoQuery): whether the file exists, its size (0 when
+  // the IO cannot tell) and whether a write open that empties nothing ("r+") would succeed
+  HookQuery = record
+    Found: bool;
+    Size: int64;
+    Writable: bool;
+  end;
+  // How open handles use one source entry (ucrt's share rules for D): the plain and the D
+  // handles, counted before the entry opens; Removing while its last D close removes it
+  HookEntryUse = record
+    Source: IOSource;
+    EntryName: string;
+    Plain: int64;
+    Temporary: int64;
+    Removing: bool;
+  end;
+  // What a mode string asks for, as ucrt's fopen reads it. First: 'r', 'w' or 'a'. Mode: r
+  // Read, w Write, a Append, any with + ReadWrite (First then says whether the open empties,
+  // w, or appends, a). Text: reads and writes translate. Exclusive: x. Temporary: D.
+  // Encoded: a ccs= part, Encoding its name (1 UTF-8, 2 UTF-16LE, 3 UNICODE)
+  HookOpenMode = record
+    First: char;
+    Mode: FileMode;
+    Plus: bool;
+    Text: bool;
+    Exclusive: bool;
+    Temporary: bool;
+    Encoded: bool;
+    Encoding: int32;
+  end;
+
+  // A handle's neutral part, what the core opens fill: Stream (the IO it reads and writes),
+  // Owned (the handle opened Stream itself, a source entry, and closes it), Position (its place
+  // in Stream), Lock (the stream lock guarding Stream), Source / EntryName / Temporary (the
+  // source entry it holds a use of and whether with D; Source nil on a registered IO and once
+  // the use is given back), OwnedSource (a folder IOSource the handle made for itself, closed
+  // once the entry use is given back)
+  HookStream = record
+    Stream: IO;
+    Owned: bool;
+    Position: int64;
+    Lock: ptr to HookStreamLock;
+    Source: IOSource;
+    EntryName: string;
+    Temporary: bool;
+    OwnedSource: IOSource;
+  end;
+
+public var
+  // The registry lock: the entries, the stream locks, the open list and the entry uses. Never
+  // held while CustomIO runs: a source that opens files comes back through these hooks
+  GLock: mutex;
+
+var
+  GEntries: array of HookEntry;
+  GStreamLocks: array of ptr to HookStreamLock;
+  GEntryUses: array of ptr to HookEntryUse;
+  // The last prefix number handed out (0 is never one), under GLock
+  GLastId: uint64;
+  // The prefix number of the source SetIOPathSource set (0: none), by the atomics. It is a
+  // registered entry like any other, so a lookup copies it out under the lock (DoFind) and a
+  // source unset meanwhile is simply not found
+  GPathSourceId: uint64;
+
+threadstatic
+  // How deep this thread is inside HookIO's own path work (a hooked open): while it is above
+  // 0 a plain path is never looked up in a path source, so a source's own opens reach the real
+  // file system
+  GPathDepth: int32;
+  // The prefix number of this thread's own path source (SetIOThreadPathSource; 0: none).
+  // While it is set, this thread's plain paths are looked up in it instead of the program's
+  // path source; other threads never see it
+  GThreadPathSourceId: uint64;
+
+// Gives back one user of ALock (nil: nothing); its last user takes it out of GStreamLocks and
+// frees it
+public routine HookIOReleaseLock(const ALock: ptr to HookStreamLock);
+var
+  LLock: ptr to HookStreamLock;
+  LFree: bool;
+  LCount: int64;
+  LI: int64;
+begin
+  if ALock = nil then
+    return;
+  end;
+  LFree := false;
+  lock (GLock) do
+    ALock->Users := ALock->Users - 1;
+    if ALock->Users = 0 then
+      LFree := true;
+      if ALock->Listed then
+        LCount := len(GStreamLocks);
+        LI := 0;
+        while (LI < LCount) and (GStreamLocks[LI] <> ALock) do
+          LI := LI + 1;
+        end;
+        if LI < LCount then
+          while LI < LCount - 1 do
+            GStreamLocks[LI] := GStreamLocks[LI + 1];
+            LI := LI + 1;
+          end;
+          setlength(GStreamLocks, LCount - 1);
+        end;
+      end;
+    end;
+  end;
+  if LFree then
+    LLock := ALock;
+    destroy(LLock);
+  end;
+end;
+// AStream's shared stream lock with one more user, made on first use (the caller holds
+// GLock); nil when there is no room. One IO has one lock however often it is registered,
+// also after an unregister while its handles stay open
+public routine HookIOStreamLockOf(const AStream: IO): ptr to HookStreamLock;
+var
+  LLock: ptr to HookStreamLock;
+  LCount: int64;
+  LI: int64;
+begin
+  for LI := 0 to len(GStreamLocks) - 1 do
+    LLock := GStreamLocks[LI];
+    if LLock->Stream = AStream then
+      LLock->Users := LLock->Users + 1;
+      return LLock;
+    end;
+  end;
+  create(LLock);
+  if LLock = nil then
+    return nil;
+  end;
+  LLock->Stream := AStream;
+  LLock->Listed := true;
+  LLock->Users := 1;
+  LCount := len(GStreamLocks);
+  setlength(GStreamLocks, LCount + 1);
+  GStreamLocks[LCount] := LLock;
+  return LLock;
+end;
+// A stream lock of a handle's own, with the handle as its one user (a source entry's IO is
+// that handle's alone); nil when there is no room
+public routine HookIOOwnLock(): ptr to HookStreamLock;
+var
+  LLock: ptr to HookStreamLock;
+begin
+  create(LLock);
+  if LLock <> nil then
+    LLock->Users := 1;
+  end;
+  return LLock;
+end;
+// True when APath from AFrom on is virtual (starts with io://). AId: its prefix number, 0 when
+// the number is missing, has a leading zero, passes uint64 or is followed by anything but the
+// end or '/' (no prefix is 0, so the path is a missing file). ARest: what follows the number,
+// "" or "/<name>"
+public routine HookIOParse(const APath: string; const AFrom: int64; var AId: uint64;
+  var ARest: string): bool;
+var
+  LCount: int64;
+  LAt: int64;
+  LId: uint64;
+  LDigit: uint64;
+  LDigits: bool;
+begin
+  AId := 0;
+  ARest := "";
+  LCount := len(APath);
+  if Substring(APath, AFrom, ADAM_HOOKIO_SCHEME_LENGTH) <> ADAM_HOOKIO_SCHEME then
+    return false;
+  end;
+  LAt := AFrom + ADAM_HOOKIO_SCHEME_LENGTH;
+  if (LAt < LCount) and (APath[LAt] = '0') then
+    return true;
+  end;
+  LId := 0;
+  LDigits := false;
+  while (LAt < LCount) and (APath[LAt] >= '0') and (APath[LAt] <= '9') do
+    LDigit := uint64(int32(APath[LAt]) - 48);
+    // Past the largest number: no such prefix
+    if LId > ((18446744073709551615u - LDigit) div 10) then
+      return true;
+    end;
+    LId := (LId * 10) + LDigit;
+    LDigits := true;
+    LAt := LAt + 1;
+  end;
+  if not LDigits then
+    return true;
+  end;
+  if (LAt < LCount) and (APath[LAt] <> '/') then
+    return true;
+  end;
+  AId := LId;
+  ARest := Substring(APath, LAt, LCount - LAt);
+  return true;
+end;
+// Where APath's io:// path starts when every leading "./" (or ".\", the same step on Windows)
+// is followed by one, else 0. A C library joining a folder with no root and a name writes
+// "./<folder>" (raylib's GetDirectoryPath), so "./io://3/a.png" names "io://3/a.png"
+public routine HookIOSkipCurrentFolder(const APath: string): int64;
+var
+  LAt: int64;
+begin
+  LAt := 0;
+  while (LAt + 1 < len(APath)) and (APath[LAt] = '.') and
+    ((APath[LAt + 1] = '/') or (APath[LAt + 1] = '\\')) do
+    LAt := LAt + 2;
+  end;
+  if (LAt > 0) and (Substring(APath, LAt, ADAM_HOOKIO_SCHEME_LENGTH) = ADAM_HOOKIO_SCHEME) then
+    return LAt;
+  end;
+  return 0;
+end;
+// True when APath names a virtual path (io://, after HookIOSkipCurrentFolder)
+public routine HookIOIsVirtual(const APath: string): bool;
+begin
+  return Substring(APath, HookIOSkipCurrentFolder(APath), ADAM_HOOKIO_SCHEME_LENGTH) =
+    ADAM_HOOKIO_SCHEME;
+end;
+// The registered entry of AId copied out under the lock, its stream lock with one more user
+// (the open gives it back when it is done); false when none
+public routine HookIOFind(const AId: uint64; var AEntry: HookEntry): bool;
+var
+  LI: int64;
+begin
+  lock (GLock) do
+    for LI := 0 to len(GEntries) - 1 do
+      if GEntries[LI].Id = AId then
+        AEntry := GEntries[LI];
+        if AEntry.Lock <> nil then
+          AEntry.Lock->Users := AEntry.Lock->Users + 1;
+        end;
+        return true;
+      end;
+    end;
+  end;
+  return false;
+end;
+// Registers one stream under the next prefix number, AId that number (0 when nothing is
+// registered); "" when both are nil or there is no room. The prefix text is built before the
+// entry is added, so a failure registers nothing
+public routine HookIORegisterWithId(const AStream: IO; const ASource: IOSource; var AId: uint64): string;
+var
+  LEntry: HookEntry;
+  LPrefix: string;
+  LCount: int64;
+begin
+  AId := 0;
+  if (AStream = nil) and (ASource = nil) then
+    return "";
+  end;
+  LEntry.Id := 0;
+  LEntry.Stream := AStream;
+  LEntry.Source := ASource;
+  LEntry.Lock := nil;
+  lock (GLock) do
+    if AStream <> nil then
+      LEntry.Lock := HookIOStreamLockOf(AStream);
+      if LEntry.Lock = nil then
+        return "";
+      end;
+    end;
+    LEntry.Id := GLastId + 1;
+    LPrefix := ADAM_HOOKIO_SCHEME + UIntToStr(LEntry.Id);
+    LCount := len(GEntries);
+    setlength(GEntries, LCount + 1);
+    GEntries[LCount] := LEntry;
+    GLastId := LEntry.Id;
+  end;
+  AId := LEntry.Id;
+  return LPrefix;
+end;
+// Registers one stream under the next prefix number, as HookIORegisterWithId
+public routine HookIORegister(const AStream: IO; const ASource: IOSource): string;
+var
+  LId: uint64;
+begin
+  return HookIORegisterWithId(AStream, ASource, LId);
+end;
+// Removes the entry of prefix number AId; false when none is registered under it
+public routine HookIOUnregisterId(const AId: uint64): bool;
+var
+  LLock: ptr to HookStreamLock;
+  LFound: bool;
+  LCount: int64;
+  LI: int64;
+begin
+  LFound := false;
+  LLock := nil;
+  lock (GLock) do
+    LCount := len(GEntries);
+    LI := 0;
+    while (LI < LCount) and (GEntries[LI].Id <> AId) do
+      LI := LI + 1;
+    end;
+    if LI < LCount then
+      LFound := true;
+      LLock := GEntries[LI].Lock;
+      while LI < LCount - 1 do
+        GEntries[LI] := GEntries[LI + 1];
+        LI := LI + 1;
+      end;
+      setlength(GEntries, LCount - 1);
+    end;
+  end;
+  HookIOReleaseLock(LLock);
+  return LFound;
+end;
+// Removes a registered prefix (exactly `io://<n>`); false when it is not one
+public routine HookIOUnregister(const APrefix: string): bool;
+var
+  LId: uint64;
+  LRest: string;
+begin
+  if not HookIOParse(APrefix, 0, LId, LRest) then
+    return false;
+  end;
+  if (LId = 0) or (len(LRest) <> 0) then
+    return false;
+  end;
+  return HookIOUnregisterId(LId);
+end;
+// The prefix number of a source registered for a path source (nil: 0, nothing registered);
+// false when there is no room, nothing registered
+public routine HookIOPathSourceIdOf(const ASource: IOSource; var AId: uint64): bool;
+var
+  LPrefix: string;
+begin
+  AId := 0;
+  if ASource = nil then
+    return true;
+  end;
+  LPrefix := HookIORegisterWithId(nil, ASource, AId);
+  return len(LPrefix) <> 0;
+end;
+// Makes ASource the program's path source (nil: none). It is registered under a prefix of its
+// own first (false, nothing changed, when that fails); the one it replaces is unregistered
+// after the swap, so a lookup meanwhile sees either source, never neither by mistake
+public routine HookIOSetPathSource(const ASource: IOSource): bool;
+var
+  LNewId: uint64;
+  LOldId: uint64;
+begin
+  if not HookIOPathSourceIdOf(ASource, LNewId) then
+    return false;
+  end;
+  LOldId := atomicswap(GPathSourceId, LNewId);
+  if LOldId <> 0 then
+    HookIOUnregisterId(LOldId);
+  end;
+  return true;
+end;
+// Makes ASource this thread's own path source (nil: none, the program's applies again), as
+// HookIOSetPathSource; only this thread reads GThreadPathSourceId, so the swap needs no atomic
+public routine HookIOSetThreadPathSource(const ASource: IOSource): bool;
+var
+  LNewId: uint64;
+  LOldId: uint64;
+begin
+  if not HookIOPathSourceIdOf(ASource, LNewId) then
+    return false;
+  end;
+  LOldId := GThreadPathSourceId;
+  GThreadPathSourceId := LNewId;
+  if LOldId <> 0 then
+    HookIOUnregisterId(LOldId);
+  end;
+  return true;
+end;
+// The source this thread's own path source was set from (nil: none set)
+public routine HookIOThreadPathSource(): IOSource;
+var
+  LEntry: HookEntry;
+begin
+  if GThreadPathSourceId = 0 then
+    return nil;
+  end;
+  if not HookIOFind(GThreadPathSourceId, LEntry) then
+    return nil;
+  end;
+  // A source entry has no stream lock; HookIOFind's user is given back all the same
+  HookIOReleaseLock(LEntry.Lock);
+  return LEntry.Source;
+end;
+// The prefix number a plain path on this thread is looked up in: the thread's own path source
+// when one is set, else the program's (0: none)
+public routine HookIOActivePathSourceId(): uint64;
+begin
+  if GThreadPathSourceId <> 0 then
+    return GThreadPathSourceId;
+  end;
+  return atomicload(GPathSourceId);
+end;
+// True when a plain path may be looked up in a path source: one is set (this thread's own or
+// the program's) and this thread is not inside HookIO's own path work. pcpp also skipped the
+// lookup inside CustomIO's real file system work (InFileSystemWork); Adam's CustomIO opens and
+// queries its files through System.Runtime's file handles and paths, never a hooked C name,
+// so its file IO and folder source never come back through these hooks
+public routine HookIOPathSourceActive(): bool;
+begin
+  return (GPathDepth = 0) and (HookIOActivePathSourceId() <> 0);
+end;
+// A plain path as an entry name of the path source: '\' turned to '/', and every leading "./"
+// or '/' dropped (a source's names are relative), as raylib's file callbacks name them; ""
+// when nothing is left
+public routine HookIOPathEntryName(const APath: string): string;
+var
+  LName: string;
+  LCount: int64;
+  LAt: int64;
+  LI: int64;
+  LSkipping: bool;
+begin
+  LCount := len(APath);
+  LAt := 0;
+  LSkipping := true;
+  while LSkipping do
+    LSkipping := false;
+    if (LAt < LCount) and ((APath[LAt] = '/') or (APath[LAt] = '\\')) then
+      LAt := LAt + 1;
+      LSkipping := true;
+    end;
+    if (not LSkipping) and (LAt + 1 < LCount) and (APath[LAt] = '.') and
+      ((APath[LAt + 1] = '/') or (APath[LAt + 1] = '\\')) then
+      LAt := LAt + 2;
+      LSkipping := true;
+    end;
+  end;
+  setlength(LName, LCount - LAt);
+  for LI := 0 to len(LName) - 1 do
+    if APath[LAt + LI] = '\\' then
+      LName[LI] := '/';
+    else
+      LName[LI] := APath[LAt + LI];
+    end;
+  end;
+  return LName;
+end;
+// As HookIOParse (after HookIOSkipCurrentFolder), and a plain path the path source holds (this
+// thread's own when set, else the program's): then AId is that source's prefix number and
+// ARest "/<entry>". A plain path the source lacks (or any path while no source is set, or
+// inside HookIO's own path work) is false: the C runtime gets it
+public routine HookIOResolve(const APath: string; var AId: uint64; var ARest: string): bool;
+var
+  LEntry: HookEntry;
+  LSourceId: uint64;
+  LName: string;
+  LExists: bool;
+begin
+  if HookIOParse(APath, HookIOSkipCurrentFolder(APath), AId, ARest) then
+    return true;
+  end;
+  if (len(APath) = 0) or (not HookIOPathSourceActive()) then
+    return false;
+  end;
+  LSourceId := HookIOActivePathSourceId();
+  if (LSourceId = 0) or (not HookIOFind(LSourceId, LEntry)) then
+    return false;
+  end;
+  // A source entry has no stream lock; HookIOFind's user is given back all the same
+  HookIOReleaseLock(LEntry.Lock);
+  if LEntry.Source = nil then
+    return false;
+  end;
+  LName := HookIOPathEntryName(APath);
+  if len(LName) = 0 then
+    return false;
+  end;
+  // The lookup is HookIO's own path work: a source that opens files reaches the real ones
+  GPathDepth := GPathDepth + 1;
+  LExists := IOSourceExists(LEntry.Source, LName);
+  GPathDepth := GPathDepth - 1;
+  if not LExists then
+    return false;
+  end;
+  AId := LSourceId;
+  ARest := "/" + LName;
+  return true;
+end;
+// The place of ASource's entry AEntry in GEntryUses (the caller holds GLock), or -1
+public routine HookIOFindEntryUse(const ASource: IOSource; const AEntry: string): int64;
+var
+  LUse: ptr to HookEntryUse;
+  LI: int64;
+begin
+  for LI := 0 to len(GEntryUses) - 1 do
+    LUse := GEntryUses[LI];
+    if (LUse->Source = ASource) and (LUse->EntryName = AEntry) then
+      return LI;
+    end;
+  end;
+  return -1;
+end;
+// Takes the use record at AAt out of GEntryUses (the caller holds GLock) and frees it
+public routine HookIODropEntryUseAt(const AAt: int64);
+var
+  LUse: ptr to HookEntryUse;
+  LCount: int64;
+  LI: int64;
+begin
+  LUse := GEntryUses[AAt];
+  LCount := len(GEntryUses);
+  LI := AAt;
+  while LI < LCount - 1 do
+    GEntryUses[LI] := GEntryUses[LI + 1];
+    LI := LI + 1;
+  end;
+  setlength(GEntryUses, LCount - 1);
+  destroy(LUse);
+end;
+// Takes a use of a source entry before it is opened (ucrt's share rules for D: a D open asks
+// DELETE access and shares deletion, every other open shares reading and writing only, so a D
+// handle and a plain one refuse each other). False with errno set: EACCES when the other kind
+// holds it, ENOENT while its last D close is removing it, ENOMEM
+public routine HookIOReserveEntry(const ASource: IOSource; const AEntry: string;
+  const ATemporary: bool): bool;
+var
+  LUse: ptr to HookEntryUse;
+  LAt: int64;
+  LCount: int64;
+begin
+  lock (GLock) do
+    LAt := HookIOFindEntryUse(ASource, AEntry);
+    if LAt >= 0 then
+      LUse := GEntryUses[LAt];
+    else
+      create(LUse);
+      if LUse = nil then
+        SetCErrno(ADAM_ERRNO_ENOMEM);
+        return false;
+      end;
+      LUse->Source := ASource;
+      LUse->EntryName := AEntry;
+      LCount := len(GEntryUses);
+      setlength(GEntryUses, LCount + 1);
+      GEntryUses[LCount] := LUse;
+    end;
+    if LUse->Removing then
+      SetCErrno(ADAM_ERRNO_ENOENT);
+      return false;
+    end;
+    if (ATemporary and (LUse->Plain > 0)) or ((not ATemporary) and (LUse->Temporary > 0)) then
+      SetCErrno(ADAM_ERRNO_EACCES);
+      return false;
+    end;
+    if ATemporary then
+      LUse->Temporary := LUse->Temporary + 1;
+    else
+      LUse->Plain := LUse->Plain + 1;
+    end;
+  end;
+  return true;
+end;
+// Gives a use back. True when it was the entry's last D use and ARemove asks for the removal:
+// the entry is then marked Removing and the caller removes it (HookIOFinishRemove). ARemove is
+// false when the open that took the use failed before its IO was opened
+public routine HookIOReleaseEntry(const ASource: IOSource; const AEntry: string; const ATemporary: bool;
+  const ARemove: bool): bool;
+var
+  LUse: ptr to HookEntryUse;
+  LAt: int64;
+begin
+  lock (GLock) do
+    LAt := HookIOFindEntryUse(ASource, AEntry);
+    if LAt < 0 then
+      return false;
+    end;
+    LUse := GEntryUses[LAt];
+    if ATemporary then
+      LUse->Temporary := LUse->Temporary - 1;
+    else
+      LUse->Plain := LUse->Plain - 1;
+    end;
+    if ATemporary and ARemove and (LUse->Temporary = 0) then
+      LUse->Removing := true;
+      return true;
+    end;
+    if (LUse->Plain = 0) and (LUse->Temporary = 0) and (not LUse->Removing) then
+      HookIODropEntryUseAt(LAt);
+    end;
+  end;
+  return false;
+end;
+// Removes an entry whose last D handle closed (GLock is not held: the source runs), then
+// forgets its use. The result is not reported: ucrt's fclose cannot see whether the OS deleted
+// the file either
+public routine HookIOFinishRemove(const ASource: IOSource; const AEntry: string);
+var
+  LAt: int64;
+begin
+  IOSourceRemove(ASource, AEntry);
+  lock (GLock) do
+    LAt := HookIOFindEntryUse(ASource, AEntry);
+    if LAt >= 0 then
+      HookIODropEntryUseAt(LAt);
+    end;
+  end;
+end;
+// Gives back the entry use a handle holds, once (Source is cleared), and removes the entry when
+// that was its last D handle. A no-op on a registered IO
+public routine HookIOGiveBackEntry(const AHandle: ptr to HookStream; const ARemove: bool);
+var
+  LSource: IOSource;
+begin
+  LSource := AHandle->Source;
+  if LSource = nil then
+    return;
+  end;
+  AHandle->Source := nil;
+  if HookIOReleaseEntry(LSource, AHandle->EntryName, AHandle->Temporary, ARemove) then
+    HookIOFinishRemove(LSource, AHandle->EntryName);
+  end;
+end;
+// The entry name in a path's rest after the prefix: "/<entry>" -> "<entry>"
+public routine HookIOEntryName(const ARest: string): string;
+begin
+  if (len(ARest) > 0) and (ARest[0] = '/') then
+    return Substring(ARest, 1, len(ARest) - 1);
+  end;
+  return ARest;
+end;
+// True when the open's target exists: always for a registered IO (every name under its prefix
+// is that IO), IOSourceExists for a source entry
+public routine HookIOExists(const AEntry: HookEntry; const ARest: string): bool;
+begin
+  if AEntry.Stream <> nil then
+    return true;
+  end;
+  return IOSourceExists(AEntry.Source, HookIOEntryName(ARest));
+end;
+// w / w+ empty the handle's IO, as the C runtime's open truncates the file (on a registered IO
+// every other handle sees it emptied). An IO that cannot write refuses the open with EACCES (a
+// read-only file); one that cannot be emptied (no Truncate, or a failed one) with ucrt's EINVAL
+// for a file it cannot truncate. False with errno set; the handle starts at 0
+public routine HookIOEmptyIO(const AHandle: ptr to HookStream): bool;
+var
+  LEmptied: bool;
+  LReadOnly: bool;
+begin
+  LEmptied := false;
+  LReadOnly := false;
+  lock (AHandle->Lock->Lock) do
+    LEmptied := IOTruncate(AHandle->Stream, 0);
+    if not LEmptied then
+      LReadOnly := IOStatus(AHandle->Stream) = IOState.ReadOnly;
+    end;
+  end;
+  if not LEmptied then
+    if LReadOnly then
+      SetCErrno(ADAM_ERRNO_EACCES);
+    else
+      SetCErrno(ADAM_ERRNO_EINVAL);
+    end;
+    return false;
+  end;
+  AHandle->Position := 0;
+  return true;
+end;
+// w+ / a+ on a source entry: CustomIO has no mode that creates AND reads, so a missing entry
+// is created first by IOSourceOpen in Write (w+) or Append (a+) and closed at once; the handle
+// then opens it ReadWrite. False with errno set: ENOENT when the source would not create it,
+// EIO when closing the new entry failed
+public routine HookIOCreateEntry(const ASource: IOSource; const AEntry: string;
+  const AParsed: HookOpenMode): bool;
+var
+  LCreated: IO;
+  LMode: FileMode;
+begin
+  if IOSourceExists(ASource, AEntry) then
+    return true;
+  end;
+  LMode := FileMode.Append;
+  if AParsed.First = 'w' then
+    LMode := FileMode.Write;
+  end;
+  LCreated := IOSourceOpen(ASource, AEntry, LMode);
+  if LCreated = nil then
+    SetCErrno(ADAM_ERRNO_ENOENT);
+    return false;
+  end;
+  if not IOClose(LCreated) then
+    SetCErrno(ADAM_ERRNO_EIO);
+    return false;
+  end;
+  return true;
+end;
+// ucrt's D open asks DELETE access, which a file that cannot be deleted refuses with EACCES
+// before anything is opened. For an entry: a source that cannot remove entries (a zip), or an
+// existing entry that does not open for writing. A missing entry opened with r is left to the
+// open's own ENOENT. False with errno set
+public routine HookIOTemporaryAllowed(const ASource: IOSource; const AEntry: string;
+  const AParsed: HookOpenMode): bool;
+var
+  LExists: bool;
+  LProbe: IO;
+begin
+  LExists := IOSourceExists(ASource, AEntry);
+  if (not LExists) and (AParsed.First = 'r') then
+    return true;
+  end;
+  if not IOSourceCanRemove(ASource) then
+    SetCErrno(ADAM_ERRNO_EACCES);
+    return false;
+  end;
+  if not LExists then
+    return true;
+  end;
+  LProbe := IOSourceOpen(ASource, AEntry, FileMode.ReadWrite);
+  if LProbe = nil then
+    SetCErrno(ADAM_ERRNO_EACCES);
+    return false;
+  end;
+  IOClose(LProbe);
+  return true;
+end;
+// A handle on a registered IO, sharing the entry's stream lock (one more user for the
+// handle). w / w+ empty the IO (HookIOEmptyIO); every handle starts at 0 (an appending one is
+// placed by its platform unit)
+public routine HookIOOpenShared(const AEntry: HookEntry; const AParsed: HookOpenMode;
+  const AHandle: ptr to HookStream): bool;
+begin
+  lock (GLock) do
+    AEntry.Lock->Users := AEntry.Lock->Users + 1;
+  end;
+  AHandle->Stream := AEntry.Stream;
+  AHandle->Lock := AEntry.Lock;
+  AHandle->Owned := false;
+  AHandle->Position := 0;
+  if AParsed.First = 'w' then
+    return HookIOEmptyIO(AHandle);
+  end;
+  return true;
+end;
+// A handle's IO on the source entry AEntry; the handle owns the IO and a stream lock of its
+// own. w+ / a+ open it ReadWrite (HookIOCreateEntry first), w+ then empties it (HookIOEmptyIO). A
+// failed open sets errno: EACCES when the entry exists (the source does not offer that mode),
+// ENOENT otherwise (missing, or a path IOSourceOpen refuses)
+public routine HookIOOpenEntryIO(const ASource: IOSource; const AEntry: string; const AParsed: HookOpenMode;
+  const AHandle: ptr to HookStream): bool;
+var
+  LCreating: bool;
+  LStream: IO;
+  LFailed: bool;
+  LError: int32;
+begin
+  LCreating := AParsed.Plus and (AParsed.First <> 'r');
+  if LCreating and (not HookIOCreateEntry(ASource, AEntry, AParsed)) then
+    return false;
+  end;
+  LStream := IOSourceOpen(ASource, AEntry, AParsed.Mode);
+  if LStream = nil then
+    if IOSourceExists(ASource, AEntry) then
+      SetCErrno(ADAM_ERRNO_EACCES);
+    else
+      SetCErrno(ADAM_ERRNO_ENOENT);
+    end;
+    return false;
+  end;
+  AHandle->Stream := LStream;
+  AHandle->Owned := true;
+  AHandle->Position := 0;
+  AHandle->Lock := HookIOOwnLock();
+  if AHandle->Lock = nil then
+    IOClose(LStream);
+    AHandle->Stream := nil;
+    SetCErrno(ADAM_ERRNO_ENOMEM);
+    return false;
+  end;
+  LFailed := false;
+  if LCreating and (AParsed.First = 'w') then
+    LFailed := not HookIOEmptyIO(AHandle);
+  end;
+  if LFailed then
+    // errno is set by the step that failed; the close must not change it
+    LError := CErrno();
+    IOClose(LStream);
+    AHandle->Stream := nil;
+    SetCErrno(LError);
+    return false;
+  end;
+  return true;
+end;
+// A handle on a source entry (HookIOOpenEntryIO): the handle takes a use of the entry first (ucrt's
+// share rules for D, HookIOReserveEntry) and a D open checks the entry can be removed
+// (HookIOTemporaryAllowed); the handle keeps the entry and gives the use back at its close
+public routine HookIOOpenEntry(const ASource: IOSource; const ARest: string; const AParsed: HookOpenMode;
+  const AHandle: ptr to HookStream): bool;
+var
+  LEntry: string;
+  LError: int32;
+begin
+  LEntry := HookIOEntryName(ARest);
+  if AParsed.Temporary and (not HookIOTemporaryAllowed(ASource, LEntry, AParsed)) then
+    return false;
+  end;
+  if not HookIOReserveEntry(ASource, LEntry, AParsed.Temporary) then
+    return false;
+  end;
+  if not HookIOOpenEntryIO(ASource, LEntry, AParsed, AHandle) then
+    LError := CErrno();
+    HookIOReleaseEntry(ASource, LEntry, AParsed.Temporary, false);
+    SetCErrno(LError);
+    return false;
+  end;
+  AHandle->Source := ASource;
+  AHandle->EntryName := LEntry;
+  AHandle->Temporary := AParsed.Temporary;
+  return true;
+end;
+// Closes the folder source a handle made for itself (a freopen onto a real path, DoReopen),
+// once its entry use is given back. False when closing the source failed
+public routine HookIOCloseOwnedSource(const AHandle: ptr to HookStream): bool;
+var
+  LSource: IOSource;
+begin
+  LSource := AHandle->OwnedSource;
+  if LSource = nil then
+    return true;
+  end;
+  AHandle->OwnedSource := nil;
+  return IOSourceClose(LSource);
+end;
+// The query family (access, stat, GetFileAttributesA) answers a virtual path, or one the path
+// source holds (HookIOResolve), as fopen would find it. False: neither, the caller passes it to
+// the C runtime. True: answered in AQuery; a missing file sets errno ENOENT, a found one
+// leaves errno as the caller had it. Writable: a write open that empties nothing ("r+")
+// would succeed: always on a registered IO (HookIOOpenShared opens it in every mode), on a
+// source entry when IOSourceOpen gives it in ReadWrite (opened and closed at once). Under a
+// registered IO's prefix every name is that IO; a source entry exists when IOSourceExists
+// says so. Directories are not answered: CustomIO has no directory query, and a source's
+// root is a missing file, as opendir finds it. GLock is never held while CustomIO runs
+public routine HookIOQuery(const APath: string; var AQuery: HookQuery): bool;
+var
+  LEntry: HookEntry;
+  LRest: string;
+  LName: string;
+  LId: uint64;
+  LFound: bool;
+  LStream: IO;
+  LCallerErrno: int32;
+begin
+  AQuery.Found := false;
+  AQuery.Size := 0;
+  AQuery.Writable := false;
+  LCallerErrno := CErrno();
+  if not HookIOResolve(APath, LId, LRest) then
+    SetCErrno(LCallerErrno);
+    return false;
+  end;
+  // The query's own work (the source's real files) never maps a plain path
+  GPathDepth := GPathDepth + 1;
+  LFound := false;
+  if LId <> 0 then
+    LFound := HookIOFind(LId, LEntry);
+  end;
+  if LFound then
+    if LEntry.Stream <> nil then
+      lock (LEntry.Lock->Lock) do
+        AQuery.Size := IOSize(LEntry.Stream);
+      end;
+      AQuery.Writable := true;
+      AQuery.Found := true;
+    else
+      LName := HookIOEntryName(LRest);
+      if IOSourceExists(LEntry.Source, LName) then
+        AQuery.Size := IOSourceSize(LEntry.Source, LName);
+        LStream := IOSourceOpen(LEntry.Source, LName, FileMode.ReadWrite);
+        if LStream <> nil then
+          AQuery.Writable := true;
+          IOClose(LStream);
+        end;
+        AQuery.Found := true;
+      end;
+    end;
+    // The entry's stream lock user HookIOFind took
+    HookIOReleaseLock(LEntry.Lock);
+  end;
+  GPathDepth := GPathDepth - 1;
+  if AQuery.Size < 0 then
+    AQuery.Size := 0;
+  end;
+  if AQuery.Found then
+    SetCErrno(LCallerErrno);
+  else
+    SetCErrno(ADAM_ERRNO_ENOENT);
+  end;
+  return true;
+end;
+
+// Enters HookIO's own path work on this thread (a hooked open's or a query's): until the
+// matching HookIOLeavePathWork a plain path is never looked up in a path source, so a
+// source's own opens reach the real file system
+public routine HookIOEnterPathWork();
+begin
+  GPathDepth := GPathDepth + 1;
+end;
+
+// Leaves the path work HookIOEnterPathWork entered
+public routine HookIOLeavePathWork();
+begin
+  GPathDepth := GPathDepth - 1;
+end;
+
+end.
