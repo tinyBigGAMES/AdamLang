@@ -29,7 +29,15 @@
                   with (ElfMachineX86_64); for reading a
                   foreign object (Adam.Elf.Foreign, LX3a) the types that mean
                   nothing, the 32-bit pc-relative ones (S + A - P) and the
-                  GOT-relative ones (a slot holding S, its address + A - P)
+                  GOT-relative ones (a slot holding S, its address + A - P);
+                  for a dynamic exe (Adam.Elf.Linker, LX3b) the psABI's
+                  interpreter, the slot relocation the loader fills
+                  (GLOB_DAT), Adam's own _start (glibc crt1.o's: the
+                  kernel's argc / argv and the loader's fini to the C
+                  runtime's start routine, its main's address and the call
+                  through the routine's slot at the fields named) and a
+                  routine's stub (a jump through its slot: the target of a
+                  foreign call to a shared library's routine)
   WriteElfObject  the object (ET_REL), laid out in this order: the ELF
                   header, then the contents in section index order (each at
                   its alignment), then the section header table.
@@ -90,7 +98,7 @@
 
 module unit Adam.Elf.Writer;
 
-import System.SysUtils, Adam.Core.Containers, Adam.Backend.Sections, System.Elf;
+import System.SysUtils, Adam.Core.Common, Adam.Core.Containers, Adam.Backend.Sections, System.Elf;
 
 public const
   // Raised (see the header)
@@ -121,6 +129,19 @@ public const
   ADAM_ELF_X86_64_JUMP: uint8 = 0xE9;
   // x86_64's int3, an image's code gap fill
   ADAM_ELF_X86_64_INT3: int64 = 0xCC;
+  // x86_64's dynamic exe pieces (see the header; GNU as's bytes): the psABI's interpreter;
+  // _start = endbr64; xor ebp, ebp; mov r9, rdx; pop rsi; mov rdx, rsp; and rsp, -16;
+  // push rax; push rsp; xor r8d, r8d; xor ecx, ecx; lea rdi, [rip + main];
+  // call [rip + slot]; hlt; a stub = jmp [rip + slot], int3 to 8 bytes
+  ADAM_ELF_X86_64_INTERPRETER: string = "/lib64/ld-linux-x86-64" + ADAM_EXT_ELF_SO + ".2";
+  ADAM_ELF_X86_64_START: array[0..37] of uint8 = [
+    0xF3, 0x0F, 0x1E, 0xFA, 0x31, 0xED, 0x49, 0x89, 0xD1, 0x5E, 0x48, 0x89, 0xE2,
+    0x48, 0x83, 0xE4, 0xF0, 0x50, 0x54, 0x45, 0x31, 0xC0, 0x31, 0xC9,
+    0x48, 0x8D, 0x3D, 0, 0, 0, 0, 0xFF, 0x15, 0, 0, 0, 0, 0xF4];
+  ADAM_ELF_X86_64_START_MAIN_AT: int64 = 27;
+  ADAM_ELF_X86_64_START_CALL_AT: int64 = 33;
+  ADAM_ELF_X86_64_STUB: array[0..7] of uint8 = [0xFF, 0x25, 0, 0, 0, 0, 0xCC, 0xCC];
+  ADAM_ELF_X86_64_STUB_SLOT_AT: int64 = 2;
 
 const
   // The writer's own section names
@@ -151,6 +172,16 @@ public type
     PageSize: int64;
     // The byte an image's code gaps are filled with (x86_64's int3)
     CodeFill: int64;
+    // A dynamic exe's (see the header): the interpreter, the slot relocation, _start's
+    // bytes and its main / call fields, a stub's bytes and its slot field (each field a
+    // 32-bit pc-relative one ending its instruction)
+    Interpreter: string;
+    RelocGlobDat: int64;
+    StartCode: ByteArray;
+    StartMainAt: int64;
+    StartCallAt: int64;
+    StubCode: ByteArray;
+    StubSlotAt: int64;
 
     init(const AMachine: int64; const ARelocPc32: int64; const ARelocPlt32: int64;
       const ARelocAbs64: int64; const ARelocGotPcRel: int64; const ARelocDtpOff32: int64;
@@ -168,6 +199,13 @@ public type
       self.CodeFill := 0;
       setlength(self.PcRelTypes, 0);
       setlength(self.GotRelTypes, 0);
+      self.Interpreter := "";
+      self.RelocGlobDat := 0;
+      setlength(self.StartCode, 0);
+      self.StartMainAt := 0;
+      self.StartCallAt := 0;
+      setlength(self.StubCode, 0);
+      self.StubSlotAt := 0;
     end;
 
     // True when ATypes holds AType
@@ -204,10 +242,12 @@ public type
   end;
 
 // x86_64's ElfMachine (the psABI's relocation types, E8 call / E9 jmp rel32; a foreign
-// object's PC32 / PLT32 pc-relative, GOTPCREL / GOTPCRELX / REX_GOTPCRELX through a slot)
+// object's PC32 / PLT32 pc-relative, GOTPCREL / GOTPCRELX / REX_GOTPCRELX through a slot; a
+// dynamic exe's interpreter, GLOB_DAT, _start and stub)
 public routine ElfMachineX86_64(): ref ElfMachine;
 var
   LMachine: ref ElfMachine;
+  LI: int64;
 begin
   LMachine := ref ElfMachine(EM_X86_64, R_X86_64_PC32, R_X86_64_PLT32, R_X86_64_64,
     R_X86_64_GOTPCREL, R_X86_64_DTPOFF32, ADAM_ELF_PAGE_X86_64);
@@ -223,6 +263,19 @@ begin
   LMachine.GotRelTypes[0] := int64(R_X86_64_GOTPCREL);
   LMachine.GotRelTypes[1] := int64(R_X86_64_GOTPCRELX);
   LMachine.GotRelTypes[2] := int64(R_X86_64_REX_GOTPCRELX);
+  LMachine.Interpreter := ADAM_ELF_X86_64_INTERPRETER;
+  LMachine.RelocGlobDat := int64(R_X86_64_GLOB_DAT);
+  setlength(LMachine.StartCode, len(ADAM_ELF_X86_64_START));
+  for LI := 0 to len(ADAM_ELF_X86_64_START) - 1 do
+    LMachine.StartCode[LI] := ADAM_ELF_X86_64_START[LI];
+  end;
+  LMachine.StartMainAt := ADAM_ELF_X86_64_START_MAIN_AT;
+  LMachine.StartCallAt := ADAM_ELF_X86_64_START_CALL_AT;
+  setlength(LMachine.StubCode, len(ADAM_ELF_X86_64_STUB));
+  for LI := 0 to len(ADAM_ELF_X86_64_STUB) - 1 do
+    LMachine.StubCode[LI] := ADAM_ELF_X86_64_STUB[LI];
+  end;
+  LMachine.StubSlotAt := ADAM_ELF_X86_64_STUB_SLOT_AT;
   return LMachine;
 end;
 
