@@ -50,12 +50,18 @@
   slot, set at entry to its first variadic argument (IrOp.VarargsStart, the
   arch part homing the register ones beside the stacked ones); each
   varargs.next(T) reads the cursor's place at T's promoted type (an
-  aggregate as the caller passed it: its bytes there, or the address of its
-  copy) and moves the cursor one Target.VariadicSlotBytes on. Where the
-  target's va_list is a register save area's state (Target.VarargsSave,
-  LX1b: x86_64-linux-gnu), varargsstart gives that state's address instead
-  and varargs.next(T) is C's va_arg over it (DoSavedVarargPlace); an
-  aggregate T there is PLAN-LINUX64 LX1b2's.
+  aggregate as the ABI part passed it: its bytes there, or the address of
+  its copy, VariadicAggregate.ByAddress) and moves the cursor one
+  Target.VariadicSlotBytes on. Where the target's va_list is a register
+  save area's state (Target.VarargsSave, LX1b: x86_64-linux-gnu),
+  varargsstart gives that state's address instead and varargs.next(T) is
+  C's va_arg over it (DoSavedVarargPlace; an aggregate T eightbyte by
+  eightbyte from the area or whole from the overflow area, as the ABI
+  part's VariadicAggregate says: DoSavedVarargAggregate). A variadic
+  argument that is an aggregate by value (LX1b2) goes as a named one does:
+  the call's operand the address of a copy, its IrAggregate the
+  operand's shape (IrInstr.SetOperandShape), placed by the ABI part; one
+  that holds texts goes as the address of a copy, a plain ptr.
 
   A cpplink variadic (M3.7d, BNF sec 6) takes a typed pack: its IR signature
   is its fixed parameters and one more ptr, the pack's header, built by the
@@ -242,7 +248,8 @@ module unit Adam.Backend.Lowering;
 
 import System.SysUtils, Adam.Core.Common, Adam.Core.Messages, Adam.Core.Containers, Adam.Target,
   Adam.Compiler.Diagnostics, Adam.Compiler.AST, Adam.Compiler.Types, Adam.Compiler.Layout,
-  Adam.Compiler.Symbols, Adam.Compiler.Scopes, Adam.Backend.Ssa;
+  Adam.Compiler.Symbols, Adam.Compiler.Scopes, Adam.Backend.Ssa, Adam.Backend.Parts,
+  Adam.Backend.Targets;
 
 public const
   ADAM_ERR_LOWERING_001: string = "LW0001";   // a construct code generation does not handle yet
@@ -882,6 +889,9 @@ public type
   Lowerer = object
     hidden FTree: ref SyntaxTree;
     hidden FTarget: ref Target;
+    // The target's ABI part (nil: no backend has the triple, nothing lowered then): how a
+    // variadic function reads a variadic aggregate (LayoutVariadicAggregate)
+    hidden FAbi: ref AbiPart;
     hidden FDiagnostics: ref Diagnostics;
     hidden FModule: ref IrModule;
     // By node id (0: none): the function a routine or an initialize / finalize section
@@ -1216,9 +1226,18 @@ public type
 
     init(const ATree: ref SyntaxTree; const ATarget: ref Target; const ADiagnostics: ref Diagnostics;
       const AUnit: int64);
+    var
+      LBackend: ref Backend;
     begin
       self.FTree := ATree;
       self.FTarget := ATarget;
+      self.FAbi := nil;
+      if ATarget <> nil then
+        LBackend := BackendFor(ATarget.Triple());
+        if LBackend <> nil then
+          self.FAbi := LBackend.Abi;
+        end;
+      end;
       self.FDiagnostics := ADiagnostics;
       self.FUnit := AUnit;
       self.FDeclaring := false;
@@ -1432,27 +1451,6 @@ public type
         return self.FTree[AId].ResolvedConvert;
       end;
       return self.FTree[AId].ResolvedType;
-    end;
-
-    // The integer IR type an aggregate of the canonical type AType (DoIsAggregate) passes
-    // as a clink VARIADIC argument when the target passes its size in one register
-    // (Target.AggregateInRegister: its bytes, unsigned, at its size); Void for any other
-    // aggregate (a pointer to a copy), for one that holds texts (it always crosses by
-    // address) and for a type that is no aggregate. A fixed parameter or a result never
-    // asks (LX1a2: the ABI part places it, DoShapeOf); this goes with PLAN-LINUX64 LX1b's
-    // variadic aggregates
-    hidden method DoAggregateIr(const AType: int64): IrType;
-    var
-      LSize: int64;
-    begin
-      if (not self.DoIsAggregate(AType)) or self.DoHoldsManaged(AType) then
-        return IrType.Void;
-      end;
-      LSize := TypeSize(self.FTree, self.FTarget, AType);
-      if not self.FTarget.AggregateInRegister(LSize) then
-        return IrType.Void;
-      end;
-      return self.DoIntIr(LSize * 8, false);
     end;
 
     // True when an aggregate of the canonical type AType by value crosses a call as an
@@ -6128,11 +6126,11 @@ public type
     end;
 
     // The operand the variadic argument AArg (one past a clink routine's fixed parameters)
-    // passes, at its own type (SEM converts none, BNF sec 4): an aggregate as a by-value
-    // parameter would be (its bytes in a register, widened to the 8-byte slot, or the
-    // address of a copy keyed by AArg), any other value promoted (DoVariadicIr); 0 after
-    // LW0001
-    hidden method DoVariadicArgument(const AArg: int64): int64;
+    // passes, at its own type (SEM converts none, BNF sec 4): an aggregate the address of a
+    // copy keyed by AArg, AShape its IrAggregate when it crosses as one (DoShapes: the ABI
+    // part places it as a named one, LX1b2), else nil (one that holds texts: a plain ptr);
+    // any other value promoted (DoVariadicIr), AShape nil; 0 after LW0001
+    hidden method DoVariadicArgument(const AArg: int64; var AShape: ref IrAggregate): int64;
     var
       LType: int64;
       LIr: IrType;
@@ -6140,25 +6138,21 @@ public type
       LSlot: int64;
       LValue: int64;
     begin
+      AShape := nil;
       LType := self.DoUsedType(AArg);
-      if self.DoIsAggregate(LType) and self.FTarget.VarargsSave().Used then
-        self.DoRefuse(AArg, "an aggregate variadic argument on this target (PLAN-LINUX64 LX1b2)");
-        return 0;
-      end;
       if self.DoIsAggregate(LType) then
         LSource := self.DoAggregateSource(AArg);
         if LSource = 0 then
           return 0;
-        end;
-        LIr := self.DoAggregateIr(LType);
-        if LIr <> IrType.Void then
-          return self.DoConvertIr(self.DoLoad(LSource, LIr, AArg), IrType.UInt64, AArg);
         end;
         LSlot := self.DoSlot(AArg, LType, false);
         if LSlot = 0 then
           return 0;
         end;
         self.DoCopyBytes(LSlot, LSource, TypeSize(self.FTree, self.FTarget, LType), AArg);
+        if self.DoShapes(LType) then
+          AShape := self.DoShapeOf(LType);
+        end;
         return LSlot;
       end;
       LValue := self.DoValue(AArg);
@@ -6169,27 +6163,40 @@ public type
       return self.DoConvertIr(LValue, self.DoVariadicIr(LIr), AArg);
     end;
 
-    // The address varargs.next(T) AId reads its argument at, the cursor moved one
-    // Target.VariadicSlotBytes on (a clink variadic, BNF sec 6: C's va_arg, unchecked): the
-    // cursor's place, or for an aggregate T the caller passed as the address of its copy
-    // (DoAggregateIr Void, as DoVariadicArgument passes it) the address that place holds;
-    // 0 after LW0001 (another member, or no cursor: never from a valid tree, SEM's SM0417 /
-    // SM0418, and a cpplink variadic is refused before its body)
+    // The address varargs.next(T) AId reads its argument at (a clink variadic, BNF sec 6:
+    // C's va_arg, unchecked). A cursor's (the target's va_list one): the cursor's place, the
+    // cursor moved one Target.VariadicSlotBytes on; for an aggregate T the address that
+    // place holds when the caller passed the address of its copy (one that holds texts, or
+    // the ABI part's VariadicAggregate.ByAddress). A register save area's (VarargsSave): C's
+    // va_arg over it (DoSavedVarargPlace; an aggregate T by DoSavedVarargAggregate, one that
+    // holds texts the address its ptr place holds). 0 after LW0001 (another member, or no
+    // cursor: never from a valid tree, SEM's SM0417 / SM0418, and a cpplink variadic is
+    // refused before its body)
     hidden method DoVarargsPlace(const AId: int64): int64;
     var
       LCursor: int64;
       LType: int64;
       LIr: IrType;
+      LPlace: int64;
+      LByAddress: bool;
     begin
       if (self.FTree[AId].Text <> "next") or (self.FVarargsSlot = 0) then
         self.DoRefuse(AId, self.FTree.ConstructPhrase(AId));
         return 0;
       end;
+      LType := self.FTree[AId].ResolvedType;
+      if self.DoShapes(LType) and (self.FAbi = nil) then
+        self.DoRefuse(AId, self.FTree.ConstructPhrase(AId));
+        return 0;
+      end;
       if self.FTarget.VarargsSave().Used then
-        LType := self.FTree[AId].ResolvedType;
+        if self.DoShapes(LType) then
+          return self.DoSavedVarargAggregate(LType, self.FAbi.LayoutVariadicAggregate(self.DoShapeOf(LType)),
+            AId);
+        end;
         if self.DoIsAggregate(LType) then
-          self.DoRefuse(AId, "an aggregate variadic argument on this target (PLAN-LINUX64 LX1b2)");
-          return 0;
+          LPlace := self.DoSavedVarargPlace(false, AId);
+          return self.DoLoad(LPlace, IrType.Pointer, AId);
         end;
         LIr := self.DoTypeAt(LType, AId);
         if LIr = IrType.Void then
@@ -6200,11 +6207,138 @@ public type
       LCursor := self.DoLoad(self.FVarargsSlot, IrType.Pointer, AId);
       self.DoStore(self.FVarargsSlot, self.DoByteOffset(LCursor, self.FTarget.VariadicSlotBytes(), AId),
         AId);
-      LType := self.FTree[AId].ResolvedType;
-      if self.DoIsAggregate(LType) and (self.DoAggregateIr(LType) = IrType.Void) then
+      LByAddress := self.DoIsAggregate(LType) and not self.DoShapes(LType);
+      if self.DoShapes(LType) then
+        LByAddress := self.FAbi.LayoutVariadicAggregate(self.DoShapeOf(LType)).ByAddress;
+      end;
+      if LByAddress then
         return self.DoLoad(LCursor, IrType.Pointer, AId);
       end;
       return LCursor;
+    end;
+
+    // The address of varargs.next(T) AId's aggregate of the canonical type AType (DoShapes)
+    // by C's va_arg over the register save area's va_list state the varargs slot holds the
+    // address of (Target.VarargsSave), as ALayout (the ABI part's) says: with pieces, while
+    // gp_offset leaves room for its integer ones and fp_offset for its float ones, each
+    // piece copied from the area into a slot keyed by AId (the offsets moved past them);
+    // else (and always without pieces) its place in the overflow area (DoOverflowPlace)
+    hidden method DoSavedVarargAggregate(const AType: int64; const ALayout: ref VariadicAggregate;
+      const AId: int64): int64;
+    var
+      LFacts: VarargsSaveFacts;
+      LState: int64;
+      LGpAt: int64;
+      LFpAt: int64;
+      LGp: int64;
+      LFp: int64;
+      LInts: int64;
+      LFloats: int64;
+      LCheckFp: int64;
+      LInArea: int64;
+      LInOverflow: int64;
+      LJoin: int64;
+      LArea: int64;
+      LSlot: int64;
+      LFrom: int64;
+      LIntAt: int64;
+      LFloatAt: int64;
+      LAreaEnd: int64;
+      LOverflow: int64;
+      LOverflowEnd: int64;
+      LK: int64;
+    begin
+      LFacts := self.FTarget.VarargsSave();
+      LState := self.DoLoad(self.FVarargsSlot, IrType.Pointer, AId);
+      if ALayout.Pieces = nil then
+        return self.DoOverflowPlace(LState, ALayout, AId);
+      end;
+      LInts := ALayout.IntPieces();
+      LFloats := ALayout.FloatPieces();
+      LGpAt := self.DoByteOffset(LState, LFacts.GpAt, AId);
+      LFpAt := self.DoByteOffset(LState, LFacts.FpAt, AId);
+      LGp := self.DoLoad(LGpAt, IrType.UInt32, AId);
+      LFp := self.DoLoad(LFpAt, IrType.UInt32, AId);
+      LCheckFp := self.FModule.AddBlock(self.FFunction);
+      LInArea := self.FModule.AddBlock(self.FFunction);
+      LInOverflow := self.FModule.AddBlock(self.FFunction);
+      LJoin := self.FModule.AddBlock(self.FFunction);
+      // room for the integer pieces (gp_offset at most GpEnd less their places), then for
+      // the float ones (psABI 3.5.7's va_arg, step 3)
+      self.DoBranchOn(self.DoCompareWith(IrPredicate.ULessEqual, LGp,
+        self.DoConstant(IrType.UInt32, LFacts.GpEnd - LInts * self.FTarget.VariadicSlotBytes(), AId), AId),
+        LCheckFp, LInOverflow, AId);
+      self.FBlock := LCheckFp;
+      self.DoBranchOn(self.DoCompareWith(IrPredicate.ULessEqual, LFp,
+        self.DoConstant(IrType.UInt32, LFacts.FpEnd - LFloats * LFacts.FpStep, AId), AId),
+        LInArea, LInOverflow, AId);
+      // in the area: each piece from the next register place of its kind into the slot
+      self.FBlock := LInArea;
+      LSlot := self.DoSlot(AId, AType, false);
+      if LSlot = 0 then
+        return 0;
+      end;
+      LArea := self.DoLoad(self.DoByteOffset(LState, LFacts.AreaAt, AId), IrType.Pointer, AId);
+      LIntAt := 0;
+      LFloatAt := 0;
+      for LK := 0 to ALayout.Pieces.PieceCount - 1 do
+        LFrom := self.DoEmit(IrOp.Offset, IrType.Pointer, AId);
+        self.FModule.InstrAt(LFrom).Operands.Add(LArea);
+        if ALayout.Pieces.PieceFloat(LK) then
+          self.FModule.InstrAt(LFrom).Operands.Add(self.DoBinaryIr(IrOp.Add, IrType.Int64,
+            self.DoConvertIr(LFp, IrType.Int64, AId), self.DoConstant(IrType.Int64, LFloatAt * LFacts.FpStep, AId),
+            AId));
+          LFloatAt := LFloatAt + 1;
+        else
+          self.FModule.InstrAt(LFrom).Operands.Add(self.DoBinaryIr(IrOp.Add, IrType.Int64,
+            self.DoConvertIr(LGp, IrType.Int64, AId),
+            self.DoConstant(IrType.Int64, LIntAt * self.FTarget.VariadicSlotBytes(), AId), AId));
+          LIntAt := LIntAt + 1;
+        end;
+        self.DoCopyBytes(self.DoByteOffset(LSlot, ALayout.Pieces.PieceOffset(LK), AId), LFrom,
+          ALayout.Pieces.PieceBytes(LK), AId);
+      end;
+      if LInts > 0 then
+        self.DoStore(LGpAt, self.DoBinaryIr(IrOp.Add, IrType.UInt32, LGp,
+          self.DoConstant(IrType.UInt32, LInts * self.FTarget.VariadicSlotBytes(), AId), AId), AId);
+      end;
+      if LFloats > 0 then
+        self.DoStore(LFpAt, self.DoBinaryIr(IrOp.Add, IrType.UInt32, LFp,
+          self.DoConstant(IrType.UInt32, LFloats * LFacts.FpStep, AId), AId), AId);
+      end;
+      self.DoJumpTo(LJoin, AId);
+      LAreaEnd := self.FBlock;
+      // in the overflow area: whole, as a MEMORY one (the offsets left as they are)
+      self.FBlock := LInOverflow;
+      LOverflow := self.DoOverflowPlace(LState, ALayout, AId);
+      self.DoJumpTo(LJoin, AId);
+      LOverflowEnd := self.FBlock;
+      self.FBlock := LJoin;
+      return self.DoJoinOf(IrType.Pointer, LSlot, LAreaEnd, LOverflow, LOverflowEnd, AId);
+    end;
+
+    // The place of a variadic aggregate in the overflow area of the va_list state at AState
+    // (Target.VarargsSave): overflow_arg_area aligned up to ALayout.OverflowAlign (past a
+    // place's own alignment), then moved ALayout.OverflowBytes past it
+    hidden method DoOverflowPlace(const AState: int64; const ALayout: ref VariadicAggregate;
+      const AId: int64): int64;
+    var
+      LOverflowAt: int64;
+      LPlace: int64;
+      LBits: int64;
+    begin
+      LOverflowAt := self.DoByteOffset(AState, self.FTarget.VarargsSave().OverflowAt, AId);
+      LPlace := self.DoLoad(LOverflowAt, IrType.Pointer, AId);
+      if ALayout.OverflowAlign > self.FTarget.VariadicSlotBytes() then
+        // (place + align - 1) with its low bits cleared
+        LBits := self.DoBinaryIr(IrOp.Add, IrType.Int64, self.DoConvertIr(LPlace, IrType.Int64, AId),
+          self.DoConstant(IrType.Int64, ALayout.OverflowAlign - 1, AId), AId);
+        LBits := self.DoBinaryIr(IrOp.BitAnd, IrType.Int64, LBits,
+          self.DoConstant(IrType.Int64, -ALayout.OverflowAlign, AId), AId);
+        LPlace := self.DoConvertIr(LBits, IrType.Pointer, AId);
+      end;
+      self.DoStore(LOverflowAt, self.DoByteOffset(LPlace, ALayout.OverflowBytes, AId), AId);
+      return LPlace;
     end;
 
     // The address of the next variadic argument of a float's kind (AFloat) or an integer's,
@@ -6961,14 +7095,15 @@ public type
     end;
 
     // The operands of call ACall of the routine ADecl, each argument's (DoArgument; one
-    // past a clink variadic routine's fixed parameters DoVariadicArgument), then for a
-    // cpplink variadic the address of the pack its extra arguments go in
-    // (DoPackArguments); nil when one was refused
-    hidden method DoArguments(const ACall: int64; const ADecl: int64): ref Int64List;
+    // past a clink variadic routine's fixed parameters DoVariadicArgument, its shape at its
+    // position in AShapes, nil for none), then for a cpplink variadic the address of the
+    // pack its extra arguments go in (DoPackArguments); nil when one was refused
+    hidden method DoArguments(const ACall: int64; const ADecl: int64; var AShapes: IrAggregateArray): ref Int64List;
     var
       LList: ref Int64List;
       LArg: int64;
       LValue: int64;
+      LShape: ref IrAggregate;
       LParams: int64;
       LGiven: int64;
       LPack: bool;
@@ -6981,15 +7116,21 @@ public type
       if LPack and (LGiven > LParams) then
         LGiven := LParams;
       end;
+      setlength(AShapes, 0);
       for LI := 0 to LGiven - 1 do
         LArg := self.FTree.NthOf(ACall, NodeRole.Argument, LI);
+        LShape := nil;
         if LI < LParams then
           LValue := self.DoArgument(LArg, self.FTree.NthOf(ADecl, NodeRole.Param, LI));
         else
-          LValue := self.DoVariadicArgument(LArg);
+          LValue := self.DoVariadicArgument(LArg, LShape);
         end;
         if LValue = 0 then
           return nil;
+        end;
+        if LShape <> nil then
+          setlength(AShapes, LList.Count + 1);
+          AShapes[LList.Count] := LShape;
         end;
         LList.Add(LValue);
       end;
@@ -14355,26 +14496,23 @@ public type
 
     // The operand a task entry passes for the extra argument AArg of a clink variadic call
     // (T1) from its copy at AAddress in the task's object, at ANode, as DoVariadicArgument
-    // passes the argument itself: an aggregate's bytes in a register widened to the 8-byte
-    // slot, or the copy's address (the task's own copy, used by this one call); a managed
-    // value its block (borrowed: the object holds it); any other value loaded at its type
-    // and promoted (DoVariadicIr); 0 after LW0001
-    hidden method DoTaskVariadicOperand(const AArg: int64; const AAddress: int64; const ANode: int64): int64;
+    // passes the argument itself: an aggregate the copy's address (the task's own copy, used
+    // by this one call), AShape its IrAggregate when it crosses as one (DoShapes), else nil;
+    // a managed value its block (borrowed: the object holds it); any other value loaded at
+    // its type and promoted (DoVariadicIr); 0 after LW0001
+    hidden method DoTaskVariadicOperand(const AArg: int64; const AAddress: int64; const ANode: int64;
+      var AShape: ref IrAggregate): int64;
     var
       LType: int64;
       LIr: IrType;
     begin
+      AShape := nil;
       LType := self.DoTaskExtraType(AArg);
-      if self.DoIsAggregate(LType) and self.FTarget.VarargsSave().Used then
-        self.DoRefuse(ANode, "an aggregate variadic argument on this target (PLAN-LINUX64 LX1b2)");
-        return 0;
-      end;
       if self.DoIsAggregate(LType) then
-        LIr := self.DoAggregateIr(LType);
-        if LIr = IrType.Void then
-          return AAddress;
+        if self.DoShapes(LType) then
+          AShape := self.DoShapeOf(LType);
         end;
-        return self.DoConvertIr(self.DoLoad(AAddress, LIr, ANode), IrType.UInt64, ANode);
+        return AAddress;
       end;
       if self.DoIsManaged(LType) then
         return self.DoLoad(AAddress, IrType.Pointer, ANode);
@@ -14465,6 +14603,8 @@ public type
       LOffsets: ref Int64List;
       LObject: int64;
       LArgs: ref Int64List;
+      LShapes: IrAggregateArray;
+      LShape: ref IrAggregate;
       LPlaces: ref Int64List;
       LTarget: int64;
       LSelf: int64;
@@ -14509,6 +14649,7 @@ public type
         LSelf := self.DoLoad(LAddress, IrType.Pointer, AAsync);
       end;
       LArgs := ref Int64List();
+      setlength(LShapes, 0);
       LParams := self.FTree.CountOf(LSig, NodeRole.Param);
       for LI := 0 to LParams - 1 do
         LAddress := self.DoByteOffset(LObject, LOffsets[LFirst + LI], AAsync);
@@ -14535,9 +14676,13 @@ public type
         for LI := 0 to LExtras - 1 do
           LAddress := self.DoByteOffset(LObject, LOffsets[LFirst + LParams + LI], AAsync);
           LOperand := self.DoTaskVariadicOperand(self.FTree.NthOf(LCall, NodeRole.Argument, LParams + LI),
-            LAddress, AAsync);
+            LAddress, AAsync, LShape);
           if LOperand = 0 then
             return;
+          end;
+          if LShape <> nil then
+            setlength(LShapes, LArgs.Count + 1);
+            LShapes[LArgs.Count] := LShape;
           end;
           LArgs.Add(LOperand);
         end;
@@ -14605,7 +14750,8 @@ public type
         end;
         LHolder := self.DoGeneratorHolderArg(LDecl, LHeld, LValue, LSelf, AAsync);
       end;
-      LId := self.DoEmitCallWith(LCall, LSig, LKind, LLink, LIrResult, LTarget, LSelf, LHolder, LArgs);
+      LId := self.DoEmitCallShaped(LCall, LSig, LKind, LLink, LIrResult, LTarget, LSelf, LHolder, LArgs,
+        LShapes);
       if LId = 0 then
         return;
       end;
@@ -15829,16 +15975,31 @@ public type
 
     // DoEmitCall's instruction with a generator method's holder AHolder after self (0:
     // none, DoGeneratorHolderArg) and the arguments AArgs already made (an accessor's: the
-    // index and a write's value, DoAccessorCall; a task's copies); nil: the call ACall's
-    // own (DoArguments)
+    // index and a write's value, DoAccessorCall); nil: the call ACall's own (DoArguments).
+    // No variadic shapes (DoEmitCallShaped's, a task's copies)
     hidden method DoEmitCallWith(const ACall: int64; const ASig: int64; const AKind: IrOp;
       const ALink: int64; const AResult: IrType; const ATarget: int64; const ASelf: int64;
       const AHolder: int64; const AArgs: ref Int64List): int64;
+    var
+      LNone: IrAggregateArray;
+    begin
+      setlength(LNone, 0);
+      return self.DoEmitCallShaped(ACall, ASig, AKind, ALink, AResult, ATarget, ASelf, AHolder, AArgs,
+        LNone);
+    end;
+
+    // DoEmitCallWith's instruction, the variadic shapes of AArgs AShapes by position (a
+    // task's copies, DoTaskBody), as DoArguments gives them for the call's own
+    hidden method DoEmitCallShaped(const ACall: int64; const ASig: int64; const AKind: IrOp;
+      const ALink: int64; const AResult: IrType; const ATarget: int64; const ASelf: int64;
+      const AHolder: int64; const AArgs: ref Int64List; const AShapes: IrAggregateArray): int64;
     var
       LType: int64;
       LHidden: int64;
       LSlot: int64;
       LArgs: ref Int64List;
+      LShapes: IrAggregateArray;
+      LFirst: int64;
       LId: int64;
       LI: int64;
     begin
@@ -15861,8 +16022,9 @@ public type
         end;
       end;
       LArgs := AArgs;
+      LShapes := AShapes;
       if LArgs = nil then
-        LArgs := self.DoArguments(ACall, ASig);
+        LArgs := self.DoArguments(ACall, ASig, LShapes);
       end;
       if LArgs = nil then
         return 0;
@@ -15881,8 +16043,15 @@ public type
       if AHolder <> 0 then
         self.FModule.InstrAt(LId).Operands.Add(AHolder);
       end;
+      LFirst := self.FModule.InstrAt(LId).Operands.Count;
       for LI := 0 to LArgs.Count - 1 do
         self.FModule.InstrAt(LId).Operands.Add(LArgs[LI]);
+      end;
+      // a variadic aggregate's shape at its operand (LX1b2: the ABI part places it)
+      for LI := 0 to len(LShapes) - 1 do
+        if LShapes[LI] <> nil then
+          self.FModule.InstrAt(LId).SetOperandShape(LFirst + LI, LShapes[LI]);
+        end;
       end;
       // the callee has built (or moved) its object into the call's temporary: live now
       if (LHidden <> 0) and self.DoHasLifetime(LType) then
