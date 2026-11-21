@@ -33,24 +33,32 @@
   adam_thread_callbacks (a C identifier: a linker's __start_ / __stop_
   bound it; the linux runtime's thread end, LX4d, runs them).
 
-  Built so far (PLAN-LINUX64): the object writer (LX2a). A debug build's
-  debug information is not written (DWARF is a later plan): WriteDebugInfo
-  adds nothing and the image holds no debug file beside it. Reading an
-  object back (ReadSection / ReplaceSection: a compiled unit's payload) and
-  the static library's archive are LX2b's: until then no ELF .acu is read
-  back (each unit compiles from its source) and a lib build raises. Linking
-  (MergeObject, LinkExe) is LX3's: it reports EL0001.
+  An object is read back by Adam.Elf.Reader (ReadSection / ReplaceSection:
+  a compiled unit's payload, H4). A static library is a GNU ar archive
+  (Adam.Backend.Archive's Gnu kind): each object a member <name>.o, the
+  symbol index its defined non-local symbols (global, weak, unique; in a
+  section, absolute or common) in symbol table order, as GNU ar indexes
+  them.
+
+  Built so far (PLAN-LINUX64): the object writer (LX2a), the reader and the
+  static library (LX2b). A debug build's debug information is not written
+  (DWARF is a later plan): WriteDebugInfo adds nothing and the image holds
+  no debug file beside it. Linking (MergeObject, LinkExe) is LX3's: it
+  reports EL0001.
 *******************************************************************************/
 
 module unit Adam.Elf.Format;
 
 import System.SysUtils, Adam.Core.Common, Adam.Core.Containers, Adam.Core.Messages, Adam.Compiler.SourceText,
   Adam.Compiler.Diagnostics, Adam.Compiler.AST, Adam.Backend.Ssa, Adam.Backend.Sections,
-  Adam.Backend.Parts, Adam.Backend.DebugInfo, Adam.Elf.Writer;
+  Adam.Backend.Parts, Adam.Backend.DebugInfo, Adam.Backend.Archive, Adam.Elf.Writer,
+  Adam.Elf.Reader, System.Elf;
 
 const
-  // Raised (a compiler bug: no lib build reaches it before LX2b)
-  ADAM_ELF_FAULT_ARCHIVE: string = "Elf.Format: no ELF static library is written before PLAN-LINUX64 LX2b";
+  // The report budget of a scratch Diagnostics: only whether a read worked counts
+  ADAM_ELF_READ_BUDGET: int64 = 1;
+  // Raised (a compiler bug) by WriteStaticLibrary for a member that is no object it reads
+  ADAM_ELF_FAULT_MEMBER: string = "Elf.Format: a static library member is no object: ";
   // A static library's name around its module's name
   ADAM_ELF_LIB_PREFIX: string = "lib";
 
@@ -147,19 +155,72 @@ public type
       return WriteElfObject(ASections, self.Machine);
     end;
 
-    // LX2b (see the header): no ELF object is read back yet
-    override method ReadSection(const ABytes: ByteArray; const AName: string;
-      var ASection: ByteArray): bool;
+    // The index of the first section named AName holding bytes in AObject (no SHT_NOBITS);
+    // 0 when there is none
+    method FindSection(const AObject: ElfObjectData; const AName: string): int64;
+    var
+      LI: int64;
     begin
-      setlength(ASection, 0);
-      return false;
+      for LI := 1 to len(AObject.Sections) - 1 do
+        if (AObject.Sections[LI].SectionName = AName) and
+          (AObject.Sections[LI].SectionType <> int64(SHT_NOBITS)) then
+          return LI;
+        end;
+      end;
+      return 0;
     end;
 
-    // LX2b (see the header)
+    // Read by Adam.Elf.Reader; its report of a damaged object stays in a scratch
+    // Diagnostics (the caller only needs to know the section is not there)
+    override method ReadSection(const ABytes: ByteArray; const AName: string;
+      var ASection: ByteArray): bool;
+    var
+      LScratch: ref Diagnostics;
+      LObject: ElfObjectData;
+      LIndex: int64;
+      LSize: int64;
+    begin
+      setlength(ASection, 0);
+      LScratch := ref Diagnostics(ADAM_ELF_READ_BUDGET);
+      if not ReadElfObject(ABytes, 0, len(ABytes), AName, NoPlace(), LScratch, LObject) then
+        return false;
+      end;
+      LIndex := self.FindSection(LObject, AName);
+      if LIndex = 0 then
+        return false;
+      end;
+      // One block copy (ReadElfObject checked the data lies inside ABytes)
+      LSize := LObject.Sections[LIndex].DataSize;
+      setlength(ASection, LSize);
+      if LSize > 0 then
+        CopyBytes(addr of ASection[0], addr of ABytes[LObject.Sections[LIndex].DataAt], LSize);
+      end;
+      return true;
+    end;
+
+    // Read by Adam.Elf.Reader as ReadSection reads (its report kept in a scratch
+    // Diagnostics); the section's data overwritten where the object holds it
     override method ReplaceSection(var ABytes: ByteArray; const AName: string;
       const ASection: ByteArray): bool;
+    var
+      LScratch: ref Diagnostics;
+      LObject: ElfObjectData;
+      LIndex: int64;
     begin
-      return false;
+      LScratch := ref Diagnostics(ADAM_ELF_READ_BUDGET);
+      if not ReadElfObject(ABytes, 0, len(ABytes), AName, NoPlace(), LScratch, LObject) then
+        return false;
+      end;
+      LIndex := self.FindSection(LObject, AName);
+      if (LIndex = 0) or (LObject.Sections[LIndex].DataSize <> len(ASection)) then
+        return false;
+      end;
+      // One block copy (ReadElfObject checked the data lies inside ABytes)
+      if len(ASection) > 0 then
+        CopyBytes(addr of ABytes[LObject.Sections[LIndex].DataAt], addr of ASection[0],
+          len(ASection));
+      end;
+      return true;
     end;
 
     override method ImportListName(): string;
@@ -173,17 +234,86 @@ public type
       return ADAM_ELF_LIB_PREFIX + AModuleName + ADAM_EXT_AR;
     end;
 
-    // LX2b (see the header)
+    // Adam.Backend.Archive's WriteArchive (Gnu) over AObjects, each member named by its
+    // object's name and the ELF object ending (.o), its index entries its defined non-local
+    // symbols (see the header) in its symbol table's order
     override method WriteStaticLibrary(const AObjects: ObjectFileArray): ByteArray;
+    var
+      LMembers: ArchiveInputArray;
+      LScratch: ref Diagnostics;
+      LObject: ElfObjectData;
+      LSymbol: ElfSymbol;
+      LDefines: StringArray;
+      LName: string;
+      LCount: int64;
+      LI: int64;
+      LJ: int64;
     begin
-      raise(ADAM_ELF_FAULT_ARCHIVE);
+      setlength(LMembers, len(AObjects));
+      for LI := 0 to len(AObjects) - 1 do
+        LScratch := ref Diagnostics(ADAM_ELF_READ_BUDGET);
+        LName := AObjects[LI].MemberName + ADAM_EXT_ELF_OBJ;
+        if not ReadElfObject(AObjects[LI].Bytes, 0, len(AObjects[LI].Bytes), LName, NoPlace(),
+          LScratch, LObject) then
+          raise(ADAM_ELF_FAULT_MEMBER + LName);
+        end;
+        setlength(LDefines, len(LObject.Symbols));
+        LCount := 0;
+        for LJ := 0 to len(LObject.Symbols) - 1 do
+          LSymbol := LObject.Symbols[LJ];
+          if (LSymbol.Bind <> int64(STB_LOCAL)) and (LSymbol.SectionIndex <> int64(SHN_UNDEF)) and
+            (LSymbol.SymbolName <> "") then
+            LDefines[LCount] := LSymbol.SymbolName;
+            LCount := LCount + 1;
+          end;
+        end;
+        setlength(LDefines, LCount);
+        LMembers[LI].MemberName := LName;
+        LMembers[LI].Bytes := AObjects[LI].Bytes;
+        LMembers[LI].Defines := LDefines;
+      end;
+      return WriteArchive(LMembers, ArchiveKind.Gnu);
     end;
 
-    // LX2b (see the header): no library read back yet
+    // The members of WriteStaticLibrary's archive; false for an archive that is no such one
+    // (a member that is no ELF object, or not named with the object ending)
     override method ReadStaticLibrary(const ABytes: ByteArray; var AObjects: ObjectFileArray): bool;
+    var
+      LArchive: ArchiveContents;
+      LScratch: ref Diagnostics;
+      LEntry: ArchiveEntry;
+      LCount: int64;
+      LI: int64;
     begin
       setlength(AObjects, 0);
-      return false;
+      LScratch := ref Diagnostics(ADAM_ELF_READ_BUDGET);
+      if not ReadArchiveContents(ABytes, "", NoPlace(), LScratch, LArchive) then
+        return false;
+      end;
+      setlength(AObjects, len(LArchive.Entries));
+      LCount := 0;
+      for LI := 0 to len(LArchive.Entries) - 1 do
+        LEntry := LArchive.Entries[LI];
+        if LEntry.Kind = ArchiveEntryKind.Member then
+          // WriteStaticLibrary's member names end in the object ending it added, its data
+          // an ELF object
+          if (not EndsStr(ADAM_EXT_ELF_OBJ, LEntry.EntryName)) or (LEntry.Size < 4) or
+            (ABytes[LEntry.DataAt] <> ELFMAG0) or (ABytes[LEntry.DataAt + 1] <> ELFMAG1) or
+            (ABytes[LEntry.DataAt + 2] <> ELFMAG2) or (ABytes[LEntry.DataAt + 3] <> ELFMAG3) then
+            setlength(AObjects, 0);
+            return false;
+          end;
+          AObjects[LCount].MemberName := Substring(LEntry.EntryName, 0,
+            len(LEntry.EntryName) - len(ADAM_EXT_ELF_OBJ));
+          setlength(AObjects[LCount].Bytes, LEntry.Size);
+          if LEntry.Size > 0 then
+            CopyBytes(addr of AObjects[LCount].Bytes[0], addr of ABytes[LEntry.DataAt], LEntry.Size);
+          end;
+          LCount := LCount + 1;
+        end;
+      end;
+      setlength(AObjects, LCount);
+      return true;
     end;
 
     override method StartListGroupOf(const APlace: StartListPlace): string;

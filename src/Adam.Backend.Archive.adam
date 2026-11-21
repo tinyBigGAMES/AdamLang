@@ -1,0 +1,713 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Backend.Archive.adam - the ar archive (a static library's container),
+  read and written in the kinds the object format parts need (DESIGN sec 7;
+  below the parts: COFF's and ELF's static libraries are both ar archives,
+  PLAN-LINUX64 LX2b)
+
+  Every layout fact is the common ar format as GNU ar, llvm-ar and
+  Microsoft's lib write it (Microsoft's "PE Format": Archive (Library) File
+  Format; the System V / GNU form: binutils' ar.h, bfd's archive.c): the
+  signature, 60-byte member headers (name, date, ids, octal mode, decimal
+  size, the two marker bytes), each member's data at an even offset (an LF
+  pads), the symbol index "/" (a big-endian count, a big-endian member header
+  offset per symbol, the NUL-ended names), the long-name table "//" (a
+  member named "/N" takes the name at offset N; a short name ends in '/').
+
+  IsArchive     whether bytes start with the signature.
+  ReadArchiveContents  an archive's bytes -> its entries in file order, each
+                with its header's offset, its data's offset and size and its
+                name (a special entry's "/" or "//", else the name with its
+                ending '/' dropped, a "/N" name read from the long-name
+                table up to its '/', LF or NUL), each classed: the symbol
+                index (every "/" entry: COFF's archives hold two), the
+                long-name table, a member; then the first symbol index's
+                symbols, each tied to the entry whose header is at its
+                offset. A format part classes its members further (COFF's
+                short imports: Adam.Coff.Archive).
+  WriteArchive  members (a name, bytes, the symbols each defines) as an
+                archive of a kind (ArchiveKind, llvm's ArchiveWriter kinds):
+                Gnu, GNU ar's ELF form: the signature, the symbol index (in
+                member order), the long-name table when a name is over 15
+                bytes (each once, ended by "/" and LF), then the members;
+                Coff, MS's lib and llvm's COFF form: the same with the
+                second (MS) linker member after the symbol index (the member
+                count and offsets, the symbol count, a 16-bit member number
+                per symbol and the names, sorted byte-wise) and the long
+                names NUL-ended. Deterministic: date, ids 0, mode 644 (AD.7).
+  ArchiveText, ArchiveNulAt, PutNulEnded, ArchivePadded  the byte steps of
+                reading and writing a member, shared with the format parts'
+                own member forms (COFF's short imports and import objects).
+
+  Nothing raises in the reader: a file that is no archive, a header cut off
+  or damaged, a long name the table does not hold, a symbol index cut off or
+  pointing where no entry starts are reported (AR0001..AR0004) at the place
+  the caller gives, and false is returned. The writer raises (a compiler
+  bug) for a field a member header cannot hold, and in the Coff kind for a
+  symbol two members define (the second linker member names one member per
+  symbol); in the Gnu kind a symbol a later member defines again is indexed
+  at its first member (as GNU ar does: a linker pulls the first).
+*******************************************************************************/
+
+module unit Adam.Backend.Archive;
+
+import System.SysUtils, Adam.Core.Messages, Adam.Core.Containers, Adam.Compiler.SourceText,
+  Adam.Compiler.Diagnostics;
+
+public const
+  // Reported (see the header)
+  ADAM_ERR_ARCHIVE_001: string = "AR0001";   // a file that is no archive
+  ADAM_ERR_ARCHIVE_002: string = "AR0002";   // a member header cut off or damaged
+  ADAM_ERR_ARCHIVE_003: string = "AR0003";   // a long name the table does not hold
+  ADAM_ERR_ARCHIVE_004: string = "AR0004";   // a symbol index cut off or pointing nowhere
+
+  // The archive signature, and a member header's size and fields (see the header)
+  ADAM_ARCHIVE_SIGNATURE: string = "!<arch>\n";
+  ADAM_ARCHIVE_HEADER_SIZE: int64 = 60;
+  ADAM_ARCHIVE_NAME_SIZE: int64 = 16;
+  ADAM_ARCHIVE_SIZE_AT: int64 = 48;
+  ADAM_ARCHIVE_SIZE_SIZE: int64 = 10;
+  ADAM_ARCHIVE_END_AT: int64 = 58;
+  // The special entries' names
+  ADAM_ARCHIVE_INDEX_NAME: string = "/";
+  ADAM_ARCHIVE_TABLE_NAME: string = "//";
+
+  // Raised by the writer (see the header)
+  ADAM_ARCHIVE_FAULT_SYMBOL_TWICE: string = "Archive writer: a symbol two members define: ";
+  ADAM_ARCHIVE_FAULT_FIELD: string = "Archive writer: a member header field too long: ";
+  // A member header's fields after its name: date, user and group ids, mode (octal); the
+  // mode a member is written with
+  ADAM_ARCHIVE_DATE_SIZE: int64 = 12;
+  ADAM_ARCHIVE_ID_SIZE: int64 = 6;
+  ADAM_ARCHIVE_MODE_SIZE: int64 = 8;
+  ADAM_ARCHIVE_MEMBER_MODE: string = "644";
+  // The longest name a member header holds itself (then its ending '/')
+  ADAM_ARCHIVE_SHORT_NAME_MAX: int64 = 15;
+
+public type
+  // The archive forms WriteArchive writes (see the header)
+  ArchiveKind = choices(Gnu, Coff);
+
+  // What one entry holds (see the header)
+  ArchiveEntryKind = choices(SymbolIndex, NameTable, Member);
+
+  // One entry (see the header)
+  ArchiveEntry = record
+    Kind: ArchiveEntryKind;
+    EntryName: string;
+    HeaderAt: int64;
+    DataAt: int64;
+    Size: int64;
+  end;
+
+  // An archive's entries, in file order
+  ArchiveEntryArray = array of ArchiveEntry;
+
+  // One symbol of the symbol index: its name and the entry (an index into Entries; a
+  // format part's member list keeps the same order) that defines it
+  ArchiveSymbol = record
+    SymbolName: string;
+    Member: int64;
+  end;
+
+  // The symbol index's symbols, in its order
+  ArchiveSymbolArray = array of ArchiveSymbol;
+
+  // One archive read (see the header)
+  ArchiveContents = record
+    Entries: ArchiveEntryArray;
+    Symbols: ArchiveSymbolArray;
+  end;
+
+  // One member WriteArchive writes: the name a linker reports it by, its bytes, the symbols
+  // it defines (the symbol index's, in this order)
+  ArchiveInput = record
+    MemberName: string;
+    Bytes: ByteArray;
+    Defines: StringArray;
+  end;
+
+  // The members WriteArchive writes, in file order
+  ArchiveInputArray = array of ArchiveInput;
+
+// The ACount bytes at AAt in ABytes as text, each byte one char (one block copy)
+public routine ArchiveText(const ABytes: ByteArray; const AAt: int64; const ACount: int64): string;
+begin
+  if ACount <= 0 then
+    return "";
+  end;
+  return StringFromC(ptr to const char(addr of ABytes[AAt]), ACount);
+end;
+
+// The index of the first NUL byte in ABytes from AAt up to AEnd (not included); -1 when
+// there is none
+public routine ArchiveNulAt(const ABytes: ByteArray; const AAt: int64; const AEnd: int64): int64;
+var
+  LI: int64;
+begin
+  LI := AAt;
+  while LI < AEnd do
+    if ABytes[LI] = 0 then
+      return LI;
+    end;
+    LI := LI + 1;
+  end;
+  return -1;
+end;
+
+// The big-endian 32-bit value at AAt in ABytes (the first linker member's numbers)
+routine DoGetBe32(const ABytes: ByteArray; const AAt: int64): int64;
+begin
+  return (int64(ABytes[AAt]) shl 24) | (int64(ABytes[AAt + 1]) shl 16) |
+    (int64(ABytes[AAt + 2]) shl 8) | int64(ABytes[AAt + 3]);
+end;
+
+// True when ABytes start with the archive signature
+routine DoHasSignature(const ABytes: ByteArray): bool;
+begin
+  if len(ABytes) < len(ADAM_ARCHIVE_SIGNATURE) then
+    return false;
+  end;
+  return ArchiveText(ABytes, 0, len(ADAM_ARCHIVE_SIGNATURE)) = ADAM_ARCHIVE_SIGNATURE;
+end;
+
+// Reports the member header at AAt in APath damaged for AReason (AR0002): false
+routine DoBadHeader(const ADiagnostics: ref Diagnostics; const APlace: SourcePlace;
+  const APath: string; const AAt: int64; const AReason: string): bool;
+begin
+  ADiagnostics.Add(Severity.Error, ADAM_ERR_ARCHIVE_002, APlace, ADAM_MSG_ARCHIVE_BAD_HEADER,
+    NoArgs().Str(APath).Int(AAt).Str(AReason));
+  return false;
+end;
+
+// Adds AMember at the end of AList
+routine DoAddMember(var AList: ArchiveEntryArray; const AMember: ArchiveEntry);
+var
+  LCount: int64;
+begin
+  LCount := len(AList);
+  setlength(AList, LCount + 1);
+  AList[LCount] := AMember;
+end;
+
+// A member read from its header at AHeaderAt: ARawName its name field as written (blanks
+// cut), its data right after the header, ASize bytes; classed by its name only
+routine DoMember(const ARawName: string; const AHeaderAt: int64; const ASize: int64): ArchiveEntry;
+var
+  LMember: ArchiveEntry;
+begin
+  LMember.Kind := ArchiveEntryKind.Member;
+  if ARawName = ADAM_ARCHIVE_INDEX_NAME then
+    LMember.Kind := ArchiveEntryKind.SymbolIndex;
+  end;
+  if ARawName = ADAM_ARCHIVE_TABLE_NAME then
+    LMember.Kind := ArchiveEntryKind.NameTable;
+  end;
+  LMember.EntryName := ARawName;
+  LMember.HeaderAt := AHeaderAt;
+  LMember.DataAt := AHeaderAt + ADAM_ARCHIVE_HEADER_SIZE;
+  LMember.Size := ASize;
+  return LMember;
+end;
+
+// Reads every member header from the signature to the file's end into AArchive.Entries
+// (names as written); a header cut off or damaged is reported (AR0002): false
+routine DoReadHeaders(const ABytes: ByteArray; const APath: string; const APlace: SourcePlace;
+  const ADiagnostics: ref Diagnostics; var AArchive: ArchiveContents): bool;
+var
+  LAt: int64;
+  LSize: int64;
+  LName: string;
+begin
+  LAt := len(ADAM_ARCHIVE_SIGNATURE);
+  while LAt < len(ABytes) do
+    if LAt + ADAM_ARCHIVE_HEADER_SIZE > len(ABytes) then
+      return DoBadHeader(ADiagnostics, APlace, APath, LAt, ADAM_MSG_ARCHIVE_REASON_CUT);
+    end;
+    LSize := 0;
+    if not TryStrToInt(Trim(ArchiveText(ABytes, LAt + ADAM_ARCHIVE_SIZE_AT, ADAM_ARCHIVE_SIZE_SIZE)),
+      LSize) or (LSize < 0) then
+      return DoBadHeader(ADiagnostics, APlace, APath, LAt, ADAM_MSG_ARCHIVE_REASON_SIZE);
+    end;
+    if (ABytes[LAt + ADAM_ARCHIVE_END_AT] <> 0x60) or (ABytes[LAt + ADAM_ARCHIVE_END_AT + 1] <> 0x0A) then
+      return DoBadHeader(ADiagnostics, APlace, APath, LAt, ADAM_MSG_ARCHIVE_REASON_END);
+    end;
+    if LAt + ADAM_ARCHIVE_HEADER_SIZE + LSize > len(ABytes) then
+      return DoBadHeader(ADiagnostics, APlace, APath, LAt, ADAM_MSG_ARCHIVE_REASON_DATA);
+    end;
+    LName := TrimRight(ArchiveText(ABytes, LAt, ADAM_ARCHIVE_NAME_SIZE));
+    DoAddMember(AArchive.Entries, DoMember(LName, LAt, LSize));
+    // The next header starts on an even offset
+    LAt := LAt + ADAM_ARCHIVE_HEADER_SIZE + LSize;
+    if LAt mod 2 = 1 then
+      LAt := LAt + 1;
+    end;
+  end;
+  return true;
+end;
+
+// AName without its one ending '/' (how a member's name field and a long name end)
+routine DoDropSlash(const AName: string): string;
+begin
+  if EndsStr("/", AName) then
+    return Substring(AName, 0, len(AName) - 1);
+  end;
+  return AName;
+end;
+
+// The index of the long-name table among AArchive.Entries; -1 when it has none
+routine DoTableIndex(const AArchive: ArchiveContents): int64;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(AArchive.Entries) - 1 do
+    if AArchive.Entries[LI].Kind = ArchiveEntryKind.NameTable then
+      return LI;
+    end;
+  end;
+  return -1;
+end;
+
+// The long name at AOffset in the long-name table AArchive.Entries[ATable]: its bytes up to
+// the first LF or NUL (or the table's end), its ending '/' dropped
+routine DoLongName(const ABytes: ByteArray; const AArchive: ArchiveContents; const ATable: int64;
+  const AOffset: int64): string;
+var
+  LAt: int64;
+  LEnd: int64;
+begin
+  LAt := AArchive.Entries[ATable].DataAt + AOffset;
+  LEnd := AArchive.Entries[ATable].DataAt + AArchive.Entries[ATable].Size;
+  while (LAt < LEnd) and (ABytes[LAt] <> 0x0A) and (ABytes[LAt] <> 0) do
+    LAt := LAt + 1;
+  end;
+  return DoDropSlash(ArchiveText(ABytes, AArchive.Entries[ATable].DataAt + AOffset,
+    LAt - AArchive.Entries[ATable].DataAt - AOffset));
+end;
+
+// Every member's name as it is meant: a "/N" name read from the long-name table, any
+// other its ending '/' dropped. A long name the table does not hold is reported (AR0003):
+// false
+routine DoResolveNames(const ABytes: ByteArray; const APath: string; const APlace: SourcePlace;
+  const ADiagnostics: ref Diagnostics; var AArchive: ArchiveContents): bool;
+var
+  LTable: int64;
+  LI: int64;
+  LRaw: string;
+  LOffset: int64;
+  LReason: string;
+begin
+  LTable := DoTableIndex(AArchive);
+  for LI := 0 to len(AArchive.Entries) - 1 do
+    LRaw := AArchive.Entries[LI].EntryName;
+    if AArchive.Entries[LI].Kind = ArchiveEntryKind.Member then
+      LOffset := -1;
+      // "/N": the long name at offset N of the table
+      if StartsStr("/", LRaw) and TryStrToInt(Substring(LRaw, 1, len(LRaw) - 1), LOffset) then
+        LReason := "";
+        if LTable < 0 then
+          LReason := ADAM_MSG_ARCHIVE_REASON_NO_TABLE;
+        else
+          if (LOffset < 0) or (LOffset >= AArchive.Entries[LTable].Size) then
+            LReason := ADAM_MSG_ARCHIVE_REASON_PAST_TABLE;
+          end;
+        end;
+        if LReason <> "" then
+          ADiagnostics.Add(Severity.Error, ADAM_ERR_ARCHIVE_003, APlace,
+            ADAM_MSG_ARCHIVE_BAD_LONG_NAME, NoArgs().Str(APath)
+            .Int(AArchive.Entries[LI].HeaderAt).Str(LRaw).Str(LReason));
+          return false;
+        end;
+        AArchive.Entries[LI].EntryName := DoLongName(ABytes, AArchive, LTable, LOffset);
+      else
+        AArchive.Entries[LI].EntryName := DoDropSlash(LRaw);
+      end;
+    end;
+  end;
+  return true;
+end;
+
+// Each member's index by the offset of its header (-1 for an offset where no member starts):
+// a symbol's member found without a scan
+routine DoMembersAt(const AArchive: ArchiveContents): ref Int64Map;
+var
+  LMap: ref Int64Map;
+  LI: int64;
+begin
+  LMap := ref Int64Map(-1);
+  for LI := 0 to len(AArchive.Entries) - 1 do
+    LMap.Put(AArchive.Entries[LI].HeaderAt, LI);
+  end;
+  return LMap;
+end;
+
+// Reports the symbol index damaged for AReason (AR0004): false
+routine DoBadIndex(const ADiagnostics: ref Diagnostics; const APlace: SourcePlace;
+  const APath: string; const AReason: string): bool;
+begin
+  ADiagnostics.Add(Severity.Error, ADAM_ERR_ARCHIVE_004, APlace, ADAM_MSG_ARCHIVE_BAD_INDEX,
+    NoArgs().Str(APath).Str(AReason));
+  return false;
+end;
+
+// The first linker member's symbols into AArchive.Symbols (none when the archive has no
+// symbol index); one cut off or pointing where no member starts is reported (AR0004): false
+routine DoReadIndex(const ABytes: ByteArray; const APath: string; const APlace: SourcePlace;
+  const ADiagnostics: ref Diagnostics; var AArchive: ArchiveContents): bool;
+var
+  LIndex: int64;
+  LAt: int64;
+  LEnd: int64;
+  LCount: int64;
+  LNameAt: int64;
+  LNameEnd: int64;
+  LI: int64;
+  LOffset: int64;
+  LMember: int64;
+  LSymbol: ArchiveSymbol;
+  LMembersAt: ref Int64Map;
+begin
+  LIndex := -1;
+  LI := 0;
+  while (LIndex < 0) and (LI < len(AArchive.Entries)) do
+    if AArchive.Entries[LI].Kind = ArchiveEntryKind.SymbolIndex then
+      LIndex := LI;
+    end;
+    LI := LI + 1;
+  end;
+  if LIndex < 0 then
+    return true;
+  end;
+  LAt := AArchive.Entries[LIndex].DataAt;
+  LEnd := LAt + AArchive.Entries[LIndex].Size;
+  if LAt + 4 > LEnd then
+    return DoBadIndex(ADiagnostics, APlace, APath, ADAM_MSG_ARCHIVE_REASON_INDEX_CUT);
+  end;
+  LCount := DoGetBe32(ABytes, LAt);
+  if LAt + 4 + LCount * 4 > LEnd then
+    return DoBadIndex(ADiagnostics, APlace, APath, ADAM_MSG_ARCHIVE_REASON_INDEX_CUT);
+  end;
+  // The names follow the offsets, one NUL-ended name per offset, in the same order
+  LNameAt := LAt + 4 + LCount * 4;
+  LMembersAt := DoMembersAt(AArchive);
+  setlength(AArchive.Symbols, LCount);
+  for LI := 0 to LCount - 1 do
+    LNameEnd := ArchiveNulAt(ABytes, LNameAt, LEnd);
+    if LNameEnd < 0 then
+      // What was read before it stays (see ReadArchive)
+      setlength(AArchive.Symbols, LI);
+      return DoBadIndex(ADiagnostics, APlace, APath, ADAM_MSG_ARCHIVE_REASON_INDEX_CUT);
+    end;
+    LOffset := DoGetBe32(ABytes, LAt + 4 + LI * 4);
+    LMember := LMembersAt.Find(LOffset);
+    if LMember < 0 then
+      setlength(AArchive.Symbols, LI);
+      return DoBadIndex(ADiagnostics, APlace, APath,
+        NoArgs().Int(LOffset).Fill(ADAM_MSG_ARCHIVE_REASON_INDEX_MEMBER));
+    end;
+    LSymbol.SymbolName := ArchiveText(ABytes, LNameAt, LNameEnd - LNameAt);
+    LSymbol.Member := LMember;
+    AArchive.Symbols[LI] := LSymbol;
+    LNameAt := LNameEnd + 1;
+  end;
+  return true;
+end;
+
+// True when ABytes start with the archive signature (!<arch> and LF): a file to read with
+// ReadArchiveContents
+public routine IsArchive(const ABytes: ByteArray): bool;
+begin
+  return DoHasSignature(ABytes);
+end;
+
+// Reads the archive ABytes (the file APath, named in a report at APlace) into AArchive (see
+// the header): true when it is read whole; else every fault is reported into ADiagnostics
+// (AR0001..AR0004) and false returned, AArchive holding what was read before it
+public routine ReadArchiveContents(const ABytes: ByteArray; const APath: string;
+  const APlace: SourcePlace; const ADiagnostics: ref Diagnostics; var AArchive: ArchiveContents): bool;
+begin
+  setlength(AArchive.Entries, 0);
+  setlength(AArchive.Symbols, 0);
+  if not DoHasSignature(ABytes) then
+    ADiagnostics.Add(Severity.Error, ADAM_ERR_ARCHIVE_001, APlace, ADAM_MSG_ARCHIVE_NO_SIGNATURE,
+      NoArgs().Str(APath));
+    return false;
+  end;
+  if not DoReadHeaders(ABytes, APath, APlace, ADiagnostics, AArchive) then
+    return false;
+  end;
+  if not DoResolveNames(ABytes, APath, APlace, ADiagnostics, AArchive) then
+    return false;
+  end;
+  return DoReadIndex(ABytes, APath, APlace, ADiagnostics, AArchive);
+end;
+
+// ---------------------------------------------------------------------------------------
+// The writer (WriteArchive; see the header)
+
+// AText as bytes at AAt of ABytes, then blanks up to AWidth bytes (a member header's field)
+routine DoPutField(var ABytes: ByteArray; const AAt: int64; const AText: string;
+  const AWidth: int64);
+var
+  LI: int64;
+begin
+  if len(AText) > AWidth then
+    raise(ADAM_ARCHIVE_FAULT_FIELD + AText);
+  end;
+  for LI := 0 to AWidth - 1 do
+    if LI < len(AText) then
+      ABytes[AAt + LI] := uint8(AText[LI]);
+    else
+      ABytes[AAt + LI] := uint8(0x20);
+    end;
+  end;
+end;
+
+// The member header at AAt: its name field AName, its data's size ASize; the special members
+// (ASpecial: the linker members, the long-name table) leave date, ids and mode as GNU ar
+// and llvm write them, every other member date 0, ids 0 and mode 644: no time stamp (AD.7)
+routine DoPutHeader(var ABytes: ByteArray; const AAt: int64; const AName: string;
+  const ASize: int64; const ASpecial: bool);
+var
+  LAt: int64;
+begin
+  LAt := AAt;
+  DoPutField(ABytes, LAt, AName, ADAM_ARCHIVE_NAME_SIZE);
+  LAt := LAt + ADAM_ARCHIVE_NAME_SIZE;
+  if ASpecial and (AName = ADAM_ARCHIVE_TABLE_NAME) then
+    // The long-name table: no date, ids or mode at all
+    DoPutField(ABytes, LAt, "", ADAM_ARCHIVE_DATE_SIZE + 2 * ADAM_ARCHIVE_ID_SIZE +
+      ADAM_ARCHIVE_MODE_SIZE);
+  else
+    DoPutField(ABytes, LAt, "0", ADAM_ARCHIVE_DATE_SIZE);
+    DoPutField(ABytes, LAt + ADAM_ARCHIVE_DATE_SIZE, "0", ADAM_ARCHIVE_ID_SIZE);
+    DoPutField(ABytes, LAt + ADAM_ARCHIVE_DATE_SIZE + ADAM_ARCHIVE_ID_SIZE, "0",
+      ADAM_ARCHIVE_ID_SIZE);
+    if ASpecial then
+      DoPutField(ABytes, LAt + ADAM_ARCHIVE_DATE_SIZE + 2 * ADAM_ARCHIVE_ID_SIZE, "0",
+        ADAM_ARCHIVE_MODE_SIZE);
+    else
+      DoPutField(ABytes, LAt + ADAM_ARCHIVE_DATE_SIZE + 2 * ADAM_ARCHIVE_ID_SIZE,
+        ADAM_ARCHIVE_MEMBER_MODE, ADAM_ARCHIVE_MODE_SIZE);
+    end;
+  end;
+  DoPutField(ABytes, AAt + ADAM_ARCHIVE_SIZE_AT, IntToStr(ASize), ADAM_ARCHIVE_SIZE_SIZE);
+  ABytes[AAt + ADAM_ARCHIVE_END_AT] := uint8(0x60);
+  ABytes[AAt + ADAM_ARCHIVE_END_AT + 1] := uint8(0x0A);
+end;
+
+// AValue as the big-endian 32-bit field at AAt of ABytes (the first linker member's numbers)
+routine DoPutBe32(var ABytes: ByteArray; const AAt: int64; const AValue: int64);
+begin
+  ABytes[AAt] := uint8((AValue shr 24) & 255);
+  ABytes[AAt + 1] := uint8((AValue shr 16) & 255);
+  ABytes[AAt + 2] := uint8((AValue shr 8) & 255);
+  ABytes[AAt + 3] := uint8(AValue & 255);
+end;
+
+// AText's bytes at AAt of ABytes, then a NUL; the offset after the NUL
+public routine PutNulEnded(var ABytes: ByteArray; const AAt: int64; const AText: string): int64;
+begin
+  if len(AText) > 0 then
+    CopyBytes(addr of ABytes[AAt], ptr to const uint8(addr of AText[0]), len(AText));
+  end;
+  ABytes[AAt + len(AText)] := uint8(0);
+  return AAt + len(AText) + 1;
+end;
+
+// ASize rounded up to even: a member's data is followed by one LF when its size is odd
+public routine ArchivePadded(const ASize: int64): int64;
+begin
+  return ASize + (ASize & 1);
+end;
+
+// The bytes of AMembers as an archive of AKind (see the header); raises (a compiler bug) for
+// a field a member header cannot hold and, in the Coff kind, for a symbol two members define
+public routine WriteArchive(const AMembers: ArchiveInputArray; const AKind: ArchiveKind): ByteArray;
+var
+  LBytes: ByteArray;
+  LTableAt: ref StringIdMap;
+  LTableSize: int64;
+  LSymbolCount: int64;
+  LStringsSize: int64;
+  LMemberOf: ref StringIdMap;
+  LIndexed: BoolArray;
+  LSorted: StringArray;
+  LHeaders: Int64Array;
+  LFirstSize: int64;
+  LSecondSize: int64;
+  LFirstAt: int64;
+  LSecondAt: int64;
+  LNamesAt: int64;
+  LNameEnding: int64;
+  LAt: int64;
+  LI: int64;
+  LJ: int64;
+  LK: int64;
+  LN: int64;
+  LCount: int64;
+  LName: string;
+begin
+  // A long name ends in a NUL (Coff: MS's form) or in "/" and LF (Gnu)
+  LNameEnding := 1;
+  if AKind = ArchiveKind.Gnu then
+    LNameEnding := 2;
+  end;
+  // The long-name table: each name over 15 bytes once, at an offset kept one up (0 means
+  // none in a StringIdMap). The indexed symbols: each define once (Gnu: its first member's;
+  // Coff: a second define raises), LIndexed in define order over all members
+  LTableAt := ref StringIdMap(0);
+  LTableSize := 0;
+  LSymbolCount := 0;
+  LStringsSize := 0;
+  LMemberOf := ref StringIdMap(0);
+  LCount := 0;
+  for LI := 0 to len(AMembers) - 1 do
+    LCount := LCount + len(AMembers[LI].Defines);
+  end;
+  setlength(LIndexed, LCount);
+  LK := 0;
+  for LI := 0 to len(AMembers) - 1 do
+    LName := AMembers[LI].MemberName;
+    if (len(LName) > ADAM_ARCHIVE_SHORT_NAME_MAX) and (LTableAt.Find(LName) = 0) then
+      LTableAt.Put(LName, LTableSize + 1);
+      LTableSize := LTableSize + len(LName) + LNameEnding;
+    end;
+    for LJ := 0 to len(AMembers[LI].Defines) - 1 do
+      LIndexed[LK] := false;
+      if LMemberOf.Find(AMembers[LI].Defines[LJ]) <> 0 then
+        if AKind = ArchiveKind.Coff then
+          raise(ADAM_ARCHIVE_FAULT_SYMBOL_TWICE + AMembers[LI].Defines[LJ]);
+        end;
+      else
+        // The member's number in the second linker member (from 1)
+        LMemberOf.Put(AMembers[LI].Defines[LJ], LI + 1);
+        LIndexed[LK] := true;
+        LSymbolCount := LSymbolCount + 1;
+        LStringsSize := LStringsSize + len(AMembers[LI].Defines[LJ]) + 1;
+      end;
+      LK := LK + 1;
+    end;
+  end;
+  // The symbol index: the count, an offset per symbol, the names (big-endian counts); the
+  // second (MS) linker member (Coff only): the member count, an offset per member, the
+  // symbol count, a 16-bit member number per symbol, the names sorted (little-endian)
+  LFirstSize := 4 + 4 * LSymbolCount + LStringsSize;
+  LSecondSize := 0;
+  if AKind = ArchiveKind.Coff then
+    LSecondSize := 4 + 4 * len(AMembers) + 4 + 2 * LSymbolCount + LStringsSize;
+  end;
+  // Every entry's place: the special entries first, then the members in their order
+  LFirstAt := len(ADAM_ARCHIVE_SIGNATURE);
+  LSecondAt := LFirstAt + ADAM_ARCHIVE_HEADER_SIZE + ArchivePadded(LFirstSize);
+  LNamesAt := LSecondAt;
+  if AKind = ArchiveKind.Coff then
+    LNamesAt := LSecondAt + ADAM_ARCHIVE_HEADER_SIZE + ArchivePadded(LSecondSize);
+  end;
+  LAt := LNamesAt;
+  if LTableSize > 0 then
+    LAt := LAt + ADAM_ARCHIVE_HEADER_SIZE + ArchivePadded(LTableSize);
+  end;
+  setlength(LHeaders, len(AMembers));
+  for LI := 0 to len(AMembers) - 1 do
+    LHeaders[LI] := LAt;
+    LAt := LAt + ADAM_ARCHIVE_HEADER_SIZE + ArchivePadded(len(AMembers[LI].Bytes));
+  end;
+  // Every byte no field writes is a pad LF
+  setlength(LBytes, LAt);
+  for LI := 0 to LAt - 1 do
+    LBytes[LI] := uint8(0x0A);
+  end;
+  for LI := 0 to len(ADAM_ARCHIVE_SIGNATURE) - 1 do
+    LBytes[LI] := uint8(ADAM_ARCHIVE_SIGNATURE[LI]);
+  end;
+  // The symbol index: symbols in member order
+  DoPutHeader(LBytes, LFirstAt, ADAM_ARCHIVE_INDEX_NAME, LFirstSize, true);
+  LAt := LFirstAt + ADAM_ARCHIVE_HEADER_SIZE;
+  DoPutBe32(LBytes, LAt, LSymbolCount);
+  LJ := LAt + 4;
+  LK := LAt + 4 + 4 * LSymbolCount;
+  LCount := 0;
+  for LI := 0 to len(AMembers) - 1 do
+    for LN := 0 to len(AMembers[LI].Defines) - 1 do
+      if LIndexed[LCount] then
+        DoPutBe32(LBytes, LJ, LHeaders[LI]);
+        LJ := LJ + 4;
+        LK := PutNulEnded(LBytes, LK, AMembers[LI].Defines[LN]);
+      end;
+      LCount := LCount + 1;
+    end;
+  end;
+  // The second linker member (Coff): the names sorted byte-wise (what a linker
+  // binary-searches)
+  if AKind = ArchiveKind.Coff then
+    DoPutHeader(LBytes, LSecondAt, ADAM_ARCHIVE_INDEX_NAME, LSecondSize, true);
+    LAt := LSecondAt + ADAM_ARCHIVE_HEADER_SIZE;
+    PutLe(LBytes, LAt, uint64(len(AMembers)), 4);
+    for LI := 0 to len(AMembers) - 1 do
+      PutLe(LBytes, LAt + 4 + 4 * LI, uint64(LHeaders[LI]), 4);
+    end;
+    LAt := LAt + 4 + 4 * len(AMembers);
+    PutLe(LBytes, LAt, uint64(LSymbolCount), 4);
+    setlength(LSorted, LSymbolCount);
+    LK := 0;
+    for LI := 0 to len(AMembers) - 1 do
+      for LN := 0 to len(AMembers[LI].Defines) - 1 do
+        LSorted[LK] := AMembers[LI].Defines[LN];
+        LK := LK + 1;
+      end;
+    end;
+    SortStrings(LSorted);
+    LK := LAt + 4 + 2 * LSymbolCount;
+    for LI := 0 to LSymbolCount - 1 do
+      PutLe(LBytes, LAt + 4 + 2 * LI, uint64(LMemberOf.Find(LSorted[LI])), 2);
+      LK := PutNulEnded(LBytes, LK, LSorted[LI]);
+    end;
+  end;
+  // The long-name table
+  if LTableSize > 0 then
+    DoPutHeader(LBytes, LNamesAt, ADAM_ARCHIVE_TABLE_NAME, LTableSize, true);
+    for LI := 0 to len(AMembers) - 1 do
+      LName := AMembers[LI].MemberName;
+      LJ := LTableAt.Find(LName);
+      if LJ <> 0 then
+        LK := PutNulEnded(LBytes, LNamesAt + ADAM_ARCHIVE_HEADER_SIZE + LJ - 1, LName);
+        if AKind = ArchiveKind.Gnu then
+          // GNU's "/" and LF in place of the NUL (the LF is already the pad byte)
+          LBytes[LK - 1] := uint8(0x2F);
+        end;
+      end;
+    end;
+  end;
+  // The members: a long name as "/" and its table offset, a short one with its ending '/'
+  for LI := 0 to len(AMembers) - 1 do
+    LName := AMembers[LI].MemberName;
+    LJ := LTableAt.Find(LName);
+    if LJ <> 0 then
+      LName := ADAM_ARCHIVE_INDEX_NAME + IntToStr(LJ - 1);
+    else
+      LName := LName + "/";
+    end;
+    DoPutHeader(LBytes, LHeaders[LI], LName, len(AMembers[LI].Bytes), false);
+    if len(AMembers[LI].Bytes) > 0 then
+      CopyBytes(addr of LBytes[LHeaders[LI] + ADAM_ARCHIVE_HEADER_SIZE],
+        addr of AMembers[LI].Bytes[0], len(AMembers[LI].Bytes));
+    end;
+  end;
+  return LBytes;
+end;
+
+end.
