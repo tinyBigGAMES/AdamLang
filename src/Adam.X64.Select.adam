@@ -97,6 +97,8 @@ public const
   // The most bytes an aggregate copied to the stack moves through a register, 8 at a time;
   // a bigger one moves by rep movsb
   ADAM_X64_SELECT_MOVE_INLINE: int64 = 64;
+  // A register save area's alignment (a vector register's place, LX1b)
+  ADAM_X64_SELECT_SAVE_ALIGN: int64 = 16;
   // The register a shift's count is in (the SDM's shl / shr / sar r/m, cl)
   ADAM_X64_SELECT_SHIFT_COUNT: string = "rcx";
   // A float32's / float64's sign bit, the mask a negation xors in (IEEE 754: -0.0 from
@@ -440,6 +442,8 @@ type
     hidden FOwnLayout: ref CallLayout;
     // A variadic function's homes and first variadic argument (nil for any other)
     hidden FOwnVarargs: ref VarargsLayout;
+    // Its register save area's frame slot (VarargsLayout.SaveBytes; -1: none)
+    hidden FSaveSlot: int64;
     hidden FVolatile: ref Int64List;
     // SSA instruction id -> its virtual register (-1: none), its slot (-1: no slot), and
     // whether some selected instruction reads it as a register (1; 0: not, or only folded:
@@ -1457,22 +1461,60 @@ type
       end;
     end;
 
-    // A variadic function's homes (FOwnVarargs): each argument register stored at its place
-    // in the incoming area, first of all (no copy has used a register yet), so the variadic
-    // arguments it carried sit beside the stacked ones
+    // A variadic function's homes (FOwnVarargs): each argument register stored at its place,
+    // first of all (no copy has used a register yet): in the incoming area, so the variadic
+    // arguments it carried sit beside the stacked ones; or with a register save area
+    // (VarargsLayout.SaveBytes) in that frame slot (FSaveSlot), a vector register's 8 bytes
+    // by movsd, then the va_list state after it filled (gp_offset, fp_offset, the first
+    // stacked variadic argument's address, the area's address)
     hidden method DoHomes();
     var
       LHome: ref Location;
+      LReg: int64;
+      LNode: int64;
+      LAddress: ref MachineOperand;
+      LState: int64;
       LI: int64;
     begin
       if self.FOwnVarargs = nil then
         return;
       end;
+      LNode := self.FFunction.Node;
+      if self.FOwnVarargs.SaveBytes > 0 then
+        self.FSaveSlot := self.FMachine.AddSlot(self.FOwnVarargs.SaveBytes, ADAM_X64_SELECT_SAVE_ALIGN);
+      end;
       for LI := 0 to self.FOwnVarargs.HomeCount - 1 do
         LHome := self.FOwnVarargs.HomeAt(LI);
-        self.DoEmitPair(X64Op.Mov, DoWidth(IrType.UInt64, 0), IncomingMemory(LHome.EntryOffset),
-          PhysicalOperand(self.DoPhysical(LHome.RegisterName)), self.FFunction.Node);
+        LReg := self.DoPhysical(LHome.RegisterName);
+        if self.FSaveSlot < 0 then
+          self.DoEmitPair(X64Op.Mov, DoWidth(IrType.UInt64, 0), IncomingMemory(LHome.EntryOffset),
+            PhysicalOperand(LReg), LNode);
+        else
+          if LReg >= ADAM_X64_FIRST_XMM then
+            self.DoEmitPair(X64Op.MovSD, 0, SlotMemory(self.FSaveSlot, LHome.EntryOffset),
+              PhysicalOperand(LReg), LNode);
+          else
+            self.DoEmitPair(X64Op.Mov, 8, SlotMemory(self.FSaveSlot, LHome.EntryOffset),
+              PhysicalOperand(LReg), LNode);
+          end;
+        end;
       end;
+      if self.FSaveSlot < 0 then
+        return;
+      end;
+      LState := self.FOwnVarargs.StateAt;
+      self.DoEmitPair(X64Op.Mov, 4, SlotMemory(self.FSaveSlot, LState + self.FOwnVarargs.GpAt),
+        ImmediateOperand(self.FOwnVarargs.GpStart), LNode);
+      self.DoEmitPair(X64Op.Mov, 4, SlotMemory(self.FSaveSlot, LState + self.FOwnVarargs.FpAt),
+        ImmediateOperand(self.FOwnVarargs.FpStart), LNode);
+      LAddress := VirtualOperand(self.FMachine.NewVReg(RegClass.General));
+      self.DoEmitPair(X64Op.Lea, 8, LAddress, IncomingMemory(self.FOwnVarargs.FirstAt), LNode);
+      self.DoEmitPair(X64Op.Mov, 8, SlotMemory(self.FSaveSlot, LState + self.FOwnVarargs.OverflowAt),
+        LAddress, LNode);
+      LAddress := VirtualOperand(self.FMachine.NewVReg(RegClass.General));
+      self.DoEmitPair(X64Op.Lea, 8, LAddress, SlotMemory(self.FSaveSlot, 0), LNode);
+      self.DoEmitPair(X64Op.Mov, 8, SlotMemory(self.FSaveSlot, LState + self.FOwnVarargs.AreaAt),
+        LAddress, LNode);
     end;
 
     // Each parameter copied out of its register or its incoming place, at the start of the
@@ -2906,6 +2948,12 @@ type
           end;
         end;
       end;
+      // a System V variadic call's al: the vector registers its arguments take
+      if LLayout.VectorCountRegister <> "" then
+        LReg := self.DoPhysical(LLayout.VectorCountRegister);
+        self.DoLoadImm(4, PhysicalOperand(LReg), LLayout.VectorCount, LInstr.Node);
+        LUses.Add(LReg);
+      end;
       if LTail then
         self.DoTailJump(LInstr, ATarget, LUses);
         return;
@@ -2972,12 +3020,18 @@ type
     end;
 
     // varargsstart: lea of the first variadic argument's place in the incoming area (the
-    // homes put the register ones there: DoHomes); raises in a function that is not
-    // variadic (Verify refuses it)
+    // homes put the register ones there: DoHomes), or with a register save area lea of its
+    // va_list state (VarargsLayout.StateAt); raises in a function that is not variadic
+    // (Verify refuses it)
     hidden method DoVarargsStart(const AId: int64; const AInstr: ref IrInstr);
     begin
       if self.FOwnVarargs = nil then
         raise(ADAM_X64_SELECT_FAULT_VARARGS + IntToStr(AId));
+      end;
+      if self.FSaveSlot >= 0 then
+        self.DoEmitPair(X64Op.Lea, DoWidth(IrType.Pointer, AId), self.DoVReg(AId),
+          SlotMemory(self.FSaveSlot, self.FOwnVarargs.StateAt), AInstr.Node);
+        return;
       end;
       self.DoEmitPair(X64Op.Lea, DoWidth(IrType.Pointer, AId), self.DoVReg(AId),
         IncomingMemory(self.FOwnVarargs.FirstAt), AInstr.Node);
@@ -3337,6 +3391,7 @@ type
       self.FMachine.Internal := self.FFunction.Internal;
       self.FOwnLayout := self.FAbi.LayoutCall(self.FFunction.Signature);
       self.FOwnVarargs := nil;
+      self.FSaveSlot := -1;
       if self.FFunction.Signature.Variadic then
         self.FOwnVarargs := self.FAbi.LayoutVarargs(self.FFunction.Signature);
       end;
