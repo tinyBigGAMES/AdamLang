@@ -1,0 +1,305 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.SysV.Unwind.adam - x86_64-linux-gnu's unwind data (DESIGN sec 6)
+
+  Every generated function on x86_64-linux-gnu gets two descriptions of its
+  frame (PLAN-LINUX64 H1, LX1c):
+  - Adam.Backend.Unwind's tables (the x86_64 prologue codes and scope
+    tables Windows reads too) in adam_xdata / adam_pdata, the sections
+    System.Runtime.Linux64's unwinder finds through the linker's
+    __start_ / __stop_ symbols (C identifiers for that reason); their Rva32
+    fields count from the image's start (__ehdr_start, the ELF linker's)
+  - a DWARF call frame description in .eh_frame (the LSB / DWARF 5 sec 6.4
+    form glibc's backtrace(), gdb and perf read): one piece per function
+    (going with its code, as the table pieces do), a CIE then the
+    function's FDE:
+      CIE   length, id 0, version 1, augmentation "zR", code alignment 1,
+            data alignment -8, return address register 16, augmentation
+            data the FDE pointer encoding (pcrel | sdata4), then the state
+            at the first instruction: the CFA is rsp + 8, the return
+            address at CFA - 8; padded with DW_CFA_nop to 8 bytes
+      FDE   length, the offset back to the CIE, the function's start
+            (pc-relative 32 bits: a Rel32 relocation, addend 4), its byte
+            count, no augmentation data, then per prologue step where it
+            ends (DW_CFA_advance_loc): a push makes the CFA 8 further from
+            rsp (DW_CFA_def_cfa_offset) and says where the register is
+            (DW_CFA_offset, factored by -8); the reservation moves the CFA
+            offset by its bytes; a realigned frame's frame register step
+            makes it the CFA's register (DW_CFA_def_cfa_register); padded
+            to 8 bytes
+    The epilogues are not described (glibc's and gdb's unwinding of a
+    frame stopped inside one is off, as for code built without
+    asynchronous tables); System.Runtime.Linux64 reads the tables, never
+    this.
+
+  FrameInfo      writes one function's .eh_frame piece. A step it cannot
+                 describe raises (a compiler bug): a vector save (no
+                 System V register is callee-saved), a register with no
+                 DWARF number, steps not in rising order
+*******************************************************************************/
+
+module unit Adam.SysV.Unwind;
+
+import System.SysUtils, Adam.Core.Containers, Adam.Backend.Sections, Adam.Backend.Parts;
+
+public const
+  // The table sections (Adam.Backend.Unwind's, named as C identifiers) and the frame
+  // description's section, its alignment and the mark between its group and a function's
+  // symbol in a piece's set name
+  ADAM_SYSV_UNWIND_INFO: string = "adam_xdata";
+  ADAM_SYSV_UNWIND_TABLE: string = "adam_pdata";
+  ADAM_SYSV_EH_FRAME: string = ".eh_frame";
+  ADAM_SYSV_EH_ALIGN: int64 = 8;
+  ADAM_SYSV_EH_PIECE_MARK: string = "#";
+  // The general registers by their DWARF numbers (the psABI's Figure 3.36: 0 rax .. 15
+  // r15) and the return address column
+  ADAM_SYSV_DWARF_REGISTERS: string =
+    "rax rdx rcx rbx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15";
+  ADAM_SYSV_DWARF_RETURN: int64 = 16;
+  ADAM_SYSV_DWARF_STACK: int64 = 7;
+  // The CIE: version, augmentation, alignments, the FDE pointer encoding
+  // (DW_EH_PE_pcrel | DW_EH_PE_sdata4), the return address's slot and the CFA at entry
+  ADAM_SYSV_CIE_VERSION: int64 = 1;
+  ADAM_SYSV_CIE_AUGMENTATION: string = "zR";
+  ADAM_SYSV_CIE_CODE_ALIGN: int64 = 1;
+  ADAM_SYSV_CIE_DATA_ALIGN: int64 = -8;
+  ADAM_SYSV_CIE_FDE_ENCODING: int64 = 0x1B;
+  ADAM_SYSV_ENTRY_CFA: int64 = 8;
+  // The call frame instructions written (DWARF 5 Table 7.29)
+  DW_CFA_advance_loc: int64 = 0x40;
+  DW_CFA_offset: int64 = 0x80;
+  DW_CFA_nop: int64 = 0x00;
+  DW_CFA_advance_loc1: int64 = 0x02;
+  DW_CFA_advance_loc2: int64 = 0x03;
+  DW_CFA_advance_loc4: int64 = 0x04;
+  DW_CFA_def_cfa: int64 = 0x0C;
+  DW_CFA_def_cfa_register: int64 = 0x0D;
+  DW_CFA_def_cfa_offset: int64 = 0x0E;
+  // The largest delta each advance takes (6 bits, then 1, 2 bytes)
+  ADAM_SYSV_ADVANCE_SMALL: int64 = 63;
+  ADAM_SYSV_ADVANCE_BYTE: int64 = 255;
+  ADAM_SYSV_ADVANCE_WORD: int64 = 65535;
+  // A Rel32 field's own 4 bytes (S + A - (P + 4) with A = 4 is pcrel's S - P)
+  ADAM_SYSV_PCREL_ADDEND: int64 = 4;
+  // Raised (an invariant broken) by a step the description cannot take (see the header)
+  ADAM_SYSV_UNWIND_FAULT_STEP: string = "SysV unwind: a prologue step .eh_frame cannot describe: ";
+
+type
+  // Writes one function's .eh_frame piece (FrameInfo makes one per function)
+  FrameWriter = object
+    hidden FCode: ref FunctionCode;
+    hidden FSections: ref SectionSet;
+    hidden FSection: ref Section;
+    hidden FRegisters: StringArray;
+
+    init(const ACode: ref FunctionCode; const ASections: ref SectionSet);
+    begin
+      self.FCode := ACode;
+      self.FSections := ASections;
+      self.FRegisters := SplitString(ADAM_SYSV_DWARF_REGISTERS, " ");
+    end;
+
+    // AValue as unsigned LEB128
+    hidden method DoUleb(const AValue: int64);
+    var
+      LValue: uint64;
+      LByte: uint64;
+    begin
+      LValue := uint64(AValue);
+      repeat
+        LByte := LValue & 0x7F;
+        LValue := LValue shr uint64(7);
+        if LValue <> 0 then
+          LByte := LByte | 0x80;
+        end;
+        self.FSection.Put8(LByte);
+      until LValue = 0;
+    end;
+
+    // AValue as signed LEB128
+    hidden method DoSleb(const AValue: int64);
+    var
+      LValue: int64;
+      LByte: int64;
+      LMore: bool;
+    begin
+      LValue := AValue;
+      LMore := true;
+      while LMore do
+        LByte := LValue & 0x7F;
+        // the rest, the low 7 bits taken off (an exact division keeps the sign)
+        LValue := (LValue - LByte) div 128;
+        if ((LValue = 0) and ((LByte & 0x40) = 0)) or ((LValue = -1) and ((LByte & 0x40) <> 0)) then
+          LMore := false;
+        else
+          LByte := LByte | 0x80;
+        end;
+        self.FSection.Put8(uint64(LByte));
+      end;
+    end;
+
+    // The DWARF number of the register named AName; raises for none
+    hidden const method DoNumber(const AName: string): int64;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FRegisters) - 1 do
+        if self.FRegisters[LI] = AName then
+          return LI;
+        end;
+      end;
+      raise(ADAM_SYSV_UNWIND_FAULT_STEP + "the register '" + AName + "' in " + self.FCode.Symbol);
+    end;
+
+    // DW_CFA_nop up to the section's next ADAM_SYSV_EH_ALIGN boundary from AStart
+    hidden method DoPad(const AStart: int64);
+    begin
+      while ((self.FSection.Size() - AStart) mod ADAM_SYSV_EH_ALIGN) <> 0 do
+        self.FSection.Put8(uint64(DW_CFA_nop));
+      end;
+    end;
+
+    // The CFA's location advanced ADelta bytes (0: nothing), by the shortest form
+    hidden method DoAdvance(const ADelta: int64);
+    begin
+      if ADelta = 0 then
+        return;
+      end;
+      if ADelta < 0 then
+        raise(ADAM_SYSV_UNWIND_FAULT_STEP + "steps not in rising order in " + self.FCode.Symbol);
+      end;
+      if ADelta <= ADAM_SYSV_ADVANCE_SMALL then
+        self.FSection.Put8(uint64(DW_CFA_advance_loc + ADelta));
+        return;
+      end;
+      if ADelta <= ADAM_SYSV_ADVANCE_BYTE then
+        self.FSection.Put8(uint64(DW_CFA_advance_loc1));
+        self.FSection.Put8(uint64(ADelta));
+        return;
+      end;
+      if ADelta <= ADAM_SYSV_ADVANCE_WORD then
+        self.FSection.Put8(uint64(DW_CFA_advance_loc2));
+        self.FSection.Put16(uint64(ADelta));
+        return;
+      end;
+      self.FSection.Put8(uint64(DW_CFA_advance_loc4));
+      self.FSection.Put32(uint64(ADelta));
+    end;
+
+    // The CIE (see the header), from AStart; its length patched in at the end
+    hidden method DoCie(const AStart: int64);
+    var
+      LI: int64;
+    begin
+      self.FSection.Put32(uint64(0));
+      self.FSection.Put32(uint64(0));
+      self.FSection.Put8(uint64(ADAM_SYSV_CIE_VERSION));
+      for LI := 0 to len(ADAM_SYSV_CIE_AUGMENTATION) - 1 do
+        self.FSection.Put8(uint64(uint8(ADAM_SYSV_CIE_AUGMENTATION[LI])));
+      end;
+      self.FSection.Put8(uint64(0));
+      self.DoUleb(ADAM_SYSV_CIE_CODE_ALIGN);
+      self.DoSleb(ADAM_SYSV_CIE_DATA_ALIGN);
+      self.DoUleb(ADAM_SYSV_DWARF_RETURN);
+      // the augmentation data: one byte, the FDE pointer encoding
+      self.DoUleb(1);
+      self.FSection.Put8(uint64(ADAM_SYSV_CIE_FDE_ENCODING));
+      // at entry: CFA = rsp + 8, the return address at CFA - 8
+      self.FSection.Put8(uint64(DW_CFA_def_cfa));
+      self.DoUleb(ADAM_SYSV_DWARF_STACK);
+      self.DoUleb(ADAM_SYSV_ENTRY_CFA);
+      self.FSection.Put8(uint64(DW_CFA_offset + ADAM_SYSV_DWARF_RETURN));
+      self.DoUleb(ADAM_SYSV_ENTRY_CFA div (-ADAM_SYSV_CIE_DATA_ALIGN));
+      self.DoPad(AStart);
+      self.FSection.Patch32(AStart, uint64(self.FSection.Size() - AStart - 4));
+    end;
+
+    // The FDE (see the header), from AStart, its CIE at ACie
+    hidden method DoFde(const ASectionId: int64; const AStart: int64; const ACie: int64);
+    var
+      LStep: ref PrologueStep;
+      LCfa: int64;
+      LAt: int64;
+      LI: int64;
+    begin
+      self.FSection.Put32(uint64(0));
+      // the offset from this field back to the CIE
+      self.FSection.Put32(uint64(self.FSection.Size() - ACie));
+      LAt := self.FSection.Size();
+      self.FSection.Put32(uint64(0));
+      self.FSections.AddReloc(ASectionId, LAt, RelocKind.Rel32, self.FCode.SymbolId,
+        ADAM_SYSV_PCREL_ADDEND);
+      self.FSection.Put32(uint64(self.FCode.ByteCount));
+      self.DoUleb(0);
+      LCfa := ADAM_SYSV_ENTRY_CFA;
+      LAt := 0;
+      for LI := 0 to self.FCode.StepCount - 1 do
+        LStep := self.FCode.StepAt(LI);
+        self.DoAdvance(LStep.EndsAt - LAt);
+        LAt := LStep.EndsAt;
+        match LStep.Action of
+          PrologueAction.SaveRegister:
+            LCfa := LCfa + (-ADAM_SYSV_CIE_DATA_ALIGN);
+            self.FSection.Put8(uint64(DW_CFA_def_cfa_offset));
+            self.DoUleb(LCfa);
+            self.FSection.Put8(uint64(DW_CFA_offset + self.DoNumber(LStep.RegisterName)));
+            self.DoUleb(LCfa div (-ADAM_SYSV_CIE_DATA_ALIGN));
+          PrologueAction.Allocate:
+            LCfa := LCfa + LStep.Bytes;
+            self.FSection.Put8(uint64(DW_CFA_def_cfa_offset));
+            self.DoUleb(LCfa);
+          PrologueAction.SetFrame:
+            self.FSection.Put8(uint64(DW_CFA_def_cfa_register));
+            self.DoUleb(self.DoNumber(LStep.RegisterName));
+          PrologueAction.SaveVector:
+            raise(ADAM_SYSV_UNWIND_FAULT_STEP + "a vector save in " + self.FCode.Symbol);
+        end;
+      end;
+      self.DoPad(AStart);
+      self.FSection.Patch32(AStart, uint64(self.FSection.Size() - AStart - 4));
+    end;
+
+    // The function's piece of .eh_frame (link-time removal: Removable, associated with its
+    // code section, as Adam.Backend.Unwind's pieces), its CIE then its FDE
+    method Run();
+    var
+      LId: int64;
+      LCie: int64;
+    begin
+      LId := self.FSections.AddSection(ADAM_SYSV_EH_FRAME + ADAM_SYSV_EH_PIECE_MARK + self.FCode.Symbol,
+        SectionKind.ReadOnly, ADAM_SYSV_EH_ALIGN);
+      self.FSection := self.FSections.SectionAt(LId);
+      self.FSection.GroupName := ADAM_SYSV_EH_FRAME;
+      self.FSection.Removable := true;
+      self.FSection.Associate := self.FSections.SymbolAt(self.FCode.SymbolId).SectionId;
+      self.FSection.AlignTo(ADAM_SYSV_EH_ALIGN, uint8(0));
+      LCie := self.FSection.Size();
+      self.DoCie(LCie);
+      self.DoFde(LId, self.FSection.Size(), LCie);
+    end;
+  end;
+
+// ACode's call frame description written into ASections as its own .eh_frame piece (see the
+// header)
+public routine FrameInfo(const ACode: ref FunctionCode; const ASections: ref SectionSet);
+var
+  LWriter: ref FrameWriter;
+begin
+  LWriter := ref FrameWriter(ACode, ASections);
+  LWriter.Run();
+end;
+
+end.
