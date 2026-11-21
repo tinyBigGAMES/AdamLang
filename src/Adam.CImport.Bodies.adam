@@ -27,6 +27,11 @@
                   routine's head and its text, or the reason it is not
                   bound (BodyResult)
 
+  A translated routine is `cpplink` (DESIGN sec 2: the Itanium name in the
+  unit's namespace): C's static inline has no symbol, so the translation
+  never takes the plain C name a library may define as well (raylib's
+  rcore.c exports raymath's routines).
+
   A body is C's statements Adam can say: a compound statement (its own
   scope), a declaration of locals (each with its initializer, as an
   assignment where C declares it), if / else, while, do .. while (Adam's
@@ -39,21 +44,31 @@
   locals share their routine's scope); a static local only as a constant
   (const, its initializer a constant), a const array with an initializer
   list of constants (one per element, its size from the list when C gives
-  none) in the routine's const block; a struct or union the body declares
+  none) in the routine's const block; any other struct or array local with
+  an initializer list as the Adam record / array literal C's list means,
+  assigned where C declares it: elements in field / index order, `.name =`
+  designators picking the field, nested lists, C's brace elision (an
+  aggregate member's elements taken from the enclosing list), a struct
+  value initializing a whole member, what C leaves out zero (a record
+  literal zeroes the fields it does not name, an array literal is padded
+  with its element's zero); a struct or union the body declares
   is a type of the routine's type block (its tag, or the variable's name
   and _type). A parameter the body assigns, steps or takes the address of
   is a value parameter, the others const. Statements after one that ends
   the path (return, break, continue, an endless loop) never run and are
   not written. A routine with a result whose end can be reached is not
   bound (Adam requires the return). switch, goto, labels, asm, a variadic
-  routine and an initializer list other than a const array's are not
-  bound, each with its reason: never dropped silently.
+  routine and an initializer list Adam cannot say (a union's, a record with
+  bitfields or a flexible member, an index designator, an empty list, a
+  static local's) are not bound, each with its reason: never dropped
+  silently.
 *******************************************************************************/
 
 module unit Adam.CImport.Bodies;
 
 import System.SysUtils, Adam.Core.Containers, Adam.Core.Messages, Adam.Compiler.Diagnostics,
-  Adam.CImport.Lexer, Adam.CImport.CTypes, Adam.CImport.Parser, Adam.CImport.Macros;
+  Adam.CImport.Spec, Adam.CImport.Lexer, Adam.CImport.CTypes, Adam.CImport.Parser,
+  Adam.CImport.Macros;
 
 public const
   // A body's statements are indented this much per level
@@ -66,6 +81,16 @@ public const
   ADAM_CIMPORT_BODIES_RUNTIME: int64 = -1;
   ADAM_CIMPORT_BODIES_FALSE: int64 = 0;
   ADAM_CIMPORT_BODIES_TRUE: int64 = 1;
+
+// A C field name as the Adam name the binding writer gives it: an Adam keyword with a
+// trailing '_' (AD.5)
+routine DoFieldName(const ACName: string): string;
+begin
+  if IsAdamName(ACName) then
+    return ACName;
+  end;
+  return ACName + "_";
+end;
 
 public type
   // What the binding writer says of a type for a body (see the header)
@@ -114,6 +139,8 @@ public type
     hidden FLocalTypes: ref Int64Map;
     hidden FLocalTypeNames: StringArray;
     hidden FLocalTypeCount: int64;
+    // the local whose initializer list is being read (its name in a reason and a body record's)
+    hidden FInitName: string;
     // the loops around the statement being read, innermost last: each one's continue lines
     // (Adam statements, one per line) and whether a leave left it
     hidden FContinues: StringArray;
@@ -220,7 +247,10 @@ public type
           LParams[LI] := "const " + self.FEval.LocalName(LI) + ": " + LType;
         end;
       end;
-      LText := "public routine " + AAdamName + "(" + JoinStrings(LParams, "; ") + ")";
+      // cpplink: the translation has no C symbol of its own (C's static inline), so its
+      // symbol is the unit's mangled name, never the plain one a library may export too
+      // (raylib's rcore.c defines every raymath routine: RAYMATH_IMPLEMENTATION)
+      LText := "public routine cpplink " + AAdamName + "(" + JoinStrings(LParams, "; ") + ")";
       if not self.FVoid then
         LWhy := "";
         LType := ATypes.BodyTypeText(LFunc.Base, LWhy);
@@ -990,6 +1020,10 @@ public type
       LConst := self.DoIsConst(ALocal.TypeId) or
         ((LType.Kind = CTypeKind.Array) and self.DoIsConst(LType.Base));
       if (ALocal.InitFirst >= 0) and self.DoIsAt(ALocal.InitFirst, "{") then
+        if ((LType.Kind = CTypeKind.Record) or ((LType.Kind = CTypeKind.Array) and not LConst)) and
+          not ALocal.IsStatic then
+          return self.DoListInit(ALocal, LType, AIndent, AOut, ATypes);
+        end;
         if (LType.Kind <> CTypeKind.Array) or not LConst then
           return self.DoFail(NoArgs().Str(ALocal.Name).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_INIT));
         end;
@@ -1087,6 +1121,402 @@ public type
       self.FLocalTypeCount := self.FLocalTypeCount + 1;
       self.FLocalTypes.Put(ARecord, self.FLocalTypeCount);
       return LName;
+    end;
+
+    // A struct or (not const) array local with an initializer list (see the header): `Name :=
+    // <literal>;` where C declares it; an array C sizes by its list takes the list's count
+    hidden method DoListInit(const ALocal: CLocal; const AType: CType; const AIndent: string;
+      const AOut: ref TextBuilder; const ATypes: BodyTypes): bool;
+    var
+      LText: string;
+      LValue: string;
+      LName: string;
+      LPos: int64;
+      LCount: int64;
+    begin
+      self.FInitName := ALocal.Name;
+      LCount := -1;
+      if (AType.Kind = CTypeKind.Array) and (AType.Count < 0) then
+        LCount := self.DoListCount(ALocal.InitFirst);
+        if LCount <= 0 then
+          return self.DoFailInit();
+        end;
+        LText := self.DoTypeText(AType.Base, ATypes);
+        if LText = "" then
+          return false;
+        end;
+        LText := "array[0.." + IntToStr(LCount - 1) + "] of " + LText;
+      else
+        LText := self.DoLocalTypeText(ALocal, ATypes);
+        if LText = "" then
+          return false;
+        end;
+      end;
+      LPos := ALocal.InitFirst;
+      if not self.DoBraced(ALocal.TypeId, LCount, LPos, ATypes, LValue) then
+        return false;
+      end;
+      if LPos <> ALocal.InitEnd then
+        self.FPos := LPos;
+        return self.DoSyntax();
+      end;
+      LName := self.FEval.LocalName(self.FEval.AddLocal(ALocal.Name, ALocal.TypeId));
+      self.FVarLines.Add(ADAM_CIMPORT_BODIES_INDENT + LName + ": " + LText + ";\n");
+      AOut.Add(AIndent + LName + " := " + LValue + ";\n");
+      return true;
+    end;
+
+    // The reason an initializer list of the local being read cannot be said; false
+    hidden method DoFailInit(): bool;
+    begin
+      return self.DoFail(NoArgs().Str(self.FInitName).Fill(ADAM_MSG_CIMPORT_WRITER_WHY_BODY_INIT));
+    end;
+
+    // The elements of the braced list at AFirst (its '{'), counted at its own level (a nested
+    // list or a call's commas are one element; a trailing comma adds none); 0 for an empty one
+    hidden method DoListCount(const AFirst: int64): int64;
+    var
+      LPos: int64;
+      LDepth: int64;
+      LCount: int64;
+      LText: string;
+    begin
+      LPos := AFirst + 1;
+      LDepth := 0;
+      LCount := 0;
+      if self.DoIsAt(LPos, "}") then
+        return 0;
+      end;
+      LCount := 1;
+      while LPos < len(self.FToks) do
+        LText := self.FToks[LPos].Text;
+        if (LText = "{") or (LText = "(") or (LText = "[") then
+          LDepth := LDepth + 1;
+        else
+          if (LText = ")") or (LText = "]") then
+            LDepth := LDepth - 1;
+          else
+            if LText = "}" then
+              if LDepth = 0 then
+                return LCount;
+              end;
+              LDepth := LDepth - 1;
+            else
+              if (LText = ",") and (LDepth = 0) and not self.DoIsAt(LPos + 1, "}") then
+                LCount := LCount + 1;
+              end;
+            end;
+          end;
+        end;
+        LPos := LPos + 1;
+      end;
+      return 0;
+    end;
+
+    // The Adam type text of ATypeId inside an initializer: a struct / union the body declares
+    // by its type block's name, any other as the writer says it; "" (the reason kept) when
+    // Adam cannot say it
+    hidden method DoTypeText(const ATypeId: int64; const ATypes: BodyTypes): string;
+    var
+      LType: CType;
+      LText: string;
+      LWhy: string;
+    begin
+      LType := self.FTypes.Item(self.FTypes.Resolved(ATypeId));
+      if (LType.Kind = CTypeKind.Record) and (LType.Index >= self.FFirstLocal) then
+        return self.DoLocalRecord(LType.Index, self.FInitName, ATypes);
+      end;
+      LWhy := "";
+      LText := ATypes.BodyTypeText(ATypeId, LWhy);
+      if LText = "" then
+        self.DoFail(NoArgs().Str(self.FInitName).Str(LWhy).Fill(
+          ADAM_MSG_CIMPORT_WRITER_WHY_BODY_LOCAL_TYPE));
+      end;
+      return LText;
+    end;
+
+    // The struct ARecord as an initializer's record literal can be: complete, no union, no
+    // bitfield, no flexible member, every field named; false (the reason kept) otherwise
+    hidden method DoListRecord(const AIndex: int64; var ARecord: CRecord): bool;
+    var
+      LI: int64;
+    begin
+      ARecord := self.FTypes.RecordAt(AIndex);
+      if not ARecord.Complete or ARecord.IsUnion or ARecord.HasBitfields or ARecord.HasFlexible then
+        return self.DoFailInit();
+      end;
+      for LI := 0 to len(ARecord.Fields) - 1 do
+        if ARecord.Fields[LI].Name = "" then
+          return self.DoFailInit();
+        end;
+      end;
+      if len(ARecord.Fields) = 0 then
+        return self.DoFailInit();
+      end;
+      return true;
+    end;
+
+    // The zero of ATypeId as Adam text (what C leaves out of a list): a record literal naming
+    // its first field's zero (a record literal zeroes the rest), an array literal of its
+    // element's zero, nil, else the evaluator's converted 0
+    hidden method DoZero(const ATypeId: int64; const ATypes: BodyTypes; var AText: string): bool;
+    var
+      LType: CType;
+      LRecord: CRecord;
+      LName: string;
+      LElement: string;
+      LOut: ref TextBuilder;
+      LI: int64;
+    begin
+      LType := self.FTypes.Item(self.FTypes.Resolved(ATypeId));
+      if LType.Kind = CTypeKind.Record then
+        if not self.DoListRecord(LType.Index, LRecord) then
+          return false;
+        end;
+        LName := self.DoTypeText(ATypeId, ATypes);
+        if LName = "" then
+          return false;
+        end;
+        if not self.DoZero(LRecord.Fields[0].TypeId, ATypes, LElement) then
+          return false;
+        end;
+        AText := LName + "(" + DoFieldName(LRecord.Fields[0].Name) + ": " + LElement + ")";
+        return true;
+      end;
+      if LType.Kind = CTypeKind.Array then
+        if LType.Count <= 0 then
+          return self.DoFailInit();
+        end;
+        if not self.DoZero(LType.Base, ATypes, LElement) then
+          return false;
+        end;
+        LOut := ref TextBuilder();
+        LOut.Add("[");
+        for LI := 0 to LType.Count - 1 do
+          if LI > 0 then
+            LOut.Add(", ");
+          end;
+          LOut.Add(LElement);
+        end;
+        LOut.Add("]");
+        AText := LOut.Text();
+        return true;
+      end;
+      if LType.Kind = CTypeKind.Pointer then
+        AText := "nil";
+        return true;
+      end;
+      AText := self.FEval.ZeroAs(ATypeId);
+      if AText = "" then
+        return self.DoFailExpression();
+      end;
+      return true;
+    end;
+
+    // The braced list at APos (its '{') as the value of ATypeId (ACount: an array's element
+    // count when C sizes it by the list, else -1), APos after its '}'; an empty list is not
+    // bound
+    hidden method DoBraced(const ATypeId: int64; const ACount: int64; var APos: int64;
+      const ATypes: BodyTypes; var AText: string): bool;
+    begin
+      if not self.DoIsAt(APos, "{") then
+        self.FPos := APos;
+        return self.DoSyntax();
+      end;
+      APos := APos + 1;
+      if self.DoIsAt(APos, "}") then
+        return self.DoFailInit();
+      end;
+      if not self.DoMembers(ATypeId, ACount, true, APos, ATypes, AText) then
+        return false;
+      end;
+      // a trailing comma
+      if self.DoIsAt(APos, ",") and self.DoIsAt(APos + 1, "}") then
+        APos := APos + 1;
+      end;
+      if not self.DoIsAt(APos, "}") then
+        self.FPos := APos;
+        return self.DoSyntax();
+      end;
+      APos := APos + 1;
+      return true;
+    end;
+
+    // One element at APos as the value of ATypeId: a braced list read whole; an aggregate with
+    // no brace initialized by one expression of its own struct type, else its elements taken
+    // from the enclosing list (C's brace elision); a scalar one expression converted to it
+    hidden method DoElement(const ATypeId: int64; var APos: int64; const ATypes: BodyTypes;
+      var AText: string): bool;
+    var
+      LType: CType;
+      LValue: MacroValue;
+      LSave: int64;
+    begin
+      if self.DoIsAt(APos, "{") then
+        return self.DoBraced(ATypeId, -1, APos, ATypes, AText);
+      end;
+      LType := self.FTypes.Item(self.FTypes.Resolved(ATypeId));
+      if (LType.Kind = CTypeKind.Record) or (LType.Kind = CTypeKind.Array) then
+        if LType.Kind = CTypeKind.Record then
+          LSave := APos;
+          if self.FEval.ExpressionAt(self.FToks, APos, LValue) and
+            (self.FTypes.Resolved(LValue.TypeId) = self.FTypes.Resolved(ATypeId)) then
+            AText := self.FEval.ValueAs(LValue, ATypeId);
+            if AText = "" then
+              return self.DoFailExpression();
+            end;
+            return true;
+          end;
+          APos := LSave;
+        end;
+        return self.DoMembers(ATypeId, -1, false, APos, ATypes, AText);
+      end;
+      if not self.FEval.ExpressionAt(self.FToks, APos, LValue) then
+        return self.DoFailExpression();
+      end;
+      AText := self.FEval.ValueAs(LValue, ATypeId);
+      if AText = "" then
+        return self.DoFailExpression();
+      end;
+      return true;
+    end;
+
+    // The members of ATypeId read in order from the list at APos (ABraced: its own list, `.name
+    // =` designators allowed; else elided from the enclosing list, stopping once every member
+    // has its element, the comma after it left to that list), APos at what ends them; AText
+    // the record / array literal (ACount as DoBraced's), a scalar's one element
+    hidden method DoMembers(const ATypeId: int64; const ACount: int64; const ABraced: bool;
+      var APos: int64; const ATypes: BodyTypes; var AText: string): bool;
+    var
+      LType: CType;
+      LRecord: CRecord;
+      LTexts: StringArray;
+      LOut: ref TextBuilder;
+      LName: string;
+      LCount: int64;
+      LIndex: int64;
+      LGiven: int64;
+      LI: int64;
+      LFirst: bool;
+    begin
+      LType := self.FTypes.Item(self.FTypes.Resolved(ATypeId));
+      if (LType.Kind <> CTypeKind.Record) and (LType.Kind <> CTypeKind.Array) then
+        // a scalar in braces: its one element
+        return self.DoElement(ATypeId, APos, ATypes, AText);
+      end;
+      if LType.Kind = CTypeKind.Record then
+        if not self.DoListRecord(LType.Index, LRecord) then
+          return false;
+        end;
+        LCount := len(LRecord.Fields);
+      else
+        LCount := LType.Count;
+        if ACount >= 0 then
+          LCount := ACount;
+        end;
+        if LCount <= 0 then
+          return self.DoFailInit();
+        end;
+      end;
+      setlength(LTexts, LCount);
+      for LI := 0 to LCount - 1 do
+        LTexts[LI] := "";
+      end;
+      LIndex := 0;
+      LFirst := true;
+      while not self.DoIsAt(APos, "}") do
+        if not LFirst then
+          // the comma after the element before: a trailing one is the braced list's
+          if not self.DoIsAt(APos, ",") or self.DoIsAt(APos + 1, "}") then
+            leave;
+          end;
+          APos := APos + 1;
+        end;
+        if self.DoIsAt(APos, "[") or (self.DoIsAt(APos, ".") and
+          (not ABraced or (LType.Kind <> CTypeKind.Record))) then
+          return self.DoFailInit();
+        end;
+        if self.DoIsAt(APos, ".") then
+          // a designator: the field it names, then '='
+          LIndex := -1;
+          if APos + 1 < len(self.FToks) then
+            for LI := 0 to LCount - 1 do
+              if LRecord.Fields[LI].Name = self.FToks[APos + 1].Text then
+                LIndex := LI;
+              end;
+            end;
+          end;
+          if LIndex < 0 then
+            return self.DoFailInit();
+          end;
+          APos := APos + 2;
+          if not self.DoIsAt(APos, "=") then
+            self.FPos := APos;
+            return self.DoSyntax();
+          end;
+          APos := APos + 1;
+        end;
+        if LIndex >= LCount then
+          return self.DoFailInit();
+        end;
+        if LType.Kind = CTypeKind.Record then
+          if not self.DoElement(LRecord.Fields[LIndex].TypeId, APos, ATypes, LTexts[LIndex]) then
+            return false;
+          end;
+        else
+          if not self.DoElement(LType.Base, APos, ATypes, LTexts[LIndex]) then
+            return false;
+          end;
+        end;
+        LIndex := LIndex + 1;
+        LFirst := false;
+        if not ABraced and (LIndex >= LCount) then
+          leave;
+        end;
+      end;
+      LOut := ref TextBuilder();
+      if LType.Kind = CTypeKind.Record then
+        LName := self.DoTypeText(ATypeId, ATypes);
+        if LName = "" then
+          return false;
+        end;
+        LOut.Add(LName + "(");
+        LGiven := 0;
+        // the literal names its fields in their declared order (BNF sec 6); none given: the
+        // first one's zero (a record literal names one at least)
+        for LI := 0 to LCount - 1 do
+          if LTexts[LI] <> "" then
+            if LGiven > 0 then
+              LOut.Add(", ");
+            end;
+            LOut.Add(DoFieldName(LRecord.Fields[LI].Name) + ": " + LTexts[LI]);
+            LGiven := LGiven + 1;
+          end;
+        end;
+        if LGiven = 0 then
+          if not self.DoZero(LRecord.Fields[0].TypeId, ATypes, LTexts[0]) then
+            return false;
+          end;
+          LOut.Add(DoFieldName(LRecord.Fields[0].Name) + ": " + LTexts[0]);
+        end;
+        LOut.Add(")");
+      else
+        LOut.Add("[");
+        for LI := 0 to LCount - 1 do
+          if LI > 0 then
+            LOut.Add(", ");
+          end;
+          if LTexts[LI] = "" then
+            if not self.DoZero(LType.Base, ATypes, LTexts[LI]) then
+              return false;
+            end;
+          end;
+          LOut.Add(LTexts[LI]);
+        end;
+        LOut.Add("]");
+      end;
+      AText := LOut.Text();
+      return true;
     end;
 
     // A const array with an initializer list: every element a constant, one per element (the
