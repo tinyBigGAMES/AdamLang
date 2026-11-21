@@ -1,0 +1,1415 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Elf.Linker.adam - a SectionSet and its static libraries as an ELF64
+  executable (DESIGN sec 7, PLAN-LINUX64 LX3)
+
+  Every layout fact is the System V gABI's (ELF header, program header,
+  section header, symbol table) with elf.h's names (std System.Elf); the
+  arch's facts are its ElfMachine (Adam.Elf.Writer).
+
+  LinkElfImage  one SectionSet (the program's parts and every unit's object
+                merged into it, Adam.Elf.Foreign) linked into an ET_EXEC's
+                bytes, in this order (PLAN-LINUX64 LX3a, the static part):
+    imports     each import's library found by BNF sec 2's search for ELF
+                (DoFindLibrary: in each library path in order, lib<name>.a
+                then <name>.a; a name ending in .a is that file; a name
+                holding a folder is EL0004, one found nowhere EL0003): a
+                static library, so the import is unbound and its routine
+                is a symbol of its name its objects define, the code reading
+                its address from a local slot (8 bytes in .got, an Abs64 of
+                the routine, as the COFF linker's local import); then the
+                program's @linklibrary libraries, the same search
+    archives    the C runtime's stand-ins bound first (CRuntimeFacts: a C
+                name no object defines yet defined where its runtime routine
+                is: atexit -> PlatformCAtExit), then the libraries' members
+                the program needs (Adam.Elf.Foreign, the libraries in
+                first-use order, then the C runtime's archives)
+    bounds      every Undefined __start_<g> / __stop_<g>, g a C identifier
+                an output section is named (adam_pdata, adam_xdata ...),
+                made the linker's: that output section's start / end; those
+                sections are roots of the removal
+    removal     SU2.7's link-time removal (Adam.Backend.Sections): every
+                section that is not Removable is kept, so is the entry's
+                and every bounded section not going with another; a kept
+                section keeps the sections that go with it and, unless it is
+                a Tombstone one, every Defined symbol's section its
+                relocations name; the rest is emptied
+    undefined   a symbol a kept section needs that nothing defines: 0 when
+                only weak references of the libraries reached it (the
+                gABI's undefined weak), else EL0002 at its declaration;
+                thread-local storage a kept section holds or reaches
+                (SecRel32) is EL0001 (LX3c)
+    layout      at the arch's image base (ADAM_ELF_LINKER_BASE), three
+                PT_LOAD segments, each page aligned and its file offset its
+                address less the base (so every offset matches its address
+                modulo the page): R (the ELF and program headers, then the
+                read-only output sections), RX (code, gaps filled with the
+                arch's CodeFill), RW (data, then the zeroed sections, which
+                take no file bytes); an empty one is left out; then
+                PT_GNU_STACK (RW: no executable stack). An output section is
+                every kept set section of one kind whose group name has the
+                same part before its first '$' (the order mark), laid where
+                its first one (id order) is, its sections by the part after
+                the mark (none: an init / fini array's "65536", after every
+                priority, GNU ld's order), then id, each at its alignment;
+                .eh_frame's pieces back to back (4-byte steps: a gap reads
+                as the list's end) and ended by a zero word. The program's
+                start list (ExeSettings' bounds group, the format's
+                StartListGroupOf(First / Last)): when the set holds that
+                group, its first section is laid, then the .preinit_array
+                and .init_array sections, then its others, so the entry's
+                RunStartList runs every start (a lib's, a C object's
+                constructor) after its own managed setup, as on win64, and
+                the image holds no init array for the loader to run
+                (PLAN-LINUX64 LX3a's check); else the arrays are output
+                sections of their own
+    relocations Rel32 S + A - (P + 4), Rva32 S + A - P (on ELF the field
+                holds its target relative to itself: Adam.Elf.Writer),
+                Abs64 S + A; a 32-bit value out of range is EL0005
+    file        the ELF header (ET_EXEC, entry the entry symbol), the
+                program headers, the segments' bytes, then .symtab (the kept
+                Defined symbols the program names: internal ones STB_LOCAL
+                first, then the others STB_GLOBAL; the link's own, whose
+                names hold '#', and an unbound import's slot, found by no
+                name, left out), .strtab, .shstrtab and the section header
+                table (one per output section, in address order)
+  Deterministic: every list in the set's id order; no time, no path.
+  The dynamic part (libc.so.6 imports: PLT / GOT, .interp, .dynamic, the
+  versions, Adam's _start) is LX3b; thread-local storage LX3c; a dll (.so)
+  LX6b: until then each is reported where the link needs it (EL0001).
+
+  Raised (a compiler bug): no sections, machine, diagnostics or settings; an
+  Info section handed to the link; an entry that is no symbol defined in
+  code; a symbol still an Import after the imports were bound; a Section or
+  SecRel32 relocation reaching the relocation step.
+*******************************************************************************/
+
+module unit Adam.Elf.Linker;
+
+import System.SysUtils, System.IO, Adam.Core.Common, Adam.Core.Containers, Adam.Core.Messages,
+  Adam.Compiler.SourceText, Adam.Compiler.Diagnostics, Adam.Compiler.AST, Adam.Backend.Sections,
+  Adam.Backend.Parts, Adam.Elf.Writer, Adam.Elf.Foreign, System.Elf;
+
+public const
+  // Reported (see the header)
+  ADAM_ERR_ELF_LINKER_001: string = "EL0001";   // a link the ELF linker does not make yet
+  ADAM_ERR_ELF_LINKER_002: string = "EL0002";   // a symbol nothing defines
+  ADAM_ERR_ELF_LINKER_003: string = "EL0003";   // a library found nowhere
+  ADAM_ERR_ELF_LINKER_004: string = "EL0004";   // a library named with a folder
+  ADAM_ERR_ELF_LINKER_005: string = "EL0005";   // a relocation that does not reach
+  // The image base of an ET_EXEC (GNU ld's x86_64 default, below 2 GB: a 32-bit
+  // absolute reference reaches it)
+  ADAM_ELF_LINKER_BASE: int64 = 0x400000;
+  // Raised (see the header)
+  ADAM_ELF_LINKER_FAULT_INPUT: string = "ELF linker: no sections, machine, diagnostics or settings";
+  ADAM_ELF_LINKER_FAULT_INFO: string = "ELF linker: an Info section handed to the link: ";
+  ADAM_ELF_LINKER_FAULT_ENTRY: string = "ELF linker: the entry is no symbol defined in code: ";
+  ADAM_ELF_LINKER_FAULT_IMPORT: string = "ELF linker: a symbol still an import: ";
+  ADAM_ELF_LINKER_FAULT_RELOC: string = "ELF linker: a relocation it cannot write: ";
+
+const
+  // The bound symbols' prefixes (GNU's)
+  ADAM_ELF_LINKER_START: string = "__start_";
+  ADAM_ELF_LINKER_STOP: string = "__stop_";
+  // A library's ending and its file name's prefix
+  ADAM_ELF_LINKER_LIB_PREFIX: string = "lib";
+  // The ELF64 record sizes (Elf64_Ehdr, Elf64_Phdr, Elf64_Shdr, Elf64_Sym)
+  ADAM_ELF_LINKER_EHDR: int64 = 64;
+  ADAM_ELF_LINKER_PHDR: int64 = 56;
+  ADAM_ELF_LINKER_SHDR: int64 = 64;
+  ADAM_ELF_LINKER_SYM: int64 = 24;
+  // The tables' alignment, PT_GNU_STACK's
+  ADAM_ELF_LINKER_TABLE_ALIGN: int64 = 8;
+  ADAM_ELF_LINKER_STACK_ALIGN: int64 = 16;
+  // The output tables' names
+  ADAM_ELF_LINKER_SYMTAB: string = ".symtab";
+  ADAM_ELF_LINKER_STRTAB: string = ".strtab";
+  ADAM_ELF_LINKER_SHSTRTAB: string = ".shstrtab";
+  // The order key of an init / fini array section with no priority
+  ADAM_ELF_LINKER_NO_PRIORITY: string = "65536";
+  // .eh_frame's step between pieces and its end word
+  ADAM_ELF_LINKER_EH_STEP: int64 = 4;
+  // Half a 32-bit field's span: a signed field holds -half .. half - 1
+  ADAM_ELF_LINKER_I32_HALF: int64 = 0x80000000;
+  // The segments (DoSegmentOf): headers + read-only, code, data, zeroed
+  ADAM_ELF_LINKER_SEG_READ: int64 = 0;
+  ADAM_ELF_LINKER_SEG_CODE: int64 = 1;
+  ADAM_ELF_LINKER_SEG_DATA: int64 = 2;
+  ADAM_ELF_LINKER_SEG_ZERO: int64 = 3;
+  ADAM_ELF_LINKER_SEG_COUNT: int64 = 4;
+
+type
+  // One output section: its name, kind, type, flags, alignment, address and size, its
+  // set sections in layout order, its section header index
+  ElfOutput = object
+    OutputName: string;
+    Kind: SectionKind;
+    ShType: int64;
+    Flags: int64;
+    Align: int64;
+    Address: int64;
+    Size: int64;
+    Members: ref Int64List;
+    Index: int64;
+
+    init(const AOutputName: string; const AKind: SectionKind);
+    begin
+      self.OutputName := AOutputName;
+      self.Kind := AKind;
+      self.ShType := int64(SHT_PROGBITS);
+      self.Flags := int64(SHF_ALLOC);
+      self.Align := 1;
+      self.Address := 0;
+      self.Size := 0;
+      self.Members := ref Int64List();
+      self.Index := 0;
+    end;
+  end;
+
+// The part of AGroup before its first order mark ('$'): its output section's name
+routine DoGroupKey(const AGroup: string): string;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(AGroup) - 1 do
+    if AGroup[LI] = '$' then
+      return Substring(AGroup, 0, LI);
+    end;
+  end;
+  return AGroup;
+end;
+
+// The part of AGroup after its first order mark (its place in its output section); an
+// init / fini array's with none is the no-priority key, any other's ""
+routine DoOrderKey(const AGroup: string): string;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(AGroup) - 1 do
+    if AGroup[LI] = '$' then
+      return Substring(AGroup, LI + 1, len(AGroup) - LI - 1);
+    end;
+  end;
+  if (AGroup = ADAM_ELF_FOREIGN_INIT_ARRAY) or (AGroup = ADAM_ELF_FOREIGN_FINI_ARRAY) then
+    return ADAM_ELF_LINKER_NO_PRIORITY;
+  end;
+  return "";
+end;
+
+// True when AName holds a folder (a '/', '\' or ':')
+routine DoHasFolder(const AName: string): bool;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(AName) - 1 do
+    if (AName[LI] = '/') or (AName[LI] = '\\') or (AName[LI] = ':') then
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+public type
+  // One link (see the header)
+  ElfLinker = object
+    hidden FSet: ref SectionSet;
+    hidden FMachine: ref ElfMachine;
+    hidden FEntry: string;
+    hidden FEntrySymbol: int64;
+    hidden FPaths: StringArray;
+    hidden FRuntime: ref CRuntimeFacts;
+    hidden FSettings: ref ExeSettings;
+    hidden FBoundsGroup: string;
+    hidden FTree: ref SyntaxTree;
+    hidden FDiagnostics: ref Diagnostics;
+    hidden FFailed: bool;
+    // The static libraries in first-use order with the node that first named each; a
+    // spelling found -> 1, a spelling that failed -> 1, a found file (lower case) -> 1
+    hidden FArchiveFiles: StringArray;
+    hidden FArchiveNodes: Int64Array;
+    hidden FFoundSpellings: ref StringIdMap;
+    hidden FFailedSpellings: ref StringIdMap;
+    hidden FFoundFiles: ref StringIdMap;
+    // The unbound imports' slot symbols (placed by DoSlots)
+    hidden FSlots: ref Int64List;
+    // The libraries' merge (nil: no library), what it says of weak references
+    hidden FForeign: ref ElfForeignLinker;
+    // Per set section: kept by the removal
+    hidden FLive: BoolArray;
+    // Per symbol: 1 a __start_ bound, 2 a __stop_ bound, 3 a weak zero (DoBounds, DoUndefined);
+    // a bound's output section's name
+    hidden FLinkerSymbol: Int64Array;
+    hidden FBoundOf: StringArray;
+    // The output sections, by key (kind and name) -> index + 1; per set section its output
+    // (-1 none) and address
+    hidden FOutputs: array of ref ElfOutput;
+    // The outputs in address order (the section header table's)
+    hidden FHeaderOrder: Int64Array;
+    hidden FOutputOf: ref StringIdMap;
+    hidden FSectionOutput: Int64Array;
+    hidden FSectionAddress: Int64Array;
+    // Per segment: its first and last output (-1 none), start and ends (file, memory)
+    hidden FSegmentStart: Int64Array;
+    hidden FSegmentFileEnd: Int64Array;
+    hidden FSegmentEnd: Int64Array;
+    hidden FPhnum: int64;
+    // The file: the loaded part's size, the tables after it, the bytes
+    hidden FLoadedSize: int64;
+    hidden FSymtab: ByteArray;
+    hidden FStrtab: ByteArray;
+    hidden FShstrtab: ByteArray;
+    hidden FFirstGlobal: int64;
+    hidden FBytes: ByteArray;
+
+    init(const ASet: ref SectionSet; const AMachine: ref ElfMachine; const AEntry: string;
+      const APaths: StringArray; const ARuntime: ref CRuntimeFacts; const ASettings: ref ExeSettings;
+      const ABoundsGroup: string; const ATree: ref SyntaxTree; const ADiagnostics: ref Diagnostics);
+    begin
+      self.FSet := ASet;
+      self.FMachine := AMachine;
+      self.FEntry := AEntry;
+      self.FEntrySymbol := 0;
+      self.FPaths := APaths;
+      self.FRuntime := ARuntime;
+      self.FSettings := ASettings;
+      self.FBoundsGroup := ABoundsGroup;
+      self.FTree := ATree;
+      self.FDiagnostics := ADiagnostics;
+      self.FFailed := false;
+      self.FFoundSpellings := ref StringIdMap(0);
+      self.FFailedSpellings := ref StringIdMap(0);
+      self.FFoundFiles := ref StringIdMap(0);
+      self.FSlots := ref Int64List();
+      self.FForeign := nil;
+      self.FOutputOf := ref StringIdMap(0);
+      self.FPhnum := 0;
+      self.FLoadedSize := 0;
+      self.FFirstGlobal := 0;
+    end;
+
+    // Where the AST node ANode is: NoPlace with no tree or no node
+    hidden const method DoPlace(const ANode: int64): SourcePlace;
+    begin
+      if (self.FTree = nil) or (ANode = 0) then
+        return NoPlace();
+      end;
+      return self.FTree[ANode].Place;
+    end;
+
+    // Reports ACode at ANode's place; the link has failed
+    hidden method DoReport(const ACode: string; const ANode: int64; const ATemplate: string;
+      const AArgs: MessageArgs);
+    begin
+      self.FDiagnostics.Add(Severity.Error, ACode, self.DoPlace(ANode), ATemplate, AArgs);
+      self.FFailed := true;
+    end;
+
+    // The file BNF sec 2's search finds for the library ASpelling (see the header); "" after
+    // EL0004 / EL0003 at ANode
+    hidden method DoFindLibrary(const ASpelling: string; const ANode: int64): string;
+    var
+      LCandidates: StringArray;
+      LFile: string;
+      LWhere: string;
+      LI: int64;
+      LJ: int64;
+    begin
+      if DoHasFolder(ASpelling) then
+        self.DoReport(ADAM_ERR_ELF_LINKER_004, ANode, ADAM_MSG_ELF_LINKER_PATH_NAME,
+          NoArgs().Str(ASpelling));
+        return "";
+      end;
+      if EndsStr(ADAM_EXT_AR, ASpelling) then
+        setlength(LCandidates, 1);
+        LCandidates[0] := ASpelling;
+      else
+        setlength(LCandidates, 2);
+        LCandidates[0] := ADAM_ELF_LINKER_LIB_PREFIX + ASpelling + ADAM_EXT_AR;
+        LCandidates[1] := ASpelling + ADAM_EXT_AR;
+      end;
+      for LI := 0 to len(self.FPaths) - 1 do
+        for LJ := 0 to len(LCandidates) - 1 do
+          LFile := ResolvePath(LCandidates[LJ], self.FPaths[LI]);
+          if FileExists(LFile) then
+            return LFile;
+          end;
+        end;
+      end;
+      LWhere := JoinStrings(self.FPaths, "; ");
+      if len(self.FPaths) = 0 then
+        LWhere := ADAM_MSG_ELF_LINKER_NO_PATHS;
+      end;
+      self.DoReport(ADAM_ERR_ELF_LINKER_003, ANode, ADAM_MSG_ELF_LINKER_NOT_FOUND,
+        NoArgs().Str(ASpelling).Str(JoinStrings(LCandidates, ", ")).Str(LWhere));
+      return "";
+    end;
+
+    // The library ASpelling (first named at ANode) found and recorded as a static library
+    // (each file once, in first-use order); false after its report (once per spelling)
+    hidden method DoLibrary(const ASpelling: string; const ANode: int64): bool;
+    var
+      LFile: string;
+      LIndex: int64;
+    begin
+      if self.FFoundSpellings.Find(ASpelling) <> 0 then
+        return true;
+      end;
+      if self.FFailedSpellings.Find(ASpelling) <> 0 then
+        return false;
+      end;
+      LFile := self.DoFindLibrary(ASpelling, ANode);
+      if LFile = "" then
+        self.FFailedSpellings.Put(ASpelling, 1);
+        return false;
+      end;
+      self.FFoundSpellings.Put(ASpelling, 1);
+      if self.FFoundFiles.Find(LowerCase(LFile)) = 0 then
+        self.FFoundFiles.Put(LowerCase(LFile), 1);
+        LIndex := len(self.FArchiveFiles);
+        setlength(self.FArchiveFiles, LIndex + 1);
+        setlength(self.FArchiveNodes, LIndex + 1);
+        self.FArchiveFiles[LIndex] := LFile;
+        self.FArchiveNodes[LIndex] := ANode;
+      end;
+      return true;
+    end;
+
+    // Every import's library found (a static one: the import unbound, its slot kept for
+    // DoSlots), then the program's @linklibrary libraries
+    hidden method DoImports();
+    var
+      LCount: int64;
+      LImport: ref SectionImport;
+      LSlot: int64;
+      LI: int64;
+    begin
+      // UnbindImport adds no import: the count is fixed
+      LCount := self.FSet.ImportCount;
+      for LI := 1 to LCount - 1 do
+        LImport := self.FSet.ImportAt(LI);
+        if self.DoLibrary(LImport.Library, LImport.Node) then
+          LSlot := LImport.Symbol;
+          self.FSet.UnbindImport(LI);
+          self.FSlots.Add(LSlot);
+        end;
+      end;
+      for LI := 0 to len(self.FSet.LinkLibraries) - 1 do
+        self.DoLibrary(self.FSet.LinkLibraries[LI], self.FSet.LinkLibraryNodes[LI]);
+      end;
+    end;
+
+    // The C runtime's stand-ins (see the header), before any library's member is pulled in
+    hidden method DoStandIns();
+    var
+      LStandIn: int64;
+      LName: int64;
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FRuntime.CNames) - 1 do
+        LStandIn := self.FSet.FindSymbol(self.FRuntime.StandIns[LI]);
+        LName := self.FSet.FindSymbol(self.FRuntime.CNames[LI]);
+        if (LStandIn <> 0) and (self.FSet.SymbolAt(LStandIn).Kind = SymbolKind.Defined) and
+          ((LName = 0) or (self.FSet.SymbolAt(LName).Kind <> SymbolKind.Defined)) then
+          self.FSet.DefineSymbol(self.FRuntime.CNames[LI], self.FSet.SymbolAt(LStandIn).SectionId,
+            self.FSet.SymbolAt(LStandIn).Offset, self.FSet.SymbolAt(LStandIn).Node);
+        end;
+      end;
+    end;
+
+    // The libraries' members the program needs merged into the set (see the header); false
+    // after their report
+    hidden method DoArchives(): bool;
+    var
+      LFile: string;
+      LNode: int64;
+      LI: int64;
+    begin
+      self.DoStandIns();
+      if len(self.FArchiveFiles) = 0 then
+        return true;
+      end;
+      self.FForeign := ref ElfForeignLinker(self.FSet, self.FMachine, self.FTree, self.FDiagnostics);
+      for LI := 0 to len(self.FArchiveFiles) - 1 do
+        if not self.FForeign.AddArchive(self.FArchiveFiles[LI], self.FArchiveNodes[LI]) then
+          self.FFailed := true;
+          return false;
+        end;
+      end;
+      LNode := self.FArchiveNodes[0];
+      for LI := 0 to len(self.FRuntime.Archives) - 1 do
+        LFile := self.DoFindLibrary(self.FRuntime.Archives[LI], LNode);
+        if LFile = "" then
+          return false;
+        end;
+        if self.FFoundFiles.Find(LowerCase(LFile)) = 0 then
+          self.FFoundFiles.Put(LowerCase(LFile), 1);
+          if not self.FForeign.AddArchive(LFile, LNode) then
+            self.FFailed := true;
+            return false;
+          end;
+        end;
+      end;
+      if not self.FForeign.Run() then
+        self.FFailed := true;
+        return false;
+      end;
+      return true;
+    end;
+
+    // Each unbound import's slot placed: 8 bytes of its own (a Removable .got section), an
+    // Abs64 of the routine its library's objects define
+    hidden method DoSlots();
+    var
+      LSlot: int64;
+      LImport: ref SectionImport;
+      LRoutine: int64;
+      LId: int64;
+      LI: int64;
+    begin
+      for LI := 0 to self.FSlots.Count - 1 do
+        LSlot := self.FSlots[LI];
+        LImport := self.FSet.ImportAt(self.DoImportOfSlot(LSlot));
+        LRoutine := self.FSet.FindSymbol(LImport.ImportName);
+        LId := self.FSet.AddSection(ADAM_ELF_FOREIGN_GOT_PREFIX + LImport.Library + "|" +
+          LImport.ImportName, SectionKind.Data, ADAM_ELF_LINKER_TABLE_ALIGN);
+        self.FSet.SectionAt(LId).GroupName := ADAM_ELF_FOREIGN_GOT;
+        self.FSet.SectionAt(LId).Removable := true;
+        self.FSet.SectionAt(LId).PutZeros(ADAM_ELF_LINKER_TABLE_ALIGN);
+        self.FSet.AddReloc(LId, 0, RelocKind.Abs64, LRoutine, 0);
+        self.FSet.PlaceSymbol(LSlot, LId, 0);
+      end;
+    end;
+
+    // The import whose slot symbol ASlot was (its symbol id is the import's Symbol)
+    hidden const method DoImportOfSlot(const ASlot: int64): int64;
+    var
+      LI: int64;
+    begin
+      for LI := 1 to self.FSet.ImportCount - 1 do
+        if self.FSet.ImportAt(LI).Symbol = ASlot then
+          return LI;
+        end;
+      end;
+      raise(ADAM_ELF_LINKER_FAULT_IMPORT + self.FSet.SymbolAt(ASlot).SymbolName);
+    end;
+
+    // The entry: a symbol defined in a code section; raises otherwise
+    hidden method DoEntry();
+    var
+      LId: int64;
+    begin
+      LId := self.FSet.FindSymbol(self.FEntry);
+      if (LId = 0) or (self.FSet.SymbolAt(LId).Kind <> SymbolKind.Defined) or
+        (self.FSet.SectionAt(self.FSet.SymbolAt(LId).SectionId).Kind <> SectionKind.Code) then
+        raise(ADAM_ELF_LINKER_FAULT_ENTRY + self.FEntry);
+      end;
+      self.FEntrySymbol := LId;
+    end;
+
+    // True when some section of the set has the output name AName
+    hidden const method DoHasOutputNamed(const AName: string): bool;
+    var
+      LId: int64;
+    begin
+      for LId := 1 to self.FSet.SectionCount - 1 do
+        if DoGroupKey(self.FSet.SectionAt(LId).GroupName) = AName then
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // Every Undefined __start_<g> / __stop_<g> of an output section g named as a C
+    // identifier made the linker's (see the header)
+    hidden method DoBounds();
+    var
+      LSymbol: ref SectionSymbol;
+      LName: string;
+      LId: int64;
+    begin
+      setlength(self.FLinkerSymbol, self.FSet.SymbolCount);
+      setlength(self.FBoundOf, self.FSet.SymbolCount);
+      for LId := 0 to self.FSet.SymbolCount - 1 do
+        self.FLinkerSymbol[LId] := 0;
+        self.FBoundOf[LId] := "";
+      end;
+      for LId := 1 to self.FSet.SymbolCount - 1 do
+        LSymbol := self.FSet.SymbolAt(LId);
+        if (LSymbol.Kind <> SymbolKind.Undefined) or LSymbol.GroupStart then
+          skip;
+        end;
+        LName := "";
+        if StartsStr(ADAM_ELF_LINKER_START, LSymbol.SymbolName) then
+          LName := Substring(LSymbol.SymbolName, len(ADAM_ELF_LINKER_START),
+            len(LSymbol.SymbolName) - len(ADAM_ELF_LINKER_START));
+          self.FLinkerSymbol[LId] := 1;
+        end;
+        if StartsStr(ADAM_ELF_LINKER_STOP, LSymbol.SymbolName) then
+          LName := Substring(LSymbol.SymbolName, len(ADAM_ELF_LINKER_STOP),
+            len(LSymbol.SymbolName) - len(ADAM_ELF_LINKER_STOP));
+          self.FLinkerSymbol[LId] := 2;
+        end;
+        if (LName = "") or (not ElfIsCIdentifier(LName)) or (not self.DoHasOutputNamed(LName)) then
+          self.FLinkerSymbol[LId] := 0;
+          skip;
+        end;
+        self.FBoundOf[LId] := LName;
+      end;
+    end;
+
+    // Section AId kept and put on the work stack, when it is not kept yet
+    hidden method DoKeep(const AId: int64; var AStack: Int64Array; var ATop: int64);
+    begin
+      if self.FLive[AId] then
+        return;
+      end;
+      self.FLive[AId] := true;
+      AStack[ATop] := AId;
+      ATop := ATop + 1;
+    end;
+
+    // Link-time removal (see the header); the removed and the Debug sections emptied
+    hidden method DoRemoveUnreached();
+    var
+      LCount: int64;
+      LStack: Int64Array;
+      LTop: int64;
+      LFirst: Int64Array;
+      LNext: Int64Array;
+      LBounded: ref StringIdMap;
+      LId: int64;
+      LChild: int64;
+      LR: int64;
+      LSection: ref Section;
+      LSymbol: ref SectionSymbol;
+    begin
+      LCount := self.FSet.SectionCount;
+      setlength(self.FLive, LCount);
+      setlength(LStack, LCount);
+      setlength(LFirst, LCount);
+      setlength(LNext, LCount);
+      for LId := 0 to LCount - 1 do
+        self.FLive[LId] := false;
+        LFirst[LId] := 0;
+        LNext[LId] := 0;
+      end;
+      // each section's associated ones as a list: LFirst[A] its first, LNext the next
+      for LId := 1 to LCount - 1 do
+        LChild := self.FSet.SectionAt(LId).Associate;
+        if LChild <> 0 then
+          LNext[LId] := LFirst[LChild];
+          LFirst[LChild] := LId;
+        end;
+      end;
+      LBounded := ref StringIdMap(0);
+      for LId := 1 to self.FSet.SymbolCount - 1 do
+        if self.FLinkerSymbol[LId] <> 0 then
+          LBounded.Put(self.FBoundOf[LId], 1);
+        end;
+      end;
+      LTop := 0;
+      for LId := 1 to LCount - 1 do
+        LSection := self.FSet.SectionAt(LId);
+        if (not LSection.Removable) or ((LSection.Associate = 0) and
+          (LBounded.Find(DoGroupKey(LSection.GroupName)) <> 0)) then
+          self.DoKeep(LId, LStack, LTop);
+        end;
+      end;
+      self.DoKeep(self.FSet.SymbolAt(self.FEntrySymbol).SectionId, LStack, LTop);
+      while LTop > 0 do
+        LTop := LTop - 1;
+        LId := LStack[LTop];
+        LChild := LFirst[LId];
+        while LChild <> 0 do
+          self.DoKeep(LChild, LStack, LTop);
+          LChild := LNext[LChild];
+        end;
+        LSection := self.FSet.SectionAt(LId);
+        if (not LSection.Tombstone) and (LSection.Kind <> SectionKind.Debug) then
+          for LR := 0 to LSection.RelocCount - 1 do
+            LSymbol := self.FSet.SymbolAt(LSection.RelocAt(LR).Symbol);
+            if LSymbol.Kind = SymbolKind.Defined then
+              self.DoKeep(LSymbol.SectionId, LStack, LTop);
+            end;
+          end;
+        end;
+      end;
+      for LId := 1 to LCount - 1 do
+        if (not self.FLive[LId]) or (self.FSet.SectionAt(LId).Kind = SectionKind.Debug) then
+          self.FLive[LId] := false;
+          self.FSet.SectionAt(LId).Remove();
+        end;
+      end;
+    end;
+
+    // What a kept section needs that the link cannot give (see the header): an undefined
+    // symbol (0 when only weak references reached it: FLinkerSymbol 3, else EL0002, once per
+    // symbol), thread-local storage (EL0001, once)
+    hidden method DoUndefined();
+    var
+      LReported: BoolArray;
+      LTls: bool;
+      LSection: ref Section;
+      LReloc: ref SectionReloc;
+      LSymbol: ref SectionSymbol;
+      LId: int64;
+      LR: int64;
+    begin
+      setlength(LReported, self.FSet.SymbolCount);
+      for LId := 0 to self.FSet.SymbolCount - 1 do
+        LReported[LId] := false;
+      end;
+      LTls := false;
+      for LId := 1 to self.FSet.SectionCount - 1 do
+        if not self.FLive[LId] then
+          skip;
+        end;
+        LSection := self.FSet.SectionAt(LId);
+        if LSection.Kind = SectionKind.ThreadLocal then
+          LTls := true;
+        end;
+        for LR := 0 to LSection.RelocCount - 1 do
+          LReloc := LSection.RelocAt(LR);
+          LSymbol := self.FSet.SymbolAt(LReloc.Symbol);
+          if LReloc.Kind = RelocKind.SecRel32 then
+            LTls := true;
+          end;
+          if LSymbol.Kind = SymbolKind.Import then
+            raise(ADAM_ELF_LINKER_FAULT_IMPORT + LSymbol.SymbolName);
+          end;
+          if (LSymbol.Kind <> SymbolKind.Undefined) or (self.FLinkerSymbol[LReloc.Symbol] <> 0) or
+            LReported[LReloc.Symbol] then
+            skip;
+          end;
+          if (self.FForeign <> nil) and self.FForeign.WeakOnly(LSymbol.SymbolName) then
+            self.FLinkerSymbol[LReloc.Symbol] := 3;
+            skip;
+          end;
+          LReported[LReloc.Symbol] := true;
+          self.DoReport(ADAM_ERR_ELF_LINKER_002, LSymbol.Node, ADAM_MSG_ELF_LINKER_UNDEFINED,
+            NoArgs().Str(LSymbol.SymbolName));
+        end;
+      end;
+      if LTls then
+        self.DoReport(ADAM_ERR_ELF_LINKER_001, 0, ADAM_MSG_ELF_LINKER_PENDING,
+          NoArgs().Str(ADAM_MSG_ELF_LINKER_WHAT_TLS).Str("LX3c"));
+      end;
+    end;
+
+    // The segment output sections of AKind go in
+    hidden const method DoSegmentOf(const AKind: SectionKind): int64;
+    begin
+      match AKind of
+        SectionKind.Code: return ADAM_ELF_LINKER_SEG_CODE;
+        SectionKind.Data: return ADAM_ELF_LINKER_SEG_DATA;
+        SectionKind.Zeroed: return ADAM_ELF_LINKER_SEG_ZERO;
+      else
+        return ADAM_ELF_LINKER_SEG_READ;
+      end;
+    end;
+
+    // The output named AName of AKind (made the first time, in that order); its index
+    hidden method DoOutput(const AName: string; const AKind: SectionKind): int64;
+    var
+      LKey: string;
+      LIndex: int64;
+      LOutput: ref ElfOutput;
+    begin
+      LKey := SectionKindText(AKind) + "|" + AName;
+      LIndex := self.FOutputOf.Find(LKey);
+      if LIndex <> 0 then
+        return LIndex - 1;
+      end;
+      LOutput := ref ElfOutput(AName, AKind);
+      match AKind of
+        SectionKind.Code: LOutput.Flags := int64(SHF_ALLOC) | int64(SHF_EXECINSTR);
+        SectionKind.Data: LOutput.Flags := int64(SHF_ALLOC) | int64(SHF_WRITE);
+        SectionKind.Zeroed:
+          LOutput.Flags := int64(SHF_ALLOC) | int64(SHF_WRITE);
+          LOutput.ShType := int64(SHT_NOBITS);
+      else
+        // read-only: SHF_ALLOC alone, as made
+        LOutput.Flags := int64(SHF_ALLOC);
+      end;
+      if AName = ADAM_ELF_FOREIGN_INIT_ARRAY then
+        LOutput.ShType := int64(SHT_INIT_ARRAY);
+      end;
+      if AName = ADAM_ELF_FOREIGN_FINI_ARRAY then
+        LOutput.ShType := int64(SHT_FINI_ARRAY);
+      end;
+      if AName = ADAM_ELF_FOREIGN_PREINIT_ARRAY then
+        LOutput.ShType := int64(SHT_PREINIT_ARRAY);
+      end;
+      LIndex := len(self.FOutputs);
+      setlength(self.FOutputs, LIndex + 1);
+      self.FOutputs[LIndex] := LOutput;
+      self.FOutputOf.Put(LKey, LIndex + 1);
+      return LIndex;
+    end;
+
+    // AMembers (set section ids, id order) sorted by their group's order key, then id
+    // (stable insertion: only an output with order marks has more than one key)
+    hidden method DoSortMembers(const AMembers: ref Int64List);
+    var
+      LKeys: StringArray;
+      LIds: Int64Array;
+      LKey: string;
+      LId: int64;
+      LI: int64;
+      LJ: int64;
+      LMarked: bool;
+    begin
+      LMarked := false;
+      setlength(LKeys, AMembers.Count);
+      setlength(LIds, AMembers.Count);
+      for LI := 0 to AMembers.Count - 1 do
+        LIds[LI] := AMembers[LI];
+        LKeys[LI] := DoOrderKey(self.FSet.SectionAt(AMembers[LI]).GroupName);
+        if LKeys[LI] <> "" then
+          LMarked := true;
+        end;
+      end;
+      if not LMarked then
+        return;
+      end;
+      for LI := 1 to len(LIds) - 1 do
+        LKey := LKeys[LI];
+        LId := LIds[LI];
+        LJ := LI - 1;
+        while (LJ >= 0) and (LKeys[LJ] > LKey) do
+          LKeys[LJ + 1] := LKeys[LJ];
+          LIds[LJ + 1] := LIds[LJ];
+          LJ := LJ - 1;
+        end;
+        LKeys[LJ + 1] := LKey;
+        LIds[LJ + 1] := LId;
+      end;
+      for LI := 0 to len(LIds) - 1 do
+        AMembers[LI] := LIds[LI];
+      end;
+    end;
+
+    // True when the group AGroup is a start array the entry's bounds take
+    hidden const method DoIsStartArray(const AGroup: string): bool;
+    var
+      LKey: string;
+    begin
+      LKey := DoGroupKey(AGroup);
+      return (LKey = ADAM_ELF_FOREIGN_INIT_ARRAY) or (LKey = ADAM_ELF_FOREIGN_PREINIT_ARRAY);
+    end;
+
+    // Every kept section put in its output (see the header): outputs in first-use order, the
+    // start arrays inside the bounds when the set has them
+    hidden method DoOutputs();
+    var
+      LBounds: int64;
+      LPreinit: ref Int64List;
+      LInit: ref Int64List;
+      LSection: ref Section;
+      LMembers: ref Int64List;
+      LOutput: int64;
+      LId: int64;
+      LI: int64;
+    begin
+      setlength(self.FSectionOutput, self.FSet.SectionCount);
+      for LId := 0 to self.FSet.SectionCount - 1 do
+        self.FSectionOutput[LId] := -1;
+      end;
+      LBounds := -1;
+      if self.FBoundsGroup <> "" then
+        for LId := 1 to self.FSet.SectionCount - 1 do
+          if self.FLive[LId] and (DoGroupKey(self.FSet.SectionAt(LId).GroupName) = self.FBoundsGroup) then
+            LBounds := self.DoOutput(self.FBoundsGroup, self.FSet.SectionAt(LId).Kind);
+            leave;
+          end;
+        end;
+      end;
+      LPreinit := ref Int64List();
+      LInit := ref Int64List();
+      for LId := 1 to self.FSet.SectionCount - 1 do
+        if not self.FLive[LId] then
+          skip;
+        end;
+        LSection := self.FSet.SectionAt(LId);
+        if (LBounds >= 0) and self.DoIsStartArray(LSection.GroupName) then
+          if DoGroupKey(LSection.GroupName) = ADAM_ELF_FOREIGN_PREINIT_ARRAY then
+            LPreinit.Add(LId);
+          else
+            LInit.Add(LId);
+          end;
+          self.FSectionOutput[LId] := LBounds;
+          skip;
+        end;
+        LOutput := self.DoOutput(DoGroupKey(LSection.GroupName), LSection.Kind);
+        self.FOutputs[LOutput].Members.Add(LId);
+        self.FSectionOutput[LId] := LOutput;
+      end;
+      for LI := 0 to len(self.FOutputs) - 1 do
+        self.DoSortMembers(self.FOutputs[LI].Members);
+      end;
+      if LBounds < 0 then
+        return;
+      end;
+      // the bounds' first section, the start arrays (preinit first), the bounds' others
+      self.DoSortMembers(LPreinit);
+      self.DoSortMembers(LInit);
+      LMembers := ref Int64List();
+      for LI := 0 to self.FOutputs[LBounds].Members.Count - 1 do
+        LMembers.Add(self.FOutputs[LBounds].Members[LI]);
+        if LI = 0 then
+          for LId := 0 to LPreinit.Count - 1 do
+            LMembers.Add(LPreinit[LId]);
+          end;
+          for LId := 0 to LInit.Count - 1 do
+            LMembers.Add(LInit[LId]);
+          end;
+        end;
+      end;
+      self.FOutputs[LBounds].Members := LMembers;
+    end;
+
+    // The headers' size: the ELF header and one program header per non-empty segment and
+    // PT_GNU_STACK
+    hidden method DoHeaders(): int64;
+    var
+      LUsed: BoolArray;
+      LS: int64;
+      LI: int64;
+    begin
+      setlength(LUsed, ADAM_ELF_LINKER_SEG_COUNT);
+      for LS := 0 to ADAM_ELF_LINKER_SEG_COUNT - 1 do
+        LUsed[LS] := false;
+      end;
+      // the read segment holds the headers: always there
+      LUsed[ADAM_ELF_LINKER_SEG_READ] := true;
+      for LI := 0 to len(self.FOutputs) - 1 do
+        LUsed[self.DoSegmentOf(self.FOutputs[LI].Kind)] := true;
+      end;
+      self.FPhnum := 1;
+      if LUsed[ADAM_ELF_LINKER_SEG_READ] then
+        self.FPhnum := self.FPhnum + 1;
+      end;
+      if LUsed[ADAM_ELF_LINKER_SEG_CODE] then
+        self.FPhnum := self.FPhnum + 1;
+      end;
+      // data and zeroed share the RW segment
+      if LUsed[ADAM_ELF_LINKER_SEG_DATA] or LUsed[ADAM_ELF_LINKER_SEG_ZERO] then
+        self.FPhnum := self.FPhnum + 1;
+      end;
+      return ADAM_ELF_LINKER_EHDR + self.FPhnum * ADAM_ELF_LINKER_PHDR;
+    end;
+
+    // The outputs of segment ASegment laid from AAt (an address): each output at its largest
+    // member's alignment, each member at its own (.eh_frame's in 4-byte steps, its end word
+    // after them); returns where the segment ends
+    hidden method DoLaySegment(const ASegment: int64; const AAt: int64): int64;
+    var
+      LOutput: ref ElfOutput;
+      LSection: ref Section;
+      LAt: int64;
+      LAlign: int64;
+      LEh: bool;
+      LI: int64;
+      LM: int64;
+    begin
+      LAt := AAt;
+      for LI := 0 to len(self.FOutputs) - 1 do
+        LOutput := self.FOutputs[LI];
+        if self.DoSegmentOf(LOutput.Kind) <> ASegment then
+          skip;
+        end;
+        LEh := LOutput.OutputName = ADAM_ELF_FOREIGN_EH_FRAME;
+        for LM := 0 to LOutput.Members.Count - 1 do
+          LAlign := self.FSet.SectionAt(LOutput.Members[LM]).Align;
+          if LAlign > LOutput.Align then
+            LOutput.Align := LAlign;
+          end;
+        end;
+        LAt := AlignUp(LAt, LOutput.Align);
+        LOutput.Address := LAt;
+        for LM := 0 to LOutput.Members.Count - 1 do
+          LSection := self.FSet.SectionAt(LOutput.Members[LM]);
+          LAlign := LSection.Align;
+          if LEh and (LM > 0) then
+            LAlign := ADAM_ELF_LINKER_EH_STEP;
+          end;
+          LAt := AlignUp(LAt, LAlign);
+          self.FSectionAddress[LOutput.Members[LM]] := LAt;
+          LAt := LAt + LSection.Size();
+        end;
+        if LEh then
+          LAt := AlignUp(LAt, ADAM_ELF_LINKER_EH_STEP) + ADAM_ELF_LINKER_EH_STEP;
+        end;
+        LOutput.Size := LAt - LOutput.Address;
+      end;
+      return LAt;
+    end;
+
+    // Every output and set section given its address (see the header); the start array
+    // sections inside the bounds took their output's place in DoOutputs
+    hidden method DoLayout();
+    var
+      LAt: int64;
+      LPage: int64;
+      LS: int64;
+      LId: int64;
+    begin
+      setlength(self.FSectionAddress, self.FSet.SectionCount);
+      for LId := 0 to self.FSet.SectionCount - 1 do
+        self.FSectionAddress[LId] := 0;
+      end;
+      setlength(self.FSegmentStart, ADAM_ELF_LINKER_SEG_COUNT);
+      setlength(self.FSegmentFileEnd, ADAM_ELF_LINKER_SEG_COUNT);
+      setlength(self.FSegmentEnd, ADAM_ELF_LINKER_SEG_COUNT);
+      LPage := self.FMachine.PageSize;
+      LAt := ADAM_ELF_LINKER_BASE + self.DoHeaders();
+      self.FSegmentStart[ADAM_ELF_LINKER_SEG_READ] := ADAM_ELF_LINKER_BASE;
+      LAt := self.DoLaySegment(ADAM_ELF_LINKER_SEG_READ, LAt);
+      self.FSegmentEnd[ADAM_ELF_LINKER_SEG_READ] := LAt;
+      for LS := ADAM_ELF_LINKER_SEG_CODE to ADAM_ELF_LINKER_SEG_ZERO do
+        // the zeroed sections follow the data in the same segment, no new page
+        if LS <> ADAM_ELF_LINKER_SEG_ZERO then
+          LAt := AlignUp(LAt, LPage);
+        end;
+        self.FSegmentStart[LS] := LAt;
+        LAt := self.DoLaySegment(LS, LAt);
+        self.FSegmentEnd[LS] := LAt;
+      end;
+      for LS := 0 to ADAM_ELF_LINKER_SEG_COUNT - 1 do
+        self.FSegmentFileEnd[LS] := self.FSegmentEnd[LS];
+      end;
+      // the zeroed sections take no file bytes
+      self.FSegmentFileEnd[ADAM_ELF_LINKER_SEG_ZERO] := self.FSegmentStart[ADAM_ELF_LINKER_SEG_ZERO];
+      self.FLoadedSize := self.FSegmentFileEnd[ADAM_ELF_LINKER_SEG_DATA] - ADAM_ELF_LINKER_BASE;
+      if self.FSegmentEnd[ADAM_ELF_LINKER_SEG_DATA] = self.FSegmentStart[ADAM_ELF_LINKER_SEG_DATA] then
+        self.FLoadedSize := self.FSegmentEnd[ADAM_ELF_LINKER_SEG_CODE] - ADAM_ELF_LINKER_BASE;
+      end;
+    end;
+
+    // The address of the set symbol AId (see the header)
+    hidden const method DoAddressOf(const AId: int64): int64;
+    var
+      LSymbol: ref SectionSymbol;
+      LKind: int64;
+      LI: int64;
+    begin
+      LKind := self.FLinkerSymbol[AId];
+      if LKind = 3 then
+        return 0;
+      end;
+      if (LKind = 1) or (LKind = 2) then
+        for LI := 0 to len(self.FOutputs) - 1 do
+          if self.FOutputs[LI].OutputName = self.FBoundOf[AId] then
+            if LKind = 1 then
+              return self.FOutputs[LI].Address;
+            end;
+            return self.FOutputs[LI].Address + self.FOutputs[LI].Size;
+          end;
+        end;
+        // a bounded group the removal emptied: its start and end are one place, 0
+        return 0;
+      end;
+      LSymbol := self.FSet.SymbolAt(AId);
+      return self.FSectionAddress[LSymbol.SectionId] + LSymbol.Offset;
+    end;
+
+    // The file's loaded part: the headers' room, each kept section's bytes at its address
+    // less the base, the code gaps filled
+    hidden method DoSectionBytes();
+    var
+      LOutput: ref ElfOutput;
+      LSection: ref Section;
+      LAt: int64;
+      LI: int64;
+      LK: int64;
+      LId: int64;
+    begin
+      setlength(self.FBytes, self.FLoadedSize);
+      for LK := 0 to self.FLoadedSize - 1 do
+        self.FBytes[LK] := 0;
+      end;
+      for LI := 0 to len(self.FOutputs) - 1 do
+        LOutput := self.FOutputs[LI];
+        if LOutput.Kind = SectionKind.Code then
+          for LK := 0 to LOutput.Size - 1 do
+            self.FBytes[LOutput.Address - ADAM_ELF_LINKER_BASE + LK] := uint8(self.FMachine.CodeFill);
+          end;
+        end;
+      end;
+      for LId := 1 to self.FSet.SectionCount - 1 do
+        LSection := self.FSet.SectionAt(LId);
+        if self.FLive[LId] and (LSection.Kind <> SectionKind.Zeroed) and (LSection.Size() > 0) then
+          LAt := self.FSectionAddress[LId] - ADAM_ELF_LINKER_BASE;
+          for LK := 0 to LSection.Size() - 1 do
+            self.FBytes[LAt + LK] := LSection.Bytes[LK];
+          end;
+        end;
+      end;
+    end;
+
+    // AValue into the 4 bytes at the address AAt when it fits a signed 32-bit field, else
+    // EL0005 for the relocation of ASection to ASymbol at AOffset
+    hidden method DoPut32(const AAt: int64; const AValue: int64; const ASection: ref Section;
+      const AOffset: int64; const ASymbol: int64);
+    begin
+      if (AValue < 0 - ADAM_ELF_LINKER_I32_HALF) or (AValue >= ADAM_ELF_LINKER_I32_HALF) then
+        self.DoReport(ADAM_ERR_ELF_LINKER_005, self.FSet.SymbolAt(ASymbol).Node,
+          ADAM_MSG_ELF_LINKER_REACH, NoArgs().Str(ASection.SectionName).Int(AOffset).Str(
+          self.FSet.SymbolAt(ASymbol).SymbolName).Int(AValue).Int(32));
+        return;
+      end;
+      PutLe(self.FBytes, AAt - ADAM_ELF_LINKER_BASE, uint64(AValue), 4);
+    end;
+
+    // Every kept section's relocations written (see the header)
+    hidden method DoRelocate();
+    var
+      LSection: ref Section;
+      LReloc: ref SectionReloc;
+      LPlace: int64;
+      LTarget: int64;
+      LId: int64;
+      LR: int64;
+    begin
+      for LId := 1 to self.FSet.SectionCount - 1 do
+        if not self.FLive[LId] then
+          skip;
+        end;
+        LSection := self.FSet.SectionAt(LId);
+        for LR := 0 to LSection.RelocCount - 1 do
+          LReloc := LSection.RelocAt(LR);
+          LPlace := self.FSectionAddress[LId] + LReloc.Offset;
+          LTarget := self.DoAddressOf(LReloc.Symbol) + LReloc.Addend;
+          match LReloc.Kind of
+            RelocKind.Rel32: self.DoPut32(LPlace, LTarget - (LPlace + 4), LSection, LReloc.Offset,
+              LReloc.Symbol);
+            RelocKind.Rva32: self.DoPut32(LPlace, LTarget - LPlace, LSection, LReloc.Offset,
+              LReloc.Symbol);
+            RelocKind.Abs64: PutLe(self.FBytes, LPlace - ADAM_ELF_LINKER_BASE, uint64(LTarget), 8);
+            RelocKind.SecRel32: raise(ADAM_ELF_LINKER_FAULT_RELOC + LSection.SectionName);
+            RelocKind.Section: raise(ADAM_ELF_LINKER_FAULT_RELOC + LSection.SectionName);
+          end;
+        end;
+      end;
+    end;
+
+    // AText and its NUL appended to the string table ATable; its offset there
+    hidden method DoString(var ATable: ByteArray; const AText: string): int64;
+    var
+      LAt: int64;
+      LI: int64;
+    begin
+      LAt := len(ATable);
+      setlength(ATable, LAt + len(AText) + 1);
+      for LI := 0 to len(AText) - 1 do
+        ATable[LAt + LI] := uint8(AText[LI]);
+      end;
+      ATable[LAt + len(AText)] := 0;
+      return LAt;
+    end;
+
+    // One .symtab record appended
+    hidden method DoSymbol(const AName: int64; const AInfo: int64; const AIndex: int64;
+      const AValue: int64);
+    var
+      LAt: int64;
+    begin
+      LAt := len(self.FSymtab);
+      setlength(self.FSymtab, LAt + ADAM_ELF_LINKER_SYM);
+      PutLe(self.FSymtab, LAt, uint64(AName), 4);
+      self.FSymtab[LAt + 4] := uint8(AInfo);
+      self.FSymtab[LAt + 5] := 0;
+      PutLe(self.FSymtab, LAt + 6, uint64(AIndex), 2);
+      PutLe(self.FSymtab, LAt + 8, uint64(AValue), 8);
+      PutLe(self.FSymtab, LAt + 16, 0, 8);
+    end;
+
+    // The kept Defined symbols the program names whose Internal is AInternal appended
+    // (see the header)
+    hidden method DoSymbolsOf(const AInternal: bool);
+    var
+      LSymbol: ref SectionSymbol;
+      LType: int64;
+      LBind: int64;
+      LId: int64;
+      LOutput: int64;
+    begin
+      for LId := 1 to self.FSet.SymbolCount - 1 do
+        LSymbol := self.FSet.SymbolAt(LId);
+        if (LSymbol.Kind <> SymbolKind.Defined) or (LSymbol.Internal <> AInternal) or
+          (not self.FLive[LSymbol.SectionId]) or (IndexOf(ADAM_ELF_FOREIGN_MARK, LSymbol.SymbolName, 0) >= 0) or
+          (self.FSet.FindSymbol(LSymbol.SymbolName) <> LId) then
+          skip;
+        end;
+        LOutput := self.FSectionOutput[LSymbol.SectionId];
+        LType := int64(STT_OBJECT);
+        if self.FSet.SectionAt(LSymbol.SectionId).Kind = SectionKind.Code then
+          LType := int64(STT_FUNC);
+        end;
+        LBind := int64(STB_GLOBAL);
+        if AInternal then
+          LBind := int64(STB_LOCAL);
+        end;
+        self.DoSymbol(self.DoString(self.FStrtab, LSymbol.SymbolName), (LBind shl 4) | LType,
+          self.FOutputs[LOutput].Index, self.DoAddressOf(LId));
+      end;
+    end;
+
+    // The non-loaded tables: the output sections' header indexes, .shstrtab's names,
+    // .symtab / .strtab
+    hidden method DoTables();
+    var
+      LCount: int64;
+      LS: int64;
+      LI: int64;
+    begin
+      setlength(self.FShstrtab, 0);
+      self.DoString(self.FShstrtab, "");
+      setlength(self.FStrtab, 0);
+      self.DoString(self.FStrtab, "");
+      // the outputs by segment, each segment's in its layout order: address order
+      setlength(self.FHeaderOrder, len(self.FOutputs));
+      LCount := 0;
+      for LS := 0 to ADAM_ELF_LINKER_SEG_COUNT - 1 do
+        for LI := 0 to len(self.FOutputs) - 1 do
+          if self.DoSegmentOf(self.FOutputs[LI].Kind) = LS then
+            self.FHeaderOrder[LCount] := LI;
+            LCount := LCount + 1;
+            self.FOutputs[LI].Index := LCount;
+          end;
+        end;
+      end;
+      setlength(self.FSymtab, 0);
+      self.DoSymbol(0, 0, 0, 0);
+      self.DoSymbolsOf(true);
+      self.FFirstGlobal := len(self.FSymtab) div ADAM_ELF_LINKER_SYM;
+      self.DoSymbolsOf(false);
+    end;
+
+    // AValue into the ACount bytes at file offset AAt of the image
+    hidden method DoPut(const AAt: int64; const AValue: int64; const ACount: int64);
+    begin
+      PutLe(self.FBytes, AAt, uint64(AValue), ACount);
+    end;
+
+    // ABytes appended to the image at AAt (its size already made)
+    hidden method DoCopy(const AAt: int64; const ABytes: ByteArray);
+    begin
+      if len(ABytes) > 0 then
+        CopyBytes(addr of self.FBytes[AAt], addr of ABytes[0], len(ABytes));
+      end;
+    end;
+
+    // One program header at file offset AAt for the segment from AStart to AFileEnd / AEnd
+    hidden method DoProgramHeader(const AAt: int64; const AType: int64; const AFlags: int64;
+      const AStart: int64; const AFileEnd: int64; const AEnd: int64; const AAlign: int64);
+    begin
+      self.DoPut(AAt, AType, 4);
+      self.DoPut(AAt + 4, AFlags, 4);
+      self.DoPut(AAt + 8, AStart - ADAM_ELF_LINKER_BASE, 8);
+      self.DoPut(AAt + 16, AStart, 8);
+      self.DoPut(AAt + 24, AStart, 8);
+      self.DoPut(AAt + 32, AFileEnd - AStart, 8);
+      self.DoPut(AAt + 40, AEnd - AStart, 8);
+      self.DoPut(AAt + 48, AAlign, 8);
+    end;
+
+    // One section header at file offset AAt
+    hidden method DoSectionHeader(const AAt: int64; const AName: int64; const AType: int64;
+      const AFlags: int64; const AAddress: int64; const AOffset: int64; const ASize: int64;
+      const ALink: int64; const AInfo: int64; const AAlign: int64; const AEntry: int64);
+    begin
+      self.DoPut(AAt, AName, 4);
+      self.DoPut(AAt + 4, AType, 4);
+      self.DoPut(AAt + 8, AFlags, 8);
+      self.DoPut(AAt + 16, AAddress, 8);
+      self.DoPut(AAt + 24, AOffset, 8);
+      self.DoPut(AAt + 32, ASize, 8);
+      self.DoPut(AAt + 40, ALink, 4);
+      self.DoPut(AAt + 44, AInfo, 4);
+      self.DoPut(AAt + 48, AAlign, 8);
+      self.DoPut(AAt + 56, AEntry, 8);
+    end;
+
+    // The file whole (see the header): the headers into the loaded part's room, the tables
+    // and the section header table after it
+    hidden method DoWrite();
+    var
+      LOutput: ref ElfOutput;
+      LNames: Int64Array;
+      LSymtabAt: int64;
+      LStrtabAt: int64;
+      LShstrtabAt: int64;
+      LShoff: int64;
+      LShnum: int64;
+      LSymtabName: int64;
+      LStrtabName: int64;
+      LShstrtabName: int64;
+      LAt: int64;
+      LOffset: int64;
+      LI: int64;
+    begin
+      self.DoTables();
+      setlength(LNames, len(self.FOutputs));
+      for LI := 0 to len(self.FOutputs) - 1 do
+        LNames[LI] := self.DoString(self.FShstrtab, self.FOutputs[self.FHeaderOrder[LI]].OutputName);
+      end;
+      LSymtabName := self.DoString(self.FShstrtab, ADAM_ELF_LINKER_SYMTAB);
+      LStrtabName := self.DoString(self.FShstrtab, ADAM_ELF_LINKER_STRTAB);
+      LShstrtabName := self.DoString(self.FShstrtab, ADAM_ELF_LINKER_SHSTRTAB);
+      LSymtabAt := AlignUp(self.FLoadedSize, ADAM_ELF_LINKER_TABLE_ALIGN);
+      LStrtabAt := LSymtabAt + len(self.FSymtab);
+      LShstrtabAt := LStrtabAt + len(self.FStrtab);
+      LShoff := AlignUp(LShstrtabAt + len(self.FShstrtab), ADAM_ELF_LINKER_TABLE_ALIGN);
+      // null, the outputs, .symtab, .strtab, .shstrtab
+      LShnum := len(self.FOutputs) + 4;
+      setlength(self.FBytes, LShoff + LShnum * ADAM_ELF_LINKER_SHDR);
+      for LAt := self.FLoadedSize to len(self.FBytes) - 1 do
+        self.FBytes[LAt] := 0;
+      end;
+      self.DoCopy(LSymtabAt, self.FSymtab);
+      self.DoCopy(LStrtabAt, self.FStrtab);
+      self.DoCopy(LShstrtabAt, self.FShstrtab);
+      // the ELF header
+      self.FBytes[0] := ELFMAG0;
+      self.FBytes[1] := ELFMAG1;
+      self.FBytes[2] := ELFMAG2;
+      self.FBytes[3] := ELFMAG3;
+      self.FBytes[EI_CLASS] := ELFCLASS64;
+      self.FBytes[EI_DATA] := ELFDATA2LSB;
+      self.FBytes[EI_VERSION] := uint8(EV_CURRENT);
+      self.FBytes[EI_OSABI] := ELFOSABI_SYSV;
+      self.DoPut(16, int64(ET_EXEC), 2);
+      self.DoPut(18, self.FMachine.Machine, 2);
+      self.DoPut(20, int64(EV_CURRENT), 4);
+      self.DoPut(24, self.DoAddressOf(self.FEntrySymbol), 8);
+      self.DoPut(32, ADAM_ELF_LINKER_EHDR, 8);
+      self.DoPut(40, LShoff, 8);
+      self.DoPut(48, 0, 4);
+      self.DoPut(52, ADAM_ELF_LINKER_EHDR, 2);
+      self.DoPut(54, ADAM_ELF_LINKER_PHDR, 2);
+      self.DoPut(56, self.FPhnum, 2);
+      self.DoPut(58, ADAM_ELF_LINKER_SHDR, 2);
+      self.DoPut(60, LShnum, 2);
+      self.DoPut(62, LShnum - 1, 2);
+      // the program headers: R, RX, RW (when not empty), then PT_GNU_STACK
+      LAt := ADAM_ELF_LINKER_EHDR;
+      self.DoProgramHeader(LAt, int64(PT_LOAD), int64(PF_R), self.FSegmentStart[ADAM_ELF_LINKER_SEG_READ],
+        self.FSegmentEnd[ADAM_ELF_LINKER_SEG_READ], self.FSegmentEnd[ADAM_ELF_LINKER_SEG_READ],
+        self.FMachine.PageSize);
+      LAt := LAt + ADAM_ELF_LINKER_PHDR;
+      if self.FSegmentEnd[ADAM_ELF_LINKER_SEG_CODE] > self.FSegmentStart[ADAM_ELF_LINKER_SEG_CODE] then
+        self.DoProgramHeader(LAt, int64(PT_LOAD), int64(PF_R) | int64(PF_X),
+          self.FSegmentStart[ADAM_ELF_LINKER_SEG_CODE], self.FSegmentEnd[ADAM_ELF_LINKER_SEG_CODE],
+          self.FSegmentEnd[ADAM_ELF_LINKER_SEG_CODE], self.FMachine.PageSize);
+        LAt := LAt + ADAM_ELF_LINKER_PHDR;
+      end;
+      if self.FSegmentEnd[ADAM_ELF_LINKER_SEG_ZERO] > self.FSegmentStart[ADAM_ELF_LINKER_SEG_DATA] then
+        self.DoProgramHeader(LAt, int64(PT_LOAD), int64(PF_R) | int64(PF_W),
+          self.FSegmentStart[ADAM_ELF_LINKER_SEG_DATA], self.FSegmentEnd[ADAM_ELF_LINKER_SEG_DATA],
+          self.FSegmentEnd[ADAM_ELF_LINKER_SEG_ZERO], self.FMachine.PageSize);
+        LAt := LAt + ADAM_ELF_LINKER_PHDR;
+      end;
+      self.DoProgramHeader(LAt, int64(PT_GNU_STACK), int64(PF_R) | int64(PF_W), ADAM_ELF_LINKER_BASE,
+        ADAM_ELF_LINKER_BASE, ADAM_ELF_LINKER_BASE, ADAM_ELF_LINKER_STACK_ALIGN);
+      // PT_GNU_STACK names no place: offset and addresses 0
+      self.DoPut(LAt + 8, 0, 8);
+      self.DoPut(LAt + 16, 0, 8);
+      self.DoPut(LAt + 24, 0, 8);
+      // the section headers
+      LAt := LShoff + ADAM_ELF_LINKER_SHDR;
+      for LI := 0 to len(self.FOutputs) - 1 do
+        LOutput := self.FOutputs[self.FHeaderOrder[LI]];
+        LOffset := LOutput.Address - ADAM_ELF_LINKER_BASE;
+        self.DoSectionHeader(LAt, LNames[LI], LOutput.ShType, LOutput.Flags, LOutput.Address, LOffset,
+          LOutput.Size, 0, 0, LOutput.Align, 0);
+        LAt := LAt + ADAM_ELF_LINKER_SHDR;
+      end;
+      self.DoSectionHeader(LAt, LSymtabName, int64(SHT_SYMTAB), 0, 0, LSymtabAt, len(self.FSymtab),
+        LShnum - 2, self.FFirstGlobal, ADAM_ELF_LINKER_TABLE_ALIGN, ADAM_ELF_LINKER_SYM);
+      LAt := LAt + ADAM_ELF_LINKER_SHDR;
+      self.DoSectionHeader(LAt, LStrtabName, int64(SHT_STRTAB), 0, 0, LStrtabAt, len(self.FStrtab),
+        0, 0, 1, 0);
+      LAt := LAt + ADAM_ELF_LINKER_SHDR;
+      self.DoSectionHeader(LAt, LShstrtabName, int64(SHT_STRTAB), 0, 0, LShstrtabAt,
+        len(self.FShstrtab), 0, 0, 1, 0);
+    end;
+
+    // The link (see the header); empty after a report
+    method Run(): ByteArray;
+    var
+      LNone: ByteArray;
+    begin
+      setlength(LNone, 0);
+      if self.FSettings.Dll then
+        self.DoReport(ADAM_ERR_ELF_LINKER_001, 0, ADAM_MSG_ELF_LINKER_PENDING,
+          NoArgs().Str(ADAM_MSG_ELF_LINKER_WHAT_SHARED).Str("LX6b"));
+        return LNone;
+      end;
+      self.DoImports();
+      // after a library's report its symbols would only repeat it as EL0002
+      if self.FFailed or (not self.DoArchives()) then
+        return LNone;
+      end;
+      self.DoSlots();
+      self.DoEntry();
+      self.DoBounds();
+      self.DoRemoveUnreached();
+      self.DoUndefined();
+      if self.FFailed then
+        return LNone;
+      end;
+      self.DoOutputs();
+      self.DoLayout();
+      self.DoSectionBytes();
+      self.DoRelocate();
+      if self.FFailed then
+        return LNone;
+      end;
+      self.DoWrite();
+      return self.FBytes;
+    end;
+  end;
+
+// ASections linked into an ELF64 executable for AMachine (see the header), entered at the
+// symbol AEntry, its imports' libraries searched in ALibraryPaths, a static library's
+// objects linked against ARuntime (the ABI's C runtime), ABoundsGroup the program's start
+// list bounds' group ("" none), reports at ATree's nodes into ADiagnostics; empty after a
+// report
+public routine LinkElfImage(const ASections: ref SectionSet; const AMachine: ref ElfMachine;
+  const AEntry: string; const ALibraryPaths: StringArray; const ARuntime: ref CRuntimeFacts;
+  const ASettings: ref ExeSettings; const ABoundsGroup: string; const ATree: ref SyntaxTree;
+  const ADiagnostics: ref Diagnostics): ByteArray;
+var
+  LLinker: ref ElfLinker;
+  LId: int64;
+begin
+  if (ASections = nil) or (AMachine = nil) or (ADiagnostics = nil) or (ARuntime = nil) or
+    (ASettings = nil) then
+    raise(ADAM_ELF_LINKER_FAULT_INPUT);
+  end;
+  // an Info section is an object file's alone (Adam.Acu.*), never an image's
+  for LId := 1 to ASections.SectionCount - 1 do
+    if ASections.SectionAt(LId).Kind = SectionKind.Info then
+      raise(ADAM_ELF_LINKER_FAULT_INFO + ASections.SectionAt(LId).SectionName);
+    end;
+  end;
+  LLinker := ref ElfLinker(ASections, AMachine, AEntry, ALibraryPaths, ARuntime, ASettings,
+    ABoundsGroup, ATree, ADiagnostics);
+  return LLinker.Run();
+end;
+
+end.
