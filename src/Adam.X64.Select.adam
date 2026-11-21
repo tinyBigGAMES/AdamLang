@@ -93,6 +93,10 @@ public const
   ADAM_X64_SELECT_FAULT_NO_TARGET: string = "X64 select: no block of this function: b";
   ADAM_X64_SELECT_FAULT_PARENT: string =
     "X64 select: a value of another function that is no slot of a funclet's laid out parent: i";
+  ADAM_X64_SELECT_FAULT_PIECE: string = "X64 select: an aggregate piece the ABI cannot give: ";
+  // The most bytes an aggregate copied to the stack moves through a register, 8 at a time;
+  // a bigger one moves by rep movsb
+  ADAM_X64_SELECT_MOVE_INLINE: int64 = 64;
   // The register a shift's count is in (the SDM's shl / shr / sar r/m, cl)
   ADAM_X64_SELECT_SHIFT_COUNT: string = "rcx";
   // A float32's / float64's sign bit, the mask a negation xors in (IEEE 754: -0.0 from
@@ -1287,6 +1291,10 @@ type
         end;
         return;
       end;
+      if LKind = IrOp.Parameter then
+        // an aggregate's slot is written as a slot (DoParameters), never read as a value
+        return;
+      end;
       if (LKind = IrOp.Call) or (LKind = IrOp.CallExternal) or (LKind = IrOp.CallIndirect) then
         LFirst := 0;
         if LKind = IrOp.CallIndirect then
@@ -1468,13 +1476,18 @@ type
     end;
 
     // Each parameter copied out of its register or its incoming place, at the start of the
-    // entry block (after a variadic function's homes: DoHomes)
+    // entry block (after a variadic function's homes: DoHomes). An aggregate's (its
+    // Parameter's slot operand, IrSignature) is the address of its bytes: its pieces stored
+    // into that slot, or a result place the ABI does not pass that slot itself, or its bytes'
+    // incoming place, else (the address of a copy, a result place passed) the address given
     hidden method DoParameters();
     var
       LInstrs: ref Int64List;
       LInstr: ref IrInstr;
       LPlace: ref Location;
+      LSlot: ref MachineOperand;
       LJ: int64;
+      LK: int64;
       LId: int64;
     begin
       self.DoHomes();
@@ -1482,6 +1495,26 @@ type
       for LJ := 0 to LInstrs.Count - 1 do
         LId := LInstrs[LJ];
         LInstr := self.FModule.InstrAt(LId);
+        if (LInstr.Kind = IrOp.Parameter) and (LInstr.Operands.Count > 0) then
+          LPlace := self.FOwnLayout.ArgAt(LInstr.Imm);
+          LSlot := SlotMemory(self.FSlotOf.Find(LInstr.Operands[0]), 0);
+          if LPlace.Kind = LocationKind.Pieces then
+            for LK := 0 to LPlace.PieceCount - 1 do
+              self.DoStorePiece(LSlot, LPlace.PieceOffset(LK),
+                PhysicalOperand(self.DoPhysical(LPlace.PieceRegister(LK))), LPlace.PieceBytes(LK),
+                LPlace.PieceFloat(LK), LInstr.Node);
+            end;
+          end;
+          if (LPlace.Kind = LocationKind.Pieces) or (LPlace.Kind = LocationKind.None) then
+            self.DoEmitPair(X64Op.Lea, DoWidth(IrType.Pointer, LId), self.DoVReg(LId), LSlot, LInstr.Node);
+            skip;
+          end;
+          if (LPlace.Kind = LocationKind.Stack) and (LPlace.Bytes > 0) then
+            self.DoEmitPair(X64Op.Lea, DoWidth(IrType.Pointer, LId), self.DoVReg(LId),
+              IncomingMemory(LPlace.EntryOffset), LInstr.Node);
+            skip;
+          end;
+        end;
         if LInstr.Kind = IrOp.Parameter then
           LPlace := self.FOwnLayout.ArgAt(LInstr.Imm);
           if LPlace.Kind = LocationKind.Register then
@@ -1496,6 +1529,184 @@ type
       if self.FFunction.Parent <> 0 then
         self.DoFrameBase();
       end;
+    end;
+
+    // AMemory (a register, slot, incoming or outgoing base, no index) AExtra bytes on
+    hidden method DoMemoryPlus(const AMemory: ref MachineOperand; const AExtra: int64): ref MachineOperand;
+    begin
+      if AMemory.Base = MemoryBase.Register then
+        return RegisterMemory(AMemory.Reg, AMemory.BaseVirtual, AMemory.Disp + AExtra);
+      end;
+      if AMemory.Base = MemoryBase.Slot then
+        return SlotMemory(AMemory.SlotIndex, AMemory.Disp + AExtra);
+      end;
+      if AMemory.Base = MemoryBase.Incoming then
+        return IncomingMemory(AMemory.Disp + AExtra);
+      end;
+      if AMemory.Base = MemoryBase.Outgoing then
+        return OutgoingMemory(AMemory.Disp + AExtra);
+      end;
+      raise(ADAM_X64_SELECT_FAULT_PIECE + "a memory base");
+    end;
+
+    // The bytes of the next part of an odd piece AFrom bytes into one of ABytes: 4, 2 or 1,
+    // the most that fit
+    hidden const method DoPartBytes(const AFrom: int64; const ABytes: int64): int64;
+    begin
+      if ABytes - AFrom >= 4 then
+        return 4;
+      end;
+      if ABytes - AFrom >= 2 then
+        return 2;
+      end;
+      return 1;
+    end;
+
+    // A part of 1, 2 or 4 bytes at AMemory loaded zero-extended into the register ADest
+    hidden method DoLoadPart(const ADest: ref MachineOperand; const AMemory: ref MachineOperand;
+      const ABytes: int64; const ANode: int64);
+    begin
+      if ABytes = 1 then
+        self.DoEmitPair(X64Op.MovZX8, 4, ADest, AMemory, ANode);
+        return;
+      end;
+      if ABytes = 2 then
+        self.DoEmitPair(X64Op.MovZX16, 4, ADest, AMemory, ANode);
+        return;
+      end;
+      self.DoEmitPair(X64Op.Mov, 4, ADest, AMemory, ANode);
+    end;
+
+    // An aggregate piece (Location.Pieces, LX1a2) of ABytes at AOffset from AMemory into the
+    // register ADest: a float's (4 or 8 bytes) by movss / movsd; an integer's of 1, 2, 4 or 8
+    // bytes by one zero-extending load; any other (3, 5, 6, 7: the last eightbyte of an
+    // aggregate) by parts of 4, 2, 1 bytes, each next one shifted to its place and or'ed in
+    // (never a load past the aggregate's last byte)
+    hidden method DoLoadPiece(const ADest: ref MachineOperand; const AMemory: ref MachineOperand;
+      const AOffset: int64; const ABytes: int64; const AFloat: bool; const ANode: int64);
+    var
+      LTemp: ref MachineOperand;
+      LDone: int64;
+      LPart: int64;
+    begin
+      if AFloat then
+        if ABytes = 4 then
+          self.DoEmitPair(X64Op.MovSS, 0, ADest, self.DoMemoryPlus(AMemory, AOffset), ANode);
+          return;
+        end;
+        if ABytes = 8 then
+          self.DoEmitPair(X64Op.MovSD, 0, ADest, self.DoMemoryPlus(AMemory, AOffset), ANode);
+          return;
+        end;
+        raise(ADAM_X64_SELECT_FAULT_PIECE + "a float piece of " + IntToStr(ABytes) + " bytes");
+      end;
+      if ABytes = 8 then
+        self.DoEmitPair(X64Op.Mov, 8, ADest, self.DoMemoryPlus(AMemory, AOffset), ANode);
+        return;
+      end;
+      LPart := self.DoPartBytes(0, ABytes);
+      self.DoLoadPart(ADest, self.DoMemoryPlus(AMemory, AOffset), LPart, ANode);
+      LDone := LPart;
+      while LDone < ABytes do
+        LPart := self.DoPartBytes(LDone, ABytes);
+        LTemp := VirtualOperand(self.FMachine.NewVReg(RegClass.General));
+        self.DoLoadPart(LTemp, self.DoMemoryPlus(AMemory, AOffset + LDone), LPart, ANode);
+        self.DoEmitPair(X64Op.Shl, 8, LTemp, ImmediateOperand(LDone * 8), ANode);
+        self.DoEmitPair(X64Op.BitOr, 8, ADest, LTemp, ANode);
+        LDone := LDone + LPart;
+      end;
+    end;
+
+    // The register ASource (an aggregate piece, DoLoadPiece's forms) stored as ABytes at
+    // AOffset from AMemory: a float's by movss / movsd, an integer's of 1, 2, 4 or 8 bytes by
+    // one store, any other by parts of 4, 2, 1 bytes from a copy shifted down after each
+    hidden method DoStorePiece(const AMemory: ref MachineOperand; const AOffset: int64;
+      const ASource: ref MachineOperand; const ABytes: int64; const AFloat: bool; const ANode: int64);
+    var
+      LTemp: ref MachineOperand;
+      LDone: int64;
+      LPart: int64;
+    begin
+      if AFloat then
+        if ABytes = 4 then
+          self.DoEmitPair(X64Op.MovSS, 0, self.DoMemoryPlus(AMemory, AOffset), ASource, ANode);
+          return;
+        end;
+        if ABytes = 8 then
+          self.DoEmitPair(X64Op.MovSD, 0, self.DoMemoryPlus(AMemory, AOffset), ASource, ANode);
+          return;
+        end;
+        raise(ADAM_X64_SELECT_FAULT_PIECE + "a float piece of " + IntToStr(ABytes) + " bytes");
+      end;
+      if (ABytes = 1) or (ABytes = 2) or (ABytes = 4) or (ABytes = 8) then
+        self.DoEmitPair(X64Op.Mov, ABytes, self.DoMemoryPlus(AMemory, AOffset), ASource, ANode);
+        return;
+      end;
+      LTemp := VirtualOperand(self.FMachine.NewVReg(RegClass.General));
+      self.DoEmitPair(X64Op.Mov, 8, LTemp, ASource, ANode);
+      LDone := 0;
+      while LDone < ABytes do
+        LPart := self.DoPartBytes(LDone, ABytes);
+        self.DoEmitPair(X64Op.Mov, LPart, self.DoMemoryPlus(AMemory, AOffset + LDone), LTemp, ANode);
+        self.DoEmitPair(X64Op.Shr, 8, LTemp, ImmediateOperand(LPart * 8), ANode);
+        LDone := LDone + LPart;
+      end;
+    end;
+
+    // ABytes copied from ASource to ADest (memory operands, DoMemoryPlus's bases): through a
+    // general register 8, 4, 2, 1 bytes at a time up to ADAM_X64_SELECT_MOVE_INLINE bytes,
+    // else by rep movsb (DoBytes' registers, implicit as there)
+    hidden method DoMoveBytes(const ADest: ref MachineOperand; const ASource: ref MachineOperand;
+      const ABytes: int64; const ANode: int64);
+    var
+      LTemp: ref MachineOperand;
+      LInstr: ref MachineInstr;
+      LDest: int64;
+      LSource: int64;
+      LCount: int64;
+      LDone: int64;
+      LPart: int64;
+    begin
+      if ABytes > ADAM_X64_SELECT_MOVE_INLINE then
+        LDest := self.DoPhysical(ADAM_X64_SELECT_STRING_DEST);
+        LSource := self.DoPhysical(ADAM_X64_SELECT_STRING_SOURCE);
+        LCount := self.DoPhysical(ADAM_X64_SELECT_STRING_COUNT);
+        self.DoEmitPair(X64Op.Lea, 8, PhysicalOperand(LSource), ASource, ANode);
+        self.DoEmitPair(X64Op.Lea, 8, PhysicalOperand(LDest), ADest, ANode);
+        self.DoEmitPair(X64Op.Mov, 8, PhysicalOperand(LCount), ImmediateOperand(ABytes), ANode);
+        LInstr := self.DoEmit(X64Op.RepMovsb, 0, ANode);
+        LInstr.ImplicitUses.Add(LDest);
+        LInstr.ImplicitUses.Add(LSource);
+        LInstr.ImplicitUses.Add(LCount);
+        LInstr.ImplicitDefs.Add(LDest);
+        LInstr.ImplicitDefs.Add(LSource);
+        LInstr.ImplicitDefs.Add(LCount);
+        return;
+      end;
+      LDone := 0;
+      while LDone < ABytes do
+        LPart := 8;
+        if ABytes - LDone < 8 then
+          LPart := self.DoPartBytes(LDone, ABytes);
+        end;
+        LTemp := VirtualOperand(self.FMachine.NewVReg(RegClass.General));
+        self.DoEmitPair(X64Op.Mov, LPart, LTemp, self.DoMemoryPlus(ASource, LDone), ANode);
+        self.DoEmitPair(X64Op.Mov, LPart, self.DoMemoryPlus(ADest, LDone), LTemp, ANode);
+        LDone := LDone + LPart;
+      end;
+    end;
+
+    // True when ASignature carries an aggregate (a parameter's or the result's)
+    hidden const method DoHasAggregate(const ASignature: ref IrSignature): bool;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to ASignature.ParamCount - 1 do
+        if ASignature.ParamShape(LI) <> nil then
+          return true;
+        end;
+      end;
+      return false;
     end;
 
     // AValue into the register ADest at AWidth bytes: 0 by zero (xor: where selection puts
@@ -2526,8 +2737,9 @@ type
       end;
       LSite := ref IrSignature(ASignature.ResultType);
       LSite.Variadic := true;
+      LSite.ResultPlace := ASignature.ResultPlace;
       for LI := 0 to ASignature.ParamCount - 1 do
-        LSite.AddParam(ASignature.ParamTypes[LI]);
+        LSite.AddParamFrom(ASignature, LI);
       end;
       for LI := AFirst + ASignature.ParamCount to AInstr.Operands.Count - 1 do
         LSite.AddParam(self.FModule.InstrAt(AInstr.Operands[LI]).ValueType);
@@ -2535,17 +2747,23 @@ type
       return LSite;
     end;
 
-    // True when the call AInstr, laid out as ALayout, leaves as a jump: marked a tail call
-    // (Adam.Opt.Tail), in a function that is no funclet and not variadic (its incoming area
-    // holds its own variadic arguments), the callee's stack arguments fitting in this
-    // function's own incoming area (they are written there: the callee finds them at the
-    // entry offsets this function found its own at)
-    hidden method DoTailFits(const AInstr: ref IrInstr; const ALayout: ref CallLayout): bool;
+    // True when the call AInstr of ASignature, laid out as ALayout, leaves as a jump: marked
+    // a tail call (Adam.Opt.Tail), in a function that is no funclet and not variadic (its
+    // incoming area holds its own variadic arguments), neither signature carrying an
+    // aggregate, the callee's stack arguments fitting in this function's own incoming area
+    // (they are written there: the callee finds them at the entry offsets this function
+    // found its own at)
+    hidden method DoTailFits(const AInstr: ref IrInstr; const ASignature: ref IrSignature;
+      const ALayout: ref CallLayout): bool;
     begin
       if not AInstr.Tail then
         return false;
       end;
       if (self.FFunction.Parent <> 0) or (self.FOwnVarargs <> nil) then
+        return false;
+      end;
+      // an aggregate's copy, a result's pieces: work the caller does around the call
+      if self.DoHasAggregate(ASignature) or self.DoHasAggregate(self.FFunction.Signature) then
         return false;
       end;
       return ALayout.OutgoingBytes <= self.FOwnLayout.OutgoingBytes;
@@ -2616,6 +2834,7 @@ type
       LShadow: int64;
       LArg: int64;
       LI: int64;
+      LK: int64;
     begin
       LInstr := self.FModule.InstrAt(AId);
       LSignature := self.DoCallSignature(LInstr, AFullSignature, AFirst);
@@ -2623,7 +2842,7 @@ type
         raise(ADAM_X64_SELECT_FAULT_ARGS + IntToStr(AId));
       end;
       LLayout := self.FAbi.LayoutCall(LSignature);
-      LTail := self.DoTailFits(LInstr, LLayout);
+      LTail := self.DoTailFits(LInstr, LSignature, LLayout);
       if not LTail then
         if LLayout.OutgoingBytes > self.FMachine.OutgoingBytes then
           self.FMachine.OutgoingBytes := LLayout.OutgoingBytes;
@@ -2639,6 +2858,12 @@ type
             LStack := OutgoingMemory(LPlace.CallOffset);
           end;
           LArg := LInstr.Operands[AFirst + LI];
+          if LPlace.Bytes > 0 then
+            // an aggregate copied whole into its place (the operand: its copy's address)
+            self.DoMoveBytes(LStack, RegisterMemory(self.DoVReg(LArg).Reg, true, 0), LPlace.Bytes,
+              LInstr.Node);
+            skip;
+          end;
           if self.DoArgImm(LArg) then
             // A constant argument stored as the immediate (DoArgImm: it fits)
             self.DoEmitPair(X64Op.Mov, DoWidth(self.FModule.InstrAt(LArg).ValueType, LArg),
@@ -2651,6 +2876,16 @@ type
       LUses := ref Int64List();
       for LI := 0 to LLayout.ArgCount - 1 do
         LPlace := LLayout.ArgAt(LI);
+        if LPlace.Kind = LocationKind.Pieces then
+          // an aggregate's pieces loaded from its copy (the operand: the copy's address)
+          LArg := LInstr.Operands[AFirst + LI];
+          for LK := 0 to LPlace.PieceCount - 1 do
+            LReg := self.DoPhysical(LPlace.PieceRegister(LK));
+            self.DoLoadPiece(PhysicalOperand(LReg), RegisterMemory(self.DoVReg(LArg).Reg, true, 0),
+              LPlace.PieceOffset(LK), LPlace.PieceBytes(LK), LPlace.PieceFloat(LK), LInstr.Node);
+            LUses.Add(LReg);
+          end;
+        end;
         if LPlace.Kind = LocationKind.Register then
           LReg := self.DoPhysical(LPlace.RegisterName);
           LArg := LInstr.Operands[AFirst + LI];
@@ -2680,6 +2915,18 @@ type
       LCall.ImplicitUses := LUses;
       for LI := 0 to self.FVolatile.Count - 1 do
         LCall.ImplicitDefs.Add(self.FVolatile[LI]);
+      end;
+      if LLayout.ResultAt.Kind = LocationKind.Pieces then
+        // an aggregate result's pieces stored at its place (operand 0, the caller's slot),
+        // which is the call's value
+        LArg := LInstr.Operands[AFirst];
+        for LK := 0 to LLayout.ResultAt.PieceCount - 1 do
+          self.DoStorePiece(RegisterMemory(self.DoVReg(LArg).Reg, true, 0), LLayout.ResultAt.PieceOffset(LK),
+            PhysicalOperand(self.DoPhysical(LLayout.ResultAt.PieceRegister(LK))),
+            LLayout.ResultAt.PieceBytes(LK), LLayout.ResultAt.PieceFloat(LK), LInstr.Node);
+        end;
+        self.DoCopy(IrType.Pointer, self.DoVReg(AId), self.DoVReg(LArg), AId, LInstr.Node);
+        return;
       end;
       if LInstr.ValueType <> IrType.Void then
         self.DoCopy(LInstr.ValueType, self.DoVReg(AId),
@@ -2745,14 +2992,29 @@ type
     hidden method DoRet(const AId: int64; const AInstr: ref IrInstr);
     var
       LRet: ref MachineInstr;
+      LPieces: ref Int64List;
       LReg: int64;
+      LPieceReg: int64;
+      LK: int64;
     begin
       if self.FTailDone then
         self.FTailDone := false;
         return;
       end;
       LReg := -1;
-      if AInstr.Operands.Count > 0 then
+      LPieces := nil;
+      if self.FOwnLayout.ResultAt.Kind = LocationKind.Pieces then
+        // an aggregate result's pieces loaded from its place (the operand: its address)
+        LPieces := ref Int64List();
+        for LK := 0 to self.FOwnLayout.ResultAt.PieceCount - 1 do
+          LPieceReg := self.DoPhysical(self.FOwnLayout.ResultAt.PieceRegister(LK));
+          self.DoLoadPiece(PhysicalOperand(LPieceReg), RegisterMemory(self.DoVReg(AInstr.Operands[0]).Reg, true, 0),
+            self.FOwnLayout.ResultAt.PieceOffset(LK), self.FOwnLayout.ResultAt.PieceBytes(LK),
+            self.FOwnLayout.ResultAt.PieceFloat(LK), AInstr.Node);
+          LPieces.Add(LPieceReg);
+        end;
+      end;
+      if (AInstr.Operands.Count > 0) and (LPieces = nil) then
         LReg := self.DoPhysical(self.FOwnLayout.ResultAt.RegisterName);
         if self.DoIsImmConstant(AInstr.Operands[0]) then
           // A constant result moved in as the immediate (a register takes any)
@@ -2769,6 +3031,11 @@ type
       LRet := self.DoEmit(X64Op.Ret, 0, AInstr.Node);
       if LReg >= 0 then
         LRet.ImplicitUses.Add(LReg);
+      end;
+      if LPieces <> nil then
+        for LK := 0 to LPieces.Count - 1 do
+          LRet.ImplicitUses.Add(LPieces[LK]);
+        end;
       end;
     end;
 

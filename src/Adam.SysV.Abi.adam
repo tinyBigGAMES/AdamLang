@@ -25,6 +25,20 @@
                   rest on the stack from the stack pointer at the call up,
                   one 8-byte place each, in order. No home (shadow) area.
                 - The result in rax (a float in xmm0); none for void.
+                - An aggregate by value (LX1a2, its IrAggregate) is
+                  classified by eightbytes (psABI 3.2.3): one bigger than 16
+                  bytes or with an unaligned field is MEMORY; else each
+                  eightbyte is INTEGER when any integer touches it, else
+                  SSE when a float does (one only of padding takes no
+                  register). An argument whose eightbytes all fit in the
+                  registers left takes one each in order (an INTEGER one
+                  the next of rdi .. r9 at its bytes, an SSE one the next
+                  of xmm0 .. xmm7); else, and for MEMORY, its bytes are
+                  copied to the stack (its place aligned to its alignment,
+                  8 at least) and no register is used. A result classified
+                  so comes back in rax, rdx (INTEGER) and xmm0, xmm1 (SSE),
+                  its place (parameter 0) not passed; a MEMORY one through
+                  its place, its address in rdi and handed back in rax.
                 - The stack pointer is 16-byte aligned at every call; the
                   call pushes the 8-byte return address, so at a callee's
                   first instruction an argument's offset is 8 more.
@@ -43,9 +57,9 @@
                   rax, r10, r11 (free at a function's start: no argument,
                   no result; a variadic callee's al is read by nothing here,
                   its register save area keeps every vector register).
-                Records by value (their eightbyte classes), a variadic call's
-                al and a variadic function's register save area are atoms
-                LX1a2 and LX1b of PLAN-LINUX64; the unwind data is LX1c's.
+                A variadic call's al and a variadic function's register save
+                area are atom LX1b of PLAN-LINUX64; the unwind data is
+                LX1c's.
 *******************************************************************************/
 
 module unit Adam.SysV.Abi;
@@ -77,6 +91,12 @@ public const
   ADAM_SYSV_FLOAT_ARGS: string = "xmm0 xmm1 xmm2 xmm3 xmm4 xmm5 xmm6 xmm7";
   ADAM_SYSV_INT_RESULT: string = "rax";
   ADAM_SYSV_FLOAT_RESULT: string = "xmm0";
+  // An aggregate's result registers, by its eightbytes' classes in order
+  ADAM_SYSV_INT_RESULTS: string = "rax rdx";
+  ADAM_SYSV_FLOAT_RESULTS: string = "xmm0 xmm1";
+  // An eightbyte (psABI 3.2.3) and the most of them a value passed in registers has
+  ADAM_SYSV_EIGHTBYTE: int64 = 8;
+  ADAM_SYSV_REGISTER_EIGHTBYTES: int64 = 2;
   ADAM_SYSV_CALLEE_SAVED: string = "rbx rbp r12 r13 r14 r15";
   ADAM_SYSV_VOLATILE: string = "rax rcx rdx rsi rdi r8 r9 r10 r11 xmm0 xmm1 xmm2 xmm3 xmm4 " +
     "xmm5 xmm6 xmm7 xmm8 xmm9 xmm10 xmm11 xmm12 xmm13 xmm14 xmm15";
@@ -94,6 +114,7 @@ public const
   ADAM_SYSV_FAULT_VARARGS: string =
     "SysVAbi: a variadic function's register save area is PLAN-LINUX64 LX1b's: ";
   ADAM_SYSV_FAULT_UNWIND: string = "SysVAbi: unwind data is PLAN-LINUX64 LX1c's: ";
+  ADAM_SYSV_FAULT_RESULT: string = "SysVAbi: an aggregate result its registers cannot hold: ";
 
 // AValue (0 or more) rounded up to a multiple of AAlign (1 or more)
 routine DoRoundUp(const AValue: int64; const AAlign: int64): int64;
@@ -101,16 +122,142 @@ begin
   return ((AValue + AAlign - 1) div AAlign) * AAlign;
 end;
 
+// The smaller of AFirst and ASecond
+routine DoMin(const AFirst: int64; const ASecond: int64): int64;
+begin
+  if AFirst < ASecond then
+    return AFirst;
+  end;
+  return ASecond;
+end;
+
 public type
+  // An eightbyte's class (see the header): only padding, INTEGER, SSE
+  EightbyteClass = choices(Empty, General, Sse);
+
   // The System V x86_64 convention (see the header)
   SysVAbi = object(AbiPart)
     hidden FIntArgs: StringArray;
     hidden FFloatArgs: StringArray;
+    hidden FIntResults: StringArray;
+    hidden FFloatResults: StringArray;
 
     init();
     begin
       self.FIntArgs := SplitString(ADAM_SYSV_INT_ARGS, " ");
       self.FFloatArgs := SplitString(ADAM_SYSV_FLOAT_ARGS, " ");
+      self.FIntResults := SplitString(ADAM_SYSV_INT_RESULTS, " ");
+      self.FFloatResults := SplitString(ADAM_SYSV_FLOAT_RESULTS, " ");
+    end;
+
+    // True when an aggregate of AShape is MEMORY: past two eightbytes, empty or unaligned
+    hidden const method DoInMemory(const AShape: ref IrAggregate): bool;
+    begin
+      return (AShape.Size <= 0) or (AShape.Size > ADAM_SYSV_REGISTER_EIGHTBYTES * ADAM_SYSV_EIGHTBYTE) or
+        AShape.Unaligned;
+    end;
+
+    // The eightbytes of AShape
+    hidden const method DoEightbytes(const AShape: ref IrAggregate): int64;
+    begin
+      return (AShape.Size + ADAM_SYSV_EIGHTBYTE - 1) div ADAM_SYSV_EIGHTBYTE;
+    end;
+
+    // The class of eightbyte AIndex of AShape: INTEGER when an integer leaf touches it, else
+    // SSE when a float leaf does, else Empty
+    hidden const method DoClassOf(const AShape: ref IrAggregate; const AIndex: int64): EightbyteClass;
+    var
+      LStart: int64;
+      LEnd: int64;
+      LFloat: bool;
+      LI: int64;
+    begin
+      LStart := AIndex * ADAM_SYSV_EIGHTBYTE;
+      LEnd := LStart + ADAM_SYSV_EIGHTBYTE;
+      LFloat := false;
+      for LI := 0 to AShape.LeafCount - 1 do
+        if (AShape.LeafOffset(LI) < LEnd) and (AShape.LeafOffset(LI) + AShape.LeafSize(LI) > LStart) then
+          if not AShape.LeafFloat(LI) then
+            return EightbyteClass.General;
+          end;
+          LFloat := true;
+        end;
+      end;
+      if LFloat then
+        return EightbyteClass.Sse;
+      end;
+      return EightbyteClass.Empty;
+    end;
+
+    // The bytes of eightbyte AIndex of AShape (the last may be short)
+    hidden const method DoEightbyteBytes(const AShape: ref IrAggregate; const AIndex: int64): int64;
+    begin
+      return DoMin(ADAM_SYSV_EIGHTBYTE, AShape.Size - AIndex * ADAM_SYSV_EIGHTBYTE);
+    end;
+
+    // AShape (not DoInMemory) as pieces, each eightbyte in the next register of its class
+    // from AInts / AFloats (counted on); nil when they are short, the counts then unchanged
+    hidden const method DoPieces(const AShape: ref IrAggregate; const AInts: StringArray;
+      const AFloats: StringArray; var AIntAt: int64; var AFloatAt: int64): ref Location;
+    var
+      LPlace: ref Location;
+      LClass: EightbyteClass;
+      LInts: int64;
+      LFloats: int64;
+      LI: int64;
+    begin
+      LInts := 0;
+      LFloats := 0;
+      for LI := 0 to self.DoEightbytes(AShape) - 1 do
+        LClass := self.DoClassOf(AShape, LI);
+        if LClass = EightbyteClass.General then
+          LInts := LInts + 1;
+        end;
+        if LClass = EightbyteClass.Sse then
+          LFloats := LFloats + 1;
+        end;
+      end;
+      if (AIntAt + LInts > len(AInts)) or (AFloatAt + LFloats > len(AFloats)) then
+        return nil;
+      end;
+      LPlace := ref Location(LocationKind.Pieces);
+      for LI := 0 to self.DoEightbytes(AShape) - 1 do
+        LClass := self.DoClassOf(AShape, LI);
+        if LClass = EightbyteClass.General then
+          LPlace.AddPiece(AInts[AIntAt], LI * ADAM_SYSV_EIGHTBYTE, self.DoEightbyteBytes(AShape, LI), false);
+          AIntAt := AIntAt + 1;
+        end;
+        if LClass = EightbyteClass.Sse then
+          LPlace.AddPiece(AFloats[AFloatAt], LI * ADAM_SYSV_EIGHTBYTE, self.DoEightbyteBytes(AShape, LI),
+            true);
+          AFloatAt := AFloatAt + 1;
+        end;
+      end;
+      return LPlace;
+    end;
+
+    // An aggregate argument of AShape: its pieces in the registers left (DoPieces), else
+    // its bytes copied to the next stack place, aligned to its alignment (8 at least)
+    hidden const method DoAggregatePlace(const AShape: ref IrAggregate; var AInts: int64;
+      var AFloats: int64; var AStackBytes: int64): ref Location;
+    var
+      LPlace: ref Location;
+      LAlign: int64;
+      LOffset: int64;
+    begin
+      if not self.DoInMemory(AShape) then
+        LPlace := self.DoPieces(AShape, self.FIntArgs, self.FFloatArgs, AInts, AFloats);
+        if LPlace <> nil then
+          return LPlace;
+        end;
+      end;
+      LAlign := AShape.Align;
+      if LAlign < ADAM_SYSV_SLOT_BYTES then
+        LAlign := ADAM_SYSV_SLOT_BYTES;
+      end;
+      LOffset := DoRoundUp(AStackBytes, LAlign);
+      AStackBytes := LOffset + DoRoundUp(AShape.Size, ADAM_SYSV_SLOT_BYTES);
+      return StackBytesLocation(LOffset, LOffset + ADAM_SYSV_RETURN_BYTES, AShape.Size);
     end;
 
     override method AbiName(): string;
@@ -163,21 +310,39 @@ public type
     override method LayoutCall(const ASignature: ref IrSignature): ref CallLayout;
     var
       LLayout: ref CallLayout;
+      LShape: ref IrAggregate;
+      LResult: ref Location;
       LI: int64;
       LType: IrType;
       LInts: int64;
       LFloats: int64;
-      LStackArgs: int64;
-      LOffset: int64;
+      LStackBytes: int64;
+      LIntResult: int64;
+      LFloatResult: int64;
     begin
       LLayout := ref CallLayout();
       LInts := 0;
       LFloats := 0;
-      LStackArgs := 0;
+      LStackBytes := 0;
       for LI := 0 to ASignature.ParamCount - 1 do
         LType := ASignature.ParamTypes[LI];
         if LType = IrType.Void then
           raise(ADAM_SYSV_FAULT_VOID_PARAM + IntToStr(LI));
+        end;
+        LShape := ASignature.ParamShape(LI);
+        // a result's place: passed (in rdi, the first) only for a MEMORY result
+        if ASignature.ResultPlace and (LI = 0) then
+          if self.DoInMemory(LShape) then
+            LLayout.AddArg(RegisterLocation(self.FIntArgs[LInts]));
+            LInts := LInts + 1;
+          else
+            LLayout.AddArg(ref Location(LocationKind.None));
+          end;
+          skip;
+        end;
+        if LShape <> nil then
+          LLayout.AddArg(self.DoAggregatePlace(LShape, LInts, LFloats, LStackBytes));
+          skip;
         end;
         if IsFloatType(LType) and (LFloats < len(self.FFloatArgs)) then
           LLayout.AddArg(RegisterLocation(self.FFloatArgs[LFloats]));
@@ -187,9 +352,8 @@ public type
             LLayout.AddArg(RegisterLocation(self.FIntArgs[LInts]));
             LInts := LInts + 1;
           else
-            LOffset := LStackArgs * ADAM_SYSV_SLOT_BYTES;
-            LLayout.AddArg(StackLocation(LOffset, LOffset + ADAM_SYSV_RETURN_BYTES));
-            LStackArgs := LStackArgs + 1;
+            LLayout.AddArg(StackLocation(LStackBytes, LStackBytes + ADAM_SYSV_RETURN_BYTES));
+            LStackBytes := LStackBytes + ADAM_SYSV_SLOT_BYTES;
           end;
         end;
       end;
@@ -199,8 +363,19 @@ public type
       if (ASignature.ResultType <> IrType.Void) and not IsFloatType(ASignature.ResultType) then
         LLayout.ResultAt := RegisterLocation(ADAM_SYSV_INT_RESULT);
       end;
+      // an aggregate result in registers: its pieces (a MEMORY one's address is in rax)
+      LShape := ASignature.ResultShape();
+      if (LShape <> nil) and not self.DoInMemory(LShape) then
+        LIntResult := 0;
+        LFloatResult := 0;
+        LResult := self.DoPieces(LShape, self.FIntResults, self.FFloatResults, LIntResult, LFloatResult);
+        if LResult = nil then
+          raise(ADAM_SYSV_FAULT_RESULT + LShape.Text());
+        end;
+        LLayout.ResultAt := LResult;
+      end;
       // No home area: only the stacked arguments' places
-      LLayout.OutgoingBytes := LStackArgs * ADAM_SYSV_SLOT_BYTES;
+      LLayout.OutgoingBytes := LStackBytes;
       return LLayout;
     end;
 
