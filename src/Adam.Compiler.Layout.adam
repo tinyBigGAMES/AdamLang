@@ -36,7 +36,10 @@
     packed one), bitfields by the
     target's rule (Microsoft: a run of bitfields shares a unit while the
     unit's type has the same size and its bits hold them; anything else
-    starts a new unit); align(n) raises the alignment. An overlay is a C
+    starts a new unit. Itanium, System V: a bitfield takes the next free
+    bit while its bits stay inside one aligned unit of its type, whatever
+    came before; an unnamed one's type never raises the alignment);
+    align(n) raises the alignment. An overlay is a C
     union. An anonymous part is laid out as a member of its own kind. An empty
     aggregate is 1 byte (C++, as PaskalCPP emits it).
   - An object is a C++ class by the Itanium ABI: a vtable pointer at 0 when it
@@ -123,12 +126,15 @@ type
   // Where an aggregate's layout stands: the next free byte (a union: its widest member's
   // end), the open bitfield run (its unit's offset and size, the bits used), the largest
   // member alignment, the pack limit (0 none: packed(N) caps each member's alignment at N);
-  // Unknown once a member's layout is
+  // RunBits: under BitfieldRule.Itanium the open run's next free bit, counted from the
+  // aggregate's start (Offset is then that bit's byte, rounded up); Unknown once a member's
+  // layout is
   LayoutCursor = record
     Offset: int64;
     RunOffset: int64;
     RunSize: int64;
     RunUsed: int64;
+    RunBits: int64;
     MaxAlign: int64;
     Pack: int64;
     Union: bool;
@@ -645,6 +651,7 @@ begin
   LCursor.RunOffset := 0;
   LCursor.RunSize := 0;
   LCursor.RunUsed := 0;
+  LCursor.RunBits := 0;
   LCursor.MaxAlign := 1;
   LCursor.Pack := APack;
   LCursor.Union := AUnion;
@@ -703,12 +710,66 @@ begin
   ABit := 0;
 end;
 
-// An unnamed zero-width bitfield of a type ASize bytes, aligned AAlign (`_: T : 0;`, C's
-// `T : 0;`, M9e0c) into ACursor. The target's rule: Microsoft's (clang's and gcc's on
-// x86_64-windows-gnu) ignores one that does not follow a bitfield of a nonzero width; after
-// one it closes that run, rounds the end up to AAlign and raises the aggregate's alignment
-routine DoPlaceZeroWidth(var ACursor: LayoutCursor; const ASize: int64; const AAlign: int64);
+// The next free bit of ACursor, counted from the aggregate's start: the open run's end
+// under BitfieldRule.Itanium, else the next free byte's first bit
+routine DoNextBit(const ACursor: LayoutCursor): int64;
 begin
+  if ACursor.RunSize > 0 then
+    return ACursor.RunBits;
+  end;
+  return ACursor.Offset * 8;
+end;
+
+// BitfieldRule.Itanium (System V, gcc's and clang's on x86_64-linux-gnu): a bitfield of
+// ASize bytes (aligned AAlign, the pack limit already applied) and AWidth bits takes the
+// next free bit when its bits stay inside one AAlign-aligned unit of ASize bytes, else it
+// starts at the next AAlign boundary; whatever came before (another declared type, a byte
+// field) shares the unit. Its unit's offset (AAlign-aligned) in AAt, its bit offset in that
+// unit in ABit (ABit + AWidth never passes ASize * 8); the cursor's next free byte follows
+// its last bit
+routine DoPlaceItaniumBits(var ACursor: LayoutCursor; const ASize: int64;
+  const AAlign: int64; const AWidth: int64; var AAt: int64; var ABit: int64);
+var
+  LStart: int64;
+  LUnitBits: int64;
+begin
+  LStart := DoNextBit(ACursor);
+  LUnitBits := AAlign * 8;
+  // straddling the declared type's width from the unit's start: on to the next unit
+  if (LStart mod LUnitBits) + AWidth > ASize * 8 then
+    LStart := DoRoundUp(LStart, LUnitBits);
+  end;
+  AAt := (LStart div LUnitBits) * AAlign;
+  ABit := LStart - AAt * 8;
+  if AAt > ADAM_LAYOUT_MAX_SIZE - ASize then
+    ACursor.Unknown := true;
+    ACursor.TooLarge := true;
+    return;
+  end;
+  ACursor.RunOffset := AAt;
+  ACursor.RunSize := ASize;
+  ACursor.RunUsed := ABit + AWidth;
+  ACursor.RunBits := LStart + AWidth;
+  ACursor.Offset := (ACursor.RunBits + 7) div 8;
+end;
+
+// An unnamed zero-width bitfield of a type ASize bytes, aligned AAlign (`_: T : 0;`, C's
+// `T : 0;`, M9e0c) into ACursor under ARule. Microsoft's (clang's and gcc's on
+// x86_64-windows-gnu) ignores one that does not follow a bitfield of a nonzero width; after
+// one it closes that run, rounds the end up to AAlign and raises the aggregate's alignment.
+// Itanium's (System V) always rounds the next free bit up to AAlign and closes the run, never
+// raising the aggregate's alignment (an unnamed bitfield's type does not count, psABI); in a
+// union it does nothing
+routine DoPlaceZeroWidth(var ACursor: LayoutCursor; const ARule: BitfieldRule;
+  const ASize: int64; const AAlign: int64);
+begin
+  if ARule = BitfieldRule.Itanium then
+    if not ACursor.Union then
+      ACursor.Offset := DoRoundUp(DoNextBit(ACursor), AAlign * 8) div 8;
+    end;
+    ACursor.RunSize := 0;
+    return;
+  end;
   if ACursor.RunSize = 0 then
     return;
   end;
@@ -750,7 +811,7 @@ begin
   LWidth := 0;
   if (LWidthExpr <> 0) and IsUnnamedField(ATree, AField) and
     BoundValue(ATree, ATarget, LWidthExpr, LWidth) and (LWidth = 0) then
-    DoPlaceZeroWidth(ACursor, LSize, LAlign);
+    DoPlaceZeroWidth(ACursor, ATarget.Bitfields(), LSize, LAlign);
     ATree[AField].ResolvedOffset := ABase + ACursor.Offset;
     ATree[AField].ResolvedBitOffset := 0;
     ATree[AField].ResolvedBitWidth := 0;
@@ -762,17 +823,27 @@ begin
     ATree[AField].ResolvedOffset := ABase + LAt;
     return;
   end;
-  ACursor.MaxAlign := DoMax(ACursor.MaxAlign, LAlign);
+  // Microsoft: every bitfield's type raises the aggregate's alignment; Itanium (System V):
+  // only a named one's (an unnamed bitfield's type does not count, psABI)
+  if (ATarget.Bitfields() <> BitfieldRule.Itanium) or not IsUnnamedField(ATree, AField) then
+    ACursor.MaxAlign := DoMax(ACursor.MaxAlign, LAlign);
+  end;
   if ACursor.Union then
-    ACursor.Offset := DoMax(ACursor.Offset, LSize);
+    // Microsoft: a union bitfield takes its whole unit; Itanium: the bytes its bits fill
+    if ATarget.Bitfields() = BitfieldRule.Itanium then
+      ACursor.Offset := DoMax(ACursor.Offset, (LWidth + 7) div 8);
+    else
+      ACursor.Offset := DoMax(ACursor.Offset, LSize);
+    end;
     LAt := 0;
     LBit := 0;
   else
-    // Each rule sets both; a rule with no arm here would leave the field at 0
+    // Each rule sets both
     LAt := 0;
     LBit := 0;
     match ATarget.Bitfields() of
       BitfieldRule.Microsoft: DoPlaceMicrosoftBits(ACursor, LSize, LAlign, LWidth, LAt, LBit);
+      BitfieldRule.Itanium: DoPlaceItaniumBits(ACursor, LSize, LAlign, LWidth, LAt, LBit);
     end;
   end;
   ATree[AField].ResolvedOffset := ABase + LAt;
