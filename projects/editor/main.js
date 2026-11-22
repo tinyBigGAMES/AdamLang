@@ -696,11 +696,12 @@ ipcMain.handle('session:load', async () => {
   return { files: LFiles, active: LActive };
 });
 
-// Bundled examples: <editor>\resources -> <editor> -> bin\res -> examples.
+// Bundled examples: res\editor\<host>\resources -> res\editor\<host> ->
+// res\editor -> bin\res -> examples.
 // The official folder: while it is missing it is not shown, but nothing
 // about it is ever forgotten (its open folders, a dialog folder in it).
 function examplesDir() {
-  return path.resolve(process.resourcesPath, '..', '..', 'examples');
+  return path.resolve(process.resourcesPath, '..', '..', '..', 'examples');
 }
 
 // True when APath is the examples folder or inside it (case-insensitive)
@@ -1189,13 +1190,14 @@ ipcMain.on('terminal:menu', (AEvent, AHasSelection) => {
   ]).popup({ window: gWindow });
 });
 
-// Build / pack: adam.exe lives in repo\bin, three levels above the editor's
-// resources dir (res\editor\resources -> res\editor -> res -> bin). It is
+// Build / pack: adam.exe lives in repo\bin, four levels above the editor's
+// resources dir (res\editor\<host>\resources -> res\editor\<host> -> res\editor
+// -> res -> bin; <host> win-x64, linux-x64 beside it). It is
 // spawned with cwd = repo\bin so its default 'output' dir matches a console
 // build. One build / pack at a time; Stop kills the process tree. Run (F9)
 // is not a build: it is a DAP session with noDebug (src/debug.js), so the
 // program's terminal is the debug session's
-const ADAM_BIN_DIR = path.resolve(process.resourcesPath, '..', '..', '..');
+const ADAM_BIN_DIR = path.resolve(process.resourcesPath, '..', '..', '..', '..');
 const ADAM_COMPILER = path.join(ADAM_BIN_DIR, 'adam.exe');
 // adam -opt <level> (the @optimize levels) and -t <triple> (the targets,
 // DESIGN sec 6); the first of each is the default
