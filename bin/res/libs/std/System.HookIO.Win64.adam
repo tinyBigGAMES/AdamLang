@@ -103,8 +103,11 @@
   the lowio state (text mode, append, Ctrl-Z end), as ucrt's: a _dup2
   onto a handle's number makes the FILE holding it read and write the
   source's file; _fdopen / _wfdopen open a FILE on a handle's number that
-  runs on its lowio state (fclose closes the number). Any other path or
-  number is ucrt's. mingw's oldnames (open, read, lseek, fstat ..) reach these hooks
+  runs on its lowio state (fclose closes the number). A _dup2 of a real
+  file's descriptor onto a handle's number a FILE holds makes that FILE
+  read and write the real file (ucrt's own calls on a binary duplicate of
+  it, the file pointer the OS file object's); onto a lowio-only number it
+  gives the number back to ucrt. Any other path or number is ucrt's. mingw's oldnames (open, read, lseek, fstat ..) reach these hooks
   as libcextras aliases of the ucrt imports.
 
   A failed parameter check of ucrt's (fread_s' buffer too small, no
@@ -326,7 +329,12 @@ type
   // internal description handle (no number, never in the open list): its IO is closed and its
   // entry use given back when its last user goes. Joined: how deep this handle is inside its
   // stream lock's calls; the outermost one takes the shared state in (DoJoinLocked) and gives
-  // it back (DoPartLocked)
+  // it back (DoPartLocked). Real: a Description that is a real file's open file description,
+  // what a _dup2 of a descriptor ucrt opened itself puts on a number a FILE holds
+  // (DoRealDescription): its IO runs ucrt's own _read / _write / _lseeki64 / _fstat64 on
+  // RealFile, a binary duplicate ucrt made of that descriptor (the OS file object shared, so
+  // its file pointer is the one every number on the file moves: Position adopted from it before
+  // each call, DoSyncLocked); RealFile is closed with the description
   HookHandle = record
     Base: HookStream;
     Mode: FileMode;
@@ -353,6 +361,8 @@ type
     Low: ptr to HookHandle;
     Description: bool;
     Joined: int64;
+    Real: bool;
+    RealFile: int32;
   end;
 
   // A number's lowio state as ucrt's _dup / _dup2 copy it to the new number (_osfile less
@@ -664,7 +674,7 @@ type
   CreatFn = routine(const APath: ptr to const char; const APMode: int32): int32;
   WcreatFn = routine(const APath: ptr to const wchar; const APMode: int32): int32;
   FdReadFn = routine(const AFile: int32; const ABuffer: ptr; const ACount: uint32): int32;
-  FdWriteFn = routine(const AFile: int32; const ABuffer: ptr; const ACount: uint32): int32;
+  FdWriteFn = routine(const AFile: int32; const ABuffer: ptr to const; const ACount: uint32): int32;
   LseekFn = routine(const AFile: int32; const AOffset: clong; const AOrigin: int32): clong;
   Lseeki64Fn = routine(const AFile: int32; const AOffset: int64; const AOrigin: int32): int64;
   FdLongFn = routine(const AFile: int32): clong;
@@ -1820,6 +1830,37 @@ begin
   AResult := 0;
 end;
 
+// ABuf's st_dev and st_rdev as AKind's stat record set to ADevice (ucrt's fstat puts a device
+// or pipe's descriptor number there)
+routine DoStatDevice(const ABuf: ptr; const AKind: HookStatKind; const ADevice: uint32);
+var
+  LStat32: ptr to System.Windows._stat32;
+  LStat32i64: ptr to System.Windows._stat32i64;
+  LStat64i32: ptr to System.Windows._stat64i32;
+  LStat64: ptr to System.Windows._stat64;
+begin
+  if AKind = HookStatKind.Stat32 then
+    LStat32 := ptr to System.Windows._stat32(ABuf);
+    LStat32->st_dev := ADevice;
+    LStat32->st_rdev := ADevice;
+  end;
+  if AKind = HookStatKind.Stat32i64 then
+    LStat32i64 := ptr to System.Windows._stat32i64(ABuf);
+    LStat32i64->st_dev := ADevice;
+    LStat32i64->st_rdev := ADevice;
+  end;
+  if AKind = HookStatKind.Stat64i32 then
+    LStat64i32 := ptr to System.Windows._stat64i32(ABuf);
+    LStat64i32->st_dev := ADevice;
+    LStat64i32->st_rdev := ADevice;
+  end;
+  if AKind = HookStatKind.Stat64 then
+    LStat64 := ptr to System.Windows._stat64(ABuf);
+    LStat64->st_dev := ADevice;
+    LStat64->st_rdev := ADevice;
+  end;
+end;
+
 // True when APath (UTF-8) names an executable by its extension (.exe, .cmd, .bat, .com, any
 // case): ucrt's stat gives such a file the execute bit
 routine DoExecutableName(const APath: string): bool;
@@ -1965,13 +2006,44 @@ begin
   return true;
 end;
 
+// True when AHandle's number runs on a real file's description (DoRealDescription)
+routine DoRealPlace(const AHandle: ptr to HookHandle): bool;
+begin
+  return DoPlaceOf(AHandle)->Real;
+end;
+
+// A read or write of AHandle's IO that failed sets errno AErrno, as lowio maps the failure;
+// on a real file's description whose IO failed (IOState.Error) ucrt's own call set errno
+// already (EBADF for a right the OS handle lacks, ENOSPC ..), which stays
+routine DoIOFailedLocked(const AHandle: ptr to HookHandle; const AErrno: int32);
+begin
+  if DoRealPlace(AHandle) and (IOStatus(AHandle->Base.Stream) = IOState.Error) then
+    return;
+  end;
+  SetCErrno(AErrno);
+end;
+
 // Moves the IO to the handle's Position: another handle on the same IO, or a seek that only
 // tried a target, may have left it elsewhere (a Pipe handle's IO never moves). False: the IO
-// cannot go there
+// cannot go there. A real file's description (DoRealPlace) has the OS file pointer, which any
+// number on the file (ucrt's own included) moves: Position is adopted from it instead (true;
+// errno as it was)
 routine DoSyncLocked(const AHandle: ptr to HookHandle): bool;
+var
+  LAt: int64;
+  LError: int32;
 begin
   // A Pipe handle's IO is read and written at its own place (Position is only a number)
   if AHandle->Pipe then
+    return true;
+  end;
+  if DoRealPlace(AHandle) then
+    LError := CErrno();
+    LAt := IOTell(AHandle->Base.Stream);
+    if LAt >= 0 then
+      AHandle->Base.Position := LAt;
+    end;
+    SetCErrno(LError);
     return true;
   end;
   if IOTell(AHandle->Base.Stream) = AHandle->Base.Position then
@@ -2036,10 +2108,10 @@ begin
   if LGot < ASize then
     AHandle->Failed := true;
     if LGot = 0 then
-      SetCErrno(ADAM_ERRNO_ENOSPC);
+      DoIOFailedLocked(AHandle, ADAM_ERRNO_ENOSPC);
       return -1;
     end;
-    SetCErrno(ADAM_ERRNO_EIO);
+    DoIOFailedLocked(AHandle, ADAM_ERRNO_EIO);
   end;
   return LGot;
 end;
@@ -2262,7 +2334,7 @@ begin
     AHandle->Base.Position := AHandle->Base.Position + LGot;
   end;
   if (LGot = 0) and (ASize > 0) and (IOStatus(AHandle->Base.Stream) <> IOState.Eof) then
-    SetCErrno(ADAM_ERRNO_EIO);
+    DoIOFailedLocked(AHandle, ADAM_ERRNO_EIO);
     return -1;
   end;
   return LGot;
@@ -9218,10 +9290,14 @@ end;
 
 // _commit of descriptor AFile when it is a handle's: its IO flushed (FlushFileBuffers' part).
 // False: not a handle's. True: AResult 0, or -1 with errno: a closed number EBADF (the handler
-// run), a flush the IO refuses EBADF (ucrt's answer to a failed FlushFileBuffers)
+// run), a flush the IO refuses EBADF (ucrt's answer to a failed FlushFileBuffers). A real
+// file's description (DoRealPlace) is ucrt's own _commit of its RealFile (the same file
+// object's FlushFileBuffers)
 routine DoFdCommit(const AFile: int32; var AResult: int32): bool;
 var
   LHandle: ptr to HookHandle;
+  LFound: ptr;
+  LReal: FdIntFn;
 begin
   AResult := -1;
   LHandle := DoFindDescriptor(AFile);
@@ -9232,10 +9308,18 @@ begin
     DoJoinLocked(LHandle);
     defer DoPartLocked(LHandle);
     if not DoFdGone(LHandle) then
-      if IOFlush(LHandle->Base.Stream) then
-        AResult := 0;
+      if DoRealPlace(LHandle) then
+        LFound := DoReal(GRealCommit, ptr to const char("_commit"));
+        if LFound <> nil then
+          LReal := FdIntFn(LFound);
+          AResult := LReal(DoPlaceOf(LHandle)->RealFile);
+        end;
       else
-        SetCErrno(ADAM_ERRNO_EBADF);
+        if IOFlush(LHandle->Base.Stream) then
+          AResult := 0;
+        else
+          SetCErrno(ADAM_ERRNO_EBADF);
+        end;
       end;
     end;
   end;
@@ -9307,13 +9391,18 @@ end;
 // group and other), on no device; a pipe's (an IO that cannot seek) a FIFO of size 0 with no
 // bits, the number its device. False: not a handle's. True: AResult 0, or -1 with errno: no
 // buffer EINVAL and a closed number EBADF (ucrt's parameter checks, in that order, the
-// handler run), a size past the record's st_size EOVERFLOW
-routine DoFdStat(const AFile: int32; const ABuf: ptr; const AKind: HookStatKind;
-  var AResult: int32): bool;
+// handler run), a size past the record's st_size EOVERFLOW. A real file's description
+// (DoRealPlace) is answered by ucrt's own fstat (AName, ASlot its slot) of its RealFile, the
+// file's own times, size and bits; a device or pipe's st_dev / st_rdev are then AFile, as
+// ucrt puts the number there (DoStatDevice)
+routine DoFdStat(const AFile: int32; const ABuf: ptr; const AKind: HookStatKind; var ASlot: ptr;
+  const AName: ptr to const char; var AResult: int32): bool;
 var
   LHandle: ptr to HookHandle;
   LSize: int64;
   LModeBits: uint16;
+  LFound: ptr;
+  LReal: FstatFn;
 begin
   AResult := -1;
   LHandle := DoFindDescriptor(AFile);
@@ -9329,21 +9418,32 @@ begin
     DoJoinLocked(LHandle);
     defer DoPartLocked(LHandle);
     if not DoFdGone(LHandle) then
-      if LHandle->Pipe then
-        DoFillStat(ABuf, AKind, _S_IFIFO, uint32(AFile), 0, AResult);
+      if DoRealPlace(LHandle) then
+        LFound := DoReal(ASlot, AName);
+        if LFound <> nil then
+          LReal := FstatFn(LFound);
+          AResult := LReal(DoPlaceOf(LHandle)->RealFile, ABuf);
+          if (AResult = 0) and LHandle->Pipe then
+            DoStatDevice(ABuf, AKind, uint32(AFile));
+          end;
+        end;
       else
-        LSize := IOSize(LHandle->Base.Stream);
-        if LSize < 0 then
-          LSize := 0;
+        if LHandle->Pipe then
+          DoFillStat(ABuf, AKind, _S_IFIFO, uint32(AFile), 0, AResult);
+        else
+          LSize := IOSize(LHandle->Base.Stream);
+          if LSize < 0 then
+            LSize := 0;
+          end;
+          // uint16 operands promote to int32: each result is narrowed back
+          LModeBits := uint16(_S_IFREG | _S_IREAD);
+          if DoCanWrite(LHandle) or IOCanWrite(LHandle->Base.Stream) then
+            LModeBits := uint16(LModeBits | _S_IWRITE);
+          end;
+          LModeBits := uint16(LModeBits | ((LModeBits & ADAM_HOOKIO_S_OWNER) shr 3) |
+            ((LModeBits & ADAM_HOOKIO_S_OWNER) shr 6));
+          DoFillStat(ABuf, AKind, LModeBits, 0u, LSize, AResult);
         end;
-        // uint16 operands promote to int32: each result is narrowed back
-        LModeBits := uint16(_S_IFREG | _S_IREAD);
-        if DoCanWrite(LHandle) or IOCanWrite(LHandle->Base.Stream) then
-          LModeBits := uint16(LModeBits | _S_IWRITE);
-        end;
-        LModeBits := uint16(LModeBits | ((LModeBits & ADAM_HOOKIO_S_OWNER) shr 3) |
-          ((LModeBits & ADAM_HOOKIO_S_OWNER) shr 6));
-        DoFillStat(ABuf, AKind, LModeBits, 0u, LSize, AResult);
       end;
     end;
   end;
@@ -9525,10 +9625,14 @@ end;
 // stands behind it (its bytes are an IO's, not a file object's), what ucrt answers for an open
 // number whose _osfhnd is INVALID_HANDLE_VALUE, errno as it was; a closed number EBADF (the
 // handler run). Never the reservation's NUL handle: a Win32 call on it would read nothing and
-// write nowhere where the caller meant the handle's bytes
+// write nowhere where the caller meant the handle's bytes. A real file's description
+// (DoRealPlace) has a file object behind it: ucrt's own _get_osfhandle of its RealFile (a
+// handle to the same file object, as the number's own would be)
 routine DoFdOsfhandle(const AFile: int32; var AResult: int64): bool;
 var
   LHandle: ptr to HookHandle;
+  LFound: ptr;
+  LReal: FdInt64Fn;
 begin
   AResult := -1;
   LHandle := DoFindDescriptor(AFile);
@@ -9538,7 +9642,13 @@ begin
   lock (LHandle->Base.Lock->Lock) do
     DoJoinLocked(LHandle);
     defer DoPartLocked(LHandle);
-    DoFdGone(LHandle);
+    if (not DoFdGone(LHandle)) and DoRealPlace(LHandle) then
+      LFound := DoReal(GRealGetOsfhandle, ptr to const char("_get_osfhandle"));
+      if LFound <> nil then
+        LReal := FdInt64Fn(LFound);
+        AResult := LReal(DoPlaceOf(LHandle)->RealFile);
+      end;
+    end;
   end;
   DoReleaseHandle(LHandle);
   return true;
@@ -9579,8 +9689,419 @@ begin
   return true;
 end;
 
+// --- a real file put on a handle's number (_dup2 of a descriptor ucrt opened itself) --------
+
+// The IO of a real file's description (DoRealDescription): ucrt's own _read / _write /
+// _lseeki64 / _fstat64 / _chsize_s / _close on the binary duplicate its user pointer holds,
+// never the hooks (that number is no handle's). A failed call is IOState.Error with ucrt's
+// errno kept
+routine DoRealFileOf(const AUserData: ptr): int32;
+begin
+  return int32(int64(uint64(AUserData)));
+end;
+
+routine DoRealFileRead(const AUserData: ptr; const ABuffer: ptr; const ASize: int64;
+  var AState: IOState): int64;
+var
+  LFound: ptr;
+  LRead: FdReadFn;
+  LCount: int64;
+  LGot: int32;
+begin
+  LFound := DoReal(GRealRead, ptr to const char("_read"));
+  if LFound = nil then
+    AState := IOState.Error;
+    return 0;
+  end;
+  LRead := FdReadFn(LFound);
+  // lowio reads at most INT_MAX bytes at a time; a short count is not the end
+  LCount := ASize;
+  if LCount > ADAM_HOOKIO_LOW_READ_MAX then
+    LCount := ADAM_HOOKIO_LOW_READ_MAX;
+  end;
+  LGot := LRead(DoRealFileOf(AUserData), ABuffer, uint32(LCount));
+  if LGot < 0 then
+    AState := IOState.Error;
+    return 0;
+  end;
+  if LGot = 0 then
+    AState := IOState.Eof;
+  end;
+  return int64(LGot);
+end;
+
+// Writes all ASize bytes, lowio's largest count at a time; a write that stops short (ucrt's
+// -1: a full disk ENOSPC, a handle without write access EBADF) is IOState.Error with what
+// landed before it
+routine DoRealFileWrite(const AUserData: ptr; const ABuffer: ptr to const; const ASize: int64;
+  var AState: IOState): int64;
+var
+  LFound: ptr;
+  LWrite: FdWriteFn;
+  LBytes: ptr to const uint8;
+  LDone: int64;
+  LCount: int64;
+  LGot: int32;
+begin
+  LFound := DoReal(GRealWrite, ptr to const char("_write"));
+  if LFound = nil then
+    AState := IOState.Error;
+    return 0;
+  end;
+  LWrite := FdWriteFn(LFound);
+  LBytes := ptr to const uint8(ABuffer);
+  LDone := 0;
+  while LDone < ASize do
+    LCount := ASize - LDone;
+    if LCount > ADAM_HOOKIO_LOW_WRITE_MAX then
+      LCount := ADAM_HOOKIO_LOW_WRITE_MAX;
+    end;
+    LGot := LWrite(DoRealFileOf(AUserData), LBytes + LDone, uint32(LCount));
+    if LGot < 0 then
+      AState := IOState.Error;
+      return LDone;
+    end;
+    if LGot = 0 then
+      // A device that took nothing (ucrt's Ctrl-Z first byte on a character device): no
+      // failure, and no more will land
+      return LDone;
+    end;
+    LDone := LDone + int64(LGot);
+  end;
+  return LDone;
+end;
+
+routine DoRealFileSeek(const AUserData: ptr; const AOffset: int64; const AOrigin: SeekOrigin): int64;
+var
+  LFound: ptr;
+  LSeek: Lseeki64Fn;
+  LWhence: int32;
+begin
+  LWhence := ADAM_HOOKIO_SEEK_SET;
+  if AOrigin = SeekOrigin.FromCurrent then
+    LWhence := ADAM_HOOKIO_SEEK_CUR;
+  end;
+  if AOrigin = SeekOrigin.FromEnd then
+    LWhence := ADAM_HOOKIO_SEEK_END;
+  end;
+  LFound := DoReal(GRealLseeki64, ptr to const char("_lseeki64"));
+  if LFound = nil then
+    return -1;
+  end;
+  LSeek := Lseeki64Fn(LFound);
+  return LSeek(DoRealFileOf(AUserData), AOffset, LWhence);
+end;
+
+routine DoRealFileTell(const AUserData: ptr): int64;
+begin
+  return DoRealFileSeek(AUserData, 0, SeekOrigin.FromCurrent);
+end;
+
+// A regular file's st_size, -1 for anything else (a pipe, a device) or a failed fstat (errno
+// as it was: a size query is no call of the user's)
+routine DoRealFileSize(const AUserData: ptr): int64;
+var
+  LFound: ptr;
+  LFstat: FstatFn;
+  LStat: System.Windows._stat64;
+  LError: int32;
+  LGot: int32;
+begin
+  LError := CErrno();
+  LFound := HookReal(GRealFstat64, ptr to const char("_fstat64"));
+  if LFound = nil then
+    return -1;
+  end;
+  LFstat := FstatFn(LFound);
+  LGot := LFstat(DoRealFileOf(AUserData), ptr(addr of LStat));
+  SetCErrno(LError);
+  if (LGot <> 0) or ((LStat.st_mode & _S_IFMT) <> _S_IFREG) then
+    return -1;
+  end;
+  return LStat.st_size;
+end;
+
+// The file cut or grown to ASize bytes by ucrt's _chsize_s (its errno set when it refuses)
+routine DoRealFileTruncate(const AUserData: ptr; const ASize: int64; var AState: IOState): bool;
+var
+  LFound: ptr;
+  LChsize: ChsizeSFn;
+begin
+  LFound := DoReal(GRealChsizeS, ptr to const char("_chsize_s"));
+  if LFound = nil then
+    AState := IOState.Error;
+    return false;
+  end;
+  LChsize := ChsizeSFn(LFound);
+  if LChsize(DoRealFileOf(AUserData), ASize) <> 0 then
+    AState := IOState.Error;
+    return false;
+  end;
+  return true;
+end;
+
+// The duplicate closed with the description (errno as it was)
+routine DoRealFileClose(const AUserData: ptr): bool;
+var
+  LFound: ptr;
+  LClose: FdIntFn;
+  LError: int32;
+  LOk: bool;
+begin
+  LError := CErrno();
+  LOk := false;
+  LFound := HookReal(GRealClose, ptr to const char("_close"));
+  if LFound <> nil then
+    LClose := FdIntFn(LFound);
+    LOk := LClose(DoRealFileOf(AUserData)) = 0;
+  end;
+  SetCErrno(LError);
+  return LOk;
+end;
+
+// The lowio text state of ucrt's _setmode answer AMode (the old mode of a number), as the
+// number's own: _O_BINARY none; _O_TEXT ANSI; _O_U8TEXT UTF-8; _O_WTEXT / _O_U16TEXT UTF-16.
+// _tm_unicode is set for a Unicode text mode, as the open that asked it sets it
+routine DoTextStateOf(const AMode: int32; var AState: HookLowState);
+begin
+  AState.Text := AMode <> _O_BINARY;
+  AState.LowText := HookLowText.Ansi;
+  if AMode = _O_U8TEXT then
+    AState.LowText := HookLowText.Utf8;
+  end;
+  if (AMode = _O_WTEXT) or (AMode = _O_U16TEXT) then
+    AState.LowText := HookLowText.Utf16;
+  end;
+  AState.WideText := AState.Text and (AState.LowText <> HookLowText.Ansi);
+end;
+
+// The open file description of descriptor ASource, a file ucrt opened itself, made one a
+// handle's number runs on (_dup2 of ASource onto it): an internal Description handle (Real,
+// never in the open list, closed with its last user) whose IO is RealFile (DoRealFile*), a
+// duplicate ucrt's _dup makes of ASource (the same OS file object: its file pointer shared)
+// set binary, so ucrt hands the bytes as they are and the number's text mode is the model's;
+// Pipe when the file is no disk file (GetFileType: a pipe, a console), its place the OS
+// file pointer; on its own stream lock, Users 1. AState: the lowio state _dup2 gives the
+// number, ASource's text mode (_setmode's answer, DoTextStateOf), read and write rights (the
+// OS handle refuses what it lacks, ucrt's EBADF), no append of the model's (a FAPPEND rides
+// the duplicate: ucrt's _write goes to the end itself), no Ctrl-Z end or CRLF seen yet. nil
+// with errno: ASource not open EBADF (ucrt's _dup ran the handler), no number left EMFILE,
+// ENOMEM; nothing is left open then
+routine DoRealDescription(const ASource: int32; var AState: HookLowState): ptr to HookHandle;
+var
+  LDesc: ptr to HookHandle;
+  LFound: ptr;
+  LDup: FdIntFn;
+  LSetmode: SetmodeFn;
+  LOsfhandle: FdInt64Fn;
+  LInterface: IOInterface;
+  LStream: IO;
+  LLock: ptr to HookStreamLock;
+  LFile: int32;
+  LOldMode: int32;
+  LOs: int64;
+  LPipe: bool;
+  LAt: int64;
+begin
+  LFound := DoReal(GRealDup, ptr to const char("_dup"));
+  if LFound = nil then
+    return nil;
+  end;
+  LDup := FdIntFn(LFound);
+  LFile := LDup(ASource);
+  if LFile < 0 then
+    return nil;
+  end;
+  LFound := DoReal(GRealSetmode, ptr to const char("_setmode"));
+  LOldMode := -1;
+  if LFound <> nil then
+    LSetmode := SetmodeFn(LFound);
+    LOldMode := LSetmode(LFile, _O_BINARY);
+  end;
+  LOs := -1;
+  if LOldMode <> -1 then
+    LFound := DoReal(GRealGetOsfhandle, ptr to const char("_get_osfhandle"));
+    if LFound <> nil then
+      LOsfhandle := FdInt64Fn(LFound);
+      LOs := LOsfhandle(LFile);
+    end;
+  end;
+  if (LOldMode = -1) or (LOs = -1) then
+    DoCloseReserved(LFile);
+    return nil;
+  end;
+  LPipe := GetFileType(uint64(LOs)) <> FILE_TYPE_DISK;
+  LInterface.Read := DoRealFileRead;
+  LInterface.Write := DoRealFileWrite;
+  LInterface.Seek := DoRealFileSeek;
+  LInterface.Tell := DoRealFileTell;
+  LInterface.Size := DoRealFileSize;
+  LInterface.Flush := nil;
+  LInterface.Close := DoRealFileClose;
+  LInterface.Truncate := DoRealFileTruncate;
+  LStream := CreateIO(LInterface, ptr(uint64(int64(LFile))));
+  LLock := HookIOOwnLock();
+  create(LDesc);
+  if (LStream = nil) or (LLock = nil) or (LDesc = nil) then
+    // The IO's close closes the duplicate; without an IO it is closed here
+    if LStream <> nil then
+      IOClose(LStream);
+    else
+      DoCloseReserved(LFile);
+    end;
+    HookIOReleaseLock(LLock);
+    if LDesc <> nil then
+      destroy(LDesc);
+    end;
+    SetCErrno(ADAM_ERRNO_ENOMEM);
+    return nil;
+  end;
+  LDesc->Users := 1;
+  LDesc->Description := true;
+  LDesc->Base.Stream := LStream;
+  LDesc->Base.Owned := true;
+  LDesc->Base.Lock := LLock;
+  LDesc->Mode := FileMode.ReadWrite;
+  LDesc->Pipe := LPipe;
+  if not LPipe then
+    LAt := IOTell(LStream);
+    if LAt >= 0 then
+      LDesc->Base.Position := LAt;
+    end;
+  end;
+  LDesc->Descriptor := -1;
+  LDesc->DescriptorOwned := false;
+  LDesc->DescriptorClosed := false;
+  LDesc->Real := true;
+  LDesc->RealFile := LFile;
+  AState.Mode := FileMode.ReadWrite;
+  AState.Appending := false;
+  DoTextStateOf(LOldMode, AState);
+  AState.Pipe := LPipe;
+  AState.LowEof := false;
+  AState.LowCrlf := false;
+  return LDesc;
+end;
+
+// True when number handle AHandle is held by a FILE: a FILE's own number (fileno's: not a
+// lowio open's or a dup's), or a number an open _fdopen FILE rides (Low) (the caller holds
+// AHandle's stream lock, which an _fdopen FILE shares)
+routine DoNumberHeld(const AHandle: ptr to HookHandle): bool;
+var
+  LI: int64;
+begin
+  if not AHandle->DescriptorOwned then
+    return true;
+  end;
+  lock (GLock) do
+    for LI := 0 to len(GHandles) - 1 do
+      if (GHandles[LI]->Low = AHandle) and (not GHandles[LI]->Closed) then
+        return true;
+      end;
+    end;
+  end;
+  return false;
+end;
+
+// Number handle AHandle's number taken out of GDescriptors without closing it (ucrt's _dup2
+// put a real file there, which is ucrt's own from here): AHandle holds no number (the caller
+// holds its stream lock)
+routine DoUnlistNumberLocked(const AHandle: ptr to HookHandle);
+var
+  LAt: int64;
+  LCount: int64;
+  LI: int64;
+begin
+  lock (GLock) do
+    LAt := DoNumberAtLocked(AHandle->Descriptor);
+    if LAt >= 0 then
+      LCount := len(GDescriptors);
+      LI := LAt;
+      while LI < LCount - 1 do
+        GDescriptors[LI] := GDescriptors[LI + 1];
+        LI := LI + 1;
+      end;
+      setlength(GDescriptors, LCount - 1);
+      atomicadd(GDescriptorCount, -1);
+    end;
+    AHandle->Descriptor := -1;
+    AHandle->DescriptorOwned := false;
+    AHandle->DescriptorClosed := false;
+  end;
+end;
+
+// _dup2 of descriptor ASource that is no handle's (a file ucrt opened itself, or a number that
+// is not open) onto ATarget when ATarget is a handle's number (dup2.cpp). False: ATarget is no
+// handle's (ucrt's own). True: AResult 0, or -1 with ucrt's errno and nothing changed (a
+// source that is not open EBADF, the handler run once; no number left for the description's
+// duplicate EMFILE; ENOMEM). ucrt's _dup2 closes ATarget's reservation and puts ASource's file
+// there: a number a FILE holds (DoNumberHeld) follows that file (DoFollowNumber onto
+// DoRealDescription's description: a FILE's buffer kept, it and an _fdopen FILE riding the
+// number read and write the real file from here, its file pointer shared with ASource); a
+// lowio-only number (an open's or a dup's no FILE rides) is given back to ucrt: unlisted
+// (DoUnlistNumberLocked) and its handle closed, the number ucrt's own real file from here. A
+// success leaves errno as it was
+routine DoFdDup2Onto(const ASource: int32; const ATarget: int32; var AResult: int32): bool;
+var
+  LTarget: ptr to HookHandle;
+  LDesc: ptr to HookHandle;
+  LState: HookLowState;
+  LFound: ptr;
+  LReal: Dup2Fn;
+  LPut: int32;
+  LError: int32;
+  LClosed: int32;
+  LHeld: bool;
+begin
+  AResult := -1;
+  LTarget := DoFindDescriptor(ATarget);
+  if LTarget = nil then
+    return false;
+  end;
+  LError := CErrno();
+  // Made before ucrt's _dup2 so a failure leaves the number as it was (a source that is not
+  // open fails here, ucrt's handler run by its _dup)
+  LDesc := DoRealDescription(ASource, LState);
+  if LDesc = nil then
+    DoReleaseHandle(LTarget);
+    return true;
+  end;
+  LPut := -1;
+  LHeld := false;
+  lock (LTarget->Base.Lock->Lock) do
+    DoJoinLocked(LTarget);
+    defer DoPartLocked(LTarget);
+    LHeld := DoNumberHeld(LTarget);
+    LFound := DoReal(GRealDup2, ptr to const char("_dup2"));
+    if LFound <> nil then
+      LReal := Dup2Fn(LFound);
+      LPut := LReal(ASource, ATarget);
+    end;
+    if (LPut = 0) and (not LHeld) then
+      DoUnlistNumberLocked(LTarget);
+    end;
+  end;
+  if (LPut = 0) and LHeld then
+    // The description's one user is the number's from here
+    DoFollowNumber(LTarget, LDesc, LState);
+  else
+    DoReleaseHandle(LDesc);
+  end;
+  if LPut = 0 then
+    if not LHeld then
+      // The open list's handle (a lowio open's or a dup's); a close that raced this one took
+      // it first
+      DoClose(ptr(LTarget), LClosed);
+    end;
+    AResult := 0;
+    SetCErrno(LError);
+  end;
+  DoReleaseHandle(LTarget);
+  return true;
+end;
+
 // _dup2 of descriptor ASource onto ATarget when ASource is a handle's (dup2.cpp). False:
-// ASource is no handle's (ucrt's own; a real source onto a handle's number is LX3d3e3a3's). True:
+// ASource is no handle's (ucrt's own, or DoFdDup2Onto's when ATarget is a handle's). True:
 // AResult 0, or -1 with errno: a closed source EBADF, then a target outside [0, _NHANDLE_)
 // EBADF (ucrt's parameter checks in that order, the handler run); the same number 0 with
 // nothing done. A target that is a handle's number follows the source (DoFollowNumber: its own
@@ -10373,7 +10894,7 @@ var
   LFound: ptr;
   LReal: FstatFn;
 begin
-  if DoFdStat(AFile, ABuf, AKind, LResult) then
+  if DoFdStat(AFile, ABuf, AKind, ASlot, AName, LResult) then
     return LResult;
   end;
   LFound := DoReal(ASlot, AName);
@@ -10505,7 +11026,7 @@ begin
 end;
 
 // _dup2 (mingw's oldnames dup2 reaches it too): a handle's descriptor onto ATarget
-// (DoFdDup2), else ucrt's
+// (DoFdDup2), any other onto a handle's number (DoFdDup2Onto), else ucrt's
 public routine _dup2(const AFile: int32; const ATarget: int32): int32;
 var
   LResult: int32;
@@ -10513,6 +11034,9 @@ var
   LReal: Dup2Fn;
 begin
   if DoFdDup2(AFile, ATarget, LResult) then
+    return LResult;
+  end;
+  if DoFdDup2Onto(AFile, ATarget, LResult) then
     return LResult;
   end;
   LFound := DoReal(GRealDup2, ptr to const char("_dup2"));
