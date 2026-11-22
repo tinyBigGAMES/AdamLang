@@ -1,0 +1,549 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  std_hookio_unseekable_linux.adam - a HookIO handle on an IO that cannot seek
+  (no Seek callback) behaves as glibc's FILE on a real pipe (PLAN-LINUX64
+  LX3d3c3y): each case runs the same steps on a real pipe (pipe + fdopen,
+  glibc's own FILE, which the hooks hand to glibc) holding the same bytes,
+  and the two transcripts (every value, errno and ftell) must match: fseek /
+  ftell (every lseek of a pipe ESPIPE, whatever the target), reads with seeks
+  between them, a read past the buffer (glibc reads it straight into the
+  caller's array), byte and wide scans (the bytes the scan's stand-in looked
+  ahead at are read once from the pipe and kept for the stream's next
+  reads), and writes ("w" and "a": the bytes the pipe gets). The model's
+  pipe also gives its bytes a few at a time (chunked), as a real pipe may.
+  The pinned no-data table is checked too.
+*******************************************************************************/
+
+/*
+@@test
+  kind run
+  targets x86_64-linux-gnu
+  exitcode 0
+  | ok seek
+  | ok seek pinned
+  | ok read
+  | ok read chunked
+  | ok fast track
+  | ok set in buffer
+  | ok set past buffer
+  | ok big read
+  | ok big read chunked
+  | ok scan
+  | ok scan chunked
+  | ok wide scan
+  | ok wide scan chunked
+  | ok write w
+  | ok write a
+  | done 0
+  | [Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+@@end
+*/
+
+module exe std_hookio_unseekable_linux;
+
+@addlibrarypath "$P:res/tests/std/fixtures/x86_64-linux-gnu";
+
+import System.SysUtils, System.Runtime, System.CustomIO, System.HookIO, System.HookIO.Linux64;
+
+routine pipe(const AFds: ptr to int32): int32; external "c";
+routine fdopen(const AFd: int32; const AMode: ptr to const char): ptr; external "c";
+routine write(const AFd: int32; const AData: ptr to const; const ASize: uint64): int64;
+  external "c";
+routine read(const AFd: int32; const AData: ptr; const ASize: uint64): int64; external "c";
+routine close(const AFd: int32): int32; external "c";
+routine clink std_hookio_c_fscanf_file(AFile: ptr; AValue: ptr to int32): int32;
+  external "std_hookio_c";
+
+const
+  ADAM_TEST_DATA: string = "ab\ncd\nefgh";
+  ADAM_TEST_SCAN: string = "12 34";
+  ADAM_TEST_BIG: int64 = 6000;
+  ADAM_TEST_BIG_READ: int64 = 5000;
+  ADAM_TEST_WEOF: uint32 = 0xFFFFFFFFu;
+
+type
+  // The model's pipe: Data read from Place on, at most Chunk bytes per read (0: no limit);
+  // Written collects what a write gives it
+  Feed = record
+    Data: array of uint8;
+    Place: int64;
+    Chunk: int64;
+    Written: array of uint8;
+  end;
+
+  // A case's steps, run on one FILE
+  Steps = choices(Seek, Read, FastTrack, SetInBuffer, SetPastBuffer, Big, Scan, WideScan);
+
+var
+  GFails: int32;
+
+routine Check(const AName: string; const AOk: bool);
+begin
+  if AOk then
+    println("ok {}", AName);
+  else
+    println("FAIL {}", AName);
+    GFails := GFails + 1;
+  end;
+end;
+
+routine FeedRead(const AUserData: ptr; const ABuffer: ptr; const ASize: int64;
+  var AState: IOState): int64;
+var
+  LFeed: ptr to Feed;
+  LOut: ptr to uint8;
+  LCount: int64;
+  LMost: int64;
+begin
+  LFeed := ptr to Feed(AUserData);
+  LOut := ptr to uint8(ABuffer);
+  LMost := ASize;
+  if (LFeed->Chunk > 0) and (LMost > LFeed->Chunk) then
+    LMost := LFeed->Chunk;
+  end;
+  LCount := 0;
+  while (LCount < LMost) and (LFeed->Place < len(LFeed->Data)) do
+    LOut[LCount] := LFeed->Data[LFeed->Place];
+    LFeed->Place := LFeed->Place + 1;
+    LCount := LCount + 1;
+  end;
+  if LCount = 0 then
+    AState := IOState.Eof;
+  end;
+  return LCount;
+end;
+
+routine FeedWrite(const AUserData: ptr; const ABuffer: ptr to const; const ASize: int64;
+  var AState: IOState): int64;
+var
+  LFeed: ptr to Feed;
+  LIn: ptr to const uint8;
+  LAt: int64;
+  LI: int64;
+begin
+  LFeed := ptr to Feed(AUserData);
+  LIn := ptr to const uint8(ABuffer);
+  LAt := len(LFeed->Written);
+  setlength(LFeed->Written, LAt + ASize);
+  for LI := 0 to ASize - 1 do
+    LFeed->Written[LAt + LI] := LIn[LI];
+  end;
+  return ASize;
+end;
+
+// The bytes of AText
+routine Bytes(const AText: string): array of uint8;
+var
+  LBytes: array of uint8;
+  LI: int64;
+begin
+  setlength(LBytes, len(AText));
+  for LI := 0 to len(AText) - 1 do
+    LBytes[LI] := uint8(AText[LI]);
+  end;
+  return LBytes;
+end;
+
+// ADAM_TEST_BIG bytes, 'a' to 'z' over and over
+routine BigBytes(): array of uint8;
+var
+  LBytes: array of uint8;
+  LI: int64;
+begin
+  setlength(LBytes, ADAM_TEST_BIG);
+  for LI := 0 to ADAM_TEST_BIG - 1 do
+    LBytes[LI] := uint8(97 + (LI mod 26));
+  end;
+  return LBytes;
+end;
+
+// ABytes as text, each byte a number
+routine Show(const ABytes: array of uint8): string;
+var
+  LText: string;
+  LI: int64;
+begin
+  LText := "[";
+  for LI := 0 to len(ABytes) - 1 do
+    LText := LText + IntToStr(ABytes[LI]) + " ";
+  end;
+  return LText + "]";
+end;
+
+routine TellStep(const AFile: ptr): string;
+var
+  LTell: clong;
+begin
+  SetCErrno(0);
+  LTell := ftell(AFile);
+  return FormatStr("tell {} {}; ", LTell, CErrno());
+end;
+
+routine SeekStep(const AFile: ptr; const AOffset: clong; const AOrigin: int32): string;
+var
+  LSeek: int32;
+begin
+  SetCErrno(0);
+  LSeek := fseek(AFile, AOffset, AOrigin);
+  return FormatStr("seek({}, {}) {} {}; ", AOffset, AOrigin, LSeek, CErrno()) + TellStep(AFile);
+end;
+
+routine GetStep(const AFile: ptr): string;
+var
+  LChar: int32;
+begin
+  LChar := fgetc(AFile);
+  return FormatStr("get {}; ", LChar) + TellStep(AFile);
+end;
+
+// Every byte left, then feof / ferror
+routine RestStep(const AFile: ptr): string;
+var
+  LText: string;
+  LChar: int32;
+begin
+  LText := "rest";
+  LChar := fgetc(AFile);
+  while LChar <> -1 do
+    LText := LText + " " + IntToStr(LChar);
+    LChar := fgetc(AFile);
+  end;
+  return LText + FormatStr("; eof {} err {}; ", feof(AFile) <> 0, ferror(AFile) <> 0) +
+    TellStep(AFile);
+end;
+
+// Every wide character left, then feof / ferror
+routine RestWideStep(const AFile: ptr): string;
+var
+  LText: string;
+  LChar: uint32;
+begin
+  LText := "rest wide";
+  LChar := fgetwc(AFile);
+  while LChar <> ADAM_TEST_WEOF do
+    LText := LText + " " + IntToStr(int64(LChar));
+    LChar := fgetwc(AFile);
+  end;
+  return LText + FormatStr("; eof {} err {}; ", feof(AFile) <> 0, ferror(AFile) <> 0) +
+    TellStep(AFile);
+end;
+
+// A read of ADAM_TEST_BIG_READ bytes (past the buffer: glibc reads it into the caller's array),
+// then the count and sum of the rest
+routine BigStep(const AFile: ptr): string;
+var
+  LBuffer: array of uint8;
+  LGot: int64;
+  LSum: int64;
+  LI: int64;
+  LCount: int64;
+  LChar: int32;
+begin
+  setlength(LBuffer, ADAM_TEST_BIG_READ);
+  LGot := fread(addr of LBuffer[0], 1, ADAM_TEST_BIG_READ, AFile);
+  LSum := 0;
+  for LI := 0 to LGot - 1 do
+    LSum := LSum + LBuffer[LI];
+  end;
+  LCount := 0;
+  LChar := fgetc(AFile);
+  while LChar <> -1 do
+    LCount := LCount + 1;
+    LSum := LSum + LChar;
+    LChar := fgetc(AFile);
+  end;
+  return FormatStr("big {} rest {} sum {}; eof {}; ", LGot, LCount, LSum, feof(AFile) <> 0) +
+    TellStep(AFile);
+end;
+
+// Two wide scans of %d, then every wide character left
+routine WideScanStep(const AFile: ptr): string;
+var
+  LFormat: array[0..2] of uint32;
+  LValue: int32;
+  LScan: int32;
+  LText: string;
+begin
+  LFormat[0] := 0x25u;
+  LFormat[1] := 0x64u;
+  LFormat[2] := 0u;
+  LValue := 77;
+  SetCErrno(0);
+  LScan := fwscanf(AFile, addr of LFormat[0], addr of LValue);
+  LText := FormatStr("wscan {} {} {}; ", LScan, LValue, CErrno()) + TellStep(AFile);
+  LValue := 77;
+  LScan := fwscanf(AFile, addr of LFormat[0], addr of LValue);
+  LText := LText + FormatStr("wscan {} {}; ", LScan, LValue) + TellStep(AFile);
+  return LText + RestWideStep(AFile);
+end;
+
+// The steps of ASteps on a reading AFile
+routine ReadSteps(const AFile: ptr; const ASteps: Steps): string;
+var
+  LText: string;
+  LBuffer: array[0..15] of uint8;
+  LGot: int64;
+  LValue: int32;
+  LScan: int32;
+begin
+  LText := "";
+  if ASteps = Steps.Seek then
+    LText := SeekStep(AFile, 0, 2) + SeekStep(AFile, 5, 0) + SeekStep(AFile, 3, 1) +
+      SeekStep(AFile, -2, 2) + SeekStep(AFile, -9, 0);
+    return LText;
+  end;
+  if ASteps = Steps.Big then
+    return BigStep(AFile);
+  end;
+  if ASteps = Steps.WideScan then
+    return WideScanStep(AFile);
+  end;
+  if ASteps = Steps.Scan then
+    LValue := 77;
+    SetCErrno(0);
+    LScan := std_hookio_c_fscanf_file(AFile, addr of LValue);
+    LText := FormatStr("scan {} {} {}; ", LScan, LValue, CErrno()) + TellStep(AFile);
+    LValue := 77;
+    LScan := std_hookio_c_fscanf_file(AFile, addr of LValue);
+    LText := LText + FormatStr("scan {} {}; ", LScan, LValue) + TellStep(AFile);
+    return LText + RestStep(AFile);
+  end;
+  LText := GetStep(AFile);
+  if ASteps = Steps.Read then
+    LGot := fread(addr of LBuffer[0], 1, 3, AFile);
+    LText := LText + FormatStr("fread {} {} {} {}; ", LGot, LBuffer[0], LBuffer[1], LBuffer[2]) +
+      TellStep(AFile);
+    LText := LText + SeekStep(AFile, 0, 0) + GetStep(AFile) + SeekStep(AFile, 2, 1) +
+      GetStep(AFile) + SeekStep(AFile, 0, 2) + GetStep(AFile);
+  end;
+  if ASteps = Steps.FastTrack then
+    LText := LText + SeekStep(AFile, 0, 1) + GetStep(AFile);
+  end;
+  if ASteps = Steps.SetInBuffer then
+    LText := LText + SeekStep(AFile, 0, 0) + GetStep(AFile);
+  end;
+  if ASteps = Steps.SetPastBuffer then
+    LText := LText + SeekStep(AFile, 20, 0) + GetStep(AFile);
+  end;
+  return LText + RestStep(AFile);
+end;
+
+// The steps of a writing AFile; the bytes written are the caller's to read
+routine WriteSteps(const AFile: ptr): string;
+var
+  LText: string;
+  LLine: ptr to char;
+begin
+  LLine := StringToC("hi\nyo");
+  LText := FormatStr("puts {}; ", fputs(LLine, AFile) >= 0) + TellStep(AFile);
+  LText := LText + FormatStr("flush {}; ", fflush(AFile)) + TellStep(AFile);
+  LText := LText + SeekStep(AFile, 3, 0);
+  LText := LText + FormatStr("puts {}; ", fputs(LLine, AFile) >= 0) + TellStep(AFile);
+  freemem(LLine);
+  return LText;
+end;
+
+// A case on a real pipe: its read end opened "r" after AData was written and the write end
+// closed (Seek keeps the write end open with nothing written)
+routine RealRead(const AData: array of uint8; const ASteps: Steps): string;
+var
+  LFds: array[0..1] of int32;
+  LMode: ptr to char;
+  LPipe: ptr;
+  LText: string;
+begin
+  if pipe(addr of LFds[0]) <> 0 then
+    return "no pipe";
+  end;
+  if ASteps <> Steps.Seek then
+    if len(AData) > 0 then
+      write(LFds[1], addr of AData[0], uint64(len(AData)));
+    end;
+    close(LFds[1]);
+  end;
+  LMode := StringToC("r");
+  LPipe := fdopen(LFds[0], LMode);
+  freemem(LMode);
+  if LPipe = nil then
+    return "no fdopen";
+  end;
+  LText := ReadSteps(LPipe, ASteps);
+  fclose(LPipe);
+  if ASteps = Steps.Seek then
+    close(LFds[1]);
+  end;
+  return LText;
+end;
+
+// A registered IO over AFeed (Read, and Write when AWrites; never Seek / Tell / Size), opened in
+// AMode; nil when the open failed
+routine OpenFeed(const AFeed: ptr to Feed; const AWrites: bool; const AMode: string;
+  var AIO: IO; var APrefix: string): ptr;
+var
+  LCallbacks: IOInterface;
+  LName: ptr to char;
+  LMode: ptr to char;
+  LFile: ptr;
+begin
+  LCallbacks.Read := FeedRead;
+  if AWrites then
+    LCallbacks.Write := FeedWrite;
+  end;
+  AIO := CreateIO(LCallbacks, ptr(AFeed));
+  APrefix := RegisterIO(AIO);
+  LName := StringToC(APrefix + "/pipe");
+  LMode := StringToC(AMode);
+  LFile := fopen(LName, LMode);
+  freemem(LName);
+  freemem(LMode);
+  return LFile;
+end;
+
+routine CloseFeed(const AFile: ptr; const AIO: IO; const APrefix: string);
+begin
+  if AFile <> nil then
+    fclose(AFile);
+  end;
+  UnregisterIO(APrefix);
+  IOClose(AIO);
+end;
+
+// The same case on the model, its pipe giving at most AChunk bytes a read (0: all it holds)
+routine ModelRead(const AData: array of uint8; const AChunk: int64; const ASteps: Steps): string;
+var
+  LFeed: Feed;
+  LIO: IO;
+  LPrefix: string;
+  LFile: ptr;
+  LText: string;
+begin
+  LFeed.Data := AData;
+  LFeed.Place := 0;
+  LFeed.Chunk := AChunk;
+  LFile := OpenFeed(addr of LFeed, false, "r", LIO, LPrefix);
+  LText := "no open";
+  if LFile <> nil then
+    LText := ReadSteps(LFile, ASteps);
+  end;
+  CloseFeed(LFile, LIO, LPrefix);
+  return LText;
+end;
+
+// A read case on both; the two transcripts must match
+routine Both(const AName: string; const AData: array of uint8; const AChunk: int64;
+  const ASteps: Steps);
+var
+  LReal: string;
+  LModel: string;
+begin
+  LReal := RealRead(AData, ASteps);
+  LModel := ModelRead(AData, AChunk, ASteps);
+  Check(AName, LReal = LModel);
+  if LReal <> LModel then
+    println("  real  {}", LReal);
+    println("  model {}", LModel);
+  end;
+end;
+
+// A write case in AMode on both: the transcripts, then the bytes the pipe got
+routine BothWrite(const AName: string; const AMode: string);
+var
+  LFds: array[0..1] of int32;
+  LModeC: ptr to char;
+  LPipe: ptr;
+  LReal: string;
+  LGot: array[0..63] of uint8;
+  LCount: int64;
+  LRealBytes: array of uint8;
+  LI: int64;
+  LFeed: Feed;
+  LIO: IO;
+  LPrefix: string;
+  LFile: ptr;
+  LModel: string;
+begin
+  LReal := "no pipe";
+  if pipe(addr of LFds[0]) = 0 then
+    LModeC := StringToC(AMode);
+    LPipe := fdopen(LFds[1], LModeC);
+    freemem(LModeC);
+    LReal := "no fdopen";
+    if LPipe <> nil then
+      LReal := WriteSteps(LPipe);
+      fclose(LPipe);
+    else
+      close(LFds[1]);
+    end;
+    LCount := read(LFds[0], addr of LGot[0], 64);
+    close(LFds[0]);
+    if LCount > 0 then
+      setlength(LRealBytes, LCount);
+      for LI := 0 to LCount - 1 do
+        LRealBytes[LI] := LGot[LI];
+      end;
+    end;
+    LReal := LReal + Show(LRealBytes);
+  end;
+  LFeed.Place := 0;
+  LFeed.Chunk := 0;
+  LFile := OpenFeed(addr of LFeed, true, AMode, LIO, LPrefix);
+  LModel := "no open";
+  if LFile <> nil then
+    LModel := WriteSteps(LFile);
+    fclose(LFile);
+    LFile := nil;
+    LModel := LModel + Show(LFeed.Written);
+  end;
+  CloseFeed(LFile, LIO, LPrefix);
+  Check(AName, LReal = LModel);
+  if LReal <> LModel then
+    println("  real  {}", LReal);
+    println("  model {}", LModel);
+  end;
+end;
+
+var
+  GData: array of uint8;
+  GBig: array of uint8;
+  GScan: array of uint8;
+  GNone: array of uint8;
+
+begin
+  GData := Bytes(ADAM_TEST_DATA);
+  GBig := BigBytes();
+  GScan := Bytes(ADAM_TEST_SCAN);
+  Both("seek", GNone, 0, Steps.Seek);
+  // The pinned no-data table (glibc 2.35 / 2.39): every lseek of a pipe is ESPIPE (29), so
+  // every fseek and ftell fails, whatever the target
+  Check("seek pinned", ModelRead(GNone, 0, Steps.Seek) =
+    "seek(0, 2) -1 29; tell -1 29; seek(5, 0) -1 29; tell -1 29; seek(3, 1) -1 29; " +
+    "tell -1 29; seek(-2, 2) -1 29; tell -1 29; seek(-9, 0) -1 29; tell -1 29; ");
+  Both("read", GData, 0, Steps.Read);
+  Both("read chunked", GData, 3, Steps.Read);
+  Both("fast track", GData, 0, Steps.FastTrack);
+  Both("set in buffer", GData, 0, Steps.SetInBuffer);
+  Both("set past buffer", GData, 0, Steps.SetPastBuffer);
+  Both("big read", GBig, 0, Steps.Big);
+  Both("big read chunked", GBig, 700, Steps.Big);
+  Both("scan", GScan, 0, Steps.Scan);
+  Both("scan chunked", GScan, 2, Steps.Scan);
+  Both("wide scan", GScan, 0, Steps.WideScan);
+  Both("wide scan chunked", GScan, 2, Steps.WideScan);
+  BothWrite("write w", "w");
+  BothWrite("write a", "a");
+  println("done {}", GFails);
+  ExitCode := GFails;
+end.

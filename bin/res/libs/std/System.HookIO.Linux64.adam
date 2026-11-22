@@ -74,7 +74,11 @@
   so after one too) leaves put mode first, as an fseek would, so the ungot
   byte is read, then the IO from the caller's place. A seek the IO refuses
   is EINVAL (a target the IO does not allow, past a fixed IO's end) or,
-  for an IO that cannot seek at all, ESPIPE.
+  for an IO that cannot seek at all, ESPIPE. An IO that cannot seek (no
+  Seek callback) is a pipe / FIFO as glibc meets one: every lseek ESPIPE
+  whatever the target, reads and writes in order at the IO's own place,
+  and the bytes a scan looks ahead at read once and kept for the stream's
+  next reads (a pipe gives no byte twice).
 
   A wide stream (fwide > 0, a wide call on an unoriented one, or a ccs=
   open) runs on a model of glibc's wide libio as its sources state it
@@ -359,7 +363,11 @@ type
   // (O_RDONLY, O_WRONLY, O_RDWR by the mode); Appending: O_APPEND (every write lands at the
   // IO's end). Closed: fclose ran. Path: the path the handle opened (freopen with no path opens
   // it again). Users: the open list and every call that found the handle; the last one frees
-  // it. Io: glibc's FILE state (HookLibio). Wide: a wide stream's _wide_data and conversion
+  // it. Io: glibc's FILE state (HookLibio). Wide: a wide stream's _wide_data and conversion.
+  // Pipe: the IO cannot seek (IOCanSeek false at the open), a pipe / FIFO: read(2) and write(2)
+  // go to the IO at its own place, lseek(2) is ESPIPE. Replay / ReplayNext: on a Pipe handle the
+  // bytes a scan's look ahead read from the IO (DoPeekIO) and the descriptor's own reads have
+  // not taken yet, from ReplayNext on (DoSysRead takes them before the IO)
   HookHandle = record
     Head: _IO_FILE;
     Base: HookStream;
@@ -367,6 +375,9 @@ type
     Writable: bool;
     Appending: bool;
     Closed: bool;
+    Pipe: bool;
+    Replay: array of uint8;
+    ReplayNext: int64;
     Path: string;
     Users: int64;
     Io: HookLibio;
@@ -854,9 +865,13 @@ end;
 // --- the descriptor: glibc's read / write / lseek / fstat, on the handle's IO ---------------
 
 // Moves the IO to the handle's Position: another handle on the same IO may have left it
-// elsewhere. False: the IO cannot go there
+// elsewhere. False: the IO cannot go there. A Pipe handle's IO has only its own place, where
+// every read and write lands (true)
 routine DoSyncLocked(const AHandle: ptr to HookHandle): bool;
 begin
+  if AHandle->Pipe then
+    return true;
+  end;
   if IOTell(AHandle->Base.Stream) = AHandle->Base.Position then
     return true;
   end;
@@ -864,8 +879,30 @@ begin
     AHandle->Base.Position;
 end;
 
+// A Pipe handle's Replay bytes, up to ASize, moved into AData (the count): a pipe's read(2)
+// hands out what it holds, so a short count is a whole read
+routine DoTakeReplay(const AHandle: ptr to HookHandle; const AData: uint64; const ASize: int64): int64;
+var
+  LOut: ptr to uint8;
+  LCount: int64;
+begin
+  LOut := ptr to uint8(AData);
+  LCount := 0;
+  while (LCount < ASize) and (AHandle->ReplayNext < len(AHandle->Replay)) do
+    LOut[LCount] := AHandle->Replay[AHandle->ReplayNext];
+    AHandle->ReplayNext := AHandle->ReplayNext + 1;
+    LCount := LCount + 1;
+  end;
+  if AHandle->ReplayNext >= len(AHandle->Replay) then
+    setlength(AHandle->Replay, 0);
+    AHandle->ReplayNext := 0;
+  end;
+  return LCount;
+end;
+
 // read(2) of up to ASize bytes into AData at the descriptor's place: the count (0 at the end),
-// or -1 with errno: a descriptor opened without read rights EBADF, an IO that cannot read EIO
+// or -1 with errno: a descriptor opened without read rights EBADF, an IO that cannot read EIO.
+// A Pipe handle reads its Replay bytes first, then the IO in order
 routine DoSysRead(const AHandle: ptr to HookHandle; const AData: uint64; const ASize: int64): int64;
 var
   LGot: int64;
@@ -881,7 +918,11 @@ begin
     SetCErrno(ADAM_ERRNO_EIO);
     return -1;
   end;
-  LGot := IORead(AHandle->Base.Stream, ptr(AData), ASize);
+  if AHandle->Pipe and (AHandle->ReplayNext < len(AHandle->Replay)) then
+    LGot := DoTakeReplay(AHandle, AData, ASize);
+  else
+    LGot := IORead(AHandle->Base.Stream, ptr(AData), ASize);
+  end;
   if LGot < 0 then
     LGot := 0;
   end;
@@ -907,7 +948,8 @@ begin
   if ASize <= 0 then
     return 0;
   end;
-  if AHandle->Appending then
+  // O_APPEND on a pipe changes nothing: every write lands after the last
+  if AHandle->Appending and (not AHandle->Pipe) then
     LEnd := IOSeek(AHandle->Base.Stream, 0, SeekOrigin.FromEnd);
     if LEnd >= 0 then
       AHandle->Base.Position := LEnd;
@@ -943,6 +985,12 @@ var
   LEnd: int64;
   LGot: int64;
 begin
+  // A pipe / FIFO seeks nowhere, whatever the target (the kernel's no_llseek: ESPIPE before
+  // the offset is looked at)
+  if AHandle->Pipe then
+    SetCErrno(ESPIPE);
+    return -1;
+  end;
   LTarget := AOffset;
   if ADir = _IO_seek_cur then
     LTarget := AHandle->Base.Position + AOffset;
@@ -1015,6 +1063,54 @@ end;
 routine DoCopy(const ADest: uint64; const ASource: uint64; const ACount: int64);
 begin
   CopyBytes(ptr to uint8(ADest), ptr to const uint8(ASource), ACount);
+end;
+
+// A scan's look ahead: up to ASize bytes of the IO at APosition (the descriptor's place or
+// past it, read in order) into AData, the descriptor left where it is. A seekable IO is read
+// there. A Pipe handle's IO cannot give a byte twice: the bytes already looked at come from
+// Replay, new ones are read from the IO and kept in Replay for the descriptor's own reads
+// (DoSysRead). The count, 0 at the end, -1 when the IO failed
+routine DoPeekIO(const AHandle: ptr to HookHandle; const APosition: int64; const AData: uint64;
+  const ASize: int64): int64;
+var
+  LAt: int64;
+  LKept: int64;
+  LCount: int64;
+  LGot: int64;
+begin
+  if not AHandle->Pipe then
+    if IOSeek(AHandle->Base.Stream, APosition, SeekOrigin.FromStart) <> APosition then
+      return -1;
+    end;
+  else
+    // APosition as an index into Replay (ReplayNext is the descriptor's place)
+    LAt := AHandle->ReplayNext + (APosition - AHandle->Base.Position);
+    LKept := len(AHandle->Replay);
+    if (LAt < AHandle->ReplayNext) or (LAt > LKept) then
+      return -1;
+    end;
+    if LAt < LKept then
+      LCount := LKept - LAt;
+      if LCount > ASize then
+        LCount := ASize;
+      end;
+      DoCopy(AData, uint64(addr of AHandle->Replay[LAt]), LCount);
+      return LCount;
+    end;
+  end;
+  LGot := IORead(AHandle->Base.Stream, ptr(AData), ASize);
+  if LGot < 0 then
+    return -1;
+  end;
+  if (LGot = 0) and (IOStatus(AHandle->Base.Stream) <> IOState.Eof) then
+    return -1;
+  end;
+  if AHandle->Pipe and (LGot > 0) then
+    LKept := len(AHandle->Replay);
+    setlength(AHandle->Replay, LKept + LGot);
+    DoCopy(uint64(addr of AHandle->Replay[LKept]), AData, LGot);
+  end;
+  return LGot;
 end;
 
 // The 64-bit word at the address AAt
@@ -4283,15 +4379,8 @@ begin
       if LCookie->AtEnd or (not LCookie->Handle->Readable) then
         return 0;
       end;
-      if IOSeek(LCookie->Handle->Base.Stream, LCookie->Position, SeekOrigin.FromStart) <>
-        LCookie->Position then
-        return -1;
-      end;
-      LGot := IORead(LCookie->Handle->Base.Stream, ptr(ABuffer), LWant);
+      LGot := DoPeekIO(LCookie->Handle, LCookie->Position, uint64(ABuffer), LWant);
       if LGot < 0 then
-        return -1;
-      end;
-      if (LGot = 0) and (IOStatus(LCookie->Handle->Base.Stream) <> IOState.Eof) then
         return -1;
       end;
       LCookie->Position := LCookie->Position + LGot;
@@ -4426,10 +4515,8 @@ begin
     LPendingCount := LLeft;
     LPendingAt := 0;
     setlength(LPending, LPendingCount + ADAM_HOOKIO_BLOCK_SIZE);
-    LGot := -1;
-    if IOSeek(AHandle->Base.Stream, LPosition, SeekOrigin.FromStart) = LPosition then
-      LGot := IORead(AHandle->Base.Stream, ptr(addr of LPending[LPendingCount]), ADAM_HOOKIO_BLOCK_SIZE);
-    end;
+    LGot := DoPeekIO(AHandle, LPosition, uint64(addr of LPending[LPendingCount]),
+      ADAM_HOOKIO_BLOCK_SIZE);
     if LGot <= 0 then
       LAtEnd := true;
     else
@@ -5098,6 +5185,9 @@ begin
     DoFreeHandle(LHandle);
     return nil;
   end;
+  // An IO with no Seek callback is a pipe / FIFO to glibc: S_ISFIFO, lseek ESPIPE
+  LHandle->Pipe := not IOCanSeek(LHandle->Base.Stream);
+  LHandle->ReplayNext := 0;
   // A write-only appending open sends the descriptor to the end (the offset cache untouched:
   // _IO_file_open); "a+" stays at 0
   if LHandle->Appending and (not LHandle->Readable) then
@@ -5287,6 +5377,8 @@ begin
     LOk := false;
   end;
   AHandle->Base.Stream := nil;
+  setlength(AHandle->Replay, 0);
+  AHandle->ReplayNext := 0;
   DoFreeModel(AHandle);
   LIo->Flags := _IO_MAGIC | _IO_IS_FILEBUF | _IO_NO_READS | _IO_NO_WRITES | _IO_TIED_PUT_GET;
   LIo->Offset := ADAM_HOOKIO_POS_BAD;
