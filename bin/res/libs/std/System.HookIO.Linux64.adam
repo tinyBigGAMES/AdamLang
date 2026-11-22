@@ -134,8 +134,26 @@
   and no longer a handle. A real FILE reopened onto a virtual path is the C
   runtime's object and fails as glibc fails it (ENOENT). flockfile,
   funlockfile and ftrylockfile are nothing on a handle (0 from the try);
-  fileno is -1 with EBADF (no descriptor); pclose closes a handle as glibc's
-  pclose closes any stream (it is fclose). The query family (access, stat,
+  pclose closes a handle as glibc's pclose closes any stream (it is fclose).
+
+  A handle has a file descriptor as glibc's FILE has one: fileno answers a
+  number the kernel reserved for it (glibc's open of /dev/null, read-only,
+  closed on exec, so no other open gets the number while it is held), made
+  at its first fileno and given back at fclose. The descriptor family on
+  that number runs on the handle as the kernel runs it on the FILE's real
+  file (the libio model's own descriptor: the same place): read, pread,
+  write, pwrite, lseek (SEEK_SET / CUR / END), fstat (a regular file of the
+  IO's size, a FIFO for an IO that cannot seek), mmap (a private anonymous
+  mapping filled with the IO's bytes from the offset: a shared writable one
+  cannot reach the IO and is ENODEV) and close (then the descriptor's calls
+  and the stream's own reads, writes and seeks are EBADF, as glibc's are on
+  a closed _fileno, and fclose reports EOF with EBADF; the number stays
+  reserved until that fclose, so no other open meets the stream).
+  open and open64 (and _FORTIFY_SOURCE's __open_2 / __open64_2) of a
+  virtual path, or one the path source holds, open a handle as fopen would
+  (the kernel's O_* rules: O_CREAT / O_EXCL / O_TRUNC / O_APPEND, the
+  access mode's rights) and answer its descriptor; close(2) of it closes the
+  handle. Every other descriptor and path is glibc's. The query family (access, stat,
   stat64, lstat, lstat64 and glibc's __xstat / __xstat64 / __lxstat /
   __lxstat64) answers a virtual path as fopen would find it: a regular
   file, readable by all, writable as an "r+" open would be, never
@@ -182,7 +200,36 @@ const
   // errno.h (x86_64 glibc): what the runtime's set lacks
   ESPIPE: int32 = 29;
   EAGAIN: int32 = 11;
-  // sys/stat.h: a regular file, the read and write bits of owner, group and other
+  ENODEV: int32 = 19;
+  ENOTDIR: int32 = 20;
+  EMFILE: int32 = 24;
+  // fcntl.h (x86_64): open's access modes and the flags a virtual open reads
+  O_ACCMODE: int32 = 3;
+  O_RDONLY: int32 = 0;
+  O_WRONLY: int32 = 1;
+  O_RDWR: int32 = 2;
+  O_CREAT: int32 = 0x40;
+  O_EXCL: int32 = 0x80;
+  O_TRUNC: int32 = 0x200;
+  O_APPEND: int32 = 0x400;
+  O_DIRECTORY: int32 = 0x10000;
+  O_CLOEXEC: int32 = 0x80000;
+  O_TMPFILE: int32 = 0x410000;
+  // sys/mman.h: a mapping's write right, its sharing, an anonymous one, mmap's failure
+  // (MAP_FAILED, (void *) -1)
+  PROT_WRITE: int32 = 2;
+  MAP_SHARED: int32 = 1;
+  MAP_PRIVATE: int32 = 2;
+  MAP_ANONYMOUS: int32 = 0x20;
+  ADAM_HOOKIO_MAP_FAILED: uint64 = 18446744073709551615u;
+  // x86_64 Linux's page: an mmap offset is a multiple of it
+  ADAM_HOOKIO_PAGE_SIZE: int64 = 4096;
+  // The file a handle's descriptor is reserved on (glibc's open of it, read-only, closed on
+  // exec): the kernel hands out the number, so no other open ever gets it while it is held
+  ADAM_HOOKIO_RESERVE_PATH: string = "/dev/null";
+  // sys/stat.h: a FIFO (a handle on an IO that cannot seek), a regular file, the read and
+  // write bits of owner, group and other
+  S_IFIFO: uint32 = 0x1000u;
   S_IFREG: uint32 = 0x8000u;
   S_IRUSR: uint32 = 0x0100u;
   S_IWUSR: uint32 = 0x0080u;
@@ -367,7 +414,12 @@ type
   // Pipe: the IO cannot seek (IOCanSeek false at the open), a pipe / FIFO: read(2) and write(2)
   // go to the IO at its own place, lseek(2) is ESPIPE. Replay / ReplayNext: on a Pipe handle the
   // bytes a scan's look ahead read from the IO (DoPeekIO) and the descriptor's own reads have
-  // not taken yet, from ReplayNext on (DoSysRead takes them before the IO)
+  // not taken yet, from ReplayNext on (DoSysRead takes them before the IO).
+  // Descriptor: the handle's file descriptor (-1: none yet), a number the kernel reserved for
+  // it (ADAM_HOOKIO_RESERVE_PATH) at its first fileno or at the open(2) that made it, listed in
+  // GDescriptors while held; DescriptorOwned: open(2) made the handle (close(2) closes it);
+  // DescriptorClosed: close(2) ran on a fileno one (its calls and the stream's own system
+  // calls EBADF, as glibc's on a closed _fileno; the number stays reserved until fclose)
   HookHandle = record
     Head: _IO_FILE;
     Base: HookStream;
@@ -382,6 +434,9 @@ type
     Users: int64;
     Io: HookLibio;
     Wide: HookWide;
+    Descriptor: int32;
+    DescriptorOwned: bool;
+    DescriptorClosed: bool;
   end;
 
   // What a mode string asks for beyond the core's HookOpenMode (glibc's _IO_new_file_fopen):
@@ -519,12 +574,32 @@ type
   AccessFn = routine(const APath: ptr to const char; const AMode: int32): int32;
   StatFn = routine(const APath: ptr to const char; const ABuf: ptr): int32;
   XstatFn = routine(const AVersion: int32; const APath: ptr to const char; const ABuf: ptr): int32;
+  OpenFn = routine(const APath: ptr to const char; const AFlags: int32; const AMode: uint32): int32;
+  Open2Fn = routine(const APath: ptr to const char; const AFlags: int32): int32;
+  FdIntFn = routine(const AFile: int32): int32;
+  FdReadFn = routine(const AFile: int32; const ABuffer: ptr; const ACount: uint64): int64;
+  FdReadChkFn = routine(const AFile: int32; const ABuffer: ptr; const ACount: uint64;
+    const ABufferSize: uint64): int64;
+  FdWriteFn = routine(const AFile: int32; const ABuffer: ptr to const; const ACount: uint64): int64;
+  FdPreadFn = routine(const AFile: int32; const ABuffer: ptr; const ACount: uint64;
+    const AOffset: int64): int64;
+  FdPreadChkFn = routine(const AFile: int32; const ABuffer: ptr; const ACount: uint64;
+    const AOffset: int64; const ABufferSize: uint64): int64;
+  FdPwriteFn = routine(const AFile: int32; const ABuffer: ptr to const; const ACount: uint64;
+    const AOffset: int64): int64;
+  LseekFn = routine(const AFile: int32; const AOffset: int64; const AWhence: int32): int64;
+  MmapFn = routine(const AAddress: ptr; const ALength: uint64; const AProt: int32;
+    const AFlags: int32; const AFile: int32; const AOffset: int64): ptr;
+  FstatFn = routine(const AFile: int32; const ABuf: ptr): int32;
+  FxstatFn = routine(const AVersion: int32; const AFile: int32; const ABuf: ptr): int32;
 
 // glibc's C functions this unit calls itself, none of which takes a FILE*: the line buffer
 // getdelim hands the caller (malloc / realloc, the caller frees it), the text vasprintf /
 // __vasprintf_chk hand back (free), the wide text a memstream holds, the stand-ins' FILEs (a
-// wide scan's temporary file: mkstemp, write, close, unlink), iconv, the abort of a failed
-// _chk check, glibc's abort of a wide seek from the current place over ungot characters
+// wide scan's temporary file: mkstemp, unlink; its write and close glibc's through their
+// slots), iconv, the abort of a failed _chk
+// check, glibc's abort of a wide seek from the current place over ungot characters, the
+// rights a virtual mmap's pages end with (mprotect)
 routine malloc(const ASize: uint64): ptr; external "c";
 routine realloc(const APointer: ptr; const ASize: uint64): ptr; external "c";
 routine free(const APointer: ptr); external "c";
@@ -542,8 +617,8 @@ routine iconv(const ADescriptor: ptr; const AIn: ptr to ptr to uint8; const AInL
 routine iconv_close(const ADescriptor: ptr): int32; external "c";
 routine nl_langinfo(const AItem: int32): ptr to const char; external "c";
 routine mkstemp(const ATemplate: ptr to char): int32; external "c";
-routine write(const AFile: int32; const ABuffer: ptr; const ACount: uint64): int64; external "c";
-routine close(const AFile: int32): int32; external "c";
+routine mprotect(const AAddress: ptr; const ALength: uint64; const AProt: int32): int32;
+  external "c";
 routine unlink(const APath: ptr to const char): int32; external "c";
 routine __chk_fail(); noreturn; external "c";
 routine abort(); noreturn; external "c";
@@ -556,6 +631,10 @@ var
   GHandles: array of ptr to HookHandle;
   // How many handles are open (atomic): while it is 0 no address is a handle
   GOpenCount: int64;
+  // The handles holding a descriptor (each listed holds one user of its handle), under GLock;
+  // how many (atomic): while it is 0 no descriptor is a handle's
+  GDescriptors: array of ptr to HookHandle;
+  GDescriptorCount: int64;
   // Whether the exit flush is registered (DoExitFlush, once, at the first open), under GLock
   GExitArmed: bool;
   // HookReal's slots of the real functions
@@ -669,6 +748,28 @@ var
   GRealXstat64: ptr;
   GRealLxstat: ptr;
   GRealLxstat64: ptr;
+  GRealOpen: ptr;
+  GRealOpen64: ptr;
+  GRealOpen2: ptr;
+  GRealOpen64Of2: ptr;
+  GRealRead: ptr;
+  GRealReadChk: ptr;
+  GRealPread: ptr;
+  GRealPread64: ptr;
+  GRealPreadChk: ptr;
+  GRealPread64Chk: ptr;
+  GRealWrite: ptr;
+  GRealPwrite: ptr;
+  GRealPwrite64: ptr;
+  GRealLseek: ptr;
+  GRealLseek64: ptr;
+  GRealMmap: ptr;
+  GRealMmap64: ptr;
+  GRealClose: ptr;
+  GRealFstat: ptr;
+  GRealFstat64: ptr;
+  GRealFxstat: ptr;
+  GRealFxstat64: ptr;
   // The real functions the scans, the wide prints and the stand-ins call (never hooked
   // through these slots: their FILE is a real one)
   GRealCookieFclose: ptr;
@@ -901,13 +1002,14 @@ begin
 end;
 
 // read(2) of up to ASize bytes into AData at the descriptor's place: the count (0 at the end),
-// or -1 with errno: a descriptor opened without read rights EBADF, an IO that cannot read EIO.
+// or -1 with errno: a descriptor opened without read rights or closed by close(2) EBADF, an IO
+// that cannot read EIO.
 // A Pipe handle reads its Replay bytes first, then the IO in order
 routine DoSysRead(const AHandle: ptr to HookHandle; const AData: uint64; const ASize: int64): int64;
 var
   LGot: int64;
 begin
-  if not AHandle->Readable then
+  if (not AHandle->Readable) or AHandle->DescriptorClosed then
     SetCErrno(ADAM_ERRNO_EBADF);
     return -1;
   end;
@@ -935,13 +1037,14 @@ begin
 end;
 
 // write(2) of ASize bytes at AData at the descriptor's place (O_APPEND: the IO's end first).
-// The count written, or -1 with errno: no write rights EBADF, nothing written ENOSPC
+// The count written, or -1 with errno: no write rights or closed by close(2) EBADF, nothing
+// written ENOSPC
 routine DoSysWrite(const AHandle: ptr to HookHandle; const AData: uint64; const ASize: int64): int64;
 var
   LEnd: int64;
   LGot: int64;
 begin
-  if not AHandle->Writable then
+  if (not AHandle->Writable) or AHandle->DescriptorClosed then
     SetCErrno(ADAM_ERRNO_EBADF);
     return -1;
   end;
@@ -978,13 +1081,18 @@ end;
 
 // lseek(2): the descriptor to AOffset from ADir (SEEK_SET / CUR / END). The new place, or -1
 // with errno: before the start, or a target the IO refuses, EINVAL; an IO that cannot seek
-// ESPIPE
+// ESPIPE; closed by close(2) EBADF
 routine DoSysSeek(const AHandle: ptr to HookHandle; const AOffset: int64; const ADir: int32): int64;
 var
   LTarget: int64;
   LEnd: int64;
   LGot: int64;
 begin
+  // A descriptor close(2) ran on is no file at all
+  if AHandle->DescriptorClosed then
+    SetCErrno(ADAM_ERRNO_EBADF);
+    return -1;
+  end;
   // A pipe / FIFO seeks nowhere, whatever the target (the kernel's no_llseek: ESPIPE before
   // the offset is looked at)
   if AHandle->Pipe then
@@ -4431,6 +4539,131 @@ begin
   end;
 end;
 
+// --- descriptors: a handle's own number (fileno, open(2)) -----------------------------------
+
+// A new reserved descriptor: glibc's open of ADAM_HOOKIO_RESERVE_PATH (read-only, closed on
+// exec), so the number is the kernel's and no other open gets it while it is held; -1 with
+// glibc's errno (EMFILE ..)
+routine DoReserveDescriptor(): int32;
+var
+  LFound: ptr;
+  LOpen: OpenFn;
+begin
+  LFound := DoReal(GRealOpen, ptr to const char("open"));
+  if LFound = nil then
+    return -1;
+  end;
+  LOpen := OpenFn(LFound);
+  return LOpen(ADAM_HOOKIO_RESERVE_PATH, O_RDONLY | O_CLOEXEC, 0u);
+end;
+
+// glibc's close of AFile (errno left as it was): a reservation given back, a wide scan's
+// stand-in file
+routine DoCloseReal(const AFile: int32);
+var
+  LFound: ptr;
+  LClose: FdIntFn;
+  LError: int32;
+begin
+  LError := CErrno();
+  LFound := DoReal(GRealClose, ptr to const char("close"));
+  if LFound <> nil then
+    LClose := FdIntFn(LFound);
+    LClose(AFile);
+  end;
+  SetCErrno(LError);
+end;
+
+// AHandle's descriptor (the caller holds its stream lock): the one it holds, else a new
+// reservation listed in GDescriptors (the list's own user of the handle taken) and written to
+// the FILE head's _fileno; -1 with errno when no descriptor can be reserved. A success leaves
+// errno as it was
+routine DoDescriptorLocked(const AHandle: ptr to HookHandle): int32;
+var
+  LFile: int32;
+  LCount: int64;
+  LError: int32;
+begin
+  if AHandle->Descriptor >= 0 then
+    return AHandle->Descriptor;
+  end;
+  LError := CErrno();
+  LFile := DoReserveDescriptor();
+  if LFile < 0 then
+    return -1;
+  end;
+  SetCErrno(LError);
+  AHandle->Descriptor := LFile;
+  AHandle->DescriptorClosed := false;
+  AHandle->Head._fileno := LFile;
+  lock (GLock) do
+    AHandle->Users := AHandle->Users + 1;
+    LCount := len(GDescriptors);
+    setlength(GDescriptors, LCount + 1);
+    GDescriptors[LCount] := AHandle;
+    atomicadd(GDescriptorCount, 1);
+  end;
+  return LFile;
+end;
+
+// The handle holding descriptor AFile with one more user (given back with DoReleaseHandle),
+// or nil when AFile is not a handle's. While no handle holds one no lock is taken
+routine DoFindDescriptor(const AFile: int32): ptr to HookHandle;
+var
+  LHandle: ptr to HookHandle;
+  LI: int64;
+begin
+  if (AFile < 0) or (atomicload(GDescriptorCount) = 0) then
+    return nil;
+  end;
+  lock (GLock) do
+    for LI := 0 to len(GDescriptors) - 1 do
+      LHandle := GDescriptors[LI];
+      if LHandle->Descriptor = AFile then
+        LHandle->Users := LHandle->Users + 1;
+        return LHandle;
+      end;
+    end;
+  end;
+  return nil;
+end;
+
+// AHandle's descriptor given back (fclose, a failed freopen, close(2) of the open that made
+// it): out of GDescriptors, its reservation closed, the list's user given back (the caller
+// still holds one, so the handle is not freed here). Nothing when it holds none
+routine DoDropDescriptor(const AHandle: ptr to HookHandle);
+var
+  LFile: int32;
+  LCount: int64;
+  LI: int64;
+begin
+  LFile := -1;
+  lock (GLock) do
+    LCount := len(GDescriptors);
+    LI := 0;
+    while (LI < LCount) and (GDescriptors[LI] <> AHandle) do
+      LI := LI + 1;
+    end;
+    if LI < LCount then
+      while LI < LCount - 1 do
+        GDescriptors[LI] := GDescriptors[LI + 1];
+        LI := LI + 1;
+      end;
+      setlength(GDescriptors, LCount - 1);
+      atomicadd(GDescriptorCount, -1);
+      LFile := AHandle->Descriptor;
+      AHandle->Descriptor := -1;
+      AHandle->DescriptorOwned := false;
+      AHandle->DescriptorClosed := false;
+      AHandle->Head._fileno := -1;
+    end;
+  end;
+  if LFile >= 0 then
+    DoCloseReal(LFile);
+    DoReleaseHandle(AHandle);
+  end;
+end;
+
 // The characters of a wide area from AFrom to ATo added to AChars (ACount of them held so
 // far, at most AWant)
 routine DoScanTake(var AChars: array of uint32; var ACount: int64; const AFrom: uint64;
@@ -4584,6 +4817,7 @@ var
   LDone: int64;
   LGot: int64;
   LFound: ptr;
+  LWrite: FdWriteFn;
   LFopen: FopenFn;
   LFile: ptr;
 begin
@@ -4602,15 +4836,20 @@ begin
     freemem(LPath);
     return nil;
   end;
+  // glibc's write and close (the stand-in's file is never a handle's)
   LDone := 0;
-  while LDone < LSize do
-    LGot := write(LFd, ptr(addr of LText[LDone]), uint64(LSize - LDone));
-    if LGot <= 0 then
-      leave;
+  LFound := DoReal(GRealWrite, ptr to const char("write"));
+  if LFound <> nil then
+    LWrite := FdWriteFn(LFound);
+    while LDone < LSize do
+      LGot := LWrite(LFd, ptr(addr of LText[LDone]), uint64(LSize - LDone));
+      if LGot <= 0 then
+        leave;
+      end;
+      LDone := LDone + LGot;
     end;
-    LDone := LDone + LGot;
   end;
-  close(LFd);
+  DoCloseReal(LFd);
   LFile := nil;
   if LDone = LSize then
     LFound := DoReal(GRealStandInFopen, ptr to const char("fopen"));
@@ -4907,7 +5146,7 @@ begin
     HookOp.Flush: DoCallFlush(AHandle, ACall);
     HookOp.Setvbuf: ACall.Answer := DoSetvbuf(AHandle, uint64(ACall.Buffer), ACall.Value, uint64(ACall.Size));
     HookOp.Setbuffer: DoSetbuffer(AHandle, uint64(ACall.Buffer), uint64(ACall.Size));
-    HookOp.Fileno: SetCErrno(ADAM_ERRNO_EBADF);
+    HookOp.Fileno: ACall.Answer := DoDescriptorLocked(AHandle);
     HookOp.Pending: ACall.Answer := DoPendingCount(AHandle);
     HookOp.Reading: ACall.Answer := DoFlagValue(((LIo->Flags & _IO_NO_WRITES) <> 0u) or
       (((LIo->Flags & (_IO_CURRENTLY_PUTTING | _IO_NO_READS)) = 0u) and (LIo->ReadBase <> 0u)));
@@ -5174,6 +5413,9 @@ begin
   LHandle->Io.Offset := ADAM_HOOKIO_POS_BAD;
   LHandle->Io.Orientation := 0;
   LHandle->Head._fileno := -1;
+  LHandle->Descriptor := -1;
+  LHandle->DescriptorOwned := false;
+  LHandle->DescriptorClosed := false;
   LHandle->Wide.Charset := LExtra.Charset;
   // errno is set by the open that fails
   if AEntry.Stream <> nil then
@@ -5303,28 +5545,17 @@ begin
   return true;
 end;
 
-// The stat family on a virtual path: AResult 0 with ABuf (a struct stat / stat64, HookStat)
-// filled, or -1 with errno (missing ENOENT). A regular file, readable by all, writable by all
-// as an "r+" open would be, one link, its size in 512-byte blocks, a 4096-byte block
-// (ADAM_HOOKIO_BLOCK_SIZE), no device, owner or times (0). False: not such a path
-routine DoStat(const APath: ptr to const char; const ABuf: ptr; var AResult: int32): bool;
+// ABuf (a struct stat / stat64, HookStat) filled for a virtual file of AType (S_IFREG, a
+// handle on an IO that cannot seek S_IFIFO) and ASize bytes: readable by all, writable by all
+// when AWritable, one link, its size in 512-byte blocks, a 4096-byte block
+// (ADAM_HOOKIO_BLOCK_SIZE), no device, owner or times (0)
+routine DoFillStat(const ABuf: ptr; const AType: uint32; const ASize: int64; const AWritable: bool);
 var
-  LQuery: HookQuery;
   LStat: ptr to HookStat;
   LMode: uint32;
 begin
-  AResult := -1;
-  if APath = nil then
-    return false;
-  end;
-  if not HookIOQuery(StringFromC(APath), LQuery) then
-    return false;
-  end;
-  if not LQuery.Found then
-    return true;
-  end;
-  LMode := S_IFREG | S_IRUSR | S_IRGRP | S_IROTH;
-  if LQuery.Writable then
+  LMode := AType | S_IRUSR | S_IRGRP | S_IROTH;
+  if AWritable then
     LMode := LMode | S_IWUSR | S_IWGRP | S_IWOTH;
   end;
   LStat := ptr to HookStat(ABuf);
@@ -5336,9 +5567,9 @@ begin
   LStat->st_gid := 0u;
   LStat->pad0 := 0;
   LStat->st_rdev := 0u;
-  LStat->st_size := LQuery.Size;
+  LStat->st_size := ASize;
   LStat->st_blksize := ADAM_HOOKIO_BLOCK_SIZE;
-  LStat->st_blocks := (LQuery.Size + 511) div 512;
+  LStat->st_blocks := (ASize + 511) div 512;
   LStat->st_atime := 0;
   LStat->st_atimensec := 0;
   LStat->st_mtime := 0;
@@ -5348,6 +5579,26 @@ begin
   LStat->reserved[0] := 0;
   LStat->reserved[1] := 0;
   LStat->reserved[2] := 0;
+end;
+
+// The stat family on a virtual path: AResult 0 with ABuf filled as DoFillStat fills a regular
+// file (writable as an "r+" open would be), or -1 with errno (missing ENOENT). False: not
+// such a path
+routine DoStat(const APath: ptr to const char; const ABuf: ptr; var AResult: int32): bool;
+var
+  LQuery: HookQuery;
+begin
+  AResult := -1;
+  if APath = nil then
+    return false;
+  end;
+  if not HookIOQuery(StringFromC(APath), LQuery) then
+    return false;
+  end;
+  if not LQuery.Found then
+    return true;
+  end;
+  DoFillStat(ABuf, S_IFREG, LQuery.Size, LQuery.Writable);
   AResult := 0;
   return true;
 end;
@@ -5413,14 +5664,22 @@ routine DoClose(const AFile: ptr; var AResult: int32): bool;
 var
   LHandle: ptr to HookHandle;
   LOk: bool;
+  LGone: bool;
 begin
   AResult := 0;
   LHandle := DoTakeHandle(AFile);
   if LHandle = nil then
     return false;
   end;
+  // glibc's fclose of a FILE whose _fileno close(2) closed: its own close fails (EBADF)
+  LGone := LHandle->DescriptorClosed;
   LOk := DoShutHandle(LHandle);
+  DoDropDescriptor(LHandle);
   DoReleaseHandle(LHandle);
+  if LGone then
+    SetCErrno(ADAM_ERRNO_EBADF);
+    LOk := false;
+  end;
   if not LOk then
     AResult := ADAM_HOOKIO_EOF;
   end;
@@ -5499,13 +5758,15 @@ begin
 end;
 
 // Takes AFile out of the open list and gives the list's user back (a failed freopen leaves the
-// stream closed); a call still holding the handle keeps it alive until it gives it back
+// stream closed, its descriptor with it); a call still holding the handle keeps it alive until
+// it gives it back
 routine DoForgetHandle(const AFile: ptr);
 var
   LHandle: ptr to HookHandle;
 begin
   LHandle := DoTakeHandle(AFile);
   if LHandle <> nil then
+    DoDropDescriptor(LHandle);
     DoReleaseHandle(LHandle);
   end;
 end;
@@ -5580,6 +5841,8 @@ var
   LNew: ptr to HookHandle;
   LOldLock: ptr to HookStreamLock;
   LUsers: int64;
+  LDescriptor: int32;
+  LDescriptorOwned: bool;
   LNewFile: ptr;
   LSource: IOSource;
   LCallerErrno: int32;
@@ -5627,13 +5890,21 @@ begin
     return true;
   end;
   // The new state at the old address (a fresh open holds no area that points into its own
-  // record): the old record keeps its users; its closed stream's lock is given back and the
-  // new one's taken over, so the freed new record gives no lock back
+  // record): the old record keeps its users and its descriptor (glibc's freopen gives the new
+  // file the old number; a close(2) of it undone, the file being open again); its closed
+  // stream's lock is given back and the new one's taken over, so the freed new record gives no
+  // lock back
   lock (GLock) do
     LUsers := LOld->Users;
     LOldLock := LOld->Base.Lock;
+    LDescriptor := LOld->Descriptor;
+    LDescriptorOwned := LOld->DescriptorOwned;
     LOld^ := LNew^;
     LOld->Users := LUsers;
+    LOld->Descriptor := LDescriptor;
+    LOld->DescriptorOwned := LDescriptorOwned;
+    LOld->DescriptorClosed := false;
+    LOld->Head._fileno := LDescriptor;
     LNew->Base.Lock := nil;
     LNew->Wide.ToWide := nil;
     LNew->Wide.ToBytes := nil;
@@ -5667,6 +5938,402 @@ begin
   end;
   DoReleaseHandle(LHandle);
   return LStream;
+end;
+
+// --- descriptor calls on a handle ------------------------------------------------------------
+// A handle's descriptor (fileno's, or the one a hooked open(2) of a virtual path made) is the
+// handle's own descriptor in the libio model (Base.Position its place, DoSysRead / DoSysWrite
+// / DoSysSeek / DoSysSize its system calls), so a C library mixing fileno and fread on one
+// FILE, or reading a virtual file through open / fstat / read / lseek / mmap / close, sees
+// what glibc gives on a real file of the same bytes
+
+// read(2)'s count as the model takes it (ssize_t: at most SSIZE_MAX, as the kernel clamps)
+routine DoFdCount(const ACount: uint64): int64;
+begin
+  if ACount > uint64(ADAM_HOOKIO_SSIZE_MAX) then
+    return ADAM_HOOKIO_SSIZE_MAX;
+  end;
+  return int64(ACount);
+end;
+
+// pread / pwrite / mmap's place: AHandle's descriptor moved to AOffset, its place before that
+// in AKeep (the caller puts it back: these calls leave the place where it was). False with
+// errno: a pipe ESPIPE, a negative offset EINVAL, a target the IO refuses (DoSysSeek's)
+routine DoFdPlace(const AHandle: ptr to HookHandle; const AOffset: int64; var AKeep: int64): bool;
+begin
+  AKeep := AHandle->Base.Position;
+  if AHandle->Pipe then
+    SetCErrno(ESPIPE);
+    return false;
+  end;
+  if AOffset < 0 then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return false;
+  end;
+  return DoSysSeek(AHandle, AOffset, _IO_seek_set) >= 0;
+end;
+
+// True when AOffset is at or past the end of AHandle's IO (a pread / mmap there reads nothing:
+// the kernel's answer, where the IO refuses the seek)
+routine DoFdPastEnd(const AHandle: ptr to HookHandle; const AOffset: int64): bool;
+var
+  LSize: int64;
+begin
+  if AHandle->Pipe or (AOffset < 0) then
+    return false;
+  end;
+  if not DoSysSize(AHandle, LSize) then
+    return false;
+  end;
+  return AOffset >= LSize;
+end;
+
+// True (EBADF set) when AHandle's descriptor can take no call: the handle closed, or close(2)
+// ran on its fileno descriptor. The caller holds the stream lock
+routine DoFdGone(const AHandle: ptr to HookHandle): bool;
+begin
+  if AHandle->Closed or AHandle->DescriptorClosed then
+    SetCErrno(ADAM_ERRNO_EBADF);
+    return true;
+  end;
+  return false;
+end;
+
+// read(2) (APositioned false) or pread(2) at AOffset (the place kept) on AHandle's descriptor:
+// the count, 0 at the end, or -1 with errno (DoSysRead's, DoFdPlace's, EBADF)
+routine DoFdRead(const AHandle: ptr to HookHandle; const ABuffer: ptr; const ACount: uint64;
+  const APositioned: bool; const AOffset: int64): int64;
+var
+  LKeep: int64;
+  LGot: int64;
+  LError: int32;
+begin
+  LGot := -1;
+  lock (AHandle->Base.Lock->Lock) do
+    if not DoFdGone(AHandle) then
+      if not APositioned then
+        LGot := DoSysRead(AHandle, uint64(ABuffer), DoFdCount(ACount));
+      else
+        LError := CErrno();
+        if DoFdPlace(AHandle, AOffset, LKeep) then
+          LGot := DoSysRead(AHandle, uint64(ABuffer), DoFdCount(ACount));
+          AHandle->Base.Position := LKeep;
+        else
+          if DoFdPastEnd(AHandle, AOffset) then
+            SetCErrno(LError);
+            LGot := 0;
+          end;
+        end;
+      end;
+    end;
+  end;
+  return LGot;
+end;
+
+// write(2) (APositioned false) or pwrite(2) at AOffset (the place kept) on AHandle's
+// descriptor: the count, or -1 with errno (DoSysWrite's, DoFdPlace's, EBADF)
+routine DoFdWrite(const AHandle: ptr to HookHandle; const ABuffer: ptr to const;
+  const ACount: uint64; const APositioned: bool; const AOffset: int64): int64;
+var
+  LKeep: int64;
+  LGot: int64;
+begin
+  LGot := -1;
+  lock (AHandle->Base.Lock->Lock) do
+    if not DoFdGone(AHandle) then
+      if not APositioned then
+        LGot := DoSysWrite(AHandle, uint64(ABuffer), DoFdCount(ACount));
+      else
+        if DoFdPlace(AHandle, AOffset, LKeep) then
+          LGot := DoSysWrite(AHandle, uint64(ABuffer), DoFdCount(ACount));
+          AHandle->Base.Position := LKeep;
+        end;
+      end;
+    end;
+  end;
+  return LGot;
+end;
+
+// lseek(2) on AHandle's descriptor: DoSysSeek; a direction past SEEK_END (SEEK_DATA /
+// SEEK_HOLE: a virtual file has no holes to ask about) EINVAL, as is any unknown one
+routine DoFdSeek(const AHandle: ptr to HookHandle; const AOffset: int64; const AWhence: int32): int64;
+var
+  LGot: int64;
+begin
+  LGot := -1;
+  lock (AHandle->Base.Lock->Lock) do
+    if not DoFdGone(AHandle) then
+      if (AWhence < _IO_seek_set) or (AWhence > _IO_seek_end) then
+        SetCErrno(ADAM_ERRNO_EINVAL);
+      else
+        LGot := DoSysSeek(AHandle, AOffset, AWhence);
+      end;
+    end;
+  end;
+  return LGot;
+end;
+
+// fstat(2) of descriptor AFile when it is a handle's: AResult 0 with ABuf filled (DoFillStat:
+// a regular file of the IO's size, a FIFO of size 0 for an IO that cannot seek or tell its
+// size; writable when the handle or its IO writes), or -1 with EBADF. False: not a handle's
+routine DoFdStat(const AFile: int32; const ABuf: ptr; var AResult: int32): bool;
+var
+  LHandle: ptr to HookHandle;
+  LSize: int64;
+  LType: uint32;
+begin
+  AResult := -1;
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle = nil then
+    return false;
+  end;
+  lock (LHandle->Base.Lock->Lock) do
+    if not DoFdGone(LHandle) then
+      LType := S_IFREG;
+      if LHandle->Pipe then
+        LType := S_IFIFO;
+      end;
+      if LHandle->Pipe or (not DoSysSize(LHandle, LSize)) then
+        LSize := 0;
+      end;
+      DoFillStat(ABuf, LType, LSize, LHandle->Writable or IOCanWrite(LHandle->Base.Stream));
+      AResult := 0;
+    end;
+  end;
+  DoReleaseHandle(LHandle);
+  return true;
+end;
+
+// mmap(2) of descriptor AFile when it is a handle's: a private anonymous mapping of ALength
+// bytes (at AAddress as the caller's flags ask) holding the IO's bytes from AOffset (past the
+// IO's end zeros, as a real file's last page), then given the rights AProt asks. glibc's mmap
+// makes the mapping, so its address, MAP_FIXED and the rest are the kernel's. AResult the
+// mapping, or MAP_FAILED with errno: a closed descriptor EBADF; no length, a negative or
+// unaligned offset EINVAL; an IO that cannot seek ENODEV (a pipe cannot be mapped); a
+// descriptor without read rights EACCES; a shared writable mapping EACCES without write
+// rights, else ENODEV (a virtual file has no pages a write could reach the IO through).
+// False: not a handle's
+routine DoFdMap(const AAddress: ptr; const ALength: uint64; const AProt: int32;
+  const AFlags: int32; const AFile: int32; const AOffset: int64; var AResult: ptr): bool;
+var
+  LHandle: ptr to HookHandle;
+  LFound: ptr;
+  LMap: MmapFn;
+  LPages: ptr;
+  LAt: uint64;
+  LGot: int64;
+  LKeep: int64;
+  LError: int32;
+  LFail: int32;
+begin
+  AResult := ptr(ADAM_HOOKIO_MAP_FAILED);
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle = nil then
+    return false;
+  end;
+  LError := CErrno();
+  lock (LHandle->Base.Lock->Lock) do
+    LFail := 0;
+    if LHandle->Closed or LHandle->DescriptorClosed then
+      LFail := ADAM_ERRNO_EBADF;
+    end;
+    if (LFail = 0) and ((ALength = 0u) or (AOffset < 0) or
+      ((AOffset mod ADAM_HOOKIO_PAGE_SIZE) <> 0)) then
+      LFail := ADAM_ERRNO_EINVAL;
+    end;
+    if (LFail = 0) and LHandle->Pipe then
+      LFail := ENODEV;
+    end;
+    if (LFail = 0) and (not LHandle->Readable) then
+      LFail := ADAM_ERRNO_EACCES;
+    end;
+    if (LFail = 0) and ((AFlags & MAP_SHARED) <> 0) and ((AProt & PROT_WRITE) <> 0) then
+      if LHandle->Writable then
+        LFail := ENODEV;
+      else
+        LFail := ADAM_ERRNO_EACCES;
+      end;
+    end;
+    if LFail <> 0 then
+      SetCErrno(LFail);
+    else
+      LFound := DoReal(GRealMmap, ptr to const char("mmap"));
+      if LFound <> nil then
+        LMap := MmapFn(LFound);
+        // Written while it is filled, its sharing private and anonymous whatever was asked
+        LPages := LMap(AAddress, ALength, AProt | PROT_WRITE,
+          (AFlags & (~(MAP_SHARED | MAP_PRIVATE))) | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if uint64(LPages) <> ADAM_HOOKIO_MAP_FAILED then
+          // The bytes from AOffset (an offset the IO cannot reach is past its end: zeros)
+          if DoFdPlace(LHandle, AOffset, LKeep) then
+            LAt := 0u;
+            while LAt < ALength do
+              LGot := DoSysRead(LHandle, uint64(LPages) + LAt, DoFdCount(ALength - LAt));
+              if LGot <= 0 then
+                leave;
+              end;
+              LAt := LAt + uint64(LGot);
+            end;
+          end;
+          LHandle->Base.Position := LKeep;
+          if (AProt & PROT_WRITE) = 0 then
+            mprotect(LPages, ALength, AProt);
+          end;
+          SetCErrno(LError);
+          AResult := LPages;
+        end;
+      end;
+    end;
+  end;
+  DoReleaseHandle(LHandle);
+  return true;
+end;
+
+// close(2) of AHandle's descriptor: the open(2) that made the handle closes it (fclose's work:
+// its flush, its own IO, the descriptor given back; 0, or -1 with EIO when the flush or the
+// close failed); a fileno one makes the descriptor unusable (EBADF to its calls and to the
+// stream's own system calls, as glibc's on a closed _fileno) until fclose gives the number
+// back. -1 with EBADF: closed already
+routine DoFdClose(const AHandle: ptr to HookHandle): int32;
+var
+  LOwned: bool;
+  LAnswer: int32;
+  LResult: int32;
+begin
+  LOwned := false;
+  LAnswer := -1;
+  lock (AHandle->Base.Lock->Lock) do
+    if not DoFdGone(AHandle) then
+      LOwned := AHandle->DescriptorOwned;
+      if not LOwned then
+        AHandle->DescriptorClosed := true;
+        LAnswer := 0;
+      end;
+    end;
+  end;
+  if LOwned then
+    LAnswer := 0;
+    if DoClose(ptr(AHandle), LResult) and (LResult <> 0) then
+      SetCErrno(ADAM_ERRNO_EIO);
+      LAnswer := -1;
+    end;
+  end;
+  return LAnswer;
+end;
+
+// AHandle's rights made the descriptor's (the caller holds its stream lock): read with
+// O_RDONLY or O_RDWR, write with O_WRONLY or O_RDWR (the libio flags in step), and O_APPEND's
+// writes at the IO's end
+routine DoFdRights(const AHandle: ptr to HookHandle; const AAccess: int32; const AAppend: bool);
+begin
+  AHandle->Readable := AAccess <> O_WRONLY;
+  AHandle->Writable := AAccess <> O_RDONLY;
+  AHandle->Io.Flags := AHandle->Io.Flags & (~(_IO_NO_READS | _IO_NO_WRITES));
+  if not AHandle->Readable then
+    AHandle->Io.Flags := AHandle->Io.Flags | _IO_NO_READS;
+  end;
+  if not AHandle->Writable then
+    AHandle->Io.Flags := AHandle->Io.Flags | _IO_NO_WRITES;
+  end;
+  if AAppend then
+    AHandle->Appending := true;
+    AHandle->Io.Flags := AHandle->Io.Flags | _IO_IS_APPENDING;
+  end;
+  DoMirror(AHandle);
+end;
+
+// A hooked open(2) of APath with AFlags. False: not a virtual path nor one the path source
+// holds (HookIOQuery), the caller passes it to glibc with errno as it came. True: AResult the
+// new descriptor (a handle opened as fopen opens the path, DescriptorOwned), or -1 with errno.
+// The open's rules are the kernel's on a regular file: O_ACCMODE 3 EINVAL; O_DIRECTORY
+// ENOTDIR; missing without O_CREAT ENOENT; O_CREAT | O_EXCL on one that exists EEXIST; O_CREAT
+// makes a missing one and O_TRUNC empties one with write rights ("w+"), anything else keeps
+// the bytes ("r", "r+": a read-only open never asks for write rights); then the rights are
+// O_ACCMODE's and O_APPEND's. The handle's own refusals are fopen's (EACCES: a mode the IO
+// or source does not offer). Other flags (O_CLOEXEC, O_NONBLOCK, O_NOFOLLOW ..) change nothing
+// on a virtual file; its descriptor is closed on exec always (ADAM_HOOKIO_RESERVE_PATH)
+routine DoFdOpen(const APath: ptr to const char; const AFlags: int32; var AResult: int32): bool;
+var
+  LPath: string;
+  LQuery: HookQuery;
+  LAccess: int32;
+  LMode: string;
+  LFile: ptr;
+  LHandle: ptr to HookHandle;
+  LError: int32;
+  LCallerErrno: int32;
+  LClosed: int32;
+begin
+  AResult := -1;
+  if APath = nil then
+    return false;
+  end;
+  LCallerErrno := CErrno();
+  LPath := StringFromC(APath);
+  if not HookIOQuery(LPath, LQuery) then
+    return false;
+  end;
+  LAccess := AFlags & O_ACCMODE;
+  if LAccess = O_ACCMODE then
+    SetCErrno(ADAM_ERRNO_EINVAL);
+    return true;
+  end;
+  if (AFlags & O_DIRECTORY) <> 0 then
+    if LQuery.Found then
+      SetCErrno(ENOTDIR);
+    end;
+    return true;
+  end;
+  if LQuery.Found then
+    if ((AFlags & O_CREAT) <> 0) and ((AFlags & O_EXCL) <> 0) then
+      SetCErrno(ADAM_ERRNO_EEXIST);
+      return true;
+    end;
+  else
+    // HookIOQuery set ENOENT
+    if (AFlags & O_CREAT) = 0 then
+      return true;
+    end;
+  end;
+  if (not LQuery.Found) or (((AFlags & O_TRUNC) <> 0) and (LAccess <> O_RDONLY)) then
+    LMode := "w+";
+  else
+    if LAccess = O_RDONLY then
+      LMode := "r";
+    else
+      LMode := "r+";
+    end;
+  end;
+  SetCErrno(LCallerErrno);
+  LFile := nil;
+  if not DoOpenText(LPath, LMode, LFile) then
+    SetCErrno(ADAM_ERRNO_ENOENT);
+    return true;
+  end;
+  if LFile = nil then
+    return true;
+  end;
+  LHandle := DoFindHandle(LFile);
+  if LHandle = nil then
+    SetCErrno(ADAM_ERRNO_EBADF);
+    return true;
+  end;
+  lock (LHandle->Base.Lock->Lock) do
+    DoFdRights(LHandle, LAccess, (AFlags & O_APPEND) <> 0);
+    AResult := DoDescriptorLocked(LHandle);
+    if AResult >= 0 then
+      LHandle->DescriptorOwned := true;
+    end;
+  end;
+  DoReleaseHandle(LHandle);
+  if AResult < 0 then
+    LError := CErrno();
+    DoClose(LFile, LClosed);
+    SetCErrno(LError);
+    return true;
+  end;
+  SetCErrno(LCallerErrno);
+  return true;
 end;
 
 // --- the hooks' shapes --------------------------------------------------------------------
@@ -6767,7 +7434,8 @@ begin
   LReal(AFile);
 end;
 
-// fileno / fileno_unlocked: a handle has no descriptor (-1, EBADF)
+// fileno / fileno_unlocked: a handle's descriptor (DoDescriptorLocked: reserved at the first
+// ask; -1 with errno when none can be)
 public routine fileno(const AFile: ptr): int32;
 begin
   return DoFileInt(HookOp.Fileno, -1, AFile, GRealFileno, ptr to const char("fileno"));
@@ -7330,6 +7998,489 @@ begin
     return LResult;
   end;
   return DoRealXstat(AVersion, APath, ABuf, GRealLxstat64, ptr to const char("__lxstat64"));
+end;
+
+// The descriptor family: a handle's descriptor (fileno's, or a hooked open's of a virtual path:
+// DoFdOpen) runs on the handle (the DoFd* calls), anything else is glibc's. glibc before 2.33
+// has no fstat / fstat64 symbol (C reached them through __fxstat and its kin, _STAT_VER 1): the
+// real call falls back on those, as the stat family's does
+
+// The real open-like call AName (ASlot its slot): -1 with ENOSYS when glibc has none
+routine DoRealOpen(const APath: ptr to const char; const AFlags: int32; const AMode: uint32;
+  var ASlot: ptr; const AName: ptr to const char): int32;
+var
+  LFound: ptr;
+  LOpen: OpenFn;
+begin
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return -1;
+  end;
+  LOpen := OpenFn(LFound);
+  return LOpen(APath, AFlags, AMode);
+end;
+
+// open / open64 (the same on a 64-bit target): the mode after the flags is read only with
+// O_CREAT or O_TMPFILE, as glibc's open reads it
+public routine open(const APath: ptr to const char; const AFlags: int32; ...): int32;
+var
+  LResult: int32;
+  LMode: int32;
+begin
+  LMode := 0;
+  if ((AFlags & O_CREAT) <> 0) or ((AFlags & O_TMPFILE) = O_TMPFILE) then
+    LMode := varargs.next(int32);
+  end;
+  if DoFdOpen(APath, AFlags, LResult) then
+    return LResult;
+  end;
+  return DoRealOpen(APath, AFlags, uint32(LMode), GRealOpen, ptr to const char("open"));
+end;
+public routine open64(const APath: ptr to const char; const AFlags: int32; ...): int32;
+var
+  LResult: int32;
+  LMode: int32;
+begin
+  LMode := 0;
+  if ((AFlags & O_CREAT) <> 0) or ((AFlags & O_TMPFILE) = O_TMPFILE) then
+    LMode := varargs.next(int32);
+  end;
+  if DoFdOpen(APath, AFlags, LResult) then
+    return LResult;
+  end;
+  return DoRealOpen(APath, AFlags, uint32(LMode), GRealOpen64,
+    ptr to const char("open64"));
+end;
+
+// The real __open_2-like call AName (ASlot its slot): -1 with ENOSYS when glibc has none
+routine DoRealOpen2(const APath: ptr to const char; const AFlags: int32; var ASlot: ptr;
+  const AName: ptr to const char): int32;
+var
+  LFound: ptr;
+  LOpen: Open2Fn;
+begin
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return -1;
+  end;
+  LOpen := Open2Fn(LFound);
+  return LOpen(APath, AFlags);
+end;
+
+// __open_2 / __open64_2 (_FORTIFY_SOURCE's open with no mode): O_CREAT or O_TMPFILE goes to
+// glibc's, which ends the program as a fortify failure before it looks at the path
+public routine __open_2(const APath: ptr to const char; const AFlags: int32): int32;
+var
+  LResult: int32;
+begin
+  if (((AFlags & O_CREAT) = 0) and ((AFlags & O_TMPFILE) <> O_TMPFILE)) and
+    DoFdOpen(APath, AFlags, LResult) then
+    return LResult;
+  end;
+  return DoRealOpen2(APath, AFlags, GRealOpen2, ptr to const char("__open_2"));
+end;
+public routine __open64_2(const APath: ptr to const char; const AFlags: int32): int32;
+var
+  LResult: int32;
+begin
+  if (((AFlags & O_CREAT) = 0) and ((AFlags & O_TMPFILE) <> O_TMPFILE)) and
+    DoFdOpen(APath, AFlags, LResult) then
+    return LResult;
+  end;
+  return DoRealOpen2(APath, AFlags, GRealOpen64Of2, ptr to const char("__open64_2"));
+end;
+
+public routine read(const AFile: int32; const ABuffer: ptr; const ACount: uint64): int64;
+var
+  LHandle: ptr to HookHandle;
+  LAnswer: int64;
+  LFound: ptr;
+  LRead: FdReadFn;
+begin
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle <> nil then
+    LAnswer := DoFdRead(LHandle, ABuffer, ACount, false, 0);
+    DoReleaseHandle(LHandle);
+    return LAnswer;
+  end;
+  LFound := DoReal(GRealRead, ptr to const char("read"));
+  if LFound = nil then
+    return -1;
+  end;
+  LRead := FdReadFn(LFound);
+  return LRead(AFile, ABuffer, ACount);
+end;
+
+// __read_chk (_FORTIFY_SOURCE's read): a count past the buffer's size ends the program
+public routine __read_chk(const AFile: int32; const ABuffer: ptr; const ACount: uint64;
+  const ABufferSize: uint64): int64;
+var
+  LHandle: ptr to HookHandle;
+  LAnswer: int64;
+  LFound: ptr;
+  LRead: FdReadChkFn;
+begin
+  if ACount > ABufferSize then
+    __chk_fail();
+  end;
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle <> nil then
+    LAnswer := DoFdRead(LHandle, ABuffer, ACount, false, 0);
+    DoReleaseHandle(LHandle);
+    return LAnswer;
+  end;
+  LFound := DoReal(GRealReadChk, ptr to const char("__read_chk"));
+  if LFound = nil then
+    return -1;
+  end;
+  LRead := FdReadChkFn(LFound);
+  return LRead(AFile, ABuffer, ACount, ABufferSize);
+end;
+
+// The real pread-like call AName (ASlot its slot): -1 with ENOSYS when glibc has none
+routine DoRealPread(const AFile: int32; const ABuffer: ptr; const ACount: uint64;
+  const AOffset: int64; var ASlot: ptr; const AName: ptr to const char): int64;
+var
+  LFound: ptr;
+  LRead: FdPreadFn;
+begin
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return -1;
+  end;
+  LRead := FdPreadFn(LFound);
+  return LRead(AFile, ABuffer, ACount, AOffset);
+end;
+
+// pread / pread64 (the same on a 64-bit target)
+public routine pread(const AFile: int32; const ABuffer: ptr; const ACount: uint64;
+  const AOffset: int64): int64;
+var
+  LHandle: ptr to HookHandle;
+  LAnswer: int64;
+begin
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle <> nil then
+    LAnswer := DoFdRead(LHandle, ABuffer, ACount, true, AOffset);
+    DoReleaseHandle(LHandle);
+    return LAnswer;
+  end;
+  return DoRealPread(AFile, ABuffer, ACount, AOffset, GRealPread, ptr to const char("pread"));
+end;
+public routine pread64(const AFile: int32; const ABuffer: ptr; const ACount: uint64;
+  const AOffset: int64): int64;
+var
+  LHandle: ptr to HookHandle;
+  LAnswer: int64;
+begin
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle <> nil then
+    LAnswer := DoFdRead(LHandle, ABuffer, ACount, true, AOffset);
+    DoReleaseHandle(LHandle);
+    return LAnswer;
+  end;
+  return DoRealPread(AFile, ABuffer, ACount, AOffset, GRealPread64, ptr to const char("pread64"));
+end;
+
+// The real __pread_chk-like call AName (ASlot its slot): -1 with ENOSYS when glibc has none
+routine DoRealPreadChk(const AFile: int32; const ABuffer: ptr; const ACount: uint64;
+  const AOffset: int64; const ABufferSize: uint64; var ASlot: ptr;
+  const AName: ptr to const char): int64;
+var
+  LFound: ptr;
+  LRead: FdPreadChkFn;
+begin
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return -1;
+  end;
+  LRead := FdPreadChkFn(LFound);
+  return LRead(AFile, ABuffer, ACount, AOffset, ABufferSize);
+end;
+
+// __pread_chk / __pread64_chk (_FORTIFY_SOURCE's pread): a count past the buffer's size ends
+// the program
+public routine __pread_chk(const AFile: int32; const ABuffer: ptr; const ACount: uint64;
+  const AOffset: int64; const ABufferSize: uint64): int64;
+var
+  LHandle: ptr to HookHandle;
+  LAnswer: int64;
+begin
+  if ACount > ABufferSize then
+    __chk_fail();
+  end;
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle <> nil then
+    LAnswer := DoFdRead(LHandle, ABuffer, ACount, true, AOffset);
+    DoReleaseHandle(LHandle);
+    return LAnswer;
+  end;
+  return DoRealPreadChk(AFile, ABuffer, ACount, AOffset, ABufferSize, GRealPreadChk,
+    ptr to const char("__pread_chk"));
+end;
+public routine __pread64_chk(const AFile: int32; const ABuffer: ptr; const ACount: uint64;
+  const AOffset: int64; const ABufferSize: uint64): int64;
+var
+  LHandle: ptr to HookHandle;
+  LAnswer: int64;
+begin
+  if ACount > ABufferSize then
+    __chk_fail();
+  end;
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle <> nil then
+    LAnswer := DoFdRead(LHandle, ABuffer, ACount, true, AOffset);
+    DoReleaseHandle(LHandle);
+    return LAnswer;
+  end;
+  return DoRealPreadChk(AFile, ABuffer, ACount, AOffset, ABufferSize, GRealPread64Chk,
+    ptr to const char("__pread64_chk"));
+end;
+
+public routine write(const AFile: int32; const ABuffer: ptr to const; const ACount: uint64): int64;
+var
+  LHandle: ptr to HookHandle;
+  LAnswer: int64;
+  LFound: ptr;
+  LWrite: FdWriteFn;
+begin
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle <> nil then
+    LAnswer := DoFdWrite(LHandle, ABuffer, ACount, false, 0);
+    DoReleaseHandle(LHandle);
+    return LAnswer;
+  end;
+  LFound := DoReal(GRealWrite, ptr to const char("write"));
+  if LFound = nil then
+    return -1;
+  end;
+  LWrite := FdWriteFn(LFound);
+  return LWrite(AFile, ABuffer, ACount);
+end;
+
+// The real pwrite-like call AName (ASlot its slot): -1 with ENOSYS when glibc has none
+routine DoRealPwrite(const AFile: int32; const ABuffer: ptr to const; const ACount: uint64;
+  const AOffset: int64; var ASlot: ptr; const AName: ptr to const char): int64;
+var
+  LFound: ptr;
+  LWrite: FdPwriteFn;
+begin
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return -1;
+  end;
+  LWrite := FdPwriteFn(LFound);
+  return LWrite(AFile, ABuffer, ACount, AOffset);
+end;
+
+// pwrite / pwrite64 (the same on a 64-bit target)
+public routine pwrite(const AFile: int32; const ABuffer: ptr to const; const ACount: uint64;
+  const AOffset: int64): int64;
+var
+  LHandle: ptr to HookHandle;
+  LAnswer: int64;
+begin
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle <> nil then
+    LAnswer := DoFdWrite(LHandle, ABuffer, ACount, true, AOffset);
+    DoReleaseHandle(LHandle);
+    return LAnswer;
+  end;
+  return DoRealPwrite(AFile, ABuffer, ACount, AOffset, GRealPwrite, ptr to const char("pwrite"));
+end;
+public routine pwrite64(const AFile: int32; const ABuffer: ptr to const; const ACount: uint64;
+  const AOffset: int64): int64;
+var
+  LHandle: ptr to HookHandle;
+  LAnswer: int64;
+begin
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle <> nil then
+    LAnswer := DoFdWrite(LHandle, ABuffer, ACount, true, AOffset);
+    DoReleaseHandle(LHandle);
+    return LAnswer;
+  end;
+  return DoRealPwrite(AFile, ABuffer, ACount, AOffset, GRealPwrite64,
+    ptr to const char("pwrite64"));
+end;
+
+// The real lseek-like call AName (ASlot its slot): -1 with ENOSYS when glibc has none
+routine DoRealLseek(const AFile: int32; const AOffset: int64; const AWhence: int32;
+  var ASlot: ptr; const AName: ptr to const char): int64;
+var
+  LFound: ptr;
+  LSeek: LseekFn;
+begin
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return -1;
+  end;
+  LSeek := LseekFn(LFound);
+  return LSeek(AFile, AOffset, AWhence);
+end;
+
+// lseek / lseek64 (the same on a 64-bit target)
+public routine lseek(const AFile: int32; const AOffset: int64; const AWhence: int32): int64;
+var
+  LHandle: ptr to HookHandle;
+  LAnswer: int64;
+begin
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle <> nil then
+    LAnswer := DoFdSeek(LHandle, AOffset, AWhence);
+    DoReleaseHandle(LHandle);
+    return LAnswer;
+  end;
+  return DoRealLseek(AFile, AOffset, AWhence, GRealLseek, ptr to const char("lseek"));
+end;
+public routine lseek64(const AFile: int32; const AOffset: int64; const AWhence: int32): int64;
+var
+  LHandle: ptr to HookHandle;
+  LAnswer: int64;
+begin
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle <> nil then
+    LAnswer := DoFdSeek(LHandle, AOffset, AWhence);
+    DoReleaseHandle(LHandle);
+    return LAnswer;
+  end;
+  return DoRealLseek(AFile, AOffset, AWhence, GRealLseek64, ptr to const char("lseek64"));
+end;
+
+// The real mmap-like call AName (ASlot its slot): MAP_FAILED with ENOSYS when glibc has none
+routine DoRealMmap(const AAddress: ptr; const ALength: uint64; const AProt: int32;
+  const AFlags: int32; const AFile: int32; const AOffset: int64; var ASlot: ptr;
+  const AName: ptr to const char): ptr;
+var
+  LFound: ptr;
+  LMap: MmapFn;
+begin
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return ptr(ADAM_HOOKIO_MAP_FAILED);
+  end;
+  LMap := MmapFn(LFound);
+  return LMap(AAddress, ALength, AProt, AFlags, AFile, AOffset);
+end;
+
+// mmap / mmap64 (the same on a 64-bit target); munmap and mprotect stay glibc's (a handle's
+// mapping is an anonymous one)
+public routine mmap(const AAddress: ptr; const ALength: uint64; const AProt: int32;
+  const AFlags: int32; const AFile: int32; const AOffset: int64): ptr;
+var
+  LResult: ptr;
+begin
+  if DoFdMap(AAddress, ALength, AProt, AFlags, AFile, AOffset, LResult) then
+    return LResult;
+  end;
+  return DoRealMmap(AAddress, ALength, AProt, AFlags, AFile, AOffset, GRealMmap,
+    ptr to const char("mmap"));
+end;
+public routine mmap64(const AAddress: ptr; const ALength: uint64; const AProt: int32;
+  const AFlags: int32; const AFile: int32; const AOffset: int64): ptr;
+var
+  LResult: ptr;
+begin
+  if DoFdMap(AAddress, ALength, AProt, AFlags, AFile, AOffset, LResult) then
+    return LResult;
+  end;
+  return DoRealMmap(AAddress, ALength, AProt, AFlags, AFile, AOffset, GRealMmap64,
+    ptr to const char("mmap64"));
+end;
+
+public routine close(const AFile: int32): int32;
+var
+  LHandle: ptr to HookHandle;
+  LAnswer: int32;
+  LFound: ptr;
+  LClose: FdIntFn;
+begin
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle <> nil then
+    LAnswer := DoFdClose(LHandle);
+    DoReleaseHandle(LHandle);
+    return LAnswer;
+  end;
+  LFound := DoReal(GRealClose, ptr to const char("close"));
+  if LFound = nil then
+    return -1;
+  end;
+  LClose := FdIntFn(LFound);
+  return LClose(AFile);
+end;
+
+// The real fstat-like call AName on AFile, else its __fxstat-like AOldName with _STAT_VER
+routine DoRealFstat(const AFile: int32; const ABuf: ptr; var ASlot: ptr;
+  const AName: ptr to const char; var AOldSlot: ptr; const AOldName: ptr to const char): int32;
+var
+  LFound: ptr;
+  LStat: FstatFn;
+  LXstat: FxstatFn;
+begin
+  LFound := HookReal(ASlot, AName);
+  if LFound <> nil then
+    LStat := FstatFn(LFound);
+    return LStat(AFile, ABuf);
+  end;
+  LFound := DoReal(AOldSlot, AOldName);
+  if LFound = nil then
+    return -1;
+  end;
+  LXstat := FxstatFn(LFound);
+  return LXstat(_STAT_VER, AFile, ABuf);
+end;
+public routine fstat(const AFile: int32; const ABuf: ptr): int32;
+var
+  LResult: int32;
+begin
+  if DoFdStat(AFile, ABuf, LResult) then
+    return LResult;
+  end;
+  return DoRealFstat(AFile, ABuf, GRealFstat, ptr to const char("fstat"), GRealFxstat,
+    ptr to const char("__fxstat"));
+end;
+public routine fstat64(const AFile: int32; const ABuf: ptr): int32;
+var
+  LResult: int32;
+begin
+  if DoFdStat(AFile, ABuf, LResult) then
+    return LResult;
+  end;
+  return DoRealFstat(AFile, ABuf, GRealFstat64, ptr to const char("fstat64"), GRealFxstat64,
+    ptr to const char("__fxstat64"));
+end;
+
+// The real __fxstat-like call AName with AVersion
+routine DoRealFxstat(const AVersion: int32; const AFile: int32; const ABuf: ptr;
+  var ASlot: ptr; const AName: ptr to const char): int32;
+var
+  LFound: ptr;
+  LXstat: FxstatFn;
+begin
+  LFound := DoReal(ASlot, AName);
+  if LFound = nil then
+    return -1;
+  end;
+  LXstat := FxstatFn(LFound);
+  return LXstat(AVersion, AFile, ABuf);
+end;
+public routine __fxstat(const AVersion: int32; const AFile: int32; const ABuf: ptr): int32;
+var
+  LResult: int32;
+begin
+  if DoFdStat(AFile, ABuf, LResult) then
+    return LResult;
+  end;
+  return DoRealFxstat(AVersion, AFile, ABuf, GRealFxstat, ptr to const char("__fxstat"));
+end;
+public routine __fxstat64(const AVersion: int32; const AFile: int32; const ABuf: ptr): int32;
+var
+  LResult: int32;
+begin
+  if DoFdStat(AFile, ABuf, LResult) then
+    return LResult;
+  end;
+  return DoRealFxstat(AVersion, AFile, ABuf, GRealFxstat64, ptr to const char("__fxstat64"));
 end;
 
 end.
