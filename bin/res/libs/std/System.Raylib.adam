@@ -47,17 +47,40 @@
   for a missing file (nil, size 0, an empty image, ...) with its own
   warning.
 
+  The frame window: InitFrameWindow opens raylib's window at a base
+  (virtual) size x the frame's zoom (SetFrameZoom) x the monitor's scale
+  (DPI / 96), centred, resizable, and follows a DPI change. BeginFrame /
+  EndFrame (inside BeginDrawing) draw in base units through a letterboxed
+  Camera2D, the aspect kept on resize, maximize and ToggleFrameFullscreen,
+  bars outside it; BeginFrameMode2D / BeginFrameMode3D draw the program's
+  own Camera2D / Camera3D through the letterbox (the 3D scene at the base
+  size's aspect); RestoreFrameClip turns the frame's clip on again.
+  GetFrameMousePosition is the mouse in base units. SetFrameIntegerScale
+  keeps the letterbox a whole multiple of the base size. GetFrameLetterbox
+  is the frame's rectangle in the window now. GetLetterboxRect,
+  GetIntegerLetterboxRect, GetScaledFrameSize and GetFramePoint are its
+  rules, usable with no window. CloseWindow closes the frame too: the frame
+  learns its native window is gone (the platform unit's hook), so a window
+  opened after it is never taken for the frame.
+
+  The program icon, with no call of the program's own: the icon @exeicon
+  gives is set on raylib's window as GLFW makes it (the platform unit's
+  hook); a program's own SetWindowIcon later wins.
+
   The unit names no OS: the hooked C names it calls (fopen, fread ..) are
-  the HookIO platform unit's the target triple picks.
+  the HookIO platform unit's the target triple picks, and the frame's DPI,
+  native window and window hooks are System.Raylib.Win64's /
+  System.Raylib.Linux64's.
 *******************************************************************************/
 
 module unit System.Raylib;
 
-import System.SysUtils, System.Collections, System.Raylib.C, System.CustomIO, System.HookIO, System.HookIO.Core
+import System.SysUtils, System.Collections, System.LibC.C, System.Raylib.C, System.CustomIO,
+  System.HookIO, System.HookIO.Core
 @ifdef TARGET_X86_64_WINDOWS_GNU
-  , System.HookIO.Win64
+  , System.HookIO.Win64, System.Raylib.Win64
 @elseif TARGET_X86_64_LINUX_GNU
-  , System.HookIO.Linux64
+  , System.HookIO.Linux64, System.Raylib.Linux64
 @endif
   ;
 
@@ -960,6 +983,861 @@ begin
     UnregisterIO(LReplaced);
   end;
   return true;
+end;
+
+// ---------------------------------------------------------------------------------------------
+// The frame window (pcpp's raylib_ext frame): a window opened at a base (virtual) size x the
+// zoom x the monitor's scale (DPI / 96), drawn in base units through a letterboxed Camera2D,
+// the mouse mapped back to them. The DPI is the OS's, asked through the platform unit.
+// ---------------------------------------------------------------------------------------------
+
+// GLFW names raylib links statically (its header is not shipped): the monitor list and a
+// monitor's work area
+routine glfwGetMonitors(const ACount: ptr to int32): ptr to ptr; external "raylib";
+routine glfwGetMonitorWorkarea(const AMonitor: ptr; const AX: ptr to int32; const AY: ptr to int32;
+  const AWidth: ptr to int32; const AHeight: ptr to int32); external "raylib";
+
+const
+  // The DPI the base size is drawn for (scale 1)
+  ADAM_RAYLIB_BASE_DPI: int32 = 96;
+
+type
+  // The frame as it stands
+  FrameWindow = record
+    Open: bool;
+    BaseWidth: int32;
+    BaseHeight: int32;
+    Dpi: int32;
+    // FLAG_WINDOW_HIGHDPI was set too: raylib sized the window and maps the mouse itself, so
+    // the frame window never resizes for the DPI (no stacking)
+    RaylibScales: bool;
+    // SetFrameIntegerScale: the letterbox a whole multiple of the base size
+    IntegerScale: bool;
+    // SetFrameZoom: the window's normal size is base x Zoom x the DPI scale
+    Zoom: float32;
+    FrameColor: Color;
+    BarColor: Color;
+    Camera: Camera2D;
+    Letterbox: Rectangle;
+    Mouse: Vector2;
+    LastDpiCheck: float64;
+    // The native window (Windows' HWND, X11's Window id): its destruction is the frame's close
+    NativeWindow: uint64;
+  end;
+
+var
+  // The frame (raylib's one window per program; raylib's calls are one thread's, so no lock);
+  // GFrameReady false until its settings got their defaults (DoFrameState)
+  GFrame: FrameWindow;
+  GFrameReady: bool;
+
+// AFrame as no frame window: zeroed, the DPI the base's, the colours WHITE / BLACK, no
+// integer scale, zoom 1
+routine DoFrameDefaults(var AFrame: FrameWindow);
+begin
+  AFrame.Open := false;
+  AFrame.BaseWidth := 0;
+  AFrame.BaseHeight := 0;
+  AFrame.Dpi := ADAM_RAYLIB_BASE_DPI;
+  AFrame.RaylibScales := false;
+  AFrame.IntegerScale := false;
+  AFrame.Zoom := 1.0f;
+  AFrame.FrameColor := WHITE;
+  AFrame.BarColor := BLACK;
+  AFrame.Camera.offset := Vector2(x: 0.0f, y: 0.0f);
+  AFrame.Camera.target := Vector2(x: 0.0f, y: 0.0f);
+  AFrame.Camera.rotation := 0.0f;
+  AFrame.Camera.zoom := 0.0f;
+  AFrame.Letterbox := Rectangle(x: 0.0f, y: 0.0f, width: 0.0f, height: 0.0f);
+  AFrame.Mouse := Vector2(x: 0.0f, y: 0.0f);
+  AFrame.LastDpiCheck := 0.0;
+  AFrame.NativeWindow := 0;
+end;
+
+// AFrame back to "no frame window", the frame and bar colours, the integer-scale rule and
+// the zoom (the program's settings) kept
+routine DoFrameReset(var AFrame: FrameWindow);
+var
+  LFrameColor: Color;
+  LBarColor: Color;
+  LIntegerScale: bool;
+  LZoom: float32;
+begin
+  LFrameColor := AFrame.FrameColor;
+  LBarColor := AFrame.BarColor;
+  LIntegerScale := AFrame.IntegerScale;
+  LZoom := AFrame.Zoom;
+  DoFrameDefaults(AFrame);
+  AFrame.FrameColor := LFrameColor;
+  AFrame.BarColor := LBarColor;
+  AFrame.IntegerScale := LIntegerScale;
+  AFrame.Zoom := LZoom;
+end;
+
+// The frame's settings given their defaults the first time it is read
+routine DoFrameState();
+begin
+  if not GFrameReady then
+    DoFrameDefaults(GFrame);
+    GFrameReady := true;
+  end;
+end;
+
+// The frame as it stands, read by every frame routine. Its close is seen as its native
+// window goes (DoFrameWindowGone, from CloseWindow through GLFW), so a window opened after it
+// is never taken for the frame; a frame whose raylib window is not there is closed too.
+routine DoFrameLive();
+begin
+  DoFrameState();
+  if GFrame.Open and not IsWindowReady() then
+    DoFrameReset(GFrame);
+  end;
+end;
+
+// The platform unit's notice: the native window AWindow goes (the frame's own: closed)
+routine DoFrameWindowGone(const AWindow: uint64);
+begin
+  DoFrameState();
+  if GFrame.Open and (AWindow <> 0) and (AWindow = GFrame.NativeWindow) then
+    DoFrameReset(GFrame);
+  end;
+end;
+
+// The DPI raylib's window is shown at now (the platform's answer; the base DPI when it has
+// none)
+routine DoQueryDpi(): int32;
+var
+  LDpi: int32;
+begin
+  LDpi := RaylibPlatformQueryDpi(GetWindowHandle());
+  if LDpi <= 0 then
+    return ADAM_RAYLIB_BASE_DPI;
+  end;
+  return LDpi;
+end;
+
+// C's lround of a float32 / float64 (halfway away from zero) as an int32
+routine DoRound(const AValue: float32): int32;
+begin
+  return int32(lroundf(AValue));
+end;
+
+routine DoRound(const AValue: float64): int32;
+begin
+  return int32(lround(AValue));
+end;
+
+// The frame's base size x its zoom, each side rounded: the window's normal size at 96 DPI
+// (the DPI scale goes on top, DoScaledSize)
+routine DoZoomedWidth(): int32;
+begin
+  return DoRound(float32(GFrame.BaseWidth) * GFrame.Zoom);
+end;
+
+routine DoZoomedHeight(): int32;
+begin
+  return DoRound(float32(GFrame.BaseHeight) * GFrame.Zoom);
+end;
+
+// ABase scaled for ADpi, each side rounded
+routine DoScaledSize(const ABaseWidth: int32; const ABaseHeight: int32; const ADpi: int32): Vector2;
+var
+  LScale: float64;
+begin
+  LScale := float64(ADpi) / float64(ADAM_RAYLIB_BASE_DPI);
+  return Vector2(x: float32(DoRound(float64(ABaseWidth) * LScale)),
+    y: float32(DoRound(float64(ABaseHeight) * LScale)));
+end;
+
+// The rectangle (window units) that fits ABase's aspect into AWindow, centred, bars outside
+// it; the whole window when a size is 0 or less
+routine DoLetterbox(const AWindowWidth: int32; const AWindowHeight: int32; const ABaseWidth: int32;
+  const ABaseHeight: int32): Rectangle;
+var
+  LRect: Rectangle;
+  LWindowRatio: float32;
+  LBaseRatio: float32;
+begin
+  LRect := Rectangle(x: 0.0f, y: 0.0f, width: float32(AWindowWidth), height: float32(AWindowHeight));
+  if (AWindowWidth <= 0) or (AWindowHeight <= 0) or (ABaseWidth <= 0) or (ABaseHeight <= 0) then
+    return LRect;
+  end;
+  LWindowRatio := float32(AWindowWidth) / float32(AWindowHeight);
+  LBaseRatio := float32(ABaseWidth) / float32(ABaseHeight);
+  if LWindowRatio >= LBaseRatio then
+    // Wider than the frame: bars left and right
+    LRect.width := float32(AWindowHeight) * LBaseRatio;
+    LRect.x := (float32(AWindowWidth) - LRect.width) / 2.0f;
+  else
+    // Taller than the frame: bars above and below
+    LRect.height := float32(AWindowWidth) / LBaseRatio;
+    LRect.y := (float32(AWindowHeight) - LRect.height) / 2.0f;
+  end;
+  return LRect;
+end;
+
+// The rectangle (window units) of the largest WHOLE multiple of ABase that fits into
+// AWindow, centred on whole pixels, bars around it. The multiple is taken in framebuffer
+// pixels (APixelsPerUnit of them per window unit), so each base pixel covers the same square
+// of real pixels on a scaled display too. A window smaller than one base size gets the fit
+// rule instead (never an empty frame); a size of 0 gives the whole window.
+routine DoIntegerLetterbox(const AWindowWidth: int32; const AWindowHeight: int32;
+  const ABaseWidth: int32; const ABaseHeight: int32; const APixelsPerUnit: float32): Rectangle;
+var
+  LPixelWidth: int32;
+  LPixelHeight: int32;
+  LMultiple: int32;
+  LWidth: int32;
+  LHeight: int32;
+  LX: int32;
+  LY: int32;
+begin
+  if (AWindowWidth <= 0) or (AWindowHeight <= 0) or (ABaseWidth <= 0) or (ABaseHeight <= 0) or
+    (APixelsPerUnit <= 0.0f) then
+    return DoLetterbox(AWindowWidth, AWindowHeight, ABaseWidth, ABaseHeight);
+  end;
+  LPixelWidth := DoRound(float32(AWindowWidth) * APixelsPerUnit);
+  LPixelHeight := DoRound(float32(AWindowHeight) * APixelsPerUnit);
+  LMultiple := LPixelWidth div ABaseWidth;
+  if LPixelHeight div ABaseHeight < LMultiple then
+    LMultiple := LPixelHeight div ABaseHeight;
+  end;
+  if LMultiple < 1 then
+    return DoLetterbox(AWindowWidth, AWindowHeight, ABaseWidth, ABaseHeight);
+  end;
+  // Whole pixels throughout: the size is exact, the centring rounds down
+  LWidth := ABaseWidth * LMultiple;
+  LHeight := ABaseHeight * LMultiple;
+  LX := (LPixelWidth - LWidth) div 2;
+  LY := (LPixelHeight - LHeight) div 2;
+  return Rectangle(x: float32(LX) / APixelsPerUnit, y: float32(LY) / APixelsPerUnit,
+    width: float32(LWidth) / APixelsPerUnit, height: float32(LHeight) / APixelsPerUnit);
+end;
+
+// The frame's letterbox for the window as it is now, under its rule (fit, or a whole
+// multiple): the one rule BeginFrame, the mouse and GetFrameLetterbox share
+routine DoLetterboxNow(): Rectangle;
+var
+  LPixelsPerUnit: float32;
+begin
+  if not GFrame.IntegerScale then
+    return DoLetterbox(GetScreenWidth(), GetScreenHeight(), GFrame.BaseWidth, GFrame.BaseHeight);
+  end;
+  // Framebuffer pixels per window unit: more than 1 when raylib scales the window itself
+  // (FLAG_WINDOW_HIGHDPI)
+  LPixelsPerUnit := 1.0f;
+  if GetScreenWidth() > 0 then
+    LPixelsPerUnit := float32(GetRenderWidth()) / float32(GetScreenWidth());
+  end;
+  return DoIntegerLetterbox(GetScreenWidth(), GetScreenHeight(), GFrame.BaseWidth,
+    GFrame.BaseHeight, LPixelsPerUnit);
+end;
+
+// AValue held to [ALow, AHigh] (std::clamp's rule)
+routine DoClamp(const AValue: float32; const ALow: float32; const AHigh: float32): float32;
+begin
+  if AValue < ALow then
+    return ALow;
+  end;
+  if AHigh < AValue then
+    return AHigh;
+  end;
+  return AValue;
+end;
+
+// A window point (window units) in frame units through the letterbox ALetterbox of a ABase
+// frame, clamped to the frame and rounded
+routine DoFramePoint(const APoint: Vector2; const ALetterbox: Rectangle; const ABaseWidth: int32;
+  const ABaseHeight: int32): Vector2;
+var
+  LX: float32;
+  LY: float32;
+begin
+  if (ALetterbox.width <= 0.0f) or (ALetterbox.height <= 0.0f) or (ABaseWidth <= 0) or
+    (ABaseHeight <= 0) then
+    return Vector2(x: 0.0f, y: 0.0f);
+  end;
+  LX := (APoint.x - ALetterbox.x) * float32(ABaseWidth) / ALetterbox.width;
+  LY := (APoint.y - ALetterbox.y) * float32(ABaseHeight) / ALetterbox.height;
+  return Vector2(x: float32(DoRound(DoClamp(LX, 0.0f, float32(ABaseWidth - 1)))),
+    y: float32(DoRound(DoClamp(LY, 0.0f, float32(ABaseHeight - 1)))));
+end;
+
+// The window at the base size x the zoom x the scale (a window at its normal size only:
+// fullscreen, borderless, maximized and minimized are the system's), centred on its
+// monitor's work area when ACenter
+routine DoApplyScale(const ACenter: bool);
+var
+  LSize: Vector2;
+  LMonitor: int32;
+  LMonitors: ptr to ptr;
+  LCount: int32;
+  LAreaX: int32;
+  LAreaY: int32;
+  LAreaWidth: int32;
+  LAreaHeight: int32;
+  LPosition: Vector2;
+  LLeft: int32;
+  LTop: int32;
+begin
+  DoFrameLive();
+  if GFrame.RaylibScales or IsWindowFullscreen() or
+    IsWindowState(uint32(FLAG_BORDERLESS_WINDOWED_MODE)) or IsWindowMaximized() or
+    IsWindowMinimized() then
+    return;
+  end;
+  LSize := DoScaledSize(DoZoomedWidth(), DoZoomedHeight(), GFrame.Dpi);
+  SetWindowSize(int32(LSize.x), int32(LSize.y));
+  if not ACenter then
+    return;
+  end;
+
+  LCount := 0;
+  LAreaX := 0;
+  LAreaY := 0;
+  LAreaWidth := 0;
+  LAreaHeight := 0;
+  LMonitor := GetCurrentMonitor();
+  LMonitors := glfwGetMonitors(addr of LCount);
+  if (LMonitors <> nil) and (LMonitor >= 0) and (LMonitor < LCount) then
+    glfwGetMonitorWorkarea(LMonitors[LMonitor], addr of LAreaX, addr of LAreaY,
+      addr of LAreaWidth, addr of LAreaHeight);
+  end;
+  if (LAreaWidth <= 0) or (LAreaHeight <= 0) then
+    LPosition := GetMonitorPosition(LMonitor);
+    LAreaX := int32(LPosition.x);
+    LAreaY := int32(LPosition.y);
+    LAreaWidth := GetMonitorWidth(LMonitor);
+    LAreaHeight := GetMonitorHeight(LMonitor);
+  end;
+  // Centred; a window larger than the area starts at its top left
+  LLeft := (LAreaWidth - int32(LSize.x)) div 2;
+  if LLeft < 0 then
+    LLeft := 0;
+  end;
+  LTop := (LAreaHeight - int32(LSize.y)) div 2;
+  if LTop < 0 then
+    LTop := 0;
+  end;
+  SetWindowPosition(LAreaX + LLeft, LAreaY + LTop);
+end;
+
+// The DPI asked again when its check is due (each frame on Windows, a cheap call; once a
+// second on X11, a round trip to the server); a change resizes the window
+routine DoFollowDpi();
+var
+  LDpi: int32;
+begin
+  if GetTime() - GFrame.LastDpiCheck < ADAM_RAYLIB_DPI_CHECK_SECONDS then
+    return;
+  end;
+  GFrame.LastDpiCheck := GetTime();
+  LDpi := DoQueryDpi();
+  if LDpi = GFrame.Dpi then
+    return;
+  end;
+  GFrame.Dpi := LDpi;
+  DoApplyScale(false);
+end;
+
+// The frame's clip: drawing held to the letterbox, in whole window units (BeginFrame's and
+// RestoreFrameClip's one rule)
+routine DoFrameClip();
+begin
+  BeginScissorMode(DoRound(GFrame.Letterbox.x), DoRound(GFrame.Letterbox.y),
+    DoRound(GFrame.Letterbox.width), DoRound(GFrame.Letterbox.height));
+end;
+
+// ACamera (in base units) composed with the frame's camera: raylib's BeginMode2D replaces
+// the matrix, so the two are folded into one. The frame's camera is T(offset) S(zoom) (target
+// 0, no rotation); a uniform scale commutes with a rotation, so the product is again one
+// Camera2D
+routine DoFrameCompose(const ACamera: Camera2D): Camera2D;
+var
+  LResult: Camera2D;
+begin
+  LResult := ACamera;
+  LResult.offset.x := GFrame.Camera.offset.x + GFrame.Camera.zoom * ACamera.offset.x;
+  LResult.offset.y := GFrame.Camera.offset.y + GFrame.Camera.zoom * ACamera.offset.y;
+  LResult.zoom := GFrame.Camera.zoom * ACamera.zoom;
+  return LResult;
+end;
+
+// The letterbox in framebuffer pixels, as rlViewport takes it: HIGHDPI renders above the
+// window's size (render / screen is the pixel scale), and GL's viewport origin is the
+// framebuffer's bottom-left corner
+routine DoFrameViewport();
+var
+  LScaleX: float32;
+  LScaleY: float32;
+  LX: int32;
+  LWidth: int32;
+  LHeight: int32;
+  LBottom: int32;
+begin
+  LScaleX := 1.0f;
+  LScaleY := 1.0f;
+  if (GetScreenWidth() > 0) and (GetScreenHeight() > 0) then
+    LScaleX := float32(GetRenderWidth()) / float32(GetScreenWidth());
+    LScaleY := float32(GetRenderHeight()) / float32(GetScreenHeight());
+  end;
+  LX := DoRound(GFrame.Letterbox.x * LScaleX);
+  LWidth := DoRound(GFrame.Letterbox.width * LScaleX);
+  LHeight := DoRound(GFrame.Letterbox.height * LScaleY);
+  LBottom := DoRound((GFrame.Letterbox.y + GFrame.Letterbox.height) * LScaleY);
+  rlViewport(LX, GetRenderHeight() - LBottom, LWidth, LHeight);
+end;
+
+// ACamera's projection at the frame's base aspect: raylib's BeginMode3D rule (rcore.c), with
+// the base size in place of the framebuffer's
+routine DoFrameProjection(const ACamera: Camera3D);
+var
+  LAspect: float64;
+  LNear: float64;
+  LFar: float64;
+  LTop: float64;
+  LRight: float64;
+begin
+  LAspect := float64(GFrame.BaseWidth) / float64(GFrame.BaseHeight);
+  LNear := rlGetCullDistanceNear();
+  LFar := rlGetCullDistanceFar();
+  rlMatrixMode(RL_PROJECTION);
+  rlLoadIdentity();
+  if ACamera.projection = CAMERA_PERSPECTIVE then
+    LTop := LNear * tan(float64(ACamera.fovy) * 0.5 * float64(DEG2RAD));
+    LRight := LTop * LAspect;
+    rlFrustum(-LRight, LRight, -LTop, LTop, LNear, LFar);
+  else
+    if ACamera.projection = CAMERA_ORTHOGRAPHIC then
+      LTop := float64(ACamera.fovy) / 2.0;
+      LRight := LTop * LAspect;
+      rlOrtho(-LRight, LRight, -LTop, LTop, LNear, LFar);
+    end;
+  end;
+  rlMatrixMode(RL_MODELVIEW);
+end;
+
+/// Opens raylib's window as a frame window: ABaseWidth x ABaseHeight is the base (virtual)
+/// size everything is drawn in. The window opens at the base size x the frame's zoom
+/// (SetFrameZoom, 1 by default) x the monitor's scale (GetFrameDpi / 96), centred on its
+/// monitor's work area, resizable, and takes a new size when the DPI changes (a move to
+/// another monitor). Draw between BeginFrame and EndFrame in base units; on resize, maximize
+/// or fullscreen the frame keeps its aspect (letterboxed, or a whole multiple with
+/// SetFrameIntegerScale), bars outside it. SetConfigFlags before it adds flags (raylib's).
+/// CloseWindow closes the frame too (GetFrameWidth 0 again, the frame and bar colours, the
+/// integer scale and the zoom kept).
+/// @param ABaseWidth the base width, more than 0
+/// @param ABaseHeight the base height, more than 0
+/// @param ATitle the window's title
+/// @returns true when the window opened; false for a base size of 0 or less, with a raylib
+///   window already open, or when raylib could not open one
+/// @example `if not InitFrameWindow(800, 450, "Game") then return; end;`
+/// @see BeginFrame
+public routine cpplink InitFrameWindow(const ABaseWidth: int32; const ABaseHeight: int32;
+  const ATitle: ptr to const char): bool;
+begin
+  DoFrameLive();
+  // A frame has a size; one window per program (raylib's rule)
+  if (ABaseWidth <= 0) or (ABaseHeight <= 0) or IsWindowReady() then
+    return false;
+  end;
+  RaylibPlatformSetWindowGone(DoFrameWindowGone);
+  GFrame.BaseWidth := ABaseWidth;
+  GFrame.BaseHeight := ABaseHeight;
+  // At the zoomed size (raylib scales it on top itself with FLAG_WINDOW_HIGHDPI; otherwise
+  // DoApplyScale does below)
+  SetConfigFlags(uint32(FLAG_WINDOW_RESIZABLE));
+  InitWindow(DoZoomedWidth(), DoZoomedHeight(), ATitle);
+  if not IsWindowReady() then
+    GFrame.BaseWidth := 0;
+    GFrame.BaseHeight := 0;
+    return false;
+  end;
+  GFrame.Open := true;
+  GFrame.NativeWindow := RaylibPlatformNativeWindow(GetWindowHandle());
+  GFrame.RaylibScales := IsWindowState(uint32(FLAG_WINDOW_HIGHDPI));
+  GFrame.Dpi := DoQueryDpi();
+  GFrame.LastDpiCheck := GetTime();
+  DoApplyScale(true);
+  return true;
+end;
+
+/// Begins drawing the frame (inside BeginDrawing): the whole window cleared to the bar
+/// colour, then drawing held to the letterbox in base units (GetFrameCamera's Camera2D), the
+/// frame filled with its colour, and the mouse taken (GetFrameMousePosition). Does nothing
+/// with no frame window.
+/// @example `BeginDrawing(); BeginFrame(); DrawCircle(400, 225, 50.0f, RED); EndFrame(); EndDrawing();`
+/// @see EndFrame
+public routine cpplink BeginFrame();
+begin
+  DoFrameLive();
+  if not GFrame.Open then
+    return;
+  end;
+  DoFollowDpi();
+  // The letterbox follows the window's size as it is now (a resize needs no call)
+  GFrame.Letterbox := DoLetterboxNow();
+  GFrame.Camera.offset := Vector2(x: GFrame.Letterbox.x, y: GFrame.Letterbox.y);
+  GFrame.Camera.target := Vector2(x: 0.0f, y: 0.0f);
+  GFrame.Camera.rotation := 0.0f;
+  GFrame.Camera.zoom := GFrame.Letterbox.width / float32(GFrame.BaseWidth);
+  // The bars: the whole window; then the frame, clipped to it
+  ClearBackground(GFrame.BarColor);
+  DoFrameClip();
+  BeginMode2D(GFrame.Camera);
+  DrawRectangle(0, 0, GFrame.BaseWidth, GFrame.BaseHeight, GFrame.FrameColor);
+  GFrame.Mouse := DoFramePoint(GetMousePosition(), GFrame.Letterbox, GFrame.BaseWidth,
+    GFrame.BaseHeight);
+end;
+
+/// Ends BeginFrame: drawing is in window units again, unclipped (for a HUD over the bars).
+/// Does nothing with no frame window.
+/// @example `EndFrame(); DrawFPS(10, 10); EndDrawing();`
+/// @see BeginFrame
+public routine cpplink EndFrame();
+begin
+  DoFrameLive();
+  if not GFrame.Open then
+    return;
+  end;
+  EndMode2D();
+  EndScissorMode();
+end;
+
+/// Draws through ACamera (in base units) inside the frame: raylib's BeginMode2D would replace
+/// the frame's camera, so use this pair inside BeginFrame / EndFrame. With no frame window it
+/// is raylib's BeginMode2D.
+/// @param ACamera the program's camera, in base units
+/// @example `BeginFrameMode2D(LCamera); DrawTexture(LMap, 0, 0, WHITE); EndFrameMode2D();`
+/// @see EndFrameMode2D
+public routine cpplink BeginFrameMode2D(const ACamera: Camera2D);
+begin
+  DoFrameLive();
+  if not GFrame.Open then
+    BeginMode2D(ACamera);
+    return;
+  end;
+  BeginMode2D(DoFrameCompose(ACamera));
+end;
+
+/// Ends BeginFrameMode2D: drawing is in base units through the frame's own camera again.
+/// With no frame window it is raylib's EndMode2D.
+/// @example `EndFrameMode2D(); DrawText("HUD", 10, 10, 20, WHITE);`
+/// @see BeginFrameMode2D
+public routine cpplink EndFrameMode2D();
+begin
+  DoFrameLive();
+  // Back to the frame's own camera (raylib's EndMode2D would leave window units)
+  if not GFrame.Open then
+    EndMode2D();
+    return;
+  end;
+  BeginMode2D(GFrame.Camera);
+end;
+
+/// Draws a 3D scene through ACamera inside the frame: the scene's projection is at the base
+/// size's aspect and its viewport the letterbox, where raylib's BeginMode3D takes the whole
+/// window's aspect, so use this pair inside BeginFrame / EndFrame. With no frame window it is
+/// raylib's BeginMode3D.
+/// @param ACamera the program's 3D camera
+/// @example `BeginFrameMode3D(LCamera); DrawGrid(10, 1.0f); EndFrameMode3D();`
+/// @see EndFrameMode3D
+public routine cpplink BeginFrameMode3D(const ACamera: Camera3D);
+begin
+  DoFrameLive();
+  // raylib's BeginMode3D first: the batch drawn, the 2D projection saved, the view matrix,
+  // the depth test; then the projection and the viewport are the letterbox's (the frame's
+  // Camera2D and clip stay as they are)
+  BeginMode3D(ACamera);
+  if not GFrame.Open then
+    return;
+  end;
+  DoFrameProjection(ACamera);
+  DoFrameViewport();
+end;
+
+/// Ends BeginFrameMode3D: drawing is in base units through the frame's own camera and clip
+/// again, as BeginFrame set them. With no frame window it is raylib's EndMode3D.
+/// @example `EndFrameMode3D(); DrawText("HUD", 10, 10, 20, WHITE);`
+/// @see BeginFrameMode3D
+public routine cpplink EndFrameMode3D();
+begin
+  // raylib's EndMode3D: the batch drawn, the 2D projection back, the depth test off; then
+  // raylib's own viewport (desktop GLFW sets no render offset) and the frame's camera and
+  // clip, as BeginFrame left them
+  EndMode3D();
+  DoFrameLive();
+  if not GFrame.Open then
+    return;
+  end;
+  rlViewport(0, 0, GetRenderWidth(), GetRenderHeight());
+  BeginMode2D(GFrame.Camera);
+  DoFrameClip();
+end;
+
+/// Turns the frame's clip on again, as BeginFrame set it (drawing held to the letterbox): for
+/// code between BeginFrame and EndFrame that turned raylib's scissor off or changed it. Does
+/// nothing with no frame window.
+/// @example `EndScissorMode(); RestoreFrameClip(); DrawText("clipped again", 10, 10, 20, WHITE);`
+/// @see BeginFrame
+public routine cpplink RestoreFrameClip();
+begin
+  DoFrameLive();
+  if not GFrame.Open then
+    return;
+  end;
+  DoFrameClip();
+end;
+
+/// The frame's base width (InitFrameWindow's); 0 with no frame window.
+/// @example `LWidth := GetFrameWidth();`
+/// @see GetFrameHeight
+public routine cpplink GetFrameWidth(): int32;
+begin
+  DoFrameLive();
+  return GFrame.BaseWidth;
+end;
+
+/// The frame's base height (InitFrameWindow's); 0 with no frame window.
+/// @example `LHeight := GetFrameHeight();`
+/// @see GetFrameWidth
+public routine cpplink GetFrameHeight(): int32;
+begin
+  DoFrameLive();
+  return GFrame.BaseHeight;
+end;
+
+/// The DPI the frame window is sized for (the monitor's, followed as it changes); 96 with no
+/// frame window.
+/// @example `println(GetFrameDpi());`
+/// @see GetFrameScale
+public routine cpplink GetFrameDpi(): int32;
+begin
+  DoFrameLive();
+  return GFrame.Dpi;
+end;
+
+/// The monitor's scale the frame window is sized for: GetFrameDpi / 96.
+/// @example `LScale := GetFrameScale();`
+/// @see GetFrameDpi
+public routine cpplink GetFrameScale(): float32;
+begin
+  return float32(GetFrameDpi()) / 96.0f;
+end;
+
+/// The DPI raylib's window is shown at now (a frame window or not; the monitor's): Windows
+/// the window's own, X11's Xft.dpi; 96 when the OS gives none.
+/// @example `LScale := float32(GetWindowDpi()) / 96.0f;`
+/// @see GetFrameDpi
+public routine cpplink GetWindowDpi(): int32;
+begin
+  return DoQueryDpi();
+end;
+
+/// The mouse at BeginFrame, in base units, clamped to the frame (0 to the base size - 1) and
+/// rounded; 0, 0 with no frame window.
+/// @example `LMouse := GetFrameMousePosition();`
+/// @see BeginFrame
+public routine cpplink GetFrameMousePosition(): Vector2;
+begin
+  DoFrameLive();
+  return GFrame.Mouse;
+end;
+
+/// The Camera2D BeginFrame draws through (its offset is the letterbox's top left, its zoom
+/// window units per base unit): for raylib's own world / screen mapping.
+/// @returns the frame's camera as BeginFrame last set it
+/// @example `LWorld := GetScreenToWorld2D(LTouch, GetFrameCamera());`
+/// @see BeginFrame
+public routine cpplink GetFrameCamera(): Camera2D;
+begin
+  DoFrameLive();
+  return GFrame.Camera;
+end;
+
+/// Sets the colour the frame is filled with at BeginFrame (WHITE by default).
+/// @param AColor the frame's colour
+/// @example `SetFrameColor(RAYWHITE);`
+/// @see SetFrameBarColor
+public routine cpplink SetFrameColor(const AColor: Color);
+begin
+  DoFrameLive();
+  GFrame.FrameColor := AColor;
+end;
+
+/// The colour the frame is filled with at BeginFrame.
+/// @example `LColor := GetFrameColor();`
+/// @see SetFrameColor
+public routine cpplink GetFrameColor(): Color;
+begin
+  DoFrameLive();
+  return GFrame.FrameColor;
+end;
+
+/// Sets the colour of the bars around the frame (BLACK by default).
+/// @param AColor the bars' colour
+/// @example `SetFrameBarColor(DARKGRAY);`
+/// @see SetFrameColor
+public routine cpplink SetFrameBarColor(const AColor: Color);
+begin
+  DoFrameLive();
+  GFrame.BarColor := AColor;
+end;
+
+/// The colour of the bars around the frame.
+/// @example `LColor := GetFrameBarColor();`
+/// @see SetFrameBarColor
+public routine cpplink GetFrameBarColor(): Color;
+begin
+  DoFrameLive();
+  return GFrame.BarColor;
+end;
+
+/// Turns integer scaling on or off: on, the frame is the largest whole multiple of the base
+/// size that fits the window (GetIntegerLetterboxRect's rule, taken in real framebuffer
+/// pixels), so every base pixel is the same square of screen pixels (pixel art); off (the
+/// default), it fills the window at its aspect (GetLetterboxRect's rule). It may be set before
+/// InitFrameWindow and holds until changed; BeginFrame, GetFrameMousePosition and
+/// GetFrameLetterbox follow it at once.
+/// @param AEnabled true for whole multiples
+/// @example `SetFrameIntegerScale(true); InitFrameWindow(320, 180, "Game");`
+/// @see GetFrameLetterbox
+/// @see GetIntegerLetterboxRect
+public routine cpplink SetFrameIntegerScale(const AEnabled: bool);
+begin
+  DoFrameLive();
+  GFrame.IntegerScale := AEnabled;
+end;
+
+/// Whether the frame is integer scaled (SetFrameIntegerScale).
+/// @example `if IsFrameIntegerScale() then ... end;`
+/// @see SetFrameIntegerScale
+public routine cpplink IsFrameIntegerScale(): bool;
+begin
+  DoFrameLive();
+  return GFrame.IntegerScale;
+end;
+
+/// Sets the frame's zoom: the window's normal size is the base size x the zoom x the
+/// monitor's scale (a 320 x 180 game at zoom 4 opens at 1280 x 720 on a 96 DPI monitor);
+/// drawing stays in base units, the frame only bigger when the window is bigger. Set it
+/// before InitFrameWindow for the first size; on an open frame window the window takes its
+/// new normal size at once (not while fullscreen, maximized or minimized). A zoom of 0 or less
+/// is 1. It holds until changed, over a CloseWindow too.
+/// @param AZoom the zoom, more than 0
+/// @example `SetFrameZoom(4.0f); InitFrameWindow(320, 180, "Game");`
+/// @see InitFrameWindow
+/// @see GetFrameZoom
+public routine cpplink SetFrameZoom(const AZoom: float32);
+begin
+  DoFrameLive();
+  // A zoom of 0 or less (or not a number) is no zoom: 1
+  if AZoom > 0.0f then
+    GFrame.Zoom := AZoom;
+  else
+    GFrame.Zoom := 1.0f;
+  end;
+  if GFrame.Open then
+    DoApplyScale(false);
+  end;
+end;
+
+/// The frame's zoom (SetFrameZoom).
+/// @example `LZoom := GetFrameZoom();`
+/// @see SetFrameZoom
+public routine cpplink GetFrameZoom(): float32;
+begin
+  DoFrameLive();
+  return GFrame.Zoom;
+end;
+
+/// The frame's rectangle in the window now, in window units, under its rule (fit, or a whole
+/// multiple with SetFrameIntegerScale): where BeginFrame draws the frame this frame. Code that
+/// maps between the window and the frame outside BeginFrame / EndFrame uses it; empty with no
+/// frame window.
+/// @example `LBox := GetFrameLetterbox(); LZoom := LBox.width / float32(GetFrameWidth());`
+/// @see SetFrameIntegerScale
+/// @see BeginFrame
+public routine cpplink GetFrameLetterbox(): Rectangle;
+begin
+  DoFrameLive();
+  if not GFrame.Open then
+    return Rectangle(x: 0.0f, y: 0.0f, width: 0.0f, height: 0.0f);
+  end;
+  return DoLetterboxNow();
+end;
+
+/// Toggles the frame window between a borderless window over its monitor and its window (the
+/// context kept; raylib puts the window back at its place and size). Does nothing with no
+/// frame window.
+/// @example `if IsKeyPressed(KEY_F11) then ToggleFrameFullscreen(); end;`
+/// @see InitFrameWindow
+public routine cpplink ToggleFrameFullscreen();
+begin
+  DoFrameLive();
+  if GFrame.Open then
+    ToggleBorderlessWindowed();
+  end;
+end;
+
+/// The letterbox rule itself (no window needed): the rectangle, in window units, that fits a
+/// base size's aspect into a window, centred, bars outside it (left and right in a wider
+/// window, above and below in a taller one); the whole window when a size is 0 or less.
+/// @param AWindowWidth the window's width
+/// @param AWindowHeight the window's height
+/// @param ABaseWidth the base width
+/// @param ABaseHeight the base height
+/// @example `LBox := GetLetterboxRect(1920, 1080, 800, 600);`
+/// @see GetScaledFrameSize
+public routine cpplink GetLetterboxRect(const AWindowWidth: int32; const AWindowHeight: int32;
+  const ABaseWidth: int32; const ABaseHeight: int32): Rectangle;
+begin
+  return DoLetterbox(AWindowWidth, AWindowHeight, ABaseWidth, ABaseHeight);
+end;
+
+/// The integer letterbox rule itself (no window needed): the rectangle, in window units, of
+/// the largest whole multiple of the base size that fits the window, centred (the bars round
+/// down); a window smaller than the base size gets GetLetterboxRect's fit rule instead; a size
+/// of 0 or less, the whole window. The frame uses it with SetFrameIntegerScale on.
+/// @param AWindowWidth the window's width
+/// @param AWindowHeight the window's height
+/// @param ABaseWidth the base width
+/// @param ABaseHeight the base height
+/// @example `LBox := GetIntegerLetterboxRect(1366, 768, 320, 180); // 4x: 1280x720 at (43, 24)`
+/// @see GetLetterboxRect
+/// @see SetFrameIntegerScale
+public routine cpplink GetIntegerLetterboxRect(const AWindowWidth: int32;
+  const AWindowHeight: int32; const ABaseWidth: int32; const ABaseHeight: int32): Rectangle;
+begin
+  return DoIntegerLetterbox(AWindowWidth, AWindowHeight, ABaseWidth, ABaseHeight, 1.0f);
+end;
+
+/// The DPI rule itself (no window needed): the window size InitFrameWindow opens for a base
+/// size on a monitor of ADpi: base x ADpi / 96, each side rounded (halfway away from zero).
+/// @param ABaseWidth the base width
+/// @param ABaseHeight the base height
+/// @param ADpi the monitor's DPI
+/// @example `LSize := GetScaledFrameSize(800, 450, 144);`
+/// @see GetLetterboxRect
+public routine cpplink GetScaledFrameSize(const ABaseWidth: int32; const ABaseHeight: int32;
+  const ADpi: int32): Vector2;
+begin
+  return DoScaledSize(ABaseWidth, ABaseHeight, ADpi);
+end;
+
+/// The frame point rule itself (no window needed): a window point (window units) in base
+/// units through a letterbox (GetLetterboxRect's) of a base-size frame, clamped to the frame
+/// (0 to the base size - 1) and rounded; 0, 0 for an empty letterbox or base size.
+/// @param APoint the point in the window
+/// @param ALetterbox the frame's rectangle in the window
+/// @param ABaseWidth the base width
+/// @param ABaseHeight the base height
+/// @example `LAt := GetFramePoint(GetMousePosition(), LBox, 800, 600);`
+/// @see GetFrameMousePosition
+public routine cpplink GetFramePoint(const APoint: Vector2; const ALetterbox: Rectangle;
+  const ABaseWidth: int32; const ABaseHeight: int32): Vector2;
+begin
+  return DoFramePoint(APoint, ALetterbox, ABaseWidth, ABaseHeight);
 end;
 
 end.
