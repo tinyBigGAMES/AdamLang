@@ -1,0 +1,461 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  std_hookio_fd_win64.adam - a HookIO handle's CRT descriptor on win64
+  (PLAN-LINUX64 LX3d3e3, the parity of std_hookio_fd_linux: a C library doing
+  _fstat64(_fileno(f)) or ucrt lowio on a virtual path): _fileno of a zip
+  entry handle and lowio on it (the fstat family a regular file of the
+  entry's size, _read / _lseeki64 / _lseek / _tell / _eof / _filelength on
+  the stream's own place, _commit, _close making the number and the
+  stream's own lowio calls ucrt's on a closed number: EBADF and the invalid
+  parameter handler, fclose EOF); _open / _wopen / _sopen_s / _creat of
+  virtual names (binary and text reads, a write-only append, every refusal:
+  missing, _O_EXCL, write rights on a zip, a bad access or sharing mode, a
+  bad pmode, a read-only truncate), a path source's name, mingw's oldnames
+  open / fstat / lseek / read / close from C (libstd_hookio_c.a) reaching
+  the hooks, and a real file's and stdout's
+  descriptors left to ucrt.
+*******************************************************************************/
+
+/*
+@@test
+  kind run
+  targets x86_64-windows-gnu
+  exitcode 0
+  | ok fileno handle
+  | ok fstat handle
+  | ok fstat kinds
+  | ok fread after fstat
+  | ok fd read
+  | ok fd seek and tell
+  | ok fd eof and length
+  | ok fd commit
+  | ok fd close ends lowio calls
+  | ok fread after close
+  | ok fclose after close
+  | ok open io
+  | ok open read all
+  | ok close open
+  | ok open text
+  | ok wopen
+  | ok sopen_s
+  | ok creat memory
+  | ok memory bytes
+  | ok write-only append
+  | ok open path source
+  | ok open refused
+  | ok open refused checks
+  | ok oldnames
+  | ok real file ucrt
+  | ok stdout ucrt
+  | done 0
+  | [Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+@@end
+*/
+
+module exe std_hookio_fd_win64;
+
+@ifndef TARGET_X86_64_WINDOWS_GNU
+@message error "std_hookio_fd_win64 runs on x86_64-windows-gnu only: build it with -t x86_64-windows-gnu";
+@endif
+
+@addlibrarypath "$P:res/tests/std/fixtures/x86_64-windows-gnu";
+
+import System.Windows, System.SysUtils, System.Runtime, System.CustomIO, System.HookIO,
+  System.HookIO.Win64;
+
+// ucrt's handler of a failed parameter check for this thread (it comes before the process's)
+routine _set_thread_local_invalid_parameter_handler(const AHandler: routine(
+  const AExpression: ptr to const wchar; const AFunction: ptr to const wchar;
+  const AFile: ptr to const wchar; const ALine: uint32; const AReserved: uint64)): ptr;
+  external "ucrtbase";
+// ucrt's standard streams (stdout is 1)
+routine __acrt_iob_func(const AIndex: uint32): ptr; external "ucrtbase";
+// ucrt's remove of a real file
+routine remove(const APath: ptr to const char): int32; external "ucrtbase";
+// The fixture's descriptor read by a C library's names (mingw's oldnames open / fstat / lseek
+// / read / close, libcextras aliases of ucrt's lowio imports)
+routine clink std_hookio_c_lowio(APath: ptr to const char; ABuffer: ptr to uint8; ACap: clong;
+  AResults: ptr to int64); external "std_hookio_c";
+
+const
+  // ucrt's errno.h
+  ENOENT: int32 = 2;
+  EBADF: int32 = 9;
+  EACCES: int32 = 13;
+  EEXIST: int32 = 17;
+  EINVAL: int32 = 22;
+  SEEK_SET: int32 = 0;
+  SEEK_CUR: int32 = 1;
+  SEEK_END: int32 = 2;
+  ADAM_TEST_ZIP: string = "$P:../../../../res/tests/std/fixtures/std_customio_stored.zip";
+  ADAM_TEST_SIZE: int64 = 12;
+
+var
+  GFails: int32;
+  // The entry's own bytes (CreateZipFileIO), what every read is compared with
+  GBytes: array[0..11] of uint8;
+  // The failed parameter checks so far
+  GInvalid: int64;
+
+routine Check(const AName: string; const AOk: bool);
+begin
+  if AOk then
+    println("ok {}", AName);
+  else
+    println("FAIL {}", AName);
+    GFails := GFails + 1;
+  end;
+end;
+
+// The thread's invalid parameter handler: counts the call and returns (the call then returns
+// its failure)
+routine OnInvalid(const AExpression: ptr to const wchar; const AFunction: ptr to const wchar;
+  const AFile: ptr to const wchar; const ALine: uint32; const AReserved: uint64);
+begin
+  GInvalid := GInvalid + 1;
+end;
+
+// True when the ACount bytes at AData are the entry's from AFrom
+routine SameAs(const AData: ptr; const AFrom: int64; const ACount: int64): bool;
+var
+  LData: ptr to uint8;
+  LI: int64;
+begin
+  LData := ptr to uint8(AData);
+  for LI := 0 to ACount - 1 do
+    if LData[LI] <> GBytes[AFrom + LI] then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// A call's failure: -1 and errno AError (errno cleared by the caller before the call)
+routine FailedWith(const AAnswer: int64; const AError: int32): bool;
+begin
+  return (AAnswer = -1) and (CErrno() = AError);
+end;
+
+// A call's failure as ucrt's failed parameter check gives it: -1, errno AError and one more
+// handler call since ABefore
+routine RefusedWith(const AAnswer: int64; const AError: int32; const ABefore: int64): bool;
+begin
+  return FailedWith(AAnswer, AError) and (GInvalid = ABefore + 1);
+end;
+
+// _open of an Adam text path (its C copy freed after the call)
+routine OpenFd(const APath: string; const AFlags: int32): int32;
+var
+  LPath: ptr to char;
+  LFile: int32;
+begin
+  LPath := StringToC(APath);
+  LFile := _open(LPath, AFlags, int32(_S_IREAD | _S_IWRITE));
+  freemem(LPath);
+  return LFile;
+end;
+
+// fopen of an Adam text path and mode
+routine OpenPath(const APath: string; const AMode: string): ptr;
+var
+  LPath: ptr to char;
+  LMode: ptr to char;
+  LFile: ptr;
+begin
+  LPath := StringToC(APath);
+  LMode := StringToC(AMode);
+  LFile := fopen(LPath, LMode);
+  freemem(LPath);
+  freemem(LMode);
+  return LFile;
+end;
+
+// _sopen of an Adam text path with AShare (its C copy freed after the call)
+routine DoSopen(const APath: string; const AFlags: int32; const AShare: int32): int32;
+var
+  LPath: ptr to char;
+  LFile: int32;
+begin
+  LPath := StringToC(APath);
+  LFile := _sopen(LPath, AFlags, AShare);
+  freemem(LPath);
+  return LFile;
+end;
+
+// _fstat64 of AFile: a regular file of ASize bytes
+routine RegularOf(const AFile: int32; const ASize: int64): bool;
+var
+  LStat: _stat64;
+begin
+  if _fstat64(AFile, addr of LStat) <> 0 then
+    return false;
+  end;
+  return ((LStat.st_mode & _S_IFMT) = _S_IFREG) and (LStat.st_size = ASize) and
+    (LStat.st_nlink = 1);
+end;
+
+// The other fstat records of AFile: each a regular file of ASize bytes
+routine KindsOf(const AFile: int32; const ASize: int64): bool;
+var
+  L32: _stat32;
+  L32i64: _stat32i64;
+  L64i32: _stat64i32;
+begin
+  if (_fstat32(AFile, addr of L32) <> 0) or (_fstat32i64(AFile, addr of L32i64) <> 0) or
+    (_fstat64i32(AFile, addr of L64i32) <> 0) then
+    return false;
+  end;
+  return ((L32.st_mode & _S_IFMT) = _S_IFREG) and (int64(L32.st_size) = ASize) and
+    ((L32i64.st_mode & _S_IFMT) = _S_IFREG) and (L32i64.st_size = ASize) and
+    ((L64i32.st_mode & _S_IFMT) = _S_IFREG) and (int64(L64i32.st_size) = ASize);
+end;
+
+// _fileno of a zip entry handle and lowio on it
+routine TestFileno(const APrefix: string);
+var
+  LFile: ptr;
+  LFd: int32;
+  LBuffer: array[0..15] of uint8;
+  LBefore: int64;
+begin
+  LFile := OpenPath(APrefix + "/hello.txt", "rb");
+  LFd := _fileno(LFile);
+  Check("fileno handle", (LFile <> nil) and (LFd >= 0) and (fileno(LFile) = LFd));
+  Check("fstat handle", RegularOf(LFd, ADAM_TEST_SIZE));
+  Check("fstat kinds", KindsOf(LFd, ADAM_TEST_SIZE));
+  Check("fread after fstat", (fread(addr of LBuffer[0], 1, ADAM_TEST_SIZE, LFile) = ADAM_TEST_SIZE)
+    and SameAs(addr of LBuffer[0], 0, ADAM_TEST_SIZE));
+  // The descriptor is the stream's own: fread's fill left lowio's place at the end
+  Check("fd read", (_lseeki64(LFd, 0, SEEK_CUR) = ADAM_TEST_SIZE) and (_lseeki64(LFd, 0, SEEK_SET) = 0) and
+    (_read(LFd, addr of LBuffer[0], 5u) = 5) and SameAs(addr of LBuffer[0], 0, 5) and
+    (_telli64(LFd) = 5) and (_tell(LFd) = 5));
+  SetCErrno(0);
+  Check("fd seek and tell", (_lseek(LFd, -2, SEEK_END) = ADAM_TEST_SIZE - 2) and
+    FailedWith(_lseeki64(LFd, -100, SEEK_CUR), EINVAL) and (_telli64(LFd) = ADAM_TEST_SIZE - 2) and
+    FailedWith(_lseeki64(LFd, 0, 3), EINVAL));
+  Check("fd eof and length", (_eof(LFd) = 0) and (_filelengthi64(LFd) = ADAM_TEST_SIZE) and
+    (_filelength(LFd) = ADAM_TEST_SIZE) and (_telli64(LFd) = ADAM_TEST_SIZE - 2) and
+    (_lseeki64(LFd, 0, SEEK_END) = ADAM_TEST_SIZE) and (_eof(LFd) = 1));
+  Check("fd commit", _commit(LFd) = 0);
+  // _close of a fileno descriptor: the number is ucrt's closed one from here (each call EBADF
+  // and the handler), the stream's next fill too
+  SetCErrno(0);
+  LBefore := GInvalid;
+  Check("fd close ends lowio calls", (_close(LFd) = 0) and
+    RefusedWith(_read(LFd, addr of LBuffer[0], 1u), EBADF, LBefore) and
+    RefusedWith(_close(LFd), EBADF, LBefore + 1) and RefusedWith(_telli64(LFd), EBADF, LBefore + 2) and
+    (_fileno(LFile) = LFd));
+  SetCErrno(0);
+  LBefore := GInvalid;
+  Check("fread after close", (fseek(LFile, 0, SEEK_SET) = -1) and (CErrno() = EBADF) and
+    (GInvalid > LBefore));
+  SetCErrno(0);
+  LBefore := GInvalid;
+  Check("fclose after close", (fclose(LFile) = -1) and (CErrno() = EBADF) and (GInvalid = LBefore + 1));
+end;
+
+// _open of an io:// name: fstat, read, close; a text open's translation
+routine TestOpen(const APrefix: string);
+var
+  LFd: int32;
+  LBuffer: array[0..15] of uint8;
+  LText: array[0..3] of uint8;
+  LMemory: IO;
+  LPrefix: string;
+  LWide: own WideBox;
+  LBefore: int64;
+begin
+  LFd := OpenFd(APrefix + "/hello.txt", _O_RDONLY | _O_BINARY);
+  Check("open io", (LFd >= 0) and RegularOf(LFd, ADAM_TEST_SIZE));
+  Check("open read all", (_read(LFd, addr of LBuffer[0], 16u) = ADAM_TEST_SIZE) and
+    SameAs(addr of LBuffer[0], 0, ADAM_TEST_SIZE) and (_read(LFd, addr of LBuffer[0], 16u) = 0) and
+    (_eof(LFd) = 1));
+  SetCErrno(0);
+  LBefore := GInvalid;
+  // The number goes back to ucrt at the close: a call on it is ucrt's on a closed number
+  Check("close open", (_close(LFd) = 0) and RefusedWith(_read(LFd, addr of LBuffer[0], 1u), EBADF, LBefore));
+  // A text open reads "\r\n" as '\n' (lowio's translation, the handle's own)
+  LText[0] := 97u;
+  LText[1] := 13u;
+  LText[2] := 10u;
+  LText[3] := 98u;
+  LMemory := CreateMemoryIO(addr of LText[0], 4, true);
+  LPrefix := RegisterIO(LMemory);
+  LFd := OpenFd(LPrefix, _O_RDONLY | _O_TEXT);
+  Check("open text", (LFd >= 0) and (_read(LFd, addr of LBuffer[0], 16u) = 3) and (LBuffer[0] = 97u) and
+    (LBuffer[1] = 10u) and (LBuffer[2] = 98u) and (_close(LFd) = 0));
+  UnregisterIO(LPrefix);
+  IOClose(LMemory);
+  // _wopen of the same name in UTF-16
+  LWide := own WideBox();
+  Utf8ToWide(APrefix + "/hello.txt", LWide.Data);
+  LFd := _wopen(ptr to const wchar(addr of LWide.Data[0]), _O_RDONLY | _O_BINARY);
+  Check("wopen", (LFd >= 0) and (_read(LFd, addr of LBuffer[0], 5u) = 5) and SameAs(addr of LBuffer[0], 0, 5) and
+    (_close(LFd) = 0));
+end;
+
+// _sopen_s, _creat and a write-only append on registered memory IOs
+routine TestOpenForms(const APrefix: string);
+var
+  LFd: int32;
+  LPath: ptr to char;
+  LMemory: IO;
+  LPrefix: string;
+  LText: array[0..4] of uint8;
+  LBack: array[0..7] of uint8;
+  LOk: bool;
+  LBefore: int64;
+begin
+  LPath := StringToC(APrefix + "/hello.txt");
+  LFd := 99;
+  LOk := (_sopen_s(addr of LFd, LPath, _O_RDONLY | _O_BINARY, _SH_DENYNO, 0) = 0) and (LFd >= 0) and
+    RegularOf(LFd, ADAM_TEST_SIZE) and (_close(LFd) = 0);
+  SetCErrno(0);
+  LBefore := GInvalid;
+  LFd := 99;
+  LOk := LOk and (_sopen_s(addr of LFd, LPath, _O_RDONLY, _SH_DENYNO, 0x1000) = EINVAL) and (LFd = -1) and
+    (GInvalid = LBefore + 1);
+  Check("sopen_s", LOk);
+  freemem(LPath);
+  LText[0] := 104u;
+  LText[1] := 101u;
+  LText[2] := 108u;
+  LText[3] := 108u;
+  LText[4] := 111u;
+  LMemory := CreateMemoryIO();
+  LPrefix := RegisterIO(LMemory);
+  LPath := StringToC(LPrefix);
+  LFd := _creat(LPath, int32(_S_IREAD | _S_IWRITE));
+  freemem(LPath);
+  // _creat is read-write, binary as _get_fmode's default: write, back to 0, read the bytes
+  LOk := (LFd >= 0) and (_write(LFd, addr of LText[0], 5u) = 5) and (_lseeki64(LFd, 0, SEEK_SET) = 0) and
+    (_read(LFd, addr of LBack[0], 5u) = 5) and (LBack[0] = 104u) and (LBack[4] = 111u) and RegularOf(LFd, 5);
+  Check("creat memory", LOk and (_close(LFd) = 0));
+  LOk := (IOSize(LMemory) = 5) and (IOSeek(LMemory, 0, SeekOrigin.FromStart) = 0) and
+    (IORead(LMemory, addr of LBack[0], 5) = 5) and (LBack[1] = 101u);
+  Check("memory bytes", LOk);
+  // A write-only append open keeps the bytes and writes at the end; it cannot read
+  LFd := OpenFd(LPrefix, _O_WRONLY | _O_APPEND | _O_BINARY);
+  SetCErrno(0);
+  LOk := (LFd >= 0) and (_write(LFd, addr of LText[0], 2u) = 2) and FailedWith(_read(LFd, addr of LBack[0], 1u), EBADF) and
+    (_close(LFd) = 0);
+  LOk := LOk and (IOSize(LMemory) = 7) and (IOSeek(LMemory, 5, SeekOrigin.FromStart) = 5) and
+    (IORead(LMemory, addr of LBack[0], 2) = 2) and (LBack[0] = 104u) and (LBack[1] = 101u);
+  Check("write-only append", LOk);
+  UnregisterIO(LPrefix);
+  IOClose(LMemory);
+end;
+
+// _open of a path source's name, and the refusals of a virtual open
+routine TestOpenSource(const AZip: IOSource; const APrefix: string);
+var
+  LFd: int32;
+  LBuffer: array[0..15] of uint8;
+  LOk: bool;
+  LBefore: int64;
+  LStart: int64;
+begin
+  LStart := GInvalid;
+  SetIOThreadPathSource(AZip);
+  LFd := OpenFd("hello.txt", _O_RDONLY | _O_BINARY);
+  LOk := (LFd >= 0) and RegularOf(LFd, ADAM_TEST_SIZE) and (_read(LFd, addr of LBuffer[0], 12u) = 12) and
+    SameAs(addr of LBuffer[0], 0, ADAM_TEST_SIZE);
+  Check("open path source", LOk and (_close(LFd) = 0));
+  SetIOThreadPathSource(nil);
+  SetCErrno(0);
+  LOk := FailedWith(OpenFd(APrefix + "/missing.txt", _O_RDONLY), ENOENT);
+  SetCErrno(0);
+  LOk := LOk and FailedWith(OpenFd(APrefix + "/hello.txt", _O_RDWR), EACCES);
+  SetCErrno(0);
+  LOk := LOk and FailedWith(OpenFd(APrefix + "/hello.txt", _O_RDONLY | _O_CREAT | _O_EXCL), EEXIST);
+  SetCErrno(0);
+  LOk := LOk and FailedWith(OpenFd(APrefix + "/hello.txt", _O_RDONLY | _O_TRUNC), EINVAL);
+  Check("open refused", LOk and (GInvalid = LStart));
+  // ucrt's failed parameter checks: an access mode past _O_RDWR, an unknown sharing mode
+  SetCErrno(0);
+  LBefore := GInvalid;
+  LOk := RefusedWith(OpenFd(APrefix + "/hello.txt", 3), EINVAL, LBefore);
+  SetCErrno(0);
+  LOk := LOk and RefusedWith(DoSopen(APrefix + "/hello.txt", _O_RDONLY, 0x7F), EINVAL, LBefore + 1);
+  Check("open refused checks", LOk);
+end;
+
+// mingw's oldnames (libcextras aliases of the ucrt imports) reach the hooks from C: the
+// fixture's open / fstat / lseek / read / close of a virtual name
+routine TestOldnames(const APrefix: string);
+var
+  LPath: ptr to char;
+  LBuffer: array[0..15] of uint8;
+  LResults: array[0..5] of int64;
+begin
+  LPath := StringToC(APrefix + "/hello.txt");
+  std_hookio_c_lowio(LPath, addr of LBuffer[0], 16, addr of LResults[0]);
+  freemem(LPath);
+  Check("oldnames", (LResults[0] >= 0) and (LResults[1] = 0) and (LResults[2] = ADAM_TEST_SIZE) and
+    (LResults[3] = ADAM_TEST_SIZE) and (LResults[4] = ADAM_TEST_SIZE) and
+    SameAs(addr of LBuffer[0], 0, ADAM_TEST_SIZE) and (LResults[5] = 0));
+end;
+
+// A real file's descriptor and stdout's: ucrt's
+routine TestReal();
+var
+  LPath: string;
+  LCPath: ptr to char;
+  LFd: int32;
+  LText: array[0..2] of uint8;
+  LBack: array[0..2] of uint8;
+  LOk: bool;
+begin
+  LText[0] := 97u;
+  LText[1] := 98u;
+  LText[2] := 99u;
+  LPath := paramstr(0) + ".fdreal.txt";
+  LFd := OpenFd(LPath, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY);
+  LOk := (LFd >= 0) and (_write(LFd, addr of LText[0], 3u) = 3) and (_close(LFd) = 0);
+  LFd := OpenFd(LPath, _O_RDONLY | _O_BINARY);
+  LOk := LOk and (LFd >= 0) and RegularOf(LFd, 3) and (_read(LFd, addr of LBack[0], 3u) = 3) and
+    (LBack[0] = 97u) and (LBack[2] = 99u) and (_close(LFd) = 0);
+  LCPath := StringToC(LPath);
+  LOk := LOk and (remove(LCPath) = 0);
+  freemem(LCPath);
+  Check("real file ucrt", LOk);
+  Check("stdout ucrt", _fileno(__acrt_iob_func(1u)) = 1);
+end;
+
+var
+  LZip: IOSource;
+  LDirect: IO;
+  LPrefix: string;
+begin
+  _set_thread_local_invalid_parameter_handler(OnInvalid);
+  LDirect := CreateZipFileIO(ADAM_TEST_ZIP, "hello.txt");
+  if (LDirect = nil) or (IORead(LDirect, addr of GBytes[0], ADAM_TEST_SIZE) <> ADAM_TEST_SIZE) then
+    println("FAIL fixture");
+    GFails := GFails + 1;
+  end;
+  IOClose(LDirect);
+  LZip := CreateZipIOSource(ADAM_TEST_ZIP);
+  LPrefix := RegisterIOSource(LZip);
+  TestFileno(LPrefix);
+  TestOpen(LPrefix);
+  TestOpenForms(LPrefix);
+  TestOpenSource(LZip, LPrefix);
+  TestOldnames(LPrefix);
+  TestReal();
+  UnregisterIO(LPrefix);
+  IOSourceClose(LZip);
+  println("done {}", GFails);
+end.
