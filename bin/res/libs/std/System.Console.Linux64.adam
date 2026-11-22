@@ -1,0 +1,443 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.Console.Linux64.adam - System.Console's platform unit for
+  x86_64-linux-gnu: the same ConsolePlatform* routines as
+  System.Console.Win64, over glibc's terminal calls (isatty, termios,
+  ioctl TIOCGWINSZ, poll, read; System.Linux's declarations).
+
+  The same results as on Windows where a terminal lets them be (parity): a
+  terminal takes VT sequences and UTF-8 as it is; a key is read in raw mode
+  (no line editing, no echo, Ctrl+C read as a key, as Windows' console mode
+  0), its old modes put back after. Enter is KeyEnter ("\r"), Backspace
+  (DEL, 0x7F) is KeyBackspace ("\x08"), a lone Escape is KeyEscape; a key
+  that types nothing (an arrow, F1, Home: an escape sequence) is passed
+  over, Alt+<key> types the key. A terminal outlives the program, so it
+  never closes with it; the title is the terminal's escape sequence (no OS
+  call). A line is read as bytes from a terminal (its own line editing) and
+  from a pipe or a file alike. Nothing here writes to standard output.
+*******************************************************************************/
+
+module unit System.Console.Linux64;
+
+import System.SysUtils, System.Linux;
+
+const
+  // The bytes one read of standard input takes at most
+  ADAM_CONSOLE_LINUX_READ_BYTES: uint64 = 4096;
+  // How long an Escape byte waits for the rest of a sequence: none in that time = the Escape key
+  ADAM_CONSOLE_LINUX_ESCAPE_MS: int32 = 50;
+  // The bytes a terminal sends: Escape, Enter (CR in raw mode), Backspace (DEL)
+  ADAM_CONSOLE_LINUX_ESC: uint8 = 0x1B;
+  ADAM_CONSOLE_LINUX_CR: uint8 = 0x0D;
+  ADAM_CONSOLE_LINUX_DEL: uint8 = 0x7F;
+  ADAM_CONSOLE_LINUX_BS: uint8 = 0x08;
+
+type
+  // The bytes of one read of standard input
+  ConsoleReadBytes = array[0..4095] of uint8;
+
+var
+  // Standard input's bytes read but not yet taken (a line, a key); keys and lines take them
+  // in order, so a key typed ahead of a line is not lost
+  GInBytes: ConsoleReadBytes;
+  GInCount: int64;
+  GInAt: int64;
+
+// True when descriptor AFile is a terminal
+routine DoIsTty(const AFile: int32): bool;
+begin
+  return isatty(AFile) = 1;
+end;
+
+// The terminal size of standard output into ASize; false when it is no terminal
+routine DoWindowSize(var ASize: winsize): bool;
+begin
+  if not DoIsTty(STDOUT_FILENO) then
+    return false;
+  end;
+  ASize.ws_row := 0;
+  ASize.ws_col := 0;
+  ASize.ws_xpixel := 0;
+  ASize.ws_ypixel := 0;
+  return ioctl(STDOUT_FILENO, TIOCGWINSZ, addr of ASize) = 0;
+end;
+
+// Standard input's terminal put in raw mode (one byte at a time, no echo, no signal keys, no
+// CR to NL, no flow control), its modes as they were into AOld; false when it is no terminal
+routine DoRawMode(var AOld: termios): bool;
+var
+  LRaw: termios;
+begin
+  if tcgetattr(STDIN_FILENO, AOld) <> 0 then
+    return false;
+  end;
+  LRaw := AOld;
+  LRaw.c_lflag := LRaw.c_lflag & ~(ICANON | ECHO | ISIG | IEXTEN);
+  LRaw.c_iflag := LRaw.c_iflag & ~(ICRNL | IXON);
+  LRaw.c_cc[VMIN] := 1;
+  LRaw.c_cc[VTIME] := 0;
+  return tcsetattr(STDIN_FILENO, TCSANOW, addr of LRaw) = 0;
+end;
+
+// Standard input's modes put back as DoRawMode found them
+routine DoRestoreMode(const AOld: termios);
+begin
+  tcsetattr(STDIN_FILENO, TCSANOW, addr of AOld);
+end;
+
+// True when standard input has a byte to read within ATimeout ms (0: now, -1: no limit); a
+// byte already read and not taken counts at once
+routine DoInputReady(const ATimeout: int32): bool;
+var
+  LPoll: pollfd;
+  LCount: int32;
+begin
+  if GInAt < GInCount then
+    return true;
+  end;
+  LPoll.fd := STDIN_FILENO;
+  LPoll.events := POLLIN;
+  LPoll.revents := 0;
+  LCount := poll(addr of LPoll, 1, ATimeout);
+  // A signal breaking the wait off asks again (a timed wait then waits its whole time again)
+  while (LCount < 0) and (CErrno() = EINTR) do
+    LCount := poll(addr of LPoll, 1, ATimeout);
+  end;
+  return (LCount > 0) and ((LPoll.revents & POLLIN) <> 0);
+end;
+
+// The next byte of standard input into AByte (the bytes read but not taken first); false at
+// its end or on an error
+routine DoReadInputByte(var AByte: uint8): bool;
+var
+  LRead: int64;
+begin
+  if GInAt >= GInCount then
+    LRead := read(STDIN_FILENO, addr of GInBytes, ADAM_CONSOLE_LINUX_READ_BYTES);
+    while (LRead < 0) and (CErrno() = EINTR) do
+      LRead := read(STDIN_FILENO, addr of GInBytes, ADAM_CONSOLE_LINUX_READ_BYTES);
+    end;
+    if LRead <= 0 then
+      return false;
+    end;
+    GInCount := LRead;
+    GInAt := 0;
+  end;
+  AByte := GInBytes[GInAt];
+  GInAt := GInAt + 1;
+  return true;
+end;
+
+// The next byte of a sequence already under way: one that comes within the escape wait; false
+// when none does
+routine DoNextSequenceByte(var AByte: uint8): bool;
+begin
+  if not DoInputReady(ADAM_CONSOLE_LINUX_ESCAPE_MS) then
+    return false;
+  end;
+  return DoReadInputByte(AByte);
+end;
+
+// The rest of an escape sequence, its Escape byte read: CSI (ESC [ params intermediates final,
+// the final 0x40..0x7E) and SS3 (ESC O and one byte) are passed over whole. AByte is then the
+// byte after the Escape. Returns 0 for a sequence passed over (a key that types nothing), 1
+// for a lone Escape, 2 for Alt+<key> with that key's first byte in AByte
+routine DoEscapeSequence(var AByte: uint8): int32;
+var
+  LByte: uint8;
+begin
+  if not DoNextSequenceByte(LByte) then
+    return 1;
+  end;
+  AByte := LByte;
+  if LByte = 0x5B then
+    // CSI: parameters (0x30..0x3F) and intermediates (0x20..0x2F) up to the final byte
+    while DoNextSequenceByte(LByte) do
+      if (LByte >= 0x40) and (LByte <= 0x7E) then
+        leave;
+      end;
+    end;
+    return 0;
+  end;
+  if LByte = 0x4F then
+    // SS3: one more byte names the key (F1..F4, keypad keys)
+    DoNextSequenceByte(LByte);
+    return 0;
+  end;
+  if LByte = ADAM_CONSOLE_LINUX_ESC then
+    // Escape typed twice: the second is a key of its own
+    return 1;
+  end;
+  return 2;
+end;
+
+// U+FFFD as UTF-8 text: what a cut or wrong sequence reads as
+routine DoReplacement(): string;
+var
+  LText: string;
+  LAt: int64;
+begin
+  LText := "";
+  setlength(LText, 4);
+  LAt := 0;
+  EncodeUtf8Char(LText, LAt, ADAM_SYSUTILS_REPLACEMENT);
+  setlength(LText, LAt);
+  return LText;
+end;
+
+// The UTF-8 character whose first byte is ALead as text (its continuation bytes read); a cut
+// or wrong sequence is U+FFFD
+routine DoCharacter(const ALead: uint8): string;
+var
+  LText: string;
+  LCount: int32;
+  LI: int32;
+  LByte: uint8;
+  LIndex: int64;
+begin
+  if ALead < 0x80 then
+    LText := "";
+    setlength(LText, 1);
+    LText[0] := char(ALead);
+    return LText;
+  end;
+  // The continuation bytes the lead asks for; 0 for a continuation byte or a lead UTF-8
+  // never uses
+  LCount := 0;
+  if (ALead >= 0xC2) and (ALead <= 0xDF) then
+    LCount := 1;
+  end;
+  if (ALead >= 0xE0) and (ALead <= 0xEF) then
+    LCount := 2;
+  end;
+  if (ALead >= 0xF0) and (ALead <= 0xF4) then
+    LCount := 3;
+  end;
+  if LCount = 0 then
+    return DoReplacement();
+  end;
+  LText := "";
+  setlength(LText, LCount + 1);
+  LText[0] := char(ALead);
+  for LI := 1 to LCount do
+    if (not DoReadInputByte(LByte)) or (LByte < 0x80) or (LByte > 0xBF) then
+      return DoReplacement();
+    end;
+    LText[LI] := char(LByte);
+  end;
+  // An overlong form or a surrogate passes the byte ranges: DecodeUtf8Char has the last word
+  LIndex := 0;
+  if DecodeUtf8Char(LText, LIndex) = ADAM_SYSUTILS_REPLACEMENT then
+    return DoReplacement();
+  end;
+  return LText;
+end;
+
+// The next key that types something, read in raw mode, as UTF-8 text (Enter "\r", Backspace
+// "\x08", Escape "\x1b"); "" when standard input ends
+routine DoReadRawKey(): string;
+var
+  LByte: uint8;
+  LKind: int32;
+  LKey: string;
+begin
+  while DoReadInputByte(LByte) do
+    if LByte = ADAM_CONSOLE_LINUX_ESC then
+      LKind := DoEscapeSequence(LByte);
+      if LKind = 1 then
+        LKey := "";
+        setlength(LKey, 1);
+        LKey[0] := char(ADAM_CONSOLE_LINUX_ESC);
+        return LKey;
+      end;
+      if LKind = 2 then
+        // Alt+<key>: the key itself, read on from its first byte
+        if LByte = ADAM_CONSOLE_LINUX_DEL then
+          LByte := ADAM_CONSOLE_LINUX_BS;
+        end;
+        return DoCharacter(LByte);
+      end;
+    else
+      if LByte = ADAM_CONSOLE_LINUX_DEL then
+        LByte := ADAM_CONSOLE_LINUX_BS;
+      end;
+      if LByte = 0x0A then
+        // A terminal that sends LF for Enter
+        LByte := ADAM_CONSOLE_LINUX_CR;
+      end;
+      return DoCharacter(LByte);
+    end;
+  end;
+  return "";
+end;
+
+// True when standard output is a terminal (a pipe, a file or /dev/null is not)
+public routine cpplink ConsolePlatformIsTerminal(): bool;
+begin
+  return DoIsTty(STDOUT_FILENO);
+end;
+
+// A terminal standard output takes UTF-8 text and VT sequences as it is: true when standard
+// output is a terminal
+public routine cpplink ConsolePlatformEnableEscapes(): bool;
+begin
+  return DoIsTty(STDOUT_FILENO);
+end;
+
+// The terminal's visible columns; 0 when standard output is no terminal (or tells no size)
+public routine cpplink ConsolePlatformWidth(): int32;
+var
+  LSize: winsize;
+begin
+  if not DoWindowSize(LSize) then
+    return 0;
+  end;
+  return int32(LSize.ws_col);
+end;
+
+// The terminal's visible lines; 0 when standard output is no terminal (or tells no size)
+public routine cpplink ConsolePlatformHeight(): int32;
+var
+  LSize: winsize;
+begin
+  if not DoWindowSize(LSize) then
+    return 0;
+  end;
+  return int32(LSize.ws_row);
+end;
+
+// True when standard input is a terminal (a keyboard to read)
+public routine cpplink ConsolePlatformKeyboard(): bool;
+begin
+  return DoIsTty(STDIN_FILENO);
+end;
+
+// The keys typed so far dropped (those already read and the terminal's queue)
+public routine cpplink ConsolePlatformDropKeys();
+begin
+  if DoIsTty(STDIN_FILENO) then
+    GInAt := GInCount;
+    tcflush(STDIN_FILENO, TCIFLUSH);
+  end;
+end;
+
+// A terminal outlives the program that runs in it: never true on linux
+public routine cpplink ConsolePlatformClosesWithProgram(): bool;
+begin
+  return false;
+end;
+
+// Waits for a key press on a terminal standard input (an escape sequence is one key, read
+// whole); returns at once when standard input is no terminal
+public routine cpplink ConsolePlatformWaitKey();
+var
+  LOld: termios;
+  LByte: uint8;
+begin
+  if not DoIsTty(STDIN_FILENO) then
+    return;
+  end;
+  if not DoRawMode(LOld) then
+    return;
+  end;
+  if DoReadInputByte(LByte) then
+    if LByte = ADAM_CONSOLE_LINUX_ESC then
+      DoEscapeSequence(LByte);
+    end;
+  end;
+  DoRestoreMode(LOld);
+end;
+
+// True while a key waits to be read (a byte typed, the terminal in raw mode to see it before
+// Enter); false when standard input is no terminal
+public routine cpplink ConsolePlatformKeyWaiting(): bool;
+var
+  LOld: termios;
+  LReady: bool;
+begin
+  if not DoIsTty(STDIN_FILENO) then
+    return false;
+  end;
+  if GInAt < GInCount then
+    return true;
+  end;
+  if not DoRawMode(LOld) then
+    return false;
+  end;
+  LReady := DoInputReady(0);
+  DoRestoreMode(LOld);
+  return LReady;
+end;
+
+// The next typed character as UTF-8 text; a key that types nothing (an arrow, F1) is passed
+// over. "" when standard input is no terminal or it ends
+public routine cpplink ConsolePlatformReadKey(): string;
+var
+  LOld: termios;
+  LKey: string;
+begin
+  if not DoIsTty(STDIN_FILENO) then
+    return "";
+  end;
+  if not DoRawMode(LOld) then
+    return "";
+  end;
+  LKey := DoReadRawKey();
+  DoRestoreMode(LOld);
+  return LKey;
+end;
+
+// One line from standard input into ALine, its line break (LF, or CR LF) left out, read as
+// its bytes (a terminal edits the line itself). False at the end of input (Ctrl+D on an empty
+// line), ALine then ""; a last line with no line break is still a line
+public routine cpplink ConsolePlatformReadLine(var ALine: string): bool;
+var
+  LByte: uint8;
+  LAt: int64;
+begin
+  ALine := "";
+  LAt := 0;
+  if not DoReadInputByte(LByte) then
+    return false;
+  end;
+  while LByte <> 0x0A do
+    if LAt >= len(ALine) then
+      setlength(ALine, len(ALine) * 2 + 64);
+    end;
+    ALine[LAt] := char(LByte);
+    LAt := LAt + 1;
+    if not DoReadInputByte(LByte) then
+      leave;
+    end;
+  end;
+  if (LAt > 0) and (ALine[LAt - 1] = char(0x0D)) then
+    LAt := LAt - 1;
+  end;
+  setlength(ALine, LAt);
+  return true;
+end;
+
+// A terminal's title is set by its escape sequence (System.Console writes CsiTitle): false,
+// no OS call does it
+public routine cpplink ConsolePlatformSetTitle(const ATitle: string): bool;
+begin
+  return false;
+end;
+
+end.
