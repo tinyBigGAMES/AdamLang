@@ -1,0 +1,644 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.IO.Linux64.adam - System.IO's platform unit for x86_64-linux-gnu:
+  the same IoPlatform* routines as System.IO.Win64, over glibc (System.Linux's
+  declarations) and System.Runtime's neutral path routines (PathKind,
+  ListFolder, RemoveFile, FullPath, ProgramPath).
+
+  The same results as on Windows where the OS lets them be (parity): paths
+  are UTF-8, '\\' is read as '/', the prefixes $P: $D: $S: mean what they do
+  there ($R: gives ""), '.' and '..' fold as text (the disk is never
+  touched); a resolved path is rooted at '/' with no trailing '/' (but the
+  root). Linux tells names apart by their bytes, so SamePath does too.
+  GetFiles / GetDirectories sort by bytes, as there; an entry that is
+  neither a file nor a folder as a link followed (a dangling link, a
+  socket) is in neither list.
+*******************************************************************************/
+
+module unit System.IO.Linux64;
+
+import System.SysUtils, System.Linux;
+
+const
+  // A folder made with every permission the umask leaves (0777), as mkdir(1) does
+  ADAM_IO_LINUX_FOLDER_MODE: uint32 = 0x1FF;
+  // The most bytes one getrandom call is asked for (the kernel's own cap, 32 MiB - 1)
+  ADAM_IO_LINUX_RANDOM_MAX: int64 = 33554431;
+  // Where an x86_64 glibc system keeps its libraries (Debian's multiarch folders, then the
+  // lib64 ones Fedora / RHEL / SUSE use): SystemDir is the first that holds libc.so.6
+  ADAM_IO_LINUX_LIBRARY_DIRS: array[0..3] of string = ["/usr/lib/x86_64-linux-gnu",
+    "/lib/x86_64-linux-gnu", "/usr/lib64", "/lib64"];
+  ADAM_IO_LINUX_C_RUNTIME: string = "libc.so.6";
+  // The cache folder's variable (XDG base directory spec), and its default under $HOME
+  ADAM_IO_LINUX_ENV_CACHE: string = "XDG_CACHE_HOME";
+  ADAM_IO_LINUX_ENV_HOME: string = "HOME";
+  ADAM_IO_LINUX_CACHE_DEFAULT: string = "/.cache";
+
+// True when AText starts with the prefix "$<ALetter>:", the letter (upper case) in either case
+routine DoHasPrefix(const AText: string; const ALetter: char): bool;
+var
+  LLetter: uint8;
+begin
+  if len(AText) < 3 then
+    return false;
+  end;
+  LLetter := uint8(AText[1]);
+  if (LLetter >= 0x61) and (LLetter <= 0x7A) then
+    LLetter := uint8(LLetter - 0x20);
+  end;
+  return (AText[0] = '$') and (LLetter = uint8(ALetter)) and (AText[2] = ':');
+end;
+
+// AText with every '\' made '/': Linux's one separator
+routine DoSlashes(const AText: string): string;
+var
+  LText: string;
+  LI: int64;
+begin
+  LText := AText;
+  for LI := 0 to len(LText) - 1 do
+    if LText[LI] = '\\' then
+      LText[LI] := '/';
+    end;
+  end;
+  return LText;
+end;
+
+// A block System.Runtime handed back (ACount bytes, then a NUL) as a string, the block freed;
+// "" for nil
+routine DoTakeBlock(const ABlock: ptr; const ACount: int64): string;
+var
+  LText: string;
+begin
+  if ABlock = nil then
+    return "";
+  end;
+  LText := StringFromC(ptr to const char(ABlock), ACount);
+  freemem(ABlock);
+  return LText;
+end;
+
+// APath made full by System.Runtime's FullPath (the working folder joined to a relative path,
+// '.' / '..' folded, repeated '/' joined); "" when it cannot be made
+routine DoFull(const APath: string): string;
+var
+  LText: ptr to char;
+  LCount: int64;
+  LBlock: ptr;
+begin
+  LText := StringToC(APath);
+  if LText = nil then
+    return "";
+  end;
+  LCount := 0;
+  LBlock := FullPath(LText, LCount);
+  freemem(LText);
+  return DoTakeBlock(LBlock, LCount);
+end;
+
+// The folder of this program's exe (/proc/self/exe's target, never argv[0]); "" when the OS
+// cannot tell
+routine DoExeFolder(): string;
+var
+  LCount: int64;
+  LFile: string;
+  LSep: int64;
+  LI: int64;
+begin
+  LCount := 0;
+  LFile := DoTakeBlock(ProgramPath(LCount), LCount);
+  LSep := -1;
+  for LI := 0 to len(LFile) - 1 do
+    if LFile[LI] = '/' then
+      LSep := LI;
+    end;
+  end;
+  if LSep < 0 then
+    return "";
+  end;
+  if LSep = 0 then
+    return "/";
+  end;
+  return Substring(LFile, 0, LSep);
+end;
+
+// System.IO's ResolvePath: $P: the exe's folder, $D: the working folder, $S: (or none)
+// ABaseDir ("" = the working folder), $R: ""; a path rooted at '/' only normalized; '\' read
+// as '/'; the result full, folded, no trailing '/' but the root's. "" for an empty path, a
+// prefix alone, or a path that cannot be made full
+public routine cpplink IoPlatformResolvePath(const APath: string; const ABaseDir: string): string;
+var
+  LPath: string;
+  LBase: string;
+  LExeBase: bool;
+  LCurrentBase: bool;
+begin
+  LPath := Trim(APath);
+  if LPath = "" then
+    return "";
+  end;
+  if DoHasPrefix(LPath, 'R') then
+    return "";
+  end;
+  // An explicit prefix, at the very start only, overrides the caller's base
+  LExeBase := DoHasPrefix(LPath, 'P');
+  LCurrentBase := DoHasPrefix(LPath, 'D');
+  if LExeBase or LCurrentBase or DoHasPrefix(LPath, 'S') then
+    LPath := Trim(Substring(LPath, 3, len(LPath) - 3));
+  end;
+  if LPath = "" then
+    return "";
+  end;
+  LPath := DoSlashes(LPath);
+  LBase := DoSlashes(ABaseDir);
+  if LExeBase then
+    LBase := DoExeFolder();
+    if LBase = "" then
+      return "";
+    end;
+  end;
+  if LCurrentBase then
+    LBase := "";
+  end;
+  // A relative path under its base; FullPath joins whatever is still relative to the
+  // working folder
+  if (LPath[0] <> '/') and (LBase <> "") then
+    LPath := LBase + "/" + LPath;
+  end;
+  return DoFull(LPath);
+end;
+
+// System.IO's ResolvePath against the working folder
+public routine cpplink IoPlatformResolvePath(const APath: string): string;
+begin
+  return IoPlatformResolvePath(APath, "");
+end;
+
+// What is at APath (resolved first), a link followed: System.Runtime's ADAM_PATH_* (ASize a
+// file's size); ADAM_PATH_NONE when it resolves to ""
+routine DoKind(const APath: string; var ASize: int64): int32;
+var
+  LPath: string;
+  LText: ptr to char;
+  LKind: int32;
+begin
+  ASize := 0;
+  LPath := IoPlatformResolvePath(APath);
+  if LPath = "" then
+    return ADAM_PATH_NONE;
+  end;
+  LText := StringToC(LPath);
+  if LText = nil then
+    return ADAM_PATH_NONE;
+  end;
+  LKind := PathKind(LText, ASize);
+  freemem(LText);
+  return LKind;
+end;
+
+// The value of the environment variable AName; "" when it is not set
+routine DoEnv(const AName: string): string;
+var
+  LName: ptr to char;
+  LValue: ptr to char;
+  LText: string;
+begin
+  LName := StringToC(AName);
+  if LName = nil then
+    return "";
+  end;
+  LValue := getenv(LName);
+  LText := "";
+  if LValue <> nil then
+    LText := StringFromC(ptr to const char(LValue));
+  end;
+  freemem(LName);
+  return LText;
+end;
+
+// System.IO's FileExists: a file, a link followed
+public routine cpplink IoPlatformFileExists(const APath: string): bool;
+var
+  LSize: int64;
+begin
+  return DoKind(APath, LSize) = ADAM_PATH_FILE;
+end;
+
+// System.IO's DirectoryExists: a folder, a link followed
+public routine cpplink IoPlatformDirectoryExists(const APath: string): bool;
+var
+  LSize: int64;
+begin
+  return DoKind(APath, LSize) = ADAM_PATH_FOLDER;
+end;
+
+// System.IO's FileSize: a file's size in bytes; -1 for a folder, a missing path or one that
+// cannot be read
+public routine cpplink IoPlatformFileSize(const APath: string): int64;
+var
+  LSize: int64;
+begin
+  if DoKind(APath, LSize) <> ADAM_PATH_FILE then
+    return -1;
+  end;
+  return LSize;
+end;
+
+// System.IO's FileWriteTime: st_mtim as nanoseconds since the epoch (compared, never shown);
+// -1 for a folder, a missing path or one that cannot be read
+public routine cpplink IoPlatformFileWriteTime(const APath: string): int64;
+var
+  LPath: string;
+  LText: ptr to char;
+  LStat: stat;
+  LResult: int32;
+begin
+  LPath := IoPlatformResolvePath(APath);
+  if LPath = "" then
+    return -1;
+  end;
+  LText := StringToC(LPath);
+  if LText = nil then
+    return -1;
+  end;
+  LResult := __xstat(_STAT_VER, LText, LStat);
+  freemem(LText);
+  if LResult <> 0 then
+    return -1;
+  end;
+  if (LStat.st_mode & S_IFMT) = S_IFDIR then
+    return -1;
+  end;
+  return LStat.st_mtim.tv_sec * 1000000000 + LStat.st_mtim.tv_nsec;
+end;
+
+// APath resolved as C text (freemem it); nil when it resolves to "" or there is no room
+routine DoCPath(const APath: string): ptr to char;
+var
+  LPath: string;
+begin
+  LPath := IoPlatformResolvePath(APath);
+  if LPath = "" then
+    return nil;
+  end;
+  return StringToC(LPath);
+end;
+
+// System.IO's ReplaceFile: rename(2), which puts the file in the target's place in one step;
+// false when ASourcePath is not a file, ATargetPath is a folder or the OS refuses it (another
+// file system)
+public routine cpplink IoPlatformReplaceFile(const ASourcePath: string; const ATargetPath: string): bool;
+var
+  LSource: ptr to char;
+  LTarget: ptr to char;
+  LOk: bool;
+begin
+  if not IoPlatformFileExists(ASourcePath) then
+    return false;
+  end;
+  if IoPlatformDirectoryExists(ATargetPath) then
+    return false;
+  end;
+  LSource := DoCPath(ASourcePath);
+  LTarget := DoCPath(ATargetPath);
+  LOk := (LSource <> nil) and (LTarget <> nil);
+  if LOk then
+    LOk := rename(LSource, LTarget) = 0;
+  end;
+  if LSource <> nil then
+    freemem(LSource);
+  end;
+  if LTarget <> nil then
+    freemem(LTarget);
+  end;
+  return LOk;
+end;
+
+// System.IO's DeleteFile: a file only, never a folder
+public routine cpplink IoPlatformDeleteFile(const APath: string): bool;
+var
+  LText: ptr to char;
+  LOk: bool;
+begin
+  if not IoPlatformFileExists(APath) then
+    return false;
+  end;
+  LText := DoCPath(APath);
+  if LText = nil then
+    return false;
+  end;
+  LOk := RemoveFile(LText);
+  freemem(LText);
+  return LOk;
+end;
+
+// System.IO's CreateDir: one folder, its parent there already; false when the name exists
+public routine cpplink IoPlatformCreateDir(const APath: string): bool;
+var
+  LText: ptr to char;
+  LOk: bool;
+begin
+  LText := DoCPath(APath);
+  if LText = nil then
+    return false;
+  end;
+  LOk := mkdir(LText, ADAM_IO_LINUX_FOLDER_MODE) = 0;
+  freemem(LText);
+  return LOk;
+end;
+
+// The folder above APath (a resolved path): the text before its last '/', the root for a
+// folder right under it; "" for the root itself
+routine DoParentDir(const APath: string): string;
+var
+  LSep: int64;
+  LI: int64;
+begin
+  LSep := -1;
+  for LI := 0 to len(APath) - 1 do
+    if APath[LI] = '/' then
+      LSep := LI;
+    end;
+  end;
+  if (LSep < 0) or (len(APath) <= 1) then
+    return "";
+  end;
+  if LSep = 0 then
+    return "/";
+  end;
+  return Substring(APath, 0, LSep);
+end;
+
+// System.IO's ForceDirectories: every missing folder made, the top first; true when the path
+// is a folder after. A loop, never a recursion, so a deep path takes no stack
+public routine cpplink IoPlatformForceDirectories(const APath: string): bool;
+var
+  LPath: string;
+  LParent: string;
+  LMissing: array of string;
+  LCount: int64;
+  LI: int64;
+begin
+  LPath := IoPlatformResolvePath(APath);
+  if LPath = "" then
+    return false;
+  end;
+  if IoPlatformDirectoryExists(LPath) then
+    return true;
+  end;
+  if IoPlatformFileExists(LPath) then
+    return false;
+  end;
+  // The missing folders, the deepest first; each step up is shorter: the walk ends at the root
+  setlength(LMissing, 1);
+  LMissing[0] := LPath;
+  LCount := 1;
+  LParent := DoParentDir(LPath);
+  while (LParent <> "") and (len(LParent) < len(LMissing[LCount - 1])) and
+    (not IoPlatformDirectoryExists(LParent)) do
+    setlength(LMissing, LCount + 1);
+    LMissing[LCount] := LParent;
+    LCount := LCount + 1;
+    LParent := DoParentDir(LParent);
+  end;
+  // Made from the top down; a folder another program made meanwhile is still a success: the
+  // check decides
+  for LI := LCount - 1 downto 0 do
+    IoPlatformCreateDir(LMissing[LI]);
+    if not IoPlatformDirectoryExists(LMissing[LI]) then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// The names of ADir's entries that are folders (AWantDirectories) or files (not), a link
+// followed, sorted by SortStrings. False when the folder cannot be listed; an empty folder is
+// true with an empty list
+routine DoList(const ADir: string; const AWantDirectories: bool; var AList: StringArray): bool;
+var
+  LDir: string;
+  LText: ptr to char;
+  LBlock: ptr;
+  LChars: ptr to const char;
+  LTotal: int64;
+  LAt: int64;
+  LLength: int64;
+  LName: string;
+  LKind: int32;
+  LSize: int64;
+  LWant: int32;
+  LCount: int64;
+begin
+  setlength(AList, 0);
+  LDir := IoPlatformResolvePath(ADir);
+  if LDir = "" then
+    return false;
+  end;
+  LText := StringToC(LDir);
+  if LText = nil then
+    return false;
+  end;
+  LTotal := 0;
+  LBlock := ListFolder(LText, LTotal);
+  freemem(LText);
+  if LBlock = nil then
+    return false;
+  end;
+  if AWantDirectories then
+    LWant := ADAM_PATH_FOLDER;
+  else
+    LWant := ADAM_PATH_FILE;
+  end;
+  if LDir = "/" then
+    LDir := "";
+  end;
+  // Each name ends at its NUL
+  LChars := ptr to const char(LBlock);
+  LAt := 0;
+  LCount := 0;
+  while LAt < LTotal do
+    LLength := 0;
+    while LChars[LAt + LLength] <> char(0) do
+      LLength := LLength + 1;
+    end;
+    LName := StringFromC(addr of LChars[LAt], LLength);
+    LAt := LAt + LLength + 1;
+    // Its kind asked by its full path: a name gone meanwhile is NONE and left out
+    LKind := DoKind(LDir + "/" + LName, LSize);
+    if LKind = LWant then
+      setlength(AList, LCount + 1);
+      AList[LCount] := LName;
+      LCount := LCount + 1;
+    end;
+  end;
+  freemem(LBlock);
+  SortStrings(AList);
+  return true;
+end;
+
+// System.IO's GetFiles: the files in ADir, sorted by their bytes
+public routine cpplink IoPlatformGetFiles(const ADir: string; var AList: StringArray): bool;
+begin
+  return DoList(ADir, false, AList);
+end;
+
+// System.IO's GetDirectories: the folders in ADir, sorted by their bytes
+public routine cpplink IoPlatformGetDirectories(const ADir: string; var AList: StringArray): bool;
+begin
+  return DoList(ADir, true, AList);
+end;
+
+// System.IO's SamePath: the two resolved paths byte for byte (Linux's names keep their case);
+// false when either resolves to ""
+public routine cpplink IoPlatformSamePath(const AFirst: string; const ASecond: string): bool;
+var
+  LFirst: string;
+  LSecond: string;
+begin
+  LFirst := IoPlatformResolvePath(AFirst);
+  LSecond := IoPlatformResolvePath(ASecond);
+  if (LFirst = "") or (LSecond = "") then
+    return false;
+  end;
+  return LFirst = LSecond;
+end;
+
+// System.IO's SystemDir: the first of glibc's library folders that holds libc.so.6; "" when
+// none does
+public routine cpplink IoPlatformSystemDir(): string;
+var
+  LDirs: array[0..3] of string;
+  LI: int64;
+begin
+  LDirs := ADAM_IO_LINUX_LIBRARY_DIRS;
+  for LI := 0 to 3 do
+    if IoPlatformFileExists(LDirs[LI] + "/" + ADAM_IO_LINUX_C_RUNTIME) then
+      return IoPlatformResolvePath(LDirs[LI]);
+    end;
+  end;
+  return "";
+end;
+
+// System.IO's UserCacheDir: $XDG_CACHE_HOME when it is an absolute path, else $HOME/.cache
+// (the XDG base directory spec), resolved; "" when neither is set
+public routine cpplink IoPlatformUserCacheDir(): string;
+var
+  LDir: string;
+begin
+  LDir := DoEnv(ADAM_IO_LINUX_ENV_CACHE);
+  if (LDir <> "") and (LDir[0] = '/') then
+    return IoPlatformResolvePath(LDir);
+  end;
+  LDir := DoEnv(ADAM_IO_LINUX_ENV_HOME);
+  if LDir = "" then
+    return "";
+  end;
+  return IoPlatformResolvePath(LDir + ADAM_IO_LINUX_CACHE_DEFAULT);
+end;
+
+// System.IO's SecureRandomBytes: getrandom(2) from the kernel's generator, a call a signal
+// broke off made again; false when it fails (ABytes then empty)
+public routine cpplink IoPlatformSecureRandomBytes(const ACount: int64; var ABytes: ByteArray): bool;
+var
+  LFrom: int64;
+  LCount: int64;
+  LGot: int64;
+begin
+  if ACount <= 0 then
+    setlength(ABytes, 0);
+    return true;
+  end;
+  setlength(ABytes, ACount);
+  LFrom := 0;
+  while LFrom < ACount do
+    LCount := ACount - LFrom;
+    if LCount > ADAM_IO_LINUX_RANDOM_MAX then
+      LCount := ADAM_IO_LINUX_RANDOM_MAX;
+    end;
+    LGot := getrandom(ptr(addr of ABytes[LFrom]), uint64(LCount), 0);
+    if LGot < 0 then
+      if CErrno() <> EINTR then
+        setlength(ABytes, 0);
+        return false;
+      end;
+    else
+      LFrom := LFrom + LGot;
+    end;
+  end;
+  return true;
+end;
+
+// CLOCK_MONOTONIC read (it never fails on Linux)
+routine DoMonotonic(): timespec;
+var
+  LTime: timespec;
+begin
+  LTime.tv_sec := 0;
+  LTime.tv_nsec := 0;
+  clock_gettime(CLOCK_MONOTONIC, LTime);
+  return LTime;
+end;
+
+// System.IO's TickCountMs: CLOCK_MONOTONIC in milliseconds
+public routine cpplink IoPlatformTickCountMs(): int64;
+var
+  LTime: timespec;
+begin
+  LTime := DoMonotonic();
+  return LTime.tv_sec * 1000 + LTime.tv_nsec div 1000000;
+end;
+
+// System.IO's Delay: nanosleep(2), the time left slept again when a signal woke it
+public routine cpplink IoPlatformDelay(const AMilliseconds: int32);
+var
+  LWant: timespec;
+  LLeft: timespec;
+begin
+  if AMilliseconds <= 0 then
+    return;
+  end;
+  LWant.tv_sec := int64(AMilliseconds) div 1000;
+  LWant.tv_nsec := (int64(AMilliseconds) mod 1000) * 1000000;
+  LLeft.tv_sec := 0;
+  LLeft.tv_nsec := 0;
+  while nanosleep(addr of LWant, addr of LLeft) <> 0 do
+    if CErrno() <> EINTR then
+      leave;
+    end;
+    LWant := LLeft;
+  end;
+end;
+
+// System.IO's PerformanceCounter: CLOCK_MONOTONIC in nanoseconds
+public routine cpplink IoPlatformPerformanceCounter(): int64;
+var
+  LTime: timespec;
+begin
+  LTime := DoMonotonic();
+  return LTime.tv_sec * 1000000000 + LTime.tv_nsec;
+end;
+
+// System.IO's PerformanceFrequency: nanoseconds, 10^9 counts a second
+public routine cpplink IoPlatformPerformanceFrequency(): int64;
+begin
+  return 1000000000;
+end;
+
+end.
