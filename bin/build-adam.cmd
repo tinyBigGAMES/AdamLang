@@ -111,18 +111,20 @@ if errorlevel 1 (echo BUILD FAILED - adamtest.exe not installed & goto :failed)
 
 :: The shared compiled-unit cache (res\acu beside adam.exe) prebuilt for a release: the
 :: installed adam.exe builds a program importing every std unit (the runtime comes with
-:: it) at every optimization level (debug, then -opt safe / fast / small), into its own
-:: stage folder
+:: it; each target's platform units under its @ifdef) for every target triple at every
+:: optimization level (debug, then -opt safe / fast / small), into its own stage folder
 echo [6/6] prebuild: the std and the runtime compiled into res\acu, every level
 set PRE=%OUT%\prebuild
 if not exist "%PRE%" mkdir "%PRE%"
 call :prebuild_source "%PRE%\adam_prebuild.adam"
 if errorlevel 1 (echo BUILD FAILED - prebuild source & goto :failed)
-"%BIN%adam.exe" build "%PRE%\adam_prebuild.adam" -o "%PRE%"
-if errorlevel 1 (echo BUILD FAILED - prebuild debug & goto :failed)
-for %%l in (safe fast small) do (
-  "%BIN%adam.exe" build "%PRE%\adam_prebuild.adam" -o "%PRE%" -opt %%l
-  if errorlevel 1 (echo BUILD FAILED - prebuild %%l & goto :failed)
+for %%t in (x86_64-windows-gnu x86_64-linux-gnu) do (
+  "%BIN%adam.exe" build "%PRE%\adam_prebuild.adam" -o "%PRE%" -t %%t
+  if errorlevel 1 (echo BUILD FAILED - prebuild %%t debug & goto :failed)
+  for %%l in (safe fast small) do (
+    "%BIN%adam.exe" build "%PRE%\adam_prebuild.adam" -o "%PRE%" -t %%t -opt %%l
+    if errorlevel 1 (echo BUILD FAILED - prebuild %%t %%l & goto :failed)
+  )
 )
 
 del adam-stageA.exe adam-stageB.exe
@@ -134,18 +136,40 @@ del adam-stageA.exe adam-stageB.exe 2>nul
 exit /b 1
 
 :: Writes %1, the prebuild's program: one import clause naming every std unit
-:: (res\libs\std\*.adam, each name its file's without .adam) and an empty body
+:: (res\libs\std\*.adam, each name its file's without .adam) and an empty body.
+:: A target's own units (*.Win64 and the System.Windows binding units: Windows;
+:: *.Linux64: Linux) are imported only under that target's @ifdef, so each
+:: triple's build takes its own platform units and never another's
 :prebuild_source
 setlocal enabledelayedexpansion
 set UNITS=
+set WIN=
+set LIN=
 for %%f in ("%BIN%res\libs\std\*.adam") do (
-  if defined UNITS (set "UNITS=!UNITS!, %%~nf") else (set "UNITS=%%~nf")
+  set "N=%%~nf"
+  if /i "!N:~-6!"==".Win64" (
+    set "WIN=!WIN!, !N!"
+  ) else if /i "!N:~0,14!"=="System.Windows" (
+    set "WIN=!WIN!, !N!"
+  ) else if /i "!N:~-8!"==".Linux64" (
+    set "LIN=!LIN!, !N!"
+  ) else if defined UNITS (
+    set "UNITS=!UNITS!, !N!"
+  ) else (
+    set "UNITS=!N!"
+  )
 )
 if not defined UNITS (endlocal & exit /b 1)
 > %1 (
   echo module exe adam_prebuild;
   echo.
-  echo import !UNITS!;
+  echo import !UNITS!
+  echo @ifdef TARGET_X86_64_WINDOWS_GNU
+  echo   !WIN!
+  echo @elseif TARGET_X86_64_LINUX_GNU
+  echo   !LIN!
+  echo @endif
+  echo   ;
   echo.
   echo begin
   echo end.
