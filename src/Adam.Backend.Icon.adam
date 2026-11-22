@@ -1,0 +1,765 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Backend.Icon.adam - an .ico file read by the compiler itself, on every
+  target (BNF sec 2, @exeicon): its directory checked, its largest image
+  decoded to RGBA. Target-neutral: no OS is named, no OS decoder is asked.
+
+  The layout facts are Microsoft's (ICONDIR / ICONDIRENTRY, BITMAPINFOHEADER,
+  RGBQUAD, the AND mask) and the W3C's PNG specification (chunks, CRC,
+  IHDR / PLTE / tRNS / IDAT / IEND, the five filters, Adam7), the zlib
+  stream inflated by System.Zlib.
+
+  IconCheck   what keeps a file from being an icon file (IconFault.None: it
+              is one): too short or a wrong ICONDIR, no image, an entry or
+              an image past the file's end (or of no bytes)
+  IconImage   the largest image (by the directory's width x height, 0 =
+              256; a tie by the higher bit count, then the first) decoded:
+              ADAM_ICON_IMAGE_HEADER bytes (width, height: uint32 LE), then
+              its RGBA pixels, rows top down (straight, not premultiplied
+              alpha). A BMP DIB of 1 / 4 / 8 bpp (its palette), 16 (X1R5G5B5),
+              24 or 32 bpp, BI_RGB, with its AND mask (1 = transparent; a 32 bpp image's
+              own alpha wins when any pixel has one); a PNG frame of every
+              colour type and depth the specification has, interlaced or
+              not, tRNS honoured, every chunk's CRC checked.
+              IconFault.BadImage for an image that is neither, or one that
+              is damaged or cut inside (or wider / taller than
+              ADAM_ICON_MAX_SIDE, larger than ADAM_ICON_MAX_PIXELS)
+*******************************************************************************/
+
+module unit Adam.Backend.Icon;
+
+import System.SysUtils, System.Zlib;
+
+public const
+  // ICONDIR (reserved, type 1, count), an ICONDIRENTRY, the ICONDIR type of an icon
+  ADAM_ICON_DIR_SIZE: int64 = 6;
+  ADAM_ICON_ENTRY_SIZE: int64 = 16;
+  ADAM_ICON_TYPE: int64 = 1;
+  // IconImage's header before the pixels: width and height, uint32 LE each
+  ADAM_ICON_IMAGE_HEADER: int64 = 8;
+  // The largest side and pixel count IconImage decodes (an icon frame is 256 at most in
+  // practice; a 1024 logo frame is well inside)
+  ADAM_ICON_MAX_SIDE: int64 = 16384;
+  ADAM_ICON_MAX_PIXELS: int64 = 67108864;
+
+const
+  // A directory entry's width / height of 0 means 256
+  ADAM_ICON_FULL_SIDE: int64 = 256;
+  // BITMAPINFOHEADER's size (the smallest header an icon image has), BI_RGB
+  ADAM_ICON_BMP_HEADER: int64 = 40;
+  ADAM_ICON_BMP_RGB: int64 = 0;
+  // PNG: the signature's size, a chunk's length + type and its CRC, IHDR's data size
+  ADAM_ICON_PNG_SIGNATURE: int64 = 8;
+  ADAM_ICON_PNG_CHUNK_HEAD: int64 = 8;
+  ADAM_ICON_PNG_CHUNK_CRC: int64 = 4;
+  ADAM_ICON_PNG_IHDR_SIZE: int64 = 13;
+  // PNG colour types: grey, RGB, palette, grey + alpha, RGBA
+  ADAM_ICON_PNG_GREY: int64 = 0;
+  ADAM_ICON_PNG_RGB: int64 = 2;
+  ADAM_ICON_PNG_PALETTE: int64 = 3;
+  ADAM_ICON_PNG_GREY_ALPHA: int64 = 4;
+  ADAM_ICON_PNG_RGBA: int64 = 6;
+  // The Adam7 passes: each pass's first column / row and its column / row steps
+  ADAM_ICON_ADAM7_X: array[0..6] of int64 = [0, 4, 0, 2, 0, 1, 0];
+  ADAM_ICON_ADAM7_Y: array[0..6] of int64 = [0, 0, 4, 0, 2, 0, 1];
+  ADAM_ICON_ADAM7_DX: array[0..6] of int64 = [8, 8, 4, 4, 2, 2, 1];
+  ADAM_ICON_ADAM7_DY: array[0..6] of int64 = [8, 8, 8, 4, 4, 2, 2];
+
+public type
+  // What keeps an icon file from being one, or its image from being decoded (None: it is,
+  // or it was): no ICONDIR (too short, a reserved or type field that is not 0 / 1), no
+  // image (a count of 0), an entry or an image past the file's end (or an image of no
+  // bytes), an image that is no BMP DIB or PNG Adam decodes, or is damaged or cut inside
+  IconFault = choices(None, NoDirectory, NoImage, PastEnd, BadImage);
+
+// The big-endian 4-byte word at AAt of ABytes (PNG's order)
+routine DoBe32(const ABytes: ByteArray; const AAt: int64): int64;
+begin
+  return (int64(ABytes[AAt]) shl 24) | (int64(ABytes[AAt + 1]) shl 16) |
+    (int64(ABytes[AAt + 2]) shl 8) | int64(ABytes[AAt + 3]);
+end;
+
+// The little-endian 4-byte word at AAt of ABytes read as a signed int32's value
+routine DoLe32Signed(const ABytes: ByteArray; const AAt: int64): int64;
+var
+  LValue: int64;
+begin
+  LValue := int64(GetLe(ABytes, AAt, 4));
+  if LValue >= 0x80000000 then
+    LValue := LValue - 0x100000000;
+  end;
+  return LValue;
+end;
+
+// The ACount bytes of ABytes from AFrom
+routine DoSlice(const ABytes: ByteArray; const AFrom: int64; const ACount: int64): ByteArray;
+var
+  LSlice: ByteArray;
+  LI: int64;
+begin
+  setlength(LSlice, ACount);
+  for LI := 0 to ACount - 1 do
+    LSlice[LI] := ABytes[AFrom + LI];
+  end;
+  return LSlice;
+end;
+
+/// What keeps AIcon from being an icon file (IconFault.None: it is one; see the header).
+/// @param AIcon the .ico file's bytes
+public routine IconCheck(const AIcon: ByteArray): IconFault;
+var
+  LCount: int64;
+  LI: int64;
+  LEntry: int64;
+  LSize: int64;
+  LOffset: int64;
+begin
+  if len(AIcon) < ADAM_ICON_DIR_SIZE then
+    return IconFault.NoDirectory;
+  end;
+  if (GetLe(AIcon, 0, 2) <> 0) or (int64(GetLe(AIcon, 2, 2)) <> ADAM_ICON_TYPE) then
+    return IconFault.NoDirectory;
+  end;
+  LCount := int64(GetLe(AIcon, 4, 2));
+  if LCount = 0 then
+    return IconFault.NoImage;
+  end;
+  if ADAM_ICON_DIR_SIZE + ADAM_ICON_ENTRY_SIZE * LCount > len(AIcon) then
+    return IconFault.PastEnd;
+  end;
+  for LI := 0 to LCount - 1 do
+    LEntry := ADAM_ICON_DIR_SIZE + ADAM_ICON_ENTRY_SIZE * LI;
+    LSize := int64(GetLe(AIcon, LEntry + 8, 4));
+    LOffset := int64(GetLe(AIcon, LEntry + 12, 4));
+    if (LSize = 0) or (LOffset + LSize > len(AIcon)) then
+      return IconFault.PastEnd;
+    end;
+  end;
+  return IconFault.None;
+end;
+
+// A directory side (a byte, 0 = 256)
+routine DoSide(const AByte: uint8): int64;
+begin
+  if AByte = 0 then
+    return ADAM_ICON_FULL_SIDE;
+  end;
+  return int64(AByte);
+end;
+
+// The entry IconImage decodes of AIcon (IconCheck passed): the largest by the directory's
+// width x height, a tie by the higher bit count, then the first
+routine DoLargest(const AIcon: ByteArray): int64;
+var
+  LCount: int64;
+  LI: int64;
+  LEntry: int64;
+  LArea: int64;
+  LBits: int64;
+  LBest: int64;
+  LBestArea: int64;
+  LBestBits: int64;
+begin
+  LCount := int64(GetLe(AIcon, 4, 2));
+  LBest := 0;
+  LBestArea := -1;
+  LBestBits := -1;
+  for LI := 0 to LCount - 1 do
+    LEntry := ADAM_ICON_DIR_SIZE + ADAM_ICON_ENTRY_SIZE * LI;
+    LArea := DoSide(AIcon[LEntry]) * DoSide(AIcon[LEntry + 1]);
+    LBits := int64(GetLe(AIcon, LEntry + 6, 2));
+    if (LArea > LBestArea) or ((LArea = LBestArea) and (LBits > LBestBits)) then
+      LBest := LI;
+      LBestArea := LArea;
+      LBestBits := LBits;
+    end;
+  end;
+  return LBest;
+end;
+
+// AImage sized for AWidth x AHeight: its header written, every pixel 0 (transparent black);
+// false for a size IconImage does not decode
+routine DoStartImage(var AImage: ByteArray; const AWidth: int64; const AHeight: int64): bool;
+var
+  LI: int64;
+begin
+  if (AWidth < 1) or (AHeight < 1) or (AWidth > ADAM_ICON_MAX_SIDE) or
+    (AHeight > ADAM_ICON_MAX_SIDE) or (AWidth * AHeight > ADAM_ICON_MAX_PIXELS) then
+    return false;
+  end;
+  setlength(AImage, ADAM_ICON_IMAGE_HEADER + AWidth * AHeight * 4);
+  for LI := 0 to len(AImage) - 1 do
+    AImage[LI] := 0;
+  end;
+  PutLe(AImage, 0, uint64(AWidth), 4);
+  PutLe(AImage, 4, uint64(AHeight), 4);
+  return true;
+end;
+
+// Pixel (AX, AY) of AImage (DoStartImage's; rows top down) set to AR AG AB AA
+routine DoPut(var AImage: ByteArray; const AWidth: int64; const AX: int64; const AY: int64;
+  const AR: int64; const AG: int64; const AB: int64; const AA: int64);
+var
+  LAt: int64;
+begin
+  LAt := ADAM_ICON_IMAGE_HEADER + (AY * AWidth + AX) * 4;
+  AImage[LAt] := uint8(AR);
+  AImage[LAt + 1] := uint8(AG);
+  AImage[LAt + 2] := uint8(AB);
+  AImage[LAt + 3] := uint8(AA);
+end;
+
+// The ABits-wide sample AIndex of the packed row at ARow of ABytes (ABits 1, 2, 4 or 8,
+// the most significant bits first, as both BMP and PNG pack them)
+routine DoPacked(const ABytes: ByteArray; const ARow: int64; const AIndex: int64;
+  const ABits: int64): int64;
+var
+  LBit: int64;
+begin
+  LBit := AIndex * ABits;
+  return (int64(ABytes[ARow + LBit div 8]) shr (8 - ABits - LBit mod 8)) &
+    ((int64(1) shl ABits) - 1);
+end;
+
+// The BMP DIB image ABmp (an icon's: its height twice the image's, the XOR bitmap then
+// the AND mask, rows bottom up) decoded into AImage (see the header); false when it is no
+// DIB Adam decodes or it is cut inside
+routine DoDecodeBmp(const ABmp: ByteArray; var AImage: ByteArray): bool;
+var
+  LHeaderSize: int64;
+  LWidth: int64;
+  LHeight: int64;
+  LBits: int64;
+  LWord: int64;
+  LColours: int64;
+  LPalette: int64;
+  LXor: int64;
+  LXorRow: int64;
+  LAnd: int64;
+  LAndRow: int64;
+  LHasMask: bool;
+  LOwnAlpha: bool;
+  LX: int64;
+  LY: int64;
+  LRow: int64;
+  LAt: int64;
+  LIndex: int64;
+  LR: int64;
+  LG: int64;
+  LB: int64;
+  LA: int64;
+begin
+  if len(ABmp) < ADAM_ICON_BMP_HEADER then
+    return false;
+  end;
+  LHeaderSize := int64(GetLe(ABmp, 0, 4));
+  LWidth := DoLe32Signed(ABmp, 4);
+  LHeight := DoLe32Signed(ABmp, 8);
+  LBits := int64(GetLe(ABmp, 14, 2));
+  if (LHeaderSize < ADAM_ICON_BMP_HEADER) or (LHeaderSize > len(ABmp)) or
+    (int64(GetLe(ABmp, 16, 4)) <> ADAM_ICON_BMP_RGB) or (LHeight < 2) or (LHeight mod 2 <> 0) then
+    return false;
+  end;
+  if (LBits <> 1) and (LBits <> 4) and (LBits <> 8) and (LBits <> 16) and (LBits <> 24) and
+    (LBits <> 32) then
+    return false;
+  end;
+  LHeight := LHeight div 2;
+  if not DoStartImage(AImage, LWidth, LHeight) then
+    return false;
+  end;
+  // The palette (1 / 4 / 8 bpp): biClrUsed colours, else all 2^bpp; RGBQUAD B G R 0
+  LColours := 0;
+  if LBits <= 8 then
+    LColours := int64(GetLe(ABmp, 32, 4));
+    if (LColours = 0) or (LColours > (int64(1) shl LBits)) then
+      LColours := int64(1) shl LBits;
+    end;
+  end;
+  LPalette := LHeaderSize;
+  LXor := LPalette + LColours * 4;
+  // Each row padded to 4 bytes
+  LXorRow := ((LWidth * LBits + 31) div 32) * 4;
+  LAnd := LXor + LXorRow * LHeight;
+  LAndRow := ((LWidth + 31) div 32) * 4;
+  if LAnd > len(ABmp) then
+    return false;
+  end;
+  // A 32 bpp image may leave its mask out; any other needs it
+  LHasMask := LAnd + LAndRow * LHeight <= len(ABmp);
+  if not LHasMask and (LBits <> 32) then
+    return false;
+  end;
+  // A 32 bpp image with any alpha uses its own (the mask is the older form's)
+  LOwnAlpha := false;
+  if LBits = 32 then
+    for LY := 0 to LHeight - 1 do
+      for LX := 0 to LWidth - 1 do
+        if ABmp[LXor + LY * LXorRow + LX * 4 + 3] <> 0 then
+          LOwnAlpha := true;
+        end;
+      end;
+    end;
+  end;
+  for LY := 0 to LHeight - 1 do
+    // File row LY is the image's row LHeight - 1 - LY (bottom up)
+    LRow := LXor + LY * LXorRow;
+    for LX := 0 to LWidth - 1 do
+      if LBits <= 8 then
+        LIndex := DoPacked(ABmp, LRow, LX, LBits);
+        if LIndex >= LColours then
+          return false;
+        end;
+        LAt := LPalette + LIndex * 4;
+      else
+        LAt := LRow + LX * (LBits div 8);
+      end;
+      if LBits = 16 then
+        // X1R5G5B5, each 5-bit level scaled to 8 bits
+        LWord := int64(GetLe(ABmp, LAt, 2));
+        LB := ((LWord & 31) * 255) div 31;
+        LG := (((LWord shr 5) & 31) * 255) div 31;
+        LR := (((LWord shr 10) & 31) * 255) div 31;
+      else
+        LB := int64(ABmp[LAt]);
+        LG := int64(ABmp[LAt + 1]);
+        LR := int64(ABmp[LAt + 2]);
+      end;
+      LA := 255;
+      if LOwnAlpha then
+        LA := int64(ABmp[LAt + 3]);
+      else
+        if LHasMask and (DoPacked(ABmp, LAnd + LY * LAndRow, LX, 1) = 1) then
+          LA := 0;
+        end;
+      end;
+      DoPut(AImage, LWidth, LX, LHeight - 1 - LY, LR, LG, LB, LA);
+    end;
+  end;
+  return true;
+end;
+
+// PNG's Paeth predictor of the left, up and up-left bytes
+routine DoPaeth(const ALeft: int64; const AUp: int64; const AUpLeft: int64): int64;
+var
+  LGuess: int64;
+  LToLeft: int64;
+  LToUp: int64;
+  LToUpLeft: int64;
+begin
+  LGuess := ALeft + AUp - AUpLeft;
+  LToLeft := LGuess - ALeft;
+  if LToLeft < 0 then
+    LToLeft := -LToLeft;
+  end;
+  LToUp := LGuess - AUp;
+  if LToUp < 0 then
+    LToUp := -LToUp;
+  end;
+  LToUpLeft := LGuess - AUpLeft;
+  if LToUpLeft < 0 then
+    LToUpLeft := -LToUpLeft;
+  end;
+  if (LToLeft <= LToUp) and (LToLeft <= LToUpLeft) then
+    return ALeft;
+  end;
+  if LToUp <= LToUpLeft then
+    return AUp;
+  end;
+  return AUpLeft;
+end;
+
+type
+  // A PNG being decoded: its IHDR facts, its palette (RGBA per entry) and tRNS key, the
+  // inflated scanlines and where the next pass starts in them
+  PngState = record
+    Width: int64;
+    Height: int64;
+    Depth: int64;
+    Colour: int64;
+    Channels: int64;
+    PixelBits: int64;
+    Palette: ByteArray;
+    PaletteCount: int64;
+    HasKey: bool;
+    KeyR: int64;
+    KeyG: int64;
+    KeyB: int64;
+    Lines: ByteArray;
+    At: int64;
+  end;
+
+// Whether ADepth is a bit depth PNG allows for the colour type AColour
+routine DoPngDepthOk(const AColour: int64; const ADepth: int64): bool;
+begin
+  if AColour = ADAM_ICON_PNG_GREY then
+    return (ADepth = 1) or (ADepth = 2) or (ADepth = 4) or (ADepth = 8) or (ADepth = 16);
+  end;
+  if AColour = ADAM_ICON_PNG_PALETTE then
+    return (ADepth = 1) or (ADepth = 2) or (ADepth = 4) or (ADepth = 8);
+  end;
+  if (AColour = ADAM_ICON_PNG_RGB) or (AColour = ADAM_ICON_PNG_GREY_ALPHA) or
+    (AColour = ADAM_ICON_PNG_RGBA) then
+    return (ADepth = 8) or (ADepth = 16);
+  end;
+  return false;
+end;
+
+// The samples a pixel of the colour type AColour has
+routine DoPngChannels(const AColour: int64): int64;
+begin
+  if AColour = ADAM_ICON_PNG_RGB then
+    return 3;
+  end;
+  if AColour = ADAM_ICON_PNG_GREY_ALPHA then
+    return 2;
+  end;
+  if AColour = ADAM_ICON_PNG_RGBA then
+    return 4;
+  end;
+  return 1;
+end;
+
+// Sample AChannel of pixel AX of the unfiltered row at ARow of AState.Lines, at the image's
+// own depth (16-bit samples big-endian)
+routine DoPngSample(const AState: PngState; const ARow: int64; const AX: int64;
+  const AChannel: int64): int64;
+var
+  LAt: int64;
+begin
+  if AState.Depth < 8 then
+    return DoPacked(AState.Lines, ARow, AX, AState.Depth);
+  end;
+  if AState.Depth = 8 then
+    return int64(AState.Lines[ARow + AX * AState.Channels + AChannel]);
+  end;
+  LAt := ARow + (AX * AState.Channels + AChannel) * 2;
+  return (int64(AState.Lines[LAt]) shl 8) | int64(AState.Lines[LAt + 1]);
+end;
+
+// A sample of AState's depth scaled to 8 bits
+routine DoPngEight(const AState: PngState; const ASample: int64): int64;
+begin
+  if AState.Depth = 16 then
+    return ASample shr 8;
+  end;
+  if AState.Depth < 8 then
+    return (ASample * 255) div ((int64(1) shl AState.Depth) - 1);
+  end;
+  return ASample;
+end;
+
+// One pass of AState's scanlines (the whole image when not interlaced: start 0 / 0, steps
+// 1 / 1) unfiltered in place and put into AImage; false when the data is cut or a row's
+// filter or a palette index is wrong
+routine DoPngPass(var AState: PngState; var AImage: ByteArray; const AStartX: int64;
+  const AStartY: int64; const AStepX: int64; const AStepY: int64): bool;
+var
+  LWidth: int64;
+  LHeight: int64;
+  LRowBytes: int64;
+  LStride: int64;
+  LRow: int64;
+  LPrior: int64;
+  LFilter: int64;
+  LY: int64;
+  LX: int64;
+  LI: int64;
+  LLeft: int64;
+  LUp: int64;
+  LUpLeft: int64;
+  LByte: int64;
+  LR: int64;
+  LG: int64;
+  LB: int64;
+  LA: int64;
+  LIndex: int64;
+begin
+  if (AStartX >= AState.Width) or (AStartY >= AState.Height) then
+    return true;
+  end;
+  LWidth := (AState.Width - AStartX + AStepX - 1) div AStepX;
+  LHeight := (AState.Height - AStartY + AStepY - 1) div AStepY;
+  LRowBytes := (LWidth * AState.PixelBits + 7) div 8;
+  // The filter's byte distance: one pixel's bytes, at least one
+  LStride := (AState.PixelBits + 7) div 8;
+  if AState.At + LHeight * (LRowBytes + 1) > len(AState.Lines) then
+    return false;
+  end;
+  LPrior := -1;
+  for LY := 0 to LHeight - 1 do
+    LFilter := int64(AState.Lines[AState.At]);
+    LRow := AState.At + 1;
+    if LFilter > 4 then
+      return false;
+    end;
+    // Each byte from its filtered value and the left / up / up-left bytes already
+    // restored (0 before the row's first pixel and above the pass's first row)
+    for LI := 0 to LRowBytes - 1 do
+      LLeft := 0;
+      LUp := 0;
+      LUpLeft := 0;
+      if LI >= LStride then
+        LLeft := int64(AState.Lines[LRow + LI - LStride]);
+      end;
+      if LPrior >= 0 then
+        LUp := int64(AState.Lines[LPrior + LI]);
+        if LI >= LStride then
+          LUpLeft := int64(AState.Lines[LPrior + LI - LStride]);
+        end;
+      end;
+      LByte := int64(AState.Lines[LRow + LI]);
+      if LFilter = 1 then
+        LByte := LByte + LLeft;
+      end;
+      if LFilter = 2 then
+        LByte := LByte + LUp;
+      end;
+      if LFilter = 3 then
+        LByte := LByte + (LLeft + LUp) div 2;
+      end;
+      if LFilter = 4 then
+        LByte := LByte + DoPaeth(LLeft, LUp, LUpLeft);
+      end;
+      AState.Lines[LRow + LI] := uint8(LByte & 255);
+    end;
+    // The row's pixels into the image at their place in the pass
+    for LX := 0 to LWidth - 1 do
+      LA := 255;
+      if AState.Colour = ADAM_ICON_PNG_PALETTE then
+        LIndex := DoPngSample(AState, LRow, LX, 0);
+        if LIndex >= AState.PaletteCount then
+          return false;
+        end;
+        LR := int64(AState.Palette[LIndex * 4]);
+        LG := int64(AState.Palette[LIndex * 4 + 1]);
+        LB := int64(AState.Palette[LIndex * 4 + 2]);
+        LA := int64(AState.Palette[LIndex * 4 + 3]);
+      else
+        if (AState.Colour = ADAM_ICON_PNG_GREY) or (AState.Colour = ADAM_ICON_PNG_GREY_ALPHA) then
+          LR := DoPngSample(AState, LRow, LX, 0);
+          if AState.HasKey and (LR = AState.KeyR) then
+            LA := 0;
+          end;
+          LR := DoPngEight(AState, LR);
+          LG := LR;
+          LB := LR;
+          if AState.Colour = ADAM_ICON_PNG_GREY_ALPHA then
+            LA := DoPngEight(AState, DoPngSample(AState, LRow, LX, 1));
+          end;
+        else
+          LR := DoPngSample(AState, LRow, LX, 0);
+          LG := DoPngSample(AState, LRow, LX, 1);
+          LB := DoPngSample(AState, LRow, LX, 2);
+          if AState.HasKey and (LR = AState.KeyR) and (LG = AState.KeyG) and
+            (LB = AState.KeyB) then
+            LA := 0;
+          end;
+          LR := DoPngEight(AState, LR);
+          LG := DoPngEight(AState, LG);
+          LB := DoPngEight(AState, LB);
+          if AState.Colour = ADAM_ICON_PNG_RGBA then
+            LA := DoPngEight(AState, DoPngSample(AState, LRow, LX, 3));
+          end;
+        end;
+      end;
+      DoPut(AImage, AState.Width, AStartX + LX * AStepX, AStartY + LY * AStepY, LR, LG, LB, LA);
+    end;
+    LPrior := LRow;
+    AState.At := AState.At + LRowBytes + 1;
+  end;
+  return true;
+end;
+
+// The PNG image APng decoded into AImage (see the header); false when it is no PNG, a
+// chunk's CRC is wrong, or it is damaged or cut inside
+routine DoDecodePng(const APng: ByteArray; var AImage: ByteArray): bool;
+var
+  LState: PngState;
+  LData: ByteArray;
+  LAt: int64;
+  LLength: int64;
+  LType: string;
+  LFrom: int64;
+  LSeenHeader: bool;
+  LSeenEnd: bool;
+  LInterlace: int64;
+  LI: int64;
+  LCount: int64;
+  LError: string;
+  LPass: int64;
+begin
+  if len(APng) < ADAM_ICON_PNG_SIGNATURE then
+    return false;
+  end;
+  if (APng[0] <> 137) or (APng[1] <> 80) or (APng[2] <> 78) or (APng[3] <> 71) or
+    (APng[4] <> 13) or (APng[5] <> 10) or (APng[6] <> 26) or (APng[7] <> 10) then
+    return false;
+  end;
+  LState.PaletteCount := 0;
+  LState.HasKey := false;
+  LState.At := 0;
+  LInterlace := 0;
+  LSeenHeader := false;
+  LSeenEnd := false;
+  setlength(LData, 0);
+  LAt := ADAM_ICON_PNG_SIGNATURE;
+  while not LSeenEnd do
+    if LAt + ADAM_ICON_PNG_CHUNK_HEAD + ADAM_ICON_PNG_CHUNK_CRC > len(APng) then
+      return false;
+    end;
+    LLength := DoBe32(APng, LAt);
+    LFrom := LAt + ADAM_ICON_PNG_CHUNK_HEAD;
+    if LFrom + LLength + ADAM_ICON_PNG_CHUNK_CRC > len(APng) then
+      return false;
+    end;
+    // The CRC covers the type and the data
+    if int64(ZlibCrc32(0, DoSlice(APng, LAt + 4, LLength + 4))) <> DoBe32(APng, LFrom + LLength) then
+      return false;
+    end;
+    LType := "";
+    for LI := 0 to 3 do
+      LType := LType + char(APng[LAt + 4 + LI]);
+    end;
+    // IHDR first, once
+    if not LSeenHeader and (LType <> "IHDR") then
+      return false;
+    end;
+    if LType = "IHDR" then
+      if LSeenHeader or (LLength <> ADAM_ICON_PNG_IHDR_SIZE) then
+        return false;
+      end;
+      LSeenHeader := true;
+      LState.Width := DoBe32(APng, LFrom);
+      LState.Height := DoBe32(APng, LFrom + 4);
+      LState.Depth := int64(APng[LFrom + 8]);
+      LState.Colour := int64(APng[LFrom + 9]);
+      LInterlace := int64(APng[LFrom + 12]);
+      // Compression and filter method 0 are the only ones; interlace none or Adam7
+      if (APng[LFrom + 10] <> 0) or (APng[LFrom + 11] <> 0) or (LInterlace > 1) or
+        not DoPngDepthOk(LState.Colour, LState.Depth) then
+        return false;
+      end;
+      LState.Channels := DoPngChannels(LState.Colour);
+      LState.PixelBits := LState.Channels * LState.Depth;
+    end;
+    if LType = "PLTE" then
+      LCount := LLength div 3;
+      if (LLength mod 3 <> 0) or (LCount = 0) or (LCount > 256) then
+        return false;
+      end;
+      LState.PaletteCount := LCount;
+      setlength(LState.Palette, LCount * 4);
+      for LI := 0 to LCount - 1 do
+        LState.Palette[LI * 4] := APng[LFrom + LI * 3];
+        LState.Palette[LI * 4 + 1] := APng[LFrom + LI * 3 + 1];
+        LState.Palette[LI * 4 + 2] := APng[LFrom + LI * 3 + 2];
+        LState.Palette[LI * 4 + 3] := 255;
+      end;
+    end;
+    if LType = "tRNS" then
+      // A palette's alphas (after PLTE), else the one transparent grey / RGB value
+      if LState.Colour = ADAM_ICON_PNG_PALETTE then
+        if LLength > LState.PaletteCount then
+          return false;
+        end;
+        for LI := 0 to LLength - 1 do
+          LState.Palette[LI * 4 + 3] := APng[LFrom + LI];
+        end;
+      end;
+      if LState.Colour = ADAM_ICON_PNG_GREY then
+        if LLength <> 2 then
+          return false;
+        end;
+        LState.HasKey := true;
+        LState.KeyR := (int64(APng[LFrom]) shl 8) | int64(APng[LFrom + 1]);
+      end;
+      if LState.Colour = ADAM_ICON_PNG_RGB then
+        if LLength <> 6 then
+          return false;
+        end;
+        LState.HasKey := true;
+        LState.KeyR := (int64(APng[LFrom]) shl 8) | int64(APng[LFrom + 1]);
+        LState.KeyG := (int64(APng[LFrom + 2]) shl 8) | int64(APng[LFrom + 3]);
+        LState.KeyB := (int64(APng[LFrom + 4]) shl 8) | int64(APng[LFrom + 5]);
+      end;
+    end;
+    if LType = "IDAT" then
+      LCount := len(LData);
+      setlength(LData, LCount + LLength);
+      for LI := 0 to LLength - 1 do
+        LData[LCount + LI] := APng[LFrom + LI];
+      end;
+    end;
+    if LType = "IEND" then
+      LSeenEnd := true;
+    end;
+    LAt := LFrom + LLength + ADAM_ICON_PNG_CHUNK_CRC;
+  end;
+  if (LState.Colour = ADAM_ICON_PNG_PALETTE) and (LState.PaletteCount = 0) then
+    return false;
+  end;
+  if (len(LData) = 0) or not ZlibInflate(LData, ZlibFormat.Zlib, LState.Lines, LError) then
+    return false;
+  end;
+  if not DoStartImage(AImage, LState.Width, LState.Height) then
+    return false;
+  end;
+  if LInterlace = 0 then
+    return DoPngPass(LState, AImage, 0, 0, 1, 1);
+  end;
+  for LPass := 0 to 6 do
+    if not DoPngPass(LState, AImage, ADAM_ICON_ADAM7_X[LPass], ADAM_ICON_ADAM7_Y[LPass],
+      ADAM_ICON_ADAM7_DX[LPass], ADAM_ICON_ADAM7_DY[LPass]) then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+/// The icon file AIcon's largest image decoded into AImage: width, height (uint32 LE),
+/// then RGBA rows top down (see the header); IconFault.None when it was, else what kept it
+/// (AImage then empty).
+/// @param AIcon the .ico file's bytes
+/// @param AImage the decoded image
+public routine IconImage(const AIcon: ByteArray; var AImage: ByteArray): IconFault;
+var
+  LFault: IconFault;
+  LEntry: int64;
+  LBytes: ByteArray;
+  LDecoded: bool;
+begin
+  setlength(AImage, 0);
+  LFault := IconCheck(AIcon);
+  if LFault <> IconFault.None then
+    return LFault;
+  end;
+  LEntry := ADAM_ICON_DIR_SIZE + ADAM_ICON_ENTRY_SIZE * DoLargest(AIcon);
+  LBytes := DoSlice(AIcon, int64(GetLe(AIcon, LEntry + 12, 4)), int64(GetLe(AIcon, LEntry + 8, 4)));
+  // A PNG frame starts with PNG's signature, any other image is a DIB
+  if (len(LBytes) >= ADAM_ICON_PNG_SIGNATURE) and (LBytes[0] = 137) and (LBytes[1] = 80) then
+    LDecoded := DoDecodePng(LBytes, AImage);
+  else
+    LDecoded := DoDecodeBmp(LBytes, AImage);
+  end;
+  if not LDecoded then
+    setlength(AImage, 0);
+    return IconFault.BadImage;
+  end;
+  return IconFault.None;
+end;
+
+end.
