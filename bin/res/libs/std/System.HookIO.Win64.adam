@@ -268,7 +268,10 @@ type
   // is _IOCTRLZ (a fill of a read-only stream met a Ctrl-Z; cleared only by setvbuf);
   // SetvbufBuffer is _IOBUFFER_SETVBUF. The lowio side, over the handle's Position: LowEof is
   // FEOFLAG (a text read met a Ctrl-Z; lowio reads nothing until a seek clears it), LowCrlf is
-  // FCRLF (the last text read began with a newline). A binary handle never sets either
+  // FCRLF (the last text read began with a newline). A binary handle never sets either.
+  // LowLookahead is lowio's _pipe_lookahead of a Pipe handle: the bytes a text read looked at
+  // past its end and could not step back over (a pipe cannot seek), handed to the next read
+  // first; ADAM_HOOKIO_LF marks a slot empty, as in lowio
   HookCrtModel = record
     Buffer: HookCrtBuffer;
     Next: int64;
@@ -283,6 +286,7 @@ type
     SetvbufBuffer: bool;
     LowEof: bool;
     LowCrlf: bool;
+    LowLookahead: array[0..2] of uint8;
   end;
 
   // An open handle, what a hooked open returns in place of a FILE*. Base: the neutral part
@@ -296,7 +300,13 @@ type
   // open's), WideText lowio's _tm_unicode (the open asked ccs=UNICODE, binary or text: the byte
   // calls refuse it whatever its text mode). Utf8Translated: lowio's _utf8translations (the
   // last UTF-8 read handed fewer bytes than it took from Stream, so a tell walks them again);
-  // StartPos: lowio's _startpos (the place in Stream where that read began). Source /
+  // StartPos: lowio's _startpos (the place in Stream where that read began). Pipe: Stream
+  // cannot seek (IOCanSeek false at the open), lowio's FPIPE: Position is then only the number
+  // lowio's lseek last set (a pipe's file pointer, never moved by a read or a write; an lseek
+  // to the end gives 0), every read and write goes to the IO at its own place. Replay /
+  // ReplayNext / Journal / Journaling: on a Pipe handle the raw bytes a scan's stand-in took
+  // from Stream (Journal, while Journaling) are given back when the scan puts the handle back
+  // (DoRestoreReadState), read again before Stream (Replay from ReplayNext). Source /
   // EntryName / Temporary: the source entry the handle opened and whether with D (Source nil
   // on a registered IO, and once the use is given back). OwnedSource: a folder IOSource the
   // handle made for itself (a freopen onto a real path, DoReopen), closed once the handle's
@@ -316,6 +326,11 @@ type
     WideText: bool;
     Utf8Translated: bool;
     StartPos: int64;
+    Pipe: bool;
+    Replay: array of uint8;
+    ReplayNext: int64;
+    Journal: array of uint8;
+    Journaling: bool;
     Users: int64;
     Crt: HookCrtModel;
   end;
@@ -1026,6 +1041,65 @@ begin
   end;
 end;
 
+// lowio's _pipe_lookahead emptied: every slot ADAM_HOOKIO_LF
+routine DoClearLookahead(const AHandle: ptr to HookHandle);
+begin
+  AHandle->Crt.LowLookahead[0] := ADAM_HOOKIO_LF;
+  AHandle->Crt.LowLookahead[1] := ADAM_HOOKIO_LF;
+  AHandle->Crt.LowLookahead[2] := ADAM_HOOKIO_LF;
+end;
+
+// ReadFile on the handle's IO: up to ASize raw bytes into AData from the IO's own place. A
+// Pipe handle first hands back the bytes a scan's replay gave back (Replay), and records what
+// it takes while a scan's stand-in reads (Journaling). The count, as IORead gives it
+routine DoIOReadLocked(const AHandle: ptr to HookHandle; const AData: ptr to uint8;
+  const ASize: int64): int64;
+var
+  LCount: int64;
+  LGot: int64;
+  LAt: int64;
+begin
+  if not AHandle->Pipe then
+    return IORead(AHandle->Base.Stream, ptr(AData), ASize);
+  end;
+  LCount := 0;
+  while (LCount < ASize) and (AHandle->ReplayNext < len(AHandle->Replay)) do
+    AData[LCount] := AHandle->Replay[AHandle->ReplayNext];
+    AHandle->ReplayNext := AHandle->ReplayNext + 1;
+    LCount := LCount + 1;
+  end;
+  if AHandle->ReplayNext >= len(AHandle->Replay) then
+    setlength(AHandle->Replay, 0);
+    AHandle->ReplayNext := 0;
+  end;
+  if LCount < ASize then
+    LGot := IORead(AHandle->Base.Stream, ptr(AData + LCount), ASize - LCount);
+    if (LGot < 0) and (LCount = 0) then
+      return LGot;
+    end;
+    if LGot > 0 then
+      LCount := LCount + LGot;
+    end;
+  end;
+  if AHandle->Journaling and (LCount > 0) then
+    LAt := len(AHandle->Journal);
+    setlength(AHandle->Journal, LAt + LCount);
+    CopyBytes(addr of AHandle->Journal[LAt], AData, LCount);
+  end;
+  return LCount;
+end;
+
+// lowio's lseek of the descriptor to APlace from the start, the IO moved with it: a Pipe
+// handle's lseek only sets the number (a pipe's file pointer), so it always succeeds. False:
+// the IO cannot go there
+routine DoLowMoveLocked(const AHandle: ptr to HookHandle; const APlace: int64): bool;
+begin
+  if AHandle->Pipe then
+    return true;
+  end;
+  return IOSeek(AHandle->Base.Stream, APlace, SeekOrigin.FromStart) = APlace;
+end;
+
 // Where a write-only append handle ("a") starts, as ucrt opens it: its descriptor at 0 (lowio
 // moves it to the end at each write, so ftell before the first write is 0, measured). "a+"
 // starts at 0 too
@@ -1040,10 +1114,15 @@ var
   LEnd: int64;
   LLast: uint8;
 begin
-  LEnd := IOSize(AHandle->Base.Stream);
-  // An IO with no size may still know its end
-  if LEnd < 0 then
-    LEnd := IOSeek(AHandle->Base.Stream, 0, SeekOrigin.FromEnd);
+  // A pipe's end is 0 (lowio's lseek to it on a pipe gives 0)
+  if AHandle->Pipe then
+    LEnd := 0;
+  else
+    LEnd := IOSize(AHandle->Base.Stream);
+    // An IO with no size may still know its end
+    if LEnd < 0 then
+      LEnd := IOSeek(AHandle->Base.Stream, 0, SeekOrigin.FromEnd);
+    end;
   end;
   // An empty file: ucrt's seek to -1 from the end fails with EINVAL; the open goes on
   if LEnd = 0 then
@@ -1155,6 +1234,8 @@ begin
     DoFreeHandle(LHandle);
     return nil;
   end;
+  LHandle->Pipe := not IOCanSeek(LHandle->Base.Stream);
+  DoClearLookahead(LHandle);
   // Where an appending handle starts (the core opens leave every handle at 0)
   if LParsed.Mode = FileMode.Append then
     DoAppendStart(LHandle);
@@ -1492,9 +1573,14 @@ begin
 end;
 
 // Moves the IO to the handle's Position: another handle on the same IO, or a seek that only
-// tried a target, may have left it elsewhere. False: the IO cannot go there
+// tried a target, may have left it elsewhere (a Pipe handle's IO never moves). False: the IO
+// cannot go there
 routine DoSyncLocked(const AHandle: ptr to HookHandle): bool;
 begin
+  // A Pipe handle's IO is read and written at its own place (Position is only a number)
+  if AHandle->Pipe then
+    return true;
+  end;
   if IOTell(AHandle->Base.Stream) = AHandle->Base.Position then
     return true;
   end;
@@ -1528,7 +1614,11 @@ begin
     return -1;
   end;
   if AHandle->Appending then
-    LEnd := IOSeek(AHandle->Base.Stream, 0, SeekOrigin.FromEnd);
+    // A pipe's end is 0
+    LEnd := 0;
+    if not AHandle->Pipe then
+      LEnd := IOSeek(AHandle->Base.Stream, 0, SeekOrigin.FromEnd);
+    end;
     if LEnd >= 0 then
       AHandle->Base.Position := LEnd;
     end;
@@ -1543,7 +1633,10 @@ begin
   if LGot < 0 then
     LGot := 0;
   end;
-  AHandle->Base.Position := AHandle->Base.Position + LGot;
+  // A write never moves a pipe's file pointer
+  if not AHandle->Pipe then
+    AHandle->Base.Position := AHandle->Base.Position + LGot;
+  end;
   if LGot < ASize then
     AHandle->Failed := true;
     if LGot = 0 then
@@ -1761,11 +1854,14 @@ begin
     SetCErrno(ADAM_ERRNO_EIO);
     return -1;
   end;
-  LGot := IORead(AHandle->Base.Stream, ptr(AData), ASize);
+  LGot := DoIOReadLocked(AHandle, AData, ASize);
   if LGot < 0 then
     LGot := 0;
   end;
-  AHandle->Base.Position := AHandle->Base.Position + LGot;
+  // A read never moves a pipe's file pointer
+  if not AHandle->Pipe then
+    AHandle->Base.Position := AHandle->Base.Position + LGot;
+  end;
   if (LGot = 0) and (ASize > 0) and (IOStatus(AHandle->Base.Stream) <> IOState.Eof) then
     SetCErrno(ADAM_ERRNO_EIO);
     return -1;
@@ -1826,6 +1922,18 @@ begin
       LTo := LTo + 1;
       skip;
     end;
+    // A pipe cannot step back: a '\n' is taken, any other byte is kept for the next read
+    // (lowio's store_lookahead) after the '\r'
+    if AHandle->Pipe then
+      if LPeek = ADAM_HOOKIO_LF then
+        AData[LTo] := ADAM_HOOKIO_LF;
+      else
+        AData[LTo] := ADAM_HOOKIO_CR;
+        AHandle->Crt.LowLookahead[0] := LPeek;
+      end;
+      LTo := LTo + 1;
+      skip;
+    end;
     if (LPeek = ADAM_HOOKIO_LF) and (LTo = 0) then
       AData[LTo] := ADAM_HOOKIO_LF;
       LTo := LTo + 1;
@@ -1846,7 +1954,7 @@ end;
 // EINVAL
 routine DoSeekLowLocked(const AHandle: ptr to HookHandle; const APlace: int64): bool;
 begin
-  if IOSeek(AHandle->Base.Stream, APlace, SeekOrigin.FromStart) <> APlace then
+  if not DoLowMoveLocked(AHandle, APlace) then
     SetCErrno(ADAM_ERRNO_EINVAL);
     return false;
   end;
@@ -1895,15 +2003,18 @@ begin
     end;
     IOClose(LView);
   else
-    if IOSeek(AHandle->Base.Stream, AHandle->Base.Position, SeekOrigin.FromStart) <> AHandle->Base.Position then
+    if not DoLowMoveLocked(AHandle, AHandle->Base.Position) then
       return -1;
     end;
-    LRead := IORead(AHandle->Base.Stream, ptr(addr of ABom[0]), 3);
+    LRead := DoIOReadLocked(AHandle, addr of ABom[0], 3);
   end;
   if LRead < 0 then
     return -1;
   end;
-  AHandle->Base.Position := AHandle->Base.Position + LRead;
+  // A read never moves a pipe's file pointer
+  if not AHandle->Pipe then
+    AHandle->Base.Position := AHandle->Base.Position + LRead;
+  end;
   return DoLowTranslateLocked(AHandle, addr of ABom[0], LRead);
 end;
 
@@ -2066,6 +2177,20 @@ begin
       skip;
     end;
     LPeekUnit := DoUtf16Unit(addr of LPeek[0], 0);
+    // A pipe cannot step back: a L'\n' is taken, any other character is kept for the next
+    // read (lowio's wide store_lookahead: its two bytes, the third slot empty) after the L'\r'
+    if AHandle->Pipe then
+      if LPeekUnit = uint32(ADAM_HOOKIO_LF) then
+        DoSetUtf16Unit(AData, LTo, uint32(ADAM_HOOKIO_LF));
+      else
+        DoSetUtf16Unit(AData, LTo, uint32(ADAM_HOOKIO_CR));
+        AHandle->Crt.LowLookahead[0] := LPeek[0];
+        AHandle->Crt.LowLookahead[1] := LPeek[1];
+        AHandle->Crt.LowLookahead[2] := ADAM_HOOKIO_LF;
+      end;
+      LTo := LTo + 1;
+      skip;
+    end;
     if (LPeekUnit = uint32(ADAM_HOOKIO_LF)) and (LTo = 0) then
       DoSetUtf16Unit(AData, LTo, uint32(ADAM_HOOKIO_LF));
       LTo := LTo + 1;
@@ -2080,6 +2205,49 @@ begin
     end;
   end;
   return 2 * LTo;
+end;
+
+// lowio's read of the descriptor at the start of a _read (read.cpp _read_nolock): a Pipe
+// handle's lookahead bytes first (slot 0; slot 1 in a Unicode text mode; slot 2 in UTF-8),
+// each slot emptied as it is taken, then up to the rest of ASize raw bytes
+// (DoLowRawLocked). An IO at its end gives 0 even after lookahead bytes, as lowio's
+// ERROR_BROKEN_PIPE return does (they are gone). ucrt's text translation of such a read
+// starts past the lookahead bytes and runs over one byte past the read (memory the read did
+// not fill): the model translates the bytes read, the lookahead first. Returns the count or -1
+routine DoLowFillLocked(const AHandle: ptr to HookHandle; const AData: ptr to uint8;
+  const ASize: int64): int64;
+var
+  LCount: int64;
+  LGot: int64;
+  LSlots: int64;
+  LSlot: int64;
+begin
+  LCount := 0;
+  if AHandle->Pipe then
+    LSlots := 1;
+    if AHandle->Text and (AHandle->LowText <> HookLowText.Ansi) then
+      LSlots := 2;
+      if AHandle->LowText = HookLowText.Utf8 then
+        LSlots := 3;
+      end;
+    end;
+    LSlot := 0;
+    while (LSlot < LSlots) and (LCount < ASize) and
+      (AHandle->Crt.LowLookahead[LSlot] <> ADAM_HOOKIO_LF) do
+      AData[LCount] := AHandle->Crt.LowLookahead[LSlot];
+      AHandle->Crt.LowLookahead[LSlot] := ADAM_HOOKIO_LF;
+      LCount := LCount + 1;
+      LSlot := LSlot + 1;
+    end;
+  end;
+  if LCount = ASize then
+    return LCount;
+  end;
+  LGot := DoLowRawLocked(AHandle, AData + LCount, ASize - LCount);
+  if LGot <= 0 then
+    return LGot;
+  end;
+  return LCount + LGot;
 end;
 
 // ucrt's _lookuptrailbytes: the trail bytes a UTF-8 lead byte announces (0 for an ASCII byte,
@@ -2140,7 +2308,7 @@ begin
   end;
   setlength(LRaw, LWant);
   AHandle->StartPos := AHandle->Base.Position;
-  LGot := DoLowRawLocked(AHandle, addr of LRaw[0], LWant);
+  LGot := DoLowFillLocked(AHandle, addr of LRaw[0], LWant);
   if LGot < 0 then
     return -1;
   end;
@@ -2165,10 +2333,21 @@ begin
     if (LTrail + 1) = LCounter then
       LEnd := LEnd + LCounter;
     else
-      // The cut character is read again by the next read (lowio's lseek back, which clears
-      // LowEof)
-      AHandle->Base.Position := AHandle->Base.Position - LCounter;
-      AHandle->Crt.LowEof := false;
+      if AHandle->Pipe then
+        // A pipe keeps the cut character's bytes (at most 3) for the next read
+        AHandle->Crt.LowLookahead[0] := LRaw[LEnd];
+        if LCounter >= 2 then
+          AHandle->Crt.LowLookahead[1] := LRaw[LEnd + 1];
+        end;
+        if LCounter = 3 then
+          AHandle->Crt.LowLookahead[2] := LRaw[LEnd + 2];
+        end;
+      else
+        // The cut character is read again by the next read (lowio's lseek back, which
+        // clears LowEof)
+        AHandle->Base.Position := AHandle->Base.Position - LCounter;
+        AHandle->Crt.LowEof := false;
+      end;
     end;
   end;
   // No whole character (only a cut one was read) still goes to MultiByteToWideChar, as ucrt's
@@ -2209,7 +2388,7 @@ begin
       return DoLowReadUtf8Locked(AHandle, AData, ASize);
     end;
   end;
-  LGot := DoLowRawLocked(AHandle, AData, ASize);
+  LGot := DoLowFillLocked(AHandle, AData, ASize);
   if LGot < 0 then
     return -1;
   end;
@@ -2513,11 +2692,13 @@ begin
   end;
   LCurrent := AHandle->Crt.Next div 2;
   setlength(LRaw, ADAM_HOOKIO_BUFFER_SIZE);
-  if IOSeek(AHandle->Base.Stream, AHandle->StartPos, SeekOrigin.FromStart) <> AHandle->StartPos then
+  // On a pipe both lseeks only set the number and the read takes the pipe's next bytes (ucrt
+  // reads them as it does: they are gone)
+  if not DoLowMoveLocked(AHandle, AHandle->StartPos) then
     return -1;
   end;
-  LGot := IORead(AHandle->Base.Stream, ptr(addr of LRaw[0]), ADAM_HOOKIO_BUFFER_SIZE);
-  if IOSeek(AHandle->Base.Stream, ALow, SeekOrigin.FromStart) <> ALow then
+  LGot := DoIOReadLocked(AHandle, addr of LRaw[0], ADAM_HOOKIO_BUFFER_SIZE);
+  if not DoLowMoveLocked(AHandle, ALow) then
     return -1;
   end;
   if LGot < 0 then
@@ -2614,8 +2795,13 @@ begin
     return LLow - AHandle->Crt.Count;
   end;
   LBytes := AHandle->Crt.Count + AHandle->Crt.Next;
-  // An IO with no size is never "at the end" (ucrt's lseek to the end failed)
-  LEnd := IOSize(AHandle->Base.Stream);
+  // An IO with no size is never "at the end" (ucrt's lseek to the end failed); a pipe's end
+  // is 0
+  if AHandle->Pipe then
+    LEnd := 0;
+  else
+    LEnd := IOSize(AHandle->Base.Stream);
+  end;
   if LEnd = LLow then
     LBytes := LBytes + (DoCrtNewlinesSized(AHandle, 0, LBytes, LWide) * LCharSize);
     if AHandle->Crt.StreamCtrlZ then
@@ -2699,7 +2885,8 @@ end;
 // ftell, the buffer is flushed and dropped (a read-only stream's next fill asks for the small
 // size) and the descriptor moves: the target must be reachable in the IO (past the end when
 // the IO allows it); before the start or out of reach fails with EINVAL; success clears the
-// Ctrl-Z end. Returns 0 or -1
+// Ctrl-Z end. A Pipe handle's descriptor moves as a number only (its end is 0, a target
+// before the start still fails), its IO stays where it is. Returns 0 or -1
 routine DoSeekLocked(const AHandle: ptr to HookHandle; const AOffset: int64;
   const AOrigin: int32): int32;
 var
@@ -2723,7 +2910,8 @@ begin
   end;
   DoCrtFlushLocked(AHandle);
   DoCrtResetLocked(AHandle, true);
-  if AOrigin = ADAM_HOOKIO_SEEK_END then
+  // A pipe's end is 0 (lowio's lseek to it on a pipe gives 0)
+  if (AOrigin = ADAM_HOOKIO_SEEK_END) and (not AHandle->Pipe) then
     LBase := IOSize(AHandle->Base.Stream);
     // An IO with no size may still know its end
     if LBase < 0 then
@@ -2745,7 +2933,7 @@ begin
     SetCErrno(ADAM_ERRNO_EINVAL);
     return -1;
   end;
-  if IOSeek(AHandle->Base.Stream, LTarget, SeekOrigin.FromStart) <> LTarget then
+  if not DoLowMoveLocked(AHandle, LTarget) then
     SetCErrno(ADAM_ERRNO_EINVAL);
     return -1;
   end;
@@ -2888,7 +3076,11 @@ begin
     LWritten := DoLowWriteLocked(AHandle, DoCrtData(AHandle), LToWrite);
   else
     if AHandle->Appending then
-      LEnd := IOSeek(AHandle->Base.Stream, 0, SeekOrigin.FromEnd);
+      // A pipe's end is 0
+      LEnd := 0;
+      if not AHandle->Pipe then
+        LEnd := IOSeek(AHandle->Base.Stream, 0, SeekOrigin.FromEnd);
+      end;
       if LEnd < 0 then
         // ucrt returns its EOF from this bool function here, which is true: the stream is
         // flagged, the character is not stored, and its caller reports success
@@ -3596,7 +3788,7 @@ begin
   AHandle->AtEnd := false;
   AHandle->Failed := false;
   AHandle->Crt.LowEof := false;
-  if IOSeek(AHandle->Base.Stream, 0, SeekOrigin.FromStart) = 0 then
+  if DoLowMoveLocked(AHandle, 0) then
     AHandle->Base.Position := 0;
   else
     AHandle->Failed := true;
@@ -4301,6 +4493,11 @@ begin
   LState.Utf8Translated := AHandle->Utf8Translated;
   LState.StartPos := AHandle->StartPos;
   LState.Crt := AHandle->Crt;
+  // A Pipe handle records what the reads after this take from its IO, for the restore
+  if AHandle->Pipe then
+    setlength(AHandle->Journal, 0);
+    AHandle->Journaling := true;
+  end;
   if (AHandle->Crt.Buffer.Caller <> nil) and (AHandle->Crt.Buffer.Size > 0) then
     setlength(LState.CallerBytes, AHandle->Crt.Buffer.Size);
     CopyBytes(addr of LState.CallerBytes[0], AHandle->Crt.Buffer.Caller,
@@ -4309,7 +4506,31 @@ begin
   return LState;
 end;
 
-// AStart put back on AHandle, the caller's array bytes included
+// A Pipe handle's journal (the raw bytes taken from its IO since DoSaveReadState) put in
+// front of what is still to be replayed, so the next reads take them again; recording ends
+routine DoGiveBackJournal(const AHandle: ptr to HookHandle);
+var
+  LBack: array of uint8;
+  LLeft: int64;
+  LTaken: int64;
+begin
+  LTaken := len(AHandle->Journal);
+  LLeft := len(AHandle->Replay) - AHandle->ReplayNext;
+  setlength(LBack, LTaken + LLeft);
+  if LTaken > 0 then
+    CopyBytes(addr of LBack[0], addr of AHandle->Journal[0], LTaken);
+  end;
+  if LLeft > 0 then
+    CopyBytes(addr of LBack[LTaken], addr of AHandle->Replay[AHandle->ReplayNext], LLeft);
+  end;
+  AHandle->Replay := LBack;
+  AHandle->ReplayNext := 0;
+  setlength(AHandle->Journal, 0);
+  AHandle->Journaling := false;
+end;
+
+// AStart put back on AHandle, the caller's array bytes included (a Pipe handle's IO bytes
+// taken since then given back, DoGiveBackJournal)
 routine DoRestoreReadState(const AHandle: ptr to HookHandle; const AStart: HookReadState);
 begin
   AHandle->Base.Position := AStart.Position;
@@ -4318,6 +4539,9 @@ begin
   AHandle->Utf8Translated := AStart.Utf8Translated;
   AHandle->StartPos := AStart.StartPos;
   AHandle->Crt := AStart.Crt;
+  if AHandle->Pipe then
+    DoGiveBackJournal(AHandle);
+  end;
   if (AHandle->Crt.Buffer.Caller <> nil) and (len(AStart.CallerBytes) > 0) then
     CopyBytes(AHandle->Crt.Buffer.Caller, addr of AStart.CallerBytes[0],
       len(AStart.CallerBytes));
@@ -4820,6 +5044,11 @@ end;
 // answer stays -1)
 routine DoRun(const AHandle: ptr to HookHandle; var ACall: HookCall);
 begin
+  // A journal lives only within the scan that started it
+  if AHandle->Journaling then
+    setlength(AHandle->Journal, 0);
+    AHandle->Journaling := false;
+  end;
   // ucrt validates these calls' stream as ANSI first: refused, the answer stays the failure
   // value
   if DoNeedsAnsi(ACall.Op) and (not DoAnsiStream(AHandle)) then
