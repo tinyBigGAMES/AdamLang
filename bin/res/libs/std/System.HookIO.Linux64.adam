@@ -159,6 +159,14 @@
   sets O_APPEND and a write-only one starts at the end). A description
   outlives the stream that opened it while another number or stream still
   uses it, and closes with the last of them.
+  A dup2 or dup3 onto a number an open FILE holds as its descriptor takes the
+  FILE along, as the kernel's FILE keeps its number: its system calls then run
+  on the new file (a handle's description, or the kernel's own description of a
+  real descriptor: glibc's read, write, lseek and fstat on that number, the
+  kernel's place and rights), and its old description closes unless another
+  number or FILE still uses it. A number such a FILE holds whose real file the
+  kernel let go of (close(2), an fclose of another FILE on it, a freopen) goes
+  back to a reservation until that FILE's fclose.
   open and open64 (and _FORTIFY_SOURCE's __open_2 / __open64_2) of a
   virtual path, or one the path source holds, open a handle as fopen would
   (the kernel's O_* rules: O_CREAT / O_EXCL / O_TRUNC / O_APPEND, the
@@ -245,6 +253,7 @@ const
   ADAM_HOOKIO_RESERVE_PATH: string = "/dev/null";
   // sys/stat.h: a FIFO (a handle on an IO that cannot seek), a regular file, the read and
   // write bits of owner, group and other
+  S_IFMT: uint32 = 0xF000u;
   S_IFIFO: uint32 = 0x1000u;
   S_IFREG: uint32 = 0x8000u;
   S_IRUSR: uint32 = 0x0100u;
@@ -441,7 +450,11 @@ type
   // calls EBADF, as glibc's on a closed _fileno; the number stays reserved until fclose).
   // Desc: the handle whose open file description (IO, place, rights, a pipe's replay) this
   // FILE's system calls run on, nil: its own; an fdopen of a handle's descriptor sets it (one
-  // user of it held; the FILE shares its stream lock)
+  // user of it held; the FILE shares its stream lock).
+  // Kernel: the description is the kernel's own, a real descriptor's a dup2 / dup3 put on a
+  // number a FILE holds (DoKernelDescription): its IO runs glibc's read / write / lseek / fstat
+  // on KernelFile, its place is the kernel's offset (Position adopted from it before each
+  // call, never kept over one: DoAdoptKernelPlace), its rights and O_APPEND the kernel's
   HookHandle = record
     Head: _IO_FILE;
     Base: HookStream;
@@ -460,6 +473,8 @@ type
     DescriptorOwned: bool;
     DescriptorClosed: bool;
     Desc: ptr to HookHandle;
+    Kernel: bool;
+    KernelFile: int32;
   end;
 
   // One descriptor number on a handle's description (GDescriptors): Number (a reservation the
@@ -1028,12 +1043,36 @@ end;
 
 // --- the descriptor: glibc's read / write / lseek / fstat, on the handle's IO ---------------
 
+// A kernel description's place adopted from the kernel (lseek's SEEK_CUR through its IO):
+// another number on the same open file description may have moved it since. Nothing for any
+// other description, or a pipe (it has no place). errno as it was
+routine DoAdoptKernelPlace(const AHandle: ptr to HookHandle);
+var
+  LAt: int64;
+  LError: int32;
+begin
+  if (not AHandle->Kernel) or AHandle->Pipe or (AHandle->Base.Stream = nil) then
+    return;
+  end;
+  LError := CErrno();
+  LAt := IOTell(AHandle->Base.Stream);
+  if LAt >= 0 then
+    AHandle->Base.Position := LAt;
+  end;
+  SetCErrno(LError);
+end;
+
 // Moves the IO to the handle's Position: another handle on the same IO may have left it
 // elsewhere. False: the IO cannot go there. A Pipe handle's IO has only its own place, where
-// every read and write lands (true)
+// every read and write lands (true); a kernel description's IO is where the kernel's offset
+// is, which becomes its Position (true)
 routine DoSyncLocked(const AHandle: ptr to HookHandle): bool;
 begin
   if AHandle->Pipe then
+    return true;
+  end;
+  if AHandle->Kernel then
+    DoAdoptKernelPlace(AHandle);
     return true;
   end;
   if IOTell(AHandle->Base.Stream) = AHandle->Base.Position then
@@ -1093,7 +1132,10 @@ begin
   end;
   AHandle->Base.Position := AHandle->Base.Position + LGot;
   if (LGot = 0) and (IOStatus(AHandle->Base.Stream) <> IOState.Eof) then
-    SetCErrno(ADAM_ERRNO_EIO);
+    // A kernel description's read failed with the kernel's errno, kept
+    if not AHandle->Kernel then
+      SetCErrno(ADAM_ERRNO_EIO);
+    end;
     return -1;
   end;
   return LGot;
@@ -1127,7 +1169,10 @@ begin
   end;
   LGot := IOWrite(AHandle->Base.Stream, ptr(AData), ASize);
   if LGot <= 0 then
-    SetCErrno(ADAM_ERRNO_ENOSPC);
+    // A kernel description's write failed with the kernel's errno, kept
+    if not AHandle->Kernel then
+      SetCErrno(ADAM_ERRNO_ENOSPC);
+    end;
     return -1;
   end;
   AHandle->Base.Position := AHandle->Base.Position + LGot;
@@ -1157,6 +1202,8 @@ begin
     SetCErrno(ESPIPE);
     return -1;
   end;
+  // SEEK_CUR counts from the kernel's place on a kernel description
+  DoAdoptKernelPlace(AHandle);
   LTarget := AOffset;
   if ADir = _IO_seek_cur then
     LTarget := AHandle->Base.Position + AOffset;
@@ -1274,6 +1321,7 @@ var
   LKept: int64;
   LCount: int64;
   LGot: int64;
+  LState: IOState;
   LDesc: ptr to HookHandle;
 begin
   LDesc := DoDescOf(AHandle);
@@ -1298,10 +1346,15 @@ begin
     end;
   end;
   LGot := IORead(LDesc->Base.Stream, ptr(AData), ASize);
+  LState := IOStatus(LDesc->Base.Stream);
+  // A kernel description's IO is its place: the look ahead moved it, so it goes back
+  if LDesc->Kernel and (not LDesc->Pipe) then
+    IOSeek(LDesc->Base.Stream, LDesc->Base.Position, SeekOrigin.FromStart);
+  end;
   if LGot < 0 then
     return -1;
   end;
-  if (LGot = 0) and (IOStatus(LDesc->Base.Stream) <> IOState.Eof) then
+  if (LGot = 0) and (LState <> IOState.Eof) then
     return -1;
   end;
   if LDesc->Pipe and (LGot > 0) then
@@ -4681,6 +4734,226 @@ begin
   return LFcntl(AFile, F_DUPFD_CLOEXEC, uint64(int64(AMin)));
 end;
 
+// The real dup2 (AThree false) or dup3 with AFlags of AFile onto ATarget: ATarget, or -1 with
+// glibc's errno
+routine DoRealCopyTo(const AFile: int32; const ATarget: int32; const AThree: bool;
+  const AFlags: int32): int32;
+var
+  LFound: ptr;
+  LDup2: Dup2Fn;
+  LDup3: Dup3Fn;
+begin
+  if AThree then
+    LFound := DoReal(GRealDup3, ptr to const char("dup3"));
+    if LFound = nil then
+      return -1;
+    end;
+    LDup3 := Dup3Fn(LFound);
+    return LDup3(AFile, ATarget, AFlags);
+  end;
+  LFound := DoReal(GRealDup2, ptr to const char("dup2"));
+  if LFound = nil then
+    return -1;
+  end;
+  LDup2 := Dup2Fn(LFound);
+  return LDup2(AFile, ATarget);
+end;
+
+// Number AFile given back to a reservation (the kernel lets go of the real file it named, the
+// number kept for the FILE that holds it as its _fileno): glibc's dup3 of a new reservation
+// onto it. errno as it was
+routine DoParkNumber(const AFile: int32);
+var
+  LReserve: int32;
+  LError: int32;
+begin
+  LError := CErrno();
+  LReserve := DoReserveDescriptor();
+  if LReserve >= 0 then
+    DoRealCopyTo(LReserve, AFile, true, O_CLOEXEC);
+    DoCloseReal(LReserve);
+  end;
+  SetCErrno(LError);
+end;
+
+// glibc's fstat, defined below
+forward routine DoRealFstat(const AFile: int32; const ABuf: ptr; var ASlot: ptr;
+  const AName: ptr to const char; var AOldSlot: ptr; const AOldName: ptr to const char): int32;
+
+// The IO of a kernel description (DoKernelDescription): glibc's own read / write / lseek /
+// fstat on the number its user pointer holds, never the hooks (the number is listed). A failed
+// call is Error with the kernel's errno kept; nothing here closes the number (its entry's
+// give back does: DoCloseReal)
+routine DoKernelFileOf(const AUserData: ptr): int32;
+begin
+  return int32(int64(uint64(AUserData)));
+end;
+routine DoKernelRead(const AUserData: ptr; const ABuffer: ptr; const ASize: int64;
+  var AState: IOState): int64;
+var
+  LFound: ptr;
+  LRead: FdReadFn;
+  LGot: int64;
+begin
+  LFound := DoReal(GRealRead, ptr to const char("read"));
+  if LFound = nil then
+    AState := IOState.Error;
+    return 0;
+  end;
+  LRead := FdReadFn(LFound);
+  LGot := LRead(DoKernelFileOf(AUserData), ABuffer, uint64(ASize));
+  if LGot < 0 then
+    AState := IOState.Error;
+    return 0;
+  end;
+  if LGot = 0 then
+    AState := IOState.Eof;
+  end;
+  return LGot;
+end;
+routine DoKernelWrite(const AUserData: ptr; const ABuffer: ptr to const; const ASize: int64;
+  var AState: IOState): int64;
+var
+  LFound: ptr;
+  LWrite: FdWriteFn;
+  LGot: int64;
+begin
+  LFound := DoReal(GRealWrite, ptr to const char("write"));
+  if LFound = nil then
+    AState := IOState.Error;
+    return 0;
+  end;
+  LWrite := FdWriteFn(LFound);
+  LGot := LWrite(DoKernelFileOf(AUserData), ABuffer, uint64(ASize));
+  if LGot < 0 then
+    AState := IOState.Error;
+    return 0;
+  end;
+  return LGot;
+end;
+routine DoKernelSeek(const AUserData: ptr; const AOffset: int64; const AOrigin: SeekOrigin): int64;
+var
+  LFound: ptr;
+  LSeek: LseekFn;
+  LWhence: int32;
+begin
+  LWhence := _IO_seek_set;
+  if AOrigin = SeekOrigin.FromCurrent then
+    LWhence := _IO_seek_cur;
+  end;
+  if AOrigin = SeekOrigin.FromEnd then
+    LWhence := _IO_seek_end;
+  end;
+  LFound := DoReal(GRealLseek, ptr to const char("lseek"));
+  if LFound = nil then
+    return -1;
+  end;
+  LSeek := LseekFn(LFound);
+  return LSeek(DoKernelFileOf(AUserData), AOffset, LWhence);
+end;
+routine DoKernelTell(const AUserData: ptr): int64;
+begin
+  return DoKernelSeek(AUserData, 0, SeekOrigin.FromCurrent);
+end;
+// A regular file's st_size, -1 for anything else (a pipe, a terminal) or a failed fstat
+// (errno as it was: a size query is no call of the user's)
+routine DoKernelSize(const AUserData: ptr): int64;
+var
+  LStat: HookStat;
+  LError: int32;
+  LGot: int32;
+begin
+  LError := CErrno();
+  LGot := DoRealFstat(DoKernelFileOf(AUserData), ptr(addr of LStat), GRealFstat,
+    ptr to const char("fstat"), GRealFxstat, ptr to const char("__fxstat"));
+  SetCErrno(LError);
+  if (LGot <> 0) or ((LStat.st_mode & S_IFMT) <> S_IFREG) then
+    return -1;
+  end;
+  return LStat.st_size;
+end;
+
+// The kernel's own open file description of real descriptor AFile, made a description FILEs
+// run their system calls on (a dup2 / dup3 put AFile on a number a FILE holds): an internal
+// handle (DescriptorOwned: it closes with its last number) whose IO is AFile's (DoKernel*),
+// Kernel, its rights the kernel's access mode (F_GETFL), Pipe when AFile cannot seek (a pipe,
+// a FIFO, a terminal), its place the kernel's; Users 1, in the open list. nil when the kernel
+// does not answer F_GETFL or there is no room. errno as it was
+routine DoKernelDescription(const AFile: int32): ptr to HookHandle;
+var
+  LDesc: ptr to HookHandle;
+  LFound: ptr;
+  LFcntl: FcntlFn;
+  LInterface: IOInterface;
+  LStream: IO;
+  LLock: ptr to HookStreamLock;
+  LFlags: int32;
+  LAccess: int32;
+  LAt: int64;
+  LError: int32;
+begin
+  LError := CErrno();
+  LFound := DoReal(GRealFcntl, ptr to const char("fcntl"));
+  if LFound = nil then
+    SetCErrno(LError);
+    return nil;
+  end;
+  LFcntl := FcntlFn(LFound);
+  LFlags := LFcntl(AFile, F_GETFL, 0u);
+  if LFlags < 0 then
+    SetCErrno(LError);
+    return nil;
+  end;
+  LInterface.Read := DoKernelRead;
+  LInterface.Write := DoKernelWrite;
+  LInterface.Seek := DoKernelSeek;
+  LInterface.Tell := DoKernelTell;
+  LInterface.Size := DoKernelSize;
+  LInterface.Flush := nil;
+  LInterface.Close := nil;
+  LInterface.Truncate := nil;
+  LStream := CreateIO(LInterface, ptr(uint64(int64(AFile))));
+  LLock := HookIOOwnLock();
+  create(LDesc);
+  if (LStream = nil) or (LLock = nil) or (LDesc = nil) then
+    if LStream <> nil then
+      IOClose(LStream);
+    end;
+    HookIOReleaseLock(LLock);
+    if LDesc <> nil then
+      destroy(LDesc);
+    end;
+    SetCErrno(LError);
+    return nil;
+  end;
+  LDesc->Users := 1;
+  LDesc->Base.Stream := LStream;
+  LDesc->Base.Owned := true;
+  LDesc->Base.Lock := LLock;
+  LAccess := LFlags & O_ACCMODE;
+  LDesc->Readable := LAccess <> O_WRONLY;
+  LDesc->Writable := LAccess <> O_RDONLY;
+  // O_APPEND is the kernel's: its writes land at the end without the model's seek
+  LDesc->Appending := false;
+  LAt := IOTell(LStream);
+  LDesc->Pipe := LAt < 0;
+  if LAt >= 0 then
+    LDesc->Base.Position := LAt;
+  end;
+  LDesc->Kernel := true;
+  LDesc->KernelFile := AFile;
+  LDesc->Io.Flags := _IO_MAGIC | _IO_IS_FILEBUF | _IO_NO_READS | _IO_NO_WRITES | _IO_TIED_PUT_GET;
+  LDesc->Io.Offset := ADAM_HOOKIO_POS_BAD;
+  LDesc->Head._fileno := -1;
+  LDesc->Descriptor := -1;
+  LDesc->DescriptorOwned := true;
+  LDesc->DescriptorClosed := false;
+  DoMirror(LDesc);
+  DoAddHandle(LDesc);
+  SetCErrno(LError);
+  return LDesc;
+end;
+
 // The index of number AFile in GDescriptors, -1 when it is no handle's (the caller holds GLock)
 routine DoNumberAtLocked(const AFile: int32): int64;
 var
@@ -4825,7 +5098,9 @@ end;
 
 // The description number AFile names, with one more user (given back with DoReleaseHandle),
 // or nil when AFile is not a handle's; AClosed: close(2) ran on it (the number kept for its
-// FILE). While no handle holds one no lock is taken
+// FILE). An open number on a kernel description is no handle's here: its descriptor calls are
+// glibc's on the real file (a closed one is the FILE's reservation: AClosed). While no handle
+// holds one no lock is taken
 routine DoFindDescriptor(const AFile: int32; var AClosed: bool): ptr to HookHandle;
 var
   LHandle: ptr to HookHandle;
@@ -4839,6 +5114,9 @@ begin
     LAt := DoNumberAtLocked(AFile);
     if LAt >= 0 then
       LHandle := GDescriptors[LAt].Handle;
+      if LHandle->Kernel and (not GDescriptors[LAt].Closed) then
+        return nil;
+      end;
       LHandle->Users := LHandle->Users + 1;
       AClosed := GDescriptors[LAt].Closed;
       return LHandle;
@@ -4856,12 +5134,14 @@ var
   LFile: int32;
   LDesc: ptr to HookHandle;
   LAt: int64;
+  LPark: bool;
 begin
   LFile := AHandle->Descriptor;
   if LFile < 0 then
     return;
   end;
   LDesc := nil;
+  LPark := false;
   lock (GLock) do
     AHandle->Descriptor := -1;
     AHandle->DescriptorOwned := false;
@@ -4870,11 +5150,16 @@ begin
     LAt := DoNumberAtLocked(LFile);
     if LAt >= 0 then
       if DoHoldersLocked(LFile, true) then
+        // The kernel closes a real file's number: its holder keeps a reservation
+        LPark := (not GDescriptors[LAt].Closed) and GDescriptors[LAt].Handle->Kernel;
         GDescriptors[LAt].Closed := true;
       else
         LDesc := DoUnlistLocked(LAt);
       end;
     end;
+  end;
+  if LPark then
+    DoParkNumber(LFile);
   end;
   if LDesc <> nil then
     DoCloseReal(LFile);
@@ -5432,6 +5717,9 @@ var
   LIo: ptr to HookLibio;
 begin
   LIo := addr of AHandle->Io;
+  // The place a call starts from (a scan's look ahead counts from it) is the kernel's on a
+  // kernel description
+  DoAdoptKernelPlace(DoDescOf(AHandle));
   match ACall.Op of
     HookOp.Read: DoCallRead(AHandle, ACall);
     HookOp.Write: DoCallWrite(AHandle, ACall);
@@ -6267,6 +6555,10 @@ begin
     end;
   end;
   if LPrevDesc <> nil then
+    // freopen closes the real file a kernel description's number named first
+    if LPrevDesc->Kernel then
+      DoParkNumber(LDescriptor);
+    end;
     DoGiveUpNumber(LPrevDesc);
   end;
   LOld->Base.OwnedSource := LSource;
@@ -6567,12 +6859,14 @@ var
   LDesc: ptr to HookHandle;
   LAt: int64;
   LFound: bool;
+  LPark: bool;
 begin
   AResult := -1;
   if (AFile < 0) or (atomicload(GDescriptorCount) = 0) then
     return false;
   end;
   LFound := false;
+  LPark := false;
   LDesc := nil;
   lock (GLock) do
     LAt := DoNumberAtLocked(AFile);
@@ -6582,6 +6876,9 @@ begin
         SetCErrno(ADAM_ERRNO_EBADF);
       else
         if DoHoldersLocked(AFile, true) then
+          // A kernel description's number lets go of the real file (a pipe's other end sees
+          // it closed); the FILE holding it keeps a reservation
+          LPark := GDescriptors[LAt].Handle->Kernel;
           GDescriptors[LAt].Closed := true;
           AResult := 0;
         else
@@ -6593,6 +6890,9 @@ begin
         end;
       end;
     end;
+  end;
+  if LPark then
+    DoParkNumber(AFile);
   end;
   if LDesc <> nil then
     DoCloseReal(AFile);
@@ -6746,17 +7046,20 @@ begin
   return true;
 end;
 
-// Number ATarget's entry taken out for a dup2 / dup3 onto it (the kernel's copy has replaced its
-// reservation, so nothing is closed): its description, the entry's user now the caller's, or
-// nil when it is no handle's. A handle holding it as its _fileno holds no descriptor any more:
-// a FILE of a user's answers EBADF to its system calls, fileno and fclose (the caller holds
-// GLock)
-routine DoTakeNumberLocked(const ATarget: int32): ptr to HookHandle;
+// Number ATarget's entry taken out for a dup2 / dup3 onto it (the kernel's copy has replaced
+// it, so nothing is closed): its description, the entry's user now the caller's, or nil when
+// it is no handle's. AHolders: every open FILE of a user's holding ATarget as its _fileno,
+// with one more user each (the caller follows them onto the number's new description,
+// DoFollowNumber, then gives that user back); a handle open(2) made on it holds no descriptor
+// any more (the caller holds GLock)
+routine DoTakeNumberLocked(const ATarget: int32; var AHolders: array of ptr to HookHandle): ptr to HookHandle;
 var
   LHandle: ptr to HookHandle;
   LAt: int64;
+  LCount: int64;
   LI: int64;
 begin
+  setlength(AHolders, 0);
   LAt := DoNumberAtLocked(ATarget);
   if LAt < 0 then
     return nil;
@@ -6764,39 +7067,92 @@ begin
   for LI := 0 to len(GHandles) - 1 do
     LHandle := GHandles[LI];
     if LHandle->Descriptor = ATarget then
-      LHandle->Descriptor := -1;
-      LHandle->Head._fileno := -1;
-      if not LHandle->DescriptorOwned then
-        LHandle->DescriptorClosed := true;
+      if LHandle->DescriptorOwned then
+        LHandle->Descriptor := -1;
+        LHandle->Head._fileno := -1;
+      else
+        LHandle->Users := LHandle->Users + 1;
+        LCount := len(AHolders);
+        setlength(AHolders, LCount + 1);
+        AHolders[LCount] := LHandle;
       end;
     end;
   end;
   return DoUnlistLocked(LAt);
 end;
 
-// The real dup2 (AThree false) or dup3 with AFlags of AFile onto ATarget: ATarget, or -1 with
-// glibc's errno
-routine DoRealCopyTo(const AFile: int32; const ATarget: int32; const AThree: bool;
-  const AFlags: int32): int32;
+// AHandle, an open FILE holding a number a dup2 / dup3 just replaced, follows the number onto
+// description ADesc, as the kernel's FILE keeps its _fileno whose file is now ADesc's: its own
+// description given up first (one another number or FILE uses moves on without it,
+// DoMoveDescriptionLocked; one no one else uses closes, as the kernel closes it with its last
+// number: its IO flushed and closed, its entry use and folder source given back), then its
+// system calls run on ADesc (Desc), whose stream lock it takes over as freopen's swap does (an
+// fdopen FILE's previous description given back). A FILE already on ADesc only has its
+// number open again. ADesc nil (no description could be made): the FILE holds no descriptor
+// any more (EBADF to its system calls, fileno and fclose)
+routine DoFollowNumber(const AHandle: ptr to HookHandle; const ADesc: ptr to HookHandle);
 var
-  LFound: ptr;
-  LDup2: Dup2Fn;
-  LDup3: Dup3Fn;
+  LLock: ptr to HookStreamLock;
+  LOldLock: ptr to HookStreamLock;
+  LPrevDesc: ptr to HookHandle;
+  LStream: IO;
+  LEmpty: array of uint8;
+  LGiveBack: bool;
 begin
-  if AThree then
-    LFound := DoReal(GRealDup3, ptr to const char("dup3"));
-    if LFound = nil then
-      return -1;
+  LLock := AHandle->Base.Lock;
+  LOldLock := nil;
+  LPrevDesc := nil;
+  LGiveBack := false;
+  lock (LLock->Lock) do
+    if ADesc = nil then
+      lock (GLock) do
+        AHandle->Descriptor := -1;
+        AHandle->Head._fileno := -1;
+        AHandle->DescriptorClosed := true;
+      end;
+    else
+      if DoDescOf(AHandle) = ADesc then
+        AHandle->DescriptorClosed := false;
+      else
+        if AHandle->Desc = nil then
+          DoMoveDescriptionLocked(AHandle);
+          LStream := AHandle->Base.Stream;
+          if LStream <> nil then
+            if AHandle->Writable then
+              IOFlush(LStream);
+            end;
+            if AHandle->Base.Owned then
+              IOClose(LStream);
+            end;
+          end;
+          AHandle->Base.Stream := nil;
+          AHandle->Base.Owned := false;
+          AHandle->Replay := LEmpty;
+          AHandle->ReplayNext := 0;
+          LGiveBack := true;
+        end;
+        lock (GLock) do
+          LPrevDesc := AHandle->Desc;
+          AHandle->Desc := ADesc;
+          ADesc->Users := ADesc->Users + 1;
+          AHandle->DescriptorClosed := false;
+          if ADesc->Base.Lock <> LLock then
+            LOldLock := LLock;
+            AHandle->Base.Lock := ADesc->Base.Lock;
+            ADesc->Base.Lock->Users := ADesc->Base.Lock->Users + 1;
+          end;
+        end;
+      end;
     end;
-    LDup3 := Dup3Fn(LFound);
-    return LDup3(AFile, ATarget, AFlags);
   end;
-  LFound := DoReal(GRealDup2, ptr to const char("dup2"));
-  if LFound = nil then
-    return -1;
+  if LGiveBack then
+    HookIOGiveBackEntry(addr of AHandle->Base, true);
+    HookIOCloseOwnedSource(addr of AHandle->Base);
   end;
-  LDup2 := Dup2Fn(LFound);
-  return LDup2(AFile, ATarget);
+  if LPrevDesc <> nil then
+    DoReleaseHandle(LPrevDesc);
+  end;
+  HookIOReleaseLock(LOldLock);
 end;
 
 // dup2(2) (AThree false) or dup3(2) with AFlags of AFile onto ATarget when either is a
@@ -6805,22 +7161,33 @@ end;
 // itself: ATarget, nothing done); glibc's. The kernel's copy replaces ATarget (a handle's
 // number there taken out: DoTakeNumberLocked, its description given up); a copy of a handle's
 // number is a reservation (closed on exec, as every one) listed on its description, a copy of
-// any other is glibc's own
+// any other is glibc's own. An open FILE holding ATarget as its _fileno follows the number
+// (DoFollowNumber): onto AFile's description, or for a real AFile onto the kernel's own
+// description of the copy (DoKernelDescription, ATarget listed on it)
 routine DoFdCopyTo(const AFile: int32; const ATarget: int32; const AThree: bool;
   const AFlags: int32; var AResult: int32): bool;
 var
   LDesc: ptr to HookHandle;
   LOld: ptr to HookHandle;
+  LNew: ptr to HookHandle;
+  LKernel: ptr to HookHandle;
+  LHolders: array of ptr to HookHandle;
   LClosed: bool;
   LListed: bool;
+  LHeld: bool;
   LGot: int32;
+  LI: int64;
 begin
   AResult := -1;
   LDesc := DoFindDescriptor(AFile, LClosed);
   LListed := false;
-  if (LDesc = nil) and (ATarget >= 0) and (atomicload(GDescriptorCount) > 0) then
+  LHeld := false;
+  if (ATarget >= 0) and (atomicload(GDescriptorCount) > 0) then
     lock (GLock) do
       LListed := DoNumberAtLocked(ATarget) >= 0;
+      if LListed then
+        LHeld := DoHoldersLocked(ATarget, false);
+      end;
     end;
   end;
   if (LDesc = nil) and (not LListed) then
@@ -6850,11 +7217,25 @@ begin
     LGot := DoRealCopyTo(AFile, ATarget, AThree, AFlags);
   end;
   if LGot >= 0 then
+    // A real AFile copied onto a number a FILE holds: the FILE runs on the kernel's own
+    // description of it
+    LKernel := nil;
+    if (LDesc = nil) and LHeld then
+      LKernel := DoKernelDescription(ATarget);
+    end;
+    LNew := LDesc;
+    if LKernel <> nil then
+      LNew := LKernel;
+    end;
     lock (GLock) do
-      LOld := DoTakeNumberLocked(ATarget);
-      if LDesc <> nil then
-        DoListNumberLocked(ATarget, LDesc);
+      LOld := DoTakeNumberLocked(ATarget, LHolders);
+      if LNew <> nil then
+        DoListNumberLocked(ATarget, LNew);
       end;
+    end;
+    for LI := 0 to len(LHolders) - 1 do
+      DoFollowNumber(LHolders[LI], LNew);
+      DoReleaseHandle(LHolders[LI]);
     end;
     if LOld <> nil then
       DoGiveUpNumber(LOld);

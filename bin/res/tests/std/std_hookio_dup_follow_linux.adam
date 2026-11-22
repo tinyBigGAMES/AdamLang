@@ -1,0 +1,368 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  std_hookio_dup_follow_linux.adam - a FILE follows its number through a
+  dup2 / dup3 on linux (PLAN-LINUX64 LX3d3e1a), as the kernel's FILE keeps
+  its _fileno: onto a zip entry handle's description (its reads, the shared
+  place, its fclose closing the number only), its own shared description
+  moving on without it, a real file's (buffered writes reaching the file, the
+  kernel's place shared with the real number, fstat, reads after a seek),
+  a pipe's write end (close(2) and fclose let go of the real file: the
+  reader sees the end), and dup3.
+*******************************************************************************/
+
+/*
+@@test
+  kind run
+  targets x86_64-linux-gnu
+  exitcode 0
+  | ok follow handle
+  | ok follow fclose
+  | ok follow shared
+  | ok follow real read
+  | ok follow real place
+  | ok follow real fstat
+  | ok follow real fclose
+  | ok follow real write
+  | ok follow pipe
+  | ok follow pipe close
+  | ok follow pipe fclose
+  | ok follow dup3
+  | done 0
+  | [Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+@@end
+*/
+
+module exe std_hookio_dup_follow_linux;
+
+@ifndef TARGET_X86_64_LINUX_GNU
+@message error "std_hookio_dup_follow_linux runs on x86_64-linux-gnu only: build it with -t x86_64-linux-gnu";
+@endif
+
+import System.SysUtils, System.Runtime, System.CustomIO, System.HookIO, System.HookIO.Linux64;
+
+const
+  // fcntl.h / unistd.h / sys/stat.h / errno.h (x86_64 glibc)
+  O_RDONLY: int32 = 0;
+  O_CLOEXEC: int32 = 0x80000;
+  SEEK_SET: int32 = 0;
+  SEEK_CUR: int32 = 1;
+  S_IFMT: uint32 = 0xF000u;
+  S_IFREG: uint32 = 0x8000u;
+  EBADF: int32 = 9;
+  ADAM_TEST_ZIP: string = "$P:../../../../res/tests/std/fixtures/std_customio_stored.zip";
+  ADAM_TEST_SIZE: int64 = 12;
+
+type
+  // glibc's struct stat (x86_64, 144 bytes)
+  StatBuf = record
+    st_dev: uint64;
+    st_ino: uint64;
+    st_nlink: uint64;
+    st_mode: uint32;
+    st_uid: uint32;
+    st_gid: uint32;
+    pad0: int32;
+    st_rdev: uint64;
+    st_size: int64;
+    st_blksize: int64;
+    st_blocks: int64;
+    st_atime: int64;
+    st_atimensec: int64;
+    st_mtime: int64;
+    st_mtimensec: int64;
+    st_ctime: int64;
+    st_ctimensec: int64;
+    reserved: array[0..2] of int64;
+  end;
+
+// unistd.h / stdlib.h: glibc's, no HookIO hook
+routine pipe(const AFiles: ptr to int32): int32; external "c";
+routine mkstemp(const ATemplate: ptr to char): int32; external "c";
+routine unlink(const APath: ptr to const char): int32; external "c";
+
+var
+  GFails: int32;
+  // The entry's own bytes (CreateZipFileIO), what every read is compared with
+  GBytes: array[0..11] of uint8;
+
+routine Check(const AName: string; const AOk: bool);
+begin
+  if AOk then
+    println("ok {}", AName);
+  else
+    println("FAIL {}", AName);
+    GFails := GFails + 1;
+  end;
+end;
+
+// True when the ACount bytes at AData are the entry's from AFrom
+routine SameAs(const AData: ptr; const AFrom: int64; const ACount: int64): bool;
+var
+  LData: ptr to uint8;
+  LI: int64;
+begin
+  LData := ptr to uint8(AData);
+  for LI := 0 to ACount - 1 do
+    if LData[LI] <> GBytes[AFrom + LI] then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// True when the ACount bytes at AData are AText's
+routine TextIs(const AData: ptr; const ACount: int64; const AText: string): bool;
+var
+  LData: ptr to uint8;
+  LI: int64;
+begin
+  if ACount <> len(AText) then
+    return false;
+  end;
+  LData := ptr to uint8(AData);
+  for LI := 0 to ACount - 1 do
+    if LData[LI] <> uint8(AText[LI]) then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// A call's failure: -1 and errno AError (errno cleared by the caller before the call)
+routine FailedWith(const AAnswer: int64; const AError: int32): bool;
+begin
+  return (AAnswer = -1) and (CErrno() = AError);
+end;
+
+// open(2) of an Adam text path (its C copy freed after the call)
+routine OpenFd(const APath: string; const AFlags: int32): int32;
+var
+  LPath: ptr to char;
+  LFile: int32;
+begin
+  LPath := StringToC(APath);
+  LFile := open(LPath, AFlags, 420);
+  freemem(LPath);
+  return LFile;
+end;
+
+// fopen of an Adam text path and mode
+routine OpenPath(const APath: string; const AMode: string): ptr;
+var
+  LPath: ptr to char;
+  LMode: ptr to char;
+  LFile: ptr;
+begin
+  LPath := StringToC(APath);
+  LMode := StringToC(AMode);
+  LFile := fopen(LPath, LMode);
+  freemem(LPath);
+  freemem(LMode);
+  return LFile;
+end;
+
+// fputs of an Adam text
+routine PutText(const AText: string; const AFile: ptr): bool;
+var
+  LText: ptr to char;
+  LOk: bool;
+begin
+  LText := StringToC(AText);
+  LOk := fputs(LText, AFile) >= 0;
+  freemem(LText);
+  return LOk;
+end;
+
+// write(2) of an Adam text
+routine WriteText(const AFile: int32; const AText: string): bool;
+var
+  LText: ptr to char;
+  LOk: bool;
+begin
+  LText := StringToC(AText);
+  LOk := write(AFile, LText, uint64(len(AText))) = len(AText);
+  freemem(LText);
+  return LOk;
+end;
+
+// pread(2) of the whole file AFile (at most 31 bytes) as text AText
+routine FileIs(const AFile: int32; const AText: string): bool;
+var
+  LBuffer: array[0..31] of uint8;
+  LGot: int64;
+begin
+  LGot := pread(AFile, addr of LBuffer[0], 32u, 0);
+  return (LGot >= 0) and TextIs(addr of LBuffer[0], LGot, AText);
+end;
+
+// A new empty real file in /tmp, open read-write (unlinked at once: its number keeps it)
+routine TempFile(): int32;
+var
+  LTemplate: ptr to char;
+  LFile: int32;
+begin
+  LTemplate := StringToC("/tmp/adam_dup_followXXXXXX");
+  LFile := mkstemp(LTemplate);
+  if LFile >= 0 then
+    unlink(LTemplate);
+  end;
+  freemem(LTemplate);
+  return LFile;
+end;
+
+// A FILE on a memory IO follows its number onto a zip entry handle's description; a FILE on
+// a description a dup still names leaves it behind
+routine TestHandle(const APrefix: string);
+var
+  LMemory: IO;
+  LMemPrefix: string;
+  LFd: int32;
+  LFile: ptr;
+  LNumber: int32;
+  LKeep: int32;
+  LBuffer: array[0..15] of uint8;
+begin
+  LMemory := CreateMemoryIO();
+  LMemPrefix := RegisterIO(LMemory);
+  LFd := OpenFd(APrefix + "/hello.txt", O_RDONLY);
+  LFile := OpenPath(LMemPrefix, "w+");
+  LNumber := fileno(LFile);
+  Check("follow handle", (LFd >= 0) and (LNumber >= 0) and (lseek(LFd, 2, SEEK_SET) = 2) and
+    (dup2(LFd, LNumber) = LNumber) and (fileno(LFile) = LNumber) and
+    (fread(addr of LBuffer[0], 1, 4, LFile) = 4) and SameAs(addr of LBuffer[0], 2, 4) and
+    (lseek(LFd, 0, SEEK_CUR) = ADAM_TEST_SIZE));
+  // fclose closes the number only: the open's description lives on
+  SetCErrno(0);
+  Check("follow fclose", (fclose(LFile) = 0) and FailedWith(lseek(LNumber, 0, SEEK_CUR), EBADF) and
+    (lseek(LFd, 1, SEEK_SET) = 1) and (read(LFd, addr of LBuffer[0], 3u) = 3) and
+    SameAs(addr of LBuffer[0], 1, 3) and (close(LFd) = 0));
+  // The memory FILE's own description, still named by a dup, moves on without it
+  LFd := OpenFd(APrefix + "/hello.txt", O_RDONLY);
+  LFile := OpenPath(LMemPrefix, "w+");
+  LNumber := fileno(LFile);
+  LKeep := dup(LNumber);
+  Check("follow shared", (LKeep >= 0) and (dup2(LFd, LNumber) = LNumber) and
+    WriteText(LKeep, "xyz") and (IOSize(LMemory) = 3) and
+    (fread(addr of LBuffer[0], 1, 2, LFile) = 2) and SameAs(addr of LBuffer[0], 0, 2) and
+    (fclose(LFile) = 0) and WriteText(LKeep, "w") and (IOSize(LMemory) = 4) and
+    (close(LKeep) = 0) and (close(LFd) = 0));
+  UnregisterIO(LMemPrefix);
+  IOClose(LMemory);
+end;
+
+// A FILE on a zip entry follows its number onto a real file: the kernel's description, its
+// place the kernel's (shared with the real number), fstat glibc's; then a FILE on a memory IO
+// whose buffered writes reach the real file at the kernel's place
+routine TestReal(const APrefix: string; const AMemPrefix: string; const AMemory: IO);
+var
+  LReal: int32;
+  LFile: ptr;
+  LNumber: int32;
+  LStat: StatBuf;
+  LBuffer: array[0..15] of uint8;
+begin
+  LReal := TempFile();
+  LFile := OpenPath(APrefix + "/hello.txt", "rb");
+  LNumber := fileno(LFile);
+  // The FILE reads from where the real number left the kernel's place; its fill reads on
+  Check("follow real read", (LReal >= 0) and WriteText(LReal, "hello world!") and
+    (lseek(LReal, 6, SEEK_SET) = 6) and (dup2(LReal, LNumber) = LNumber) and
+    (fileno(LFile) = LNumber) and (fread(addr of LBuffer[0], 1, 5, LFile) = 5) and
+    TextIs(addr of LBuffer[0], 5, "world"));
+  Check("follow real place", (lseek(LReal, 0, SEEK_CUR) = ADAM_TEST_SIZE) and
+    (fseek(LFile, 0, SEEK_SET) = 0) and (fread(addr of LBuffer[0], 1, 5, LFile) = 5) and
+    TextIs(addr of LBuffer[0], 5, "hello") and (lseek(LReal, 0, SEEK_CUR) = ADAM_TEST_SIZE));
+  Check("follow real fstat", (fstat(LNumber, addr of LStat) = 0) and
+    ((LStat.st_mode & S_IFMT) = S_IFREG) and (LStat.st_size = ADAM_TEST_SIZE));
+  SetCErrno(0);
+  Check("follow real fclose", (fclose(LFile) = 0) and FailedWith(lseek(LNumber, 0, SEEK_CUR), EBADF) and
+    FileIs(LReal, "hello world!") and (close(LReal) = 0));
+  LReal := TempFile();
+  LFile := OpenPath(AMemPrefix, "w+");
+  LNumber := fileno(LFile);
+  Check("follow real write", (LReal >= 0) and (LFile <> nil) and (dup2(LReal, LNumber) = LNumber) and
+    PutText("abc", LFile) and (fflush(LFile) = 0) and FileIs(LReal, "abc") and
+    (lseek(LReal, 0, SEEK_CUR) = 3) and WriteText(LReal, "!!") and PutText("d", LFile) and
+    (fflush(LFile) = 0) and FileIs(LReal, "abc!!d") and (fclose(LFile) = 0) and
+    (IOSize(AMemory) = 0) and (close(LReal) = 0));
+end;
+
+// A FILE on a memory IO follows its number onto a pipe's write end: close(2) and fclose let
+// go of it
+routine TestPipe(const AMemPrefix: string);
+var
+  LPipe: array[0..1] of int32;
+  LFile: ptr;
+  LNumber: int32;
+  LBuffer: array[0..15] of uint8;
+begin
+  LFile := OpenPath(AMemPrefix, "w+");
+  LNumber := fileno(LFile);
+  Check("follow pipe", (pipe(addr of LPipe[0]) = 0) and (dup2(LPipe[1], LNumber) = LNumber) and
+    (close(LPipe[1]) = 0) and PutText("hi", LFile) and (fflush(LFile) = 0) and
+    (read(LPipe[0], addr of LBuffer[0], 16u) = 2) and TextIs(addr of LBuffer[0], 2, "hi"));
+  // close(2) of the number: the last writer gone, the reader sees the end; the FILE's own
+  // system calls EBADF and its fclose EOF / EBADF
+  SetCErrno(0);
+  Check("follow pipe close", (close(LNumber) = 0) and (read(LPipe[0], addr of LBuffer[0], 16u) = 0) and
+    PutText("x", LFile) and (fflush(LFile) <> 0) and (CErrno() = EBADF));
+  SetCErrno(0);
+  Check("follow pipe fclose", (fclose(LFile) <> 0) and (CErrno() = EBADF) and (close(LPipe[0]) = 0));
+end;
+
+// dup3 onto a FILE's number, close on exec: the FILE follows it as dup2's does
+routine TestDup3(const APrefix: string);
+var
+  LFd: int32;
+  LFile: ptr;
+  LNumber: int32;
+  LBuffer: array[0..15] of uint8;
+begin
+  LFd := OpenFd(APrefix + "/hello.txt", O_RDONLY);
+  LFile := OpenPath(APrefix + "/hello.txt", "rb");
+  LNumber := fileno(LFile);
+  Check("follow dup3", (lseek(LFd, 7, SEEK_SET) = 7) and (dup3(LFd, LNumber, O_CLOEXEC) = LNumber) and
+    (fread(addr of LBuffer[0], 1, 3, LFile) = 3) and SameAs(addr of LBuffer[0], 7, 3) and
+    (fclose(LFile) = 0) and (lseek(LFd, 0, SEEK_CUR) = ADAM_TEST_SIZE) and (close(LFd) = 0));
+end;
+
+var
+  LZip: IOSource;
+  LDirect: IO;
+  LMemory: IO;
+  LPrefix: string;
+  LMemPrefix: string;
+begin
+  LDirect := CreateZipFileIO(ADAM_TEST_ZIP, "hello.txt");
+  if (LDirect = nil) or (IORead(LDirect, addr of GBytes[0], ADAM_TEST_SIZE) <> ADAM_TEST_SIZE) then
+    println("FAIL fixture");
+    GFails := GFails + 1;
+  end;
+  IOClose(LDirect);
+  LZip := CreateZipIOSource(ADAM_TEST_ZIP);
+  LPrefix := RegisterIOSource(LZip);
+  TestHandle(LPrefix);
+  LMemory := CreateMemoryIO();
+  LMemPrefix := RegisterIO(LMemory);
+  TestReal(LPrefix, LMemPrefix, LMemory);
+  TestPipe(LMemPrefix);
+  UnregisterIO(LMemPrefix);
+  IOClose(LMemory);
+  TestDup3(LPrefix);
+  UnregisterIO(LPrefix);
+  IOSourceClose(LZip);
+  println("done {}", GFails);
+end.
