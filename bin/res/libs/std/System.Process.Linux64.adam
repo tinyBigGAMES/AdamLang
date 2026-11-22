@@ -1,0 +1,715 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.Process.Linux64.adam - System.Process's platform unit for
+  x86_64-linux-gnu, over System.Linux (glibc's posix_spawn, pipes, pseudo
+  terminals, waitpid); paths resolved by System.IO's ResolvePath, as
+  System.Process.Win64's by WinResolvePath.
+
+  Every start is posix_spawn of the program named in full (no PATH search)
+  with argv[0] its resolved path, the environment as it is now (environ:
+  SetEnvironmentVariable reaches the program), the signal mask empty and
+  every signal at its default action (as a shell starts a program), the
+  working folder changed in the program (posix_spawn_file_actions_addchdir_np,
+  glibc 2.29: Adam's floor). Every descriptor this unit opens is close-on-exec
+  and at 3 or above, so a program gets only the ones its file actions give
+  it. An exit code is the program's own (0..255), or 128 + the signal that
+  ended it (the shell's rule).
+
+  ProcessPlatformRun is the one run a captured RunPE / RunElf drives, with
+  System.Process.Win64's meaning: pipes = one pipe stdout and stderr share
+  (the order written kept), its read end private; terminal = a pseudo
+  terminal (posix_openpt), the program in a session of its own with the
+  slave as its controlling terminal on stdout / stderr (and stdin when a
+  host types the keys), the size set on the master (TIOCSWINSZ: the program
+  gets SIGWINCH on a resize). Terminal output is read while the program
+  runs in waits of ADAM_PROCESS_LINUX_SLICE_MS; once it ended this unit's
+  own slave descriptor is closed and what the master still holds is read
+  until it has nothing more within a wait (a descendant still holding the
+  slave cannot hold the run open).
+
+  A PE runs nowhere here: ProcessPlatformRunPE and ProcessPlatformCanRunPE
+  are false. An ELF runs natively: ProcessPlatformElfCommand sets the
+  execute bits when the owner's is missing (win64's chmod +x) and hands the
+  file back as the program; ProcessPlatformCanRunElf is true. A line that is
+  not UTF-8 reads each malformed byte as U+FFFD (the console's charset is
+  the locale's, UTF-8).
+*******************************************************************************/
+
+module unit System.Process.Linux64;
+
+import System.SysUtils, System.IO, System.Linux;
+
+const
+  // How long a terminal run waits for its program between reads of its output (ms)
+  ADAM_PROCESS_LINUX_SLICE_MS: int32 = 50;
+  // A terminal's size when neither the host nor this process's terminal gives one
+  ADAM_PROCESS_LINUX_COLS: int32 = 120;
+  ADAM_PROCESS_LINUX_ROWS: int32 = 30;
+  // A terminal side's largest size (as win64's pseudo console)
+  ADAM_PROCESS_LINUX_SIDE_MAX: int32 = 32767;
+  // The most bytes one read of a run's output takes
+  ADAM_PROCESS_LINUX_READ_BYTES: uint64 = 65536;
+  // Room for a pseudo terminal's slave path
+  ADAM_PROCESS_LINUX_PTS_BYTES: uint64 = 256;
+  // The first descriptor this unit keeps for itself (0..2 are the standard ones)
+  ADAM_PROCESS_LINUX_FIRST_OWN: int32 = 3;
+  // What a program reads when it gets no input
+  ADAM_PROCESS_LINUX_NULL: string = "/dev/null";
+  // A waitpid status: the signal that ended it (0: it exited) and its exit code above it
+  ADAM_PROCESS_LINUX_STATUS_SIGNAL: int32 = 0x7F;
+  ADAM_PROCESS_LINUX_STATUS_SHIFT: int32 = 8;
+  ADAM_PROCESS_LINUX_STATUS_CODE: int32 = 0xFF;
+  // A program a signal ended exits with this plus the signal (the shell's rule)
+  ADAM_PROCESS_LINUX_SIGNAL_BASE: uint32 = 128;
+
+type
+  // One read's room (a run's own, never shared between runs)
+  ProcessReadBytes = array[0..65535] of uint8;
+  // Room for a pseudo terminal's slave path (ADAM_PROCESS_LINUX_PTS_BYTES)
+  ProcessPtsName = array[0..255] of char;
+
+// A descriptor this unit opened, closed (below 0: none)
+routine DoCloseOwned(const AFile: int32);
+begin
+  if AFile >= 0 then
+    close(AFile);
+  end;
+end;
+
+// AFile kept at ADAM_PROCESS_LINUX_FIRST_OWN or above (close-on-exec): one below is copied up and
+// closed, so a file action copying it to 0..2 never meets itself. Below 0 when AFile is or the
+// copy fails
+routine DoOwnFile(const AFile: int32): int32;
+var
+  LCopy: int32;
+begin
+  if (AFile < 0) or (AFile >= ADAM_PROCESS_LINUX_FIRST_OWN) then
+    return AFile;
+  end;
+  LCopy := fcntl(AFile, F_DUPFD_CLOEXEC, ADAM_PROCESS_LINUX_FIRST_OWN);
+  close(AFile);
+  return LCopy;
+end;
+
+// True when AFile has bytes to read within ATimeout ms (a signal breaking the wait off asks
+// again); a hung-up side with nothing left reads as false
+routine DoReadable(const AFile: int32; const ATimeout: int32): bool;
+var
+  LPoll: pollfd;
+  LCount: int32;
+begin
+  LPoll.fd := AFile;
+  LPoll.events := POLLIN;
+  LPoll.revents := 0;
+  LCount := poll(addr of LPoll, 1, ATimeout);
+  while (LCount < 0) and (CErrno() = EINTR) do
+    LCount := poll(addr of LPoll, 1, ATimeout);
+  end;
+  return (LCount > 0) and ((LPoll.revents & POLLIN) <> 0);
+end;
+
+// waitpid of APid with AOptions, a signal breaking it off asking again
+routine DoWait(const APid: int32; var AStatus: int32; const AOptions: int32): int32;
+var
+  LResult: int32;
+begin
+  LResult := waitpid(APid, AStatus, AOptions);
+  while (LResult < 0) and (CErrno() = EINTR) do
+    LResult := waitpid(APid, AStatus, AOptions);
+  end;
+  return LResult;
+end;
+
+// A waitpid status as an exit code: the program's own, or 128 + the signal that ended it
+routine DoExitCode(const AStatus: int32): uint32;
+var
+  LSignal: int32;
+begin
+  LSignal := AStatus & ADAM_PROCESS_LINUX_STATUS_SIGNAL;
+  if LSignal = 0 then
+    return uint32((AStatus shr ADAM_PROCESS_LINUX_STATUS_SHIFT) & ADAM_PROCESS_LINUX_STATUS_CODE);
+  end;
+  return ADAM_PROCESS_LINUX_SIGNAL_BASE + uint32(LSignal);
+end;
+
+// A terminal side held to 1 .. ADAM_PROCESS_LINUX_SIDE_MAX
+routine DoSide(const ASide: int32): uint16;
+begin
+  if ASide < 1 then
+    return 1;
+  end;
+  if ASide > ADAM_PROCESS_LINUX_SIDE_MAX then
+    return uint16(ADAM_PROCESS_LINUX_SIDE_MAX);
+  end;
+  return uint16(ASide);
+end;
+
+// Starts AExe (resolved against the working folder) with AArgs in AWorkDir ("" = this process's
+// folder) after AActions (the caller's: made and released by it), ASession: in a session of its
+// own. APid its id. False when it does not start (nothing resolves, no room, posix_spawn
+// refused: no file, not executable, a folder it cannot enter)
+routine DoSpawn(const AExe: string; const AArgs: StringArray; const AWorkDir: string;
+  var AActions: posix_spawn_file_actions_t; const ASession: bool; var APid: int32): bool;
+var
+  LPath: string;
+  LArgv: array of ptr to char;
+  LDirText: ptr to char;
+  LAttributes: posix_spawnattr_t;
+  LSignals: sigset_t;
+  LFlags: int16;
+  LOk: bool;
+  LI: int64;
+begin
+  APid := 0;
+  LPath := ResolvePath(AExe);
+  if LPath = "" then
+    return false;
+  end;
+  // argv: the program's own path, its arguments, then NULL (the NULL never freed)
+  setlength(LArgv, len(AArgs) + 2);
+  for LI := 0 to len(LArgv) - 1 do
+    LArgv[LI] := nil;
+  end;
+  LDirText := nil;
+  LOk := true;
+  LArgv[0] := StringToC(LPath);
+  if LArgv[0] = nil then
+    LOk := false;
+  end;
+  LI := 0;
+  while LOk and (LI < len(AArgs)) do
+    LArgv[LI + 1] := StringToC(AArgs[LI]);
+    if LArgv[LI + 1] = nil then
+      LOk := false;
+    end;
+    LI := LI + 1;
+  end;
+  if LOk and (AWorkDir <> "") then
+    LDirText := StringToC(ResolvePath(AWorkDir));
+    LOk := (LDirText <> nil) and (posix_spawn_file_actions_addchdir_np(AActions, LDirText) = 0);
+  end;
+  if LOk then
+    // The program starts as a shell starts one: no signal blocked, every signal at its
+    // default action (one this program ignores would stay ignored across the exec)
+    LOk := posix_spawnattr_init(LAttributes) = 0;
+    if LOk then
+      LFlags := int16(POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+      if ASession then
+        // Its own session: the first terminal it opens (the slave) is its controlling one
+        LFlags := int16(LFlags | POSIX_SPAWN_SETSID);
+      end;
+      sigemptyset(LSignals);
+      LOk := posix_spawnattr_setsigmask(LAttributes, addr of LSignals) = 0;
+      sigfillset(LSignals);
+      LOk := LOk and (posix_spawnattr_setsigdefault(LAttributes, addr of LSignals) = 0);
+      LOk := LOk and (posix_spawnattr_setflags(LAttributes, LFlags) = 0);
+      LOk := LOk and (posix_spawn(APid, LArgv[0], addr of AActions, addr of LAttributes,
+        addr of LArgv[0], environ) = 0);
+      posix_spawnattr_destroy(LAttributes);
+    end;
+  end;
+  for LI := 0 to len(LArgv) - 1 do
+    if LArgv[LI] <> nil then
+      freemem(LArgv[LI]);
+    end;
+  end;
+  if LDirText <> nil then
+    freemem(LDirText);
+  end;
+  if not LOk then
+    APid := 0;
+  end;
+  return LOk;
+end;
+
+// This process's terminal size into ACols x ARows; false when its stdout is no terminal
+routine DoOwnTerminalSize(var ACols: int32; var ARows: int32): bool;
+var
+  LSize: winsize;
+begin
+  if ioctl(STDOUT_FILENO, TIOCGWINSZ, addr of LSize) <> 0 then
+    return false;
+  end;
+  ACols := int32(LSize.ws_col);
+  ARows := int32(LSize.ws_row);
+  return (ACols > 0) and (ARows > 0);
+end;
+
+public type
+  // One captured run (see the header). Its descriptors are closed by Close or at its end
+  ProcessPlatformRun = object
+    // A terminal run (a pseudo terminal) or a pipes run
+    hidden FTerminal: bool;
+    // Terminal: the master side, this unit's own slave descriptor and the slave's path
+    hidden FMaster: int32;
+    hidden FSlave: int32;
+    hidden FSlaveName: string;
+    // Pipes: the read end (private) and the write end the program gets (closed once it has it)
+    hidden FRead: int32;
+    hidden FWrite: int32;
+    // The program's standard input: a copy of a host's descriptor (below 0: none); else
+    // /dev/null (FNullInput), else (a terminal run with a host) the terminal
+    hidden FStdin: int32;
+    hidden FNullInput: bool;
+    // The program once started, and its progress: ended (reaped: its status kept), drained
+    hidden FPid: int32;
+    hidden FStatus: int32;
+    hidden FReaped: bool;
+    hidden FExited: bool;
+    hidden FDrained: bool;
+    hidden FBuffer: ProcessReadBytes;
+
+    init();
+    begin
+      self.FMaster := -1;
+      self.FSlave := -1;
+      self.FRead := -1;
+      self.FWrite := -1;
+      self.FStdin := -1;
+    end;
+
+    // One read of AFile appended to ABytes (a signal breaking it off asks again); the bytes
+    // read, 0 at its end, below 0 on an error
+    hidden method DoReadOnce(const AFile: int32; var ABytes: string): int64;
+    var
+      LRead: int64;
+    begin
+      LRead := read(AFile, ptr(addr of self.FBuffer), ADAM_PROCESS_LINUX_READ_BYTES);
+      while (LRead < 0) and (CErrno() = EINTR) do
+        LRead := read(AFile, ptr(addr of self.FBuffer), ADAM_PROCESS_LINUX_READ_BYTES);
+      end;
+      if LRead > 0 then
+        ABytes := ABytes + StringFromC(ptr to const char(ptr(addr of self.FBuffer)), LRead);
+      end;
+      return LRead;
+    end;
+
+    // The output channel and standard input made. ATerminal: a pseudo terminal of ACols x ARows
+    // (0 x 0: this process's terminal's size, else 120 x 30); else pipes. Standard input: AStdin
+    // (a host's descriptor, copied: the host keeps its own) when not 0; else /dev/null, except a
+    // terminal run with a host (AHasHost): the terminal (the keys the host types). False when the
+    // system refuses (nothing left open)
+    method Prepare(const ATerminal: bool; const ACols: int32; const ARows: int32;
+      const AHasHost: bool; const AStdin: uint64): bool;
+    var
+      LFiles: array[0..1] of int32;
+      LName: ProcessPtsName;
+      LText: ptr to char;
+      LSize: winsize;
+      LCols: int32;
+      LRows: int32;
+    begin
+      self.Close();
+      self.FTerminal := ATerminal;
+      if AStdin <> 0 then
+        self.FStdin := fcntl(int32(AStdin), F_DUPFD_CLOEXEC, ADAM_PROCESS_LINUX_FIRST_OWN);
+        if self.FStdin < 0 then
+          self.FStdin := -1;
+          return false;
+        end;
+      else
+        self.FNullInput := (not ATerminal) or (not AHasHost);
+      end;
+      if not ATerminal then
+        // stdout and stderr share one pipe (the order written kept); its read end stays here
+        // (close-on-exec): a child holding it could read its own output
+        if pipe2(addr of LFiles[0], O_CLOEXEC) <> 0 then
+          self.Close();
+          return false;
+        end;
+        self.FRead := DoOwnFile(LFiles[0]);
+        self.FWrite := DoOwnFile(LFiles[1]);
+        if (self.FRead < 0) or (self.FWrite < 0) then
+          self.Close();
+          return false;
+        end;
+        return true;
+      end;
+      LCols := ACols;
+      LRows := ARows;
+      if (LCols <= 0) or (LRows <= 0) then
+        if not DoOwnTerminalSize(LCols, LRows) then
+          LCols := ADAM_PROCESS_LINUX_COLS;
+          LRows := ADAM_PROCESS_LINUX_ROWS;
+        end;
+      end;
+      self.FMaster := DoOwnFile(posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC));
+      if (self.FMaster < 0) or (grantpt(self.FMaster) <> 0) or (unlockpt(self.FMaster) <> 0) or
+        (ptsname_r(self.FMaster, ptr to char(ptr(addr of LName)), ADAM_PROCESS_LINUX_PTS_BYTES) <> 0) then
+        self.Close();
+        return false;
+      end;
+      self.FSlaveName := StringFromC(ptr to const char(ptr(addr of LName)));
+      // This unit's own slave descriptor: held until the program ended, so the master never
+      // hangs up while the program has not opened its side yet
+      LText := StringToC(self.FSlaveName);
+      if LText = nil then
+        self.Close();
+        return false;
+      end;
+      self.FSlave := DoOwnFile(open(LText, O_RDWR | O_NOCTTY | O_CLOEXEC));
+      freemem(LText);
+      LSize.ws_col := DoSide(LCols);
+      LSize.ws_row := DoSide(LRows);
+      LSize.ws_xpixel := 0;
+      LSize.ws_ypixel := 0;
+      if (self.FSlave < 0) or (ioctl(self.FMaster, TIOCSWINSZ, addr of LSize) <> 0) then
+        self.Close();
+        return false;
+      end;
+      return true;
+    end;
+
+    // AExe (named in full, no PATH search) started with AArgs in AWorkDir ("" = this process's
+    // folder) on what Prepare made. False when it does not start
+    method Launch(const AExe: string; const AArgs: StringArray; const AWorkDir: string): bool;
+    var
+      LActions: posix_spawn_file_actions_t;
+      LNullText: ptr to char;
+      LSlaveText: ptr to char;
+      LOk: bool;
+    begin
+      if self.FPid <> 0 then
+        return false;
+      end;
+      if (not self.FTerminal) and (self.FWrite < 0) then
+        return false;
+      end;
+      if self.FTerminal and (self.FMaster < 0) then
+        return false;
+      end;
+      if posix_spawn_file_actions_init(LActions) <> 0 then
+        return false;
+      end;
+      LNullText := nil;
+      LSlaveText := nil;
+      LOk := true;
+      // Standard input first: a host's copy, /dev/null, or (below) the terminal
+      if self.FStdin >= 0 then
+        LOk := posix_spawn_file_actions_adddup2(LActions, self.FStdin, STDIN_FILENO) = 0;
+      end;
+      if LOk and self.FNullInput then
+        LNullText := StringToC(ADAM_PROCESS_LINUX_NULL);
+        LOk := (LNullText <> nil) and (posix_spawn_file_actions_addopen(LActions, STDIN_FILENO,
+          LNullText, O_RDONLY, 0) = 0);
+      end;
+      if LOk and self.FTerminal then
+        // Opened in the program (its own session by then): the slave becomes its controlling
+        // terminal; stdout, stderr and (a host typing the keys) stdin are it
+        LSlaveText := StringToC(self.FSlaveName);
+        LOk := (LSlaveText <> nil) and (posix_spawn_file_actions_addopen(LActions, STDOUT_FILENO,
+          LSlaveText, O_RDWR, 0) = 0);
+        LOk := LOk and (posix_spawn_file_actions_adddup2(LActions, STDOUT_FILENO, STDERR_FILENO) = 0);
+        if LOk and (self.FStdin < 0) and (not self.FNullInput) then
+          LOk := posix_spawn_file_actions_adddup2(LActions, STDOUT_FILENO, STDIN_FILENO) = 0;
+        end;
+      end;
+      if LOk and (not self.FTerminal) then
+        LOk := posix_spawn_file_actions_adddup2(LActions, self.FWrite, STDOUT_FILENO) = 0;
+        LOk := LOk and (posix_spawn_file_actions_adddup2(LActions, self.FWrite, STDERR_FILENO) = 0);
+      end;
+      if LOk then
+        LOk := DoSpawn(AExe, AArgs, AWorkDir, LActions, self.FTerminal, self.FPid);
+      end;
+      posix_spawn_file_actions_destroy(LActions);
+      if LNullText <> nil then
+        freemem(LNullText);
+      end;
+      if LSlaveText <> nil then
+        freemem(LSlaveText);
+      end;
+      if not self.FTerminal then
+        // Only the program holds the write end now: the pipe ends when it ends, so Next ends on
+        // the pipe's end, never on a size
+        DoCloseOwned(self.FWrite);
+        self.FWrite := -1;
+      end;
+      return LOk;
+    end;
+
+    // The program's output appended to ABytes as it comes (pipes: one read, waiting for it;
+    // terminal: what came within one wait, maybe nothing). False once all of it was handed over
+    method Next(var ABytes: string): bool;
+    var
+      LMore: bool;
+    begin
+      if self.FPid = 0 then
+        return false;
+      end;
+      if not self.FTerminal then
+        return self.DoReadOnce(self.FRead, ABytes) > 0;
+      end;
+      if self.FDrained then
+        return false;
+      end;
+      if self.FExited then
+        // Ended: this unit's slave let go, what the master still holds read until a wait
+        // brings nothing more (the slave's last close: the master's end)
+        DoCloseOwned(self.FSlave);
+        self.FSlave := -1;
+        LMore := true;
+        while LMore do
+          LMore := DoReadable(self.FMaster, ADAM_PROCESS_LINUX_SLICE_MS) and
+            (self.DoReadOnce(self.FMaster, ABytes) > 0);
+        end;
+        self.FDrained := true;
+        return true;
+      end;
+      if DoReadable(self.FMaster, ADAM_PROCESS_LINUX_SLICE_MS) then
+        self.DoReadOnce(self.FMaster, ABytes);
+      end;
+      if DoWait(self.FPid, self.FStatus, WNOHANG) = self.FPid then
+        self.FReaped := true;
+        self.FExited := true;
+      end;
+      return true;
+    end;
+
+    // A terminal run's program has ended (its last output may still come from Next)
+    method Exited(): bool;
+    begin
+      return self.FExited;
+    end;
+
+    // AText typed into a terminal run's program (every byte written). False for a pipes run or
+    // when it is gone
+    method WriteKeys(const AText: string): bool;
+    var
+      LAt: int64;
+      LWritten: int64;
+    begin
+      if (not self.FTerminal) or (self.FMaster < 0) then
+        return false;
+      end;
+      LAt := 0;
+      while LAt < len(AText) do
+        LWritten := write(self.FMaster, addr of AText[LAt], uint64(len(AText) - LAt));
+        if LWritten < 0 then
+          if CErrno() <> EINTR then
+            return false;
+          end;
+        else
+          LAt := LAt + LWritten;
+        end;
+      end;
+      return true;
+    end;
+
+    // A terminal run's new size (each side held to 1..32767; the program gets SIGWINCH). False
+    // for a pipes run or when refused
+    method Resize(const ACols: int32; const ARows: int32): bool;
+    var
+      LSize: winsize;
+    begin
+      if (not self.FTerminal) or (self.FMaster < 0) then
+        return false;
+      end;
+      LSize.ws_col := DoSide(ACols);
+      LSize.ws_row := DoSide(ARows);
+      LSize.ws_xpixel := 0;
+      LSize.ws_ypixel := 0;
+      return ioctl(self.FMaster, TIOCSWINSZ, addr of LSize) = 0;
+    end;
+
+    // Waits for the program and takes its exit code into ACode. False when it never started or
+    // its status cannot be read
+    method ExitCode(var ACode: uint32): bool;
+    begin
+      if self.FPid = 0 then
+        return false;
+      end;
+      if not self.FReaped then
+        if DoWait(self.FPid, self.FStatus, 0) <> self.FPid then
+          return false;
+        end;
+        self.FReaped := true;
+      end;
+      ACode := DoExitCode(self.FStatus);
+      return true;
+    end;
+
+    // Every descriptor closed; it may be prepared again. A program still running is left running
+    // (as on win64): it is reaped here when it has already ended, else by the system once this
+    // program ends
+    method Close();
+    var
+      LStatus: int32;
+    begin
+      if (self.FPid > 0) and (not self.FReaped) then
+        DoWait(self.FPid, LStatus, WNOHANG);
+      end;
+      DoCloseOwned(self.FMaster);
+      DoCloseOwned(self.FSlave);
+      DoCloseOwned(self.FRead);
+      DoCloseOwned(self.FWrite);
+      DoCloseOwned(self.FStdin);
+      self.FMaster := -1;
+      self.FSlave := -1;
+      self.FSlaveName := "";
+      self.FRead := -1;
+      self.FWrite := -1;
+      self.FStdin := -1;
+      self.FNullInput := false;
+      self.FPid := 0;
+      self.FStatus := 0;
+      self.FReaped := false;
+      self.FExited := false;
+      self.FDrained := false;
+    end;
+
+    done;
+    begin
+      self.Close();
+    end;
+  end;
+
+// System.Process's RunProcess: a pipes run (stdin /dev/null, stdout and stderr in the order
+// written), its whole output into AOutput (what was read, if anything, when it fails later)
+public routine cpplink ProcessPlatformRunProcess(const AExe: string; const AArgs: StringArray;
+  const AWorkDir: string; var AOutput: string; var AExitCode: uint32): bool;
+var
+  LRun: ref ProcessPlatformRun;
+  LMore: bool;
+  LOk: bool;
+begin
+  AOutput := "";
+  AExitCode := 0;
+  LRun := ref ProcessPlatformRun();
+  if not LRun.Prepare(false, 0, 0, false, 0) then
+    return false;
+  end;
+  LOk := false;
+  guard
+    if LRun.Launch(AExe, AArgs, AWorkDir) then
+      LMore := LRun.Next(AOutput);
+      while LMore do
+        LMore := LRun.Next(AOutput);
+      end;
+      LOk := LRun.ExitCode(AExitCode);
+    end;
+  finally
+    LRun.Close();
+  end;
+  return LOk;
+end;
+
+// System.Process's RunAttached: the program on this process's own stdin, stdout and stderr,
+// waited for
+public routine cpplink ProcessPlatformRunAttached(const AExe: string; const AArgs: StringArray;
+  const AWorkDir: string; var AExitCode: uint32): bool;
+var
+  LActions: posix_spawn_file_actions_t;
+  LPid: int32;
+  LStatus: int32;
+  LOk: bool;
+begin
+  AExitCode := 0;
+  if posix_spawn_file_actions_init(LActions) <> 0 then
+    return false;
+  end;
+  LOk := DoSpawn(AExe, AArgs, AWorkDir, LActions, false, LPid);
+  posix_spawn_file_actions_destroy(LActions);
+  if not LOk then
+    return false;
+  end;
+  LStatus := 0;
+  if DoWait(LPid, LStatus, 0) <> LPid then
+    return false;
+  end;
+  AExitCode := DoExitCode(LStatus);
+  return true;
+end;
+
+// System.Process's RunPE (the launch form): a PE runs nowhere here, so false (AExitCode 0)
+public routine cpplink ProcessPlatformRunPE(const AExe: string; const AArgs: StringArray;
+  const AWorkDir: string; const AWait: bool; var AExitCode: uint32): bool;
+begin
+  AExitCode := 0;
+  return false;
+end;
+
+// False: no PE runs here (System.Process' RunPE forms)
+public routine cpplink ProcessPlatformCanRunPE(): bool;
+begin
+  return false;
+end;
+
+// One output line's bytes as text: as they are when they are UTF-8, else each malformed byte
+// read as U+FFFD and the rest kept
+public routine cpplink ProcessPlatformDecodeLine(const ABytes: string): string;
+var
+  LText: string;
+  LIndex: int64;
+  LAt: int64;
+begin
+  if IsUtf8(ABytes) then
+    return ABytes;
+  end;
+  // A byte grows to at most 3 (U+FFFD); a whole sequence stays its own length
+  LText := "";
+  setlength(LText, len(ABytes) * 3);
+  LIndex := 0;
+  LAt := 0;
+  while LIndex < len(ABytes) do
+    EncodeUtf8Char(LText, LAt, DecodeUtf8Char(ABytes, LIndex));
+  end;
+  setlength(LText, LAt);
+  return LText;
+end;
+
+// RunElf's launch on linux64 (see the header): AExe is AElf resolved, AArgsOut AArgs (APipes
+// changes nothing: stdout and stderr already share one pipe here). False when AElf is no file or
+// its execute bits cannot be set
+public routine cpplink ProcessPlatformElfCommand(const AElf: string; const AArgs: StringArray;
+  const AWorkDir: string; const APipes: bool; var AExe: string; var AArgsOut: StringArray): bool;
+var
+  LPath: string;
+  LText: ptr to char;
+  LStat: stat;
+  LOk: bool;
+begin
+  LPath := ResolvePath(AElf);
+  if (LPath = "") or (not FileExists(LPath)) then
+    return false;
+  end;
+  LText := StringToC(LPath);
+  if LText = nil then
+    return false;
+  end;
+  // Executable first (win64's chmod +x): the execute bits added when the owner's is missing
+  LOk := __xstat(_STAT_VER, LText, LStat) = 0;
+  if LOk and ((LStat.st_mode & S_IXUSR) = 0) then
+    LOk := chmod(LText, (LStat.st_mode & ALLPERMS) | S_IXUSR | S_IXGRP | S_IXOTH) = 0;
+  end;
+  freemem(LText);
+  if not LOk then
+    return false;
+  end;
+  AExe := LPath;
+  AArgsOut := AArgs;
+  return true;
+end;
+
+// System.Process's CanRunElf on linux64: an ELF runs natively
+public routine cpplink ProcessPlatformCanRunElf(): bool;
+begin
+  return true;
+end;
+
+end.
