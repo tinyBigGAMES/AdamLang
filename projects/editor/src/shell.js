@@ -32,6 +32,8 @@ var AdamShell = (function () {
   var ADAM_EDITOR_MIN = 100;
 
   var gOnCommand = null;
+  // Called when the toolbar's target changes (renderer.js: the LSP is told)
+  var gOnTargetChange = null;
 
   function byId(AId) {
     return document.getElementById(AId);
@@ -214,6 +216,9 @@ var AdamShell = (function () {
     byId('tb-target').addEventListener('change', function () {
       byId('st-target').textContent = getTarget();
       reportBuildChoice();
+      if (gOnTargetChange) {
+        gOnTargetChange();
+      }
     });
   }
 
@@ -537,8 +542,13 @@ var AdamShell = (function () {
     };
   }
 
+  function onTargetChange(AFn) {
+    gOnTargetChange = AFn;
+  }
+
   return {
     init: init,
+    onTargetChange: onTargetChange,
     applyUiState: applyUiState,
     setTitle: setTitle,
     setTabs: setTabs,

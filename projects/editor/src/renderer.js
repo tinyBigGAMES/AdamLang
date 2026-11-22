@@ -1867,8 +1867,11 @@ var AdamEditor = (function () {
       onReady: onLspReady,
       onDown: onLspDown,
       onDiagnostics: onLspDiagnostics,
-      onShowMessage: onLspShowMessage
+      onShowMessage: onLspShowMessage,
+      getTarget: AdamShell.getTarget
     });
+    // The server checks for the toolbar's target: a change re-checks the open files
+    AdamShell.onTargetChange(AdamLsp.targetChanged);
     // The program's terminal (TERMINAL tab): the debug or run session's
     // program gets its keys and size
     AdamTerminal.init({

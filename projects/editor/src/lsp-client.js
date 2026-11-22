@@ -21,7 +21,10 @@
   onLspState); main.js (lsp-host.js) does the framing. Owns the handshake,
   request ids and the URI form. Every (re)start of the server runs
   initialize + initialized and then calls onReady; which documents are open
-  is the caller's business.
+  is the caller's business. The toolbar's target goes to the server
+  (initializationOptions.target, then workspace/didChangeConfiguration's
+  settings.target on a change: targetChanged): the server checks every
+  file for it where the file names no @target, as a build under --defaults.
 */
 'use strict';
 
@@ -30,8 +33,11 @@ var AdamLsp = (function () {
   // M11b's adam lsp); all others -> %XX
   var ADAM_URI_KEEP = /[A-Za-z0-9\/\-_.~]/;
 
-  // { onReady(caps), onDown(), onDiagnostics(uri, diagnostics), onShowMessage(type, message) }
+  // { onReady(caps), onDown(), onDiagnostics(uri, diagnostics), onShowMessage(type, message),
+  //   getTarget() (the toolbar's triple) }
   var gOpts = null;
+  // The target the running server was last given ('' before a handshake)
+  var gSentTarget = '';
   var gNextId = 1;
   // id -> { resolve, reject } for requests awaiting a response
   var gPending = {};
@@ -142,10 +148,13 @@ var AdamLsp = (function () {
     }
     gHandshaking = true;
     LGeneration = gGeneration;
+    gSentTarget = gOpts.getTarget();
     doRequest('initialize', {
       processId: null,
       clientInfo: { name: 'Adam Editor' },
       rootUri: null,
+      // The toolbar's target: every check's where a file names no @target
+      initializationOptions: { target: gSentTarget },
       // The server's file watchers are honoured by the main process
       // (lsp-watch.js): a disk change re-checks the open files
       capabilities: {
@@ -159,10 +168,28 @@ var AdamLsp = (function () {
       notify('initialized', {});
       gHandshaking = false;
       gReady = true;
+      // A toolbar change during the handshake: the server gets the target now
+      targetChanged();
       gOpts.onReady(gCaps);
     }, function () {
       // The server went down mid-handshake; its next 'running' retries
     });
+  }
+
+  // The toolbar's target changed: a ready server is told (not ready: the
+  // next handshake sends it)
+  function targetChanged() {
+    var LTarget;
+
+    if (!gReady) {
+      return;
+    }
+    LTarget = gOpts.getTarget();
+    if (LTarget === gSentTarget) {
+      return;
+    }
+    gSentTarget = LTarget;
+    notify('workspace/didChangeConfiguration', { settings: { target: LTarget } });
   }
 
   function onState(AState) {
@@ -192,6 +219,7 @@ var AdamLsp = (function () {
     init: init,
     request: request,
     notify: notify,
+    targetChanged: targetChanged,
     pathToUri: pathToUri,
     uriToPath: uriToPath,
     isReady: function () { return gReady; },
