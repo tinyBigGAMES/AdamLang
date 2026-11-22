@@ -85,7 +85,11 @@
   place, text mode and Ctrl-Z end): _read, _write, _lseek / _lseeki64,
   _tell / _telli64, _eof, _filelength / _filelengthi64, _commit, the fstat
   family (_fstat32, _fstat32i64, _fstat64i32, _fstat64: a regular file of
-  the IO's size, a FIFO for an IO that cannot seek) and _close (then the
+  the IO's size, a FIFO for an IO that cannot seek), _setmode (the text
+  mode changed in place, the old one answered), _chsize / _chsize_s (the
+  IO cut or grown with zero bytes, the place kept), _get_osfhandle
+  (INVALID_HANDLE_VALUE: an open number with no OS handle behind it) and
+  _close (then the
   number's calls and the stream's own lowio calls are ucrt's on a number
   that is not open: EBADF and the invalid parameter handler, fclose EOF;
   the number stays reserved until that fclose, so no other open meets the
@@ -627,6 +631,10 @@ type
   FdInt64Fn = routine(const AFile: int32): int64;
   FdIntFn = routine(const AFile: int32): int32;
   FstatFn = routine(const AFile: int32; const ABuf: ptr): int32;
+  // _setmode, _chsize_s (an errno), _chsize (a long size); _get_osfhandle is FdInt64Fn's form
+  SetmodeFn = routine(const AFile: int32; const AMode: int32): int32;
+  ChsizeSFn = routine(const AFile: int32; const ASize: int64): int32;
+  ChsizeFn = routine(const AFile: int32; const ASize: clong): int32;
   // ucrt's stat family of a UTF-16 path (_wstat32 .. _wstat64i32; the narrow ones are
   // Stat64i32Fn's form)
   WstatFn = routine(const APath: ptr to const wchar; const ABuf: ptr): int32;
@@ -749,6 +757,10 @@ var
   GRealFilelengthi64: ptr;
   GRealCommit: ptr;
   GRealClose: ptr;
+  GRealSetmode: ptr;
+  GRealChsizeS: ptr;
+  GRealChsize: ptr;
+  GRealGetOsfhandle: ptr;
   GRealFstat32: ptr;
   GRealFstat32i64: ptr;
   GRealFstat64i32: ptr;
@@ -8912,6 +8924,193 @@ begin
   return true;
 end;
 
+// _setmode_nolock (setmode.cpp) on handle AHandle (the caller holds its stream lock): AMode
+// (one of _O_BINARY, _O_TEXT, _O_U8TEXT, _O_U16TEXT, _O_WTEXT, checked by the caller) sets
+// lowio's text mode in place (_O_BINARY only clears it, keeping the text kind; _O_U16TEXT and
+// _O_WTEXT are both UTF-16; _tm_unicode is left as the open made it); the old mode answered:
+// _O_BINARY, else _O_TEXT / _O_U8TEXT for an ANSI / UTF-8 kind, else _O_WTEXT (ucrt's answer
+// for UTF-16 whichever flag set it)
+routine DoSetmodeLocked(const AHandle: ptr to HookHandle; const AMode: int32): int32;
+var
+  LWasText: bool;
+  LWasKind: HookLowText;
+begin
+  LWasText := AHandle->Text;
+  LWasKind := AHandle->LowText;
+  if AMode = _O_BINARY then
+    AHandle->Text := false;
+  else
+    AHandle->Text := true;
+    if AMode = _O_TEXT then
+      AHandle->LowText := HookLowText.Ansi;
+    else
+      if AMode = _O_U8TEXT then
+        AHandle->LowText := HookLowText.Utf8;
+      else
+        AHandle->LowText := HookLowText.Utf16;
+      end;
+    end;
+  end;
+  if not LWasText then
+    return _O_BINARY;
+  end;
+  if LWasKind = HookLowText.Ansi then
+    return _O_TEXT;
+  end;
+  if LWasKind = HookLowText.Utf8 then
+    return _O_U8TEXT;
+  end;
+  return _O_WTEXT;
+end;
+
+// _setmode of descriptor AFile when it is a handle's (setmode.cpp). False: not a handle's.
+// True: AResult the old mode (DoSetmodeLocked), or -1 with errno: a mode none of _O_TEXT,
+// _O_BINARY, _O_WTEXT, _O_U8TEXT, _O_U16TEXT EINVAL, then a closed number EBADF (ucrt's
+// parameter checks in that order, the handler run). The stream on the descriptor reads and
+// writes in the new mode from its next call, as ucrt's FILE does (its calls run on lowio's
+// mode)
+routine DoFdSetmode(const AFile: int32; const AMode: int32; var AResult: int32): bool;
+var
+  LHandle: ptr to HookHandle;
+begin
+  AResult := -1;
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle = nil then
+    return false;
+  end;
+  if (AMode <> _O_TEXT) and (AMode <> _O_BINARY) and (AMode <> _O_WTEXT) and
+    (AMode <> _O_U8TEXT) and (AMode <> _O_U16TEXT) then
+    DoInvalidParameter(ADAM_ERRNO_EINVAL);
+    DoReleaseHandle(LHandle);
+    return true;
+  end;
+  lock (LHandle->Base.Lock->Lock) do
+    if not DoFdGone(LHandle) then
+      AResult := DoSetmodeLocked(LHandle, AMode);
+    end;
+  end;
+  DoReleaseHandle(LHandle);
+  return true;
+end;
+
+// _chsize_nolock (chsize.cpp) on handle AHandle (the caller holds its stream lock): the IO cut
+// or grown to ASize bytes, the descriptor's place kept. As ucrt's seek guard: the place, then
+// the end (each a lowio lseek, which clears the Ctrl-Z end), and the place set back whatever
+// happens. Growing writes zero bytes at the end, ADAM_HOOKIO_BUFFER_SIZE (_INTERNAL_BUFSIZ) at
+// a time, in binary mode (the old mode set back after the last write; a failed write leaves
+// the descriptor binary, as ucrt's early return does); cutting is a lseek to ASize, then the
+// IO truncated (SetEndOfFile's part). 0, or the errno: a failed lseek's (EINVAL when it left
+// none), a failed write's (a descriptor that cannot write EACCES, ucrt's map of
+// ERROR_ACCESS_DENIED), an IO that refuses the cut EACCES. errno is set as ucrt sets it
+routine DoChsizeLocked(const AHandle: ptr to HookHandle; const ASize: int64): int32;
+var
+  LPlace: int64;
+  LEnd: int64;
+  LExtend: int64;
+  LZeros: array of uint8;
+  LChunk: int64;
+  LWritten: int64;
+  LOldMode: int32;
+  LAnswer: int32;
+begin
+  LAnswer := 0;
+  LPlace := DoFdSeekLocked(AHandle, 0, ADAM_HOOKIO_SEEK_CUR);
+  LEnd := DoFdSeekLocked(AHandle, 0, ADAM_HOOKIO_SEEK_END);
+  if (LPlace = -1) or (LEnd = -1) then
+    LAnswer := CErrno();
+    if LAnswer = 0 then
+      LAnswer := ADAM_ERRNO_EINVAL;
+    end;
+  else
+    LExtend := ASize - LEnd;
+    if LExtend > 0 then
+      setlength(LZeros, ADAM_HOOKIO_BUFFER_SIZE);
+      LOldMode := DoSetmodeLocked(AHandle, _O_BINARY);
+      while (LAnswer = 0) and (LExtend > 0) do
+        LChunk := ADAM_HOOKIO_BUFFER_SIZE;
+        if LExtend < LChunk then
+          LChunk := LExtend;
+        end;
+        LWritten := DoLowWriteLocked(AHandle, addr of LZeros[0], LChunk);
+        if LWritten = -1 then
+          if not DoCanWrite(AHandle) then
+            SetCErrno(ADAM_ERRNO_EACCES);
+          end;
+          LAnswer := CErrno();
+        else
+          LExtend := LExtend - LWritten;
+        end;
+      end;
+      if LAnswer = 0 then
+        DoSetmodeLocked(AHandle, LOldMode);
+      end;
+    else
+      if LExtend < 0 then
+        if DoFdSeekLocked(AHandle, ASize, ADAM_HOOKIO_SEEK_SET) = -1 then
+          LAnswer := CErrno();
+        else
+          if not IOTruncate(AHandle->Base.Stream, ASize) then
+            SetCErrno(ADAM_ERRNO_EACCES);
+            LAnswer := ADAM_ERRNO_EACCES;
+          end;
+        end;
+      end;
+    end;
+  end;
+  // The seek guard's destructor: back to the place (a failed first lseek's -1 included)
+  DoFdSeekLocked(AHandle, LPlace, ADAM_HOOKIO_SEEK_SET);
+  return LAnswer;
+end;
+
+// _chsize_s of descriptor AFile when it is a handle's (chsize.cpp; _chsize is its 0 / -1).
+// False: not a handle's. True: AResult 0 or the errno: a closed number EBADF, then a size
+// below 0 EINVAL (ucrt's parameter checks in that order, the handler run), else
+// DoChsizeLocked's
+routine DoFdChsize(const AFile: int32; const ASize: int64; var AResult: int32): bool;
+var
+  LHandle: ptr to HookHandle;
+begin
+  AResult := ADAM_ERRNO_EBADF;
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle = nil then
+    return false;
+  end;
+  lock (LHandle->Base.Lock->Lock) do
+    if not DoFdGone(LHandle) then
+      if ASize < 0 then
+        DoInvalidParameter(ADAM_ERRNO_EINVAL);
+        AResult := ADAM_ERRNO_EINVAL;
+      else
+        AResult := DoChsizeLocked(LHandle, ASize);
+      end;
+    end;
+  end;
+  DoReleaseHandle(LHandle);
+  return true;
+end;
+
+// _get_osfhandle of descriptor AFile when it is a handle's (osfinfo.cpp). False: not a
+// handle's. True: AResult INVALID_HANDLE_VALUE (-1): the descriptor is open but no OS handle
+// stands behind it (its bytes are an IO's, not a file object's), what ucrt answers for an open
+// number whose _osfhnd is INVALID_HANDLE_VALUE, errno as it was; a closed number EBADF (the
+// handler run). Never the reservation's NUL handle: a Win32 call on it would read nothing and
+// write nowhere where the caller meant the handle's bytes
+routine DoFdOsfhandle(const AFile: int32; var AResult: int64): bool;
+var
+  LHandle: ptr to HookHandle;
+begin
+  AResult := -1;
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle = nil then
+    return false;
+  end;
+  lock (LHandle->Base.Lock->Lock) do
+    DoFdGone(LHandle);
+  end;
+  DoReleaseHandle(LHandle);
+  return true;
+end;
+
 // The fopen mode of a lowio open's flags (DoFdOpen): ABase ("r", "r+", "w", "w+", "a", "a+"),
 // then 'b' or 't' (_O_BINARY wins; then _O_TEXT, _O_WTEXT, _O_U16TEXT or _O_U8TEXT; else
 // _get_fmode's default), 'D' for _O_TEMPORARY, and the ccs= part of the Unicode flag (in
@@ -9571,6 +9770,83 @@ end;
 public routine _fstat64(const AFile: int32; const ABuf: ptr): int32;
 begin
   return DoFstat(AFile, ABuf, HookStatKind.Stat64, GRealFstat64, ptr to const char("_fstat64"));
+end;
+
+// _setmode (mingw's oldnames setmode reaches it too): a handle's descriptor's text mode
+// (DoFdSetmode), else ucrt's
+public routine _setmode(const AFile: int32; const AMode: int32): int32;
+var
+  LResult: int32;
+  LFound: ptr;
+  LReal: SetmodeFn;
+begin
+  if DoFdSetmode(AFile, AMode, LResult) then
+    return LResult;
+  end;
+  LFound := DoReal(GRealSetmode, ptr to const char("_setmode"));
+  if LFound = nil then
+    return -1;
+  end;
+  LReal := SetmodeFn(LFound);
+  return LReal(AFile, AMode);
+end;
+
+// _chsize_s: a handle's descriptor's IO cut or grown (DoFdChsize), else ucrt's
+public routine _chsize_s(const AFile: int32; const ASize: int64): int32;
+var
+  LResult: int32;
+  LFound: ptr;
+  LReal: ChsizeSFn;
+begin
+  if DoFdChsize(AFile, ASize, LResult) then
+    return LResult;
+  end;
+  LFound := DoReal(GRealChsizeS, ptr to const char("_chsize_s"));
+  if LFound = nil then
+    return ADAM_ERRNO_ENOSYS;
+  end;
+  LReal := ChsizeSFn(LFound);
+  return LReal(AFile, ASize);
+end;
+
+// _chsize (mingw's oldnames chsize reaches it too): _chsize_s's 0, else -1 (ucrt's own
+// _chsize over _chsize_s)
+public routine _chsize(const AFile: int32; const ASize: clong): int32;
+var
+  LResult: int32;
+  LFound: ptr;
+  LReal: ChsizeFn;
+begin
+  if DoFdChsize(AFile, int64(ASize), LResult) then
+    if LResult = 0 then
+      return 0;
+    end;
+    return -1;
+  end;
+  LFound := DoReal(GRealChsize, ptr to const char("_chsize"));
+  if LFound = nil then
+    return -1;
+  end;
+  LReal := ChsizeFn(LFound);
+  return LReal(AFile, ASize);
+end;
+
+// _get_osfhandle: a handle's descriptor has no OS handle (DoFdOsfhandle), else ucrt's
+public routine _get_osfhandle(const AFile: int32): int64;
+var
+  LResult: int64;
+  LFound: ptr;
+  LReal: FdInt64Fn;
+begin
+  if DoFdOsfhandle(AFile, LResult) then
+    return LResult;
+  end;
+  LFound := DoReal(GRealGetOsfhandle, ptr to const char("_get_osfhandle"));
+  if LFound = nil then
+    return -1;
+  end;
+  LReal := FdInt64Fn(LFound);
+  return LReal(AFile);
 end;
 
 // The stat family of a narrow path through its real function (AName, ASlot its slot) when the
