@@ -63,6 +63,13 @@
   learns its native window is gone (the platform unit's hook), so a window
   opened after it is never taken for the frame.
 
+  MPEG-1 video (pl_mpeg, with its MP2 audio): LoadVideo / LoadVideoIO /
+  LoadVideoZip give a Video played as raylib's Music is (PlayVideo,
+  UpdateVideo once a frame, DrawVideo / DrawVideoPro, UnloadVideo); a frame
+  is drawn through a YCbCr shader (CPU conversion where the shader does not
+  load), the sound through a raylib AudioStream when the audio device is
+  ready.
+
   The program icon, with no call of the program's own: the icon @exeicon
   gives is set on raylib's window as GLFW makes it (the platform unit's
   hook); a program's own SetWindowIcon later wins.
@@ -75,8 +82,10 @@
 
 module unit System.Raylib;
 
-import System.SysUtils, System.Collections, System.LibC.C, System.Raylib.C, System.CustomIO,
-  System.HookIO, System.HookIO.Core
+// System.IO / System.Math come before System.Raylib.C: a bare name two imports export is the
+// last one's (BNF sec 1), and raylib's Vector2 / FileExists are this unit's
+import System.SysUtils, System.Collections, System.IO, System.Math, System.LibC.C, System.Raylib.C,
+  System.CustomIO, System.HookIO, System.HookIO.Core, System.pl_mpeg.C
 @ifdef TARGET_X86_64_WINDOWS_GNU
   , System.HookIO.Win64, System.Raylib.Win64
 @elseif TARGET_X86_64_LINUX_GNU
@@ -1838,6 +1847,970 @@ public routine cpplink GetFramePoint(const APoint: Vector2; const ALetterbox: Re
   const ABaseWidth: int32; const ABaseHeight: int32): Vector2;
 begin
   return DoFramePoint(APoint, ALetterbox, ABaseWidth, ABaseHeight);
+end;
+
+// ---------------------------------------------------------------------------------------------
+// The video player (pcpp's raylib_ext video; CONCEPT from sfml_ext's sfx::Video::Impl, in
+// raylib's procedural form): pl_mpeg decodes an MPEG-1 video with its MP2 audio from a
+// CustomIO IO; the audio goes through a raylib AudioStream fed from UpdateVideo on the
+// caller's thread; a frame is three plane textures drawn through a YCbCr -> RGB shader
+// (pl_mpeg_player_gl.c's Rec. 601 matrix), or, where the shader does not load, one RGBA
+// texture converted on the CPU (the same picture). GPU resources are made at the first frame
+// decoded with a window open, so a video can be loaded before InitWindow.
+// ---------------------------------------------------------------------------------------------
+
+public type
+  /// Where a video stands: VideoStopped (at its start, no frame shown until it plays),
+  /// VideoPlaying, or VideoPaused (where it was, its frame still drawn). A video starts
+  /// stopped; one that does not loop is stopped again at its end.
+  /// @example `if GetVideoStatus(LIntro) = VideoStatus.VideoStopped then PlayVideo(LIntro); end;`
+  /// @since 0.1
+  /// @see GetVideoStatus
+  VideoStatus = choices(VideoStopped, VideoPlaying, VideoPaused);
+
+  /// Called on every change of a video's status: by PlayVideo, PauseVideo and StopVideo when
+  /// they change it, and by UpdateVideo at the end of a video that does not loop
+  /// (VideoStopped). A call that changes nothing (PlayVideo on a playing video) calls nothing,
+  /// and neither does UnloadVideo.
+  /// @example `routine OnVideo(const AStatus: VideoStatus; const AName: ptr to const char); begin ... end;`
+  /// @since 0.1
+  /// @see SetVideoStatusCallback
+  VideoStatusCallback = routine(const AStatus: VideoStatus; const AName: ptr to const char);
+
+  /// An MPEG-1 video (pl_mpeg) with its MP2 audio, used as raylib's Music is: load it with
+  /// LoadVideo, LoadVideoIO or LoadVideoZip, PlayVideo it, call UpdateVideo once a frame and
+  /// DrawVideo it, then UnloadVideo it. The record is a handle: copies name the same video.
+  /// Every routine takes a video that did not load (ctxData nil) and does nothing with it,
+  /// giving 0, false or VideoStopped.
+  /// @example `LIntro := LoadVideoZip("$P:assets.zip", "res/assets/videos/intro.mpg", ""); PlayVideo(LIntro);`
+  /// @since 0.1
+  /// @see LoadVideo
+  Video = record
+    /// The player; nil when the video did not load (IsVideoValid)
+    ctxData: ptr;
+    /// The frame width in pixels; 0 when the video did not load
+    width: int32;
+    /// The frame height in pixels; 0 when the video did not load
+    height: int32;
+  end;
+
+const
+  // The audio stream's chunk, in sample frames, and the most the queue holds (seconds of
+  // sound); two channels always (a mono track decodes as two equal channels)
+  ADAM_RAYLIB_VIDEO_CHUNK_FRAMES: int32 = 4096;
+  ADAM_RAYLIB_VIDEO_QUEUE_SECONDS: int32 = 2;
+  ADAM_RAYLIB_VIDEO_CHANNELS: int32 = 2;
+  // pl_mpeg_player_gl.c's fragment shader in raylib's GLSL 330 form: the Y plane is
+  // texture0, Cb / Cr half its size with the same padding (so the same coordinates); Rec. 601
+  // video range; colDiffuse / fragColor keep a tint
+  ADAM_RAYLIB_VIDEO_SHADER: string = R"(#version 330
+in vec2 fragTexCoord;
+in vec4 fragColor;
+uniform sampler2D texture0;
+uniform sampler2D texture_cb;
+uniform sampler2D texture_cr;
+uniform vec4 colDiffuse;
+out vec4 finalColor;
+const mat4 rec601 = mat4(
+    1.16438,  0.00000,  1.59603, -0.87079,
+    1.16438, -0.39176, -0.81297,  0.52959,
+    1.16438,  2.01723,  0.00000, -1.08139,
+    0.0,      0.0,      0.0,      1.0);
+void main()
+{
+    float y = texture(texture0, fragTexCoord).r;
+    float cb = texture(texture_cb, fragTexCoord).r;
+    float cr = texture(texture_cr, fragTexCoord).r;
+    finalColor = vec4(y, cb, cr, 1.0) * rec601 * colDiffuse * fragColor;
+}
+)";
+
+type
+  // One video's player, behind Video.ctxData: made by create (zeroed), never moved (pl_mpeg
+  // keeps the address of Stream), freed by DoVideoClose. Plain data only: its buffers are
+  // getmem blocks and its name a C copy, all freed there.
+  VideoPlayer = record
+    Plm: ptr to plm_t;
+    Stream: plm_stream_t;
+    Source: IO;
+    OwnsSource: bool;
+    // The name the status callback is given (a NUL-ended copy)
+    Name: ptr to char;
+    Width: int32;
+    Height: int32;
+    Status: VideoStatus;
+    Loop: bool;
+    Volume: float32;
+    Callback: VideoStatusCallback;
+    // GPU state: decided at the first frame with a window (Decided)
+    Decided: bool;
+    Gpu: bool;
+    YuvShader: Shader;
+    LocCb: int32;
+    LocCr: int32;
+    PlaneY: Texture2D;
+    PlaneCb: Texture2D;
+    PlaneCr: Texture2D;
+    // The CPU path's RGBA texture and its pixels (Width x Height x 4 bytes)
+    Frame: Texture2D;
+    Pixels: ptr to uint8;
+    // The frame the last decode gave (the video callback's), nil when none
+    Pending: ptr to plm_frame_t;
+    HasFrame: bool;
+    // Audio: the video has a track (HasTrack); the stream plays it when the audio device
+    // was ready at the load (HasAudio)
+    HasTrack: bool;
+    HasAudio: bool;
+    SampleRate: int32;
+    Audio: AudioStream;
+    AudioStarted: bool;
+    // The decoded samples waiting for the stream: a ring of QueueMax int16 samples (whole
+    // sample frames: they come and go in pairs), QueueCount of them from QueueHead
+    Queue: ptr to int16;
+    QueueHead: int64;
+    QueueCount: int64;
+    QueueMax: int64;
+    // One stream chunk (ADAM_RAYLIB_VIDEO_CHUNK_FRAMES sample frames)
+    Chunk: ptr to int16;
+    // PerformanceCounter at the last update (or play)
+    Last: int64;
+  end;
+
+// The player behind a Video's ctxData (nil: no player)
+routine DoPlayer(const AContext: ptr): ptr to VideoPlayer;
+begin
+  return ptr to VideoPlayer(AContext);
+end;
+
+// pl_mpeg's read callback: up to count bytes of the player's IO (0 at its end or a failure)
+routine clink DoVideoRead(user: ptr; dest: ptr; count: uint64): uint64;
+var
+  LGot: int64;
+begin
+  LGot := IORead(DoPlayer(user)^.Source, dest, int64(count));
+  if LGot > 0 then
+    return uint64(LGot);
+  end;
+  return 0;
+end;
+
+// pl_mpeg's seek callback: the player's IO to position from its start (1 when it got there)
+routine clink DoVideoSeek(user: ptr; position: uint64): int32;
+begin
+  if IOSeek(DoPlayer(user)^.Source, int64(position), SeekOrigin.FromStart) = int64(position) then
+    return 1;
+  end;
+  return 0;
+end;
+
+// pl_mpeg's video decode callback: the newest frame kept for the update to upload
+routine clink DoVideoOnFrame(self_: ptr to plm_t; frame: ptr to plm_frame_t; user: ptr);
+begin
+  DoPlayer(user)^.Pending := frame;
+end;
+
+// One sample into the queue; a full queue drops its oldest sample (so a pair of pushes drops
+// a whole sample frame from the front)
+routine DoVideoQueuePush(const APlayer: ptr to VideoPlayer; const ASample: int16);
+begin
+  APlayer^.Queue[(APlayer^.QueueHead + APlayer^.QueueCount) mod APlayer^.QueueMax] := ASample;
+  if APlayer^.QueueCount < APlayer^.QueueMax then
+    APlayer^.QueueCount := APlayer^.QueueCount + 1;
+  else
+    APlayer^.QueueHead := (APlayer^.QueueHead + 1) mod APlayer^.QueueMax;
+  end;
+end;
+
+// pl_mpeg's audio decode callback: the samples (two channels, -1 .. 1) as int16 into the
+// queue (rounded half away from zero, std::lround's rule)
+routine clink DoVideoOnSamples(self_: ptr to plm_t; samples: ptr to plm_samples_t; user: ptr);
+var
+  LPlayer: ptr to VideoPlayer;
+  LCount: int64;
+  LI: int64;
+  LValue: float32;
+begin
+  LPlayer := DoPlayer(user);
+  if not LPlayer^.HasAudio then
+    return;
+  end;
+  LCount := int64(samples^.count) * int64(ADAM_RAYLIB_VIDEO_CHANNELS);
+  for LI := 0 to LCount - 1 do
+    LValue := DoClamp(samples^.interleaved[LI], -1.0f, 1.0f);
+    DoVideoQueuePush(LPlayer, int16(lroundf(LValue * 32767.0f)));
+  end;
+end;
+
+// A grayscale texture of AWidth x AHeight (one byte a pixel), point filtered: each Cb / Cr
+// sample then covers its 2x2 luma block as in plm_frame_to_rgba, so the shader draws the CPU
+// path's picture (an RGBA texture, raylib's default point filter) at every scale; bilinear
+// chroma blends across every color edge and gives a different picture. An empty texture
+// (id 0) when it cannot be made.
+routine DoVideoPlane(const AWidth: int32; const AHeight: int32): Texture2D;
+var
+  LImage: Image;
+  LTexture: Texture2D;
+  LSize: int64;
+begin
+  LSize := int64(AWidth) * int64(AHeight);
+  LImage.data := getmem(LSize);
+  if LImage.data = nil then
+    return LTexture;
+  end;
+  memset(LImage.data, 0, uint64(LSize));
+  LImage.width := AWidth;
+  LImage.height := AHeight;
+  LImage.mipmaps := 1;
+  LImage.format := PIXELFORMAT_UNCOMPRESSED_GRAYSCALE;
+  LTexture := LoadTextureFromImage(LImage);
+  freemem(LImage.data);
+  if LTexture.id <> 0 then
+    SetTextureFilter(LTexture, TEXTURE_FILTER_POINT);
+  end;
+  return LTexture;
+end;
+
+// One plane into its texture, made (or made again) at the plane's size
+routine DoVideoUpload(var ATexture: Texture2D; const APlane: plm_plane_t): bool;
+var
+  LWidth: int32;
+  LHeight: int32;
+begin
+  LWidth := int32(APlane.width);
+  LHeight := int32(APlane.height);
+  if (ATexture.id = 0) or (ATexture.width <> LWidth) or (ATexture.height <> LHeight) then
+    if ATexture.id <> 0 then
+      UnloadTexture(ATexture);
+    end;
+    ATexture := DoVideoPlane(LWidth, LHeight);
+    if ATexture.id = 0 then
+      return false;
+    end;
+  end;
+  UpdateTexture(ATexture, APlane.data);
+  return true;
+end;
+
+// The GPU / CPU choice, once, with a window: the shader when it loads, else the RGBA
+// texture and its pixel buffer. False while no window is open (nothing decided).
+routine DoVideoDecide(const APlayer: ptr to VideoPlayer): bool;
+var
+  LImage: Image;
+  LNone: Shader;
+  LSize: int64;
+begin
+  if APlayer^.Decided then
+    return true;
+  end;
+  if not IsWindowReady() then
+    return false;
+  end;
+  APlayer^.YuvShader := LoadShaderFromMemory(nil, ADAM_RAYLIB_VIDEO_SHADER);
+  // raylib hands back its default shader when the code does not compile: not this video's
+  APlayer^.Gpu := (APlayer^.YuvShader.id <> 0) and
+    (APlayer^.YuvShader.id <> rlGetShaderIdDefault());
+  if APlayer^.Gpu then
+    APlayer^.LocCb := GetShaderLocation(APlayer^.YuvShader, "texture_cb");
+    APlayer^.LocCr := GetShaderLocation(APlayer^.YuvShader, "texture_cr");
+  else
+    APlayer^.YuvShader := LNone;
+    // plm_frame_to_rgba leaves the alpha bytes as they are: opaque
+    LSize := int64(APlayer^.Width) * int64(APlayer^.Height) * 4;
+    APlayer^.Pixels := ptr to uint8(getmem(LSize));
+    if APlayer^.Pixels <> nil then
+      memset(APlayer^.Pixels, 255, uint64(LSize));
+      LImage.data := APlayer^.Pixels;
+      LImage.width := APlayer^.Width;
+      LImage.height := APlayer^.Height;
+      LImage.mipmaps := 1;
+      LImage.format := PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+      APlayer^.Frame := LoadTextureFromImage(LImage);
+    end;
+  end;
+  APlayer^.Decided := true;
+  return true;
+end;
+
+// Back to the start: the audio stopped and emptied, no frame shown
+routine DoVideoRewind(const APlayer: ptr to VideoPlayer);
+begin
+  if APlayer^.HasAudio then
+    StopAudioStream(APlayer^.Audio);
+  end;
+  APlayer^.QueueHead := 0;
+  APlayer^.QueueCount := 0;
+  APlayer^.AudioStarted := false;
+  if APlayer^.Plm <> nil then
+    plm_rewind(APlayer^.Plm);
+  end;
+  APlayer^.Pending := nil;
+  APlayer^.HasFrame := false;
+end;
+
+// Everything a player holds freed (its own IO closed), then the player
+routine DoVideoClose(var APlayer: ptr to VideoPlayer);
+begin
+  if APlayer = nil then
+    return;
+  end;
+  DoVideoRewind(APlayer);
+  if APlayer^.HasAudio then
+    UnloadAudioStream(APlayer^.Audio);
+  end;
+  if APlayer^.Plm <> nil then
+    plm_destroy(APlayer^.Plm);
+  end;
+  if APlayer^.Gpu then
+    UnloadShader(APlayer^.YuvShader);
+  end;
+  if APlayer^.PlaneY.id <> 0 then
+    UnloadTexture(APlayer^.PlaneY);
+  end;
+  if APlayer^.PlaneCb.id <> 0 then
+    UnloadTexture(APlayer^.PlaneCb);
+  end;
+  if APlayer^.PlaneCr.id <> 0 then
+    UnloadTexture(APlayer^.PlaneCr);
+  end;
+  if APlayer^.Frame.id <> 0 then
+    UnloadTexture(APlayer^.Frame);
+  end;
+  if APlayer^.Pixels <> nil then
+    freemem(APlayer^.Pixels);
+  end;
+  if APlayer^.Queue <> nil then
+    freemem(APlayer^.Queue);
+  end;
+  if APlayer^.Chunk <> nil then
+    freemem(APlayer^.Chunk);
+  end;
+  DoFreeCText(APlayer^.Name);
+  if APlayer^.OwnsSource and (APlayer^.Source <> nil) then
+    IOClose(APlayer^.Source);
+  end;
+  destroy(APlayer);
+end;
+
+// The player's audio: a stream when the video has a track and the audio device is ready
+// (else the video plays silently), its queue and chunk, pl_mpeg's audio decode set up. The
+// audio is turned off when there is no stream to play it.
+routine DoVideoOpenAudio(const APlayer: ptr to VideoPlayer);
+begin
+  if APlayer^.HasTrack and IsAudioDeviceReady() then
+    SetAudioStreamBufferSizeDefault(ADAM_RAYLIB_VIDEO_CHUNK_FRAMES);
+    APlayer^.Audio := LoadAudioStream(uint32(APlayer^.SampleRate), 16,
+      uint32(ADAM_RAYLIB_VIDEO_CHANNELS));
+    SetAudioStreamBufferSizeDefault(0);
+    APlayer^.HasAudio := IsAudioStreamValid(APlayer^.Audio);
+  end;
+  if APlayer^.HasAudio then
+    APlayer^.QueueMax := int64(APlayer^.SampleRate) * int64(ADAM_RAYLIB_VIDEO_CHANNELS) *
+      int64(ADAM_RAYLIB_VIDEO_QUEUE_SECONDS);
+    APlayer^.Queue := ptr to int16(getmem(APlayer^.QueueMax * size(int16)));
+    APlayer^.Chunk := ptr to int16(getmem(int64(ADAM_RAYLIB_VIDEO_CHUNK_FRAMES) *
+      int64(ADAM_RAYLIB_VIDEO_CHANNELS) * size(int16)));
+    if (APlayer^.Queue = nil) or (APlayer^.Chunk = nil) then
+      // No room for the sound: the video plays silently
+      UnloadAudioStream(APlayer^.Audio);
+      APlayer^.HasAudio := false;
+    end;
+  end;
+  if APlayer^.HasAudio then
+    SetAudioStreamVolume(APlayer^.Audio, PerceivedVolume(APlayer^.Volume, 1.0f));
+    plm_set_audio_enabled(APlayer^.Plm, 1);
+    plm_set_audio_stream(APlayer^.Plm, 0);
+    plm_set_audio_decode_callback(APlayer^.Plm, DoVideoOnSamples, APlayer);
+    // Two MP2 frames ahead of the video, as sfml_ext's player decodes them
+    plm_set_audio_lead_time(APlayer^.Plm,
+      float64(PLM_AUDIO_SAMPLES_PER_FRAME) * 2.0 / float64(APlayer^.SampleRate));
+  else
+    plm_set_audio_enabled(APlayer^.Plm, 0);
+  end;
+end;
+
+// A player over ASource (taken: closed on a failure when AOwns); nil when it is no MPEG-1
+// video (no headers, no video stream, no size)
+routine DoVideoOpen(const ASource: IO; const AOwns: bool; const AName: string): ptr to VideoPlayer;
+var
+  LPlayer: ptr to VideoPlayer;
+  LSize: int64;
+  LPlm: ptr to plm_t;
+  LValid: bool;
+begin
+  if ASource = nil then
+    return nil;
+  end;
+  LSize := IOSize(ASource);
+  if LSize <= 0 then
+    if AOwns then
+      IOClose(ASource);
+    end;
+    return nil;
+  end;
+  create(LPlayer);
+  LPlayer^.Source := ASource;
+  LPlayer^.OwnsSource := AOwns;
+  LPlayer^.Name := DoCText(AName);
+  LPlayer^.Status := VideoStatus.VideoStopped;
+  LPlayer^.Volume := 1.0f;
+  LPlayer^.LocCb := -1;
+  LPlayer^.LocCr := -1;
+  IOSeek(ASource, 0, SeekOrigin.FromStart);
+  LPlayer^.Stream.read := DoVideoRead;
+  LPlayer^.Stream.seek := DoVideoSeek;
+  LPlayer^.Stream.length := uint64(LSize);
+  LPlayer^.Stream.user := LPlayer;
+  LPlm := plm_create_with_stream(addr of LPlayer^.Stream);
+  LValid := false;
+  if LPlm <> nil then
+    LValid := (plm_has_headers(LPlm) <> 0) and (plm_get_num_video_streams(LPlm) >= 1) and
+      (plm_get_width(LPlm) > 0) and (plm_get_height(LPlm) > 0);
+  end;
+  if not LValid then
+    if LPlm <> nil then
+      plm_destroy(LPlm);
+    end;
+    DoVideoClose(LPlayer);
+    return nil;
+  end;
+  LPlayer^.Plm := LPlm;
+  LPlayer^.Width := plm_get_width(LPlm);
+  LPlayer^.Height := plm_get_height(LPlm);
+  LPlayer^.SampleRate := plm_get_samplerate(LPlm);
+  LPlayer^.HasTrack := (plm_get_num_audio_streams(LPlm) > 0) and (LPlayer^.SampleRate > 0);
+  DoVideoOpenAudio(LPlayer);
+  plm_set_video_decode_callback(LPlm, DoVideoOnFrame, LPlayer);
+  plm_set_loop(LPlm, 0);
+  return LPlayer;
+end;
+
+// The video's record from a player (nil: the empty record)
+routine DoVideoRecord(const APlayer: ptr to VideoPlayer): Video;
+var
+  LVideo: Video;
+begin
+  if APlayer <> nil then
+    LVideo.ctxData := APlayer;
+    LVideo.width := APlayer^.Width;
+    LVideo.height := APlayer^.Height;
+  end;
+  return LVideo;
+end;
+
+// A status change told to the player's callback (none set: nothing)
+routine DoVideoNotify(const APlayer: ptr to VideoPlayer);
+var
+  LCallback: VideoStatusCallback;
+begin
+  LCallback := APlayer^.Callback;
+  if LCallback <> nil then
+    LCallback(APlayer^.Status, APlayer^.Name);
+  end;
+end;
+
+// The status changes: each true when it changed the status
+routine DoVideoPlay(const APlayer: ptr to VideoPlayer): bool;
+begin
+  if APlayer^.Status = VideoStatus.VideoPlaying then
+    return false;
+  end;
+  // The audio resumes where it paused; from the start, once a decode gave its first samples
+  // (no silence ahead of the picture)
+  if APlayer^.HasAudio and APlayer^.AudioStarted then
+    ResumeAudioStream(APlayer^.Audio);
+  end;
+  APlayer^.Status := VideoStatus.VideoPlaying;
+  APlayer^.Last := PerformanceCounter();
+  return true;
+end;
+
+routine DoVideoPause(const APlayer: ptr to VideoPlayer): bool;
+begin
+  if APlayer^.Status <> VideoStatus.VideoPlaying then
+    return false;
+  end;
+  if APlayer^.HasAudio and APlayer^.AudioStarted then
+    PauseAudioStream(APlayer^.Audio);
+  end;
+  APlayer^.Status := VideoStatus.VideoPaused;
+  return true;
+end;
+
+routine DoVideoStop(const APlayer: ptr to VideoPlayer): bool;
+begin
+  if APlayer^.Status = VideoStatus.VideoStopped then
+    return false;
+  end;
+  DoVideoRewind(APlayer);
+  APlayer^.Status := VideoStatus.VideoStopped;
+  return true;
+end;
+
+// The audio stream fed: every processed buffer gets the next chunk of the queue, silence
+// where it has none (an underrun keeps the stream going)
+routine DoVideoFeed(const APlayer: ptr to VideoPlayer);
+var
+  LWant: int64;
+  LTake: int64;
+  LI: int64;
+begin
+  if (not APlayer^.HasAudio) or (not APlayer^.AudioStarted) then
+    return;
+  end;
+  LWant := int64(ADAM_RAYLIB_VIDEO_CHUNK_FRAMES) * int64(ADAM_RAYLIB_VIDEO_CHANNELS);
+  while IsAudioStreamProcessed(APlayer^.Audio) do
+    LTake := APlayer^.QueueCount;
+    if LTake > LWant then
+      LTake := LWant;
+    end;
+    for LI := 0 to LWant - 1 do
+      if LI < LTake then
+        APlayer^.Chunk[LI] := APlayer^.Queue[(APlayer^.QueueHead + LI) mod APlayer^.QueueMax];
+      else
+        APlayer^.Chunk[LI] := 0;
+      end;
+    end;
+    APlayer^.QueueHead := (APlayer^.QueueHead + LTake) mod APlayer^.QueueMax;
+    APlayer^.QueueCount := APlayer^.QueueCount - LTake;
+    UpdateAudioStream(APlayer^.Audio, APlayer^.Chunk, ADAM_RAYLIB_VIDEO_CHUNK_FRAMES);
+  end;
+end;
+
+// The decoded frame (Pending) uploaded, once a window is open: the three planes for the
+// shader, else the CPU conversion into the RGBA texture
+routine DoVideoShowPending(const APlayer: ptr to VideoPlayer);
+begin
+  if APlayer^.Pending = nil then
+    return;
+  end;
+  if not DoVideoDecide(APlayer) then
+    return;
+  end;
+  if APlayer^.Gpu then
+    if DoVideoUpload(APlayer^.PlaneY, APlayer^.Pending^.y) and
+      DoVideoUpload(APlayer^.PlaneCb, APlayer^.Pending^.cb) and
+      DoVideoUpload(APlayer^.PlaneCr, APlayer^.Pending^.cr) then
+      APlayer^.HasFrame := true;
+    end;
+  else
+    if APlayer^.Frame.id <> 0 then
+      plm_frame_to_rgba(APlayer^.Pending, APlayer^.Pixels, APlayer^.Width * 4);
+      UpdateTexture(APlayer^.Frame, APlayer^.Pixels);
+      APlayer^.HasFrame := true;
+    end;
+  end;
+end;
+
+// One update of ASeconds (< 0: the real time since the last update): the decode, the last
+// frame's upload (a window open), the audio's start and feed, and the end of a video that
+// does not loop (back to its start, stopped). True when the end changed the status.
+routine DoVideoUpdate(const APlayer: ptr to VideoPlayer; const ASeconds: float64): bool;
+var
+  LNow: int64;
+  LStep: float64;
+begin
+  if APlayer^.Status <> VideoStatus.VideoPlaying then
+    return false;
+  end;
+  LNow := PerformanceCounter();
+  LStep := ASeconds;
+  if LStep < 0.0 then
+    LStep := float64(LNow - APlayer^.Last) / float64(PerformanceFrequency());
+  end;
+  APlayer^.Last := LNow;
+  APlayer^.Pending := nil;
+  if LStep > 0.0 then
+    plm_decode(APlayer^.Plm, LStep);
+  end;
+  DoVideoShowPending(APlayer);
+  APlayer^.Pending := nil;
+  if APlayer^.HasAudio and (not APlayer^.AudioStarted) and (APlayer^.QueueCount > 0) then
+    APlayer^.AudioStarted := true;
+    DoVideoFeed(APlayer);
+    PlayAudioStream(APlayer^.Audio);
+  else
+    DoVideoFeed(APlayer);
+  end;
+  // pl_mpeg starts a looping video again itself; one that does not loop stops at its start
+  if plm_has_ended(APlayer^.Plm) <> 0 then
+    DoVideoRewind(APlayer);
+    APlayer^.Status := VideoStatus.VideoStopped;
+    return true;
+  end;
+  return false;
+end;
+
+/// Loads a video from an IO: an MPEG-1 video (with or without MP2 audio) read through the IO
+/// while it plays, so the IO must stay open until UnloadVideo (which leaves it open: it stays
+/// the caller's). The audio plays through raylib's audio device when it is ready
+/// (InitAudioDevice first); without it the video plays silently. A window is not needed to
+/// load: frames are uploaded once one is open.
+/// @param AIO the video's bytes (CreateZipFileIO's, CreateFileIO's, any IO)
+/// @param AName the name the status callback is given
+/// @returns the video; ctxData nil when the IO holds no MPEG-1 video
+/// @example `LIntro := LoadVideoIO(CreateZipFileIO("$P:assets.zip", "intro.mpg"), "intro.mpg");`
+/// @see UnloadVideo
+/// @since 0.1
+public routine cpplink LoadVideoIO(const AIO: IO; const AName: string): Video;
+begin
+  return DoVideoRecord(DoVideoOpen(AIO, false, AName));
+end;
+
+/// Loads a video from a file (UTF-8 path; $P: / $D: prefixes resolved): LoadVideoIO's rules
+/// over a file IO the video owns.
+/// @param AFileName the .mpg file
+/// @returns the video; ctxData nil when the file is missing or no MPEG-1 video
+/// @example `LIntro := LoadVideo("$P:../res/assets/videos/intro.mpg");`
+/// @see LoadVideoIO
+/// @since 0.1
+public routine cpplink LoadVideo(const AFileName: string): Video;
+begin
+  return DoVideoRecord(DoVideoOpen(CreateFileIO(AFileName, FileMode.Read), true, AFileName));
+end;
+
+/// Loads a video from a zip entry (a password for an encrypted archive): LoadVideoIO's rules
+/// over the entry's IO, which the video owns.
+/// @param AArchive the zip file
+/// @param AEntry the entry's path in it
+/// @param APassword the archive's password, "" for none
+/// @returns the video; ctxData nil when the archive or entry is missing or holds no MPEG-1
+///   video
+/// @example `LIntro := LoadVideoZip("$P:assets.zip", "res/assets/videos/intro.mpg", "");`
+/// @see LoadVideoIO
+/// @since 0.1
+public routine cpplink LoadVideoZip(const AArchive: string; const AEntry: string;
+  const APassword: string): Video;
+begin
+  return DoVideoRecord(DoVideoOpen(CreateZipFileIO(AArchive, AEntry, APassword), true, AEntry));
+end;
+
+/// Unloads a video: stopped, its textures, shader and audio stream freed, its own IO closed
+/// (LoadVideo / LoadVideoZip; LoadVideoIO's stays the caller's). The status callback is not
+/// called. Every copy of the record names the freed video after it.
+/// @param AVideo the video
+/// @since 0.1
+public routine cpplink UnloadVideo(const AVideo: Video);
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  DoVideoClose(LPlayer);
+end;
+
+/// True when the video loaded (ctxData set)
+/// @since 0.1
+public routine cpplink IsVideoValid(const AVideo: Video): bool;
+begin
+  return AVideo.ctxData <> nil;
+end;
+
+/// Plays the video (from where it paused, or from its start)
+/// @since 0.1
+public routine cpplink PlayVideo(const AVideo: Video);
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer <> nil then
+    if DoVideoPlay(LPlayer) then
+      DoVideoNotify(LPlayer);
+    end;
+  end;
+end;
+
+/// Pauses a playing video where it is
+/// @since 0.1
+public routine cpplink PauseVideo(const AVideo: Video);
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer <> nil then
+    if DoVideoPause(LPlayer) then
+      DoVideoNotify(LPlayer);
+    end;
+  end;
+end;
+
+/// Stops the video back at its start (no frame shown until it plays)
+/// @since 0.1
+public routine cpplink StopVideo(const AVideo: Video);
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer <> nil then
+    if DoVideoStop(LPlayer) then
+      DoVideoNotify(LPlayer);
+    end;
+  end;
+end;
+
+/// Advances a playing video by the real time since its last update (call once a frame):
+/// decodes, uploads the newest frame, feeds the audio; the end of a video that does not loop
+/// stops it at its start.
+/// @since 0.1
+/// @see DrawVideo
+public routine cpplink UpdateVideo(const AVideo: Video);
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer <> nil then
+    if DoVideoUpdate(LPlayer, -1.0) then
+      DoVideoNotify(LPlayer);
+    end;
+  end;
+end;
+
+/// UpdateVideo by a given step instead of the real time
+/// @param ASeconds the time to advance (0 or less: nothing decoded)
+/// @since 0.1
+public routine cpplink UpdateVideo(const AVideo: Video; const ASeconds: float64);
+var
+  LPlayer: ptr to VideoPlayer;
+  LStep: float64;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer = nil then
+    return;
+  end;
+  LStep := ASeconds;
+  // Not a positive step (NaN included): nothing decoded
+  if not (LStep > 0.0) then
+    LStep := 0.0;
+  end;
+  if DoVideoUpdate(LPlayer, LStep) then
+    DoVideoNotify(LPlayer);
+  end;
+end;
+
+/// The video's status
+/// @since 0.1
+public routine cpplink GetVideoStatus(const AVideo: Video): VideoStatus;
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer = nil then
+    return VideoStatus.VideoStopped;
+  end;
+  return LPlayer^.Status;
+end;
+
+/// True while the video plays
+/// @since 0.1
+public routine cpplink IsVideoPlaying(const AVideo: Video): bool;
+begin
+  return GetVideoStatus(AVideo) = VideoStatus.VideoPlaying;
+end;
+
+/// Sets whether the video starts again at its end
+/// @since 0.1
+public routine cpplink SetVideoLooping(const AVideo: Video; const ALoop: bool);
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer = nil then
+    return;
+  end;
+  LPlayer^.Loop := ALoop;
+  if ALoop then
+    plm_set_loop(LPlayer^.Plm, 1);
+  else
+    plm_set_loop(LPlayer^.Plm, 0);
+  end;
+end;
+
+/// True when the video starts again at its end
+/// @since 0.1
+public routine cpplink IsVideoLooping(const AVideo: Video): bool;
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer = nil then
+    return false;
+  end;
+  return LPlayer^.Loop;
+end;
+
+/// Sets the video's volume, 0 .. 1 (clamped; NaN as 0), heard through System.Math's
+/// PerceivedVolume so equal steps sound equal
+/// @since 0.1
+public routine cpplink SetVideoVolume(const AVideo: Video; const AVolume: float32);
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer = nil then
+    return;
+  end;
+  if AVolume > 0.0f then
+    LPlayer^.Volume := DoClamp(AVolume, 0.0f, 1.0f);
+  else
+    LPlayer^.Volume := 0.0f;
+  end;
+  if LPlayer^.HasAudio then
+    SetAudioStreamVolume(LPlayer^.Audio, PerceivedVolume(LPlayer^.Volume, 1.0f));
+  end;
+end;
+
+/// The video's volume as set (0 .. 1)
+/// @since 0.1
+public routine cpplink GetVideoVolume(const AVideo: Video): float32;
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer = nil then
+    return 0.0f;
+  end;
+  return LPlayer^.Volume;
+end;
+
+/// Sets the routine called on every status change (nil: none)
+/// @since 0.1
+public routine cpplink SetVideoStatusCallback(const AVideo: Video;
+  const ACallback: VideoStatusCallback);
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer <> nil then
+    LPlayer^.Callback := ACallback;
+  end;
+end;
+
+/// The video's frame rate (frames a second); 0 with no video
+/// @since 0.1
+public routine cpplink GetVideoFrameRate(const AVideo: Video): float64;
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer = nil then
+    return 0.0;
+  end;
+  return plm_get_framerate(LPlayer^.Plm);
+end;
+
+/// The video's length in seconds (the last frame's start plus one frame)
+/// @since 0.1
+public routine cpplink GetVideoDuration(const AVideo: Video): float64;
+var
+  LPlayer: ptr to VideoPlayer;
+  LSeconds: float64;
+  LRate: float64;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer = nil then
+    return 0.0;
+  end;
+  // pl_mpeg's duration spans the first frame's start to the last frame's start: the video
+  // plays one frame longer
+  LSeconds := plm_get_duration(LPlayer^.Plm);
+  LRate := plm_get_framerate(LPlayer^.Plm);
+  if LRate > 0.0 then
+    LSeconds := LSeconds + 1.0 / LRate;
+  end;
+  return LSeconds;
+end;
+
+/// Where the video is, in seconds from its start
+/// @since 0.1
+public routine cpplink GetVideoTime(const AVideo: Video): float64;
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer = nil then
+    return 0.0;
+  end;
+  return plm_get_time(LPlayer^.Plm);
+end;
+
+/// True when the video has an audio track (whether or not the audio device plays it)
+/// @since 0.1
+public routine cpplink HasVideoAudio(const AVideo: Video): bool;
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer = nil then
+    return false;
+  end;
+  return LPlayer^.HasTrack;
+end;
+
+/// The audio track's sample rate (0 with none)
+/// @since 0.1
+public routine cpplink GetVideoSampleRate(const AVideo: Video): int32;
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer = nil then
+    return 0;
+  end;
+  return LPlayer^.SampleRate;
+end;
+
+/// True when the video is drawn through its YCbCr shader (else converted on the CPU);
+/// decided at the first frame with a window open
+/// @since 0.1
+public routine cpplink IsVideoShaderUsed(const AVideo: Video): bool;
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer = nil then
+    return false;
+  end;
+  return LPlayer^.Gpu;
+end;
+
+/// Draws part of the current frame (ASource in the frame's pixels) placed, scaled and rotated
+/// as DrawTexturePro draws; nothing before the first frame
+/// @since 0.1
+public routine cpplink DrawVideoPro(const AVideo: Video; const ASource: Rectangle;
+  const ADest: Rectangle; const AOrigin: Vector2; const ARotation: float32; const ATint: Color);
+var
+  LPlayer: ptr to VideoPlayer;
+begin
+  LPlayer := DoPlayer(AVideo.ctxData);
+  if LPlayer = nil then
+    return;
+  end;
+  if not LPlayer^.HasFrame then
+    return;
+  end;
+  if LPlayer^.Gpu then
+    BeginShaderMode(LPlayer^.YuvShader);
+    SetShaderValueTexture(LPlayer^.YuvShader, LPlayer^.LocCb, LPlayer^.PlaneCb);
+    SetShaderValueTexture(LPlayer^.YuvShader, LPlayer^.LocCr, LPlayer^.PlaneCr);
+    DrawTexturePro(LPlayer^.PlaneY, ASource, ADest, AOrigin, ARotation, ATint);
+    EndShaderMode();
+  else
+    DrawTexturePro(LPlayer^.Frame, ASource, ADest, AOrigin, ARotation, ATint);
+  end;
+end;
+
+/// Draws the current frame at its own size with its top left at (APosX, APosY), as
+/// DrawTexture draws (nothing before the first frame)
+/// @since 0.1
+public routine cpplink DrawVideo(const AVideo: Video; const APosX: int32; const APosY: int32;
+  const ATint: Color);
+var
+  LSource: Rectangle;
+  LDest: Rectangle;
+begin
+  LSource := Rectangle(x: 0.0f, y: 0.0f, width: float32(AVideo.width),
+    height: float32(AVideo.height));
+  LDest := Rectangle(x: float32(APosX), y: float32(APosY), width: LSource.width,
+    height: LSource.height);
+  DrawVideoPro(AVideo, LSource, LDest, Vector2(x: 0.0f, y: 0.0f), 0.0f, ATint);
 end;
 
 end.
