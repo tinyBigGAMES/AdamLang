@@ -98,8 +98,13 @@
   its flags read as ucrt's _sopen reads them (the access mode's rights,
   _O_APPEND, _O_TRUNC / _O_CREAT / _O_EXCL as CreateFile's dispositions,
   the text flags' mode and ccs=, _O_TEMPORARY as D), and answers its
-  descriptor; _close of it closes the handle. Any other path or number is
-  ucrt's. mingw's oldnames (open, read, lseek, fstat ..) reach these hooks
+  descriptor; _close of it closes the handle. _dup / _dup2 of a handle's
+  number give a number of its own that shares the file pointer and copies
+  the lowio state (text mode, append, Ctrl-Z end), as ucrt's: a _dup2
+  onto a handle's number makes the FILE holding it read and write the
+  source's file; _fdopen / _wfdopen open a FILE on a handle's number that
+  runs on its lowio state (fclose closes the number). Any other path or
+  number is ucrt's. mingw's oldnames (open, read, lseek, fstat ..) reach these hooks
   as libcextras aliases of the ucrt imports.
 
   A failed parameter check of ucrt's (fread_s' buffer too small, no
@@ -155,6 +160,9 @@ const
   // lowio's largest read (INT_MAX) and write (UINT_MAX - 1) at a time
   ADAM_HOOKIO_LOW_READ_MAX: int64 = int64(INT_MAX);
   ADAM_HOOKIO_LOW_WRITE_MAX: int64 = 4294967294;
+  // ucrt's lowio table size (corecrt_internal_lowio.h: IOINFO_ARRAYS x IOINFO_ARRAY_ELTS, no
+  // public header): _dup2's target must be below it
+  _NHANDLE_: int32 = 8192;
   // fputs's result on success (ucrt's)
   ADAM_HOOKIO_PUTS_OK: int32 = 0;
   // How far ucrt counts a string conversion with no precision (INT_MAX)
@@ -220,6 +228,10 @@ const
   // The file a handle's descriptor is reserved on (ucrt's _open of it: read-only, binary, not
   // inherited), so the number is the CRT's own and no other open gets it while it is held
   ADAM_HOOKIO_RESERVE_PATH: string = "NUL";
+
+// A handle names the handles its description and its _fdopen number are on (Desc, Low),
+// declared below
+forward type HookHandle;
 
 type
 
@@ -304,7 +316,17 @@ type
   // DescriptorOwned: a lowio open made the handle (_close closes it); DescriptorClosed: _close
   // ran on a fileno one (its calls and the stream's own lowio calls are ucrt's on a number
   // that is not open: EBADF, the invalid parameter handler; the number stays reserved until
-  // fclose)
+  // fclose). Desc: the internal handle holding the open file description this handle's number
+  // runs on (the IO, its ownership and entry use, the file pointer: Position), one user of it
+  // held; nil: its own. The first _dup / _dup2 of a number moves its handle's description there
+  // (DoShareDescriptionLocked), so a dup shares the file pointer while its lowio state (text
+  // mode, Ctrl-Z end, append, rights: ucrt's _osfile / _textmode / _tm_unicode) is its own.
+  // Low: the handle whose number and lowio state an _fdopen FILE runs on (one user held); nil:
+  // its own; Descriptor is then that number, never listed under this FILE. Description: an
+  // internal description handle (no number, never in the open list): its IO is closed and its
+  // entry use given back when its last user goes. Joined: how deep this handle is inside its
+  // stream lock's calls; the outermost one takes the shared state in (DoJoinLocked) and gives
+  // it back (DoPartLocked)
   HookHandle = record
     Base: HookStream;
     Mode: FileMode;
@@ -327,6 +349,24 @@ type
     Descriptor: int32;
     DescriptorOwned: bool;
     DescriptorClosed: bool;
+    Desc: ptr to HookHandle;
+    Low: ptr to HookHandle;
+    Description: bool;
+    Joined: int64;
+  end;
+
+  // A number's lowio state as ucrt's _dup / _dup2 copy it to the new number (_osfile less
+  // FNOINHERIT, _textmode, _tm_unicode): the rights, FAPPEND, FTEXT, the text mode, FPIPE,
+  // FEOFLAG, FCRLF
+  HookLowState = record
+    Mode: FileMode;
+    Appending: bool;
+    Text: bool;
+    LowText: HookLowText;
+    WideText: bool;
+    Pipe: bool;
+    LowEof: bool;
+    LowCrlf: bool;
   end;
 
   // One descriptor number of a handle (GDescriptors): Number, a CRT descriptor ucrt reserved
@@ -635,6 +675,10 @@ type
   SetmodeFn = routine(const AFile: int32; const AMode: int32): int32;
   ChsizeSFn = routine(const AFile: int32; const ASize: int64): int32;
   ChsizeFn = routine(const AFile: int32; const ASize: clong): int32;
+  // _dup2, _fdopen, _wfdopen (_dup is FdIntFn's form)
+  Dup2Fn = routine(const AFile: int32; const ATarget: int32): int32;
+  FdopenFn = routine(const AFile: int32; const AMode: ptr to const char): ptr;
+  WfdopenFn = routine(const AFile: int32; const AMode: ptr to const wchar): ptr;
   // ucrt's stat family of a UTF-16 path (_wstat32 .. _wstat64i32; the narrow ones are
   // Stat64i32Fn's form)
   WstatFn = routine(const APath: ptr to const wchar; const ABuf: ptr): int32;
@@ -761,6 +805,10 @@ var
   GRealChsizeS: ptr;
   GRealChsize: ptr;
   GRealGetOsfhandle: ptr;
+  GRealDup: ptr;
+  GRealDup2: ptr;
+  GRealFdopen: ptr;
+  GRealWfdopen: ptr;
   GRealFstat32: ptr;
   GRealFstat32i64: ptr;
   GRealFstat64i32: ptr;
@@ -1093,14 +1141,51 @@ begin
   return LHandle;
 end;
 
-// Frees a handle no one holds any more, its stream lock's user given back first
+// ucrt's _invalid_parameter_noinfo after an errno, defined below
+forward routine DoInvalidParameter(const AErrno: int32);
+
+// One user of a handle given back, defined below
+forward routine DoReleaseHandle(const AHandle: ptr to HookHandle);
+
+// A handle's descriptor given up, defined with the descriptors below
+forward routine DoDropDescriptor(const AHandle: ptr to HookHandle);
+
+// Frees a handle no one holds any more: a description's IO closed, its entry use given back and
+// a folder source of its own closed (the last number on it is gone, as the OS closes the file
+// object with its last handle); a number still held given up; its stream lock's user given
+// back; then the users it holds of a description (Desc) and of an _fdopen FILE's number (Low).
+// errno is kept
 routine DoFreeHandle(const AHandle: ptr to HookHandle);
 var
   LHandle: ptr to HookHandle;
+  LDesc: ptr to HookHandle;
+  LLow: ptr to HookHandle;
+  LError: int32;
 begin
+  LError := CErrno();
+  if AHandle->Description then
+    if AHandle->Base.Owned and (AHandle->Base.Stream <> nil) then
+      IOClose(AHandle->Base.Stream);
+    end;
+    AHandle->Base.Stream := nil;
+    HookIOGiveBackEntry(addr of AHandle->Base, true);
+    HookIOCloseOwnedSource(addr of AHandle->Base);
+  end;
+  if (AHandle->Low = nil) and (AHandle->Descriptor >= 0) then
+    DoDropDescriptor(AHandle);
+  end;
+  LDesc := AHandle->Desc;
+  LLow := AHandle->Low;
   HookIOReleaseLock(AHandle->Base.Lock);
   LHandle := AHandle;
   destroy(LHandle);
+  if LDesc <> nil then
+    DoReleaseHandle(LDesc);
+  end;
+  if LLow <> nil then
+    DoReleaseHandle(LLow);
+  end;
+  SetCErrno(LError);
 end;
 
 // Gives back one user of AHandle; the last one frees it
@@ -1114,6 +1199,104 @@ begin
   end;
   if LFree then
     DoFreeHandle(AHandle);
+  end;
+end;
+
+// The handle whose number and lowio state AHandle's calls run on: an _fdopen FILE's number's
+// handle (Low), else AHandle
+routine DoNumberOf(const AHandle: ptr to HookHandle): ptr to HookHandle;
+begin
+  if AHandle->Low <> nil then
+    return AHandle->Low;
+  end;
+  return AHandle;
+end;
+
+// The handle holding the description (IO, file pointer) AHandle's number runs on: that
+// number's handle's Desc, else that handle
+routine DoPlaceOf(const AHandle: ptr to HookHandle): ptr to HookHandle;
+var
+  LNumber: ptr to HookHandle;
+begin
+  LNumber := DoNumberOf(AHandle);
+  if LNumber->Desc <> nil then
+    return LNumber->Desc;
+  end;
+  return LNumber;
+end;
+
+// AHandle enters a call under its stream lock (the caller holds it; every handle on one
+// description, and an _fdopen FILE with its number, share that lock): the outermost entry takes
+// in its number's lowio state (an _fdopen FILE: its number is closed when that handle closed,
+// _close ran on it, or it gave the number up) and the description's IO and file pointer. A
+// handle on its own state takes nothing
+routine DoJoinLocked(const AHandle: ptr to HookHandle);
+var
+  LNumber: ptr to HookHandle;
+  LPlace: ptr to HookHandle;
+begin
+  AHandle->Joined := AHandle->Joined + 1;
+  if AHandle->Joined > 1 then
+    return;
+  end;
+  LNumber := DoNumberOf(AHandle);
+  if LNumber <> AHandle then
+    AHandle->Mode := LNumber->Mode;
+    AHandle->Appending := LNumber->Appending;
+    AHandle->Text := LNumber->Text;
+    AHandle->LowText := LNumber->LowText;
+    AHandle->WideText := LNumber->WideText;
+    AHandle->Utf8Translated := LNumber->Utf8Translated;
+    AHandle->StartPos := LNumber->StartPos;
+    AHandle->Pipe := LNumber->Pipe;
+    AHandle->Crt.LowEof := LNumber->Crt.LowEof;
+    AHandle->Crt.LowCrlf := LNumber->Crt.LowCrlf;
+    AHandle->Crt.LowLookahead[0] := LNumber->Crt.LowLookahead[0];
+    AHandle->Crt.LowLookahead[1] := LNumber->Crt.LowLookahead[1];
+    AHandle->Crt.LowLookahead[2] := LNumber->Crt.LowLookahead[2];
+    AHandle->DescriptorClosed := LNumber->Closed or LNumber->DescriptorClosed or
+      (LNumber->Descriptor <> AHandle->Descriptor);
+  end;
+  LPlace := DoPlaceOf(AHandle);
+  if LPlace <> AHandle then
+    AHandle->Base.Stream := LPlace->Base.Stream;
+    AHandle->Base.Position := LPlace->Base.Position;
+  end;
+end;
+
+// AHandle leaves a call under its stream lock: the outermost exit gives the lowio state back to
+// its number (an _fdopen FILE whose number is still open) and the file pointer back to the
+// description
+routine DoPartLocked(const AHandle: ptr to HookHandle);
+var
+  LNumber: ptr to HookHandle;
+  LPlace: ptr to HookHandle;
+begin
+  if AHandle->Joined <= 0 then
+    return;
+  end;
+  AHandle->Joined := AHandle->Joined - 1;
+  if AHandle->Joined > 0 then
+    return;
+  end;
+  LNumber := DoNumberOf(AHandle);
+  if (LNumber <> AHandle) and (not AHandle->DescriptorClosed) then
+    LNumber->Appending := AHandle->Appending;
+    LNumber->Text := AHandle->Text;
+    LNumber->LowText := AHandle->LowText;
+    LNumber->WideText := AHandle->WideText;
+    LNumber->Utf8Translated := AHandle->Utf8Translated;
+    LNumber->StartPos := AHandle->StartPos;
+    LNumber->Crt.LowEof := AHandle->Crt.LowEof;
+    LNumber->Crt.LowCrlf := AHandle->Crt.LowCrlf;
+    LNumber->Crt.LowLookahead[0] := AHandle->Crt.LowLookahead[0];
+    LNumber->Crt.LowLookahead[1] := AHandle->Crt.LowLookahead[1];
+    LNumber->Crt.LowLookahead[2] := AHandle->Crt.LowLookahead[2];
+  end;
+  LPlace := DoPlaceOf(AHandle);
+  if (LPlace <> AHandle) and (LPlace->Base.Stream <> nil) and
+    (LPlace->Base.Stream = AHandle->Base.Stream) then
+    LPlace->Base.Position := AHandle->Base.Position;
   end;
 end;
 
@@ -1233,6 +1416,8 @@ end;
 routine DoDropCtrlZ(const AHandle: ptr to HookHandle);
 begin
   lock (AHandle->Base.Lock->Lock) do
+    DoJoinLocked(AHandle);
+    defer DoPartLocked(AHandle);
     DoDropCtrlZLocked(AHandle);
   end;
   AHandle->Base.Position := 0;
@@ -1276,9 +1461,10 @@ var
   LConfigured: bool;
   LOpenErrno: int32;
 begin
-  // ucrt reads the mode before it touches the file
+  // ucrt reads the mode before it touches the file: a mode it refuses is its failed parameter
+  // check (corecrt_internal_stdio.h __acrt_stdio_parse_mode: EINVAL, the handler run)
   if not DoParseMode(AMode, LParsed) then
-    SetCErrno(ADAM_ERRNO_EINVAL);
+    DoInvalidParameter(ADAM_ERRNO_EINVAL);
     return nil;
   end;
   if not AFound then
@@ -1347,6 +1533,8 @@ begin
   // Then the text mode a ccs= open asks for (its BOM read or written), on the shared IO under
   // its stream lock
   lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
     LConfigured := DoConfigureTextMode(LHandle, LParsed);
   end;
   if not LConfigured then
@@ -1555,8 +1743,6 @@ begin
   return true;
 end;
 
-// ucrt's _invalid_parameter_noinfo after an errno, defined below
-forward routine DoInvalidParameter(const AErrno: int32);
 
 // ABuf filled as AKind's stat record with AModeBits, ADevice (st_dev and st_rdev), one link,
 // ASize and no times (an IO has none: 0). AResult 0, or -1 with EOVERFLOW when ASize is past
@@ -3525,6 +3711,8 @@ begin
   for LI := 0 to len(LOpen) - 1 do
     LHandle := LOpen[LI];
     lock (LHandle->Base.Lock->Lock) do
+      DoJoinLocked(LHandle);
+      defer DoPartLocked(LHandle);
       if not LHandle->Closed then
         if DoCrtFlushWrittenLocked(LHandle) <> 0 then
           LResult := ADAM_HOOKIO_EOF;
@@ -3568,6 +3756,8 @@ begin
     LHandle := LOpen[LI];
     LGoing[LI] := false;
     lock (LHandle->Base.Lock->Lock) do
+      DoJoinLocked(LHandle);
+      defer DoPartLocked(LHandle);
       if not LHandle->Closed then
         DoCrtFlushWrittenLocked(LHandle);
         if LHandle->Base.Temporary then
@@ -3640,15 +3830,16 @@ begin
 end;
 
 // AHandle's descriptor (the caller holds its stream lock): the one it holds (closed or not:
-// ucrt's _fileno answers the number a FILE keeps), else a new reservation listed in
-// GDescriptors; -1 with errno when none can be reserved. A success leaves errno as it was
+// ucrt's _fileno answers the number a FILE keeps; an _fdopen FILE's is its number's), else a
+// new reservation listed in GDescriptors; -1 with errno when none can be reserved. A success
+// leaves errno as it was
 routine DoDescriptorLocked(const AHandle: ptr to HookHandle): int32;
 var
   LFile: int32;
   LError: int32;
   LCount: int64;
 begin
-  if AHandle->Descriptor >= 0 then
+  if (AHandle->Descriptor >= 0) or (AHandle->Low <> nil) then
     return AHandle->Descriptor;
   end;
   LError := CErrno();
@@ -3691,7 +3882,8 @@ end;
 
 // AHandle gives its descriptor up (fclose, freopen's close, the _close of the open that made
 // it): out of GDescriptors, the reservation closed, the handle holding none. Nothing when it
-// holds none; errno as it was
+// holds none; an _fdopen FILE only forgets its number's (that number closes through its own
+// handle, DoShutHandle). errno as it was
 routine DoDropDescriptor(const AHandle: ptr to HookHandle);
 var
   LFile: int32;
@@ -3699,6 +3891,10 @@ var
   LCount: int64;
   LI: int64;
 begin
+  if AHandle->Low <> nil then
+    AHandle->Descriptor := -1;
+    return;
+  end;
   LFile := -1;
   lock (GLock) do
     LFile := AHandle->Descriptor;
@@ -3724,17 +3920,201 @@ begin
   end;
 end;
 
+// AHandle's lowio state as ucrt's _dup / _dup2 copy it (the caller holds its stream lock)
+routine DoTakeLowState(const AHandle: ptr to HookHandle): HookLowState;
+var
+  LState: HookLowState;
+begin
+  LState.Mode := AHandle->Mode;
+  LState.Appending := AHandle->Appending;
+  LState.Text := AHandle->Text;
+  LState.LowText := AHandle->LowText;
+  LState.WideText := AHandle->WideText;
+  LState.Pipe := AHandle->Pipe;
+  LState.LowEof := AHandle->Crt.LowEof;
+  LState.LowCrlf := AHandle->Crt.LowCrlf;
+  return LState;
+end;
+
+// AState given to number handle AHandle as ucrt's _dup / _dup2 give it to the new number; what
+// they leave as _alloc_osfhnd made it is reset (no UTF-8 translation pending, _startpos 0, an
+// empty _pipe_lookahead)
+routine DoGiveLowState(const AHandle: ptr to HookHandle; const AState: HookLowState);
+begin
+  AHandle->Mode := AState.Mode;
+  AHandle->Appending := AState.Appending;
+  AHandle->Text := AState.Text;
+  AHandle->LowText := AState.LowText;
+  AHandle->WideText := AState.WideText;
+  AHandle->Pipe := AState.Pipe;
+  AHandle->Crt.LowEof := AState.LowEof;
+  AHandle->Crt.LowCrlf := AState.LowCrlf;
+  AHandle->Utf8Translated := false;
+  AHandle->StartPos := 0;
+  DoClearLookahead(AHandle);
+end;
+
+// The description AHandle's number runs on, made shareable (the caller holds AHandle's stream
+// lock, joined): one it already runs on (Desc), else a new internal Description handle that
+// takes AHandle's IO with its ownership, entry use, D and folder source, and the file pointer,
+// on the same stream lock; AHandle keeps the IO unowned and runs on it from here on, one user
+// of it held. nil with ENOMEM when no handle can be made (AHandle unchanged)
+routine DoShareDescriptionLocked(const AHandle: ptr to HookHandle): ptr to HookHandle;
+var
+  LDesc: ptr to HookHandle;
+begin
+  if AHandle->Desc <> nil then
+    return AHandle->Desc;
+  end;
+  create(LDesc);
+  if LDesc = nil then
+    SetCErrno(ADAM_ERRNO_ENOMEM);
+    return nil;
+  end;
+  LDesc->Users := 1;
+  LDesc->Description := true;
+  LDesc->Base := AHandle->Base;
+  LDesc->Mode := AHandle->Mode;
+  LDesc->Pipe := AHandle->Pipe;
+  LDesc->Descriptor := -1;
+  LDesc->DescriptorOwned := false;
+  LDesc->DescriptorClosed := false;
+  lock (GLock) do
+    LDesc->Base.Lock->Users := LDesc->Base.Lock->Users + 1;
+  end;
+  AHandle->Base.Owned := false;
+  AHandle->Base.Source := nil;
+  AHandle->Base.OwnedSource := nil;
+  AHandle->Base.Temporary := false;
+  AHandle->Desc := LDesc;
+  return LDesc;
+end;
+
+// A new number ANumber (a reservation the caller made, or a number it put a reservation on)
+// that _dup / _dup2 give the lowio state of number handle AHandle (the caller holds its stream
+// lock, joined): a handle in the open list as a lowio open's (DescriptorOwned: _close closes
+// it), on AHandle's description (DoShareDescriptionLocked) and stream lock, listed in
+// GDescriptors. ANumber, or -1 with ENOMEM (the caller closes the reservation)
+routine DoNewNumberLocked(const AHandle: ptr to HookHandle; const ANumber: int32): int32;
+var
+  LDesc: ptr to HookHandle;
+  LNumber: ptr to HookHandle;
+  LCount: int64;
+begin
+  LDesc := DoShareDescriptionLocked(AHandle);
+  if LDesc = nil then
+    return -1;
+  end;
+  create(LNumber);
+  if LNumber = nil then
+    SetCErrno(ADAM_ERRNO_ENOMEM);
+    return -1;
+  end;
+  LNumber->Users := 1;
+  LNumber->Base := LDesc->Base;
+  LNumber->Base.Owned := false;
+  LNumber->Base.Source := nil;
+  LNumber->Base.OwnedSource := nil;
+  LNumber->Base.Temporary := false;
+  DoGiveLowState(LNumber, DoTakeLowState(AHandle));
+  LNumber->Crt.StreamUpdate := LNumber->Mode = FileMode.ReadWrite;
+  LNumber->Crt.StreamRead := LNumber->Mode = FileMode.Read;
+  LNumber->Crt.StreamWrite := LNumber->Mode = FileMode.Write;
+  LNumber->Descriptor := ANumber;
+  LNumber->DescriptorOwned := true;
+  LNumber->DescriptorClosed := false;
+  LNumber->Desc := LDesc;
+  lock (GLock) do
+    LNumber->Base.Lock->Users := LNumber->Base.Lock->Users + 1;
+    LDesc->Users := LDesc->Users + 1;
+    LCount := len(GDescriptors);
+    setlength(GDescriptors, LCount + 1);
+    GDescriptors[LCount].Number := ANumber;
+    GDescriptors[LCount].Handle := LNumber;
+    atomicadd(GDescriptorCount, 1);
+  end;
+  DoAddHandle(LNumber);
+  return ANumber;
+end;
+
+// _dup2's target number handle ATarget follows description ADesc with lowio state AState (the
+// source number's; one user of ADesc the caller took is ATarget's from here): ucrt closes the
+// target's OS handle and puts the source's duplicate on the same number, so a FILE holding it
+// (its own buffer kept) and an _fdopen FILE riding it now read and write the source's file.
+// ATarget's own IO is closed with its entry use and folder source given back (a description it
+// ran on is given up instead); it moves onto ADesc's IO and stream lock, its number and
+// DescriptorOwned kept. errno as it was
+routine DoFollowNumber(const ATarget: ptr to HookHandle; const ADesc: ptr to HookHandle;
+  const AState: HookLowState);
+var
+  LOldLock: ptr to HookStreamLock;
+  LOldDesc: ptr to HookHandle;
+  LOldBase: HookStream;
+  LGiveBack: bool;
+  LError: int32;
+begin
+  LError := CErrno();
+  LOldLock := ATarget->Base.Lock;
+  LOldDesc := nil;
+  LGiveBack := false;
+  lock (LOldLock->Lock) do
+    if ATarget->Desc <> nil then
+      LOldDesc := ATarget->Desc;
+    else
+      if ATarget->Base.Owned and (ATarget->Base.Stream <> nil) then
+        IOClose(ATarget->Base.Stream);
+      end;
+      LOldBase := ATarget->Base;
+      LGiveBack := true;
+    end;
+    ATarget->Base.Stream := ADesc->Base.Stream;
+    ATarget->Base.Owned := false;
+    ATarget->Base.Source := nil;
+    ATarget->Base.OwnedSource := nil;
+    ATarget->Base.Temporary := false;
+    ATarget->Base.Position := ADesc->Base.Position;
+    ATarget->Desc := ADesc;
+    DoGiveLowState(ATarget, AState);
+    ATarget->DescriptorClosed := false;
+    lock (GLock) do
+      ADesc->Base.Lock->Users := ADesc->Base.Lock->Users + 1;
+      ATarget->Base.Lock := ADesc->Base.Lock;
+    end;
+  end;
+  if LGiveBack then
+    HookIOGiveBackEntry(addr of LOldBase, true);
+    HookIOCloseOwnedSource(addr of LOldBase);
+  end;
+  HookIOReleaseLock(LOldLock);
+  if LOldDesc <> nil then
+    DoReleaseHandle(LOldDesc);
+  end;
+  SetCErrno(LError);
+end;
+
+// _close of number handle AHandle, defined with the lowio hooks below
+forward routine DoCloseNumberOf(const AHandle: ptr to HookHandle; var AResult: int32);
+
 // Closes AHandle's stream where it stands (fclose takes it out of the open list first, freopen
 // keeps it there): ucrt's flush of written bytes, its descriptor's close (one _close already
 // closed fails it: EBADF, the invalid parameter handler), its own IO closed, its entry use
 // given back and a folder source of its own closed; then the descriptor is given up
-// (DoDropDescriptor). False when the flush or a close failed (the handle closes anyway)
+// (DoDropDescriptor); an _fdopen FILE's number then closes as ucrt's fclose closes _file
+// (DoCloseNumberOf on its handle). False when the flush or a close failed (the handle closes
+// anyway)
 routine DoShutHandle(const AHandle: ptr to HookHandle): bool;
 var
   LOk: bool;
+  LCloseNumber: bool;
+  LNumberResult: int32;
 begin
   LOk := true;
+  LCloseNumber := false;
   lock (AHandle->Base.Lock->Lock) do
+    DoJoinLocked(AHandle);
+    defer DoPartLocked(AHandle);
+    LCloseNumber := (AHandle->Low <> nil) and (not AHandle->Closed) and
+      (not AHandle->DescriptorClosed);
     if not AHandle->Closed then
       // ucrt's fclose flushes the written bytes first; a failure makes the close EOF
       if DoCrtFlushLocked(AHandle) <> 0 then
@@ -3757,6 +4137,12 @@ begin
     LOk := false;
   end;
   DoDropDescriptor(AHandle);
+  if LCloseNumber then
+    DoCloseNumberOf(AHandle->Low, LNumberResult);
+    if LNumberResult <> 0 then
+      LOk := false;
+    end;
+  end;
   return LOk;
 end;
 
@@ -3901,6 +4287,8 @@ var
   LOld: ptr to HookHandle;
   LNew: ptr to HookHandle;
   LOldLock: ptr to HookStreamLock;
+  LOldDesc: ptr to HookHandle;
+  LOldLow: ptr to HookHandle;
   LUsers: int64;
   LNewFile: ptr;
   LSource: IOSource;
@@ -3956,10 +4344,13 @@ begin
   // The new state at the old address. The old record keeps its users (the open list's, this
   // call's, any other call's); its closed stream's lock is given back and the new one's taken
   // over, so the freed new record gives no lock back. A real path's folder source is the
-  // stream's from here (closed with it, DoShutHandle)
+  // stream's from here (closed with it, DoShutHandle). The description and the _fdopen number
+  // the old stream ran on are given up
   lock (GLock) do
     LUsers := LOld->Users;
     LOldLock := LOld->Base.Lock;
+    LOldDesc := LOld->Desc;
+    LOldLow := LOld->Low;
     LOld^ := LNew^;
     LOld->Users := LUsers;
     LNew->Base.Lock := nil;
@@ -3967,6 +4358,12 @@ begin
   LOld->Base.OwnedSource := LSource;
   HookIOReleaseLock(LOldLock);
   DoFreeHandle(LNew);
+  if LOldDesc <> nil then
+    DoReleaseHandle(LOldDesc);
+  end;
+  if LOldLow <> nil then
+    DoReleaseHandle(LOldLow);
+  end;
   DoReleaseHandle(LOld);
   AResult := AFile;
   return true;
@@ -5456,6 +5853,8 @@ begin
     return false;
   end;
   lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
     if LHandle->Closed then
       SetCErrno(ADAM_ERRNO_EBADF);
     else
@@ -7449,6 +7848,8 @@ begin
     return nil;
   end;
   lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
     LStream := LHandle->Base.Stream;
   end;
   DoReleaseHandle(LHandle);
@@ -8672,6 +9073,8 @@ begin
     return false;
   end;
   lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
     if not DoFdGone(LHandle) then
       if int64(ACount) > ADAM_HOOKIO_LOW_READ_MAX then
         DoInvalidParameter(ADAM_ERRNO_EINVAL);
@@ -8708,6 +9111,8 @@ begin
     return false;
   end;
   lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
     if not DoFdGone(LHandle) then
       if int64(ACount) = 0 then
         AResult := 0;
@@ -8742,6 +9147,8 @@ begin
     return false;
   end;
   lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
     if not DoFdGone(LHandle) then
       LKeep := LHandle->Base.Position;
       LEof := LHandle->Crt.LowEof;
@@ -8779,6 +9186,8 @@ begin
     return false;
   end;
   lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
     if not DoFdGone(LHandle) then
       LHere := DoFdSeekLocked(LHandle, 0, ADAM_HOOKIO_SEEK_CUR);
       if LHere >= 0 then
@@ -8820,6 +9229,8 @@ begin
     return false;
   end;
   lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
     if not DoFdGone(LHandle) then
       if IOFlush(LHandle->Base.Stream) then
         AResult := 0;
@@ -8841,28 +9252,44 @@ end;
 routine DoFdClose(const AFile: int32; var AResult: int32): bool;
 var
   LHandle: ptr to HookHandle;
-  LOwned: bool;
-  LClosed: int32;
 begin
   AResult := -1;
   LHandle := DoFindDescriptor(AFile);
   if LHandle = nil then
     return false;
   end;
+  DoCloseNumberOf(LHandle, AResult);
+  DoReleaseHandle(LHandle);
+  return true;
+end;
+
+// _close of the number number handle AHandle holds (DoFdClose, an _fdopen FILE's fclose): AResult
+// 0, or -1 with errno: a closed number EBADF (the handler run); a lowio open's or a dup's
+// number closes its handle (DoClose: a failed close of its IO EIO); a FILE's own number is
+// marked closed (DoFdClose)
+routine DoCloseNumberOf(const AHandle: ptr to HookHandle; var AResult: int32);
+var
+  LOwned: bool;
+  LClosed: int32;
+begin
+  AResult := -1;
   LOwned := false;
-  lock (LHandle->Base.Lock->Lock) do
-    if not DoFdGone(LHandle) then
-      if LHandle->DescriptorOwned then
+  lock (AHandle->Base.Lock->Lock) do
+    DoJoinLocked(AHandle);
+    defer DoPartLocked(AHandle);
+    if not DoFdGone(AHandle) then
+      if AHandle->DescriptorOwned then
         LOwned := true;
       else
-        LHandle->DescriptorClosed := true;
+        AHandle->DescriptorClosed := true;
         AResult := 0;
       end;
     end;
   end;
   if LOwned then
-    // The open list's handle (DoFdOpen added it); a close that raced this one took it first
-    if not DoClose(ptr(LHandle), LClosed) then
+    // The open list's handle (DoFdOpen / DoNewNumberLocked added it); a close that raced this
+    // one took it first
+    if not DoClose(ptr(AHandle), LClosed) then
       DoInvalidParameter(ADAM_ERRNO_EBADF);
     else
       if LClosed = 0 then
@@ -8872,8 +9299,6 @@ begin
       end;
     end;
   end;
-  DoReleaseHandle(LHandle);
-  return true;
 end;
 
 // The fstat family on descriptor AFile when it is a handle's, filling ABuf as AKind's record
@@ -8901,6 +9326,8 @@ begin
     return true;
   end;
   lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
     if not DoFdGone(LHandle) then
       if LHandle->Pipe then
         DoFillStat(ABuf, AKind, _S_IFIFO, uint32(AFile), 0, AResult);
@@ -8985,6 +9412,8 @@ begin
     return true;
   end;
   lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
     if not DoFdGone(LHandle) then
       AResult := DoSetmodeLocked(LHandle, AMode);
     end;
@@ -9076,6 +9505,8 @@ begin
     return false;
   end;
   lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
     if not DoFdGone(LHandle) then
       if ASize < 0 then
         DoInvalidParameter(ADAM_ERRNO_EINVAL);
@@ -9105,7 +9536,210 @@ begin
     return false;
   end;
   lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
     DoFdGone(LHandle);
+  end;
+  DoReleaseHandle(LHandle);
+  return true;
+end;
+
+// _dup of descriptor AFile when it is a handle's (dup.cpp). False: not a handle's. True:
+// AResult the new number (a reservation, DoNewNumberLocked: the file pointer shared, the lowio
+// state copied), or -1 with errno: a closed number EBADF (the handler run), no number left
+// (ucrt's EMFILE from the reservation's open), ENOMEM. A success leaves errno as it was
+routine DoFdDup(const AFile: int32; var AResult: int32): bool;
+var
+  LHandle: ptr to HookHandle;
+  LNumber: int32;
+  LError: int32;
+begin
+  AResult := -1;
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle = nil then
+    return false;
+  end;
+  LError := CErrno();
+  lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
+    if not DoFdGone(LHandle) then
+      LNumber := DoReserveDescriptor();
+      if LNumber >= 0 then
+        AResult := DoNewNumberLocked(LHandle, LNumber);
+        if AResult < 0 then
+          DoCloseReserved(LNumber);
+        else
+          SetCErrno(LError);
+        end;
+      end;
+    end;
+  end;
+  DoReleaseHandle(LHandle);
+  return true;
+end;
+
+// _dup2 of descriptor ASource onto ATarget when ASource is a handle's (dup2.cpp). False:
+// ASource is no handle's (ucrt's own; a real source onto a handle's number is LX3d3e3a3's). True:
+// AResult 0, or -1 with errno: a closed source EBADF, then a target outside [0, _NHANDLE_)
+// EBADF (ucrt's parameter checks in that order, the handler run); the same number 0 with
+// nothing done. A target that is a handle's number follows the source (DoFollowNumber: its own
+// IO closed, a FILE holding it reads and writes the source's file from here); any other
+// target gets a reservation put on it by ucrt's own _dup2 (which closes a real file open there,
+// and gives a number past the table EMFILE / ucrt's errno), then the source's lowio state
+// (DoNewNumberLocked). A success leaves errno as it was
+routine DoFdDup2(const ASource: int32; const ATarget: int32; var AResult: int32): bool;
+var
+  LHandle: ptr to HookHandle;
+  LTarget: ptr to HookHandle;
+  LDesc: ptr to HookHandle;
+  LState: HookLowState;
+  LFound: ptr;
+  LReal: Dup2Fn;
+  LReserve: int32;
+  LPut: int32;
+  LError: int32;
+  LFollow: bool;
+begin
+  AResult := -1;
+  LHandle := DoFindDescriptor(ASource);
+  if LHandle = nil then
+    return false;
+  end;
+  LError := CErrno();
+  LTarget := nil;
+  if ATarget <> ASource then
+    LTarget := DoFindDescriptor(ATarget);
+  end;
+  LFollow := false;
+  LDesc := nil;
+  lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
+    // ucrt's FOPEN check on the source first (EBADF, the handler run)
+    if not DoFdGone(LHandle) then
+      if (ATarget < 0) or (ATarget >= _NHANDLE_) then
+        DoInvalidParameter(ADAM_ERRNO_EBADF);
+      else
+        if ATarget = ASource then
+          AResult := 0;
+        else
+          if LTarget <> nil then
+            // The target follows outside this lock (its own may differ): the description held
+            // for it here
+            LDesc := DoShareDescriptionLocked(LHandle);
+            if LDesc <> nil then
+              lock (GLock) do
+                LDesc->Users := LDesc->Users + 1;
+              end;
+              LState := DoTakeLowState(LHandle);
+              LFollow := true;
+            end;
+          else
+            LReserve := DoReserveDescriptor();
+            if LReserve >= 0 then
+              // The reservation may itself be the free target (ucrt hands out the lowest)
+              LPut := 0;
+              if LReserve <> ATarget then
+                LFound := DoReal(GRealDup2, ptr to const char("_dup2"));
+                LPut := -1;
+                if LFound <> nil then
+                  LReal := Dup2Fn(LFound);
+                  LPut := LReal(LReserve, ATarget);
+                end;
+                DoCloseReserved(LReserve);
+              end;
+              if LPut = 0 then
+                // _dup2 answers 0, not the number
+                AResult := DoNewNumberLocked(LHandle, ATarget);
+                if AResult < 0 then
+                  DoCloseReserved(ATarget);
+                else
+                  AResult := 0;
+                end;
+              end;
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
+  if LFollow then
+    DoFollowNumber(LTarget, LDesc, LState);
+    AResult := 0;
+  end;
+  if AResult = 0 then
+    SetCErrno(LError);
+  end;
+  if LTarget <> nil then
+    DoReleaseHandle(LTarget);
+  end;
+  DoReleaseHandle(LHandle);
+  return true;
+end;
+
+// _fdopen / _wfdopen (AMode UTF-8) of descriptor AFile when it is a handle's (fdopen.cpp).
+// False: not a handle's. True: AResult a new FILE on that number (Low: its lowio state and
+// file pointer are the number's, so a _setmode of its _fileno changes it; fclose closes the
+// number), or nil with errno: a closed number EBADF, a mode ucrt's parse refuses EINVAL (the
+// handler run for both), ENOMEM. The FILE's stream flags are the mode's (r _IOREAD, w / a _IOWRITE,
+// + _IOUPDATE); its rights and text mode stay the number's
+routine DoFdFdopen(const AFile: int32; const AMode: string; var AResult: ptr): bool;
+var
+  LHandle: ptr to HookHandle;
+  LFile: ptr to HookHandle;
+  LPlace: ptr to HookHandle;
+  LParsed: HookOpenMode;
+  LError: int32;
+begin
+  AResult := nil;
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle = nil then
+    return false;
+  end;
+  LError := CErrno();
+  LFile := nil;
+  lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
+    if not DoFdGone(LHandle) then
+      if not DoParseMode(AMode, LParsed) then
+        DoInvalidParameter(ADAM_ERRNO_EINVAL);
+      else
+        create(LFile);
+        if LFile = nil then
+          SetCErrno(ADAM_ERRNO_ENOMEM);
+        else
+          LPlace := DoPlaceOf(LHandle);
+          LFile->Users := 1;
+          LFile->Base := LHandle->Base;
+          LFile->Base.Stream := LPlace->Base.Stream;
+          LFile->Base.Position := LPlace->Base.Position;
+          LFile->Base.Owned := false;
+          LFile->Base.Source := nil;
+          LFile->Base.OwnedSource := nil;
+          LFile->Base.Temporary := false;
+          LFile->Low := LHandle;
+          LFile->Descriptor := AFile;
+          LFile->DescriptorOwned := false;
+          LFile->DescriptorClosed := false;
+          LFile->Mode := LHandle->Mode;
+          LFile->Crt.StreamUpdate := LParsed.Mode = FileMode.ReadWrite;
+          LFile->Crt.StreamRead := LParsed.Mode = FileMode.Read;
+          LFile->Crt.StreamWrite := (LParsed.Mode = FileMode.Write) or
+            (LParsed.Mode = FileMode.Append);
+          lock (GLock) do
+            LFile->Base.Lock->Users := LFile->Base.Lock->Users + 1;
+            LHandle->Users := LHandle->Users + 1;
+          end;
+        end;
+      end;
+    end;
+  end;
+  if LFile <> nil then
+    DoAddHandle(LFile);
+    SetCErrno(LError);
+    AResult := ptr(LFile);
   end;
   DoReleaseHandle(LHandle);
   return true;
@@ -9249,6 +9883,8 @@ begin
     return true;
   end;
   lock (LHandle->Base.Lock->Lock) do
+    DoJoinLocked(LHandle);
+    defer DoPartLocked(LHandle);
     AResult := DoDescriptorLocked(LHandle);
     if AResult >= 0 then
       LHandle->DescriptorOwned := true;
@@ -9847,6 +10483,102 @@ begin
   end;
   LReal := FdInt64Fn(LFound);
   return LReal(AFile);
+end;
+
+// _dup (mingw's oldnames dup reaches it too): a handle's descriptor's dup (DoFdDup), else
+// ucrt's
+public routine _dup(const AFile: int32): int32;
+var
+  LResult: int32;
+  LFound: ptr;
+  LReal: FdIntFn;
+begin
+  if DoFdDup(AFile, LResult) then
+    return LResult;
+  end;
+  LFound := DoReal(GRealDup, ptr to const char("_dup"));
+  if LFound = nil then
+    return -1;
+  end;
+  LReal := FdIntFn(LFound);
+  return LReal(AFile);
+end;
+
+// _dup2 (mingw's oldnames dup2 reaches it too): a handle's descriptor onto ATarget
+// (DoFdDup2), else ucrt's
+public routine _dup2(const AFile: int32; const ATarget: int32): int32;
+var
+  LResult: int32;
+  LFound: ptr;
+  LReal: Dup2Fn;
+begin
+  if DoFdDup2(AFile, ATarget, LResult) then
+    return LResult;
+  end;
+  LFound := DoReal(GRealDup2, ptr to const char("_dup2"));
+  if LFound = nil then
+    return -1;
+  end;
+  LReal := Dup2Fn(LFound);
+  return LReal(AFile, ATarget);
+end;
+
+// _fdopen (mingw's oldnames fdopen reaches it too): a FILE on a handle's descriptor
+// (DoFdFdopen), else ucrt's. ucrt checks the mode before the number: a nil one is EINVAL with
+// the handler run, whoever's the number is
+public routine _fdopen(const AFile: int32; const AMode: ptr to const char): ptr;
+var
+  LResult: ptr;
+  LFound: ptr;
+  LReal: FdopenFn;
+begin
+  if AMode = nil then
+    DoInvalidParameter(ADAM_ERRNO_EINVAL);
+    return nil;
+  end;
+  if DoFdFdopen(AFile, StringFromC(AMode), LResult) then
+    return LResult;
+  end;
+  LFound := DoReal(GRealFdopen, ptr to const char("_fdopen"));
+  if LFound = nil then
+    return nil;
+  end;
+  LReal := FdopenFn(LFound);
+  return LReal(AFile, AMode);
+end;
+
+// _wfdopen: _fdopen with a UTF-16 mode (DoFdFdopen over its UTF-8; one ucrt cannot convert is
+// EINVAL), else ucrt's
+public routine _wfdopen(const AFile: int32; const AMode: ptr to const wchar): ptr;
+var
+  LResult: ptr;
+  LMode: string;
+  LFound: ptr;
+  LReal: WfdopenFn;
+  LClosed: bool;
+  LHandle: ptr to HookHandle;
+begin
+  if AMode = nil then
+    DoInvalidParameter(ADAM_ERRNO_EINVAL);
+    return nil;
+  end;
+  LHandle := DoFindDescriptor(AFile);
+  if LHandle <> nil then
+    DoReleaseHandle(LHandle);
+    if not DoNarrow(AMode, LMode) then
+      SetCErrno(ADAM_ERRNO_EINVAL);
+      return nil;
+    end;
+    if DoFdFdopen(AFile, LMode, LResult) then
+      return LResult;
+    end;
+  end;
+  LFound := DoReal(GRealWfdopen, ptr to const char("_wfdopen"));
+  if LFound = nil then
+    return nil;
+  end;
+  LReal := WfdopenFn(LFound);
+  return LReal(AFile, AMode);
 end;
 
 // The stat family of a narrow path through its real function (AName, ASlot its slot) when the
