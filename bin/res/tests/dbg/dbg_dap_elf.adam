@@ -1,0 +1,230 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  dbg_dap_elf.adam - Adam's debug adapter running another target's program
+  (PLAN-LINUX64, the editor's Run of an x86_64-linux-gnu build): launch's
+  "target" names the program's triple. Session elf runs the ELF
+  linux.linux_run_elf built (its dep) with noDebug: started through WSL in
+  its own folder, its argument passed, its lines and exit code 5 as for a
+  program of this host. Session refused: debugging it (no noDebug) is
+  refused (no debugger for that target), a missing ELF is refused, and a
+  "target" that is no known triple is a bad argument
+*******************************************************************************/
+
+/*
+@@test
+  kind run
+  runs x86_64-linux-gnu
+  deps linux.linux_run_elf
+  exitcode 0
+  | == elf
+  | <- initialize
+  | <- launch
+  | -> initialized
+  | <- configurationDone
+  |    | linux_run_elf 1
+  |    | arg dap
+  |    | [Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+  | -> exited 5
+  | -> terminated
+  | <- disconnect
+  | == exit 0
+  | == refused
+  | <- initialize
+  | <- launch failed: this adam has no debugger for x86_64-linux-gnu
+  | <- launch failed: the program to debug, '<dir>/linux_run_elf.missing', does not exist
+  | <- launch failed: launch: the argument 'target' is missing or wrong
+  | <- disconnect
+  | == exit 0
+  | [Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+@@end
+*/
+
+module exe dbg_dap_elf;
+
+@addmodulepath "$P:../src";
+
+import System.SysUtils, System.Json, Adam.Protocol.Transport, Adam.Debug.DAP;
+
+type
+  // The client's side: requests in order (none sent while the program runs), every message
+  // the adapter writes printed short (<- a response, -> an event, the program's lines as |)
+  ScriptChannel = object(ProtocolChannel)
+    FInput: string;
+    FAt: int64;
+    FSeq: int64;
+    FOutput: string;
+    // The ELF's folder, '/' separated: shown as <dir> in a message
+    FDir: string;
+
+    method Request(const ACommand: string; const AArguments: Json);
+    var
+      LRequest: Json;
+      LBody: string;
+    begin
+      self.FSeq := self.FSeq + 1;
+      LRequest.Add("seq", self.FSeq);
+      LRequest.Add("type", "request");
+      LRequest.Add("command", ACommand);
+      LRequest.Add("arguments", AArguments);
+      LBody := LRequest.ToString();
+      self.FInput := self.FInput + "Content-Length: " + IntToStr(len(LBody)) + "\r\n\r\n" + LBody;
+    end;
+
+    override method ReadBytes(const ABuffer: ptr; const ASize: int64): int64;
+    var
+      LCount: int64;
+      LDest: ptr to uint8;
+      LI: int64;
+    begin
+      LCount := len(self.FInput) - self.FAt;
+      if LCount > ASize then
+        LCount := ASize;
+      end;
+      LDest := ptr to uint8(ABuffer);
+      for LI := 0 to LCount - 1 do
+        LDest[LI] := uint8(self.FInput[self.FAt + LI]);
+      end;
+      self.FAt := self.FAt + LCount;
+      return LCount;
+    end;
+
+    // A client waits for each answer: nothing is pending while the program runs
+    override method HasPending(): bool;
+    begin
+      return false;
+    end;
+
+    override method WriteBytes(const ABuffer: ptr to const; const ASize: int64): bool;
+    var
+      LText: string;
+      LAt: int64;
+    begin
+      LText := StringFromC(ptr to const char(ABuffer), ASize);
+      LAt := IndexOf("\r\n\r\n", LText, 0);
+      self.Print(Substring(LText, LAt + 4, len(LText) - LAt - 4));
+      return true;
+    end;
+
+    // The program's output kept until a line is whole
+    method TakeLines(const AText: string);
+    var
+      LAt: int64;
+    begin
+      self.FOutput := self.FOutput + AText;
+      LAt := IndexOf("\n", self.FOutput, 0);
+      while LAt >= 0 do
+        println("   | {}", TrimRight(Substring(self.FOutput, 0, LAt)));
+        self.FOutput := Substring(self.FOutput, LAt + 1, len(self.FOutput) - LAt - 1);
+        LAt := IndexOf("\n", self.FOutput, 0);
+      end;
+    end;
+
+    // One message the adapter wrote, short (thread events left out: WSL's own threads)
+    method Print(const ABody: string);
+    var
+      LMessage: Json;
+      LEvent: string;
+    begin
+      LMessage := Json.FromString(ABody);
+      if LMessage.Get("type").AsString() = "response" then
+        if LMessage.Get("success").AsBoolean() then
+          println("<- {}", LMessage.Get("command").AsString());
+        else
+          println("<- {} failed: {}", LMessage.Get("command").AsString(),
+            ReplaceStr(ReplaceStr(LMessage.Get("message").AsString(), "\\", "/"), self.FDir,
+            "<dir>"));
+        end;
+        return;
+      end;
+      LEvent := LMessage.Get("event").AsString();
+      if LEvent = "output" then
+        if LMessage.Get("body.category").AsString() = "stdout" then
+          self.TakeLines(LMessage.Get("body.output").AsString());
+        else
+          println("-> output {}: {}", LMessage.Get("body.category").AsString(),
+            TrimRight(LMessage.Get("body.output").AsString()));
+        end;
+        return;
+      end;
+      if LEvent = "thread" then
+        return;
+      end;
+      if LEvent = "exited" then
+        println("-> exited {}", LMessage.Get("body.exitCode").AsInt64());
+        return;
+      end;
+      println("-> {}", LEvent);
+    end;
+  end;
+
+// A session over AChannel: its exit code printed
+routine DoServe(const ATitle: string; const AChannel: ref ScriptChannel);
+var
+  LCode: int32;
+begin
+  println("== {}", ATitle);
+  LCode := RunDap(ref ProtocolTransport(AChannel), nil);
+  println("== exit {}", LCode);
+end;
+
+// A launch's arguments: the program, a target, noDebug, through a pipe
+routine DoLaunchArgs(const AProgram: string; const ATarget: string; const ANoDebug: bool): Json;
+var
+  LJson: Json;
+begin
+  LJson.Add("program", AProgram);
+  LJson.Add("target", ATarget);
+  LJson.Add("terminal", false);
+  if ANoDebug then
+    LJson.Add("noDebug", true);
+  end;
+  return LJson;
+end;
+
+var
+  GC: ref ScriptChannel;
+  GNone: Json;
+  GArgs: Json;
+  GElf: string;
+
+begin
+  // The dep's ELF: <OUT>/bin/x86_64-linux-gnu/debug/linux_run_elf, beside this cell's folder
+  GElf := ReplaceStr(ExtractFileDir(ExtractFileDir(ExtractFileDir(paramstr(0)))), "\\", "/") +
+    "/x86_64-linux-gnu/debug/linux_run_elf";
+
+  // Session elf: the ELF only runs (an editor's Run of a linux build)
+  GC := ref ScriptChannel();
+  GC.FDir := ExtractFileDir(GElf);
+  GC.Request("initialize", GNone);
+  GArgs := DoLaunchArgs(GElf, "x86_64-linux-gnu", true);
+  GArgs.BeginArray("args");
+  GArgs.Add("dap");
+  GArgs.EndArray();
+  GC.Request("launch", GArgs);
+  GC.Request("configurationDone", GNone);
+  GC.Request("disconnect", GNone);
+  DoServe("elf", GC);
+
+  // Session refused: debugged, missing, an unknown target
+  GC := ref ScriptChannel();
+  GC.FDir := ExtractFileDir(GElf);
+  GC.Request("initialize", GNone);
+  GC.Request("launch", DoLaunchArgs(GElf, "x86_64-linux-gnu", false));
+  GC.Request("launch", DoLaunchArgs(GElf + ".missing", "x86_64-linux-gnu", true));
+  GC.Request("launch", DoLaunchArgs(GElf, "x86_64-nowhere-gnu", true));
+  GC.Request("disconnect", GNone);
+  DoServe("refused", GC);
+end.

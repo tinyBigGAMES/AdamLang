@@ -41,8 +41,10 @@
   (terminalInput / terminalResize -> adamTerminalInput / adamTerminalResize);
   launch asks for the tab's size.
   Run (F9, D5e): the same session with DAP's noDebug: adam dap builds the
-  program at the toolbar's level (a default: the source's @optimize wins)
-  and only runs it; no breakpoints are sent, nothing stops, no pause.
+  program at the toolbar's level and target (defaults: the source's
+  @optimize / @target win) and only runs it; no breakpoints are sent,
+  nothing stops, no pause. Another target's program runs where this machine
+  runs it (an x86_64-linux-gnu ELF through WSL); Debug needs the host's.
 */
 'use strict';
 
@@ -910,6 +912,7 @@ var AdamDebug = (function () {
         if (gNoDebug) {
           LArgs.noDebug = true;
           LArgs.optimize = gDeps.getBuildMode();
+          LArgs.target = gDeps.getTarget();
         }
         if (LHost) {
           LArgs.host = LHost;
@@ -962,10 +965,11 @@ var AdamDebug = (function () {
       gDeps.outputLine(who() + ': a build is running: stop it first (Shift+F5).');
       return;
     }
-    // The program runs on this machine: Run too needs the host's target
-    if (gDeps.getTarget() !== ADAM_DEBUG_TARGET) {
+    // Debug needs the host's target; Run asks adam dap, which runs another
+    // target's program where this machine can (an ELF through WSL) or says why not
+    if (!gNoDebug && gDeps.getTarget() !== ADAM_DEBUG_TARGET) {
       gDeps.showPanel('output');
-      gDeps.outputLine(who() + ': programs run on ' + ADAM_DEBUG_TARGET + ' only: pick it as the target.');
+      gDeps.outputLine(who() + ': programs are debugged on ' + ADAM_DEBUG_TARGET + ' only: pick it as the target.');
       return;
     }
     // Claimed before any await, so a second F5 during the saves is a no-op
