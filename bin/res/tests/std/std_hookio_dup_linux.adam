@@ -1,0 +1,368 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  std_hookio_dup_linux.adam - a HookIO handle's descriptor copied on linux
+  (PLAN-LINUX64 LX3d3e1): dup of a zip entry handle's fileno shares its
+  place and outlives the stream's fclose; dup2 / dup3 of an open(2)
+  descriptor onto a real number (self, flag and closed-number refusals),
+  a real descriptor dup2'd over a handle's number (glibc's from then on);
+  fcntl F_DUPFD / F_DUPFD_CLOEXEC at a minimum, F_GETFL / F_SETFL
+  (O_APPEND) on a registered memory IO; fdopen of an open(2) descriptor
+  (its fclose closes the number), its mode refusals, and of a dup whose
+  stream outlives the FILE the description came from.
+*******************************************************************************/
+
+/*
+@@test
+  kind run
+  targets x86_64-linux-gnu
+  exitcode 0
+  | ok dup shares place
+  | ok dup fstat
+  | ok dup outlives fclose
+  | ok dup2 onto real
+  | ok dup2 refusals
+  | ok dup3
+  | ok copies outlive open
+  | ok dup2 real over handle
+  | ok fcntl dupfd
+  | ok fcntl flags
+  | ok fcntl append
+  | ok closed number
+  | ok fdopen open
+  | ok fdopen refused
+  | ok fdopen fclose closes
+  | ok fdopen dup
+  | ok fdopen dup outlives
+  | done 0
+  | [Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+@@end
+*/
+
+module exe std_hookio_dup_linux;
+
+@ifndef TARGET_X86_64_LINUX_GNU
+@message error "std_hookio_dup_linux runs on x86_64-linux-gnu only: build it with -t x86_64-linux-gnu";
+@endif
+
+import System.SysUtils, System.Runtime, System.CustomIO, System.HookIO, System.HookIO.Linux64;
+
+const
+  // fcntl.h / unistd.h / sys/stat.h / errno.h (x86_64 glibc)
+  O_RDONLY: int32 = 0;
+  O_RDWR: int32 = 2;
+  O_TRUNC: int32 = 0x200;
+  O_APPEND: int32 = 0x400;
+  O_CLOEXEC: int32 = 0x80000;
+  F_DUPFD: int32 = 0;
+  F_GETFL: int32 = 3;
+  F_SETFL: int32 = 4;
+  F_DUPFD_CLOEXEC: int32 = 1030;
+  SEEK_SET: int32 = 0;
+  SEEK_CUR: int32 = 1;
+  SEEK_END: int32 = 2;
+  S_IFMT: uint32 = 0xF000u;
+  S_IFREG: uint32 = 0x8000u;
+  EBADF: int32 = 9;
+  EINVAL: int32 = 22;
+  ADAM_TEST_ZIP: string = "$P:../../../../res/tests/std/fixtures/std_customio_stored.zip";
+  ADAM_TEST_SIZE: int64 = 12;
+  // The lowest number F_DUPFD is asked for (above anything this row opens)
+  ADAM_TEST_MIN_FD: int32 = 50;
+
+type
+  // glibc's struct stat (x86_64, 144 bytes)
+  StatBuf = record
+    st_dev: uint64;
+    st_ino: uint64;
+    st_nlink: uint64;
+    st_mode: uint32;
+    st_uid: uint32;
+    st_gid: uint32;
+    pad0: int32;
+    st_rdev: uint64;
+    st_size: int64;
+    st_blksize: int64;
+    st_blocks: int64;
+    st_atime: int64;
+    st_atimensec: int64;
+    st_mtime: int64;
+    st_mtimensec: int64;
+    st_ctime: int64;
+    st_ctimensec: int64;
+    reserved: array[0..2] of int64;
+  end;
+
+var
+  GFails: int32;
+  // The entry's own bytes (CreateZipFileIO), what every read is compared with
+  GBytes: array[0..11] of uint8;
+
+routine Check(const AName: string; const AOk: bool);
+begin
+  if AOk then
+    println("ok {}", AName);
+  else
+    println("FAIL {}", AName);
+    GFails := GFails + 1;
+  end;
+end;
+
+// True when the ACount bytes at AData are the entry's from AFrom
+routine SameAs(const AData: ptr; const AFrom: int64; const ACount: int64): bool;
+var
+  LData: ptr to uint8;
+  LI: int64;
+begin
+  LData := ptr to uint8(AData);
+  for LI := 0 to ACount - 1 do
+    if LData[LI] <> GBytes[AFrom + LI] then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// A call's failure: -1 and errno AError (errno cleared by the caller before the call)
+routine FailedWith(const AAnswer: int64; const AError: int32): bool;
+begin
+  return (AAnswer = -1) and (CErrno() = AError);
+end;
+
+// open(2) of an Adam text path (its C copy freed after the call)
+routine OpenFd(const APath: string; const AFlags: int32): int32;
+var
+  LPath: ptr to char;
+  LFile: int32;
+begin
+  LPath := StringToC(APath);
+  LFile := open(LPath, AFlags, 420);
+  freemem(LPath);
+  return LFile;
+end;
+
+// fopen of an Adam text path and mode
+routine OpenPath(const APath: string; const AMode: string): ptr;
+var
+  LPath: ptr to char;
+  LMode: ptr to char;
+  LFile: ptr;
+begin
+  LPath := StringToC(APath);
+  LMode := StringToC(AMode);
+  LFile := fopen(LPath, LMode);
+  freemem(LPath);
+  freemem(LMode);
+  return LFile;
+end;
+
+// fdopen of AFile in an Adam text mode
+routine StreamOf(const AFile: int32; const AMode: string): ptr;
+var
+  LMode: ptr to char;
+  LFile: ptr;
+begin
+  LMode := StringToC(AMode);
+  LFile := fdopen(AFile, LMode);
+  freemem(LMode);
+  return LFile;
+end;
+
+// fstat of AFile: a regular file of ASize bytes
+routine RegularOf(const AFile: int32; const ASize: int64): bool;
+var
+  LStat: StatBuf;
+begin
+  if fstat(AFile, addr of LStat) <> 0 then
+    return false;
+  end;
+  return ((LStat.st_mode & S_IFMT) = S_IFREG) and (LStat.st_size = ASize);
+end;
+
+// read(2) of ACount bytes from AFile: the entry's from AFrom
+routine ReadsAs(const AFile: int32; const AFrom: int64; const ACount: int64): bool;
+var
+  LBuffer: array[0..15] of uint8;
+begin
+  return (read(AFile, addr of LBuffer[0], uint64(ACount)) = ACount) and
+    SameAs(addr of LBuffer[0], AFrom, ACount);
+end;
+
+// dup of a stream's fileno: one place for both numbers, the copy alive after fclose
+routine TestDup(const APrefix: string);
+var
+  LFile: ptr;
+  LFd: int32;
+  LCopy: int32;
+  LBuffer: array[0..15] of uint8;
+begin
+  LFile := OpenPath(APrefix + "/hello.txt", "rb");
+  LFd := fileno(LFile);
+  LCopy := dup(LFd);
+  Check("dup shares place", (LFd >= 0) and (LCopy >= 0) and (LCopy <> LFd) and
+    (lseek(LFd, 3, SEEK_SET) = 3) and (lseek(LCopy, 0, SEEK_CUR) = 3) and ReadsAs(LCopy, 3, 2) and
+    (lseek(LFd, 0, SEEK_CUR) = 5));
+  Check("dup fstat", RegularOf(LCopy, ADAM_TEST_SIZE));
+  // The stream closes; the copy's description lives on (its place where it was)
+  SetCErrno(0);
+  Check("dup outlives fclose", (fclose(LFile) = 0) and (lseek(LCopy, 0, SEEK_CUR) = 5) and
+    ReadsAs(LCopy, 5, 4) and (lseek(LCopy, 0, SEEK_SET) = 0) and ReadsAs(LCopy, 0, 5) and
+    RegularOf(LCopy, ADAM_TEST_SIZE) and (close(LCopy) = 0) and
+    FailedWith(read(LCopy, addr of LBuffer[0], 1u), EBADF));
+end;
+
+// dup2 / dup3 of an open(2) descriptor, and a real descriptor dup2'd over a handle's number
+routine TestDupTo(const APrefix: string);
+var
+  LFd: int32;
+  LTarget: int32;
+  LOther: int32;
+  LReal: int32;
+  LOver: int32;
+  LBuffer: array[0..15] of uint8;
+begin
+  LFd := OpenFd(APrefix + "/hello.txt", O_RDONLY);
+  LTarget := OpenFd("/dev/null", O_RDONLY);
+  LOther := OpenFd("/dev/null", O_RDONLY);
+  Check("dup2 onto real", (LFd >= 0) and (LTarget >= 0) and (dup2(LFd, LTarget) = LTarget) and
+    ReadsAs(LTarget, 0, 4) and (lseek(LFd, 0, SEEK_CUR) = 4) and RegularOf(LTarget, ADAM_TEST_SIZE));
+  SetCErrno(0);
+  Check("dup2 refusals", (dup2(LFd, LFd) = LFd) and FailedWith(dup3(LFd, LFd, 0), EINVAL) and
+    FailedWith(dup3(LFd, LOther, 1), EINVAL));
+  Check("dup3", (dup3(LFd, LOther, O_CLOEXEC) = LOther) and ReadsAs(LOther, 4, 3) and
+    (lseek(LTarget, 0, SEEK_CUR) = 7));
+  // The open's own number closes; the description lives while its copies do
+  Check("copies outlive open", (close(LFd) = 0) and ReadsAs(LTarget, 7, 2) and (close(LTarget) = 0) and
+    ReadsAs(LOther, 9, 3) and (close(LOther) = 0));
+  // A real descriptor copied over a handle's number: the number is glibc's /dev/null from then
+  LFd := OpenFd(APrefix + "/hello.txt", O_RDONLY);
+  LReal := OpenFd("/dev/null", O_RDONLY);
+  LOver := dup2(LReal, LFd);
+  Check("dup2 real over handle", (LFd >= 0) and (LReal >= 0) and (LOver = LFd) and
+    (read(LFd, addr of LBuffer[0], 4u) = 0) and (close(LFd) = 0) and (close(LReal) = 0));
+end;
+
+// fcntl on a registered memory IO opened read-write: copies at a minimum, the status flags
+routine TestFcntl();
+var
+  LMemory: IO;
+  LPrefix: string;
+  LFd: int32;
+  LCopy: int32;
+  LCloseCopy: int32;
+  LText: array[0..2] of uint8;
+  LBack: array[0..7] of uint8;
+  LOk: bool;
+begin
+  LText[0] := 97u;
+  LText[1] := 98u;
+  LText[2] := 99u;
+  LMemory := CreateMemoryIO();
+  LPrefix := RegisterIO(LMemory);
+  LFd := OpenFd(LPrefix, O_RDWR | O_TRUNC);
+  LCopy := fcntl(LFd, F_DUPFD, ADAM_TEST_MIN_FD);
+  LCloseCopy := fcntl(LFd, F_DUPFD_CLOEXEC, ADAM_TEST_MIN_FD);
+  Check("fcntl dupfd", (LFd >= 0) and (LCopy >= ADAM_TEST_MIN_FD) and
+    (LCloseCopy > LCopy) and (write(LCopy, addr of LText[0], 3u) = 3) and
+    (lseek(LFd, 0, SEEK_CUR) = 3) and (lseek(LCloseCopy, 0, SEEK_CUR) = 3));
+  Check("fcntl flags", (fcntl(LFd, F_GETFL) = O_RDWR) and (fcntl(LCopy, F_SETFL, O_APPEND) = 0) and
+    (fcntl(LCloseCopy, F_GETFL) = (O_RDWR | O_APPEND)));
+  // O_APPEND on the description: a write after a seek to 0 lands at the end
+  LOk := (lseek(LFd, 0, SEEK_SET) = 0) and (write(LFd, addr of LText[0], 2u) = 2) and
+    (lseek(LFd, 0, SEEK_CUR) = 5) and (lseek(LFd, 0, SEEK_END) = 5) and
+    (pread(LFd, addr of LBack[0], 5u, 0) = 5) and (LBack[0] = 97u) and (LBack[3] = 97u) and
+    (LBack[4] = 98u);
+  Check("fcntl append", LOk and (close(LFd) = 0) and (close(LCopy) = 0) and (close(LCloseCopy) = 0) and
+    (IOSize(LMemory) = 5));
+  UnregisterIO(LPrefix);
+  IOClose(LMemory);
+end;
+
+// A fileno number close(2) closed: every call on it EBADF, the stream's fclose too
+routine TestClosed(const APrefix: string);
+var
+  LFile: ptr;
+  LFd: int32;
+  LOk: bool;
+begin
+  LFile := OpenPath(APrefix + "/hello.txt", "rb");
+  LFd := fileno(LFile);
+  SetCErrno(0);
+  LOk := (LFd >= 0) and (close(LFd) = 0) and FailedWith(dup(LFd), EBADF);
+  SetCErrno(0);
+  LOk := LOk and FailedWith(dup2(LFd, LFd), EBADF) and FailedWith(fcntl(LFd, F_GETFL), EBADF);
+  SetCErrno(0);
+  LOk := LOk and (StreamOf(LFd, "rb") = nil) and (CErrno() = EBADF);
+  SetCErrno(0);
+  Check("closed number", LOk and FailedWith(fclose(LFile), EBADF));
+end;
+
+// fdopen of an open(2) descriptor and of a dup of a stream's number
+routine TestFdopen(const APrefix: string);
+var
+  LFd: int32;
+  LFile: ptr;
+  LFirst: ptr;
+  LCopy: int32;
+  LSecond: ptr;
+  LBuffer: array[0..15] of uint8;
+begin
+  LFd := OpenFd(APrefix + "/hello.txt", O_RDONLY);
+  LFile := StreamOf(LFd, "rb");
+  Check("fdopen open", (LFile <> nil) and (fileno(LFile) = LFd) and
+    (fread(addr of LBuffer[0], 1, ADAM_TEST_SIZE, LFile) = ADAM_TEST_SIZE) and
+    SameAs(addr of LBuffer[0], 0, ADAM_TEST_SIZE) and (lseek(LFd, 0, SEEK_CUR) = ADAM_TEST_SIZE));
+  SetCErrno(0);
+  Check("fdopen refused", (StreamOf(LFd, "wb") = nil) and (CErrno() = EINVAL) and
+    (StreamOf(LFd, "r+") = nil) and (StreamOf(LFd, "q") = nil));
+  // The FILE owns the number: its fclose closes it (and the open's description with it)
+  SetCErrno(0);
+  Check("fdopen fclose closes", (fclose(LFile) = 0) and
+    FailedWith(read(LFd, addr of LBuffer[0], 1u), EBADF));
+  // A FILE on a dup: its reads move the place both numbers share
+  LFirst := OpenPath(APrefix + "/hello.txt", "rb");
+  LCopy := dup(fileno(LFirst));
+  LSecond := StreamOf(LCopy, "rb");
+  Check("fdopen dup", (LSecond <> nil) and (fileno(LSecond) = LCopy) and
+    (fread(addr of LBuffer[0], 1, 4, LSecond) = 4) and SameAs(addr of LBuffer[0], 0, 4) and
+    (lseek(fileno(LFirst), 0, SEEK_CUR) = ADAM_TEST_SIZE));
+  // The first stream closes: the second's description lives on
+  Check("fdopen dup outlives", (fclose(LFirst) = 0) and (fseek(LSecond, 2, SEEK_SET) = 0) and
+    (fread(addr of LBuffer[0], 1, 3, LSecond) = 3) and SameAs(addr of LBuffer[0], 2, 3) and
+    RegularOf(LCopy, ADAM_TEST_SIZE) and (fclose(LSecond) = 0));
+end;
+
+var
+  LZip: IOSource;
+  LDirect: IO;
+  LPrefix: string;
+begin
+  LDirect := CreateZipFileIO(ADAM_TEST_ZIP, "hello.txt");
+  if (LDirect = nil) or (IORead(LDirect, addr of GBytes[0], ADAM_TEST_SIZE) <> ADAM_TEST_SIZE) then
+    println("FAIL fixture");
+    GFails := GFails + 1;
+  end;
+  IOClose(LDirect);
+  LZip := CreateZipIOSource(ADAM_TEST_ZIP);
+  LPrefix := RegisterIOSource(LZip);
+  TestDup(LPrefix);
+  TestDupTo(LPrefix);
+  TestFcntl();
+  TestClosed(LPrefix);
+  TestFdopen(LPrefix);
+  UnregisterIO(LPrefix);
+  IOSourceClose(LZip);
+  println("done {}", GFails);
+end.
