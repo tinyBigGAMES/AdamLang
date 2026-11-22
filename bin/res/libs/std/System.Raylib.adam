@@ -1,0 +1,965 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.Raylib.adam - raylib extended (PaskalCPP's raylib_ext): over
+  System.Raylib.C, every raylib routine that loads data from a file name
+  gets a form taking a System.CustomIO IO in its place, `<Name>IO(...)`:
+  pass the IO CreateZipFileIO gives and raylib loads from a zip, pass any
+  IO and it loads from that.
+
+  The IO forms run through System.HookIO's hooks: each registers the IO
+  for the call (RegisterIO), hands raylib's own file-name form the path
+  `io://<n>/file<type>`, and unregisters it when raylib returns. raylib
+  opens and reads that path with its own fopen / fread / fseek / ftell,
+  which the hooks give the IO, so the result is the file-name form's for a
+  file of the same bytes, read the way raylib reads files (text mode on
+  Windows for LoadFileText included), and is unloaded the same way
+  (UnloadFileData, UnloadFileText, UnloadImage, ...). The extension is what
+  raylib picks a decoder by. The IO is read from its start; it stays the
+  caller's: these routines never close it.
+
+  A music stream (LoadMusicStreamIO) is read while it plays, so its IO stays
+  registered until UnloadMusicStreamIO. The loaders that read files beside
+  the one named (LoadModelIO, LoadMaterialsIO, LoadModelAnimationsIO: a
+  glTF's .bin, an OBJ's .mtl, textures) take an IOSource and a path in it:
+  the source is registered for the call (RegisterIOSource) and raylib finds
+  every sibling in it by its path, through the same hooks. SetRaylibIOSource
+  makes an IOSource raylib's whole file system (its four file callbacks and
+  HookIO's path source).
+
+  An IO that cannot be registered (nil, no room) is handed to raylib as a
+  path no prefix answers (`io://0/file<type>`): raylib gives what it gives
+  for a missing file (nil, size 0, an empty image, ...) with its own
+  warning.
+
+  The unit names no OS: the hooked C names it calls (fopen, fread ..) are
+  the HookIO platform unit's the target triple picks.
+*******************************************************************************/
+
+module unit System.Raylib;
+
+import System.SysUtils, System.Collections, System.Raylib.C, System.CustomIO, System.HookIO, System.HookIO.Core
+@ifdef TARGET_X86_64_WINDOWS_GNU
+  , System.HookIO.Win64
+@elseif TARGET_X86_64_LINUX_GNU
+  , System.HookIO.Linux64
+@endif
+  ;
+
+const
+  // The prefix no registration ever gives: its paths open as missing files
+  ADAM_RAYLIB_NO_PREFIX: string = "io://0";
+  // The first room a source callback's whole-file read takes, doubled as it fills
+  ADAM_RAYLIB_READ_START: int64 = 65536;
+  // The most bytes raylib's int counts
+  ADAM_RAYLIB_READ_MAX: int64 = 2147483647;
+
+var
+  // The IOSource SetRaylibIOSource last made HookIO's path source (nil: none).
+  // SetRaylibIOSource is one setting for the program, not for several threads
+  // at once (as raylib's callbacks are not), so it needs no lock.
+  GPathSource: IOSource;
+  // The prefix of the IOSource SetRaylibIOSource made raylib's file system
+  // ("" when none), under GSourceLock. The lock is held only to read or swap
+  // the text, never while a file is opened (the hooks take their own).
+  GSourceLock: mutex;
+  GSourcePrefix: string;
+  // The prefix each music stream from LoadMusicStreamIO keeps registered until
+  // UnloadMusicStreamIO, by the stream's ctxData address (unique while it
+  // plays), under GMusicLock
+  GMusicLock: mutex;
+  GMusicPrefixes: Map<uint64, string>;
+
+// Records ASource as the path source SetRaylibIOSource set
+routine DoRememberPathSource(const ASource: IOSource);
+begin
+  GPathSource := ASource;
+end;
+
+// Unsets HookIO's path source when it is still the one SetRaylibIOSource set; a
+// path source the program set since (SetIOPathSource) stays
+routine DoForgetPathSource();
+begin
+  if GPathSource <> nil then
+    HookIOResetPathSourceIf(GPathSource);
+  end;
+  GPathSource := nil;
+end;
+
+// The current source's prefix ("" when none), read under its lock
+routine DoSourcePrefix(): string;
+var
+  LPrefix: string;
+begin
+  lock (GSourceLock) do
+    LPrefix := GSourcePrefix;
+  end;
+  return LPrefix;
+end;
+
+// True when AName holds "io://" at AAt
+routine DoIsIOPath(const AName: string; const AAt: int64): bool;
+begin
+  if len(AName) - AAt < 5 then
+    return false;
+  end;
+  return (AName[AAt] = 'i') and (AName[AAt + 1] = 'o') and (AName[AAt + 2] = ':') and
+    (AName[AAt + 3] = '/') and (AName[AAt + 4] = '/');
+end;
+
+// The path raylib's AFileName names in the current source: an io:// path as it
+// is (an IO form's own; after any leading "./" or ".\", which raylib writes
+// before a folder with no root, as HookIO reads it), any other as
+// `<prefix>/<name>` with '\' turned to '/' and every leading "./" or '/' dropped
+// (a source's paths are relative). With no source set, AFileName as it is.
+routine DoSourcePath(const AFileName: ptr to const char): string;
+var
+  LName: string;
+  LPrefix: string;
+  LSkip: int64;
+  LAt: int64;
+  LI: int64;
+  LDropping: bool;
+begin
+  LName := "";
+  if AFileName <> nil then
+    LName := StringFromC(AFileName);
+  end;
+  LPrefix := DoSourcePrefix();
+  if len(LPrefix) = 0 then
+    return LName;
+  end;
+  // An IO form's own path, behind the current-folder steps raylib adds
+  LSkip := 0;
+  while (len(LName) >= LSkip + 2) and (LName[LSkip] = '.') and
+    ((LName[LSkip + 1] = '/') or (LName[LSkip + 1] = '\\')) do
+    LSkip := LSkip + 2;
+  end;
+  if DoIsIOPath(LName, LSkip) then
+    return LName;
+  end;
+  for LI := 0 to len(LName) - 1 do
+    if LName[LI] = '\\' then
+      LName[LI] := '/';
+    end;
+  end;
+  // Every leading "./" and '/', in any order
+  LAt := 0;
+  LDropping := true;
+  while LDropping do
+    LDropping := false;
+    if (len(LName) - LAt >= 2) and (LName[LAt] = '.') and (LName[LAt + 1] = '/') then
+      LAt := LAt + 2;
+      LDropping := true;
+    else
+      if (len(LName) - LAt >= 1) and (LName[LAt] = '/') then
+        LAt := LAt + 1;
+        LDropping := true;
+      end;
+    end;
+  end;
+  return LPrefix + "/" + Substring(LName, LAt, len(LName) - LAt);
+end;
+
+// AText as a NUL-ended C copy for one call (an Adam string has no terminator), freed by
+// DoFreeCText; nil when there is no room (raylib then reports an invalid file name)
+routine DoCText(const AText: string): ptr to char;
+begin
+  return StringToC(AText);
+end;
+
+// Frees a DoCText copy (nil: nothing)
+routine DoFreeCText(const AText: ptr to char);
+begin
+  if AText <> nil then
+    freemem(AText);
+  end;
+end;
+
+// The whole file at APath, opened with AMode through the hooks, in memory from
+// raylib's allocator (UnloadFileData / UnloadFileText free it) with AExtra zero
+// bytes after it. nil (ASize 0) when it cannot be opened or read, is empty
+// (raylib's loaders give nil for an empty file), or holds more than an int counts.
+routine DoReadFile(const APath: string; const AMode: ptr to const char; const AExtra: int64;
+  var ASize: int32): ptr to uint8;
+var
+  LName: ptr to char;
+  LFile: ptr;
+  LData: ptr to uint8;
+  LGrown: ptr to uint8;
+  LCapacity: int64;
+  LCount: int64;
+  LGrow: int64;
+  LWant: int64;
+  LGot: int64;
+  LFailed: bool;
+  LI: int64;
+begin
+  ASize := 0;
+  LName := DoCText(APath);
+  if LName = nil then
+    return nil;
+  end;
+  LFile := fopen(LName, AMode);
+  DoFreeCText(LName);
+  if LFile = nil then
+    return nil;
+  end;
+  LData := nil;
+  LCapacity := 0;
+  LCount := 0;
+  LFailed := false;
+  while true do
+    // Room for one more byte past the count and the extra zero bytes
+    if LCount + AExtra + 1 > LCapacity then
+      LGrow := ADAM_RAYLIB_READ_START;
+      if LCapacity > 0 then
+        LGrow := LCapacity * 2;
+      end;
+      if LGrow > ADAM_RAYLIB_READ_MAX then
+        LFailed := true;
+        leave;
+      end;
+      LGrown := ptr to uint8(MemRealloc(LData, uint32(LGrow)));
+      if LGrown = nil then
+        LFailed := true;
+        leave;
+      end;
+      LData := LGrown;
+      LCapacity := LGrow;
+    end;
+    LWant := LCapacity - LCount - AExtra;
+    LGot := fread(LData + LCount, 1, LWant, LFile);
+    LCount := LCount + LGot;
+    if LGot < LWant then
+      LFailed := ferror(LFile) <> 0;
+      leave;
+    end;
+  end;
+  fclose(LFile);
+  if LFailed or (LCount = 0) then
+    MemFree(LData);
+    return nil;
+  end;
+  for LI := 0 to AExtra - 1 do
+    LData[LCount + LI] := 0;
+  end;
+  ASize := int32(LCount);
+  return LData;
+end;
+
+// raylib's file callbacks while a source is set: each opens the source's path
+// through the hooks, as raylib's own file functions would open it
+routine clink DoLoadData(fileName: ptr to const char; dataSize: ptr to int32): ptr to uint8;
+var
+  LSize: int32;
+  LData: ptr to uint8;
+begin
+  LData := DoReadFile(DoSourcePath(fileName), "rb", 0, LSize);
+  if LData = nil then
+    TraceLog(LOG_WARNING, "FILEIO: [%s] Failed to load file from the IO source", fileName);
+  end;
+  if dataSize <> nil then
+    dataSize^ := LSize;
+  end;
+  return LData;
+end;
+
+routine clink DoLoadText(fileName: ptr to const char): ptr to char;
+var
+  LSize: int32;
+  LText: ptr to char;
+begin
+  // Text mode, as raylib's LoadFileText opens a file
+  LText := ptr to char(DoReadFile(DoSourcePath(fileName), "rt", 1, LSize));
+  if LText = nil then
+    TraceLog(LOG_WARNING, "FILEIO: [%s] Failed to load text file from the IO source", fileName);
+  end;
+  return LText;
+end;
+
+routine clink DoSaveData(fileName: ptr to const char; data: ptr to const; dataSize: int32): bool;
+var
+  LPath: ptr to char;
+  LFile: ptr;
+  LWritten: int64;
+  LWant: int64;
+  LClosed: bool;
+begin
+  LPath := DoCText(DoSourcePath(fileName));
+  LFile := nil;
+  if LPath <> nil then
+    LFile := fopen(LPath, "wb");
+    DoFreeCText(LPath);
+  end;
+  if LFile = nil then
+    TraceLog(LOG_WARNING, "FILEIO: [%s] Failed to save file to the IO source", fileName);
+    return false;
+  end;
+  LWritten := 0;
+  LWant := 0;
+  if dataSize > 0 then
+    LWant := dataSize;
+  end;
+  if (data <> nil) and (LWant > 0) then
+    LWritten := fwrite(ptr(data), 1, LWant, LFile);
+  end;
+  LClosed := fclose(LFile) = 0;
+  return LClosed and (LWritten = LWant);
+end;
+
+routine clink DoSaveText(fileName: ptr to const char; text: ptr to const char): bool;
+var
+  LPath: ptr to char;
+  LFile: ptr;
+  LOk: bool;
+begin
+  LPath := DoCText(DoSourcePath(fileName));
+  // Text mode, as raylib's SaveFileText opens a file
+  LFile := nil;
+  if LPath <> nil then
+    LFile := fopen(LPath, "wt");
+    DoFreeCText(LPath);
+  end;
+  if LFile = nil then
+    TraceLog(LOG_WARNING, "FILEIO: [%s] Failed to save text file to the IO source", fileName);
+    return false;
+  end;
+  LOk := (text = nil) or (fputs(text, LFile) >= 0);
+  if fclose(LFile) <> 0 then
+    LOk := false;
+  end;
+  return LOk;
+end;
+
+// Makes APrefix ("" for none) the current source and points raylib's four file
+// callbacks at it (none: raylib's own file functions); the prefix it replaces,
+// for the caller to unregister
+routine DoInstallSource(const APrefix: string): string;
+var
+  LReplaced: string;
+  LSet: bool;
+begin
+  LSet := len(APrefix) <> 0;
+  lock (GSourceLock) do
+    LReplaced := GSourcePrefix;
+    GSourcePrefix := APrefix;
+  end;
+  if LSet then
+    SetLoadFileDataCallback(DoLoadData);
+    SetSaveFileDataCallback(DoSaveData);
+    SetLoadFileTextCallback(DoLoadText);
+    SetSaveFileTextCallback(DoSaveText);
+  else
+    SetLoadFileDataCallback(nil);
+    SetSaveFileDataCallback(nil);
+    SetLoadFileTextCallback(nil);
+    SetSaveFileTextCallback(nil);
+  end;
+  return LReplaced;
+end;
+
+// Keeps APrefix for the music stream AKey
+routine DoKeepMusic(const AKey: ptr; const APrefix: string);
+begin
+  lock (GMusicLock) do
+    GMusicPrefixes.Put(uint64(AKey), APrefix);
+  end;
+end;
+
+// Takes (removes) the prefix kept for the music stream AKey; "" when none is
+routine DoTakeMusic(const AKey: ptr): string;
+var
+  LPrefix: string;
+begin
+  LPrefix := "";
+  lock (GMusicLock) do
+    if GMusicPrefixes.TryGet(uint64(AKey), LPrefix) then
+      GMusicPrefixes.Remove(uint64(AKey));
+    end;
+  end;
+  return LPrefix;
+end;
+
+// A letter folded to lower case, as raylib's IsFileExtension compares
+routine DoLowerChar(const AChar: char): char;
+begin
+  if (AChar >= 'A') and (AChar <= 'Z') then
+    return char(uint8(AChar) - uint8('A') + uint8('a'));
+  end;
+  return AChar;
+end;
+
+// True when AFileType (".ttf", ".PNG", ...) is one of the ';'-separated
+// extensions in AList, letter case aside, as raylib's IsFileExtension compares
+routine DoIsType(const AFileType: ptr to const char; const AList: string): bool;
+var
+  LType: string;
+  LItems: array of string;
+  LI: int64;
+  LJ: int64;
+  LSame: bool;
+begin
+  if AFileType = nil then
+    return false;
+  end;
+  LType := StringFromC(AFileType);
+  LItems := SplitString(AList, ";");
+  for LI := 0 to len(LItems) - 1 do
+    if len(LItems[LI]) = len(LType) then
+      LSame := true;
+      for LJ := 0 to len(LType) - 1 do
+        if DoLowerChar(LType[LJ]) <> DoLowerChar(LItems[LI][LJ]) then
+          LSame := false;
+          leave;
+        end;
+      end;
+      if LSame then
+        return true;
+      end;
+    end;
+  end;
+  return false;
+end;
+
+// AIO registered with HookIO for one call: its prefix, or the prefix no
+// registration gives when AIO cannot be registered
+routine DoRegister(const AIO: IO): string;
+var
+  LPrefix: string;
+begin
+  LPrefix := RegisterIO(AIO);
+  if len(LPrefix) = 0 then
+    return ADAM_RAYLIB_NO_PREFIX;
+  end;
+  return LPrefix;
+end;
+
+// ASource registered with HookIO for one call, as DoRegister
+routine DoRegisterSource(const ASource: IOSource): string;
+var
+  LPrefix: string;
+begin
+  LPrefix := RegisterIOSource(ASource);
+  if len(LPrefix) = 0 then
+    return ADAM_RAYLIB_NO_PREFIX;
+  end;
+  return LPrefix;
+end;
+
+// Ends DoRegister's / DoRegisterSource's registration
+routine DoUnregister(const APrefix: string);
+begin
+  if APrefix <> ADAM_RAYLIB_NO_PREFIX then
+    UnregisterIO(APrefix);
+  end;
+end;
+
+// The path raylib is handed: `<prefix>/file<type>` (no type: `<prefix>/file`)
+routine DoPath(const APrefix: string; const AFileType: ptr to const char): string;
+begin
+  if AFileType = nil then
+    return APrefix + "/file";
+  end;
+  return APrefix + "/file" + StringFromC(AFileType);
+end;
+
+/// Loads an IO's bytes as LoadFileData loads a file's (raylib's own
+/// LoadFileData reads it through the hooks), in memory that UnloadFileData
+/// frees. The IO stays the caller's.
+/// @param AIO the stream (CreateZipFileIO's, CreateFileIO's, any IO)
+/// @param ADataSize the byte count; 0 on a failure
+/// @returns the bytes, or nil (with raylib's warning) when the IO is nil,
+///   empty, or cannot be read
+/// @example `LData := LoadFileDataIO(CreateZipFileIO("$P:assets.zip", "level1.bin"), LSize);`
+/// @see LoadFileTextIO
+public routine cpplink LoadFileDataIO(const AIO: IO; var ADataSize: int32): ptr to uint8;
+var
+  LPrefix: string;
+  LPath: ptr to char;
+  LData: ptr to uint8;
+begin
+  LPrefix := DoRegister(AIO);
+  LPath := DoCText(DoPath(LPrefix, nil));
+  LData := LoadFileData(LPath, addr of ADataSize);
+  DoFreeCText(LPath);
+  DoUnregister(LPrefix);
+  return LData;
+end;
+
+/// Loads an IO's bytes as text, as LoadFileText loads a file (raylib's own
+/// LoadFileText reads it through the hooks, in text mode on Windows),
+/// '\0'-terminated, in memory that UnloadFileText frees. The IO stays the
+/// caller's.
+/// @param AIO the stream
+/// @returns the text, or nil (with raylib's warning) when the IO is nil or
+///   cannot be read
+/// @example `LText := LoadFileTextIO(CreateZipFileIO("$P:assets.zip", "intro.txt"));`
+/// @see LoadFileDataIO
+public routine cpplink LoadFileTextIO(const AIO: IO): ptr to char;
+var
+  LPrefix: string;
+  LPath: ptr to char;
+  LText: ptr to char;
+begin
+  LPrefix := DoRegister(AIO);
+  LPath := DoCText(DoPath(LPrefix, nil));
+  LText := LoadFileText(LPath);
+  DoFreeCText(LPath);
+  DoUnregister(LPrefix);
+  return LText;
+end;
+
+/// Loads an image from an IO as LoadImage loads one from a file (raylib's
+/// own LoadImage reads it through the hooks); unload with UnloadImage.
+/// @param AIO the stream
+/// @param AFileType the file type, its extension: ".png", ".jpg", ...
+/// @returns the image; an empty one (data nil) when the IO cannot be read
+///   or its bytes do not decode
+/// @example `LImage := LoadImageIO(CreateZipFileIO("$P:assets.zip", "hero.png"), ".png");`
+/// @see LoadTextureIO
+public routine cpplink LoadImageIO(const AIO: IO; const AFileType: ptr to const char): Image;
+var
+  LPrefix: string;
+  LPath: ptr to char;
+  LImage: Image;
+begin
+  LPrefix := DoRegister(AIO);
+  LPath := DoCText(DoPath(LPrefix, AFileType));
+  LImage := LoadImage(LPath);
+  DoFreeCText(LPath);
+  DoUnregister(LPrefix);
+  return LImage;
+end;
+
+/// Loads raw pixel data from an IO as LoadImageRaw loads it from a file
+/// (raylib's own LoadImageRaw reads it through the hooks): the pixels after
+/// AHeaderSize bytes; unload with UnloadImage.
+/// @param AIO the stream
+/// @param AWidth the image width in pixels
+/// @param AHeight the image height in pixels
+/// @param AFormat a PixelFormat value
+/// @param AHeaderSize bytes to skip before the pixels
+/// @returns the image; an empty one when LoadImageRaw gives one for a file
+///   of the same bytes, or the IO cannot be read
+/// @example `LImage := LoadImageRawIO(LIO, 64, 64, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, 16);`
+/// @see LoadImageIO
+public routine cpplink LoadImageRawIO(const AIO: IO; const AWidth: int32; const AHeight: int32;
+  const AFormat: int32; const AHeaderSize: int32): Image;
+var
+  LPrefix: string;
+  LPath: ptr to char;
+  LImage: Image;
+begin
+  LPrefix := DoRegister(AIO);
+  LPath := DoCText(DoPath(LPrefix, ".raw"));
+  LImage := LoadImageRaw(LPath, AWidth, AHeight, AFormat, AHeaderSize);
+  DoFreeCText(LPath);
+  DoUnregister(LPrefix);
+  return LImage;
+end;
+
+/// Loads an image sequence from an IO as LoadImageAnim loads one from a
+/// file (raylib's own LoadImageAnim reads it through the hooks; frames
+/// appended to the image data); unload with UnloadImage.
+/// @param AIO the stream
+/// @param AFileType the file type: ".gif" (any other image type loads one
+///   frame)
+/// @param AFrames the frame count; 0 on a failure
+/// @returns the image; an empty one on a failure
+/// @example `LAnim := LoadImageAnimIO(LIO, ".gif", LFrames);`
+/// @see LoadImageIO
+public routine cpplink LoadImageAnimIO(const AIO: IO; const AFileType: ptr to const char;
+  var AFrames: int32): Image;
+var
+  LPrefix: string;
+  LPath: ptr to char;
+  LImage: Image;
+begin
+  LPrefix := DoRegister(AIO);
+  LPath := DoCText(DoPath(LPrefix, AFileType));
+  LImage := LoadImageAnim(LPath, addr of AFrames);
+  DoFreeCText(LPath);
+  DoUnregister(LPrefix);
+  return LImage;
+end;
+
+/// Loads a texture from an IO as LoadTexture loads one from a file
+/// (raylib's own LoadTexture reads it through the hooks); unload with
+/// UnloadTexture. Needs a window, as LoadTexture does.
+/// @param AIO the stream
+/// @param AFileType the file type: ".png", ...
+/// @returns the texture; an empty one (id 0) on a failure
+/// @example `LTexture := LoadTextureIO(CreateZipFileIO("$P:assets.zip", "hero.png"), ".png");`
+/// @see LoadImageIO
+public routine cpplink LoadTextureIO(const AIO: IO; const AFileType: ptr to const char): Texture2D;
+var
+  LPrefix: string;
+  LPath: ptr to char;
+  LTexture: Texture2D;
+begin
+  LPrefix := DoRegister(AIO);
+  LPath := DoCText(DoPath(LPrefix, AFileType));
+  LTexture := LoadTexture(LPath);
+  DoFreeCText(LPath);
+  DoUnregister(LPrefix);
+  return LTexture;
+end;
+
+/// Loads a font from an IO as LoadFont loads one from a file (raylib's own
+/// LoadFont reads it through the hooks): a TTF / OTF at raylib's default
+/// size and characters, any image type as an image font. A .fnt reads its
+/// page images by name beside it, which one IO cannot hold, so it is
+/// refused here (an empty font and a warning): route it through an
+/// IOSource. Unload with UnloadFont; needs a window, as LoadFont does.
+/// @param AIO the stream
+/// @param AFileType the file type: ".ttf", ".otf", ".png", ...
+/// @returns the font; on a failure what LoadFont gives for such a file
+/// @example `LFont := LoadFontIO(CreateZipFileIO("$P:assets.zip", "ui.ttf"), ".ttf");`
+/// @see LoadFontExIO
+public routine cpplink LoadFontIO(const AIO: IO; const AFileType: ptr to const char): Font;
+var
+  LPrefix: string;
+  LPath: ptr to char;
+  LFont: Font;
+begin
+  if DoIsType(AFileType, ".fnt") then
+    TraceLog(LOG_WARNING, "FONT: A .fnt reads its pages by name: load it through an IOSource");
+    return LFont;
+  end;
+  LPrefix := DoRegister(AIO);
+  LPath := DoCText(DoPath(LPrefix, AFileType));
+  LFont := LoadFont(LPath);
+  DoFreeCText(LPath);
+  DoUnregister(LPrefix);
+  return LFont;
+end;
+
+/// Loads a font from an IO as LoadFontEx loads one from a file (raylib's
+/// own LoadFontEx reads it through the hooks), at AFontSize with the given
+/// codepoints (nil and 0 for raylib's default set); unload with UnloadFont.
+/// Needs a window.
+/// @param AIO the stream
+/// @param AFileType the file type: ".ttf", ".otf"
+/// @param AFontSize the size the glyphs are made at
+/// @param ACodepoints the codepoints, or nil
+/// @param ACodepointCount how many, or 0
+/// @returns the font; on a failure what LoadFontEx gives for such a file
+/// @example `LFont := LoadFontExIO(LIO, ".ttf", 48, nil, 0);`
+/// @see LoadFontIO
+public routine cpplink LoadFontExIO(const AIO: IO; const AFileType: ptr to const char;
+  const AFontSize: int32; const ACodepoints: ptr to const int32; const ACodepointCount: int32): Font;
+var
+  LPrefix: string;
+  LPath: ptr to char;
+  LFont: Font;
+begin
+  LPrefix := DoRegister(AIO);
+  LPath := DoCText(DoPath(LPrefix, AFileType));
+  LFont := LoadFontEx(LPath, AFontSize, ACodepoints, ACodepointCount);
+  DoFreeCText(LPath);
+  DoUnregister(LPrefix);
+  return LFont;
+end;
+
+/// Loads wave data from an IO as LoadWave loads it from a file (raylib's
+/// own LoadWave reads it through the hooks); unload with UnloadWave.
+/// @param AIO the stream
+/// @param AFileType the file type raylib decodes by: ".wav", ".ogg",
+///   ".mp3", ".qoa", ".flac"
+/// @returns the wave; an empty one (data nil) on a failure
+/// @example `LWave := LoadWaveIO(CreateZipFileIO("$P:assets.zip", "hit.wav"), ".wav");`
+/// @see LoadSoundIO
+public routine cpplink LoadWaveIO(const AIO: IO; const AFileType: ptr to const char): Wave;
+var
+  LPrefix: string;
+  LPath: ptr to char;
+  LWave: Wave;
+begin
+  LPrefix := DoRegister(AIO);
+  LPath := DoCText(DoPath(LPrefix, AFileType));
+  LWave := LoadWave(LPath);
+  DoFreeCText(LPath);
+  DoUnregister(LPrefix);
+  return LWave;
+end;
+
+/// Loads a sound (a sound effect, fully in memory) from an IO as LoadSound
+/// loads one from a file (raylib's own LoadSound reads it through the
+/// hooks); unload with UnloadSound. Needs the audio device, as LoadSound
+/// does.
+/// @param AIO the stream
+/// @param AFileType the file type: ".wav", ".ogg", ".mp3", ".qoa", ".flac"
+/// @returns the sound; an empty one on a failure
+/// @example `LHit := LoadSoundIO(CreateZipFileIO("$P:assets.zip", "hit.wav"), ".wav");`
+/// @see LoadWaveIO
+public routine cpplink LoadSoundIO(const AIO: IO; const AFileType: ptr to const char): Sound;
+var
+  LPrefix: string;
+  LPath: ptr to char;
+  LSound: Sound;
+begin
+  LPrefix := DoRegister(AIO);
+  LPath := DoCText(DoPath(LPrefix, AFileType));
+  LSound := LoadSound(LPath);
+  DoFreeCText(LPath);
+  DoUnregister(LPrefix);
+  return LSound;
+end;
+
+/// Loads a music stream from an IO as LoadMusicStream loads one from a
+/// file: raylib's own LoadMusicStream opens it through the hooks, and every
+/// read and seek while it plays goes to the IO (nothing is read ahead into
+/// memory but what raylib itself reads). The IO stays registered until
+/// UnloadMusicStreamIO, so it must stay open while the music plays. Unload
+/// with UnloadMusicStreamIO, never UnloadMusicStream. Needs the audio
+/// device.
+/// @param AIO the stream
+/// @param AFileType the file type: ".ogg", ".mp3", ".wav", ".qoa", ".flac",
+///   ".xm", ".mod"
+/// @returns the music; an empty one (ctxData nil) on a failure
+/// @example `LSong := LoadMusicStreamIO(CreateZipFileIO("$P:assets.zip", "song.ogg"), ".ogg");`
+/// @see UnloadMusicStreamIO
+public routine cpplink LoadMusicStreamIO(const AIO: IO; const AFileType: ptr to const char): Music;
+var
+  LPrefix: string;
+  LPath: ptr to char;
+  LMusic: Music;
+begin
+  LPrefix := DoRegister(AIO);
+  LPath := DoCText(DoPath(LPrefix, AFileType));
+  LMusic := LoadMusicStream(LPath);
+  DoFreeCText(LPath);
+  if LMusic.ctxData = nil then
+    DoUnregister(LPrefix);
+    return LMusic;
+  end;
+  if LPrefix <> ADAM_RAYLIB_NO_PREFIX then
+    DoKeepMusic(LMusic.ctxData, LPrefix);
+  end;
+  return LMusic;
+end;
+
+/// Unloads a music stream LoadMusicStreamIO gave (UnloadMusicStream), then
+/// ends its IO's registration. The IO stays the caller's, to close after.
+/// @param AMusic the music
+/// @example `UnloadMusicStreamIO(LSong); IOClose(LSongIO);`
+/// @see LoadMusicStreamIO
+public routine cpplink UnloadMusicStreamIO(const AMusic: Music);
+var
+  LPrefix: string;
+begin
+  LPrefix := DoTakeMusic(AMusic.ctxData);
+  UnloadMusicStream(AMusic);
+  if len(LPrefix) <> 0 then
+    UnregisterIO(LPrefix);
+  end;
+end;
+
+/// Loads a shader from two IOs as LoadShader loads one from two files
+/// (raylib's own LoadShader reads them through the hooks); unload with
+/// UnloadShader. Needs a window.
+/// @param AVertex the vertex shader's source, or nil for raylib's default
+///   vertex shader (as LoadShader with NULL)
+/// @param AFragment the fragment shader's source, or nil for the default
+/// @returns the shader; raylib's default shader on a failure, as LoadShader
+///   gives
+/// @example `LShader := LoadShaderIO(nil, CreateZipFileIO("$P:assets.zip", "glow.fs"));`
+public routine cpplink LoadShaderIO(const AVertex: IO; const AFragment: IO): Shader;
+var
+  LVertexPrefix: string;
+  LFragmentPrefix: string;
+  LVertexPath: ptr to char;
+  LFragmentPath: ptr to char;
+  LVertexName: ptr to const char;
+  LFragmentName: ptr to const char;
+  LShader: Shader;
+begin
+  LVertexName := nil;
+  LFragmentName := nil;
+  LVertexPath := nil;
+  LFragmentPath := nil;
+  LVertexPrefix := ADAM_RAYLIB_NO_PREFIX;
+  LFragmentPrefix := ADAM_RAYLIB_NO_PREFIX;
+  if AVertex <> nil then
+    LVertexPrefix := DoRegister(AVertex);
+    LVertexPath := DoCText(DoPath(LVertexPrefix, ".vs"));
+    LVertexName := LVertexPath;
+  end;
+  if AFragment <> nil then
+    LFragmentPrefix := DoRegister(AFragment);
+    LFragmentPath := DoCText(DoPath(LFragmentPrefix, ".fs"));
+    LFragmentName := LFragmentPath;
+  end;
+  LShader := LoadShader(LVertexName, LFragmentName);
+  DoFreeCText(LVertexPath);
+  DoFreeCText(LFragmentPath);
+  DoUnregister(LVertexPrefix);
+  DoUnregister(LFragmentPrefix);
+  return LShader;
+end;
+
+/// Loads an automation event list from an IO as LoadAutomationEventList
+/// loads one from a file (raylib's own loader reads it through the hooks);
+/// unload with UnloadAutomationEventList.
+/// @param AIO the stream (raylib's .rae events); nil gives an empty list
+///   with raylib's capacity, as LoadAutomationEventList(NULL)
+/// @returns the list
+/// @example `LEvents := LoadAutomationEventListIO(CreateZipFileIO("$P:demo.zip", "run.rae"));`
+public routine cpplink LoadAutomationEventListIO(const AIO: IO): AutomationEventList;
+var
+  LPrefix: string;
+  LPath: ptr to char;
+  LList: AutomationEventList;
+begin
+  if AIO = nil then
+    return LoadAutomationEventList(nil);
+  end;
+  LPrefix := DoRegister(AIO);
+  LPath := DoCText(DoPath(LPrefix, ".rae"));
+  LList := LoadAutomationEventList(LPath);
+  DoFreeCText(LPath);
+  DoUnregister(LPrefix);
+  return LList;
+end;
+
+/// Loads a model from an IOSource as LoadModel loads one from a file:
+/// raylib's own LoadModel opens APath in the source through the hooks, and
+/// every file it reads beside it (a glTF's .bin, an OBJ's .mtl, textures)
+/// is read from the source by its path too. Unload with UnloadModel; needs
+/// a window.
+/// @param ASource the files (CreateZipIOSource's, a folder's, any source)
+/// @param APath the model's path in the source: "models/hero.gltf"
+/// @returns the model; what LoadModel gives for a missing file on a failure
+/// @example `LHero := LoadModelIO(CreateZipIOSource("$P:assets.zip"), "models/hero.gltf");`
+/// @see LoadMaterialsIO
+public routine cpplink LoadModelIO(const ASource: IOSource; const APath: string): Model;
+var
+  LPrefix: string;
+  LPath: ptr to char;
+  LModel: Model;
+begin
+  LPrefix := DoRegisterSource(ASource);
+  LPath := DoCText(LPrefix + "/" + APath);
+  LModel := LoadModel(LPath);
+  DoFreeCText(LPath);
+  DoUnregister(LPrefix);
+  return LModel;
+end;
+
+/// Loads the materials of a model file in an IOSource as LoadMaterials
+/// does from a file (through the hooks, siblings from the source too).
+/// @param ASource the files
+/// @param APath the material file's path in the source: "models/hero.mtl"
+/// @param AMaterialCount the count; 0 on a failure
+/// @returns the materials, or what LoadMaterials gives for a missing file
+/// @example `LMats := LoadMaterialsIO(LSource, "models/hero.mtl", LCount);`
+/// @see LoadModelIO
+public routine cpplink LoadMaterialsIO(const ASource: IOSource; const APath: string;
+  var AMaterialCount: int32): ptr to Material;
+var
+  LPrefix: string;
+  LPath: ptr to char;
+  LMaterials: ptr to Material;
+begin
+  LPrefix := DoRegisterSource(ASource);
+  LPath := DoCText(LPrefix + "/" + APath);
+  LMaterials := LoadMaterials(LPath, addr of AMaterialCount);
+  DoFreeCText(LPath);
+  DoUnregister(LPrefix);
+  return LMaterials;
+end;
+
+/// Loads the animations of a model file in an IOSource as
+/// LoadModelAnimations does from a file (through the hooks, siblings from
+/// the source too); unload with UnloadModelAnimations.
+/// @param ASource the files
+/// @param APath the model's path in the source: "models/hero.glb"
+/// @param AAnimCount the count; 0 on a failure
+/// @returns the animations, or what LoadModelAnimations gives for a missing
+///   file
+/// @example `LAnims := LoadModelAnimationsIO(LSource, "models/hero.glb", LCount);`
+/// @see LoadModelIO
+public routine cpplink LoadModelAnimationsIO(const ASource: IOSource; const APath: string;
+  var AAnimCount: int32): ptr to ModelAnimation;
+var
+  LPrefix: string;
+  LPath: ptr to char;
+  LAnimations: ptr to ModelAnimation;
+begin
+  LPrefix := DoRegisterSource(ASource);
+  LPath := DoCText(LPrefix + "/" + APath);
+  LAnimations := LoadModelAnimations(LPath, addr of AAnimCount);
+  DoFreeCText(LPath);
+  DoUnregister(LPrefix);
+  return LAnimations;
+end;
+
+/// Makes an IOSource raylib's file system: raylib's file callbacks
+/// (SetLoadFileDataCallback, SetLoadFileTextCallback and the Save pair)
+/// then open every file name raylib loads or saves in the source, by that
+/// name as a path in it ('\' as '/', a leading "./" or '/' dropped), through
+/// the hooks; text loads and saves in text mode, as raylib's own. Paths the
+/// IO forms hand raylib (`io://...`) still reach their IO. nil restores
+/// raylib's own file functions (the callbacks set to NULL). raylib keeps
+/// one set of callbacks for the process with no user data, so this is one
+/// setting for the whole program, and not for several threads at once, as
+/// raylib's callbacks are not. The source stays the caller's: unset it
+/// (nil) before closing it. Setting it replaces callbacks set by
+/// SetLoadFileDataCallback and the others, and nil leaves none set. It also
+/// makes the source HookIO's path source (SetIOPathSource), so the files
+/// raylib's decoders open by plain path themselves (music streams) come
+/// from it too; nil unsets that path source when it is still the one set
+/// here (one the program set since with SetIOPathSource stays).
+/// @param ASource the files, or nil
+/// @returns false when the source could not be registered (no room):
+///   nothing changed
+/// @example `SetRaylibIOSource(CreateZipIOSource("$P:assets.zip")); LHero := LoadModel("models/hero.gltf");`
+/// @see LoadModelIO
+public routine cpplink SetRaylibIOSource(const ASource: IOSource): bool;
+var
+  LPrefix: string;
+  LReplaced: string;
+begin
+  LPrefix := "";
+  if ASource <> nil then
+    LPrefix := RegisterIOSource(ASource);
+    if len(LPrefix) = 0 then
+      return false;
+    end;
+  end;
+  // The plain paths raylib's own decoders open (music streams) bypass the
+  // callbacks: the path source routes them to the same source. nil unsets only
+  // the path source set here, never one the program set itself.
+  if ASource <> nil then
+    if not SetIOPathSource(ASource) then
+      UnregisterIO(LPrefix);
+      return false;
+    end;
+    DoRememberPathSource(ASource);
+  else
+    DoForgetPathSource();
+  end;
+  LReplaced := DoInstallSource(LPrefix);
+  if len(LReplaced) <> 0 then
+    UnregisterIO(LReplaced);
+  end;
+  return true;
+end;
+
+end.
