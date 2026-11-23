@@ -1,0 +1,1004 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  raven_overworld.adam - a little game: walk Tiny Town, collect its coins,
+  a Raven HUD over a raylib tile map read from Tiled's own files.
+
+  WHAT IT SHOWS
+  - A Tiled map read with System.XML.Ext: maps\overworld.tmx (its size, its
+    title property, a CSV layer, a base64 + zlib layer, the object layer's
+    spawn point and coins with their values) and the tileset it names,
+    maps\tinytown.tsx (its image, its columns, which tiles block the way).
+  - The decor layer decoded the way Tiled wrote it: base64 (raylib's
+    DecodeDataBase64), then zlib (System.Zlib.Ext's ZlibInflate), then
+    little-endian 32-bit tile numbers with Tiled's flip bits masked off.
+  - Pixel-perfect tiles: the world is drawn at the map's own resolution
+    into a render texture, the camera snapped to whole map pixels, so every
+    tile edge sits on a texel edge (no seams between tiles at any scale);
+    that one texture is then drawn scaled into a DPI-scaled frame window
+    (InitFrameWindow), offset by the camera's fraction of a pixel so the
+    scrolling stays smooth. The camera follows the player and stays inside
+    the map.
+  - Movement with collision against the blocked tiles, each axis on its own
+    so the player slides along walls.
+  - Music streamed from the zip (LoadMusicStream: raylib's decoder opens the
+    entry through HookIO), footsteps while walking, a coin sound, a jingle at
+    the end (Kenney's CC0 audio, audio\Kenney-License.txt).
+  - A Raven HUD (ui\overworld.xml) over the game: coins, a score bar, the
+    music's volume and mute, an inventory panel (Tab), an end card with
+    Play again; the HUD lets the mouse through where it draws nothing.
+  - Rounds: the first round's coins lie where the map puts them; Play again
+    scatters them over random tiles the player can reach from the spawn (a
+    flood fill over the tiles that do not block), so no round is the same.
+  - Its last frame is saved as raven_overworld.png beside this file when it
+    exits (Examples.Common's SaveExampleSnapshot), the picture a user sees
+    while browsing the examples.
+
+  ADAM FEATURES ON SHOW
+  - Generators: PlacedTiles(layer) is a `sequence of PlacedTile` that yields
+    only the tiles a layer has; the drawing loop is `for LTile in ...`, and
+    System.XML.Ext's Elements / FindAll are generators too.
+  - Set<int32>: the tileset's blocked tiles; Has answers per step.
+  - List<Coin> with records in it, read and written by index.
+  - Objects with methods: TileMap loads itself and answers Blocked(x, y).
+  - Overloads: TileMap.Blocked(column, row) and Blocked(rectangle).
+  - defer for every resource (audio, music, sound, texture, Raven, window,
+    zip), released in reverse on every way out.
+  - choices + match: the facing direction picks how the player is drawn.
+  - Routine values: each Raven action name is bound to the Adam routine
+    answering it (Examples.Common's BindAction).
+  - Shared code at two levels: examples\common\Examples.Common.adam for
+    what the examples share (OpenAssets, OpenExampleWindow, StartRaven,
+    LoadWindow, BindAction, SaveExampleSnapshot), the std for what any
+    program can use (NormalizePath for the tileset's relative path,
+    FindWidget / SetWidgetText, RandomInt).
+
+  BUILD AND RUN (from repo\bin, the folder of adam.exe and assets.zip)
+    adam build res\examples\raven\raven_overworld.adam -o output -r
+  -r runs the program once built. For linux add -t x86_64-linux-gnu: on
+  Windows -r runs the linux build through WSL2 (its display, WSLg), on
+  linux natively.
+*******************************************************************************/
+
+module exe raven_overworld;
+
+// Adam's icon on the exe and on its window ($P: is adam.exe's folder)
+@exeicon "$P:res/assets/icons/adam.ico";
+
+// The examples' shared unit (Examples.Common) lives in res\examples\common
+@addmodulepath "$P:res/examples/common";
+
+// System.Math before System.Raylib.C: a bare name two imports export is the last one's (BNF
+// sec 1), so raylib's Vector2 / Rectangle are the ones used here
+import System.SysUtils, System.Math, System.Collections, System.CustomIO, System.HookIO,
+  System.XML.C, System.XML.Ext, System.Zlib.Ext, System.Raylib.C, System.Raylib.Ext,
+  System.Raven.C, System.Raven.Ext, System.Raven.Raylib, Examples.Common;
+
+const
+  // Entries of the zip, by their own names (the zip is the path source, Examples.Common's
+  // OpenAssets)
+  MAP_FOLDER: string = "res/assets/maps/";
+  MAP_FILE: string = "overworld.tmx";
+  HUD_XML: string = "res/assets/ui/overworld.xml";
+  // This example under res\examples, for its snapshot (Examples.Common's SaveExampleSnapshot)
+  SNAPSHOT_NAME: string = "raven/raven_overworld";
+  MUSIC_FILE: string = "res/assets/audio/music/farm_frolics.ogg";
+  PICKUP_SOUND: string = "res/assets/audio/sfx/coin_pickup.ogg";
+  VICTORY_SOUND: string = "res/assets/audio/sfx/victory_jingle.ogg";
+  FOOTSTEP_SOUNDS: array[0..3] of string = ["res/assets/audio/sfx/footstep00.ogg",
+    "res/assets/audio/sfx/footstep01.ogg", "res/assets/audio/sfx/footstep02.ogg",
+    "res/assets/audio/sfx/footstep03.ogg"];
+  // Map pixels walked between two footsteps, and their volume (0 .. 1)
+  FOOTSTEP_STRIDE: float32 = 14.0f;
+  FOOTSTEP_VOLUME: float32 = 0.35f;
+  // The frame's base size (the window opens at this x the monitor's scale)
+  BASE_WIDTH: int32 = 1280;
+  BASE_HEIGHT: int32 = 720;
+  // Base units per map pixel: the tiles are 16 pixels, shown 48 base units wide
+  CAMERA_ZOOM: int32 = 3;
+  // The world's render texture, in map pixels: the base size / the zoom, and one pixel more each
+  // way for the fraction of a pixel the camera is between two whole ones
+  VIEW_WIDTH: int32 = BASE_WIDTH div CAMERA_ZOOM + 2;
+  VIEW_HEIGHT: int32 = BASE_HEIGHT div CAMERA_ZOOM + 2;
+  // The player's speed (map pixels per second) and hit box (map pixels, centred on him)
+  PLAYER_SPEED: float32 = 72.0f;
+  PLAYER_HALF_WIDTH: float32 = 5.0f;
+  PLAYER_HALF_HEIGHT: float32 = 6.0f;
+  // How near (map pixels) a coin's centre must be to be picked up
+  PICKUP_RADIUS: float32 = 10.0f;
+  // Tiled's flip / rotate bits in a layer's tile numbers (masked off: the number is below)
+  TILED_GID_MASK: uint32 = 0x1FFFFFFF;
+  // The music's volume at start (0 .. 100, the HUD's slider)
+  START_VOLUME: int32 = 50;
+
+// ---------------------------------------------------------------------------
+// Reading Tiled's files (before the types: TileMap.Load calls these, and a name is
+// visible only after its declaration)
+// ---------------------------------------------------------------------------
+
+// A CSV layer's tile numbers: digits gathered, every other character a separator
+routine DecodeCsv(const AText: string; var AGids: array of int32);
+var
+  LAt: int64;
+  LValue: int64;
+  LInNumber: bool;
+  LCount: int64;
+begin
+  LCount := 0;
+  LValue := 0;
+  LInNumber := false;
+  for LAt := 0 to len(AText) do
+    if (LAt < len(AText)) and (AText[LAt] >= '0') and (AText[LAt] <= '9') then
+      LValue := LValue * 10 + int64(uint8(AText[LAt])) - 0x30;
+      LInNumber := true;
+    else
+      if LInNumber and (LCount < len(AGids)) then
+        AGids[LCount] := int32(uint32(LValue) & TILED_GID_MASK);
+        LCount := LCount + 1;
+      end;
+      LValue := 0;
+      LInNumber := false;
+    end;
+  end;
+end;
+
+// A base64 + zlib layer's tile numbers: base64 decoded by raylib, inflated by zlib, then read
+// as little-endian 32-bit numbers
+routine DecodeZlib(const AText: string; var AGids: array of int32; var AError: string): bool;
+var
+  LText: ptr to char;
+  LDecoded: ptr to uint8;
+  LSize: int32;
+  LPacked: ByteArray;
+  LBytes: ByteArray;
+  LI: int64;
+  LValue: uint32;
+begin
+  LText := StringToC(Trim(AText));
+  LSize := 0;
+  LDecoded := DecodeDataBase64(LText, addr of LSize);
+  freemem(LText);
+  if LDecoded = nil then
+    AError := "not base64";
+    return false;
+  end;
+  // raylib's buffer copied into an Adam array, then given back to raylib at once
+  setlength(LPacked, LSize);
+  for LI := 0 to int64(LSize) - 1 do
+    LPacked[LI] := LDecoded[LI];
+  end;
+  MemFree(LDecoded);
+  if not ZlibInflate(LPacked, ZlibFormat.Zlib, LBytes, AError) then
+    return false;
+  end;
+  if len(LBytes) < len(AGids) * 4 then
+    AError := FormatStr("{} bytes for {} tiles", len(LBytes), len(AGids));
+    return false;
+  end;
+  for LI := 0 to len(AGids) - 1 do
+    LValue := uint32(LBytes[LI * 4]) | (uint32(LBytes[LI * 4 + 1]) shl 8) |
+      (uint32(LBytes[LI * 4 + 2]) shl 16) | (uint32(LBytes[LI * 4 + 3]) shl 24);
+    AGids[LI] := int32(LValue & TILED_GID_MASK);
+  end;
+  return true;
+end;
+
+// A layer's <data> as ACount tile numbers, whatever encoding Tiled chose (csv, base64 + zlib)
+routine DecodeLayer(const AData: Xml; const ACount: int32; var AGids: array of int32;
+  var AError: string): bool;
+var
+  LEncoding: string;
+begin
+  setlength(AGids, ACount);
+  LEncoding := AData.Get("encoding");
+  if LEncoding = "csv" then
+    DecodeCsv(AData.Text(), AGids);
+    return true;
+  end;
+  if (LEncoding = "base64") and (AData.Get("compression") = "zlib") then
+    return DecodeZlib(AData.Text(), AGids, AError);
+  end;
+  AError := FormatStr("encoding '{}' compression '{}' is not read here", LEncoding,
+    AData.Get("compression"));
+  return false;
+end;
+
+type
+  // The direction the player faces: it picks how he is drawn
+  Facing = choices(Down, Up, Left, Right);
+
+  // One tile layer: its name and its tile numbers row by row (0 = no tile)
+  TileLayer = record
+    Name: string;
+    Gids: array of int32;
+  end;
+
+  // A tile a layer has, where it is: what PlacedTiles yields
+  PlacedTile = record
+    Column: int32;
+    Row: int32;
+    Gid: int32;
+  end;
+
+  // A coin of the object layer
+  Coin = record
+    X: float32;
+    Y: float32;
+    Value: int32;
+    Taken: bool;
+  end;
+
+  // The map as Tiled wrote it, ready to draw and to walk on
+  TileMap = object
+    FTitle: string;
+    FColumns: int32;
+    FRows: int32;
+    FTileSize: int32;
+    FFirstGid: int32;
+    FTilesetColumns: int32;
+    FTilesetImage: string;
+    FLayers: List<TileLayer>;
+    FBlocked: Set<int32>;
+    FSpawn: Vector2;
+    FCoins: List<Coin>;
+
+    // Loads the map AFolder + AFile and the tileset it names; AError says why when it fails
+    method Load(const AFolder: string; const AFile: string; var AError: string): bool;
+    var
+      LMap: Xml;
+      LTileset: Xml;
+      LNode: Xml;
+      LLayer: TileLayer;
+      LCoin: Coin;
+      LProperty: Xml;
+    begin
+      LMap := Xml.FromFile(AFolder + AFile);
+      if len(LMap.ErrorText()) > 0 then
+        AError := LMap.ErrorText();
+        return false;
+      end;
+      self.FColumns := LMap.Get("width", int32(0));
+      self.FRows := LMap.Get("height", int32(0));
+      self.FTileSize := LMap.Get("tilewidth", int32(16));
+      self.FTitle := "Overworld";
+      for LProperty in LMap.FindChild("properties").Elements("property") do
+        if LProperty.Get("name") = "title" then
+          self.FTitle := LProperty.Get("value");
+        end;
+      end;
+
+      // The tileset: its image, its columns, its blocked tiles (by local id)
+      self.FFirstGid := LMap.FindChild("tileset").Get("firstgid", int32(1));
+      LTileset := Xml.FromFile(AFolder + LMap.FindChild("tileset").Get("source"));
+      if len(LTileset.ErrorText()) > 0 then
+        AError := LTileset.ErrorText();
+        return false;
+      end;
+      self.FTilesetColumns := LTileset.Get("columns", int32(1));
+      // The image is named relative to the .tsx: "." and ".." resolved, as the zip names
+      // entries by their plain path
+      self.FTilesetImage := NormalizePath(AFolder + LTileset.FindChild("image").Get("source"));
+      self.FBlocked.Clear();
+      for LNode in LTileset.Elements("tile") do
+        for LProperty in LNode.FindAll("property") do
+          if (LProperty.Get("name") = "blocked") and LProperty.Get("value", false) then
+            self.FBlocked.Add(LNode.Get("id", int32(0)));
+          end;
+        end;
+      end;
+
+      // The tile layers, decoded as their data says
+      self.FLayers.Clear();
+      for LNode in LMap.Elements("layer") do
+        LLayer.Name := LNode.Get("name");
+        if not DecodeLayer(LNode.FindChild("data"), self.FColumns * self.FRows, LLayer.Gids,
+          AError) then
+          AError := FormatStr("layer {}: {}", LLayer.Name, AError);
+          return false;
+        end;
+        self.FLayers.Add(LLayer);
+      end;
+
+      // The objects: where the player starts, and the coins with their values
+      self.FCoins.Clear();
+      self.FSpawn := Vector2(x: 16.0f, y: 16.0f);
+      for LNode in LMap.FindChild("objectgroup").Elements("object") do
+        if LNode.Get("name") = "spawn" then
+          // Tiled's x / y are the object's top left: the player stands on its centre
+          self.FSpawn := Vector2(x: float32(LNode.Get("x", 0.0) + LNode.Get("width", 0.0) / 2.0),
+            y: float32(LNode.Get("y", 0.0) + LNode.Get("height", 0.0) / 2.0));
+        end;
+        if LNode.Get("type") = "pickup" then
+          LCoin.X := float32(LNode.Get("x", 0.0) + LNode.Get("width", 0.0) / 2.0);
+          LCoin.Y := float32(LNode.Get("y", 0.0) + LNode.Get("height", 0.0) / 2.0);
+          LCoin.Value := 0;
+          for LProperty in LNode.FindAll("property") do
+            if LProperty.Get("name") = "value" then
+              LCoin.Value := LProperty.Get("value", int32(0));
+            end;
+          end;
+          LCoin.Taken := false;
+          self.FCoins.Add(LCoin);
+        end;
+      end;
+      return true;
+    end;
+
+    // True when the tile at AColumn, ARow blocks the way in any layer; outside the map too
+    method Blocked(const AColumn: int32; const ARow: int32): bool;
+    var
+      LI: int64;
+      LGid: int32;
+    begin
+      if (AColumn < 0) or (ARow < 0) or (AColumn >= self.FColumns) or (ARow >= self.FRows) then
+        return true;
+      end;
+      for LI := 0 to self.FLayers.Count - 1 do
+        LGid := self.FLayers[LI].Gids[ARow * self.FColumns + AColumn];
+        if (LGid > 0) and self.FBlocked.Has(LGid - self.FFirstGid) then
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // True when any tile under ABox (map pixels) blocks the way: an overload of Blocked
+    method Blocked(const ABox: Rectangle): bool;
+    var
+      LColumn: int32;
+      LRow: int32;
+    begin
+      for LRow := int32(Floor(ABox.y / float32(self.FTileSize))) to
+        int32(Floor((ABox.y + ABox.height - 0.01f) / float32(self.FTileSize))) do
+        for LColumn := int32(Floor(ABox.x / float32(self.FTileSize))) to
+          int32(Floor((ABox.x + ABox.width - 0.01f) / float32(self.FTileSize))) do
+          if self.Blocked(LColumn, LRow) then
+            return true;
+          end;
+        end;
+      end;
+      return false;
+    end;
+
+    // The tile number (row * columns + column) of the map pixel AAt
+    method TileAt(const AAt: Vector2): int32;
+    begin
+      return int32(Floor(AAt.y / float32(self.FTileSize))) * self.FColumns +
+        int32(Floor(AAt.x / float32(self.FTileSize)));
+    end;
+
+    // The centre (map pixels) of tile number ATile
+    method CentreOf(const ATile: int32): Vector2;
+    begin
+      return Vector2(x: (float32(ATile mod self.FColumns) + 0.5f) * float32(self.FTileSize),
+        y: (float32(ATile div self.FColumns) + 0.5f) * float32(self.FTileSize));
+    end;
+
+    // One step of Reachable's flood fill: the tile at AColumn, ARow joins AFound when the way
+    // is open there and it is not in ASeen yet
+    method Visit(const AColumn: int32; const ARow: int32; var AFound: List<int32>;
+      var ASeen: Set<int32>);
+    var
+      LTile: int32;
+    begin
+      // Blocked answers true outside the map too, so the fill never leaves it
+      if self.Blocked(AColumn, ARow) then
+        return;
+      end;
+      LTile := ARow * self.FColumns + AColumn;
+      if ASeen.Add(LTile) then
+        AFound.Add(LTile);
+      end;
+    end;
+
+    // Every tile the player can walk to from the spawn into AFound, the spawn's first: a flood
+    // fill, one step left, right, up and down at a time over tiles that do not block (the
+    // player's box is smaller than a tile, so every such step is one he can take)
+    method Reachable(var AFound: List<int32>);
+    var
+      LSeen: Set<int32>;
+      LNext: int64;
+      LTile: int32;
+      LColumn: int32;
+      LRow: int32;
+    begin
+      AFound.Clear();
+      LTile := self.TileAt(self.FSpawn);
+      LSeen.Add(LTile);
+      AFound.Add(LTile);
+      // AFound is the fill's queue too: LNext is the next tile to step from
+      LNext := 0;
+      while LNext < AFound.Count do
+        LTile := AFound[LNext];
+        LNext := LNext + 1;
+        LColumn := LTile mod self.FColumns;
+        LRow := LTile div self.FColumns;
+        self.Visit(LColumn - 1, LRow, AFound, LSeen);
+        self.Visit(LColumn + 1, LRow, AFound, LSeen);
+        self.Visit(LColumn, LRow - 1, AFound, LSeen);
+        self.Visit(LColumn, LRow + 1, AFound, LSeen);
+      end;
+    end;
+  end;
+
+var
+  GMap: TileMap;
+  // The player: where he stands (map pixels, his centre), where he faces, how far he walked
+  GPlayer: Vector2;
+  GFacing: Facing;
+  GWalked: float32;
+  GMoving: bool;
+  // The score and the coins found
+  GScore: int32;
+  GFound: int32;
+  GTotalValue: int32;
+  // Sound: the music and the effects (valid only with an audio device)
+  GAudio: bool;
+  GMusic: Music;
+  GPickup: Sound;
+  GVictory: Sound;
+  GFootsteps: array[0..3] of Sound;
+  // The next footstep to play, and the map pixels walked since the last one
+  GFootstep: int32;
+  GStride: float32;
+  GVolume: float32;
+  GMuted: bool;
+  // The HUD and the widgets the game writes
+  GHud: Rid;
+  GCoinsLabel: Rid;
+  GScoreLabel: Rid;
+  GScoreBar: Rid;
+  GItems: Rid;
+  GInventory: Rid;
+  GVictoryCard: Rid;
+  GVictoryText: Rid;
+  GInventoryShown: bool;
+
+// ---------------------------------------------------------------------------
+// Walking a layer
+// ---------------------------------------------------------------------------
+
+// The tiles a layer has, row by row: a generator, so the caller's loop is `for LTile in ...`
+// and the empty cells never reach it
+routine PlacedTiles(const ALayer: TileLayer; const AColumns: int32): sequence of PlacedTile;
+var
+  LI: int64;
+  LTile: PlacedTile;
+begin
+  for LI := 0 to len(ALayer.Gids) - 1 do
+    if ALayer.Gids[LI] > 0 then
+      LTile.Column := int32(LI mod int64(AColumns));
+      LTile.Row := int32(LI div int64(AColumns));
+      LTile.Gid := ALayer.Gids[LI];
+      yield LTile;
+    end;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// The HUD
+// ---------------------------------------------------------------------------
+
+// A widget of the HUD by its XML name (System.Raven.Ext's FindWidget)
+routine Find(const AName: string): Rid;
+begin
+  return FindWidget(GHud, AName);
+end;
+
+routine UpdateHud();
+begin
+  SetWidgetText(GCoinsLabel, FormatStr("{} / {}", GFound, GMap.FCoins.Count));
+  SetWidgetText(GScoreLabel, FormatStr("{} of {}", GScore, GTotalValue));
+  if GTotalValue > 0 then
+    Rprogress_bar_set_value(GScoreBar, float32(GScore) / float32(GTotalValue));
+  end;
+end;
+
+routine ApplyVolume();
+begin
+  if not GAudio then
+    return;
+  end;
+  if GMuted then
+    SetMusicVolume(GMusic, 0.0f);
+  else
+    SetMusicVolume(GMusic, GVolume);
+  end;
+end;
+
+// Puts every coin on its own random tile the player can reach (never the spawn's), keeping
+// each coin's value; a coin keeps its place when the map has fewer open tiles than coins
+routine ScatterCoins();
+var
+  LOpen: List<int32>;
+  LPick: int64;
+  LI: int64;
+  LCoin: Coin;
+  LCentre: Vector2;
+begin
+  GMap.Reachable(LOpen);
+  // The spawn's tile is the first the fill found: a coin there would be taken at once
+  LOpen.Delete(0);
+  for LI := 0 to GMap.FCoins.Count - 1 do
+    if LOpen.Count = 0 then
+      return;
+    end;
+    // A random open tile, taken out (the last one moved into its place), so no two coins share
+    LPick := RandomInt(int64(0), LOpen.Count - 1);
+    LCentre := GMap.CentreOf(LOpen[LPick]);
+    LOpen[LPick] := LOpen[LOpen.Count - 1];
+    LOpen.RemoveLast();
+    LCoin := GMap.FCoins[LI];
+    LCoin.X := LCentre.x;
+    LCoin.Y := LCentre.y;
+    GMap.FCoins[LI] := LCoin;
+  end;
+end;
+
+// Back to the start: the player on the spawn, every coin back (scattered over new tiles when
+// AScatter: Play again), the score 0
+routine Restart(const AScatter: bool);
+var
+  LI: int64;
+  LCoin: Coin;
+begin
+  GPlayer := GMap.FSpawn;
+  GFacing := Facing.Down;
+  GScore := 0;
+  GFound := 0;
+  GTotalValue := 0;
+  if AScatter then
+    ScatterCoins();
+  end;
+  for LI := 0 to GMap.FCoins.Count - 1 do
+    LCoin := GMap.FCoins[LI];
+    LCoin.Taken := false;
+    GMap.FCoins[LI] := LCoin;
+    GTotalValue := GTotalValue + LCoin.Value;
+  end;
+  Rlist_view_clear_items(GItems);
+  Rwidget_set_visibility(GVictoryCard, R_COLLAPSED);
+  UpdateHud();
+end;
+
+// ---------------------------------------------------------------------------
+// The actions: one routine per name overworld.xml uses
+// ---------------------------------------------------------------------------
+
+// Play again: a new round, the coins on new tiles
+routine DoRestart(const ASender: Rid);
+begin
+  Restart(true);
+end;
+
+// The inventory panel shown or hidden (the Items button, Tab)
+routine DoInventory(const ASender: Rid);
+begin
+  GInventoryShown := not GInventoryShown;
+  if GInventoryShown then
+    Rwidget_set_visibility(GInventory, R_VISIBLE);
+  else
+    Rwidget_set_visibility(GInventory, R_COLLAPSED);
+  end;
+end;
+
+// The music's volume slider (0 .. 100)
+routine DoVolume(const ASender: Rid);
+begin
+  GVolume := Rslider_get_value(ASender) / 100.0f;
+  ApplyVolume();
+end;
+
+routine DoMute(const ASender: Rid);
+begin
+  GMuted := Rcheckbox_is_checked(ASender) <> 0;
+  ApplyVolume();
+end;
+
+// Every action name overworld.xml fires, each bound to the routine answering it
+routine BindActions();
+begin
+  BindAction("overworld.restart", DoRestart);
+  BindAction("overworld.inventory", DoInventory);
+  BindAction("overworld.volume", DoVolume);
+  BindAction("overworld.mute", DoMute);
+end;
+
+// ---------------------------------------------------------------------------
+// The game
+// ---------------------------------------------------------------------------
+
+// The player's hit box (map pixels) were he standing at AAt
+routine PlayerBox(const AAt: Vector2): Rectangle;
+begin
+  return Rectangle(x: AAt.x - PLAYER_HALF_WIDTH, y: AAt.y - PLAYER_HALF_HEIGHT,
+    width: PLAYER_HALF_WIDTH * 2.0f, height: PLAYER_HALF_HEIGHT * 2.0f);
+end;
+
+// Moves the player by the keys held, one axis at a time so he slides along what blocks him
+routine MovePlayer(const ASeconds: float32);
+var
+  LDX: float32;
+  LDY: float32;
+  LStep: float32;
+  LNext: Vector2;
+begin
+  LDX := 0.0f;
+  LDY := 0.0f;
+  if IsKeyDown(KEY_LEFT) or IsKeyDown(KEY_A) then
+    LDX := LDX - 1.0f;
+    GFacing := Facing.Left;
+  end;
+  if IsKeyDown(KEY_RIGHT) or IsKeyDown(KEY_D) then
+    LDX := LDX + 1.0f;
+    GFacing := Facing.Right;
+  end;
+  if IsKeyDown(KEY_UP) or IsKeyDown(KEY_W) then
+    LDY := LDY - 1.0f;
+    GFacing := Facing.Up;
+  end;
+  if IsKeyDown(KEY_DOWN) or IsKeyDown(KEY_S) then
+    LDY := LDY + 1.0f;
+    GFacing := Facing.Down;
+  end;
+  GMoving := (LDX <> 0.0f) or (LDY <> 0.0f);
+  if not GMoving then
+    return;
+  end;
+  LStep := PLAYER_SPEED * ASeconds;
+  // Diagonal steps are as long as straight ones
+  if (LDX <> 0.0f) and (LDY <> 0.0f) then
+    LStep := LStep * 0.7071f;
+  end;
+  LNext := Vector2(x: GPlayer.x + LDX * LStep, y: GPlayer.y);
+  if not GMap.Blocked(PlayerBox(LNext)) then
+    GPlayer := LNext;
+  end;
+  LNext := Vector2(x: GPlayer.x, y: GPlayer.y + LDY * LStep);
+  if not GMap.Blocked(PlayerBox(LNext)) then
+    GPlayer := LNext;
+  end;
+  GWalked := GWalked + LStep;
+  // A footstep every FOOTSTEP_STRIDE map pixels, the four sounds in turn
+  GStride := GStride + LStep;
+  if GAudio and (GStride >= FOOTSTEP_STRIDE) then
+    GStride := 0.0f;
+    PlaySound(GFootsteps[GFootstep]);
+    GFootstep := (GFootstep + 1) mod 4;
+  end;
+end;
+
+// Takes every coin the player stands on: score, inventory, a sound; the end card at the last
+routine PickUpCoins();
+var
+  LI: int64;
+  LCoin: Coin;
+  LDX: float32;
+  LDY: float32;
+  LText: ptr to char;
+begin
+  for LI := 0 to GMap.FCoins.Count - 1 do
+    LCoin := GMap.FCoins[LI];
+    LDX := LCoin.X - GPlayer.x;
+    LDY := LCoin.Y - GPlayer.y;
+    if (not LCoin.Taken) and (LDX * LDX + LDY * LDY <= PICKUP_RADIUS * PICKUP_RADIUS) then
+      LCoin.Taken := true;
+      GMap.FCoins[LI] := LCoin;
+      GScore := GScore + LCoin.Value;
+      GFound := GFound + 1;
+      LText := StringToC(FormatStr("Coin #{}: +{} (score {})", GFound, LCoin.Value, GScore));
+      Rlist_view_add_item(GItems, LText);
+      freemem(LText);
+      if GAudio then
+        PlaySound(GPickup);
+      end;
+      UpdateHud();
+      if GFound = int32(GMap.FCoins.Count) then
+        SetWidgetText(GVictoryText, FormatStr("All {} coins, {} points!", GFound, GScore));
+        Rwidget_set_visibility(GVictoryCard, R_VISIBLE);
+        if GAudio then
+          PlaySound(GVictory);
+        end;
+      end;
+    end;
+  end;
+end;
+
+// Every layer's tiles: each one cut from the tileset image by its local id
+routine DrawMap(const ATileset: Texture2D);
+var
+  LI: int64;
+  LTile: PlacedTile;
+  LLocal: int32;
+  LSize: float32;
+  LSource: Rectangle;
+begin
+  LSize := float32(GMap.FTileSize);
+  for LI := 0 to GMap.FLayers.Count - 1 do
+    for LTile in PlacedTiles(GMap.FLayers[LI], GMap.FColumns) do
+      LLocal := LTile.Gid - GMap.FFirstGid;
+      LSource := Rectangle(x: float32(LLocal mod GMap.FTilesetColumns) * LSize,
+        y: float32(LLocal div GMap.FTilesetColumns) * LSize, width: LSize, height: LSize);
+      DrawTextureRec(ATileset, LSource,
+        Vector2(x: float32(LTile.Column) * LSize, y: float32(LTile.Row) * LSize), WHITE);
+    end;
+  end;
+end;
+
+// The coins still there: gold discs that bob and gleam
+routine DrawCoins(const ATime: float32);
+var
+  LI: int64;
+  LCoin: Coin;
+  LBob: float32;
+begin
+  for LI := 0 to GMap.FCoins.Count - 1 do
+    LCoin := GMap.FCoins[LI];
+    if not LCoin.Taken then
+      LBob := Sin(ATime * 4.0f + float32(LI)) * 1.5f;
+      DrawEllipse(int32(LCoin.X), int32(LCoin.Y) + 5, 4.0f, 1.5f, Color(r: 0, g: 0, b: 0, a: 70));
+      DrawCircleV(Vector2(x: LCoin.X, y: LCoin.Y + LBob), 4.5f, Color(r: 245, g: 184, b: 61, a: 255));
+      DrawCircleV(Vector2(x: LCoin.X - 1.2f, y: LCoin.Y + LBob - 1.2f), 1.5f, Color(r: 255, g: 236, b: 170, a: 255));
+      DrawCircleLinesV(Vector2(x: LCoin.X, y: LCoin.Y + LBob), 4.5f, Color(r: 180, g: 120, b: 20, a: 255));
+    end;
+  end;
+end;
+
+// The player: a little Adam-blue figure, bobbing while he walks, his eyes on the way he faces
+routine DrawPlayer();
+var
+  LBob: float32;
+  LBody: Vector2;
+  LEye: Vector2;
+begin
+  LBob := 0.0f;
+  if GMoving then
+    LBob := Sin(GWalked * 0.6f) * 1.0f;
+  end;
+  // His shadow, his body, his head
+  DrawEllipse(int32(GPlayer.x), int32(GPlayer.y) + 6, 5.0f, 2.0f, Color(r: 0, g: 0, b: 0, a: 80));
+  LBody := Vector2(x: GPlayer.x, y: GPlayer.y + 1.0f + LBob);
+  DrawCircleV(LBody, 5.0f, Color(r: 14, g: 116, b: 144, a: 255));
+  DrawCircleV(Vector2(x: GPlayer.x, y: GPlayer.y - 4.0f + LBob), 3.8f, Color(r: 56, g: 189, b: 248, a: 255));
+  // Where his eyes look: match on the facing
+  match GFacing of
+    Facing.Down: LEye := Vector2(x: 0.0f, y: 1.0f);
+    Facing.Up: LEye := Vector2(x: 0.0f, y: -1.5f);
+    Facing.Left: LEye := Vector2(x: -1.5f, y: 0.0f);
+    Facing.Right: LEye := Vector2(x: 1.5f, y: 0.0f);
+  end;
+  if GFacing <> Facing.Up then
+    DrawCircleV(Vector2(x: GPlayer.x + LEye.x - 1.2f, y: GPlayer.y - 4.0f + LBob + LEye.y), 0.7f, Color(r: 7, g: 13, b: 26, a: 255));
+    DrawCircleV(Vector2(x: GPlayer.x + LEye.x + 1.2f, y: GPlayer.y - 4.0f + LBob + LEye.y), 0.7f, Color(r: 7, g: 13, b: 26, a: 255));
+  end;
+  // Adam's gold on his chest
+  DrawCircleV(Vector2(x: GPlayer.x, y: GPlayer.y + 1.5f + LBob), 1.2f, Color(r: 245, g: 184, b: 61, a: 255));
+end;
+
+// The camera: the view's top left corner in map pixels, the player in its centre, held inside
+// the map (the map centred when the view is wider than it)
+routine ViewCorner(): Vector2;
+var
+  LHalfWidth: float32;
+  LHalfHeight: float32;
+  LMapWidth: float32;
+  LMapHeight: float32;
+  LCentre: Vector2;
+begin
+  LHalfWidth := float32(BASE_WIDTH) / 2.0f / float32(CAMERA_ZOOM);
+  LHalfHeight := float32(BASE_HEIGHT) / 2.0f / float32(CAMERA_ZOOM);
+  LMapWidth := float32(GMap.FColumns * GMap.FTileSize);
+  LMapHeight := float32(GMap.FRows * GMap.FTileSize);
+  LCentre := GPlayer;
+  if LMapWidth <= LHalfWidth * 2.0f then
+    LCentre.x := LMapWidth / 2.0f;
+  else
+    LCentre.x := Clamp(GPlayer.x, LHalfWidth, LMapWidth - LHalfWidth);
+  end;
+  if LMapHeight <= LHalfHeight * 2.0f then
+    LCentre.y := LMapHeight / 2.0f;
+  else
+    LCentre.y := Clamp(GPlayer.y, LHalfHeight, LMapHeight - LHalfHeight);
+  end;
+  return Vector2(x: LCentre.x - LHalfWidth, y: LCentre.y - LHalfHeight);
+end;
+
+// The world drawn pixel-perfect: into AView at the map's own resolution, the camera moved by a
+// whole number of map pixels only (AWhole), so each tile lands exactly on the texture's texels
+// and no neighbouring tile of the tileset bleeds in at its edges
+routine DrawWorld(const AView: RenderTexture2D; const ATileset: Texture2D; const AWhole: Vector2;
+  const ATime: float32);
+var
+  LCamera: Camera2D;
+begin
+  LCamera.offset := Vector2(x: 0.0f, y: 0.0f);
+  LCamera.target := AWhole;
+  LCamera.rotation := 0.0f;
+  LCamera.zoom := 1.0f;
+  BeginTextureMode(AView);
+  ClearBackground(Color(r: 7, g: 13, b: 26, a: 255));
+  BeginMode2D(LCamera);
+  DrawMap(ATileset);
+  DrawCoins(ATime);
+  DrawPlayer();
+  EndMode2D();
+  EndTextureMode();
+end;
+
+// The world's texture into the frame (base units): CAMERA_ZOOM base units per map pixel, moved
+// back by the camera's fraction of a pixel (AFraction) so scrolling is smooth. A render texture
+// is stored upside down, hence the negative source height
+routine PresentWorld(const AView: RenderTexture2D; const AFraction: Vector2);
+var
+  LZoom: float32;
+begin
+  LZoom := float32(CAMERA_ZOOM);
+  DrawTexturePro(AView.texture,
+    Rectangle(x: 0.0f, y: 0.0f, width: float32(VIEW_WIDTH), height: -float32(VIEW_HEIGHT)),
+    Rectangle(x: -AFraction.x * LZoom, y: -AFraction.y * LZoom, width: float32(VIEW_WIDTH) * LZoom,
+      height: float32(VIEW_HEIGHT) * LZoom), Vector2(x: 0.0f, y: 0.0f), 0.0f, WHITE);
+end;
+
+// ---------------------------------------------------------------------------
+// The program
+// ---------------------------------------------------------------------------
+
+// Every sound and the music, given back to raylib's audio before its device closes
+routine ReleaseSounds();
+var
+  LI: int32;
+begin
+  UnloadMusicStream(GMusic);
+  UnloadSound(GPickup);
+  UnloadSound(GVictory);
+  for LI := 0 to 3 do
+    UnloadSound(GFootsteps[LI]);
+  end;
+end;
+
+routine Run(): int32;
+var
+  LAssets: IOSource;
+  LError: string;
+  LPath: ptr to char;
+  LTileset: Texture2D;
+  LView: RenderTexture2D;
+  LCorner: Vector2;
+  LWhole: Vector2;
+  LTime: float32;
+  LI: int32;
+  LLast: bool;
+begin
+  // The shared assets as the program's files: libxml2, raylib and Raven all open entries of
+  // bin\assets.zip by their plain names (Examples.Common)
+  LAssets := OpenAssets();
+  if LAssets = nil then
+    return 1;
+  end;
+  defer CloseAssets(LAssets);
+
+  // The map first: nothing opens when it cannot be read
+  LError := "";
+  if not GMap.Load(MAP_FOLDER, MAP_FILE, LError) then
+    println("raven_overworld: {}{}: {}", MAP_FOLDER, MAP_FILE, LError);
+    return 1;
+  end;
+
+  // The DPI-scaled frame window (AV.12): the base size x the monitor's scale
+  if not OpenExampleWindow(BASE_WIDTH, BASE_HEIGHT, "Adam - Raven overworld") then
+    return 1;
+  end;
+  defer CloseExampleWindow();
+  SetFrameColor(Color(r: 7, g: 13, b: 26, a: 255));
+
+  // Sound is a bonus: with no audio device the game plays silent
+  InitAudioDevice();
+  GAudio := IsAudioDeviceReady();
+  defer if GAudio then CloseAudioDevice(); end;
+  if GAudio then
+    LPath := StringToC(MUSIC_FILE);
+    GMusic := LoadMusicStream(LPath);
+    freemem(LPath);
+    LPath := StringToC(PICKUP_SOUND);
+    GPickup := LoadSound(LPath);
+    freemem(LPath);
+    LPath := StringToC(VICTORY_SOUND);
+    GVictory := LoadSound(LPath);
+    freemem(LPath);
+    for LI := 0 to 3 do
+      LPath := StringToC(FOOTSTEP_SOUNDS[LI]);
+      GFootsteps[LI] := LoadSound(LPath);
+      freemem(LPath);
+      SetSoundVolume(GFootsteps[LI], FOOTSTEP_VOLUME);
+    end;
+  end;
+  defer if GAudio then ReleaseSounds(); end;
+
+  // The tileset image the .tsx names, pixel-sharp (no filtering when it is scaled up)
+  LPath := StringToC(GMap.FTilesetImage);
+  LTileset := LoadTexture(LPath);
+  freemem(LPath);
+  defer UnloadTexture(LTileset);
+  SetTextureFilter(LTileset, TEXTURE_FILTER_POINT);
+
+  // The world's own texture at map resolution, scaled up whole: nearest texel, no blur
+  LView := LoadRenderTexture(VIEW_WIDTH, VIEW_HEIGHT);
+  defer UnloadRenderTexture(LView);
+  SetTextureFilter(LView.texture, TEXTURE_FILTER_POINT);
+
+  // Raven in raylib's window, its errors on the console, the example themes loaded, Aurora in use
+  if not StartRaven("raven_overworld") then
+    return 1;
+  end;
+  defer CloseRaven();
+  GHud := LoadWindow(HUD_XML);
+  if GHud = R_INVALID_ID then
+    return 1;
+  end;
+  GCoinsLabel := Find("coins");
+  GScoreLabel := Find("score");
+  GScoreBar := Find("score_bar");
+  GItems := Find("items");
+  GInventory := Find("inventory");
+  GVictoryCard := Find("victory");
+  GVictoryText := Find("victory_text");
+  SetWidgetText(Find("map_title"), GMap.FTitle);
+  BindActions();
+
+  GVolume := float32(START_VOLUME) / 100.0f;
+  GMuted := false;
+  // The first round: the coins where the map puts them
+  Restart(false);
+  if GAudio then
+    PlayMusicStream(GMusic);
+    ApplyVolume();
+  end;
+
+  LTime := 0.0f;
+  // The loop runs until the window is closed; that last frame is still drawn, and saved as the
+  // example's snapshot (raven_overworld.png beside this file) before it is shown
+  LLast := false;
+  while not LLast do
+    LLast := WindowShouldClose();
+    LTime := LTime + GetFrameTime();
+    if GAudio then
+      UpdateMusicStream(GMusic);
+    end;
+    UpdateRaven(GHud);
+    MovePlayer(GetFrameTime());
+    PickUpCoins();
+    // The camera split in two: the whole map pixels the world is drawn at, and the fraction
+    // left over that moves the finished picture
+    LCorner := ViewCorner();
+    LWhole := Vector2(x: float32(Floor(LCorner.x)), y: float32(Floor(LCorner.y)));
+    DrawWorld(LView, LTileset, LWhole, LTime);
+    BeginDrawing();
+    BeginFrame();
+    PresentWorld(LView, Vector2(x: LCorner.x - LWhole.x, y: LCorner.y - LWhole.y));
+    // The HUD over the world, in base units
+    DrawRaven(GHud);
+    EndFrame();
+    // The back buffer holds the finished frame until EndDrawing shows it (Examples.Common)
+    if LLast then
+      SaveExampleSnapshot(SNAPSHOT_NAME);
+    end;
+    EndDrawing();
+  end;
+  return 0;
+end;
+
+begin
+  return Run();
+end.
