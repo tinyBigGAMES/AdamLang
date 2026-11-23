@@ -29,12 +29,14 @@
   writes win64's x64 unwind data into adam_xdata / adam_pdata, and DoWalk
   reads it, searching the frames' scopes, then unwinding them to the catch
   (DoDispatch, PlatformFrameHandler); a C frame between unwinds by its
-  .eh_frame CFI. Coroutines run on mmap'd stacks with a guard page. The
+  .eh_frame CFI. Threads are pthreads (a thread's end runs from a thread
+  key's destructor), their waits futexes. Coroutines run on mmap'd stacks
+  with a guard page. The
   registers the unwinder starts from, its jump to a catch and a coroutine
   switch are the ELF linker's register routines (__adam_registers,
   __adam_resume, __adam_switch: machine code the language cannot write, no
   system call). The routines a later
-  atom of PLAN-LINUX64 fills (threads LX4d, hooks LX4f, loaded libraries
+  atom of PLAN-LINUX64 fills (hooks LX4f, loaded libraries
   LX4g, a .so's events LX6b) stop the process with that atom named
   (DoPending) until then.
 *******************************************************************************/
@@ -518,6 +520,10 @@ threadstatic
   GFaultPending: int32;
 
 type
+  // What a thread PlatformThreadStart made runs first (System.Runtime's ThreadRun), given
+  // the block it was started with
+  PlatformThreadRun = routine(const ABlock: ptr);
+
   // A coroutine (LX4e, plan H5): its stack pointer while it is not running (its
   // callee-saved registers and floating-point control words pushed below it:
   // __adam_switch's), its stack (mmap'd: Map / MapSize the whole mapping, a guard
@@ -2032,29 +2038,113 @@ begin
   memset(AAddress, 0, uint64(ACount));
 end;
 
-// A new thread that runs ARun(ABlock), started at once: its handle, or 0 when it could not
-// be started (LX4d: pthread_create, the thread end through a key's destructor)
-public routine PlatformThreadStart(const ARun: routine(const ABlock: ptr); const ABlock: ptr): uint64;
+// glibc: the threads (PlatformThreadStart .. PlatformThreadDetach): a new thread running
+// AStart(AArgument) (its pthread_t into AThread, 0 on success), one waited for (its result
+// into AResult when not nil), one joined only if it has ended (EBUSY while it runs), one
+// never joined (its resources freed as it ends)
+routine pthread_create(var AThread: uint64; const AAttributes: ptr;
+  const AStart: routine(AArgument: ptr): ptr; const AArgument: ptr): int32; external "c";
+routine pthread_join(const AThread: uint64; const AResult: ptr): int32; external "c";
+routine pthread_tryjoin_np(const AThread: uint64; const AResult: ptr): int32; external "c";
+routine pthread_detach(const AThread: uint64): int32; external "c";
+// glibc: a thread key (its destructor called on each thread whose value for the key is not
+// nil as that thread ends, by return or pthread_exit, its TLS still there), made once
+// however many threads start at the same time (pthread_once: a pthread_once_t, an int32,
+// 0 until done)
+routine pthread_key_create(var AKey: uint32; const ADestructor: routine(AValue: ptr)): int32;
+  external "c";
+routine pthread_setspecific(const AKey: uint32; const AValue: ptr): int32; external "c";
+routine pthread_once(const AOnce: ptr; const AInit: routine()): int32; external "c";
+
+const
+  // The thread key's value a thread PlatformThreadStart made holds: not nil, so the key's
+  // destructor (DoThreadKeyEnd) runs at its end
+  ADAM_PLATFORM_THREAD_MARK: uint64 = 1;
+
+var
+  // pthread_once's word for the thread key (DoThreadKeyMake), the key, and whether it was
+  // made (false: pthread_key_create refused, no thread is started)
+  GThreadKeyOnce: int32;
+  GThreadKey: uint32;
+  GThreadKeyReady: bool;
+
+// The thread key's destructor: a thread PlatformThreadStart made is ending (its run routine
+// returned, or it called pthread_exit), on that thread with its threadstatics there: the
+// thread end handed on (PlatformThreadCallback), as win64's loader does at DLL_THREAD_DETACH
+routine DoThreadKeyEnd(AValue: ptr);
 begin
-  DoPending(ptr to const char("PlatformThreadStart"), ptr to const char("LX4d"));
+  PlatformThreadCallback(nil, ADAM_PLATFORM_THREAD_END, nil);
 end;
 
-// Waits for the thread AThread (PlatformThreadStart's) to end (LX4d)
+// The thread key made, once (pthread_once's init)
+routine DoThreadKeyMake();
+begin
+  GThreadKeyReady := pthread_key_create(GThreadKey, DoThreadKeyEnd) = 0;
+end;
+
+// The OS's start of a thread PlatformThreadStart made (pthread_create's start routine):
+// AParameter is its two-word block from the C heap (the run routine, then its block), freed
+// here before the run routine is called on this thread; the thread key marked first, so the
+// thread's end (DoThreadKeyEnd) runs however the thread ends; the thread's result is nil
+routine DoThreadProc(AParameter: ptr): ptr;
+var
+  LSlots: ptr to ptr;
+  LRun: PlatformThreadRun;
+  LBlock: ptr;
+begin
+  LSlots := ptr to ptr(AParameter);
+  LRun := PlatformThreadRun(LSlots[0]);
+  LBlock := LSlots[1];
+  free(AParameter);
+  pthread_setspecific(GThreadKey, ptr(ADAM_PLATFORM_THREAD_MARK));
+  LRun(LBlock);
+  return nil;
+end;
+
+// A new thread that runs ARun(ABlock) (System.Runtime's ThreadRun), started at once: its
+// handle (its pthread_t, PlatformThreadJoin's; never 0 in glibc), or 0 when it could not be
+// started (no room, the thread key not made, or glibc refused)
+public routine PlatformThreadStart(const ARun: routine(const ABlock: ptr); const ABlock: ptr): uint64;
+var
+  LSlots: ptr to ptr;
+  LThread: uint64;
+begin
+  pthread_once(ptr(addr of GThreadKeyOnce), DoThreadKeyMake);
+  if not GThreadKeyReady then
+    return 0;
+  end;
+  LSlots := ptr to ptr(malloc(16));
+  if LSlots = nil then
+    return 0;
+  end;
+  LSlots[0] := ptr(ARun);
+  LSlots[1] := ABlock;
+  LThread := 0;
+  if pthread_create(LThread, nil, DoThreadProc, ptr(LSlots)) <> 0 then
+    free(ptr(LSlots));
+    return 0;
+  end;
+  return LThread;
+end;
+
+// Waits for the thread AThread (PlatformThreadStart's) to end, then its resources are freed
 public routine PlatformThreadJoin(const AThread: uint64);
 begin
-  DoPending(ptr to const char("PlatformThreadJoin"), ptr to const char("LX4d"));
+  pthread_join(AThread, nil);
 end;
 
-// The thread AThread joined only if it has ended already, never waiting (LX4d)
+// The thread AThread (PlatformThreadStart's) joined only if it has ended already, never
+// waiting: true with its resources freed; false (still running) leaves it as it was
 public routine PlatformThreadTryJoin(const AThread: uint64): bool;
 begin
-  DoPending(ptr to const char("PlatformThreadTryJoin"), ptr to const char("LX4d"));
+  return pthread_tryjoin_np(AThread, nil) = 0;
 end;
 
-// The thread AThread never joined, running on unaffected (LX4d)
+// The thread AThread (PlatformThreadStart's) never joined: its resources freed as it ends,
+// the thread running on (or ended) unaffected
 public routine PlatformThreadDetach(const AThread: uint64);
 begin
-  DoPending(ptr to const char("PlatformThreadDetach"), ptr to const char("LX4d"));
+  pthread_detach(AThread);
 end;
 
 // glibc: memory mapped, protected and given back
@@ -2319,17 +2409,41 @@ begin
   pthread_mutex_destroy(ALock);
 end;
 
-// Sleeps while the int32 at AWord holds AExpected, up to AMilliseconds (LX4d: futex)
+const
+  // sys/syscall.h (x86_64): the futex call; linux/futex.h's FUTEX_WAIT / FUTEX_WAKE with
+  // FUTEX_PRIVATE_FLAG (the word is this process's own)
+  SYS_futex: int64 = 202;
+  FUTEX_WAIT_PRIVATE: int64 = 128;
+  FUTEX_WAKE_PRIVATE: int64 = 129;
+  // Nanoseconds per millisecond and per second (a futex wait's relative timespec)
+  ADAM_PLATFORM_NS_PER_MS: int64 = 1000000;
+  ADAM_PLATFORM_MS_PER_SECOND: int64 = 1000;
+
+// Sleeps while the int32 at AWord holds AExpected (futex FUTEX_WAIT: the kernel compares
+// and sleeps in one step, so a wake between the caller's read and this sleep is never
+// lost), up to AMilliseconds (negative: no end); back early on a wake, a signal or the word
+// already changed, so the caller reads the word again (as win64's RtlWaitOnAddress)
 public routine PlatformWaitWord(const AWord: ptr; const AExpected: int32;
   const AMilliseconds: int64);
+var
+  LTimeout: timespec;
 begin
-  DoPending(ptr to const char("PlatformWaitWord"), ptr to const char("LX4d"));
+  if AMilliseconds < 0 then
+    syscall(SYS_futex, AWord, FUTEX_WAIT_PRIVATE, int64(AExpected), nil, nil, int64(0));
+    return;
+  end;
+  // Relative to now (FUTEX_WAIT's timeout is a duration)
+  LTimeout.tv_sec := AMilliseconds div ADAM_PLATFORM_MS_PER_SECOND;
+  LTimeout.tv_nsec := (AMilliseconds mod ADAM_PLATFORM_MS_PER_SECOND) * ADAM_PLATFORM_NS_PER_MS;
+  syscall(SYS_futex, AWord, FUTEX_WAIT_PRIVATE, int64(AExpected), addr of LTimeout, nil,
+    int64(0));
 end;
 
-// Wakes one thread sleeping on the word at AWord (LX4d: futex)
+// Wakes one thread sleeping on the word at AWord (PlatformWaitWord), if one is (futex
+// FUTEX_WAKE of 1)
 public routine PlatformWakeWord(const AWord: ptr);
 begin
-  DoPending(ptr to const char("PlatformWakeWord"), ptr to const char("LX4d"));
+  syscall(SYS_futex, AWord, FUTEX_WAKE_PRIVATE, int64(1), nil, nil, int64(0));
 end;
 
 // Milliseconds since a fixed point (CLOCK_MONOTONIC), never going back: only a difference
