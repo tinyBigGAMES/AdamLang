@@ -28,9 +28,11 @@
   Raise and catch run on the runtime's own unwinder (plan H1): the compiler
   writes win64's x64 unwind data into adam_xdata / adam_pdata, and DoWalk
   reads it, searching the frames' scopes, then unwinding them to the catch
-  (DoDispatch, PlatformFrameHandler). The routines a later atom of
-  PLAN-LINUX64 fills (threads LX4d, coroutines LX4e, hooks LX4f, loaded
-  libraries LX4g, a .so's events LX6b) stop the process with that atom named
+  (DoDispatch, PlatformFrameHandler); a C frame between unwinds by its
+  .eh_frame CFI. Coroutines run on glibc's ucontext (makecontext /
+  swapcontext) over mmap'd stacks with a guard page. The routines a later
+  atom of PLAN-LINUX64 fills (threads LX4d, hooks LX4f, loaded libraries
+  LX4g, a .so's events LX6b) stop the process with that atom named
   (DoPending) until then.
 *******************************************************************************/
 
@@ -519,6 +521,45 @@ threadstatic
   // (PlatformCatch), waiting for that guard's except part (PlatformFaultTaken); 0 when none
   GFaultPending: int32;
 
+type
+  // A coroutine (LX4e, plan H5): its saved registers while it is not running (a
+  // ucontext_t: swapcontext's), its stack (mmap'd: Map / MapSize the whole mapping, a guard
+  // page at its low end; nil for a thread's own coroutine, which runs on the thread's stack),
+  // the stack's bounds (StackLow .. StackHigh: what PlatformStackBase and the leak tracker's
+  // walk tell), its run and block (nil for a thread's own)
+  PlatformCoroutine = record align(16)
+    Context: PlatformContext;
+    Map: ptr;
+    MapSize: uint64;
+    StackLow: uint64;
+    StackHigh: uint64;
+    Run: routine(const ABlock: ptr);
+    Block: ptr;
+  end;
+
+threadstatic
+  // The coroutine running on this thread (nil: none yet), written by the switch that
+  // starts it (PlatformCoroutineSwitch), and the thread's own coroutine (DoThreadCoroutine:
+  // nil until a switch needs it), given back as the thread ends (DoCoroutineThreadEnd).
+  // Neither is read once a switch returns: the coroutine may run on another thread
+  GCoroutineCurrent: ptr to PlatformCoroutine;
+  GCoroutineThread: ptr to PlatformCoroutine;
+
+// A thread's end (PlatformThreadCallback, on that thread, on its own coroutine: a thread
+// ends only from there): its own coroutine given back
+routine DoCoroutineThreadEnd();
+var
+  LCoroutine: ptr to PlatformCoroutine;
+begin
+  LCoroutine := GCoroutineThread;
+  if LCoroutine = nil then
+    return;
+  end;
+  GCoroutineThread := nil;
+  GCoroutineCurrent := nil;
+  free(ptr(LCoroutine));
+end;
+
 // The byte, uint16, uint32 and uint64 at AAddress (little-endian)
 routine DoByteAt(const AAddress: uint64): uint64;
 var
@@ -899,8 +940,606 @@ begin
   return LInfo + 4 + ((LCount + 1) & 0xFE) * 2;
 end;
 
-// No frame catches the exception: the walk reached code with no Adam unwind data (a C
-// frame between: foreign frames are LX4b2's), unwind data it cannot read, or the stack's
+// glibc: each loaded object's program headers visited (the exe, libc.so.6, a dlopen'd
+// library) until the visitor gives nonzero: a foreign frame's .eh_frame_hdr is found there
+routine dl_iterate_phdr(const AVisit: routine(const AInfo: ptr; const ASize: uint64;
+  const AData: ptr): int32; const AData: ptr): int32; external "c";
+
+type
+  // A foreign pc's search (DoPhdrVisit's data): the pc, then the .eh_frame_hdr of the
+  // object whose loaded segment holds it (0: none found)
+  PlatformObjectSearch = record
+    Pc: uint64;
+    Header: uint64;
+  end;
+  // A register's rule in a CFI row (DoForeignUnwind): Kind 0 unchanged (same value or
+  // undefined), 1 saved at CFA + Value, 2 held in the register Value
+  PlatformCfiRule = record
+    Kind: int64;
+    Value: int64;
+  end;
+  // A CFI row: the CFA (CfaReg's value plus CfaOffset, DWARF numbers) and the rules of the
+  // 16 general registers and the return address (column 16)
+  PlatformCfiRow = record
+    CfaReg: int64;
+    CfaOffset: int64;
+    Rules: array[0..16] of PlatformCfiRule;
+  end;
+  // A CFI program's reading state: the bytes read up to At, the CIE's code and data
+  // alignment factors and pointer encoding
+  PlatformCfiCursor = record
+    At: uint64;
+    CodeAlign: uint64;
+    DataAlign: int64;
+    Encoding: uint64;
+  end;
+
+const
+  // dl_phdr_info's fields, an Elf64_Phdr's bytes and fields, the segment kinds read
+  ADAM_PLATFORM_PHDR_INFO_ADDR: uint64 = 0;
+  ADAM_PLATFORM_PHDR_INFO_PHDR: uint64 = 16;
+  ADAM_PLATFORM_PHDR_INFO_PHNUM: uint64 = 24;
+  ADAM_PLATFORM_PHDR_BYTES: uint64 = 56;
+  ADAM_PLATFORM_PHDR_VADDR: uint64 = 16;
+  ADAM_PLATFORM_PHDR_MEMSZ: uint64 = 40;
+  PT_LOAD: uint32 = 1;
+  PT_GNU_EH_FRAME: uint32 = 0x6474E550;
+  // The DWARF pointer encodings (DW_EH_PE_*): the value's form (low nibble), its base
+  // (high bits), and none at all
+  DW_EH_PE_absptr: uint64 = 0x00;
+  DW_EH_PE_uleb128: uint64 = 0x01;
+  DW_EH_PE_udata2: uint64 = 0x02;
+  DW_EH_PE_udata4: uint64 = 0x03;
+  DW_EH_PE_udata8: uint64 = 0x04;
+  DW_EH_PE_sleb128: uint64 = 0x09;
+  DW_EH_PE_sdata2: uint64 = 0x0A;
+  DW_EH_PE_sdata4: uint64 = 0x0B;
+  DW_EH_PE_sdata8: uint64 = 0x0C;
+  DW_EH_PE_pcrel: uint64 = 0x10;
+  DW_EH_PE_datarel: uint64 = 0x30;
+  DW_EH_PE_indirect: uint64 = 0x80;
+  DW_EH_PE_omit: uint64 = 0xFF;
+  // The call frame instructions read (DW_CFA_*; the first three in the top two bits)
+  DW_CFA_advance_loc: uint64 = 0x40;
+  DW_CFA_offset: uint64 = 0x80;
+  DW_CFA_restore: uint64 = 0xC0;
+  DW_CFA_nop: uint64 = 0x00;
+  DW_CFA_set_loc: uint64 = 0x01;
+  DW_CFA_advance_loc1: uint64 = 0x02;
+  DW_CFA_advance_loc2: uint64 = 0x03;
+  DW_CFA_advance_loc4: uint64 = 0x04;
+  DW_CFA_offset_extended: uint64 = 0x05;
+  DW_CFA_restore_extended: uint64 = 0x06;
+  DW_CFA_undefined: uint64 = 0x07;
+  DW_CFA_same_value: uint64 = 0x08;
+  DW_CFA_register: uint64 = 0x09;
+  DW_CFA_remember_state: uint64 = 0x0A;
+  DW_CFA_restore_state: uint64 = 0x0B;
+  DW_CFA_def_cfa: uint64 = 0x0C;
+  DW_CFA_def_cfa_register: uint64 = 0x0D;
+  DW_CFA_def_cfa_offset: uint64 = 0x0E;
+  DW_CFA_offset_extended_sf: uint64 = 0x11;
+  DW_CFA_def_cfa_sf: uint64 = 0x12;
+  DW_CFA_def_cfa_offset_sf: uint64 = 0x13;
+  DW_CFA_GNU_args_size: uint64 = 0x2E;
+  DW_CFA_GNU_negative_offset_extended: uint64 = 0x2F;
+  // The return address's column (x86_64), the deepest remember_state nesting kept
+  ADAM_PLATFORM_CFI_RA: int64 = 16;
+  ADAM_PLATFORM_CFI_STATES: int64 = 8;
+  // The unwind number (PlatformRegisters' order) of each DWARF register 0 .. 15 (rax rdx
+  // rcx rbx rsi rdi rbp rsp r8 .. r15)
+  ADAM_PLATFORM_DWARF_REG: array[0..15] of int64 = [0, 2, 1, 3, 6, 7, 5, 4, 8, 9, 10, 11, 12,
+    13, 14, 15];
+
+// dl_iterate_phdr's visitor: the object AInfo whose PT_LOAD segment holds the search's pc
+// (AData) gives its PT_GNU_EH_FRAME's address (1: the walk stops); 0 to go on
+routine DoPhdrVisit(const AInfo: ptr; const ASize: uint64; const AData: ptr): int32;
+var
+  LSearch: ptr to PlatformObjectSearch;
+  LBase: uint64;
+  LPhdrs: uint64;
+  LCount: uint64;
+  LPhdr: uint64;
+  LHeader: uint64;
+  LHolds: bool;
+  LI: uint64;
+begin
+  LSearch := ptr to PlatformObjectSearch(AData);
+  LBase := DoWordAt(uint64(AInfo) + ADAM_PLATFORM_PHDR_INFO_ADDR);
+  LPhdrs := DoWordAt(uint64(AInfo) + ADAM_PLATFORM_PHDR_INFO_PHDR);
+  LCount := DoHalfAt(uint64(AInfo) + ADAM_PLATFORM_PHDR_INFO_PHNUM);
+  LHolds := false;
+  LHeader := 0;
+  LI := 0;
+  while LI < LCount do
+    LPhdr := LPhdrs + LI * ADAM_PLATFORM_PHDR_BYTES;
+    if uint32(DoLongAt(LPhdr)) = PT_LOAD then
+      if (LSearch^.Pc >= LBase + DoWordAt(LPhdr + ADAM_PLATFORM_PHDR_VADDR)) and
+        (LSearch^.Pc < LBase + DoWordAt(LPhdr + ADAM_PLATFORM_PHDR_VADDR) +
+        DoWordAt(LPhdr + ADAM_PLATFORM_PHDR_MEMSZ)) then
+        LHolds := true;
+      end;
+    end;
+    if uint32(DoLongAt(LPhdr)) = PT_GNU_EH_FRAME then
+      LHeader := LBase + DoWordAt(LPhdr + ADAM_PLATFORM_PHDR_VADDR);
+    end;
+    LI := LI + 1;
+  end;
+  if not LHolds then
+    return 0;
+  end;
+  LSearch^.Header := LHeader;
+  return 1;
+end;
+
+// An unsigned and a signed LEB128 at ACursor's place, the cursor moved past it
+routine DoUleb(var AAt: uint64): uint64;
+var
+  LValue: uint64;
+  LShift: uint64;
+  LByte: uint64;
+begin
+  LValue := 0;
+  LShift := 0;
+  repeat
+    LByte := DoByteAt(AAt);
+    AAt := AAt + 1;
+    if LShift < 64 then
+      LValue := LValue | ((LByte & 0x7F) shl LShift);
+    end;
+    LShift := LShift + 7;
+  until (LByte & 0x80) = 0;
+  return LValue;
+end;
+
+routine DoSleb(var AAt: uint64): int64;
+var
+  LValue: uint64;
+  LShift: uint64;
+  LByte: uint64;
+begin
+  LValue := 0;
+  LShift := 0;
+  repeat
+    LByte := DoByteAt(AAt);
+    AAt := AAt + 1;
+    if LShift < 64 then
+      LValue := LValue | ((LByte & 0x7F) shl LShift);
+    end;
+    LShift := LShift + 7;
+  until (LByte & 0x80) = 0;
+  if (LShift < 64) and ((LByte & 0x40) <> 0) then
+    // the sign bit carried up through the bits above the last byte
+    LValue := LValue | (0xFFFFFFFFFFFFFFFF shl LShift);
+  end;
+  return int64(LValue);
+end;
+
+// A value AValue of AWidth bytes read as signed (two's complement), as a uint64
+routine DoSigned(const AValue: uint64; const AWidth: uint64): uint64;
+var
+  LSign: uint64;
+begin
+  LSign := uint64(1) shl (AWidth * 8 - 1);
+  if (AValue & LSign) = 0 then
+    return AValue;
+  end;
+  return AValue | (0xFFFFFFFFFFFFFFFF shl (AWidth * 8));
+end;
+
+// The pointer at AAt in the encoding AEncoding (ABase: .eh_frame_hdr's start, the datarel
+// base), AAt moved past it; AOk false for an encoding this reader has no rule for
+routine DoEncoded(var AAt: uint64; const AEncoding: uint64; const ABase: uint64;
+  var AOk: bool): uint64;
+var
+  LField: uint64;
+  LForm: uint64;
+  LValue: uint64;
+begin
+  LField := AAt;
+  LForm := AEncoding & 0x0F;
+  LValue := 0;
+  if (LForm = DW_EH_PE_absptr) or (LForm = DW_EH_PE_udata8) or (LForm = DW_EH_PE_sdata8) then
+    LValue := DoWordAt(AAt);
+    AAt := AAt + 8;
+  else
+    if LForm = DW_EH_PE_uleb128 then
+      LValue := DoUleb(AAt);
+    else
+      if LForm = DW_EH_PE_sleb128 then
+        LValue := uint64(DoSleb(AAt));
+      else
+        if (LForm = DW_EH_PE_udata2) or (LForm = DW_EH_PE_sdata2) then
+          LValue := DoHalfAt(AAt);
+          if LForm = DW_EH_PE_sdata2 then
+            LValue := DoSigned(LValue, 2);
+          end;
+          AAt := AAt + 2;
+        else
+          if (LForm = DW_EH_PE_udata4) or (LForm = DW_EH_PE_sdata4) then
+            LValue := DoLongAt(AAt);
+            if LForm = DW_EH_PE_sdata4 then
+              LValue := DoSigned(LValue, 4);
+            end;
+            AAt := AAt + 4;
+          else
+            AOk := false;
+            return 0;
+          end;
+        end;
+      end;
+    end;
+  end;
+  // the base, wrapping as the address arithmetic of a signed offset does
+  if (AEncoding & 0x70) = DW_EH_PE_pcrel then
+    LValue := LValue + LField;
+  end;
+  if (AEncoding & 0x70) = DW_EH_PE_datarel then
+    LValue := LValue + ABase;
+  end;
+  if ((AEncoding & 0x70) <> 0) and ((AEncoding & 0x70) <> DW_EH_PE_pcrel) and
+    ((AEncoding & 0x70) <> DW_EH_PE_datarel) then
+    AOk := false;
+    return 0;
+  end;
+  if (AEncoding & DW_EH_PE_indirect) <> 0 then
+    LValue := DoWordAt(LValue);
+  end;
+  return LValue;
+end;
+
+// The FDE covering APc in the .eh_frame_hdr at AHeader (its sorted table searched: the
+// last entry starting at or below APc); 0 when there is none or the table is in a form
+// this reader does not take (anything but datarel sdata4 entries)
+routine DoFindFde(const AHeader: uint64; const APc: uint64): uint64;
+var
+  LAt: uint64;
+  LOk: bool;
+  LCount: uint64;
+  LTable: uint64;
+  LLow: int64;
+  LHigh: int64;
+  LMiddle: int64;
+  LStart: uint64;
+begin
+  if (DoByteAt(AHeader) <> 1) or (DoByteAt(AHeader + 3) <> (DW_EH_PE_datarel | DW_EH_PE_sdata4)) or
+    (DoByteAt(AHeader + 2) = DW_EH_PE_omit) then
+    return 0;
+  end;
+  LOk := true;
+  LAt := AHeader + 4;
+  DoEncoded(LAt, DoByteAt(AHeader + 1), AHeader, LOk);
+  LCount := DoEncoded(LAt, DoByteAt(AHeader + 2), AHeader, LOk);
+  if not LOk then
+    return 0;
+  end;
+  LTable := LAt;
+  LLow := 0;
+  LHigh := int64(LCount) - 1;
+  while LLow <= LHigh do
+    LMiddle := (LLow + LHigh) div 2;
+    LStart := AHeader + DoSigned(DoLongAt(LTable + uint64(LMiddle) * 8), 4);
+    if LStart <= APc then
+      LLow := LMiddle + 1;
+    else
+      LHigh := LMiddle - 1;
+    end;
+  end;
+  if LHigh < 0 then
+    return 0;
+  end;
+  return AHeader + DoSigned(DoLongAt(LTable + uint64(LHigh) * 8 + 4), 4);
+end;
+
+// The CFI instructions from ACursor's place up to AEnd run into ARow while their location
+// (ALocation, advanced by them) is at or below APc (AToEnd: all of them, a CIE's initial
+// ones); AInitial the CIE's row (DW_CFA_restore's). False on an instruction this reader
+// has no rule for (an expression, a deeper remember_state)
+routine DoRunCfi(var ACursor: PlatformCfiCursor; const AEnd: uint64; const APc: uint64;
+  const AToEnd: bool; var ALocation: uint64; var ARow: PlatformCfiRow;
+  const AInitial: PlatformCfiRow): bool;
+var
+  LStates: array[0..7] of PlatformCfiRow;
+  LDepth: int64;
+  LOp: uint64;
+  LReg: uint64;
+  LOk: bool;
+begin
+  LDepth := 0;
+  while ACursor.At < AEnd do
+    LOp := DoByteAt(ACursor.At);
+    ACursor.At := ACursor.At + 1;
+    if (LOp & 0xC0) = DW_CFA_advance_loc then
+      ALocation := ALocation + (LOp & 0x3F) * ACursor.CodeAlign;
+      if (not AToEnd) and (ALocation > APc) then
+        return true;
+      end;
+      skip;
+    end;
+    if (LOp & 0xC0) = DW_CFA_offset then
+      LReg := LOp & 0x3F;
+      if LReg <= 16 then
+        ARow.Rules[int64(LReg)].Kind := 1;
+        ARow.Rules[int64(LReg)].Value := int64(DoUleb(ACursor.At)) * ACursor.DataAlign;
+      else
+        DoUleb(ACursor.At);
+      end;
+      skip;
+    end;
+    if (LOp & 0xC0) = DW_CFA_restore then
+      LReg := LOp & 0x3F;
+      if LReg <= 16 then
+        ARow.Rules[int64(LReg)] := AInitial.Rules[int64(LReg)];
+      end;
+      skip;
+    end;
+    if LOp = DW_CFA_nop then
+      skip;
+    end;
+    if (LOp = DW_CFA_set_loc) or (LOp = DW_CFA_advance_loc1) or (LOp = DW_CFA_advance_loc2) or
+      (LOp = DW_CFA_advance_loc4) then
+      if LOp = DW_CFA_set_loc then
+        LOk := true;
+        ALocation := DoEncoded(ACursor.At, ACursor.Encoding, 0, LOk);
+        if not LOk then
+          return false;
+        end;
+      end;
+      if LOp = DW_CFA_advance_loc1 then
+        ALocation := ALocation + DoByteAt(ACursor.At) * ACursor.CodeAlign;
+        ACursor.At := ACursor.At + 1;
+      end;
+      if LOp = DW_CFA_advance_loc2 then
+        ALocation := ALocation + DoHalfAt(ACursor.At) * ACursor.CodeAlign;
+        ACursor.At := ACursor.At + 2;
+      end;
+      if LOp = DW_CFA_advance_loc4 then
+        ALocation := ALocation + DoLongAt(ACursor.At) * ACursor.CodeAlign;
+        ACursor.At := ACursor.At + 4;
+      end;
+      if (not AToEnd) and (ALocation > APc) then
+        return true;
+      end;
+      skip;
+    end;
+    if (LOp = DW_CFA_offset_extended) or (LOp = DW_CFA_offset_extended_sf) or
+      (LOp = DW_CFA_GNU_negative_offset_extended) then
+      LReg := DoUleb(ACursor.At);
+      if LReg > 16 then
+        return false;
+      end;
+      ARow.Rules[int64(LReg)].Kind := 1;
+      if LOp = DW_CFA_offset_extended then
+        ARow.Rules[int64(LReg)].Value := int64(DoUleb(ACursor.At)) * ACursor.DataAlign;
+      end;
+      if LOp = DW_CFA_offset_extended_sf then
+        ARow.Rules[int64(LReg)].Value := DoSleb(ACursor.At) * ACursor.DataAlign;
+      end;
+      if LOp = DW_CFA_GNU_negative_offset_extended then
+        ARow.Rules[int64(LReg)].Value := 0 - int64(DoUleb(ACursor.At)) * ACursor.DataAlign;
+      end;
+      skip;
+    end;
+    if (LOp = DW_CFA_restore_extended) or (LOp = DW_CFA_undefined) or
+      (LOp = DW_CFA_same_value) then
+      LReg := DoUleb(ACursor.At);
+      if LReg > 16 then
+        return false;
+      end;
+      if LOp = DW_CFA_restore_extended then
+        ARow.Rules[int64(LReg)] := AInitial.Rules[int64(LReg)];
+      else
+        ARow.Rules[int64(LReg)].Kind := 0;
+        ARow.Rules[int64(LReg)].Value := 0;
+      end;
+      skip;
+    end;
+    if LOp = DW_CFA_register then
+      LReg := DoUleb(ACursor.At);
+      if LReg > 16 then
+        return false;
+      end;
+      ARow.Rules[int64(LReg)].Kind := 2;
+      ARow.Rules[int64(LReg)].Value := int64(DoUleb(ACursor.At));
+      skip;
+    end;
+    if LOp = DW_CFA_remember_state then
+      if LDepth >= ADAM_PLATFORM_CFI_STATES then
+        return false;
+      end;
+      LStates[LDepth] := ARow;
+      LDepth := LDepth + 1;
+      skip;
+    end;
+    if LOp = DW_CFA_restore_state then
+      if LDepth = 0 then
+        return false;
+      end;
+      LDepth := LDepth - 1;
+      // the CFA is the remembered one too (DWARF 5 sec 6.4.2.4: the whole row)
+      ARow := LStates[LDepth];
+      skip;
+    end;
+    if (LOp = DW_CFA_def_cfa) or (LOp = DW_CFA_def_cfa_sf) then
+      ARow.CfaReg := int64(DoUleb(ACursor.At));
+      if LOp = DW_CFA_def_cfa then
+        ARow.CfaOffset := int64(DoUleb(ACursor.At));
+      else
+        ARow.CfaOffset := DoSleb(ACursor.At) * ACursor.DataAlign;
+      end;
+      skip;
+    end;
+    if LOp = DW_CFA_def_cfa_register then
+      ARow.CfaReg := int64(DoUleb(ACursor.At));
+      skip;
+    end;
+    if LOp = DW_CFA_def_cfa_offset then
+      ARow.CfaOffset := int64(DoUleb(ACursor.At));
+      skip;
+    end;
+    if LOp = DW_CFA_def_cfa_offset_sf then
+      ARow.CfaOffset := DoSleb(ACursor.At) * ACursor.DataAlign;
+      skip;
+    end;
+    if LOp = DW_CFA_GNU_args_size then
+      DoUleb(ACursor.At);
+      skip;
+    end;
+    return false;
+  end;
+  return true;
+end;
+
+// ARegs unwound out of a foreign frame (code with no Adam unwind data: a C library's,
+// glibc's) by its .eh_frame CFI: the object holding the pc (dl_iterate_phdr), its FDE
+// (.eh_frame_hdr's table), the CIE's and FDE's instructions run up to the call (the return
+// address less 1), then the CFA and every saved register read back. False when there is no
+// FDE for it or its CFI is beyond this reader (a 64-bit record, an augmentation it does not
+// know, an expression); a C frame has no scopes to run
+routine DoForeignUnwind(var ARegs: PlatformRegisters): bool;
+var
+  LSearch: PlatformObjectSearch;
+  LFde: uint64;
+  LCie: uint64;
+  LAt: uint64;
+  LEnd: uint64;
+  LCieEnd: uint64;
+  LAugment: uint64;
+  LCursor: PlatformCfiCursor;
+  LInitial: PlatformCfiRow;
+  LRow: PlatformCfiRow;
+  LStart: uint64;
+  LRange: uint64;
+  LLocation: uint64;
+  LPc: uint64;
+  LCfa: uint64;
+  LOld: PlatformRegisters;
+  LOk: bool;
+  LZ: bool;
+  LLetter: uint64;
+  LI: int64;
+begin
+  LPc := ARegs.Pc - 1;
+  LSearch.Pc := LPc;
+  LSearch.Header := 0;
+  dl_iterate_phdr(DoPhdrVisit, ptr(addr of LSearch));
+  if LSearch.Header = 0 then
+    return false;
+  end;
+  LFde := DoFindFde(LSearch.Header, LPc);
+  if (LFde = 0) or (DoLongAt(LFde) = 0xFFFFFFFF) or (DoLongAt(LFde + 4) = 0) then
+    return false;
+  end;
+  LEnd := LFde + 4 + DoLongAt(LFde);
+  LCie := LFde + 4 - DoLongAt(LFde + 4);
+  if (DoLongAt(LCie) = 0xFFFFFFFF) or (DoLongAt(LCie + 4) <> 0) then
+    return false;
+  end;
+  LCieEnd := LCie + 4 + DoLongAt(LCie);
+  // the CIE: version, augmentation string, alignments, return register, its data
+  LAt := LCie + 9;
+  LAugment := LAt;
+  while DoByteAt(LAt) <> 0 do
+    LAt := LAt + 1;
+  end;
+  LAt := LAt + 1;
+  LCursor.CodeAlign := DoUleb(LAt);
+  LCursor.DataAlign := DoSleb(LAt);
+  if DoByteAt(LCie + 8) = 1 then
+    LAt := LAt + 1;
+  else
+    DoUleb(LAt);
+  end;
+  LCursor.Encoding := DW_EH_PE_absptr;
+  LOk := true;
+  LZ := DoByteAt(LAugment) = 0x7A;
+  if LZ then
+    DoUleb(LAt);
+    LI := 1;
+    LLetter := DoByteAt(LAugment + uint64(LI));
+    while LLetter <> 0 do
+      if LLetter = 0x52 then
+        // 'R': the FDE's pointer encoding
+        LCursor.Encoding := DoByteAt(LAt);
+        LAt := LAt + 1;
+      else
+        if LLetter = 0x50 then
+          // 'P': the personality routine (C++'s; never called here)
+          LAt := LAt + 1;
+          DoEncoded(LAt, DoByteAt(LAt - 1), 0, LOk);
+        else
+          if LLetter = 0x4C then
+            // 'L': the LSDA's encoding
+            LAt := LAt + 1;
+          else
+            if LLetter <> 0x53 then
+              // 'S' (a signal frame) needs nothing; any other letter is unknown
+              return false;
+            end;
+          end;
+        end;
+      end;
+      LI := LI + 1;
+      LLetter := DoByteAt(LAugment + uint64(LI));
+    end;
+  else
+    if DoByteAt(LAugment) <> 0 then
+      return false;
+    end;
+  end;
+  if not LOk then
+    return false;
+  end;
+  // the CIE's initial instructions: the row every FDE starts from
+  LInitial.CfaReg := 7;
+  LInitial.CfaOffset := 8;
+  for LI := 0 to 16 do
+    LInitial.Rules[LI].Kind := 0;
+    LInitial.Rules[LI].Value := 0;
+  end;
+  LCursor.At := LAt;
+  LLocation := 0;
+  if not DoRunCfi(LCursor, LCieEnd, 0, true, LLocation, LInitial, LInitial) then
+    return false;
+  end;
+  // the FDE: its range, its augmentation data passed over, its instructions to the pc
+  LAt := LFde + 8;
+  LStart := DoEncoded(LAt, LCursor.Encoding, 0, LOk);
+  LRange := DoEncoded(LAt, LCursor.Encoding & 0x0F, 0, LOk);
+  if (not LOk) or (LPc < LStart) or (LPc >= LStart + LRange) then
+    return false;
+  end;
+  if LZ then
+    LAt := LAt + DoUleb(LAt);
+  end;
+  LRow := LInitial;
+  LCursor.At := LAt;
+  LLocation := LStart;
+  if not DoRunCfi(LCursor, LEnd, LPc, false, LLocation, LRow, LInitial) then
+    return false;
+  end;
+  if (LRow.CfaReg < 0) or (LRow.CfaReg > 15) or (LRow.Rules[ADAM_PLATFORM_CFI_RA].Kind <> 1) then
+    return false;
+  end;
+  // the caller's registers: each saved one read back from the CFA, each moved one copied
+  LOld := ARegs;
+  LCfa := LOld.Regs[ADAM_PLATFORM_DWARF_REG[LRow.CfaReg]] + uint64(LRow.CfaOffset);
+  for LI := 0 to 15 do
+    if LRow.Rules[LI].Kind = 1 then
+      ARegs.Regs[ADAM_PLATFORM_DWARF_REG[LI]] := DoWordAt(LCfa + uint64(LRow.Rules[LI].Value));
+    end;
+    if (LRow.Rules[LI].Kind = 2) and (LRow.Rules[LI].Value >= 0) and (LRow.Rules[LI].Value <= 15) then
+      ARegs.Regs[ADAM_PLATFORM_DWARF_REG[LI]] :=
+        LOld.Regs[ADAM_PLATFORM_DWARF_REG[LRow.Rules[LI].Value]];
+    end;
+  end;
+  ARegs.Pc := DoWordAt(LCfa + uint64(LRow.Rules[ADAM_PLATFORM_CFI_RA].Value));
+  ARegs.Regs[ADAM_PLATFORM_UNWIND_RSP] := LCfa;
+  return true;
+end;
+
+// No frame catches the exception: the walk reached code no unwind data describes (neither
+// Adam's nor an .eh_frame this unwinder reads), unwind data it cannot read, or the stack's
 // end. The process stops (SIGABRT) with the reason on stderr
 routine DoNoCatch(const AWhy: ptr to const char); noreturn;
 begin
@@ -977,7 +1616,8 @@ end;
 // first, up to the catching frame, where the walk resumes at the catch (AContext's
 // registers made the frame's: setcontext). A frame of a handler running a finally
 // (GFinallyRuns: a raise out of that funclet) is passed over to the frame the funclet
-// belongs to, at the scope after it. False (searching): no frame catches it
+// belongs to, at the scope after it; a foreign frame unwinds by its .eh_frame
+// (DoForeignUnwind). False (searching): no frame catches it
 routine DoWalk(const AStart: PlatformRegisters; const APointers: ptr;
   const AContext: ptr to PlatformContext; const AUnwinding: bool; var ADepth: int64;
   var AFrame: uint64; var ATarget: uint64): bool;
@@ -1003,10 +1643,23 @@ begin
       DoNoCatch(ptr to const char("unwind data the unwinder cannot read"));
     end;
     if LFacts.Entry = nil then
-      if AUnwinding then
-        DoNoCatch(ptr to const char("a frame with no Adam unwind data while unwinding"));
+      // a foreign frame (a C library's, glibc's: a callback's caller) has no scopes: its
+      // .eh_frame unwinds it
+      if not DoForeignUnwind(LRegs) then
+        if AUnwinding then
+          DoNoCatch(ptr to const char("a frame no unwind data describes, while unwinding"));
+        end;
+        return false;
       end;
-      return false;
+      LDispatch.ScopeFirst := 0;
+      LDepth := LDepth + 1;
+      if LRegs.Pc = 0 then
+        if AUnwinding then
+          DoNoCatch(ptr to const char("the stack's end while unwinding"));
+        end;
+        return false;
+      end;
+      skip;
     end;
     LData := DoHandlerData(LFacts.Entry);
     if (LCursor <> nil) and (LFacts.Entry^.Start = uint64(ptr(LSelf))) then
@@ -1073,7 +1726,7 @@ begin
   LTarget := 0;
   if not DoWalk(LStart, ptr(addr of LPointers), addr of LContext, false, LDepth, LFrame,
     LTarget) then
-    DoNoCatch(ptr to const char("no catching scope, or a frame with no Adam unwind data"));
+    DoNoCatch(ptr to const char("no catching scope, or a frame no unwind data describes"));
   end;
   DoWalk(LStart, ptr(addr of LPointers), addr of LContext, true, LDepth, LFrame, LTarget);
   DoNoCatch(ptr to const char("the catching frame was not met again"));
@@ -1253,18 +1906,22 @@ begin
   if ptr(LEnd) <> nil then
     LEnd();
   end;
+  DoCoroutineThreadEnd();
 end;
 
 // The base (the high end) of the stack the calling code runs on: the thread's own
 // (pthread_getattr_np: its lowest address and size), so two places compare as places on
-// one stack only when their bases are the same; 0 when it cannot be read. A coroutine's
-// own stack (LX4e) is told here once coroutines run on this target
+// one stack only when their bases are the same; 0 when it cannot be read. On a coroutine
+// (PlatformCoroutineSwitch's) its own stack's
 public routine PlatformStackBase(): uint64;
 var
   LAttributes: array[0..6] of uint64;
   LLow: ptr;
   LSize: uint64;
 begin
+  if (GCoroutineCurrent <> nil) and (GCoroutineCurrent^.StackHigh <> 0) then
+    return GCoroutineCurrent^.StackHigh;
+  end;
   if pthread_getattr_np(pthread_self(), ptr(addr of LAttributes)) <> 0 then
     return 0;
   end;
@@ -1440,28 +2097,209 @@ begin
   DoPending(ptr to const char("PlatformThreadDetach"), ptr to const char("LX4d"));
 end;
 
-// A coroutine that runs ARun(ABlock) on a stack of its own (LX4e, plan H5)
-public routine PlatformCoroutineNew(const ARun: routine(const ABlock: ptr); const ABlock: ptr): ptr;
+// glibc: a coroutine's context made to start a routine on its own stack (makecontext: the
+// context getcontext filled, its uc_stack set), and the running context saved while
+// another is resumed (swapcontext: the registers, the signal mask with a system call, the
+// floating-point control state); memory mapped, protected and given back
+routine makecontext(const AContext: ptr; const AStart: routine(); const ACount: int32; ...);
+  external "c";
+routine swapcontext(const AFrom: ptr; const ATo: ptr): int32; external "c";
+routine mmap(const AAddress: ptr; const ALength: uint64; const AProtection: int32;
+  const AFlags: int32; const AFile: int32; const AOffset: int64): ptr; external "c";
+routine mprotect(const AAddress: ptr; const ALength: uint64; const AProtection: int32): int32;
+  external "c";
+routine munmap(const AAddress: ptr; const ALength: uint64): int32; external "c";
+
+const
+  // A coroutine's stack (as win64's reserve: 1 MiB), the guard page below it (a page's
+  // bytes when sysconf cannot tell: _SC_PAGESIZE)
+  ADAM_PLATFORM_COROUTINE_STACK: uint64 = 1048576;
+  ADAM_PLATFORM_PAGE_DEFAULT: uint64 = 4096;
+  _SC_PAGESIZE: int32 = 30;
+  // sys/mman.h (x86_64): the protections and mapping flags, and mmap's failure
+  PROT_NONE: int32 = 0;
+  PROT_READ: int32 = 1;
+  PROT_WRITE: int32 = 2;
+  MAP_PRIVATE: int32 = 0x02;
+  MAP_ANONYMOUS: int32 = 0x20;
+  MAP_STACK: int32 = 0x20000;
+  ADAM_PLATFORM_MAP_FAILED: uint64 = 0xFFFFFFFFFFFFFFFF;
+  // ucontext_t's uc_link and uc_stack (stack_t: ss_sp, ss_flags, ss_size)
+  ADAM_PLATFORM_CONTEXT_LINK: uint64 = 8;
+  ADAM_PLATFORM_CONTEXT_STACK_SP: uint64 = 16;
+  ADAM_PLATFORM_CONTEXT_STACK_SIZE: uint64 = 32;
+
+// The calling thread's stack bounds (pthread_getattr_np: its lowest address and size) into
+// ALow / AHigh; false when they cannot be read
+routine DoThreadStack(var ALow: uint64; var AHigh: uint64): bool;
+var
+  LAttributes: array[0..6] of uint64;
+  LLow: ptr;
+  LSize: uint64;
+  LOk: bool;
 begin
-  DoPending(ptr to const char("PlatformCoroutineNew"), ptr to const char("LX4e"));
+  if pthread_getattr_np(pthread_self(), ptr(addr of LAttributes)) <> 0 then
+    return false;
+  end;
+  LLow := nil;
+  LSize := 0;
+  LOk := pthread_attr_getstack(ptr(addr of LAttributes), LLow, LSize) = 0;
+  pthread_attr_destroy(ptr(addr of LAttributes));
+  if LOk then
+    ALow := uint64(LLow);
+    AHigh := uint64(LLow) + LSize;
+  end;
+  return LOk;
 end;
 
-// The coroutine running on the calling thread (LX4e)
+// The calling thread's own coroutine (GCoroutineThread), made the first time it is asked
+// for: no stack of its own (the thread's: its bounds kept), its context filled the first
+// time it switches away; nil when there is no room
+routine DoThreadCoroutine(): ptr to PlatformCoroutine;
+var
+  LCoroutine: ptr to PlatformCoroutine;
+  LLow: uint64;
+  LHigh: uint64;
+begin
+  if GCoroutineThread <> nil then
+    return GCoroutineThread;
+  end;
+  LCoroutine := ptr to PlatformCoroutine(malloc(uint64(size(PlatformCoroutine))));
+  if LCoroutine = nil then
+    return nil;
+  end;
+  // Map, Run and Block stay nil: a thread's own coroutine has no stack or run of its own
+  memset(ptr(LCoroutine), 0, uint64(size(PlatformCoroutine)));
+  LLow := 0;
+  LHigh := 0;
+  if DoThreadStack(LLow, LHigh) then
+    LCoroutine^.StackLow := LLow;
+    LCoroutine^.StackHigh := LHigh;
+  end;
+  GCoroutineThread := LCoroutine;
+  GCoroutineCurrent := LCoroutine;
+  return LCoroutine;
+end;
+
+// A coroutine's start (makecontext's routine, on its own stack): the coroutine is the one
+// the switch to it wrote (GCoroutineCurrent), its run called with its block. A run never
+// returns (it ends by switching away for good, System.Runtime's GeneratorEnd): its
+// context links to none (uc_link nil would end the thread), so the process ends here
+routine DoCoroutineStart();
+var
+  LCoroutine: ptr to PlatformCoroutine;
+  LRun: routine(const ABlock: ptr);
+begin
+  LCoroutine := GCoroutineCurrent;
+  LRun := LCoroutine^.Run;
+  LRun(LCoroutine^.Block);
+  PlatformTerminate(1);
+end;
+
+// A new coroutine that runs ARun(ABlock) on a stack of its own (System.Runtime's
+// GeneratorRun) once it is first switched to (PlatformCoroutineSwitch), not before; ARun
+// never returns. Its stack is ADAM_PLATFORM_COROUTINE_STACK bytes mapped (pages taken as
+// it grows) over a guard page, so an overflow faults rather than writing past it. nil when
+// it could not be made (no room, or the OS refused)
+public routine PlatformCoroutineNew(const ARun: routine(const ABlock: ptr); const ABlock: ptr): ptr;
+var
+  LCoroutine: ptr to PlatformCoroutine;
+  LPage: uint64;
+  LMap: ptr;
+  LSlot: ptr to uint64;
+begin
+  LPage := ADAM_PLATFORM_PAGE_DEFAULT;
+  if sysconf(_SC_PAGESIZE) > 0 then
+    LPage := uint64(sysconf(_SC_PAGESIZE));
+  end;
+  LCoroutine := ptr to PlatformCoroutine(malloc(uint64(size(PlatformCoroutine))));
+  if LCoroutine = nil then
+    return nil;
+  end;
+  memset(ptr(LCoroutine), 0, uint64(size(PlatformCoroutine)));
+  LMap := mmap(nil, ADAM_PLATFORM_COROUTINE_STACK + LPage, PROT_READ | PROT_WRITE,
+    MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+  if uint64(LMap) = ADAM_PLATFORM_MAP_FAILED then
+    free(ptr(LCoroutine));
+    return nil;
+  end;
+  if (mprotect(LMap, LPage, PROT_NONE) <> 0) or
+    (getcontext(ptr(addr of LCoroutine^.Context)) <> 0) then
+    munmap(LMap, ADAM_PLATFORM_COROUTINE_STACK + LPage);
+    free(ptr(LCoroutine));
+    return nil;
+  end;
+  LCoroutine^.Map := LMap;
+  LCoroutine^.MapSize := ADAM_PLATFORM_COROUTINE_STACK + LPage;
+  LCoroutine^.StackLow := uint64(LMap) + LPage;
+  LCoroutine^.StackHigh := uint64(LMap) + LPage + ADAM_PLATFORM_COROUTINE_STACK;
+  LCoroutine^.Run := ARun;
+  LCoroutine^.Block := ABlock;
+  // the stack above the guard page, linked to no context
+  LSlot := ptr to uint64(uint64(ptr(addr of LCoroutine^.Context)) + ADAM_PLATFORM_CONTEXT_LINK);
+  LSlot^ := 0;
+  LSlot := ptr to uint64(uint64(ptr(addr of LCoroutine^.Context)) + ADAM_PLATFORM_CONTEXT_STACK_SP);
+  LSlot^ := LCoroutine^.StackLow;
+  LSlot := ptr to uint64(uint64(ptr(addr of LCoroutine^.Context)) +
+    ADAM_PLATFORM_CONTEXT_STACK_SIZE);
+  LSlot^ := ADAM_PLATFORM_COROUTINE_STACK;
+  makecontext(ptr(addr of LCoroutine^.Context), DoCoroutineStart, 0);
+  return ptr(LCoroutine);
+end;
+
+// The coroutine running on the calling thread: the one switched to last, or the thread's
+// own (made the first time: DoThreadCoroutine); what a switch back names. nil when there
+// is no room for the thread's own
 public routine PlatformCoroutineSelf(): ptr;
 begin
-  DoPending(ptr to const char("PlatformCoroutineSelf"), ptr to const char("LX4e"));
+  if GCoroutineCurrent <> nil then
+    return ptr(GCoroutineCurrent);
+  end;
+  return ptr(DoThreadCoroutine());
 end;
 
-// The calling thread switched to the coroutine ATo (LX4e)
+// The calling thread switched to the coroutine ATo (PlatformCoroutineNew's, or one
+// PlatformCoroutineSelf named), which runs from where it last switched away (its run's
+// start the first time); this returns when something switches back to the coroutine that
+// called it, perhaps on another thread. The calling thread runs a coroutine already
+// (PlatformCoroutineSelf gave one); ATo is never the running one, nor one running on
+// another thread. The running coroutine (and, in a debug build, the leak tracker's stack
+// bounds: ATo's) is written before the switch and nothing of this thread's is read after
+// it (the thread may be another one by then)
 public routine PlatformCoroutineSwitch(const ATo: ptr);
+var
+  LTo: ptr to PlatformCoroutine;
+  LFrom: ptr to PlatformCoroutine;
 begin
-  DoPending(ptr to const char("PlatformCoroutineSwitch"), ptr to const char("LX4e"));
+  LTo := ptr to PlatformCoroutine(ATo);
+  LFrom := GCoroutineCurrent;
+  GCoroutineCurrent := LTo;
+@ifdef DEBUG
+  if GFrameHigh = 0 then
+    DoFrameStart();
+  end;
+  if LTo^.StackHigh <> 0 then
+    GFrameLow := LTo^.StackLow;
+    GFrameHigh := LTo^.StackHigh;
+  end;
+@endif
+  swapcontext(ptr(addr of LFrom^.Context), ptr(addr of LTo^.Context));
 end;
 
-// The coroutine ACoroutine freed, its stack with it (LX4e)
+// The coroutine ACoroutine (PlatformCoroutineNew's) freed, its stack with it: it is not
+// running anywhere (finished, or never switched to again); nil does nothing
 public routine PlatformCoroutineFree(const ACoroutine: ptr);
+var
+  LCoroutine: ptr to PlatformCoroutine;
 begin
-  DoPending(ptr to const char("PlatformCoroutineFree"), ptr to const char("LX4e"));
+  if ACoroutine = nil then
+    return;
+  end;
+  LCoroutine := ptr to PlatformCoroutine(ACoroutine);
+  if LCoroutine^.Map <> nil then
+    munmap(LCoroutine^.Map, LCoroutine^.MapSize);
+  end;
+  free(ACoroutine);
 end;
 
 // The processors online (a for parallel's workers when it gives no count, T2); at least 1
