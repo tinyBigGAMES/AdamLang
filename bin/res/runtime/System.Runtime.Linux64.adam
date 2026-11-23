@@ -25,9 +25,13 @@
   implicit import. This one is over glibc (libc.so.6, linked dynamically:
   `external "c"`), which initializes itself in __libc_start_main; the pure
   C routines it calls (memcpy, strlen ..) are libc.a's, System.Runtime.LibC.
-  The routines a later atom of PLAN-LINUX64 fills (raise and catch LX4b,
-  threads LX4d, coroutines LX4e, hooks LX4f, loaded libraries LX4g, a .so's
-  events LX6b) stop the process with that atom named (DoPending) until then.
+  Raise and catch run on the runtime's own unwinder (plan H1): the compiler
+  writes win64's x64 unwind data into adam_xdata / adam_pdata, and DoWalk
+  reads it, searching the frames' scopes, then unwinding them to the catch
+  (DoDispatch, PlatformFrameHandler). The routines a later atom of
+  PLAN-LINUX64 fills (threads LX4d, coroutines LX4e, hooks LX4f, loaded
+  libraries LX4g, a .so's events LX6b) stop the process with that atom named
+  (DoPending) until then.
 *******************************************************************************/
 
 module unit System.Runtime.Linux64;
@@ -379,45 +383,784 @@ begin
   _exit(ACode);
 end;
 
-// Raises the runtime's exception: the unwinder walks the frames for one whose scope
-// catches it, then unwinds the frames in between; it never returns (LX4b, plan H1)
+// glibc: the calling thread's registers saved into a ucontext_t (0), and a saved one
+// resumed (never returns when it works): the unwinder's start and its jump to a catch
+routine getcontext(const AContext: ptr): int32; external "c";
+routine setcontext(const AContext: ptr): int32; external "c";
+
+var
+  // The linker's bounds of Adam's function table (adam_pdata, plan H1): per function with
+  // unwind data its start, end and UNWIND_INFO, each an int32 relative to its own field
+  // (Rva32 written as R_X86_64_PC32, LX2a)
+  GPdataStart: uint8; external "c" name "__start_adam_pdata";
+  GPdataStop: uint8; external "c" name "__stop_adam_pdata";
+
+forward type PlatformFinallyRun;
+
+type
+  // A ucontext_t (glibc x86_64: 968 bytes; its gregs at 40, REG_* order) as getcontext
+  // fills it and setcontext resumes it, in a 1024-byte 16-aligned block read by offset
+  PlatformContext = record align(16)
+    Bytes: array[0..1023] of uint8;
+  end;
+  // A frame's registers as the unwinder walks them: the 16 general registers by their
+  // unwind number (0 rax, 1 rcx, 2 rdx, 3 rbx, 4 rsp, 5 rbp, 6 rsi, 7 rdi, 8 .. 15 r8 ..
+  // r15) and the frame's pc
+  PlatformRegisters = record
+    Regs: array[0..15] of uint64;
+    Pc: uint64;
+  end;
+  // A function of Adam's table (DoFunctions): its code's first byte, the byte past its
+  // last and its UNWIND_INFO, as addresses
+  PlatformFunction = record
+    Start: uint64;
+    Stop: uint64;
+    Info: uint64;
+  end;
+  // How a frame unwinds at its pc (DoFrameFacts): its base is its rsp (FrameReg -1) or the
+  // frame register FrameReg's value less FrameOffset (the frame a scope's funclets are
+  // handed: Windows' establisher frame); its return address at base + Total, the SaveCount
+  // registers it saved (SaveReg[i]: an unwind number) at base + SaveAt[i]. Entry: its
+  // function in the table (nil: no Adam unwind data, a bare leaf or a foreign frame); Pc:
+  // the pc the facts are for (0: an empty cache entry)
+  PlatformFrameFacts = record
+    Pc: uint64;
+    Entry: ptr to PlatformFunction;
+    Total: int64;
+    FrameReg: int64;
+    FrameOffset: int64;
+    SaveCount: int64;
+    SaveReg: array[0..15] of uint8;
+    SaveAt: array[0..15] of int32;
+  end;
+  // The exception being dispatched (the filters' pointers' first word points at it, as
+  // an EXCEPTION_RECORD's first DWORD is its code): ADAM_PLATFORM_RAISE_CODE,
+  // ADAM_PLATFORM_ABORT_CODE or ADAM_PLATFORM_FAULT_CODE (LX4c, its Kind an
+  // ADAM_PLATFORM_FAULT_*)
+  PlatformException = record
+    Code: uint32;
+    Kind: int32;
+  end;
+  // A finally funclet's run (PlatformFrameHandler, unwinding): the frame it belongs to as
+  // it was before the unwind left it, the scope after its own, the run around it (nil: the
+  // thread's first). A raise out of the funclet meets the handler's frame and goes on from
+  // that frame at that scope (Windows' collided unwind): the frames between, partly
+  // unwound already, are not walked a second time
+  PlatformFinallyRun = record
+    Regs: PlatformRegisters;
+    ScopeNext: int64;
+    Outer: ptr to PlatformFinallyRun;
+  end;
+  // What the walk (DoWalk) hands a frame's handler (PlatformFrameHandler's ADispatch): the
+  // frame's scope table (its count, then 16 bytes per scope), the first scope to look at,
+  // the phase; unwinding: the catching frame is this one (IsTarget) and its catch's
+  // address (TargetPc); searching: the catch the handler found (Found)
+  PlatformDispatch = record
+    Scopes: uint64;
+    ScopeFirst: int64;
+    Unwinding: bool;
+    IsTarget: bool;
+    TargetPc: uint64;
+    Found: uint64;
+  end;
+  // A scope's filter (exception pointers, frame: above 0 caught) and a finally funclet
+  // (abnormal, frame), as the compiler makes them; a frame's handler
+  PlatformFilterRoutine = routine(const APointers: ptr; const AFrame: ptr): int32;
+  PlatformFinallyRoutine = routine(const AAbnormal: uint8; const AFrame: ptr);
+  PlatformHandlerRoutine = routine(const ARecord: ptr; const AFrame: ptr; const AContext: ptr;
+    const ADispatch: ptr): int32;
+
+const
+  // Exception codes of a dispatch (System.Runtime.Win64's values, so a code reads the same
+  // on both targets): the runtime's raise, a generator's abort, a hardware fault (LX4c)
+  ADAM_PLATFORM_RAISE_CODE: uint32 = 0xE0414441;
+  ADAM_PLATFORM_ABORT_CODE: uint32 = 0xE0414442;
+  ADAM_PLATFORM_FAULT_CODE: uint32 = 0xE0414443;
+  // ucontext_t's gregs (uc_mcontext at 40, gregs first) and REG_RIP; the gregs index of
+  // each unwind number (REG_RAX 13, REG_RCX 14, REG_RDX 12, REG_RBX 11, REG_RSP 15, REG_RBP
+  // 10, REG_RSI 9, REG_RDI 8, REG_R8 .. REG_R15 0 .. 7)
+  ADAM_PLATFORM_CONTEXT_GREGS: uint64 = 40;
+  REG_RIP: uint64 = 16;
+  ADAM_PLATFORM_GREG_OF: array[0..15] of uint64 = [13, 14, 12, 11, 15, 10, 9, 8, 0, 1, 2, 3,
+    4, 5, 6, 7];
+  // rsp's unwind number
+  ADAM_PLATFORM_UNWIND_RSP: int64 = 4;
+  // A function table entry's bytes
+  ADAM_PLATFORM_PDATA_ENTRY: uint64 = 12;
+  // UNWIND_INFO's flags (bits 3-7 of its first byte): a handler for the dispatch, for the
+  // unwind, chained info
+  UNW_FLAG_EHANDLER: uint64 = 1;
+  UNW_FLAG_UHANDLER: uint64 = 2;
+  UNW_FLAG_CHAININFO: uint64 = 4;
+  // The unwind codes (UWOP_*); UWOP_EPILOG exists from version 2 on
+  UWOP_PUSH_NONVOL: uint64 = 0;
+  UWOP_ALLOC_LARGE: uint64 = 1;
+  UWOP_ALLOC_SMALL: uint64 = 2;
+  UWOP_SET_FPREG: uint64 = 3;
+  UWOP_EPILOG: uint64 = 6;
+  UWOP_SAVE_XMM128: uint64 = 8;
+  UWOP_SAVE_XMM128_FAR: uint64 = 9;
+  // A scope table entry's bytes (begin, end, handler, target)
+  ADAM_PLATFORM_SCOPE_ENTRY: uint64 = 16;
+
+var
+  // Adam's function table sorted by start (DoFunctions: made once from adam_pdata, from
+  // the C heap, kept for the process's life), GFunctionCount entries; the lock (a zeroed
+  // pthread_mutex_t) makes threads raising at once build it once
+  GFunctionsReady: bool;
+  GFunctionsLock: array[0..4] of uint64;
+  GFunctions: ptr to PlatformFunction;
+  GFunctionCount: int64;
+
+threadstatic
+  // The finally funclets running on this thread (PlatformFrameHandler), the innermost first
+  GFinallyRuns: ptr to PlatformFinallyRun;
+  // The hardware fault kind (ADAM_PLATFORM_FAULT_*) a guard's filter took on this thread
+  // (PlatformCatch), waiting for that guard's except part (PlatformFaultTaken); 0 when none
+  GFaultPending: int32;
+
+// The byte, uint16, uint32 and uint64 at AAddress (little-endian)
+routine DoByteAt(const AAddress: uint64): uint64;
+var
+  LAt: ptr to const uint8;
+begin
+  LAt := ptr to const uint8(AAddress);
+  return uint64(LAt^);
+end;
+
+routine DoHalfAt(const AAddress: uint64): uint64;
+var
+  LAt: ptr to const uint16;
+begin
+  LAt := ptr to const uint16(AAddress);
+  return uint64(LAt^);
+end;
+
+routine DoLongAt(const AAddress: uint64): uint64;
+var
+  LAt: ptr to const uint32;
+begin
+  LAt := ptr to const uint32(AAddress);
+  return uint64(LAt^);
+end;
+
+routine DoWordAt(const AAddress: uint64): uint64;
+var
+  LAt: ptr to const uint64;
+begin
+  LAt := ptr to const uint64(AAddress);
+  return LAt^;
+end;
+
+// The address an unwind field at AField names: the field's own address plus the int32
+// it holds (an Rva32 is written PC32 on this target)
+routine DoRelative(const AField: uint64): uint64;
+var
+  LValue: uint64;
+begin
+  LValue := DoLongAt(AField);
+  if LValue >= 0x80000000 then
+    return AField - (0x100000000 - LValue);
+  end;
+  return AField + LValue;
+end;
+
+// AContext's registers (getcontext's) as the walk's
+routine DoContextRegisters(const AContext: ptr to PlatformContext; var ARegs: PlatformRegisters);
+var
+  LGregs: uint64;
+  LI: int64;
+begin
+  LGregs := uint64(ptr(AContext)) + ADAM_PLATFORM_CONTEXT_GREGS;
+  for LI := 0 to 15 do
+    ARegs.Regs[LI] := DoWordAt(LGregs + ADAM_PLATFORM_GREG_OF[LI] * 8);
+  end;
+  ARegs.Pc := DoWordAt(LGregs + REG_RIP * 8);
+end;
+
+// The walk's registers ARegs written into AContext, resumed at APc (setcontext)
+routine DoResume(const AContext: ptr to PlatformContext; const ARegs: PlatformRegisters;
+  const APc: uint64); noreturn;
+var
+  LGregs: uint64;
+  LSlot: ptr to uint64;
+  LI: int64;
+begin
+  LGregs := uint64(ptr(AContext)) + ADAM_PLATFORM_CONTEXT_GREGS;
+  for LI := 0 to 15 do
+    LSlot := ptr to uint64(LGregs + ADAM_PLATFORM_GREG_OF[LI] * 8);
+    LSlot^ := ARegs.Regs[LI];
+  end;
+  LSlot := ptr to uint64(LGregs + REG_RIP * 8);
+  LSlot^ := APc;
+  setcontext(ptr(AContext));
+  DoWriteErrorText(ptr to const char("System.Runtime.Linux64: setcontext failed\n"));
+  abort();
+end;
+
+// Function table entries AA and AB swapped
+routine DoSwapFunctions(const AA: ptr to PlatformFunction; const AB: ptr to PlatformFunction);
+var
+  LHold: PlatformFunction;
+begin
+  LHold := AA^;
+  AA^ := AB^;
+  AB^ := LHold;
+end;
+
+// The heap of AFunctions' first ACount entries (by Start) made whole again at ARoot
+// (heapsort's sift down)
+routine DoSiftFunctions(const AFunctions: ptr to PlatformFunction; const ARoot: int64;
+  const ACount: int64);
+var
+  LRoot: int64;
+  LChild: int64;
+begin
+  LRoot := ARoot;
+  while LRoot * 2 + 1 < ACount do
+    LChild := LRoot * 2 + 1;
+    if (LChild + 1 < ACount) and (AFunctions[LChild].Start < AFunctions[LChild + 1].Start) then
+      LChild := LChild + 1;
+    end;
+    if AFunctions[LRoot].Start >= AFunctions[LChild].Start then
+      return;
+    end;
+    DoSwapFunctions(addr of AFunctions[LRoot], addr of AFunctions[LChild]);
+    LRoot := LChild;
+  end;
+end;
+
+// AFunctions' ACount entries sorted by Start (a heapsort: the linker lays the table in
+// section order, which is no address order once COMDAT pieces and removal move code)
+routine DoSortFunctions(const AFunctions: ptr to PlatformFunction; const ACount: int64);
+var
+  LI: int64;
+  LSorted: bool;
+begin
+  LSorted := true;
+  LI := 1;
+  while LSorted and (LI < ACount) do
+    LSorted := AFunctions[LI - 1].Start <= AFunctions[LI].Start;
+    LI := LI + 1;
+  end;
+  if LSorted then
+    return;
+  end;
+  LI := ACount div 2 - 1;
+  while LI >= 0 do
+    DoSiftFunctions(AFunctions, LI, ACount);
+    LI := LI - 1;
+  end;
+  LI := ACount - 1;
+  while LI > 0 do
+    DoSwapFunctions(addr of AFunctions[0], addr of AFunctions[LI]);
+    DoSiftFunctions(AFunctions, 0, LI);
+    LI := LI - 1;
+  end;
+end;
+
+// Adam's function table (GFunctions), made the first time it is asked for: adam_pdata's
+// entries as addresses, empty ones (a removed function's) left out, sorted by start
+routine DoFunctions();
+var
+  LFirst: uint64;
+  LLast: uint64;
+  LAt: uint64;
+  LCount: int64;
+  LTable: ptr to PlatformFunction;
+  LEntry: PlatformFunction;
+begin
+  pthread_mutex_lock(ptr(addr of GFunctionsLock));
+  if not GFunctionsReady then
+    LFirst := uint64(ptr(addr of GPdataStart));
+    LLast := uint64(ptr(addr of GPdataStop));
+    LTable := nil;
+    LCount := 0;
+    if LLast > LFirst then
+      LTable := ptr to PlatformFunction(malloc((LLast - LFirst) div ADAM_PLATFORM_PDATA_ENTRY *
+        uint64(size(PlatformFunction)) + 1));
+    end;
+    if LTable <> nil then
+      LAt := LFirst;
+      while LAt + ADAM_PLATFORM_PDATA_ENTRY <= LLast do
+        LEntry.Start := DoRelative(LAt);
+        LEntry.Stop := DoRelative(LAt + 4);
+        LEntry.Info := DoRelative(LAt + 8);
+        if (DoLongAt(LAt) <> 0) and (LEntry.Start < LEntry.Stop) then
+          LTable[LCount] := LEntry;
+          LCount := LCount + 1;
+        end;
+        LAt := LAt + ADAM_PLATFORM_PDATA_ENTRY;
+      end;
+      DoSortFunctions(LTable, LCount);
+    end;
+    GFunctions := LTable;
+    GFunctionCount := LCount;
+    GFunctionsReady := true;
+  end;
+  pthread_mutex_unlock(ptr(addr of GFunctionsLock));
+end;
+
+// The function of Adam's table whose code holds APc; nil when none does (a bare leaf, or
+// code that is not Adam's: a C library's, glibc's)
+routine DoFindFunction(const APc: uint64): ptr to PlatformFunction;
+var
+  LLow: int64;
+  LHigh: int64;
+  LMiddle: int64;
+begin
+  if not GFunctionsReady then
+    DoFunctions();
+  end;
+  // the last entry starting at or below APc
+  LLow := 0;
+  LHigh := GFunctionCount - 1;
+  while LLow <= LHigh do
+    LMiddle := (LLow + LHigh) div 2;
+    if GFunctions[LMiddle].Start <= APc then
+      LLow := LMiddle + 1;
+    else
+      LHigh := LMiddle - 1;
+    end;
+  end;
+  if (LHigh < 0) or (APc >= GFunctions[LHigh].Stop) then
+    return nil;
+  end;
+  return addr of GFunctions[LHigh];
+end;
+
+// The slots the unwind code at ASlot takes: UWOP_ALLOC_LARGE 2 (info 0) or 3,
+// UWOP_SAVE_XMM128 2, UWOP_SAVE_XMM128_FAR 3, every other 1
+routine DoCodeSlots(const ASlot: uint64): uint64;
+var
+  LOp: uint64;
+begin
+  LOp := DoByteAt(ASlot + 1) & 15;
+  if LOp = UWOP_ALLOC_LARGE then
+    if (DoByteAt(ASlot + 1) shr 4) = 0 then
+      return 2;
+    end;
+    return 3;
+  end;
+  if LOp = UWOP_SAVE_XMM128 then
+    return 2;
+  end;
+  if LOp = UWOP_SAVE_XMM128_FAR then
+    return 3;
+  end;
+  return 1;
+end;
+
+// True for an unwind code AOp the unwinder reads (Adam.Backend.Unwind's, UWOP_EPILOG from
+// version 2 on): a frame that saves a register another way is beyond it
+routine DoKnownCode(const AOp: uint64; const AVersion: uint64): bool;
+begin
+  if (AOp = UWOP_PUSH_NONVOL) or (AOp = UWOP_ALLOC_SMALL) or (AOp = UWOP_ALLOC_LARGE) or
+    (AOp = UWOP_SET_FPREG) or (AOp = UWOP_SAVE_XMM128) or (AOp = UWOP_SAVE_XMM128_FAR) then
+    return true;
+  end;
+  return (AOp = UWOP_EPILOG) and (AVersion = 2);
+end;
+
+// AFacts of the frame at APc (AReturn: APc is a return address, so its call is the byte
+// before it: the function is looked up there, past a call that ends its function); false
+// when its unwind data is beyond this unwinder (chained info, an unknown code). The codes
+// run last prologue step first; one whose prologue offset is past APc's has not run yet
+// (a fault inside a prologue, LX4c). Without Adam unwind data AFacts are a bare leaf's
+// (its return address at its rsp) with no Entry
+routine DoFrameFacts(const APc: uint64; const AReturn: bool; var AFacts: PlatformFrameFacts): bool;
+var
+  LEntry: ptr to PlatformFunction;
+  LInfo: uint64;
+  LHeader: uint64;
+  LVersion: uint64;
+  LCount: uint64;
+  LFrame: uint64;
+  LOffset: uint64;
+  LAt: uint64;
+  LSlot: uint64;
+  LOp: uint64;
+  LOpInfo: uint64;
+  LRan: bool;
+  LTotal: int64;
+  LFramed: bool;
+begin
+  AFacts.Pc := APc;
+  AFacts.Entry := nil;
+  AFacts.Total := 0;
+  AFacts.FrameReg := -1;
+  AFacts.FrameOffset := 0;
+  AFacts.SaveCount := 0;
+  if AReturn then
+    LEntry := DoFindFunction(APc - 1);
+  else
+    LEntry := DoFindFunction(APc);
+  end;
+  if LEntry = nil then
+    return true;
+  end;
+  AFacts.Entry := LEntry;
+  LInfo := LEntry^.Info;
+  LHeader := DoByteAt(LInfo);
+  LVersion := LHeader & 7;
+  if ((LVersion <> 1) and (LVersion <> 2)) or (((LHeader shr 3) & UNW_FLAG_CHAININFO) <> 0) then
+    return false;
+  end;
+  LOffset := APc - LEntry^.Start;
+  LCount := DoByteAt(LInfo + 2);
+  LFrame := DoByteAt(LInfo + 3);
+  // the frame register is the base once its step ran
+  LFramed := false;
+  LAt := 0;
+  while LAt < LCount do
+    LSlot := LInfo + 4 + LAt * 2;
+    LOp := DoByteAt(LSlot + 1) & 15;
+    if (LOp = UWOP_SET_FPREG) and (DoByteAt(LSlot) <= LOffset) then
+      LFramed := (LFrame & 15) <> 0;
+    end;
+    LAt := LAt + DoCodeSlots(LSlot);
+  end;
+  if LFramed then
+    AFacts.FrameReg := int64(LFrame & 15);
+    AFacts.FrameOffset := int64(LFrame shr 4) * 16;
+  end;
+  LTotal := 0;
+  LAt := 0;
+  while LAt < LCount do
+    LSlot := LInfo + 4 + LAt * 2;
+    LOp := DoByteAt(LSlot + 1) & 15;
+    LOpInfo := DoByteAt(LSlot + 1) shr 4;
+    LRan := DoByteAt(LSlot) <= LOffset;
+    if not DoKnownCode(LOp, LVersion) then
+      return false;
+    end;
+    if LRan and (LOp = UWOP_PUSH_NONVOL) then
+      AFacts.SaveReg[AFacts.SaveCount] := uint8(LOpInfo);
+      AFacts.SaveAt[AFacts.SaveCount] := int32(LTotal);
+      AFacts.SaveCount := AFacts.SaveCount + 1;
+      LTotal := LTotal + 8;
+    end;
+    if LRan and (LOp = UWOP_ALLOC_SMALL) then
+      LTotal := LTotal + int64(LOpInfo * 8 + 8);
+    end;
+    if LRan and (LOp = UWOP_ALLOC_LARGE) then
+      if LOpInfo = 0 then
+        LTotal := LTotal + int64(DoHalfAt(LSlot + 2) * 8);
+      else
+        LTotal := LTotal + int64(DoLongAt(LSlot + 2));
+      end;
+    end;
+    // UWOP_SET_FPREG was taken above (the base is the frame register from there on); a
+    // vector save restores nothing a frame reads (no vector register is callee-saved on
+    // SysV); a version 2 epilogue's description says nothing of a call's frame
+    LAt := LAt + DoCodeSlots(LSlot);
+  end;
+  AFacts.Total := LTotal;
+  return true;
+end;
+
+// The base of the frame ARegs are in, by AFacts: its rsp or its frame register less the
+// offset (the frame a scope's filter and funclets are handed)
+routine DoFrameBase(const ARegs: PlatformRegisters; const AFacts: PlatformFrameFacts): uint64;
+begin
+  if AFacts.FrameReg < 0 then
+    return ARegs.Regs[ADAM_PLATFORM_UNWIND_RSP];
+  end;
+  return ARegs.Regs[AFacts.FrameReg] - uint64(AFacts.FrameOffset);
+end;
+
+// ARegs unwound out of the frame AFacts describe: each register it saved read back, its
+// return address the new pc, rsp past it
+routine DoUnwindFrame(var ARegs: PlatformRegisters; const AFacts: PlatformFrameFacts);
+var
+  LBase: uint64;
+  LI: int64;
+begin
+  LBase := DoFrameBase(ARegs, AFacts);
+  for LI := 0 to AFacts.SaveCount - 1 do
+    ARegs.Regs[int64(AFacts.SaveReg[LI])] := DoWordAt(LBase + uint64(int64(AFacts.SaveAt[LI])));
+  end;
+  ARegs.Pc := DoWordAt(LBase + uint64(AFacts.Total));
+  ARegs.Regs[ADAM_PLATFORM_UNWIND_RSP] := LBase + uint64(AFacts.Total) + 8;
+end;
+
+// The handler data of the function AEntry (its frame handler's field, the scope table
+// after it); 0 when it has none (no UHANDLER / EHANDLER flag)
+routine DoHandlerData(const AEntry: ptr to PlatformFunction): uint64;
+var
+  LInfo: uint64;
+  LCount: uint64;
+begin
+  LInfo := AEntry^.Info;
+  if ((DoByteAt(LInfo) shr 3) & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) = 0 then
+    return 0;
+  end;
+  LCount := DoByteAt(LInfo + 2);
+  return LInfo + 4 + ((LCount + 1) & 0xFE) * 2;
+end;
+
+// No frame catches the exception: the walk reached code with no Adam unwind data (a C
+// frame between: foreign frames are LX4b2's), unwind data it cannot read, or the stack's
+// end. The process stops (SIGABRT) with the reason on stderr
+routine DoNoCatch(const AWhy: ptr to const char); noreturn;
+begin
+  DoWriteErrorText(ptr to const char("System.Runtime.Linux64: no frame catches the exception ("));
+  DoWriteErrorText(AWhy);
+  DoWriteErrorText(ptr to const char(")\n"));
+  abort();
+end;
+
+// The handler the unwinder (DoWalk) calls for a frame whose unwind data holds a guard's
+// scope table (the compiler names it as the frame's handler, as on win64, where it is the
+// OS's language handler): ARecord the exception's pointers, AFrame the frame's base,
+// AContext its registers (PlatformRegisters), ADispatch the walk's PlatformDispatch. Its
+// scopes from ScopeFirst on, innermost first, each holding the frame's pc: searching, a
+// catching one's filter is called and a catch ends the search (1, its target in Found);
+// unwinding, a finally's funclet runs (abnormal), on the catching frame up to its catching
+// scope. 0 otherwise
+public routine PlatformFrameHandler(const ARecord: ptr; const AFrame: ptr; const AContext: ptr;
+  const ADispatch: ptr): int32;
+var
+  LDispatch: ptr to PlatformDispatch;
+  LRegs: ptr to PlatformRegisters;
+  LRun: PlatformFinallyRun;
+  LFilter: PlatformFilterRoutine;
+  LFinally: PlatformFinallyRoutine;
+  LCount: int64;
+  LScope: uint64;
+  LPc: uint64;
+  LI: int64;
+begin
+  LDispatch := ptr to PlatformDispatch(ADispatch);
+  LRegs := ptr to PlatformRegisters(AContext);
+  LPc := LRegs^.Pc;
+  LCount := int64(DoLongAt(LDispatch^.Scopes));
+  LI := LDispatch^.ScopeFirst;
+  while LI < LCount do
+    LScope := LDispatch^.Scopes + 4 + uint64(LI) * ADAM_PLATFORM_SCOPE_ENTRY;
+    if (LPc >= DoRelative(LScope)) and (LPc < DoRelative(LScope + 4)) then
+      if DoLongAt(LScope + 12) <> 0 then
+        // a catching scope
+        if not LDispatch^.Unwinding then
+          LFilter := PlatformFilterRoutine(ptr(DoRelative(LScope + 8)));
+          if LFilter(ARecord, AFrame) > 0 then
+            LDispatch^.Found := DoRelative(LScope + 12);
+            return 1;
+          end;
+        end;
+        if LDispatch^.Unwinding and LDispatch^.IsTarget and
+          (DoRelative(LScope + 12) = LDispatch^.TargetPc) then
+          return 0;
+        end;
+      else
+        if LDispatch^.Unwinding then
+          // a finally: a raise out of it goes on from this frame past this scope
+          LRun.Regs := LRegs^;
+          LRun.ScopeNext := LI + 1;
+          LRun.Outer := GFinallyRuns;
+          GFinallyRuns := addr of LRun;
+          LFinally := PlatformFinallyRoutine(ptr(DoRelative(LScope + 8)));
+          LFinally(1, AFrame);
+          GFinallyRuns := LRun.Outer;
+        end;
+      end;
+    end;
+    LI := LI + 1;
+  end;
+  return 0;
+end;
+
+// The two phases over the frames from AStart (Windows' x64 dispatch): searching (not
+// AUnwinding), each frame's handler calls its catching scopes' filters until one catches
+// (ADepth, AFrame: that frame's place in the walk and its base, ATarget the catch's
+// address; true); unwinding, each frame's handler runs its finally funclets, innermost
+// first, up to the catching frame, where the walk resumes at the catch (AContext's
+// registers made the frame's: setcontext). A frame of a handler running a finally
+// (GFinallyRuns: a raise out of that funclet) is passed over to the frame the funclet
+// belongs to, at the scope after it. False (searching): no frame catches it
+routine DoWalk(const AStart: PlatformRegisters; const APointers: ptr;
+  const AContext: ptr to PlatformContext; const AUnwinding: bool; var ADepth: int64;
+  var AFrame: uint64; var ATarget: uint64): bool;
+var
+  LRegs: PlatformRegisters;
+  LFacts: PlatformFrameFacts;
+  LDispatch: PlatformDispatch;
+  LCursor: ptr to PlatformFinallyRun;
+  LData: uint64;
+  LHandler: PlatformHandlerRoutine;
+  LBase: uint64;
+  LDepth: int64;
+  LResult: int32;
+  LSelf: PlatformHandlerRoutine;
+begin
+  LSelf := PlatformFrameHandler;
+  LRegs := AStart;
+  LCursor := GFinallyRuns;
+  LDispatch.ScopeFirst := 0;
+  LDepth := 0;
+  while true do
+    if not DoFrameFacts(LRegs.Pc, true, LFacts) then
+      DoNoCatch(ptr to const char("unwind data the unwinder cannot read"));
+    end;
+    if LFacts.Entry = nil then
+      if AUnwinding then
+        DoNoCatch(ptr to const char("a frame with no Adam unwind data while unwinding"));
+      end;
+      return false;
+    end;
+    LData := DoHandlerData(LFacts.Entry);
+    if (LCursor <> nil) and (LFacts.Entry^.Start = uint64(ptr(LSelf))) then
+      // a handler running a finally: on from the funclet's own frame, past its scope
+      LRegs := LCursor^.Regs;
+      LDispatch.ScopeFirst := LCursor^.ScopeNext;
+      LCursor := LCursor^.Outer;
+    else
+      LBase := DoFrameBase(LRegs, LFacts);
+      if LData <> 0 then
+        LDispatch.Scopes := LData + 4;
+        LDispatch.Unwinding := AUnwinding;
+        LDispatch.IsTarget := AUnwinding and (LDepth = ADepth) and (LBase = AFrame);
+        LDispatch.TargetPc := ATarget;
+        LDispatch.Found := 0;
+        LHandler := PlatformHandlerRoutine(ptr(DoRelative(LData)));
+        LResult := LHandler(APointers, ptr(LBase), ptr(addr of LRegs), ptr(addr of LDispatch));
+        if (not AUnwinding) and (LResult > 0) then
+          ADepth := LDepth;
+          AFrame := LBase;
+          ATarget := LDispatch.Found;
+          return true;
+        end;
+      end;
+      if AUnwinding and (LDepth = ADepth) then
+        // the catching frame: the finally runs the walk passed over are abandoned with it
+        GFinallyRuns := LCursor;
+        DoResume(AContext, LRegs, ATarget);
+      end;
+      DoUnwindFrame(LRegs, LFacts);
+      LDispatch.ScopeFirst := 0;
+      LDepth := LDepth + 1;
+      if LRegs.Pc = 0 then
+        if AUnwinding then
+          DoNoCatch(ptr to const char("the stack's end while unwinding"));
+        end;
+        return false;
+      end;
+    end;
+  end;
+end;
+
+// The exception ACode (AKind: a fault's kind) dispatched from the caller's frame on: the
+// frames are searched for a catching scope, then unwound to it, where the code resumes;
+// it never returns
+routine DoDispatch(const ACode: uint32; const AKind: int32); noreturn;
+var
+  LContext: PlatformContext;
+  LRecord: PlatformException;
+  LPointers: array[0..1] of ptr;
+  LStart: PlatformRegisters;
+  LDepth: int64;
+  LFrame: uint64;
+  LTarget: uint64;
+begin
+  LRecord.Code := ACode;
+  LRecord.Kind := AKind;
+  getcontext(ptr(addr of LContext));
+  DoContextRegisters(addr of LContext, LStart);
+  LPointers[0] := ptr(addr of LRecord);
+  LPointers[1] := ptr(addr of LContext);
+  LDepth := -1;
+  LFrame := 0;
+  LTarget := 0;
+  if not DoWalk(LStart, ptr(addr of LPointers), addr of LContext, false, LDepth, LFrame,
+    LTarget) then
+    DoNoCatch(ptr to const char("no catching scope, or a frame with no Adam unwind data"));
+  end;
+  DoWalk(LStart, ptr(addr of LPointers), addr of LContext, true, LDepth, LFrame, LTarget);
+  DoNoCatch(ptr to const char("the catching frame was not met again"));
+end;
+
+// Raises the runtime's exception (ADAM_PLATFORM_RAISE_CODE): the unwinder walks the frames
+// for one whose scope catches it, then unwinds the frames in between (their finally and
+// cleanup funclets run) and resumes at the catch; it never returns (plan H1)
 public routine PlatformRaise(); noreturn;
 begin
-  DoPending(ptr to const char("PlatformRaise"), ptr to const char("LX4b"));
+  DoDispatch(ADAM_PLATFORM_RAISE_CODE, 0);
 end;
 
-// Raises a generator's abort: no guard's except part takes it (LX4b)
+// Raises a generator's abort (ADAM_PLATFORM_ABORT_CODE): no guard's except part takes it,
+// so the frames up to the generator's own start unwind (their finally and cleanup funclets
+// run) and its last catching scope (PlatformCatchAbort's) ends the generator; it never
+// returns
 public routine PlatformAbort(); noreturn;
 begin
-  DoPending(ptr to const char("PlatformAbort"), ptr to const char("LX4b"));
+  DoDispatch(ADAM_PLATFORM_ABORT_CODE, 0);
 end;
 
-// The filter of a guard's catching scope: 1 (caught) for the runtime's own exception and
-// for a hardware fault, 0 (search on) for any other (LX4b)
-public routine PlatformCatch(const APointers: ptr; const AFrame: ptr): int32;
+// The exception's code and fault kind from a filter's APointers (its first word the
+// PlatformException)
+routine DoExceptionOf(const APointers: ptr): ptr to PlatformException;
+var
+  LPointers: ptr to ptr;
 begin
-  DoPending(ptr to const char("PlatformCatch"), ptr to const char("LX4b"));
+  LPointers := ptr to ptr(APointers);
+  return ptr to PlatformException(LPointers[0]);
 end;
 
-// The filter of a last catching scope (the entry's, a teardown's, a thread's): 1 for the
-// runtime's own exception only (LX4b)
+// The filter of a guard's catching scope, called as the exception is dispatched (APointers
+// the exception's pointers, AFrame the guard's frame): 1 (caught) for the runtime's own
+// exception and for a hardware fault (BNF sec 5: a guard takes both), whose kind is kept
+// for the guard's except part (GFaultPending, PlatformFaultTaken); 0 (search on) for any
+// other, a generator's abort included (PlatformCatchAbort's alone)
+public routine PlatformCatch(const APointers: ptr; const AFrame: ptr): int32;
+var
+  LException: ptr to PlatformException;
+begin
+  LException := DoExceptionOf(APointers);
+  if LException^.Code = ADAM_PLATFORM_RAISE_CODE then
+    GFaultPending := 0;
+    return 1;
+  end;
+  if LException^.Code = ADAM_PLATFORM_FAULT_CODE then
+    GFaultPending := LException^.Kind;
+    return 1;
+  end;
+  return 0;
+end;
+
+// The filter of a last catching scope (the entry's, a module teardown's, a started
+// thread's), whose catch reports the raise and ends the process with its teardown
+// (System.Runtime's Unhandled): 1 for the runtime's own exception only (a hardware fault
+// goes on to the fault handler, PlatformAtFault: reported, no teardown, BNF sec 1)
 public routine PlatformCatchRaise(const APointers: ptr; const AFrame: ptr): int32;
 begin
-  DoPending(ptr to const char("PlatformCatchRaise"), ptr to const char("LX4b"));
+  if DoExceptionOf(APointers)^.Code = ADAM_PLATFORM_RAISE_CODE then
+    GFaultPending := 0;
+    return 1;
+  end;
+  return 0;
 end;
 
-// The filter of a generator's own start's last catching scope: 1 for a generator's abort
-// only (LX4b)
+// The filter of a generator's own start's last catching scope (System.Runtime's
+// GeneratorRun), whose catch ends the generator (GeneratorEnd): 1 for a generator's abort
+// only (PlatformAbort)
 public routine PlatformCatchAbort(const APointers: ptr; const AFrame: ptr): int32;
 begin
-  DoPending(ptr to const char("PlatformCatchAbort"), ptr to const char("LX4b"));
+  if DoExceptionOf(APointers)^.Code = ADAM_PLATFORM_ABORT_CODE then
+    return 1;
+  end;
+  return 0;
 end;
 
-// A guard's except part's start: the hardware fault kind its filter took, 0 for a raise
-// (LX4b, LX4c)
+// A guard's except part's start (System.Runtime's RaiseTaken): the hardware fault kind
+// its filter took (PlatformCatch), 0 when it took a raise (a caught stack overflow's
+// guard page is LX4c's)
 public routine PlatformFaultTaken(): int32;
+var
+  LKind: int32;
 begin
-  DoPending(ptr to const char("PlatformFaultTaken"), ptr to const char("LX4b"));
+  LKind := GFaultPending;
+  GFaultPending := 0;
+  return LKind;
 end;
 
 // AHandler called with the fault kind (ADAM_PLATFORM_FAULT_*) of a hardware fault no guard
@@ -536,17 +1279,101 @@ begin
 end;
 
 @ifdef DEBUG
+const
+  // The per-thread cache's entry count (GFrameCache's length; a power of two)
+  ADAM_PLATFORM_FRAME_CACHE: int64 = 256;
+
+threadstatic
+  // This thread's frame facts by return address (Adam code only: an exe's code is never
+  // unloaded), and its stack's bounds (0 until the thread's first capture)
+  GFrameCache: array[0..255] of PlatformFrameFacts;
+  GFrameLow: uint64;
+  GFrameHigh: uint64;
+
+// This thread's stack bounds read (pthread_getattr_np: its lowest address and size)
+routine DoFrameStart();
+var
+  LAttributes: array[0..6] of uint64;
+  LLow: ptr;
+  LSize: uint64;
+begin
+  GFrameLow := 1;
+  GFrameHigh := 0;
+  if pthread_getattr_np(pthread_self(), ptr(addr of LAttributes)) <> 0 then
+    return;
+  end;
+  LLow := nil;
+  LSize := 0;
+  if pthread_attr_getstack(ptr(addr of LAttributes), LLow, LSize) = 0 then
+    GFrameLow := uint64(LLow);
+    GFrameHigh := uint64(LLow) + LSize;
+  end;
+  pthread_attr_destroy(ptr(addr of LAttributes));
+end;
+
 // The leak tracker's frames (M4.L2; debug builds only): up to ACount return addresses of
-// the calling thread into AFrames; the count captured. The frame walk is the unwinder's
-// (LX4b): until then no frame is captured (the leak report names each block without its
-// frames), since every allocation of a debug build calls this
+// the calling thread into AFrames, innermost first, ASkip frames of the caller's own on
+// left out (0: the caller's return address first), 0 past the last; the count captured.
+// Frame 0 of the walk is this routine's own. The walk is the unwinder's (DoFrameFacts,
+// DoUnwindFrame), a frame's facts kept in a per-thread cache by return address; it ends at
+// a frame with no Adam unwind data (glibc's __libc_start_main, a C library's), a slot off
+// the thread's stack or a nil return address. The registers come from getcontext
 public routine PlatformCaptureFrames(const ASkip: int32; const ACount: int32;
   const AFrames: ptr): int32;
+var
+  LContext: PlatformContext;
+  LRegs: PlatformRegisters;
+  LFrames: ptr to uint64;
+  LEntry: ptr to PlatformFrameFacts;
+  LMiss: PlatformFrameFacts;
+  LBase: uint64;
+  LIndex: int32;
+  LCaptured: int32;
+  LI: int32;
 begin
-  if ACount > 0 then
-    memset(AFrames, 0, uint64(ACount) * 8);
+  LFrames := ptr to uint64(AFrames);
+  for LI := 0 to ACount - 1 do
+    LFrames[LI] := 0;
   end;
-  return 0;
+  if GFrameHigh = 0 then
+    DoFrameStart();
+  end;
+  getcontext(ptr(addr of LContext));
+  DoContextRegisters(addr of LContext, LRegs);
+  LIndex := 0;
+  LCaptured := 0;
+  while LCaptured < ACount do
+    if LIndex > ASkip then
+      LFrames[LCaptured] := LRegs.Pc;
+      LCaptured := LCaptured + 1;
+      if LCaptured >= ACount then
+        return LCaptured;
+      end;
+    end;
+    // the frame's facts: this thread's cache entry for its pc, else worked out into LMiss
+    LEntry := addr of GFrameCache[int64((LRegs.Pc xor (LRegs.Pc shr 10)) &
+      uint64(ADAM_PLATFORM_FRAME_CACHE - 1))];
+    if LEntry^.Pc <> LRegs.Pc then
+      if not DoFrameFacts(LRegs.Pc, true, LMiss) then
+        return LCaptured;
+      end;
+      if LMiss.Entry = nil then
+        return LCaptured;
+      end;
+      LEntry^ := LMiss;
+    end;
+    // every slot the unwind reads on this thread's stack
+    LBase := DoFrameBase(LRegs, LEntry^);
+    if (LBase < GFrameLow) or (LBase + uint64(LEntry^.Total) + 8 > GFrameHigh) then
+      return LCaptured;
+    end;
+    DoUnwindFrame(LRegs, LEntry^);
+    if LRegs.Pc = 0 then
+      return LCaptured;
+    end;
+    LIndex := LIndex + 1;
+  end;
+  return LCaptured;
 end;
 @endif
 
@@ -586,14 +1413,6 @@ end;
 public routine PlatformZero(const AAddress: ptr; const ACount: int64);
 begin
   memset(AAddress, 0, uint64(ACount));
-end;
-
-// The handler the unwinder calls for a frame whose unwind data holds a guard's scope
-// table (LX4b: the runtime's own unwinder over Adam's unwind section, plan H1)
-public routine PlatformFrameHandler(const ARecord: ptr; const AFrame: ptr; const AContext: ptr;
-  const ADispatch: ptr): int32;
-begin
-  DoPending(ptr to const char("PlatformFrameHandler"), ptr to const char("LX4b"));
 end;
 
 // A new thread that runs ARun(ABlock), started at once: its handle, or 0 when it could not
