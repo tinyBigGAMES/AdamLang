@@ -31,6 +31,19 @@
   "name(line): message" when libxml2 gives no column, or "name: message"
   when there is no place. Blank-only text between
   elements is dropped as the document is read; no network is ever used.
+  Each read also takes XmlReadOptions: [XmlReadOption.XInclude] replaces
+  every XInclude element (xi:include, its xi:fallback when the target
+  cannot be read) by what it includes as the document is read, before any
+  value views it, the targets read as the document is (so an io:// / zip
+  path works); a failed include fails the read, ErrorText naming the
+  included document when the error is in it.
+
+  HTML: Xml.FromHtmlString / FromHtmlFile / FromHtmlIO (static) and
+  ParseHtml / LoadFromHtmlFile / LoadFromHtmlIO read HTML with libxml2's
+  HTML parser (forgiving, as a browser is: only a file or IO that cannot
+  be read fails), the root element the html one (implied when missing);
+  the whole node API works on it, and ToString / SaveToFile / SaveToIO
+  write an HTML document as HTML.
 
   Walk: Name / LocalName / Prefix / NamespaceUri, Kind / IsElement, Text
   (the node's own text) / InnerText (all text below it), Line; attributes
@@ -110,6 +123,12 @@ const
   ADAM_XML_IO_NAME: string = "<io>";
   // How every document is read: no network, blank-only text between elements dropped
   ADAM_XML_READ_OPTIONS: int32 = XML_PARSE_NONET | XML_PARSE_NOBLANKS;
+  // How XInclude reads what it includes: as the document, with no XInclude start / end
+  // marker nodes left in the tree
+  ADAM_XML_XINCLUDE_OPTIONS: int32 = XML_PARSE_NONET | XML_PARSE_NOBLANKS |
+    XML_PARSE_NOXINCNODE;
+  // How every HTML document is read: no network, blank-only text between elements dropped
+  ADAM_XML_HTML_OPTIONS: int32 = HTML_PARSE_NONET | HTML_PARSE_NOBLANKS;
   // The largest text one read takes (libxml2 counts a memory buffer in an int32)
   ADAM_XML_INT32_MAX: int64 = 2147483647;
   ADAM_XML_INT32_MIN: int64 = -2147483648;
@@ -155,6 +174,8 @@ type
     // An XPath error's place in its expression (0-based)
     Offset: int32;
     Message: string;
+    // The document the error is in, as libxml2 names it ("" for a text / an IO)
+    File: string;
   end;
 
 // -- libxml2's allocator on Adam's heap
@@ -336,6 +357,7 @@ begin
   LState^.Column := AError^.int2;
   LState^.Offset := AError^.int1;
   LState^.Message := TrimRight(DoText(ptr to const xmlChar(AError^.message)));
+  LState^.File := DoText(ptr to const xmlChar(AError^.file));
 end;
 
 // libxml2's resource loader for every parse: the URL opened as written, through libxml2's
@@ -348,18 +370,30 @@ begin
   return xmlNewInputFromUrl(AUrl, AFlags, AOut);
 end;
 
-// A parser context reporting to AState, loading through DoLoadResource; nil when there is no
-// room
-routine DoNewContext(const AState: ptr to XmlReadState): ptr to xmlParserCtxt;
+// A parser context for XML, or for HTML when AHtml, reporting to AState, loading through
+// DoLoadResource; nil when there is no room
+routine DoNewReadContext(const AState: ptr to XmlReadState;
+  const AHtml: bool): ptr to xmlParserCtxt;
 var
   LContext: ptr to xmlParserCtxt;
 begin
-  LContext := xmlNewParserCtxt();
+  if AHtml then
+    LContext := htmlNewParserCtxt();
+  else
+    LContext := xmlNewParserCtxt();
+  end;
   if LContext <> nil then
     xmlCtxtSetErrorHandler(LContext, DoOnError, ptr(AState));
     xmlCtxtSetResourceLoader(LContext, DoLoadResource, nil);
   end;
   return LContext;
+end;
+
+// An XML parser context reporting to AState, loading through DoLoadResource; nil when there
+// is no room
+routine DoNewContext(const AState: ptr to XmlReadState): ptr to xmlParserCtxt;
+begin
+  return DoNewReadContext(AState, false);
 end;
 
 // Why a read of AName failed, from AState: "AName(line,col): message", "AName(line):
@@ -531,11 +565,75 @@ begin
   return ANs <> nil;
 end;
 
+public type
+  /// What a read does besides parsing (Xml.FromString / FromFile / FromIO and their
+  /// instance forms, with an XmlReadOptions set).
+  XmlReadOption = choices(
+    /// Every XInclude element (xi:include) is replaced by the document or text it includes
+    /// (its xi:fallback when that cannot be read), as the document is read
+    XInclude);
+
+  /// The XmlReadOption set a read takes ([] reads the document as it is).
+  /// @example `LBook := Xml.FromFile("book.xml", [XmlReadOption.XInclude]);`
+  XmlReadOptions = set of XmlReadOption;
+
 // -- Reading a document (Xml's reads and XmlSchema's share these)
 
-// The XML text AText as a new document (the caller's); nil with AError set
-// ("<text>(line,col): message")
-routine DoParseText(const AText: string; var AError: string): ptr to xmlDoc;
+// The XInclude elements of ADoc (read as AName from the URL AUrl; "" for a text / an IO)
+// replaced by what they include, read through DoLoadResource as the document was; false with
+// AError set ("AName(line): message", the included document's own name when the error is in
+// it); ADoc stays the caller's either way
+routine DoXInclude(const ADoc: ptr to xmlDoc; const AName: string; const AUrl: string;
+  var AError: string): bool;
+var
+  LState: XmlReadState;
+  LContext: ptr to xmlXIncludeCtxt;
+  LCount: int32;
+  LName: string;
+begin
+  LContext := xmlXIncludeNewContext(ADoc);
+  if LContext = nil then
+    AError := AName + ": " + ADAM_XML_MSG_NO_ROOM;
+    return false;
+  end;
+  xmlXIncludeSetFlags(LContext, ADAM_XML_XINCLUDE_OPTIONS);
+  xmlXIncludeSetErrorHandler(LContext, DoOnError, ptr(addr of LState));
+  xmlXIncludeSetResourceLoader(LContext, DoLoadResource, nil);
+  // The document node: an XInclude element as the root is replaced too
+  LCount := xmlXIncludeProcessNode(LContext, ptr to xmlNode(ptr(ADoc)));
+  xmlXIncludeFreeContext(LContext);
+  if LCount >= 0 then
+    return true;
+  end;
+  // An error inside an included document names that document; one at an XInclude element
+  // (a target that cannot be read, a bad href) names the document read
+  LName := AName;
+  if (len(LState.File) > 0) and (LState.File <> AUrl) then
+    LName := LState.File;
+  end;
+  AError := DoReadError(LName, LState, ADAM_XML_MSG_OPEN_FAILED);
+  return false;
+end;
+
+// ADoc (nil: the read failed, AError already set) with its XInclude elements processed when
+// AOptions asks for it; nil (ADoc freed) with AError set when that fails
+routine DoAfterRead(const ADoc: ptr to xmlDoc; const AOptions: XmlReadOptions;
+  const AName: string; const AUrl: string; var AError: string): ptr to xmlDoc;
+begin
+  if (ADoc = nil) or not (XmlReadOption.XInclude in AOptions) then
+    return ADoc;
+  end;
+  if not DoXInclude(ADoc, AName, AUrl, AError) then
+    xmlFreeDoc(ADoc);
+    return nil;
+  end;
+  return ADoc;
+end;
+
+// The text AText as a new document (the caller's), XML or HTML when AHtml, AOptions applied
+// (XML only); nil with AError set ("<text>(line,col): message")
+routine DoParseText(const AText: string; const AHtml: bool; const AOptions: XmlReadOptions;
+  var AError: string): ptr to xmlDoc;
 var
   LState: XmlReadState;
   LContext: ptr to xmlParserCtxt;
@@ -545,28 +643,36 @@ begin
     AError := ADAM_XML_TEXT_NAME + ": " + ADAM_XML_MSG_TOO_LARGE;
     return nil;
   end;
-  LContext := DoNewContext(addr of LState);
+  LContext := DoNewReadContext(addr of LState, AHtml);
   if LContext = nil then
     AError := ADAM_XML_TEXT_NAME + ": " + ADAM_XML_MSG_NO_ROOM;
     return nil;
   end;
-  LDoc := xmlCtxtReadMemory(LContext, DoChars(AText), int32(len(AText)), nil, nil,
-    ADAM_XML_READ_OPTIONS);
+  if AHtml then
+    LDoc := htmlCtxtReadMemory(LContext, DoChars(AText), int32(len(AText)), nil, nil,
+      ADAM_XML_HTML_OPTIONS);
+  else
+    LDoc := xmlCtxtReadMemory(LContext, DoChars(AText), int32(len(AText)), nil, nil,
+      ADAM_XML_READ_OPTIONS);
+  end;
   xmlFreeParserCtxt(LContext);
   if LDoc = nil then
     AError := DoReadError(ADAM_XML_TEXT_NAME, LState, ADAM_XML_MSG_IO_FAILED);
+    return nil;
   end;
-  return LDoc;
+  return DoAfterRead(LDoc, AOptions, ADAM_XML_TEXT_NAME, "", AError);
 end;
 
-// The XML file at APath read through C's file calls (a HookIO path reads its IO) as a new
-// document (the caller's); nil with AError set ("APath(line,col): message", "APath: the file
-// cannot be opened")
-routine DoParseFile(const APath: string; var AError: string): ptr to xmlDoc;
+// The file at APath read through C's file calls (a HookIO path reads its IO) as a new
+// document (the caller's), XML or HTML when AHtml, AOptions applied (XML only); nil with
+// AError set ("APath(line,col): message", "APath: the file cannot be opened")
+routine DoParseFile(const APath: string; const AHtml: bool; const AOptions: XmlReadOptions;
+  var AError: string): ptr to xmlDoc;
 var
   LState: XmlReadState;
   LContext: ptr to xmlParserCtxt;
   LPath: ptr to char;
+  LUrl: string;
   LDoc: ptr to xmlDoc;
 begin
   LPath := DoFilePath(APath);
@@ -574,25 +680,34 @@ begin
     AError := APath + ": " + ADAM_XML_MSG_NO_ROOM;
     return nil;
   end;
-  LContext := DoNewContext(addr of LState);
+  LContext := DoNewReadContext(addr of LState, AHtml);
   if LContext = nil then
     freemem(ptr(LPath));
     AError := APath + ": " + ADAM_XML_MSG_NO_ROOM;
     return nil;
   end;
-  LDoc := xmlCtxtReadFile(LContext, ptr to const char(LPath), nil, ADAM_XML_READ_OPTIONS);
+  if AHtml then
+    LDoc := htmlCtxtReadFile(LContext, ptr to const char(LPath), nil, ADAM_XML_HTML_OPTIONS);
+  else
+    LDoc := xmlCtxtReadFile(LContext, ptr to const char(LPath), nil, ADAM_XML_READ_OPTIONS);
+  end;
   xmlFreeParserCtxt(LContext);
+  // The URL libxml2 names the document by (its errors' file)
+  LUrl := DoText(ptr to const xmlChar(LPath));
   freemem(ptr(LPath));
   if LDoc = nil then
     AError := DoReadError(APath, LState, ADAM_XML_MSG_OPEN_FAILED);
+    return nil;
   end;
-  return LDoc;
+  return DoAfterRead(LDoc, AOptions, APath, LUrl, AError);
 end;
 
-// The XML text the IO AIO holds from its place to its end, read in pieces through libxml2's
-// IO callbacks, as a new document (the caller's); nil with AError set ("<io>(line,col):
-// message"); the IO stays the caller's (not closed)
-routine DoParseIO(const AIO: IO; var AError: string): ptr to xmlDoc;
+// The text the IO AIO holds from its place to its end, read in pieces through libxml2's IO
+// callbacks, as a new document (the caller's), XML or HTML when AHtml, AOptions applied (XML
+// only); nil with AError set ("<io>(line,col): message"); the IO stays the caller's (not
+// closed)
+routine DoParseIO(const AIO: IO; const AHtml: bool; const AOptions: XmlReadOptions;
+  var AError: string): ptr to xmlDoc;
 var
   LState: XmlReadState;
   LContext: ptr to xmlParserCtxt;
@@ -602,18 +717,24 @@ begin
     AError := ADAM_XML_IO_NAME + ": " + ADAM_XML_MSG_NO_IO;
     return nil;
   end;
-  LContext := DoNewContext(addr of LState);
+  LContext := DoNewReadContext(addr of LState, AHtml);
   if LContext = nil then
     AError := ADAM_XML_IO_NAME + ": " + ADAM_XML_MSG_NO_ROOM;
     return nil;
   end;
-  LDoc := xmlCtxtReadIO(LContext, DoIORead, DoIOClose, ptr(AIO), nil, nil,
-    ADAM_XML_READ_OPTIONS);
+  if AHtml then
+    LDoc := htmlCtxtReadIO(LContext, DoIORead, DoIOClose, ptr(AIO), nil, nil,
+      ADAM_XML_HTML_OPTIONS);
+  else
+    LDoc := xmlCtxtReadIO(LContext, DoIORead, DoIOClose, ptr(AIO), nil, nil,
+      ADAM_XML_READ_OPTIONS);
+  end;
   xmlFreeParserCtxt(LContext);
   if LDoc = nil then
     AError := DoReadError(ADAM_XML_IO_NAME, LState, ADAM_XML_MSG_IO_FAILED);
+    return nil;
   end;
-  return LDoc;
+  return DoAfterRead(LDoc, AOptions, ADAM_XML_IO_NAME, "", AError);
 end;
 
 // -- XPath
@@ -1233,7 +1354,7 @@ public type
     begin
       LSchema := XmlSchema.DoNew(AKind);
       if AKind <> XmlSchemaKind.Dtd then
-        DoTakeSchemaDoc(LSchema.Code, DoParseFile(APath, LError), LError, APath);
+        DoTakeSchemaDoc(LSchema.Code, DoParseFile(APath, false, [], LError), LError, APath);
         return LSchema;
       end;
       LPath := DoFilePath(APath);
@@ -1263,7 +1384,8 @@ public type
     begin
       LSchema := XmlSchema.DoNew(AKind);
       if AKind <> XmlSchemaKind.Dtd then
-        DoTakeSchemaDoc(LSchema.Code, DoParseText(AText, LError), LError, ADAM_XML_TEXT_NAME);
+        DoTakeSchemaDoc(LSchema.Code, DoParseText(AText, false, [], LError), LError,
+          ADAM_XML_TEXT_NAME);
         return LSchema;
       end;
       DoTakeDtd(LSchema.Code, xmlNewInputFromMemory(nil, DoChars(AText), uint64(len(AText)), 0),
@@ -1285,7 +1407,8 @@ public type
     begin
       LSchema := XmlSchema.DoNew(AKind);
       if AKind <> XmlSchemaKind.Dtd then
-        DoTakeSchemaDoc(LSchema.Code, DoParseIO(AIO, LError), LError, ADAM_XML_IO_NAME);
+        DoTakeSchemaDoc(LSchema.Code, DoParseIO(AIO, false, [], LError), LError,
+          ADAM_XML_IO_NAME);
         return LSchema;
       end;
       if AIO = nil then
@@ -1462,54 +1585,138 @@ public type
 
     // -- Reading text, files and IOs (a failure: a missing value, ErrorText set)
 
-    // The XML text AText, this value's document from now on (its root element); false with
-    // ErrorText when it is no well-formed XML ("<text>(line,col): message")
+    // ADoc (nil: AError says why) this value's document from now on, viewing its root
+    // element; false with ErrorText when the read failed or the document has no root
+    hidden method DoLoad(const ADoc: ptr to xmlDoc; const AError: string;
+      const AName: string): bool;
+    begin
+      if ADoc = nil then
+        self.DoFail(AError);
+        return false;
+      end;
+      return self.DoTake(ADoc, AName);
+    end;
+
+    /// Reads the XML text AText as this value's document (its root element from now on).
+    /// @param AText the XML text
+    /// @returns false, ErrorText why ("<text>(line,col): message"), when it is no
+    ///   well-formed XML
+    /// @example `if not LDoc.Parse("<config/>") then println(LDoc.ErrorText()); end;`
     method Parse(const AText: string): bool;
+    begin
+      return self.Parse(AText, []);
+    end;
+
+    /// Reads the XML text AText as this value's document, AOptions applied.
+    /// @param AText the XML text
+    /// @param AOptions what the read does besides parsing ([XmlReadOption.XInclude] ...)
+    /// @returns false, ErrorText why, when it is no well-formed XML or an include fails
+    /// @example `LDoc.Parse(LText, [XmlReadOption.XInclude]);`
+    method Parse(const AText: string; const AOptions: XmlReadOptions): bool;
     var
       LError: string;
       LDoc: ptr to xmlDoc;
     begin
-      LDoc := DoParseText(AText, LError);
-      if LDoc = nil then
-        self.DoFail(LError);
-        return false;
-      end;
-      return self.DoTake(LDoc, ADAM_XML_TEXT_NAME);
+      LDoc := DoParseText(AText, false, AOptions, LError);
+      return self.DoLoad(LDoc, LError, ADAM_XML_TEXT_NAME);
     end;
 
-    // The XML file at APath read through C's file calls (so a HookIO path reads its IO),
-    // this value's document from now on; false with ErrorText ("APath(line,col): message",
-    // "APath: the file cannot be opened")
+    /// Reads the XML file at APath, through C's file calls (so a HookIO path reads its IO),
+    /// as this value's document.
+    /// @param APath the file
+    /// @returns false, ErrorText why ("APath(line,col): message", "APath: the file cannot
+    ///   be opened"), on a failure
+    /// @example `if not LDoc.LoadFromFile("config.xml") then println(LDoc.ErrorText()); end;`
     method LoadFromFile(const APath: string): bool;
+    begin
+      return self.LoadFromFile(APath, []);
+    end;
+
+    /// Reads the XML file at APath as this value's document, AOptions applied (an
+    /// XInclude's relative href is read from the file's folder).
+    /// @param APath the file
+    /// @param AOptions what the read does besides parsing
+    /// @returns false, ErrorText why, on a failure
+    /// @example `LBook.LoadFromFile("book.xml", [XmlReadOption.XInclude]);`
+    method LoadFromFile(const APath: string; const AOptions: XmlReadOptions): bool;
     var
       LError: string;
       LDoc: ptr to xmlDoc;
     begin
-      LDoc := DoParseFile(APath, LError);
-      if LDoc = nil then
-        self.DoFail(LError);
-        return false;
-      end;
-      return self.DoTake(LDoc, APath);
+      LDoc := DoParseFile(APath, false, AOptions, LError);
+      return self.DoLoad(LDoc, LError, APath);
     end;
 
-    // The XML text the IO AIO holds from its place to its end, read in pieces through
-    // libxml2's IO callbacks, this value's document from now on; false with ErrorText
-    // ("<io>(line,col): message"); the IO stays the caller's (not closed)
+    /// Reads the XML text the IO AIO holds from its place to its end, in pieces through
+    /// libxml2's IO callbacks, as this value's document; the IO stays the caller's (not
+    /// closed).
+    /// @param AIO the IO
+    /// @returns false, ErrorText why ("<io>(line,col): message"), on a failure
+    /// @example `LDoc.LoadFromIO(LIO);`
     method LoadFromIO(const AIO: IO): bool;
+    begin
+      return self.LoadFromIO(AIO, []);
+    end;
+
+    /// Reads the XML text the IO AIO holds as this value's document, AOptions applied.
+    /// @param AIO the IO
+    /// @param AOptions what the read does besides parsing
+    /// @returns false, ErrorText why, on a failure
+    /// @example `LDoc.LoadFromIO(LIO, [XmlReadOption.XInclude]);`
+    method LoadFromIO(const AIO: IO; const AOptions: XmlReadOptions): bool;
     var
       LError: string;
       LDoc: ptr to xmlDoc;
     begin
-      LDoc := DoParseIO(AIO, LError);
-      if LDoc = nil then
-        self.DoFail(LError);
-        return false;
-      end;
-      return self.DoTake(LDoc, ADAM_XML_IO_NAME);
+      LDoc := DoParseIO(AIO, false, AOptions, LError);
+      return self.DoLoad(LDoc, LError, ADAM_XML_IO_NAME);
     end;
 
-    // Why the last Parse / LoadFromFile / LoadFromIO (or Xml.From*) failed; "" if it did not
+    /// Reads the HTML text AText as this value's document (its html element from now on),
+    /// with libxml2's forgiving HTML parser.
+    /// @param AText the HTML text
+    /// @returns false, ErrorText why, only when there is no room
+    /// @example `LPage.ParseHtml("<p>Hello<br>world");`
+    method ParseHtml(const AText: string): bool;
+    var
+      LError: string;
+      LDoc: ptr to xmlDoc;
+    begin
+      LDoc := DoParseText(AText, true, [], LError);
+      return self.DoLoad(LDoc, LError, ADAM_XML_TEXT_NAME);
+    end;
+
+    /// Reads the HTML file at APath, through C's file calls (so a HookIO path reads its IO),
+    /// as this value's document.
+    /// @param APath the file
+    /// @returns false, ErrorText why ("APath: the file cannot be opened"), on a failure
+    /// @example `if not LPage.LoadFromHtmlFile("index.html") then println(LPage.ErrorText()); end;`
+    method LoadFromHtmlFile(const APath: string): bool;
+    var
+      LError: string;
+      LDoc: ptr to xmlDoc;
+    begin
+      LDoc := DoParseFile(APath, true, [], LError);
+      return self.DoLoad(LDoc, LError, APath);
+    end;
+
+    /// Reads the HTML text the IO AIO holds from its place to its end as this value's
+    /// document; the IO stays the caller's (not closed).
+    /// @param AIO the IO
+    /// @returns false, ErrorText why ("<io>: the IO cannot be read"), on a failure
+    /// @example `LPage.LoadFromHtmlIO(LIO);`
+    method LoadFromHtmlIO(const AIO: IO): bool;
+    var
+      LError: string;
+      LDoc: ptr to xmlDoc;
+    begin
+      LDoc := DoParseIO(AIO, true, [], LError);
+      return self.DoLoad(LDoc, LError, ADAM_XML_IO_NAME);
+    end;
+
+    /// Why the last read (Parse, LoadFrom*, Xml.From*, their HTML forms) failed.
+    /// @returns the reason; "" when it did not fail
+    /// @example `println(Xml.FromString("<a>").ErrorText());`
     const method ErrorText(): string;
     begin
       return self.Error;
@@ -1517,45 +1724,148 @@ public type
 
     // -- Made from a text, a file or an IO (static: Xml.FromFile(P))
 
-    // The XML text AText's root element (a missing value with its ErrorText when it is no
-    // well-formed XML)
+    /// The XML text AText's root element.
+    /// @param AText the XML text
+    /// @returns the root element; a missing value with its ErrorText when it is no
+    ///   well-formed XML
+    /// @example `LConfig := Xml.FromString("<config debug=\"true\"/>");`
     static method FromString(const AText: string): Xml;
     var
       LXml: Xml;
     begin
-      LXml.Parse(AText);
+      LXml.Parse(AText, []);
       return LXml;
     end;
 
-    // The root element of the XML file at APath, read through C's file calls (a HookIO path
-    // reads its IO)
+    /// The XML text AText's root element, AOptions applied.
+    /// @param AText the XML text
+    /// @param AOptions what the read does besides parsing
+    /// @returns the root element; a missing value with its ErrorText on a failure
+    /// @example `LDoc := Xml.FromString(LText, [XmlReadOption.XInclude]);`
+    static method FromString(const AText: string; const AOptions: XmlReadOptions): Xml;
+    var
+      LXml: Xml;
+    begin
+      LXml.Parse(AText, AOptions);
+      return LXml;
+    end;
+
+    /// The root element of the XML file at APath, read through C's file calls (a HookIO
+    /// path reads its IO).
+    /// @param APath the file
+    /// @returns the root element; a missing value with its ErrorText on a failure
+    /// @example `LMap := Xml.FromFile("maps/overworld.tmx");`
     static method FromFile(const APath: string): Xml;
     var
       LXml: Xml;
     begin
-      LXml.LoadFromFile(APath);
+      LXml.LoadFromFile(APath, []);
       return LXml;
     end;
 
-    // The root element of the XML text the IO AIO holds from its place to its end
+    /// The root element of the XML file at APath, AOptions applied.
+    /// @param APath the file
+    /// @param AOptions what the read does besides parsing
+    /// @returns the root element; a missing value with its ErrorText on a failure
+    /// @example `LBook := Xml.FromFile("book.xml", [XmlReadOption.XInclude]);`
+    static method FromFile(const APath: string; const AOptions: XmlReadOptions): Xml;
+    var
+      LXml: Xml;
+    begin
+      LXml.LoadFromFile(APath, AOptions);
+      return LXml;
+    end;
+
+    /// The root element of the XML text the IO AIO holds from its place to its end.
+    /// @param AIO the IO (stays the caller's)
+    /// @returns the root element; a missing value with its ErrorText on a failure
+    /// @example `LDoc := Xml.FromIO(LIO);`
     static method FromIO(const AIO: IO): Xml;
     var
       LXml: Xml;
     begin
-      LXml.LoadFromIO(AIO);
+      LXml.LoadFromIO(AIO, []);
       return LXml;
     end;
 
-    // The XML text AText's root element into AXml; false when it is no well-formed XML
-    // (AXml then the missing value, its ErrorText why)
+    /// The root element of the XML text the IO AIO holds, AOptions applied.
+    /// @param AIO the IO (stays the caller's)
+    /// @param AOptions what the read does besides parsing
+    /// @returns the root element; a missing value with its ErrorText on a failure
+    /// @example `LDoc := Xml.FromIO(LIO, [XmlReadOption.XInclude]);`
+    static method FromIO(const AIO: IO; const AOptions: XmlReadOptions): Xml;
+    var
+      LXml: Xml;
+    begin
+      LXml.LoadFromIO(AIO, AOptions);
+      return LXml;
+    end;
+
+    /// The XML text AText's root element into AXml.
+    /// @param AText the XML text
+    /// @param AXml the root element; the missing value, its ErrorText why, on a failure
+    /// @returns false when it is no well-formed XML
+    /// @example `if not Xml.TryFromString(LText, LDoc) then println(LDoc.ErrorText()); end;`
     static method TryFromString(const AText: string; var AXml: Xml): bool;
+    begin
+      return Xml.TryFromString(AText, [], AXml);
+    end;
+
+    /// The XML text AText's root element into AXml, AOptions applied.
+    /// @param AText the XML text
+    /// @param AOptions what the read does besides parsing
+    /// @param AXml the root element; the missing value, its ErrorText why, on a failure
+    /// @returns false on a failure
+    /// @example `LOk := Xml.TryFromString(LText, [XmlReadOption.XInclude], LDoc);`
+    static method TryFromString(const AText: string; const AOptions: XmlReadOptions;
+      var AXml: Xml): bool;
     var
       LXml: Xml;
       LOk: bool;
     begin
-      LOk := LXml.Parse(AText);
+      LOk := LXml.Parse(AText, AOptions);
       AXml := LXml;
       return LOk;
+    end;
+
+    /// The HTML text AText's html element, read with libxml2's forgiving HTML parser
+    /// (missing html / head / body elements implied, tags closed as a browser does).
+    /// @param AText the HTML text
+    /// @returns the html element
+    /// @example `LTitle := Xml.FromHtmlString(LPage).SelectFirst("//title").Text();`
+    static method FromHtmlString(const AText: string): Xml;
+    var
+      LXml: Xml;
+    begin
+      LXml.ParseHtml(AText);
+      return LXml;
+    end;
+
+    /// The html element of the HTML file at APath, read through C's file calls (a HookIO
+    /// path reads its IO).
+    /// @param APath the file
+    /// @returns the html element; a missing value with its ErrorText when the file cannot
+    ///   be read
+    /// @example `LPage := Xml.FromHtmlFile("docs/index.html");`
+    static method FromHtmlFile(const APath: string): Xml;
+    var
+      LXml: Xml;
+    begin
+      LXml.LoadFromHtmlFile(APath);
+      return LXml;
+    end;
+
+    /// The html element of the HTML text the IO AIO holds from its place to its end.
+    /// @param AIO the IO (stays the caller's)
+    /// @returns the html element; a missing value with its ErrorText when the IO cannot be
+    ///   read
+    /// @example `LPage := Xml.FromHtmlIO(LIO);`
+    static method FromHtmlIO(const AIO: IO): Xml;
+    var
+      LXml: Xml;
+    begin
+      LXml.LoadFromHtmlIO(AIO);
+      return LXml;
     end;
 
     // -- What the node is
@@ -2810,6 +3120,32 @@ public type
 
     // -- Writing
 
+    // The node of an HTML document written as HTML (void elements as <br>, no XML
+    // declaration), indented when APretty
+    hidden const method DoDumpHtml(const APretty: bool): string;
+    var
+      LBuffer: ptr to xmlOutputBuffer;
+      LSize: uint64;
+      LResult: string;
+    begin
+      LBuffer := xmlAllocOutputBuffer(nil);
+      if LBuffer = nil then
+        return "";
+      end;
+      htmlNodeDumpFormatOutput(LBuffer, self.Tree.Doc, self.Node, nil, DoFormat(APretty));
+      LSize := xmlOutputBufferGetSize(LBuffer);
+      LResult := "";
+      if LSize > 0 then
+        LResult := StringFromC(ptr to const char(xmlOutputBufferGetContent(LBuffer)),
+          int64(LSize));
+      end;
+      xmlOutputBufferClose(LBuffer);
+      if self.Node^.type_ = XML_ATTRIBUTE_NODE then
+        LResult := TrimLeft(LResult);
+      end;
+      return LResult;
+    end;
+
     // The node's markup, indented when APretty; "" for a missing value
     hidden const method DoDump(const APretty: bool): string;
     var
@@ -2819,6 +3155,9 @@ public type
     begin
       if self.Node = nil then
         return "";
+      end;
+      if self.Tree.Doc^.type_ = XML_HTML_DOCUMENT_NODE then
+        return self.DoDumpHtml(APretty);
       end;
       LBuffer := xmlBufferCreate();
       if LBuffer = nil then
@@ -2878,7 +3217,8 @@ public type
       return self.SaveToFile(APath, APretty, ADAM_XML_UTF8);
     end;
 
-    /// SaveToFile in the encoding AEncoding (declared in the XML declaration).
+    /// SaveToFile in the encoding AEncoding (declared in the XML declaration; an HTML
+    /// document, Xml.FromHtml*, is written as HTML, the encoding in its meta charset).
     /// @param APath the file
     /// @param APretty whether a line per element
     /// @param AEncoding libxml2's name for it ("UTF-8", "UTF-16", "ISO-8859-1" ...)
@@ -2896,8 +3236,16 @@ public type
       end;
       LPath := DoFilePath(APath);
       LEncoding := StringToC(AEncoding);
-      LOk := (LPath <> nil) and (LEncoding <> nil) and
-        (xmlSaveFormatFileEnc(LPath, self.Tree.Doc, LEncoding, DoFormat(APretty)) >= 0);
+      LOk := (LPath <> nil) and (LEncoding <> nil);
+      if LOk then
+        // libxml2's xmlSave* forms always write XML: an HTML document goes through its
+        // HTML saver
+        if self.Tree.Doc^.type_ = XML_HTML_DOCUMENT_NODE then
+          LOk := htmlSaveFileFormat(LPath, self.Tree.Doc, LEncoding, DoFormat(APretty)) >= 0;
+        else
+          LOk := xmlSaveFormatFileEnc(LPath, self.Tree.Doc, LEncoding, DoFormat(APretty)) >= 0;
+        end;
+      end;
       DoFreeChars(LEncoding);
       DoFreeChars(LPath);
       return LOk;
@@ -2923,7 +3271,8 @@ public type
       return self.SaveToIO(AIO, APretty, ADAM_XML_UTF8);
     end;
 
-    /// SaveToIO in the encoding AEncoding (declared in the XML declaration).
+    /// SaveToIO in the encoding AEncoding (declared in the XML declaration; an HTML document
+    /// is written as HTML, the encoding in its meta charset).
     /// @param AIO the IO written
     /// @param APretty whether a line per element
     /// @param AEncoding libxml2's name for it ("UTF-8", "UTF-16", "ISO-8859-1" ...)
@@ -2954,8 +3303,17 @@ public type
       end;
       // The buffer owns the encoder; saving closes the buffer (the IO stays open)
       LBuffer := xmlOutputBufferCreateIO(DoIOWrite, DoIOClose, ptr(AIO), LEncoder);
-      LOk := (LBuffer <> nil) and
-        (xmlSaveFormatFileTo(LBuffer, self.Tree.Doc, LEncoding, DoFormat(APretty)) >= 0);
+      LOk := LBuffer <> nil;
+      if LOk then
+        // An HTML document through libxml2's HTML writer (xmlSave* always writes XML); that
+        // writer leaves the buffer open, its close reports a failed write
+        if self.Tree.Doc^.type_ = XML_HTML_DOCUMENT_NODE then
+          htmlDocContentDumpFormatOutput(LBuffer, self.Tree.Doc, LEncoding, DoFormat(APretty));
+          LOk := xmlOutputBufferClose(LBuffer) >= 0;
+        else
+          LOk := xmlSaveFormatFileTo(LBuffer, self.Tree.Doc, LEncoding, DoFormat(APretty)) >= 0;
+        end;
+      end;
       DoFreeChars(LEncoding);
       return LOk;
     end;
