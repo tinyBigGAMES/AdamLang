@@ -2473,6 +2473,53 @@ public type
       return self.DoMovePointer(LBase, LIndex, LPtrType, false, AId);
     end;
 
+    // True when the place AId (through parentheses) is the lowered routine's own local: a
+    // name of a local variable or a value parameter of the function being lowered, held in
+    // its own slot (a by-reference parameter, a for parallel body's captured variable and a
+    // module variable are not; an aggregate a caller copied for it is). Only another thread
+    // could share such a slot, so its copy on write stays ArrUnique / StrUnique; any other
+    // written place takes the *UniqueShared twin (BNF sec 5, shared writes from threads)
+    hidden const method DoOwnLocalPlace(const AId: int64): bool;
+    var
+      LAt: int64;
+      LDecl: int64;
+      LKind: NodeKind;
+    begin
+      LAt := AId;
+      while self.FTree[LAt].Kind = NodeKind.ParenExpression do
+        LAt := self.FTree.FirstOf(LAt, NodeRole.Operand);
+      end;
+      if self.FTree[LAt].Kind <> NodeKind.NameExpression then
+        return false;
+      end;
+      LDecl := self.FTree[LAt].ResolvedDecl;
+      if LDecl <= 0 then
+        return false;
+      end;
+      LKind := self.FTree[LDecl].Kind;
+      if (LKind <> NodeKind.VarDecl) and (LKind <> NodeKind.Param) then
+        return false;
+      end;
+      if self.FTree.RoleOf(LDecl) = NodeRole.Declaration then
+        return false;
+      end;
+      if self.FSlotOf[LDecl] = 0 then
+        return false;
+      end;
+      return (not self.FByRef[LDecl]) or self.FByCopy[LDecl];
+    end;
+
+    // The written form's copy on write of the place AOperand (DoOwnLocalPlace): AOwn, a
+    // routine's own local, or the *UniqueShared twin for any other place
+    hidden const method DoUniqueKind(const AOperand: int64; const AOwn: RuntimeRoutine;
+      const AShared: RuntimeRoutine): RuntimeRoutine;
+    begin
+      if self.DoOwnLocalPlace(AOperand) then
+        return AOwn;
+      end;
+      return AShared;
+    end;
+
     // The address of the element of a dynamic array the index expression AId names (the
     // array's index starts at 0): the array first, then the index, moved over by that many
     // elements from the block's first (DoMovePointer). To read it, the array's value (a
@@ -2504,8 +2551,8 @@ public type
         LArgs := ref Int64List();
         LArgs.Add(LSlot);
         LArgs.Add(LMap);
-        LBase := self.DoCallRuntimeSite(RuntimeRoutine.ArrUnique, LArgs, AId,
-          self.DoArrayWhat(LType));
+        LBase := self.DoCallRuntimeSite(self.DoUniqueKind(LOperand, RuntimeRoutine.ArrUnique,
+          RuntimeRoutine.ArrUniqueShared), LArgs, AId, self.DoArrayWhat(LType));
         if not self.DoHoldWritten(LOperand, LBase, LType, AId) then
           return 0;
         end;
@@ -8636,6 +8683,9 @@ public type
       if AKind = RuntimeRoutine.StrUnique then
         return RuntimeRoutine.WStrUnique;
       end;
+      if AKind = RuntimeRoutine.StrUniqueShared then
+        return RuntimeRoutine.WStrUniqueShared;
+      end;
       if AKind = RuntimeRoutine.StrSetLength then
         return RuntimeRoutine.WStrSetLength;
       end;
@@ -8682,11 +8732,13 @@ public type
     begin
       if (AKind = RuntimeRoutine.StrConcat) or (AKind = RuntimeRoutine.StrFromChar) or
         (AKind = RuntimeRoutine.StrSetLength) or (AKind = RuntimeRoutine.StrUnique) or
-        (AKind = RuntimeRoutine.WStrToUtf8) or (AKind = RuntimeRoutine.FormatRun) then
+        (AKind = RuntimeRoutine.StrUniqueShared) or (AKind = RuntimeRoutine.WStrToUtf8) or
+        (AKind = RuntimeRoutine.FormatRun) then
         return "string";
       end;
       if (AKind = RuntimeRoutine.WStrConcat) or (AKind = RuntimeRoutine.WStrFromChar) or
-        (AKind = RuntimeRoutine.WStrSetLength) or (AKind = RuntimeRoutine.WStrUnique) then
+        (AKind = RuntimeRoutine.WStrSetLength) or (AKind = RuntimeRoutine.WStrUnique) or
+        (AKind = RuntimeRoutine.WStrUniqueShared) then
         return "wstring";
       end;
       return "";
@@ -15601,7 +15653,8 @@ public type
         if LSlot = 0 then
           return 0;
         end;
-        LBase := self.DoCallRuntime(self.DoTextRoutine(RuntimeRoutine.StrUnique, LText), LSlot, 0, AId);
+        LBase := self.DoCallRuntime(self.DoTextRoutine(self.DoUniqueKind(LOperand,
+          RuntimeRoutine.StrUnique, RuntimeRoutine.StrUniqueShared), LText), LSlot, 0, AId);
         if not self.DoHoldWritten(LOperand, LBase, LText, AId) then
           return 0;
         end;
@@ -20807,6 +20860,7 @@ public type
           self.DoStore(self.DoByteOffset(LFrame, (LAt + LI) * LWord, AId), LAddress, AId);
         end;
       end;
+      self.DoUnshareParallel(AId);
       LEntry := self.DoEmit(IrOp.CodeAddress, IrType.Pointer, AId);
       self.FModule.InstrAt(LEntry).Link := self.DoParallelEntry(AId, LSelf);
       LArgs := ref Int64List();
@@ -20817,6 +20871,47 @@ public type
       LArgs.Add(self.DoConstant(IrType.Int64, LFlags, AId));
       LArgs.Add(LWorkers);
       self.DoCallRuntimeArgs(RuntimeRoutine.ParallelRun, LArgs, AId);
+    end;
+
+    // The arrays and strings the for parallel AId's body writes elements of and that live
+    // outside it (its Unshare children, Semantics' DoUnsharePlace: each a name / field chain
+    // in the body, ResolvedJump) made unshared here, on the calling thread, before any
+    // worker starts (ArrUnique with the type's element map / StrUnique / WStrUnique): every
+    // worker then writes the one buffer, its copy on write finding it unshared (BNF sec 5)
+    hidden method DoUnshareParallel(const AId: int64);
+    var
+      LUnshare: int64;
+      LPlace: int64;
+      LType: int64;
+      LSlot: int64;
+      LMap: int64;
+      LArgs: ref Int64List;
+      LI: int64;
+    begin
+      for LI := 0 to self.FTree.CountOf(AId, NodeRole.Unshare) - 1 do
+        LUnshare := self.FTree.NthOf(AId, NodeRole.Unshare, LI);
+        LPlace := self.FTree[LUnshare].ResolvedJump;
+        LType := self.DoUsedType(LPlace);
+        if self.DoIsArrayValue(LType) then
+          LSlot := self.DoAddressFor(LPlace, true);
+          LMap := self.DoElementMap(LType, LPlace);
+          if (LSlot <> 0) and (LMap <> 0) then
+            LArgs := ref Int64List();
+            LArgs.Add(LSlot);
+            LArgs.Add(LMap);
+            self.DoCallRuntimeSite(RuntimeRoutine.ArrUnique, LArgs, LPlace,
+              self.DoArrayWhat(LType));
+          end;
+        else
+          if self.DoIsText(LType) then
+            LSlot := self.DoAddressFor(LPlace, true);
+            if LSlot <> 0 then
+              self.DoCallRuntime(self.DoTextRoutine(RuntimeRoutine.StrUnique, LType), LSlot, 0,
+                LPlace);
+            end;
+          end;
+        end;
+      end;
     end;
 
     // A new body function for the for parallel AFor (internal, System.Runtime's
