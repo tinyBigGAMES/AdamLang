@@ -180,7 +180,12 @@ exit /b 0
 
 :: Mirrors folder %1 into %2 (the snapshot is this script's own scratch);
 :: %3 %4 pass robocopy an exclusion. robocopy's exit codes below 8 are success.
+:: %2 is made again from empty: robocopy keeps an existing file's name as it is
+:: spelled, so a file renamed in case only (System.Json.C -> System.JSON.C) would
+:: keep its old spelling, and a unit file is found by its exact case.
 :snap
+if exist %2 rmdir /s /q %2
+if exist %2 exit /b 1
 robocopy %1 %2 /MIR /NFL /NDL /NJH /NJS /NP %3 %4 >nul
 if errorlevel 8 exit /b 1
 exit /b 0
