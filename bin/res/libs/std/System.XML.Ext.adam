@@ -60,6 +60,20 @@
   encoding named (libxml2's built-in ones: UTF-8, UTF-16, ISO-8859-x,
   ASCII ...), through the same C file calls / IO callbacks reading uses.
 
+  XPath 1.0 (the node a value views is the context node): Select (every
+  node found, a `for .. in` sequence), SelectFirst (the first, in document
+  order), Evaluate (the result as a string, or the default's type: int32 /
+  int64 / float64 / bool; the default when it fails or does not fit). Each
+  takes the expression as a string or an XmlPath: XmlPath.Compile compiles
+  one once for any number of runs (IsValid / ErrorText say why one does
+  not compile: "<xpath>(1,col): message", or why its last run failed:
+  "<xpath>: message"), RegisterNamespace binds a prefix (the prefixes
+  declared where the context node is are bound too,
+  XPath has no default namespace) and SetVariable a $variable. A result
+  may hold attributes (XmlKind.Attribute: Name, Text = its value, Parent =
+  its element) and namespace nodes (XmlKind.Namespace: Name = the prefix,
+  Text = the URI, Parent = the element it is in scope on).
+
   The file form goes through libxml2's own C file calls (open / _wopen),
   never System.IO: with System.HookIO imported, an io://<n>/<name> path
   (a registered IO, a .rez / zip entry) or a path a path source holds reads
@@ -109,6 +123,12 @@ const
   ADAM_XML_FALSE: string = "false";
   // The first char of an Adam path prefix ($P: $D: $S:): the only paths resolved before a read
   ADAM_XML_PATH_PREFIX: char = '$';
+  // The name an XPath error carries, and what it says when libxml2 gave no reason
+  ADAM_XML_XPATH_NAME: string = "<xpath>";
+  ADAM_XML_MSG_XPATH_FAILED: string = "the XPath expression cannot be evaluated";
+  // 2^31 and 2^63, exact in float64: the int32 / int64 ranges an XPath number must fall in
+  ADAM_XML_INT32_BOUND: float64 = 2147483648.0;
+  ADAM_XML_INT64_BOUND: float64 = 9223372036854775808.0;
 
 type
   // What a parse's error handler keeps: the first error; until one comes, the first warning
@@ -119,6 +139,8 @@ type
     Domain: int32;
     Line: int32;
     Column: int32;
+    // An XPath error's place in its expression (0-based)
+    Offset: int32;
     Message: string;
   end;
 
@@ -223,14 +245,21 @@ begin
   return DoText(ALocal);
 end;
 
-// An element's or a processing instruction's name as written (prefix:local); "" for any
-// other node
+// Whether ANode is an element or an attribute (an xmlAttr shares xmlNode's fields up to ns)
+routine DoIsNamedKind(const ANode: ptr to xmlNode): bool;
+begin
+  return (ANode <> nil) and ((ANode^.type_ = XML_ELEMENT_NODE) or
+    (ANode^.type_ = XML_ATTRIBUTE_NODE));
+end;
+
+// An element's or an attribute's name as written (prefix:local), a processing
+// instruction's target; "" for any other node
 routine DoName(const ANode: ptr to xmlNode): string;
 begin
   if ANode = nil then
     return "";
   end;
-  if ANode^.type_ = XML_ELEMENT_NODE then
+  if DoIsNamedKind(ANode) then
     return DoQualified(ANode^.ns, ANode^.name);
   end;
   if ANode^.type_ = XML_PI_NODE then
@@ -292,6 +321,7 @@ begin
   LState^.Domain := AError^.domain;
   LState^.Line := AError^.line;
   LState^.Column := AError^.int2;
+  LState^.Offset := AError^.int1;
   LState^.Message := TrimRight(DoText(ptr to const xmlChar(AError^.message)));
 end;
 
@@ -483,8 +513,84 @@ begin
   return ANs <> nil;
 end;
 
-// One parsed document, shared by every Xml viewing it
+// -- XPath
+
+// The element whose in-scope namespaces an XPath run from ANode binds: ANode itself, a
+// document's root element, else the nearest element above ANode (an attribute's, a text's
+// inside an attribute); nil when there is none
+routine DoScopeElement(const ADoc: ptr to xmlDoc; const ANode: ptr to xmlNode): ptr to xmlNode;
+var
+  LNode: ptr to xmlNode;
+begin
+  if ANode = nil then
+    return nil;
+  end;
+  if (ANode^.type_ = XML_DOCUMENT_NODE) or (ANode^.type_ = XML_HTML_DOCUMENT_NODE) then
+    return xmlDocGetRootElement(ADoc);
+  end;
+  LNode := ANode;
+  while (LNode <> nil) and (LNode^.type_ <> XML_ELEMENT_NODE) do
+    LNode := LNode^.parent_;
+  end;
+  return LNode;
+end;
+
+// Why an XPath compile or run failed, from AState: a compile's "<xpath>(1,col): message" (col
+// 1-based in the expression), a run's "<xpath>: message" (a compiled run has no place in the
+// text: libxml2 reports offset 0), "<xpath>: ..." when libxml2 gave no reason
+routine DoPathError(const AState: XmlReadState; const AHasPlace: bool): string;
+begin
+  if not AState.Found then
+    return ADAM_XML_XPATH_NAME + ": " + ADAM_XML_MSG_XPATH_FAILED;
+  end;
+  if not AHasPlace then
+    return ADAM_XML_XPATH_NAME + ": " + AState.Message;
+  end;
+  return ADAM_XML_XPATH_NAME + "(1," + IntToStr(int64(AState.Offset) + 1) + "): " +
+    AState.Message;
+end;
+
+// An XPath number as an int64 into AValue; false for a NaN, an infinity, a fraction or a value
+// outside int64 (every comparison with a NaN is false, so the range test catches it)
+routine DoWhole(const ANumber: float64; var AValue: int64): bool;
+begin
+  if not ((ANumber >= -ADAM_XML_INT64_BOUND) and (ANumber < ADAM_XML_INT64_BOUND)) then
+    return false;
+  end;
+  if float64(int64(ANumber)) <> ANumber then
+    return false;
+  end;
+  AValue := int64(ANumber);
+  return true;
+end;
+
 type
+  // A compiled XPath expression, shared by every XmlPath made from one Compile
+  XmlPathCode = object
+    // nil when the expression did not compile
+    Compiled: ptr to xmlXPathCompExpr;
+    // The compile's error, then the last run's ("" after a run that worked)
+    LastError: string;
+
+    done;
+    begin
+      if self.Compiled <> nil then
+        xmlXPathFreeCompExpr(self.Compiled);
+      end;
+    end;
+  end;
+
+  // A $variable an XmlPath binds: its name and one value of the kind XPATH_STRING /
+  // XPATH_NUMBER / XPATH_BOOLEAN
+  XmlPathVariable = record
+    Name: string;
+    Kind: int32;
+    Text: string;
+    Number: float64;
+    Flag: bool;
+  end;
+
+  // One parsed document, shared by every Xml viewing it
   XmlTree = object
     Doc: ptr to xmlDoc;
     // The nodes taken out of the document (Remove, SetText), kept until it goes so no view
@@ -519,20 +625,338 @@ type
     end;
   end;
 
+// AVariable's value as a new libxml2 XPath object (the caller's); nil when there is no room
+routine DoVariableValue(const AVariable: XmlPathVariable): ptr to xmlXPathObject;
+var
+  LText: ptr to xmlChar;
+  LResult: ptr to xmlXPathObject;
+begin
+  if AVariable.Kind = XPATH_NUMBER then
+    return xmlXPathNewFloat(AVariable.Number);
+  end;
+  if AVariable.Kind = XPATH_BOOLEAN then
+    if AVariable.Flag then
+      return xmlXPathNewBoolean(1);
+    end;
+    return xmlXPathNewBoolean(0);
+  end;
+  LText := DoNewText(AVariable.Text);
+  if LText = nil then
+    return nil;
+  end;
+  LResult := xmlXPathNewString(ptr to const xmlChar(LText));
+  DoFreeText(LText);
+  return LResult;
+end;
+
 public forward type Xml;
 public forward type XmlAttribute;
 
 public type
   // What a node is
   XmlKind = choices(Missing, Element, Text, CData, Comment, Instruction, EntityReference,
-    Document, Other);
+    Attribute, Namespace, Document, Other);
+
+  /// A compiled XPath 1.0 expression with the namespace prefixes and $variables it binds:
+  /// compiled once (XmlPath.Compile), run on any node of any document any number of times
+  /// (Xml.Select / SelectFirst / Evaluate). A value: a copy shares the compiled code and
+  /// takes its own copy of the prefixes and variables.
+  /// @example `LItems := XmlPath.Compile("//p:item[@id = $id]").RegisterNamespace("p", "urn:shop").SetVariable("id", 7);`
+  XmlPath = object
+    // The compiled code (nil only for a value never made by Compile)
+    hidden Code: ref XmlPathCode;
+    // The expression as given
+    hidden Source: string;
+    // The prefixes bound, each with the URI at the same index
+    hidden Prefixes: StringArray;
+    hidden Uris: StringArray;
+    // The $variables bound
+    hidden Variables: array of XmlPathVariable;
+
+    /// Compiles the XPath 1.0 expression AExpression.
+    /// @param AExpression the expression ("//item[@id = 3]", "count(//item)", "$name" ...)
+    /// @returns the compiled expression; IsValid false, ErrorText why, when it does not
+    ///   compile
+    /// @example `LPath := XmlPath.Compile("/config/window/@width");`
+    static method Compile(const AExpression: string): XmlPath;
+    var
+      LPath: XmlPath;
+      LState: XmlReadState;
+      LContext: ptr to xmlXPathContext;
+      LText: ptr to xmlChar;
+    begin
+      LPath.Source := AExpression;
+      LPath.Code := ref XmlPathCode();
+      LContext := xmlXPathNewContext(nil);
+      if LContext = nil then
+        LPath.Code.LastError := ADAM_XML_XPATH_NAME + ": " + ADAM_XML_MSG_NO_ROOM;
+        return LPath;
+      end;
+      // Every compile error to LState: libxml2 prints nothing
+      xmlXPathSetErrorHandler(LContext, DoOnError, ptr(addr of LState));
+      LText := DoNewText(AExpression);
+      if LText <> nil then
+        LPath.Code.Compiled := xmlXPathCtxtCompile(LContext, ptr to const xmlChar(LText));
+        DoFreeText(LText);
+      end;
+      xmlXPathFreeContext(LContext);
+      if LPath.Code.Compiled = nil then
+        if LText = nil then
+          LPath.Code.LastError := ADAM_XML_XPATH_NAME + ": " + ADAM_XML_MSG_NO_ROOM;
+        else
+          LPath.Code.LastError := DoPathError(LState, true);
+        end;
+      end;
+      return LPath;
+    end;
+
+    /// Whether the expression compiled.
+    /// @returns false for one that did not (ErrorText says why) or a value never compiled
+    /// @example `if not LPath.IsValid() then println(LPath.ErrorText()); end;`
+    const method IsValid(): bool;
+    begin
+      return (self.Code <> nil) and (self.Code.Compiled <> nil);
+    end;
+
+    /// The expression as given to Compile.
+    /// @returns the expression text
+    /// @example `println(LPath.Expression());`
+    const method Expression(): string;
+    begin
+      return self.Source;
+    end;
+
+    /// Why the expression did not compile, else why its last run failed (a prefix or
+    /// $variable not bound, a function libxml2 lacks): "<xpath>(1,col): message" for a
+    /// compile, "<xpath>: message" for a run (a run has no place in the text).
+    /// @returns the error; "" when it compiled and its last run worked
+    /// @example `println(LPath.ErrorText());`
+    const method ErrorText(): string;
+    begin
+      if self.Code = nil then
+        return ADAM_XML_XPATH_NAME + ": " + ADAM_XML_MSG_XPATH_FAILED;
+      end;
+      return self.Code.LastError;
+    end;
+
+    /// Binds the namespace prefix APrefix to ANamespaceUri for every run (over a prefix
+    /// the context node has in scope, or one bound before).
+    /// @param APrefix the prefix the expression writes ("p" in "//p:item"); XPath has no
+    ///   default namespace, so an element in one is reached through a prefix bound here
+    /// @param ANamespaceUri the namespace's URI
+    /// @returns this value, so calls chain; unchanged for an empty prefix or URI
+    /// @example `LPath.RegisterNamespace("svg", "http://www.w3.org/2000/svg");`
+    method RegisterNamespace(const APrefix: string; const ANamespaceUri: string): XmlPath;
+    var
+      LI: int64;
+    begin
+      if (len(APrefix) = 0) or (len(ANamespaceUri) = 0) then
+        return self;
+      end;
+      for LI := 0 to len(self.Prefixes) - 1 do
+        if self.Prefixes[LI] = APrefix then
+          self.Uris[LI] := ANamespaceUri;
+          return self;
+        end;
+      end;
+      setlength(self.Prefixes, len(self.Prefixes) + 1);
+      setlength(self.Uris, len(self.Uris) + 1);
+      self.Prefixes[len(self.Prefixes) - 1] := APrefix;
+      self.Uris[len(self.Uris) - 1] := ANamespaceUri;
+      return self;
+    end;
+
+    // AVariable bound (over one of its name bound before); unchanged for an empty name
+    hidden method DoBind(const AVariable: XmlPathVariable): XmlPath;
+    var
+      LI: int64;
+    begin
+      if len(AVariable.Name) = 0 then
+        return self;
+      end;
+      for LI := 0 to len(self.Variables) - 1 do
+        if self.Variables[LI].Name = AVariable.Name then
+          self.Variables[LI] := AVariable;
+          return self;
+        end;
+      end;
+      setlength(self.Variables, len(self.Variables) + 1);
+      self.Variables[len(self.Variables) - 1] := AVariable;
+      return self;
+    end;
+
+    /// Binds the $variable AName to the string AValue for every run.
+    /// @param AName the name without its $ ("id" for $id)
+    /// @param AValue the value
+    /// @returns this value, so calls chain; unchanged for an empty name
+    /// @example `LPath.SetVariable("name", "door");`
+    method SetVariable(const AName: string; const AValue: string): XmlPath;
+    var
+      LVariable: XmlPathVariable;
+    begin
+      LVariable.Name := AName;
+      LVariable.Kind := XPATH_STRING;
+      LVariable.Text := AValue;
+      return self.DoBind(LVariable);
+    end;
+
+    /// Binds the $variable AName to the number AValue for every run.
+    /// @param AName the name without its $
+    /// @param AValue the value
+    /// @returns this value, so calls chain
+    /// @example `LPath.SetVariable("id", 7);`
+    method SetVariable(const AName: string; const AValue: int32): XmlPath;
+    begin
+      return self.SetVariable(AName, float64(AValue));
+    end;
+
+    /// Binds the $variable AName to the number AValue for every run (XPath numbers are
+    /// float64: an int64 beyond 2^53 is rounded).
+    /// @param AName the name without its $
+    /// @param AValue the value
+    /// @returns this value, so calls chain
+    /// @example `LPath.SetVariable("id", LId);`
+    method SetVariable(const AName: string; const AValue: int64): XmlPath;
+    begin
+      return self.SetVariable(AName, float64(AValue));
+    end;
+
+    /// Binds the $variable AName to the number AValue for every run.
+    /// @param AName the name without its $
+    /// @param AValue the value
+    /// @returns this value, so calls chain
+    /// @example `LPath.SetVariable("limit", 0.5);`
+    method SetVariable(const AName: string; const AValue: float64): XmlPath;
+    var
+      LVariable: XmlPathVariable;
+    begin
+      LVariable.Name := AName;
+      LVariable.Kind := XPATH_NUMBER;
+      LVariable.Number := AValue;
+      return self.DoBind(LVariable);
+    end;
+
+    /// Binds the $variable AName to the boolean AValue for every run.
+    /// @param AName the name without its $
+    /// @param AValue the value
+    /// @returns this value, so calls chain
+    /// @example `LPath.SetVariable("strict", true);`
+    method SetVariable(const AName: string; const AValue: bool): XmlPath;
+    var
+      LVariable: XmlPathVariable;
+    begin
+      LVariable.Name := AName;
+      LVariable.Kind := XPATH_BOOLEAN;
+      LVariable.Flag := AValue;
+      return self.DoBind(LVariable);
+    end;
+
+    // An XPath context over ADoc with this value's bindings, the prefixes in scope on AScope
+    // first, reporting to AState; nil when there is no room
+    hidden const method DoContext(const ADoc: ptr to xmlDoc; const AScope: ptr to xmlNode;
+      const AState: ptr to XmlReadState): ptr to xmlXPathContext;
+    var
+      LContext: ptr to xmlXPathContext;
+      LList: ptr to ptr to xmlNs;
+      LI: int64;
+      LName: ptr to xmlChar;
+      LUri: ptr to xmlChar;
+      LValue: ptr to xmlXPathObject;
+    begin
+      LContext := xmlXPathNewContext(ADoc);
+      if LContext = nil then
+        return nil;
+      end;
+      xmlXPathSetErrorHandler(LContext, DoOnError, ptr(AState));
+      // The prefixes declared where the context node is (a default namespace has no prefix:
+      // XPath cannot name it)
+      if AScope <> nil then
+        LList := xmlGetNsList(ADoc, AScope);
+        if LList <> nil then
+          LI := 0;
+          while LList[LI] <> nil do
+            if LList[LI]^.prefix <> nil then
+              xmlXPathRegisterNs(LContext, LList[LI]^.prefix, LList[LI]^.href);
+            end;
+            LI := LI + 1;
+          end;
+          xmlFree(ptr(LList));
+        end;
+      end;
+      // This value's prefixes, over those
+      for LI := 0 to len(self.Prefixes) - 1 do
+        LName := DoNewText(self.Prefixes[LI]);
+        LUri := DoNewText(self.Uris[LI]);
+        if (LName <> nil) and (LUri <> nil) then
+          xmlXPathRegisterNs(LContext, ptr to const xmlChar(LName), ptr to const xmlChar(LUri));
+        end;
+        DoFreeText(LUri);
+        DoFreeText(LName);
+      end;
+      // This value's $variables: the context owns each value registered
+      for LI := 0 to len(self.Variables) - 1 do
+        LValue := DoVariableValue(self.Variables[LI]);
+        LName := DoNewText(self.Variables[LI].Name);
+        if (LValue <> nil) and ((LName = nil) or
+          (xmlXPathRegisterVariable(LContext, ptr to const xmlChar(LName), LValue) <> 0)) then
+          xmlXPathFreeObject(LValue);
+        end;
+        DoFreeText(LName);
+      end;
+      return LContext;
+    end;
+
+    /// Runs the expression on ANode of ADoc at libxml2's level (Xml.Select / SelectFirst /
+    /// Evaluate are the easy forms): ANode is the context node, the prefixes in scope on
+    /// its element and this value's bindings are bound; ErrorText tells why a run failed.
+    /// @param ADoc the document
+    /// @param ANode the context node (nil: the document node)
+    /// @returns libxml2's result, the caller's to free (xmlXPathFreeObject); nil when the
+    ///   expression did not compile or the run failed
+    /// @example `LResult := LPath.EvaluateAt(LDoc, xmlDocGetRootElement(LDoc));`
+    const method EvaluateAt(const ADoc: ptr to xmlDoc; const ANode: ptr to xmlNode): ptr to xmlXPathObject;
+    var
+      LState: XmlReadState;
+      LContext: ptr to xmlXPathContext;
+      LNode: ptr to xmlNode;
+      LResult: ptr to xmlXPathObject;
+    begin
+      if (not self.IsValid()) or (ADoc = nil) then
+        return nil;
+      end;
+      LNode := ANode;
+      if LNode = nil then
+        LNode := ptr to xmlNode(ptr(ADoc));
+      end;
+      LContext := self.DoContext(ADoc, DoScopeElement(ADoc, LNode), addr of LState);
+      if LContext = nil then
+        self.Code.LastError := ADAM_XML_XPATH_NAME + ": " + ADAM_XML_MSG_NO_ROOM;
+        return nil;
+      end;
+      LResult := nil;
+      if xmlXPathSetContextNode(LNode, LContext) = 0 then
+        LResult := xmlXPathCompiledEval(self.Code.Compiled, LContext);
+      end;
+      xmlXPathFreeContext(LContext);
+      if LResult = nil then
+        self.Code.LastError := DoPathError(LState, false);
+      else
+        self.Code.LastError := "";
+      end;
+      return LResult;
+    end;
+  end;
 
   // An XML node: a view of one node of a shared parsed document (see the header)
   Xml = object
     // The document (nil for a missing value)
     hidden Tree: ref XmlTree;
-    // The node viewed (nil: a missing value)
+    // The node viewed (nil: a missing value, or a namespace node)
     hidden Node: ptr to xmlNode;
+    // A namespace node an XPath result holds (Node nil): the document's declaration of it,
+    // and the element it is in scope on
+    hidden Ns: ptr to xmlNs;
+    hidden NsOwner: ptr to xmlNode;
     // Why the last Parse / LoadFromFile / LoadFromIO failed ("" after a success)
     hidden Error: string;
 
@@ -549,11 +973,24 @@ public type
       return LView;
     end;
 
+    // A view of the namespace node ANs in scope on AOwner, in this document
+    hidden const method DoViewNs(const ANs: ptr to xmlNs; const AOwner: ptr to xmlNode): Xml;
+    var
+      LView: Xml;
+    begin
+      LView.Tree := self.Tree;
+      LView.Ns := ANs;
+      LView.NsOwner := AOwner;
+      return LView;
+    end;
+
     // This value made a missing one carrying AError
     hidden method DoFail(const AError: string);
     begin
       self.Tree := nil;
       self.Node := nil;
+      self.Ns := nil;
+      self.NsOwner := nil;
       self.Error := AError;
     end;
 
@@ -573,6 +1010,8 @@ public type
       end;
       self.Tree := LTree;
       self.Node := LRoot;
+      self.Ns := nil;
+      self.NsOwner := nil;
       self.Error := "";
       return true;
     end;
@@ -719,7 +1158,7 @@ public type
     // Whether this value names no node (a failed read, a walk past the end, a name not found)
     const method IsNull(): bool;
     begin
-      return self.Node = nil;
+      return (self.Node = nil) and (self.Ns = nil);
     end;
 
     // What the node is (XmlKind.Missing for a missing value)
@@ -727,6 +1166,9 @@ public type
     var
       LType: int32;
     begin
+      if self.Ns <> nil then
+        return XmlKind.Namespace;
+      end;
       if self.Node = nil then
         return XmlKind.Missing;
       end;
@@ -749,6 +1191,9 @@ public type
       if LType = XML_ENTITY_REF_NODE then
         return XmlKind.EntityReference;
       end;
+      if LType = XML_ATTRIBUTE_NODE then
+        return XmlKind.Attribute;
+      end;
       if (LType = XML_DOCUMENT_NODE) or (LType = XML_HTML_DOCUMENT_NODE) then
         return XmlKind.Document;
       end;
@@ -761,43 +1206,55 @@ public type
       return DoIsElement(self.Node);
     end;
 
-    // An element's name as written (prefix:local), a processing instruction's target; ""
+    // An element's or an attribute's name as written (prefix:local), a processing
+    // instruction's target, a namespace node's prefix ("" for the default namespace); ""
     // for any other node
     const method Name(): string;
     begin
+      if self.Ns <> nil then
+        return DoText(self.Ns^.prefix);
+      end;
       return DoName(self.Node);
     end;
 
-    // An element's name without its prefix; "" for any other node
+    // An element's or an attribute's name without its prefix, a namespace node's prefix;
+    // "" for any other node
     const method LocalName(): string;
     begin
-      if not DoIsElement(self.Node) then
+      if self.Ns <> nil then
+        return DoText(self.Ns^.prefix);
+      end;
+      if not DoIsNamedKind(self.Node) then
         return "";
       end;
       return DoText(self.Node^.name);
     end;
 
-    // An element's namespace prefix; "" when it has none
+    // An element's or an attribute's namespace prefix; "" when it has none
     const method Prefix(): string;
     begin
-      if (not DoIsElement(self.Node)) or (self.Node^.ns = nil) then
+      if (not DoIsNamedKind(self.Node)) or (self.Node^.ns = nil) then
         return "";
       end;
       return DoText(self.Node^.ns^.prefix);
     end;
 
-    // An element's namespace URI; "" when it is in no namespace
+    // An element's or an attribute's namespace URI; "" when it is in no namespace
     const method NamespaceUri(): string;
     begin
-      if (not DoIsElement(self.Node)) or (self.Node^.ns = nil) then
+      if (not DoIsNamedKind(self.Node)) or (self.Node^.ns = nil) then
         return "";
       end;
       return DoText(self.Node^.ns^.href);
     end;
 
-    // The line the node starts on in its source (0 for a missing value)
+    // The line the node starts on in its source (an attribute's or a namespace node's: its
+    // element's; 0 for a missing value)
     const method Line(): int64;
     begin
+      if self.Ns <> nil then
+        return int64(xmlGetLineNo(self.NsOwner));
+      end;
       if self.Node = nil then
         return 0;
       end;
@@ -807,17 +1264,31 @@ public type
     // -- Text
 
     // The node's own text: an element's text and CDATA children joined (not its
-    // descendants'), a text / CDATA / comment / processing instruction node's content
+    // descendants'), a text / CDATA / comment / processing instruction / entity reference
+    // node's content, an attribute's value, a namespace node's URI; "" for any other node
+    // (a document, a DTD: their records hold no content field)
     const method Text(): string;
     var
       LResult: string;
       LChild: ptr to xmlNode;
+      LType: int32;
     begin
+      if self.Ns <> nil then
+        return DoText(self.Ns^.href);
+      end;
       if self.Node = nil then
         return "";
       end;
-      if self.Node^.type_ <> XML_ELEMENT_NODE then
+      LType := self.Node^.type_;
+      if LType = XML_ATTRIBUTE_NODE then
+        return DoAttributeValue(ptr to xmlAttr(ptr(self.Node)));
+      end;
+      if (LType = XML_TEXT_NODE) or (LType = XML_CDATA_SECTION_NODE) or
+        (LType = XML_COMMENT_NODE) or (LType = XML_PI_NODE) or (LType = XML_ENTITY_REF_NODE) then
         return DoText(self.Node^.content);
+      end;
+      if LType <> XML_ELEMENT_NODE then
+        return "";
       end;
       LResult := "";
       LChild := self.Node^.children;
@@ -833,6 +1304,9 @@ public type
     // All the text in and below the node, in document order (entity references expanded)
     const method InnerText(): string;
     begin
+      if self.Ns <> nil then
+        return DoText(self.Ns^.href);
+      end;
       if self.Node = nil then
         return "";
       end;
@@ -1051,9 +1525,13 @@ public type
 
     // -- Walking
 
-    // The node's parent (the root element's is the document node); missing for the document
+    // The node's parent (the root element's is the document node; an attribute's its
+    // element; a namespace node's the element it is in scope on); missing for the document
     const method Parent(): Xml;
     begin
+      if self.Ns <> nil then
+        return self.DoView(self.NsOwner);
+      end;
       if self.Node = nil then
         return self.DoView(nil);
       end;
@@ -1260,6 +1738,281 @@ public type
           end;
         end;
       end;
+    end;
+
+    // -- XPath 1.0 (this node the context node; see the header and XmlPath)
+
+    // APath run from this node: libxml2's result, the caller's to free; nil for a missing
+    // value or a namespace node (no context node), or a run that failed
+    hidden const method DoEvaluate(const APath: XmlPath): ptr to xmlXPathObject;
+    begin
+      if self.Node = nil then
+        return nil;
+      end;
+      return APath.EvaluateAt(self.Tree.Doc, self.Node);
+    end;
+
+    // A view of the node-set item AItem: a namespace node as the document's own declaration
+    // of it (the item is a copy freed with the result; its next field is its element), any
+    // other node as itself; a missing value when the declaration is not found
+    hidden const method DoItem(const AItem: ptr to xmlNode): Xml;
+    var
+      LCopy: ptr to xmlNs;
+      LOwner: ptr to xmlNode;
+      LNs: ptr to xmlNs;
+    begin
+      if AItem^.type_ <> XML_NAMESPACE_DECL then
+        return self.DoView(AItem);
+      end;
+      LCopy := ptr to xmlNs(ptr(AItem));
+      LOwner := ptr to xmlNode(ptr(LCopy^.next));
+      LNs := xmlSearchNs(self.Tree.Doc, LOwner, LCopy^.prefix);
+      if LNs = nil then
+        return self.DoView(nil);
+      end;
+      return self.DoViewNs(LNs, LOwner);
+    end;
+
+    /// Every node the XPath expression APath selects from this node, in document order
+    /// (elements, attributes, texts, namespace nodes ...).
+    /// @param APath the compiled expression (its ErrorText says why a run failed)
+    /// @returns the nodes as a `for .. in` sequence; empty for a missing value, an
+    ///   expression that failed, or one whose result is no node-set (count(..), a string)
+    /// @example `for LItem in LShop.Select(LItems) do println(LItem.Get("name")); end;`
+    const method Select(const APath: XmlPath): sequence of Xml;
+    var
+      LResult: ptr to xmlXPathObject;
+      LFound: array of Xml;
+      LCount: int64;
+      LI: int64;
+    begin
+      LResult := self.DoEvaluate(APath);
+      if LResult = nil then
+        return;
+      end;
+      // The views made before anything is yielded: the result (and its namespace copies)
+      // is freed at once, so a sequence left early holds nothing of libxml2's
+      if (LResult^.type_ = XPATH_NODESET) and (LResult^.nodesetval <> nil) then
+        LCount := int64(LResult^.nodesetval^.nodeNr);
+        setlength(LFound, LCount);
+        for LI := 0 to LCount - 1 do
+          LFound[LI] := self.DoItem(LResult^.nodesetval^.nodeTab[LI]);
+        end;
+      end;
+      xmlXPathFreeObject(LResult);
+      for LI := 0 to len(LFound) - 1 do
+        if not LFound[LI].IsNull() then
+          yield LFound[LI];
+        end;
+      end;
+    end;
+
+    /// Every node the XPath expression AExpression selects from this node (compiled for
+    /// this call; XmlPath.Compile once for a run repeated).
+    /// @param AExpression the expression ("item[@price > 10]", "//p:title", "@*" ...)
+    /// @returns the nodes as a `for .. in` sequence; empty for a missing value, an
+    ///   expression that does not compile or fails, or a result that is no node-set
+    /// @example `for LLayer in LMap.Select("layer[@visible != 0]") do println(LLayer.Get("name")); end;`
+    const method Select(const AExpression: string): sequence of Xml;
+    begin
+      yield from self.Select(XmlPath.Compile(AExpression));
+    end;
+
+    /// The first node, in document order, the XPath expression APath selects from this node.
+    /// @param APath the compiled expression
+    /// @returns the node; a missing value when it selects none, fails, or gives no node-set
+    /// @example `LTitle := LBook.SelectFirst(LTitlePath);`
+    const method SelectFirst(const APath: XmlPath): Xml;
+    var
+      LResult: ptr to xmlXPathObject;
+      LFirst: Xml;
+    begin
+      LResult := self.DoEvaluate(APath);
+      if LResult = nil then
+        return LFirst;
+      end;
+      if (LResult^.type_ = XPATH_NODESET) and (LResult^.nodesetval <> nil) and
+        (LResult^.nodesetval^.nodeNr > 0) then
+        LFirst := self.DoItem(LResult^.nodesetval^.nodeTab[0]);
+      end;
+      xmlXPathFreeObject(LResult);
+      return LFirst;
+    end;
+
+    /// The first node, in document order, the XPath expression AExpression selects from
+    /// this node.
+    /// @param AExpression the expression
+    /// @returns the node; a missing value when it selects none, does not compile, fails,
+    ///   or gives no node-set
+    /// @example `LWidth := LConfig.SelectFirst("window/@width").Text();`
+    const method SelectFirst(const AExpression: string): Xml;
+    begin
+      return self.SelectFirst(XmlPath.Compile(AExpression));
+    end;
+
+    /// The XPath expression APath's result from this node as a string (XPath's string():
+    /// a node-set's first node's text, a number as XPath writes it, true / false).
+    /// @param APath the compiled expression
+    /// @param ADefault what a missing value or a failed run gives
+    /// @returns the result's string; ADefault on a failure
+    /// @example `LName := LRoot.Evaluate(LNamePath, "unnamed");`
+    const method Evaluate(const APath: XmlPath; const ADefault: string): string;
+    var
+      LResult: ptr to xmlXPathObject;
+      LText: string;
+    begin
+      LResult := self.DoEvaluate(APath);
+      if LResult = nil then
+        return ADefault;
+      end;
+      LText := DoTakeText(xmlXPathCastToString(LResult));
+      xmlXPathFreeObject(LResult);
+      return LText;
+    end;
+
+    /// The XPath expression APath's result from this node as a string.
+    /// @param APath the compiled expression
+    /// @returns the result's string; "" on a failure
+    /// @example `println(LRoot.Evaluate(LTitlePath));`
+    const method Evaluate(const APath: XmlPath): string;
+    begin
+      return self.Evaluate(APath, "");
+    end;
+
+    /// The XPath expression APath's result from this node as a number (XPath's number()).
+    /// @param APath the compiled expression
+    /// @param ADefault what a failure or a NaN (a text that is no number) gives
+    /// @returns the number (an infinity included); ADefault on a failure or a NaN
+    /// @example `LTotal := LCart.Evaluate(LSumPath, 0.0);`
+    const method Evaluate(const APath: XmlPath; const ADefault: float64): float64;
+    var
+      LResult: ptr to xmlXPathObject;
+      LNumber: float64;
+    begin
+      LResult := self.DoEvaluate(APath);
+      if LResult = nil then
+        return ADefault;
+      end;
+      LNumber := xmlXPathCastToNumber(LResult);
+      xmlXPathFreeObject(LResult);
+      if xmlXPathIsNaN(LNumber) <> 0 then
+        return ADefault;
+      end;
+      return LNumber;
+    end;
+
+    /// The XPath expression APath's result from this node as a whole number.
+    /// @param APath the compiled expression
+    /// @param ADefault what a failure, a NaN, an infinity, a fraction or a number outside
+    ///   int64 gives
+    /// @returns the number; ADefault when it does not fit
+    /// @example `LCount := LShop.Evaluate(LCountPath, int64(0));`
+    const method Evaluate(const APath: XmlPath; const ADefault: int64): int64;
+    var
+      LValue: int64;
+    begin
+      // 2^63 as the number form's default: a failure or a NaN gives it, and DoWhole refuses
+      // it (outside int64), so every failure lands on ADefault
+      if DoWhole(self.Evaluate(APath, ADAM_XML_INT64_BOUND), LValue) then
+        return LValue;
+      end;
+      return ADefault;
+    end;
+
+    /// The XPath expression APath's result from this node as a whole number in int32.
+    /// @param APath the compiled expression
+    /// @param ADefault what a failure, a NaN, an infinity, a fraction or a number outside
+    ///   int32 gives
+    /// @returns the number; ADefault when it does not fit
+    /// @example `LCount := LShop.Evaluate(LCountPath, 0);`
+    const method Evaluate(const APath: XmlPath; const ADefault: int32): int32;
+    var
+      LValue: int64;
+    begin
+      if DoWhole(self.Evaluate(APath, ADAM_XML_INT64_BOUND), LValue) and
+        (float64(LValue) >= -ADAM_XML_INT32_BOUND) and (float64(LValue) < ADAM_XML_INT32_BOUND) then
+        return int32(LValue);
+      end;
+      return ADefault;
+    end;
+
+    /// The XPath expression APath's result from this node as a boolean (XPath's boolean():
+    /// a node-set is true when not empty, a number when not 0 / NaN, a string when not "").
+    /// @param APath the compiled expression
+    /// @param ADefault what a failure gives
+    /// @returns the boolean; ADefault on a failure
+    /// @example `if LDoc.Evaluate(LHasErrors, false) then println("errors"); end;`
+    const method Evaluate(const APath: XmlPath; const ADefault: bool): bool;
+    var
+      LResult: ptr to xmlXPathObject;
+      LFlag: bool;
+    begin
+      LResult := self.DoEvaluate(APath);
+      if LResult = nil then
+        return ADefault;
+      end;
+      LFlag := xmlXPathCastToBoolean(LResult) <> 0;
+      xmlXPathFreeObject(LResult);
+      return LFlag;
+    end;
+
+    /// The XPath expression AExpression's result from this node as a string.
+    /// @param AExpression the expression ("string(@id)", "concat(first, ' ', last)" ...)
+    /// @returns the result's string; "" on a failure
+    /// @example `println(LBook.Evaluate("normalize-space(title)"));`
+    const method Evaluate(const AExpression: string): string;
+    begin
+      return self.Evaluate(XmlPath.Compile(AExpression), "");
+    end;
+
+    /// The XPath expression AExpression's result from this node as a string.
+    /// @param AExpression the expression
+    /// @param ADefault what a failure gives
+    /// @returns the result's string; ADefault on a failure
+    /// @example `LName := LRoot.Evaluate("string(@name)", "unnamed");`
+    const method Evaluate(const AExpression: string; const ADefault: string): string;
+    begin
+      return self.Evaluate(XmlPath.Compile(AExpression), ADefault);
+    end;
+
+    /// The XPath expression AExpression's result from this node as a number.
+    /// @param AExpression the expression ("sum(item/@price)" ...)
+    /// @param ADefault what a failure or a NaN gives
+    /// @returns the number; ADefault on a failure or a NaN
+    /// @example `LTotal := LCart.Evaluate("sum(item/@price)", 0.0);`
+    const method Evaluate(const AExpression: string; const ADefault: float64): float64;
+    begin
+      return self.Evaluate(XmlPath.Compile(AExpression), ADefault);
+    end;
+
+    /// The XPath expression AExpression's result from this node as a whole number.
+    /// @param AExpression the expression ("count(item)" ...)
+    /// @param ADefault what a failure or a number that is no int64 gives
+    /// @returns the number; ADefault when it does not fit
+    /// @example `LCount := LShop.Evaluate("count(item)", int64(0));`
+    const method Evaluate(const AExpression: string; const ADefault: int64): int64;
+    begin
+      return self.Evaluate(XmlPath.Compile(AExpression), ADefault);
+    end;
+
+    /// The XPath expression AExpression's result from this node as a whole number in int32.
+    /// @param AExpression the expression
+    /// @param ADefault what a failure or a number that is no int32 gives
+    /// @returns the number; ADefault when it does not fit
+    /// @example `LCount := LShop.Evaluate("count(item)", 0);`
+    const method Evaluate(const AExpression: string; const ADefault: int32): int32;
+    begin
+      return self.Evaluate(XmlPath.Compile(AExpression), ADefault);
+    end;
+
+    /// The XPath expression AExpression's result from this node as a boolean.
+    /// @param AExpression the expression ("boolean(item[@sold])" ...)
+    /// @param ADefault what a failure gives
+    /// @returns the boolean; ADefault on a failure
+    /// @example `if LShop.Evaluate("item[@price > 100]", false) then println("pricey"); end;`
+    const method Evaluate(const AExpression: string; const ADefault: bool): bool;
+    begin
+      return self.Evaluate(XmlPath.Compile(AExpression), ADefault);
     end;
 
     // -- Building (a change returns the value it was called on, so calls chain; one that
@@ -1603,12 +2356,18 @@ public type
         LResult := StringFromC(ptr to const char(xmlBufferContent(LBuffer)), int64(LLength));
       end;
       xmlBufferFree(LBuffer);
+      // libxml2 writes an attribute as it sits in a start tag, after a space: its own
+      // markup is name="value"
+      if self.Node^.type_ = XML_ATTRIBUTE_NODE then
+        LResult := TrimLeft(LResult);
+      end;
       return LResult;
     end;
 
     /// The node's own markup, compact (no XML declaration; an element with everything
-    /// below it).
-    /// @returns the markup; "" for a missing value
+    /// below it; an attribute as name="value").
+    /// @returns the markup; "" for a missing value or a namespace node (an XPath result
+    ///   with no markup of its own: its Name and Text are the prefix and URI)
     /// @example `println(LItem.ToString());`
     const method ToString(): string;
     begin
