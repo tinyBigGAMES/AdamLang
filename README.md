@@ -39,7 +39,7 @@ C is reached by declaration, never by include: a routine declared `external` (wi
 module exe readme_first_look;
 
 // The square of AValue, run as a task
-routine Square(const AValue: int64): int64;
+func Square(const AValue: int64): int64;
 begin
   return AValue * AValue;
 end;
