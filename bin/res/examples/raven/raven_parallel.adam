@@ -1,0 +1,1086 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  raven_parallel.adam - a Mandelbrot dashboard: every core of the machine
+  paints the set at once, tile by tile, while the UI stays live.
+
+  WHAT IT SHOWS
+  - The picture is 832 x 640 pixels in 13 x 10 tiles of 64. A render is one
+    task (`async Render(..)`) whose `for parallel` hands the tiles out to the
+    workers, the centre tiles first; each worker writes its rows into a
+    shared buffer and publishes how far it got with an atomic store. The
+    main thread never waits for it: each frame it colours the rows that are
+    new and uploads them into a raylib texture, so the picture fills in
+    while the workers run.
+  - That texture is shown inside the Raven layout (ui\parallel.xml) as an
+    Image (System.Raven.Raylib's CreateRavenTexture: Raven draws raylib's
+    own texture, no copy). Over it raylib draws each tile's progress: the
+    tiles still waiting are veiled, the ones being painted show their
+    scan line and an outline in their worker's colour.
+  - Cancel is `cancel(task)`: the workers read `cancelled()` at every row and
+    stop there; Render returns what it did, and `await` hands that back.
+  - Zoom with the wheel where the mouse is, pan by dragging, zoom out with
+    a right click, or pick a place from the list. Any change stops the
+    render running, moves the old picture to where the new view puts it
+    (a `for parallel` on the main thread: the picture follows the mouse at
+    once) and starts the new render, which repaints it sharply.
+  - Race: the same view drawn by one worker, then by all of them, and the
+    speed-up between the two.
+  - "Who drew it" tints every tile with the colour of the worker that drew
+    it; the palettes are cosine palettes, "Cycle" rolls the colours every
+    frame (every pixel recoloured by a `for parallel` each frame).
+  - A DPI-scaled frame window (InitFrameWindow through Examples.Common);
+    its last frame is saved as raven_parallel.png beside this file.
+
+  ADAM FEATURES ON SHOW
+  - `for parallel [(W)] I := A to B do .. end;` with and without a workers'
+    count, `workerindex()` / `workercount()` in its body, `leave` to start
+    no new tile once cancelled.
+  - `async Render(LView, LWorkers)`: a call on a thread of its own, its
+    arguments copied first; `task RenderStats` (a task with a record result),
+    `ready(T)` polled each frame, `await T` for the result, `cancel(T)` and
+    `cancelled()`.
+  - Atomics between the threads: atomicstore / atomicload of each tile's
+    finished rows, atomicadd of the tiles done.
+  - A `choices` type for the palettes, matched in `match`.
+  - System.Math's Ln / Log2 (the smooth colouring), Power, Sqrt, Cos;
+    System.Diagnostics' Stopwatch for the times.
+  - defer for every resource (the render task, the texture, Raven, the
+    window, the zip), released in reverse on every way out.
+
+  BUILD AND RUN (from repo\bin, the folder of adam.exe and assets.zip)
+    adam build res\examples\raven\raven_parallel.adam -o output -r
+  -r runs the program once built. For linux add -t x86_64-linux-gnu: on
+  Windows -r runs the linux build through WSL2 (its display, WSLg), on
+  linux natively.
+*******************************************************************************/
+
+module exe raven_parallel;
+
+// Adam's icon on the exe and on its window ($P: is adam.exe's folder)
+@exeicon "$P:res/assets/icons/adam.ico";
+
+// The examples' shared unit (Examples.Common) lives in res\examples\common
+@addmodulepath "$P:res/examples/common";
+
+// System.Math before System.Raylib.C: a bare name two imports export is the last one's (BNF
+// sec 1), so raylib's Vector2 / Rectangle are the ones used here
+import System.SysUtils, System.Math, System.Diagnostics, System.CustomIO, System.Raylib.C, System.Raylib.Ext,
+  System.Raven.C, System.Raven.Ext, System.Raven.Raylib, Examples.Common;
+
+const
+  // The controls' layout, an entry of the zip (Examples.Common's OpenAssets made the zip the
+  // program's files)
+  CONTROLS_XML: string = "res/assets/ui/parallel.xml";
+  // This example under res\examples, for its snapshot (Examples.Common's SaveExampleSnapshot)
+  SNAPSHOT_NAME: string = "raven/raven_parallel";
+  // The frame's base size (the window opens at this x the monitor's scale)
+  BASE_WIDTH: int32 = 1280;
+  BASE_HEIGHT: int32 = 720;
+  // The picture: TILES_X x TILES_Y tiles of TILE_SIZE x TILE_SIZE pixels (the Image in
+  // parallel.xml is the same size in base units)
+  TILE_SIZE: int32 = 64;
+  TILES_X: int32 = 13;
+  TILES_Y: int32 = 10;
+  TILE_COUNT: int32 = 130;
+  TILE_PIXELS: int32 = 4096;
+  IMAGE_WIDTH: int32 = 832;
+  IMAGE_HEIGHT: int32 = 640;
+  IMAGE_PIXELS: int64 = 532480;
+  // The picture's centre in pixels (a pixel's place in the plane is measured from it)
+  HALF_WIDTH: float64 = 416.0;
+  HALF_HEIGHT: float64 = 320.0;
+  // An orbit is out once |z|^2 passes this: a large radius keeps the smooth colouring smooth
+  BAILOUT: float64 = 65536.0;
+  // The buffer's two marks below every real value (real values are 0 and up): a point of
+  // the set, and a pixel no render has reached in this view yet
+  SMOOTH_INSIDE: float32 = -1.0f;
+  SMOOTH_UNKNOWN: float32 = -2.0f;
+  INSIDE_COLOR: Color = Color(r: 4, g: 6, b: 14, a: 255);
+  UNKNOWN_COLOR: Color = Color(r: 14, g: 20, b: 36, a: 255);
+  // The room behind the cards (the Raven window is transparent), top to foot; the frame's
+  // letterbox bars take the foot's colour
+  ROOM_TOP: Color = Color(r: 12, g: 20, b: 40, a: 255);
+  ROOM_FOOT: Color = Color(r: 4, g: 6, b: 14, a: 255);
+  // The palette: PALETTE_SIZE colours a cosine palette gives; a pixel's colour is the entry
+  // at (sqrt(smooth) x BAND_SCALE + the cycle) of the way round (the square root keeps the
+  // bands about as wide deep in a zoom as at the start)
+  PALETTE_SIZE: int32 = 1024;
+  BAND_SCALE: float64 = 0.11;
+  // The cosine palettes' A, B, C, D (red, green, blue) per kind, in Palette's order:
+  // Aurora (teal, violet and gold), Ember, Ice, Mono
+  PALETTE_A: array[0..11] of float64 = [0.5, 0.5, 0.5, 0.6, 0.4, 0.3, 0.5, 0.6, 0.75, 0.5, 0.5,
+    0.5];
+  PALETTE_B: array[0..11] of float64 = [0.5, 0.5, 0.5, 0.4, 0.4, 0.3, 0.4, 0.4, 0.25, 0.5, 0.5,
+    0.5];
+  PALETTE_C: array[0..11] of float64 = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0];
+  PALETTE_D: array[0..11] of float64 = [0.30, 0.20, 0.20, 0.0, 0.10, 0.20, 0.55, 0.60, 0.65, 0.0,
+    0.0, 0.0];
+  // How far "Cycle" rolls the palette per second (of the way round)
+  CYCLE_SPEED: float64 = 0.12;
+  // The zoom: per wheel notch (in), per right click (out), and the limits (pixel sizes in
+  // the plane: the whole set at most; below the deepest, float64 runs out of digits)
+  WHEEL_ZOOM: float64 = 0.8;
+  CLICK_ZOOM_OUT: float64 = 2.0;
+  WIDEST_SCALE: float64 = 0.008;
+  DEEPEST_SCALE: float64 = 0.0000000000002;
+  // The places to visit: name, centre and the plane's width across the picture
+  PLACE_COUNT: int32 = 6;
+  PLACE_NAMES: array[0..5] of string = ["The whole set", "Seahorse Valley", "Elephant Valley",
+    "Triple Spiral", "A mini Mandelbrot", "Lightning"];
+  PLACE_X: array[0..5] of float64 = [-0.6, -0.7453, 0.2810, -0.0883, -1.7548, -0.170337];
+  PLACE_Y: array[0..5] of float64 = [0.0, 0.1127, -0.0100, 0.6545, 0.0, -1.06506];
+  PLACE_WIDTH: array[0..5] of float64 = [3.4, 0.012, 0.02, 0.008, 0.012, 0.02];
+  // The iterations at the start (the slider's Value in parallel.xml)
+  START_ITERATIONS: int32 = 512;
+
+type
+  // What a render draws: the plane's point at the picture's centre, the plane's size of one
+  // pixel (the y axis points up), and how many steps an orbit gets before it counts as in
+  Viewpoint = record
+    CenterX: float64;
+    CenterY: float64;
+    Scale: float64;
+    Iterations: int32;
+  end;
+
+  // What a render tells its awaiter: how long it ran, on how many workers, the tiles it
+  // finished, and whether cancel stopped it
+  RenderStats = record
+    Milliseconds: int64;
+    Workers: int64;
+    Tiles: int32;
+    Stopped: bool;
+  end;
+
+  // The palettes, in the ComboBox's order (parallel.xml)
+  Palette = choices(Aurora, Ember, Ice, Mono);
+
+  // A race's step: none, the one-worker render running, the all-workers render running
+  RaceStep = choices(Idle, OneWorker, AllWorkers);
+
+var
+  // ---- shared with the workers (module variables are shared, never copied by async) ----
+  // The picture's buffers are plain `array of T`: every worker writes the one buffer, each
+  // into its own tile. A for parallel makes an array its body writes unshared before any
+  // worker starts (copy on write then never copies under the workers), and a write that
+  // still found one shared on a worker would raise, never race (BNF sec 5).
+  // Each pixel's smooth escape value, or SMOOTH_INSIDE / SMOOTH_UNKNOWN. Stored TILE BY
+  // TILE (tile t's 64 x 64 pixels are entries t x 4096 ..), so a tile's rows are one run of
+  // memory: a worker owns its tile's run, and the finished rows go to the texture in one
+  // UpdateTextureRec
+  GSmooth: array of float32;
+  // The picture before the last view change (Reproject reads it while writing GSmooth)
+  GBack: array of float32;
+  // Each tile's finished rows (0 .. TILE_SIZE), written by its worker with atomicstore after
+  // the rows themselves, read by the main thread with atomicload: a row counted is a row done
+  GRows: array[0..129] of int32;
+  // The worker that drew each tile (-1: none yet in this view)
+  GWorker: array[0..129] of int32;
+  // The order the tiles are handed out in: the picture's centre first, then outward
+  GOrder: array[0..129] of int32;
+
+  // ---- the main thread's own ----
+  // Each pixel's colour, laid out as GSmooth; and each tile's rows already coloured and
+  // uploaded
+  GPixels: array of Color;
+  GShown: array[0..129] of int32;
+  GPalette: array[0..1023] of Color;
+  GPaletteKind: Palette;
+  // The palette's roll (0 .. 1 of the way round) and whether it rolls
+  GCycle: float64;
+  GCycling: bool;
+  // Every pixel recoloured and uploaded next frame (a palette change, a view change)
+  GRecolorAll: bool;
+  // The texture the picture lives in, and the view it shows
+  GTexture: Texture2D;
+  GView: Viewpoint;
+  // The render task, whether one runs, and the wall clock since it started
+  GJob: task RenderStats;
+  GRunning: bool;
+  GJobWatch: Stopwatch;
+  // The workers a render asks for (0: as many as the processors)
+  GWorkers: int64;
+  // The race, and the one-worker render's time once it is in
+  GRace: RaceStep;
+  GRaceOneMs: int64;
+  // The mouse: a drag pans; where it was last frame
+  GDragging: bool;
+  GDragLast: Vector2;
+  GShowWorkers: bool;
+  // The widgets the program writes
+  GWindow: Rid;
+  GCanvas: Rid;
+  GWhere: Rid;
+  GProgress: Rid;
+  GProgressText: Rid;
+  GRaceText: Rid;
+  GIterationsText: Rid;
+  GWorkersText: Rid;
+  GPlaces: Rid;
+  GShowWorkersSwitch: Rid;
+  GCycleSwitch: Rid;
+
+// ---------------------------------------------------------------------------
+// The workers' side: the set itself
+// ---------------------------------------------------------------------------
+
+// The smooth escape value of the plane's point (ACx, ACy): how many steps its orbit took to
+// pass BAILOUT, with the fraction the last step was past it (n + 1 - log2(ln |z|)), so the
+// colours run without bands; SMOOTH_INSIDE for a point that stays in AIterations steps
+routine EscapeValue(const ACx: float64; const ACy: float64; const AIterations: int32): float32;
+var
+  LQ: float64;
+  LX: float64;
+  LY: float64;
+  LX2: float64;
+  LY2: float64;
+  LN: int32;
+  LSmooth: float64;
+begin
+  // The two largest parts of the set answer at once: the main cardioid and the period-2
+  // bulb (their points would otherwise run every iteration)
+  LQ := (ACx - 0.25) * (ACx - 0.25) + ACy * ACy;
+  if LQ * (LQ + (ACx - 0.25)) <= 0.25 * ACy * ACy then
+    return SMOOTH_INSIDE;
+  end;
+  if (ACx + 1.0) * (ACx + 1.0) + ACy * ACy <= 0.0625 then
+    return SMOOTH_INSIDE;
+  end;
+  // z := z^2 + c from z = 0, the squares kept for the test and the next step
+  LX := 0.0;
+  LY := 0.0;
+  LX2 := 0.0;
+  LY2 := 0.0;
+  LN := 0;
+  while (LN < AIterations) and (LX2 + LY2 <= BAILOUT) do
+    LY := 2.0 * LX * LY + ACy;
+    LX := LX2 - LY2 + ACx;
+    LX2 := LX * LX;
+    LY2 := LY * LY;
+    LN := LN + 1;
+  end;
+  if LN >= AIterations then
+    return SMOOTH_INSIDE;
+  end;
+  // ln |z| = ln(|z|^2) / 2 (System.Math's Ln and Log2); never below 0, the marks' room
+  LSmooth := float64(LN) + 1.0 - Log2(0.5 * Ln(LX2 + LY2));
+  return float32(Max(LSmooth, 0.0));
+end;
+
+// Tile ATile of the view AView, row by row, into GSmooth; each row published in GRows once
+// written. Stops at the next row once its task is cancelled (`cancelled()` is the flag of
+// the task whose call runs on this thread: the for parallel's workers read it too).
+// Returns true when the whole tile is done.
+routine RenderTile(const AView: Viewpoint; const ATile: int32; const AWorker: int64): bool;
+var
+  LLeft: int32;
+  LTop: int32;
+  LRow: int32;
+  LColumn: int32;
+  LBase: int64;
+  LCx: float64;
+  LCy: float64;
+begin
+  GWorker[ATile] := int32(AWorker);
+  LLeft := (ATile mod TILES_X) * TILE_SIZE;
+  LTop := (ATile div TILES_X) * TILE_SIZE;
+  LBase := int64(ATile) * int64(TILE_PIXELS);
+  for LRow := 0 to TILE_SIZE - 1 do
+    if cancelled() then
+      return false;
+    end;
+    // The plane's y grows upward, the picture's rows downward
+    LCy := AView.CenterY - (float64(LTop + LRow) - HALF_HEIGHT) * AView.Scale;
+    for LColumn := 0 to TILE_SIZE - 1 do
+      LCx := AView.CenterX + (float64(LLeft + LColumn) - HALF_WIDTH) * AView.Scale;
+      GSmooth[LBase + int64(LRow * TILE_SIZE + LColumn)] := EscapeValue(LCx, LCy,
+        AView.Iterations);
+    end;
+    // The row is written: now it counts (atomics are sequentially consistent, so the main
+    // thread that reads this count also sees the row)
+    atomicstore(GRows[ATile], LRow + 1);
+  end;
+  return true;
+end;
+
+// One render, the call a task runs: every tile of AView over AWorkers workers (0: as many
+// as the processors), GOrder's order. A cancel lets no new tile start (`leave`) and stops
+// the tiles running at their next row; the stats say how far it got.
+routine Render(const AView: Viewpoint; const AWorkers: int64): RenderStats;
+var
+  LWatch: Stopwatch;
+  LStats: RenderStats;
+  LDone: int32;
+  LUsed: int64;
+begin
+  LWatch := StartNew();
+  LDone := 0;
+  LUsed := 1;
+  // The body reaches LDone and LUsed by reference, shared by every worker: LDone through
+  // atomicadd, LUsed written by worker 0 alone
+  if AWorkers > 0 then
+    for parallel (AWorkers) LI := 0 to TILE_COUNT - 1 do
+      if workerindex() = 0 then
+        LUsed := workercount();
+      end;
+      if RenderTile(AView, GOrder[LI], workerindex()) then
+        atomicadd(LDone, 1);
+      end;
+      if cancelled() then
+        leave;
+      end;
+    end;
+  else
+    // No count written: the processors' count, never more than the tiles
+    for parallel LI := 0 to TILE_COUNT - 1 do
+      if workerindex() = 0 then
+        LUsed := workercount();
+      end;
+      if RenderTile(AView, GOrder[LI], workerindex()) then
+        atomicadd(LDone, 1);
+      end;
+      if cancelled() then
+        leave;
+      end;
+    end;
+  end;
+  // Past the loop every worker has ended (its barrier)
+  LStats.Milliseconds := LWatch.ElapsedMilliseconds();
+  LStats.Workers := LUsed;
+  LStats.Tiles := LDone;
+  LStats.Stopped := cancelled();
+  return LStats;
+end;
+
+// ---------------------------------------------------------------------------
+// The main thread's side: colours, the texture, the view
+// ---------------------------------------------------------------------------
+
+// The palette AKind as PALETTE_SIZE colours: a cosine palette, colour(t) = A + B x
+// cos(2 pi (C t + D)) per channel (Inigo Quilez's form), each kind its own A, B, C, D
+routine BuildPalette(const AKind: Palette);
+var
+  LKind: int32;
+  LChannel: array[0..2] of uint8;
+  LI: int32;
+  LK: int32;
+  LT: float64;
+  LValue: float64;
+begin
+  // The kind's row of the PALETTE_* tables
+  match AKind of
+    Palette.Aurora:
+      LKind := 0;
+    Palette.Ember:
+      LKind := 1;
+    Palette.Ice:
+      LKind := 2;
+    Palette.Mono:
+      LKind := 3;
+  end;
+  for LI := 0 to PALETTE_SIZE - 1 do
+    LT := float64(LI) / float64(PALETTE_SIZE);
+    for LK := 0 to 2 do
+      LValue := PALETTE_A[LKind * 3 + LK] + PALETTE_B[LKind * 3 + LK] *
+        Cos(2.0 * Pi * (PALETTE_C[LKind * 3 + LK] * LT + PALETTE_D[LKind * 3 + LK]));
+      LChannel[LK] := uint8(Round(System.Math.Clamp(LValue, 0.0, 1.0) * 255.0));
+    end;
+    GPalette[LI] := Color(r: LChannel[0], g: LChannel[1], b: LChannel[2], a: 255);
+  end;
+  GPaletteKind := AKind;
+  GRecolorAll := true;
+end;
+
+// The colour of a smooth value: the marks' own colours, else the palette's entry
+routine Shade(const ASmooth: float32): Color;
+var
+  LT: float64;
+begin
+  if ASmooth = SMOOTH_INSIDE then
+    return INSIDE_COLOR;
+  end;
+  if ASmooth < 0.0f then
+    return UNKNOWN_COLOR;
+  end;
+  LT := Sqrt(float64(ASmooth)) * BAND_SCALE + GCycle;
+  return GPalette[int32(Trunc(LT * float64(PALETTE_SIZE)) mod int64(PALETTE_SIZE))];
+end;
+
+// Rows AFrom .. ATo - 1 of tile ATile coloured into GPixels
+routine ShadeRows(const ATile: int32; const AFrom: int32; const ATo: int32);
+var
+  LIndex: int64;
+  LBase: int64;
+begin
+  LBase := int64(ATile) * int64(TILE_PIXELS);
+  for LIndex := LBase + int64(AFrom * TILE_SIZE) to LBase + int64(ATo * TILE_SIZE) - 1 do
+    GPixels[LIndex] := Shade(GSmooth[LIndex]);
+  end;
+end;
+
+// Rows AFrom .. ATo - 1 of tile ATile from GPixels into the texture: one run of memory
+// (GPixels is laid out tile by tile), one UpdateTextureRec
+routine UploadRows(const ATile: int32; const AFrom: int32; const ATo: int32);
+var
+  LIndex: int64;
+begin
+  if ATo <= AFrom then
+    return;
+  end;
+  LIndex := int64(ATile) * int64(TILE_PIXELS) + int64(AFrom * TILE_SIZE);
+  UpdateTextureRec(GTexture, Rectangle(x: float32((ATile mod TILES_X) * TILE_SIZE),
+    y: float32((ATile div TILES_X) * TILE_SIZE + AFrom), width: float32(TILE_SIZE),
+    height: float32(ATo - AFrom)), addr of GPixels[LIndex]);
+end;
+
+// Each frame: what is new in the picture goes to the texture. After a palette or view
+// change every pixel is recoloured, by a `for parallel` on this thread (it ends once every
+// tile is coloured: its barrier); otherwise only the rows the workers finished since the
+// last frame are coloured and uploaded.
+routine RefreshPicture();
+var
+  LTile: int32;
+  LRows: int32;
+begin
+  if GRecolorAll then
+    GRecolorAll := false;
+    // The rows each tile had before the colouring: a row a worker finishes meanwhile is
+    // coloured again next frame, from its final value
+    for LTile := 0 to TILE_COUNT - 1 do
+      GShown[LTile] := atomicload(GRows[LTile]);
+    end;
+    for parallel LT := 0 to TILE_COUNT - 1 do
+      ShadeRows(int32(LT), 0, TILE_SIZE);
+    end;
+    for LTile := 0 to TILE_COUNT - 1 do
+      UploadRows(LTile, 0, TILE_SIZE);
+    end;
+    return;
+  end;
+  for LTile := 0 to TILE_COUNT - 1 do
+    LRows := atomicload(GRows[LTile]);
+    if LRows > GShown[LTile] then
+      ShadeRows(LTile, GShown[LTile], LRows);
+      UploadRows(LTile, GShown[LTile], LRows);
+      GShown[LTile] := LRows;
+    end;
+  end;
+end;
+
+// The index in GSmooth of the picture's pixel (AX, AY)
+routine PixelIndex(const AX: int32; const AY: int32): int64;
+begin
+  return int64((AY div TILE_SIZE) * TILES_X + AX div TILE_SIZE) * int64(TILE_PIXELS) +
+    int64((AY mod TILE_SIZE) * TILE_SIZE + AX mod TILE_SIZE);
+end;
+
+// GBack and GSmooth swapped: GBack takes the old picture, GSmooth the buffer to write. In
+// a routine of its own so its swap variable lets go before the caller's for parallel
+// starts: each buffer then has its one holder, and the loop's unshare copies nothing
+routine SwapBuffers();
+var
+  LSwap: array of float32;
+begin
+  LSwap := GBack;
+  GBack := GSmooth;
+  GSmooth := LSwap;
+end;
+
+// The old picture (view AOld) moved to where the view ANew puts it, as the new picture's
+// first guess: each pixel takes the old pixel showing the same point of the plane, or
+// SMOOTH_UNKNOWN where the old view did not reach. Every tile at once (`for parallel`).
+// With AClear the guess is blank instead (a race starts from nothing).
+routine Reproject(const AOld: Viewpoint; const ANew: Viewpoint; const AClear: bool);
+begin
+  SwapBuffers();
+  for parallel LT := 0 to TILE_COUNT - 1 do
+    // A var block in the body: each iteration's own
+    var
+      LLeft: int32;
+      LTop: int32;
+      LRow: int32;
+      LColumn: int32;
+      LOldX: float64;
+      LOldY: float64;
+      LIndex: int64;
+    LLeft := (LT mod TILES_X) * TILE_SIZE;
+    LTop := (LT div TILES_X) * TILE_SIZE;
+    LIndex := int64(LT) * int64(TILE_PIXELS);
+    for LRow := 0 to TILE_SIZE - 1 do
+      for LColumn := 0 to TILE_SIZE - 1 do
+        GSmooth[LIndex] := SMOOTH_UNKNOWN;
+        if not AClear then
+          // This pixel's point of the plane in the new view, as a pixel of the old one
+          LOldX := (ANew.CenterX + (float64(LLeft + LColumn) - HALF_WIDTH) * ANew.Scale -
+            AOld.CenterX) / AOld.Scale + HALF_WIDTH;
+          LOldY := (AOld.CenterY - (ANew.CenterY - (float64(LTop + LRow) - HALF_HEIGHT) *
+            ANew.Scale)) / AOld.Scale + HALF_HEIGHT;
+          if (LOldX >= 0.0) and (LOldX < float64(IMAGE_WIDTH)) and (LOldY >= 0.0) and
+            (LOldY < float64(IMAGE_HEIGHT)) then
+            GSmooth[LIndex] := GBack[PixelIndex(int32(Trunc(LOldX)), int32(Trunc(LOldY)))];
+          end;
+        end;
+        LIndex := LIndex + 1;
+      end;
+    end;
+  end;
+end;
+
+// The render running is asked to stop and waited for (its workers stop at their next row,
+// so the wait is short); nothing when none runs. Its stats are returned.
+routine StopRender(): RenderStats;
+var
+  LStats: RenderStats;
+begin
+  if not GRunning then
+    return LStats;
+  end;
+  cancel(GJob);
+  LStats := await GJob;
+  GJob := nil;
+  GRunning := false;
+  return LStats;
+end;
+
+// A render of the view showing starts, as a task: `async` copies its arguments first, so
+// the task has a view of its own whatever the program does to GView meanwhile
+routine StartRender();
+var
+  LView: Viewpoint;
+  LWorkers: int64;
+begin
+  LView := GView;
+  LWorkers := GWorkers;
+  GJobWatch := StartNew();
+  GJob := async Render(LView, LWorkers);
+  GRunning := true;
+end;
+
+// Where the view is, under the title
+routine ShowWhere();
+begin
+  SetWidgetText(GWhere, FormatStr("x {:.10f}   y {:.10f}   zoom {:.0f}x", GView.CenterX,
+    GView.CenterY, (PLACE_WIDTH[0] / float64(IMAGE_WIDTH)) / GView.Scale));
+end;
+
+// The view becomes AView: the render running stops, the picture moves to the new view as
+// its first guess (blank with AClear), every tile starts again from no rows, and the new
+// render starts
+routine ShowView(const AView: Viewpoint; const AClear: bool);
+var
+  LTile: int32;
+  LStopped: RenderStats;
+begin
+  LStopped := StopRender();
+  Reproject(GView, AView, AClear);
+  GView := AView;
+  for LTile := 0 to TILE_COUNT - 1 do
+    atomicstore(GRows[LTile], 0);
+    GWorker[LTile] := -1;
+  end;
+  GRecolorAll := true;
+  ShowWhere();
+  StartRender();
+end;
+
+// The view showing with another centre / scale / iterations
+routine ViewAt(const ACenterX: float64; const ACenterY: float64; const AScale: float64): Viewpoint;
+var
+  LView: Viewpoint;
+begin
+  LView := GView;
+  LView.CenterX := ACenterX;
+  LView.CenterY := ACenterY;
+  // Never wider than the whole set, never deeper than float64's digits
+  LView.Scale := System.Math.Clamp(AScale, DEEPEST_SCALE, WIDEST_SCALE);
+  return LView;
+end;
+
+// Zoom by AFactor (below 1: in) keeping the plane's point under the picture's pixel (AX, AY)
+// where it is
+routine ZoomAt(const AX: float64; const AY: float64; const AFactor: float64);
+var
+  LPointX: float64;
+  LPointY: float64;
+  LView: Viewpoint;
+begin
+  LPointX := GView.CenterX + (AX - HALF_WIDTH) * GView.Scale;
+  LPointY := GView.CenterY - (AY - HALF_HEIGHT) * GView.Scale;
+  LView := ViewAt(LPointX, LPointY, GView.Scale * AFactor);
+  // The centre moves so that the point stays under the pixel at the clamped scale
+  LView.CenterX := LPointX - (AX - HALF_WIDTH) * LView.Scale;
+  LView.CenterY := LPointY + (AY - HALF_HEIGHT) * LView.Scale;
+  ShowView(LView, false);
+end;
+
+// Place AIndex of the list
+routine GoToPlace(const AIndex: int32);
+begin
+  ShowView(ViewAt(PLACE_X[AIndex], PLACE_Y[AIndex], PLACE_WIDTH[AIndex] / float64(IMAGE_WIDTH)),
+    false);
+end;
+
+// ---------------------------------------------------------------------------
+// The UI
+// ---------------------------------------------------------------------------
+
+routine Find(const AName: string): Rid;
+begin
+  return FindWidget(GWindow, AName);
+end;
+
+// A worker's colour: hues spread round the wheel, so neighbours differ
+routine WorkerColor(const AWorker: int32): Color;
+begin
+  return ColorFromHSV(float32((AWorker * 137) mod 360), 0.65f, 1.0f);
+end;
+
+// A time in milliseconds as seconds, `1.234 s`
+routine Seconds(const AMilliseconds: int64): string;
+begin
+  return FormatStr("{:.3f} s", float64(AMilliseconds) / 1000.0);
+end;
+
+// The workers asked for, as the UI says it
+routine WorkersName(const AWorkers: int64): string;
+begin
+  if AWorkers <= 0 then
+    return "all";
+  end;
+  if AWorkers = 1 then
+    return "1 worker";
+  end;
+  return FormatStr("{} workers", AWorkers);
+end;
+
+
+// A render that ended (its stats from await): the status line, and the race's next step
+routine RenderEnded(const AStats: RenderStats);
+begin
+  if AStats.Stopped then
+    SetWidgetText(GProgressText, FormatStr("cancelled: {} of {} tiles in {} on {}", AStats.Tiles,
+      TILE_COUNT, Seconds(AStats.Milliseconds), WorkersName(AStats.Workers)));
+    GRace := RaceStep.Idle;
+    return;
+  end;
+  SetWidgetText(GProgressText, FormatStr("{} tiles in {} on {}", AStats.Tiles,
+    Seconds(AStats.Milliseconds), WorkersName(AStats.Workers)));
+  match GRace of
+    RaceStep.OneWorker:
+      // One worker's time is in: now every worker, from a blank picture again
+      GRaceOneMs := Max(AStats.Milliseconds, int64(1));
+      SetWidgetText(GRaceText, FormatStr("Race: 1 worker {}, now all of them ..",
+        Seconds(GRaceOneMs)));
+      GRace := RaceStep.AllWorkers;
+      GWorkers := 0;
+      ShowView(GView, true);
+      GWorkers := int64(Rslider_get_value(Find("workers")));
+    RaceStep.AllWorkers:
+      SetWidgetText(GRaceText, FormatStr("Race: 1 worker {}, {} {}: {:.1f}x faster",
+        Seconds(GRaceOneMs), WorkersName(AStats.Workers), Seconds(AStats.Milliseconds),
+        float64(GRaceOneMs) / float64(Max(AStats.Milliseconds, int64(1)))));
+      GRace := RaceStep.Idle;
+    RaceStep.Idle:
+      GRace := RaceStep.Idle;
+  end;
+end;
+
+// Each frame: a render that ended is awaited (ready says so without waiting); the progress
+// bar and line follow the one running
+routine UpdateProgress();
+var
+  LTile: int32;
+  LRows: int64;
+  LDone: int32;
+  LWorkers: int32;
+  LStats: RenderStats;
+begin
+  if GRunning and ready(GJob) then
+    // The handle is let go before RenderEnded, which may start the next render (a race)
+    LStats := await GJob;
+    GJob := nil;
+    GRunning := false;
+    RenderEnded(LStats);
+  end;
+  LRows := 0;
+  LDone := 0;
+  LWorkers := 0;
+  for LTile := 0 to TILE_COUNT - 1 do
+    LRows := LRows + int64(atomicload(GRows[LTile]));
+    if atomicload(GRows[LTile]) = TILE_SIZE then
+      LDone := LDone + 1;
+    end;
+    LWorkers := Max(LWorkers, GWorker[LTile] + 1);
+  end;
+  Rprogress_bar_set_value(GProgress, float32(LRows) / float32(TILE_COUNT * TILE_SIZE));
+  if GRunning then
+    SetWidgetText(GProgressText, FormatStr("{} of {} tiles - {} workers - {}", LDone, TILE_COUNT,
+      LWorkers, Seconds(GJobWatch.ElapsedMilliseconds())));
+  end;
+end;
+
+// The mouse over the picture: the wheel zooms where it points, a left drag pans (the
+// picture follows at once: ShowView moves the old one), a right click zooms out
+routine HandleMouse();
+var
+  LX: float32;
+  LY: float32;
+  LWidth: float32;
+  LHeight: float32;
+  LMouse: Vector2;
+  LInside: bool;
+  LWheel: float32;
+  LPixelX: float64;
+  LPixelY: float64;
+begin
+  // The Image's place in the window, in base units (the frame's, as the mouse is)
+  Rwidget_get_rect(GCanvas, addr of LX, addr of LY, addr of LWidth, addr of LHeight);
+  if (LWidth <= 0.0f) or (LHeight <= 0.0f) then
+    return;
+  end;
+  LMouse := GetFrameMousePosition();
+  LInside := (LMouse.x >= LX) and (LMouse.x < LX + LWidth) and (LMouse.y >= LY) and
+    (LMouse.y < LY + LHeight);
+  // The mouse as a pixel of the picture (the Image may be drawn at another size)
+  LPixelX := float64((LMouse.x - LX) / LWidth) * float64(IMAGE_WIDTH);
+  LPixelY := float64((LMouse.y - LY) / LHeight) * float64(IMAGE_HEIGHT);
+  LWheel := GetMouseWheelMove();
+  if LInside and (LWheel <> 0.0f) then
+    ZoomAt(LPixelX, LPixelY, Power(WHEEL_ZOOM, float64(LWheel)));
+  end;
+  if LInside and IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) then
+    ZoomAt(LPixelX, LPixelY, CLICK_ZOOM_OUT);
+  end;
+  if LInside and IsMouseButtonPressed(MOUSE_BUTTON_LEFT) then
+    GDragging := true;
+    GDragLast := LMouse;
+  end;
+  if GDragging then
+    if not IsMouseButtonDown(MOUSE_BUTTON_LEFT) then
+      GDragging := false;
+    end;
+    if GDragging and ((LMouse.x <> GDragLast.x) or (LMouse.y <> GDragLast.y)) then
+      // The plane moves with the mouse: left by the pixels it went right, up as it went down
+      ShowView(ViewAt(GView.CenterX - float64((LMouse.x - GDragLast.x) / LWidth) *
+        float64(IMAGE_WIDTH) * GView.Scale, GView.CenterY + float64((LMouse.y - GDragLast.y) /
+        LHeight) * float64(IMAGE_HEIGHT) * GView.Scale, GView.Scale), false);
+      GDragLast := LMouse;
+    end;
+  end;
+end;
+
+// Over the picture, after Raven drew it: each tile's state. A tile waiting is veiled; one
+// being painted shows its worker's outline and scan line; with "Who drew it" every drawn
+// tile carries its worker's tint and number.
+routine DrawTiles();
+var
+  LX: float32;
+  LY: float32;
+  LWidth: float32;
+  LHeight: float32;
+  LCell: float32;
+  LTile: int32;
+  LRows: int32;
+  LWorker: int32;
+  LLeft: float32;
+  LTop: float32;
+  LText: ptr to char;
+begin
+  Rwidget_get_rect(GCanvas, addr of LX, addr of LY, addr of LWidth, addr of LHeight);
+  LCell := LWidth / float32(TILES_X);
+  for LTile := 0 to TILE_COUNT - 1 do
+    LRows := atomicload(GRows[LTile]);
+    LWorker := GWorker[LTile];
+    LLeft := LX + float32(LTile mod TILES_X) * LCell;
+    LTop := LY + float32(LTile div TILES_X) * LCell;
+    if GRunning and (LRows = 0) then
+      DrawRectangleRec(Rectangle(x: LLeft, y: LTop, width: LCell, height: LCell),
+        Color(r: 4, g: 6, b: 14, a: 110));
+    end;
+    if GRunning and (LRows > 0) and (LRows < TILE_SIZE) and (LWorker >= 0) then
+      DrawRectangleLinesEx(Rectangle(x: LLeft, y: LTop, width: LCell, height: LCell), 1.5f,
+        WorkerColor(LWorker));
+      DrawRectangleRec(Rectangle(x: LLeft, y: LTop + LCell * float32(LRows) / float32(TILE_SIZE)
+        - 1.0f, width: LCell, height: 2.0f), WorkerColor(LWorker));
+    end;
+    if GShowWorkers and (LWorker >= 0) then
+      DrawRectangleRec(Rectangle(x: LLeft, y: LTop, width: LCell, height: LCell),
+        ColorAlpha(WorkerColor(LWorker), 0.30f));
+      LText := StringToC(IntToStr(LWorker));
+      DrawText(LText, int32(LLeft) + 4, int32(LTop) + 3, 10, WHITE);
+      freemem(LText);
+    end;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// The actions: one routine per name parallel.xml uses
+// ---------------------------------------------------------------------------
+
+routine DoRender(const ASender: Rid);
+begin
+  GRace := RaceStep.Idle;
+  ShowView(GView, false);
+end;
+
+routine DoCancel(const ASender: Rid);
+begin
+  // cancel(T) only sets the task's flag; the frame's UpdateProgress sees it end and awaits it
+  if GRunning then
+    cancel(GJob);
+  end;
+end;
+
+routine DoRace(const ASender: Rid);
+begin
+  GRace := RaceStep.OneWorker;
+  SetWidgetText(GRaceText, "Race: 1 worker ..");
+  GWorkers := 1;
+  ShowView(GView, true);
+  GWorkers := int64(Rslider_get_value(Find("workers")));
+end;
+
+routine DoReset(const ASender: Rid);
+begin
+  Rlist_view_set_selected(GPlaces, 0);
+  GoToPlace(0);
+end;
+
+routine DoIterations(const ASender: Rid);
+var
+  LView: Viewpoint;
+begin
+  LView := GView;
+  LView.Iterations := int32(Rslider_get_value(ASender));
+  SetWidgetText(GIterationsText, IntToStr(LView.Iterations));
+  ShowView(LView, false);
+end;
+
+routine DoWorkers(const ASender: Rid);
+begin
+  GWorkers := int64(Rslider_get_value(ASender));
+  SetWidgetText(GWorkersText, WorkersName(GWorkers));
+end;
+
+routine DoShowWorkers(const ASender: Rid);
+begin
+  GShowWorkers := Rcheckbox_is_checked(ASender) <> 0;
+end;
+
+// The W key: the switch flipped as a click would (then its own action applies it)
+routine DoShowWorkersKey(const ASender: Rid);
+begin
+  if Rcheckbox_is_checked(GShowWorkersSwitch) <> 0 then
+    Rcheckbox_set_checked(GShowWorkersSwitch, 0);
+  else
+    Rcheckbox_set_checked(GShowWorkersSwitch, 1);
+  end;
+  DoShowWorkers(GShowWorkersSwitch);
+end;
+
+routine DoCycle(const ASender: Rid);
+begin
+  GCycling := Rcheckbox_is_checked(ASender) <> 0;
+end;
+
+// The P key: the switch flipped as a click would
+routine DoCycleKey(const ASender: Rid);
+begin
+  if Rcheckbox_is_checked(GCycleSwitch) <> 0 then
+    Rcheckbox_set_checked(GCycleSwitch, 0);
+  else
+    Rcheckbox_set_checked(GCycleSwitch, 1);
+  end;
+  DoCycle(GCycleSwitch);
+end;
+
+routine DoPalette(const ASender: Rid);
+begin
+  match Rcombo_box_get_selected(ASender) of
+    1: BuildPalette(Palette.Ember);
+    2: BuildPalette(Palette.Ice);
+    3: BuildPalette(Palette.Mono);
+  else
+    BuildPalette(Palette.Aurora);
+  end;
+end;
+
+// Every action name parallel.xml fires, each bound to the routine answering it
+routine BindActions();
+begin
+  BindAction("parallel.render", DoRender);
+  BindAction("parallel.cancel", DoCancel);
+  BindAction("parallel.race", DoRace);
+  BindAction("parallel.reset", DoReset);
+  BindAction("parallel.iterations", DoIterations);
+  BindAction("parallel.workers", DoWorkers);
+  BindAction("parallel.show_workers", DoShowWorkers);
+  BindAction("parallel.workers.key", DoShowWorkersKey);
+  BindAction("parallel.cycle", DoCycle);
+  BindAction("parallel.cycle.key", DoCycleKey);
+  BindAction("parallel.palette", DoPalette);
+end;
+
+// Raven's list selection callback (a C callback: `clink`): picking a place goes there
+routine clink OnPlaceSelected(list_view: Rid; index: int32; user_data: ptr);
+begin
+  if (index >= 0) and (index < PLACE_COUNT) then
+    GoToPlace(index);
+  end;
+end;
+
+// The tiles' order: by their centre's distance from the picture's centre, nearest first
+// (an insertion sort: 130 tiles, once)
+routine OrderTiles();
+var
+  LDistance: array[0..129] of float64;
+  LI: int32;
+  LJ: int32;
+  LTile: int32;
+  LDX: float64;
+  LDY: float64;
+begin
+  for LI := 0 to TILE_COUNT - 1 do
+    LDX := float64((LI mod TILES_X) * TILE_SIZE + TILE_SIZE div 2) - HALF_WIDTH;
+    LDY := float64((LI div TILES_X) * TILE_SIZE + TILE_SIZE div 2) - HALF_HEIGHT;
+    LDistance[LI] := LDX * LDX + LDY * LDY;
+    LTile := LI;
+    LJ := LI;
+    while (LJ > 0) and (LDistance[GOrder[LJ - 1]] > LDistance[LTile]) do
+      GOrder[LJ] := GOrder[LJ - 1];
+      LJ := LJ - 1;
+    end;
+    GOrder[LJ] := LTile;
+  end;
+end;
+
+routine Run(): int32;
+var
+  LAssets: IOSource;
+  LBlank: Image;
+  LRavenTexture: Rid;
+  LI: int32;
+  LText: ptr to char;
+  LLast: bool;
+begin
+  // The shared assets as the program's files: Raven's layout and themes are entries of
+  // bin\assets.zip (Examples.Common)
+  LAssets := OpenAssets();
+  if LAssets = nil then
+    return 1;
+  end;
+  defer CloseAssets(LAssets);
+
+  // The DPI-scaled frame window (AV.12): the base size x the monitor's scale
+  if not OpenExampleWindow(BASE_WIDTH, BASE_HEIGHT, "Adam - Raven parallel") then
+    return 1;
+  end;
+  defer CloseExampleWindow();
+  SetFrameColor(ROOM_FOOT);
+
+  // Raven in raylib's window, its errors on the console, the example themes loaded, Aurora in use
+  if not StartRaven("raven_parallel") then
+    return 1;
+  end;
+  defer CloseRaven();
+  GWindow := LoadWindow(CONTROLS_XML);
+  if GWindow = R_INVALID_ID then
+    return 1;
+  end;
+  GCanvas := Find("canvas");
+  GWhere := Find("where");
+  GProgress := Find("progress");
+  GProgressText := Find("progress_text");
+  GRaceText := Find("race_text");
+  GIterationsText := Find("iterations_text");
+  GWorkersText := Find("workers_text");
+  GPlaces := Find("places");
+  GShowWorkersSwitch := Find("show_workers");
+  GCycleSwitch := Find("cycle");
+  BindActions();
+
+  // The picture's buffers (the first ShowView writes every pixel before anything reads one)
+  setlength(GSmooth, IMAGE_PIXELS);
+  setlength(GBack, IMAGE_PIXELS);
+  setlength(GPixels, IMAGE_PIXELS);
+  // The texture, blank
+  LBlank := GenImageColor(IMAGE_WIDTH, IMAGE_HEIGHT, UNKNOWN_COLOR);
+  GTexture := LoadTextureFromImage(LBlank);
+  UnloadImage(LBlank);
+  defer UnloadTexture(GTexture);
+  // Smoothed when the frame scales it up for the monitor
+  SetTextureFilter(GTexture, TEXTURE_FILTER_BILINEAR);
+  // The texture inside the layout's Image: Raven draws raylib's texture as it is
+  LRavenTexture := CreateRavenTexture(GTexture);
+  Rimage_set_texture(GCanvas, LRavenTexture);
+  Rimage_set_stretch(GCanvas, R_STRETCH_FILL);
+
+  // The places in the list; the first view; the palette
+  for LI := 0 to PLACE_COUNT - 1 do
+    LText := StringToC(PLACE_NAMES[LI]);
+    Rlist_view_add_item(GPlaces, LText);
+    freemem(LText);
+  end;
+  OrderTiles();
+  BuildPalette(Palette.Aurora);
+  GWorkers := 0;
+  GView.Iterations := START_ITERATIONS;
+  GView.CenterX := PLACE_X[0];
+  GView.CenterY := PLACE_Y[0];
+  GView.Scale := PLACE_WIDTH[0] / float64(IMAGE_WIDTH);
+  // The render task is stopped before the texture, Raven and the window go (defers run in
+  // reverse); the program's exit would wait for it anyway, the cancel makes that quick
+  defer StopRender();
+  Rlist_view_set_selected(GPlaces, 0);
+  // The first view from a blank picture (there is no old one to move)
+  ShowView(GView, true);
+  Rlist_view_set_selection_changed_callback(GPlaces, OnPlaceSelected, nil);
+
+  // The loop runs until the window is closed; that last frame is still drawn, and saved as the
+  // example's snapshot (raven_parallel.png beside this file) before it is shown
+  LLast := false;
+  while not LLast do
+    LLast := WindowShouldClose();
+    // Raven first: the clicks and keys of this frame run their actions
+    UpdateRaven(GWindow);
+    HandleMouse();
+    UpdateProgress();
+    if GCycling then
+      GCycle := GCycle + CYCLE_SPEED * float64(GetFrameTime());
+      GCycle := GCycle - float64(Floor(GCycle));
+      GRecolorAll := true;
+    end;
+    RefreshPicture();
+    BeginDrawing();
+    BeginFrame();
+    // The room, then the cards over it (base units)
+    DrawRectangleGradientV(0, 0, BASE_WIDTH, BASE_HEIGHT, ROOM_TOP, ROOM_FOOT);
+    DrawRaven(GWindow);
+    DrawTiles();
+    EndFrame();
+    // The back buffer holds the finished frame until EndDrawing shows it (Examples.Common)
+    if LLast then
+      SaveExampleSnapshot(SNAPSHOT_NAME);
+    end;
+    EndDrawing();
+  end;
+  return 0;
+end;
+
+begin
+  return Run();
+end.
