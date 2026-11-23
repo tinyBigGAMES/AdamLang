@@ -96,6 +96,19 @@
   (XmlFinding: Line, Column, Message, IsWarning) instead of stopping at
   the first.
 
+  Stream (documents too big to hold whole): XmlReader.FromFile / FromString
+  / FromIO pull one node at a time (Read / Skip; Kind, Name, Value, Depth,
+  the attributes as Get / TryGet / Has; ReadInnerXml / ReadOuterXml;
+  ReadSubtree copies the element it is on into an Xml of its own).
+  XmlWriter.ToFile / ToIO / ToText write start tag by start tag
+  (StartDocument, StartElement, WriteAttribute, WriteText, EndElement ...,
+  Close), calls chained, the first failure kept in ErrorText.
+
+  Canonical XML: ToCanonical / SaveCanonicalToFile / SaveCanonicalToIO
+  write a node and everything below it (the document node: all of it) as
+  C14N 1.0, Exclusive C14N or C14N 1.1 (XmlCanonicalForm), comments kept
+  or not: one exact byte form, for comparing and signing documents.
+
   The file form goes through libxml2's own C file calls (open / _wopen),
   never System.IO: with System.HookIO imported, an io://<n>/<name> path
   (a registered IO, a .rez / zip entry) or a path a path source holds reads
@@ -161,6 +174,11 @@ const
   ADAM_XML_MSG_NO_SCHEMA: string = "the schema cannot be compiled";
   ADAM_XML_MSG_SCHEMA_INVALID: string = "the schema did not compile: ";
   ADAM_XML_MSG_NO_DOCUMENT: string = "no document to validate";
+  // What a writer reports when libxml2 gives no reason, and the names its errors carry
+  ADAM_XML_MSG_WRITE_FAILED: string = "the XML cannot be written";
+  ADAM_XML_MSG_CREATE_FAILED: string = "the file cannot be created";
+  // The indent a pretty writer writes per level
+  ADAM_XML_INDENT: string = "  ";
 
 type
   // What a parse's error handler keeps: the first error; until one comes, the first warning
@@ -331,6 +349,63 @@ end;
 routine DoAttributeValue(const AAttr: ptr to xmlAttr): string;
 begin
   return DoTakeText(xmlNodeGetContent(ptr to xmlNode(ptr(AAttr))));
+end;
+
+// AText (spaces around it allowed) as an int64 into AValue; false when it is no whole number
+// (AValue unchanged)
+routine DoTextInt64(const AText: string; var AValue: int64): bool;
+var
+  LValue: int64;
+begin
+  if not TryStrToInt(Trim(AText), LValue) then
+    return false;
+  end;
+  AValue := LValue;
+  return true;
+end;
+
+// AText as an int32 into AValue; false when it is no whole number in int32's range
+routine DoTextInt32(const AText: string; var AValue: int32): bool;
+var
+  LValue: int64;
+begin
+  if not DoTextInt64(AText, LValue) then
+    return false;
+  end;
+  if (LValue < ADAM_XML_INT32_MIN) or (LValue > ADAM_XML_INT32_MAX) then
+    return false;
+  end;
+  AValue := int32(LValue);
+  return true;
+end;
+
+// AText as a float64 into AValue; false when it is no number
+routine DoTextFloat64(const AText: string; var AValue: float64): bool;
+var
+  LValue: float64;
+begin
+  if not TryStrToFloat(Trim(AText), LValue) then
+    return false;
+  end;
+  AValue := LValue;
+  return true;
+end;
+
+// AText as a bool into AValue (true / 1, false / 0); false when it is neither
+routine DoTextBool(const AText: string; var AValue: bool): bool;
+var
+  LText: string;
+begin
+  LText := Trim(AText);
+  if (LText = ADAM_XML_TRUE) or (LText = "1") then
+    AValue := true;
+    return true;
+  end;
+  if (LText = ADAM_XML_FALSE) or (LText = "0") then
+    AValue := false;
+    return true;
+  end;
+  return false;
 end;
 
 // -- Reading
@@ -579,6 +654,17 @@ public type
 
 // -- Reading a document (Xml's reads and XmlSchema's share these)
 
+// The name an error in AState carries for a document read as AName from the URL AUrl ("" for
+// a text / an IO): an error inside an included document names that document; one in the
+// document itself (an XInclude element's included) names AName
+routine DoErrorName(const AName: string; const AUrl: string; const AState: XmlReadState): string;
+begin
+  if (len(AState.File) > 0) and (AState.File <> AUrl) then
+    return AState.File;
+  end;
+  return AName;
+end;
+
 // The XInclude elements of ADoc (read as AName from the URL AUrl; "" for a text / an IO)
 // replaced by what they include, read through DoLoadResource as the document was; false with
 // AError set ("AName(line): message", the included document's own name when the error is in
@@ -589,7 +675,6 @@ var
   LState: XmlReadState;
   LContext: ptr to xmlXIncludeCtxt;
   LCount: int32;
-  LName: string;
 begin
   LContext := xmlXIncludeNewContext(ADoc);
   if LContext = nil then
@@ -605,13 +690,7 @@ begin
   if LCount >= 0 then
     return true;
   end;
-  // An error inside an included document names that document; one at an XInclude element
-  // (a target that cannot be read, a bad href) names the document read
-  LName := AName;
-  if (len(LState.File) > 0) and (LState.File <> AUrl) then
-    LName := LState.File;
-  end;
-  AError := DoReadError(LName, LState, ADAM_XML_MSG_OPEN_FAILED);
+  AError := DoReadError(DoErrorName(AName, AUrl, LState), LState, ADAM_XML_MSG_OPEN_FAILED);
   return false;
 end;
 
@@ -1023,6 +1102,120 @@ begin
   end;
 end;
 
+// -- Streaming and canonical output
+
+type
+  // An open pull reader, shared by every copy of one XmlReader
+  XmlReaderCode = object
+    Reader: ptr to xmlTextReader;
+    // The input it reads (libxml2's reader does not own an input it is given)
+    Input: ptr to xmlParserInputBuffer;
+    // A text reader's text (read in place) and an IO reader's IO (the caller's), kept while
+    // it reads
+    Text: string;
+    Source: IO;
+    // The name its errors carry, and the URL libxml2 names the document by ("" for a text /
+    // an IO)
+    Name: string;
+    Url: string;
+    // What its error handler kept: the first error (the first warning until one comes)
+    State: XmlReadState;
+    // Why it failed ("" while it has not)
+    Error: string;
+
+    done;
+    begin
+      if self.Reader <> nil then
+        xmlFreeTextReader(self.Reader);
+      end;
+      if self.Input <> nil then
+        xmlFreeParserInputBuffer(self.Input);
+      end;
+    end;
+  end;
+
+  // An open streaming writer, shared by every copy of one XmlWriter
+  XmlWriterCode = object
+    // nil once closed (freeing it flushes and closes its output)
+    Writer: ptr to xmlTextWriter;
+    // A text writer's buffer (the writer does not own it)
+    Memory: ptr to xmlBuffer;
+    // The name its errors carry (the path, "<io>", "<text>")
+    Name: string;
+    // What this thread's libxml2 reports said during the last call
+    State: XmlReadState;
+    // Why it failed ("" while it has not)
+    Error: string;
+
+    done;
+    begin
+      if self.Writer <> nil then
+        xmlFreeTextWriter(self.Writer);
+      end;
+      if self.Memory <> nil then
+        xmlBufferFree(self.Memory);
+      end;
+    end;
+  end;
+
+// libxml2's C14N visibility test: a node is written when it is the subtree's top node
+// (AUserData) or below it; a namespace node (an xmlNs: its type sits where a node's does) by
+// the element it is in scope on (AParent)
+routine clink DoC14NVisible(AUserData: ptr; ANode: ptr to xmlNode;
+  AParent: ptr to xmlNode): int32;
+var
+  LTop: ptr to xmlNode;
+  LNode: ptr to xmlNode;
+begin
+  LTop := ptr to xmlNode(AUserData);
+  LNode := ANode;
+  if (LNode = nil) or (LNode^.type_ = XML_NAMESPACE_DECL) then
+    LNode := AParent;
+  end;
+  while LNode <> nil do
+    if LNode = LTop then
+      return 1;
+    end;
+    LNode := LNode^.parent_;
+  end;
+  return 0;
+end;
+
+// ACode's reader over AInput (nil: it could not be opened, AOpenFailed why), AOptions applied,
+// reporting to ACode.State and loading through DoLoadResource; ACode.Error set when it cannot
+// start
+routine DoOpenReader(const ACode: ref XmlReaderCode; const AInput: ptr to xmlParserInputBuffer;
+  const AOptions: XmlReadOptions; const AOpenFailed: string);
+var
+  LUrl: ptr to char;
+  LFlags: int32;
+begin
+  if AInput = nil then
+    ACode.Error := ACode.Name + ": " + AOpenFailed;
+    return;
+  end;
+  ACode.Input := AInput;
+  LUrl := nil;
+  if len(ACode.Url) > 0 then
+    LUrl := StringToC(ACode.Url);
+  end;
+  ACode.Reader := xmlNewTextReader(AInput, ptr to const char(LUrl));
+  LFlags := ADAM_XML_READ_OPTIONS;
+  if XmlReadOption.XInclude in AOptions then
+    LFlags := LFlags | XML_PARSE_XINCLUDE | XML_PARSE_NOXINCNODE;
+  end;
+  // No input given: the reader keeps the one it has and takes the options
+  if (ACode.Reader = nil) or
+    (xmlTextReaderSetup(ACode.Reader, nil, ptr to const char(LUrl), nil, LFlags) < 0) then
+    DoFreeChars(LUrl);
+    ACode.Error := ACode.Name + ": " + ADAM_XML_MSG_NO_ROOM;
+    return;
+  end;
+  DoFreeChars(LUrl);
+  xmlTextReaderSetStructuredErrorHandler(ACode.Reader, DoOnError, ptr(addr of ACode.State));
+  xmlTextReaderSetResourceLoader(ACode.Reader, DoLoadResource, nil);
+end;
+
 public forward type Xml;
 public forward type XmlAttribute;
 
@@ -1030,6 +1223,17 @@ public type
   // What a node is
   XmlKind = choices(Missing, Element, Text, CData, Comment, Instruction, EntityReference,
     Attribute, Namespace, Document, Other);
+
+  /// The canonical XML form ToCanonical / SaveCanonicalToFile / SaveCanonicalToIO write:
+  /// Canonical XML 1.0 (C14N), Exclusive XML Canonicalization 1.0 (namespaces only where
+  /// they are used, as XML signatures sign a part of a document) or Canonical XML 1.1.
+  XmlCanonicalForm = choices(C14N, ExclusiveC14N, C14N11);
+
+  /// What an XmlReader is on: the node Read moved to (EndElement: an element's end tag;
+  /// Whitespace: blank text that is kept, as xml:space="preserve" asks). None before the
+  /// first Read and after the last.
+  XmlReaderNode = choices(None, Element, EndElement, Text, CData, Comment, Instruction,
+    Whitespace, DocumentType, EntityReference, Other);
 
   /// A compiled XPath 1.0 expression with the namespace prefixes and $variables it binds:
   /// compiled once (XmlPath.Compile), run on any node of any document any number of times
@@ -2116,32 +2320,23 @@ public type
     const method TryGet(const AName: string; var AValue: int64): bool;
     var
       LText: string;
-      LValue: int64;
     begin
       if not self.TryGet(AName, LText) then
         return false;
       end;
-      if not TryStrToInt(Trim(LText), LValue) then
-        return false;
-      end;
-      AValue := LValue;
-      return true;
+      return DoTextInt64(LText, AValue);
     end;
 
     // The attribute AName as an int32 into AValue; false when there is none or it is no
     // whole number in int32's range (AValue unchanged)
     const method TryGet(const AName: string; var AValue: int32): bool;
     var
-      LValue: int64;
+      LText: string;
     begin
-      if not self.TryGet(AName, LValue) then
+      if not self.TryGet(AName, LText) then
         return false;
       end;
-      if (LValue < ADAM_XML_INT32_MIN) or (LValue > ADAM_XML_INT32_MAX) then
-        return false;
-      end;
-      AValue := int32(LValue);
-      return true;
+      return DoTextInt32(LText, AValue);
     end;
 
     // The attribute AName as a float64 into AValue; false when there is none or it is no
@@ -2149,16 +2344,11 @@ public type
     const method TryGet(const AName: string; var AValue: float64): bool;
     var
       LText: string;
-      LValue: float64;
     begin
       if not self.TryGet(AName, LText) then
         return false;
       end;
-      if not TryStrToFloat(Trim(LText), LValue) then
-        return false;
-      end;
-      AValue := LValue;
-      return true;
+      return DoTextFloat64(LText, AValue);
     end;
 
     // The attribute AName as a bool into AValue (true / 1, false / 0); false when there is
@@ -2170,16 +2360,7 @@ public type
       if not self.TryGet(AName, LText) then
         return false;
       end;
-      LText := Trim(LText);
-      if (LText = "true") or (LText = "1") then
-        AValue := true;
-        return true;
-      end;
-      if (LText = "false") or (LText = "0") then
-        AValue := false;
-        return true;
-      end;
-      return false;
+      return DoTextBool(LText, AValue);
     end;
 
     // How many attributes the element has (0 for any other node)
@@ -3317,12 +3498,1181 @@ public type
       DoFreeChars(LEncoding);
       return LOk;
     end;
+
+    // -- Canonical XML (C14N: one exact byte form of a node and everything below it)
+
+    // The canonical form of this node and everything below it written to ABuffer (left open;
+    // nil: nothing); false on a failure
+    hidden const method DoCanonical(const ABuffer: ptr to xmlOutputBuffer;
+      const AForm: XmlCanonicalForm; const AWithComments: bool): bool;
+    var
+      LState: XmlReadState;
+      LMode: int32;
+      LResult: int32;
+    begin
+      if (ABuffer = nil) or (self.Node = nil) then
+        return false;
+      end;
+      LMode := XML_C14N_1_0;
+      if AForm = XmlCanonicalForm.ExclusiveC14N then
+        LMode := XML_C14N_EXCLUSIVE_1_0;
+      end;
+      if AForm = XmlCanonicalForm.C14N11 then
+        LMode := XML_C14N_1_1;
+      end;
+      // libxml2's C14N has no error handler of its own: this thread's takes its reports
+      xmlSetStructuredErrorFunc(ptr(addr of LState), DoOnError);
+      LResult := xmlC14NExecute(self.Tree.Doc, DoC14NVisible, ptr(self.Node), LMode, nil,
+        DoFormat(AWithComments), ABuffer);
+      xmlSetStructuredErrorFunc(nil, nil);
+      return LResult >= 0;
+    end;
+
+    /// This node and everything below it as Canonical XML 1.0, comments left out (the
+    /// document's Root().Parent() gives the whole document).
+    /// @returns the canonical text (UTF-8); "" for a missing value or a namespace node
+    /// @example `if LA.ToCanonical() = LB.ToCanonical() then println("same XML"); end;`
+    const method ToCanonical(): string;
+    begin
+      return self.ToCanonical(XmlCanonicalForm.C14N, false);
+    end;
+
+    /// This node and everything below it in the canonical form AForm.
+    /// @param AForm C14N, ExclusiveC14N or C14N11
+    /// @param AWithComments whether comments are kept
+    /// @returns the canonical text (UTF-8); "" for a missing value or when it cannot be made
+    /// @example `LSigned := LBody.ToCanonical(XmlCanonicalForm.ExclusiveC14N, false);`
+    const method ToCanonical(const AForm: XmlCanonicalForm; const AWithComments: bool): string;
+    var
+      LBuffer: ptr to xmlOutputBuffer;
+      LSize: uint64;
+      LResult: string;
+    begin
+      LResult := "";
+      LBuffer := xmlAllocOutputBuffer(nil);
+      if self.DoCanonical(LBuffer, AForm, AWithComments) then
+        LSize := xmlOutputBufferGetSize(LBuffer);
+        if LSize > 0 then
+          LResult := StringFromC(ptr to const char(xmlOutputBufferGetContent(LBuffer)),
+            int64(LSize));
+        end;
+      end;
+      if LBuffer <> nil then
+        xmlOutputBufferClose(LBuffer);
+      end;
+      return LResult;
+    end;
+
+    /// Writes this node and everything below it as Canonical XML 1.0 to the file APath,
+    /// through C's file calls (a HookIO path writes its IO).
+    /// @param APath the file
+    /// @returns false for a missing value or when it cannot be written
+    /// @example `LDoc.Root().Parent().SaveCanonicalToFile("signed.xml");`
+    const method SaveCanonicalToFile(const APath: string): bool;
+    begin
+      return self.SaveCanonicalToFile(APath, XmlCanonicalForm.C14N, false);
+    end;
+
+    /// SaveCanonicalToFile in the canonical form AForm.
+    /// @param APath the file
+    /// @param AForm C14N, ExclusiveC14N or C14N11
+    /// @param AWithComments whether comments are kept
+    /// @returns false for a missing value or when it cannot be written
+    /// @example `LDoc.SaveCanonicalToFile("c.xml", XmlCanonicalForm.C14N11, true);`
+    const method SaveCanonicalToFile(const APath: string; const AForm: XmlCanonicalForm;
+      const AWithComments: bool): bool;
+    var
+      LPath: ptr to char;
+      LBuffer: ptr to xmlOutputBuffer;
+      LOk: bool;
+    begin
+      if self.Node = nil then
+        return false;
+      end;
+      LPath := DoFilePath(APath);
+      if LPath = nil then
+        return false;
+      end;
+      LBuffer := xmlOutputBufferCreateFilename(ptr to const char(LPath), nil, 0);
+      DoFreeChars(LPath);
+      if LBuffer = nil then
+        return false;
+      end;
+      LOk := self.DoCanonical(LBuffer, AForm, AWithComments);
+      // Closing writes what is left; its failure is the write's
+      return (xmlOutputBufferClose(LBuffer) >= 0) and LOk;
+    end;
+
+    /// Writes this node and everything below it as Canonical XML 1.0 to the IO AIO at its
+    /// place, through libxml2's IO callbacks (the IO stays the caller's, open).
+    /// @param AIO the IO written
+    /// @returns false for a missing value or when not all of it could be written
+    /// @example `LDoc.Root().SaveCanonicalToIO(LMemory);`
+    const method SaveCanonicalToIO(const AIO: IO): bool;
+    begin
+      return self.SaveCanonicalToIO(AIO, XmlCanonicalForm.C14N, false);
+    end;
+
+    /// SaveCanonicalToIO in the canonical form AForm.
+    /// @param AIO the IO written
+    /// @param AForm C14N, ExclusiveC14N or C14N11
+    /// @param AWithComments whether comments are kept
+    /// @returns false for a missing value or when not all of it could be written
+    /// @example `LBody.SaveCanonicalToIO(LMemory, XmlCanonicalForm.ExclusiveC14N, false);`
+    const method SaveCanonicalToIO(const AIO: IO; const AForm: XmlCanonicalForm;
+      const AWithComments: bool): bool;
+    var
+      LBuffer: ptr to xmlOutputBuffer;
+      LOk: bool;
+    begin
+      if (self.Node = nil) or (AIO = nil) then
+        return false;
+      end;
+      LBuffer := xmlOutputBufferCreateIO(DoIOWrite, DoIOClose, ptr(AIO), nil);
+      if LBuffer = nil then
+        return false;
+      end;
+      LOk := self.DoCanonical(LBuffer, AForm, AWithComments);
+      return (xmlOutputBufferClose(LBuffer) >= 0) and LOk;
+    end;
+
+    // -- libxml2 level
+
+    /// libxml2 level: the document ADoc (one nothing else frees) as an Xml that owns it from
+    /// now on, freed when the last value of it goes.
+    /// @param ADoc the document (XmlReader.ReadSubtree hands its copies over so)
+    /// @returns its root element; a missing value for nil or a document with none
+    /// @example `LXml := Xml.TakeDocument(xmlReadMemory(..));`
+    static method TakeDocument(const ADoc: ptr to xmlDoc): Xml;
+    var
+      LXml: Xml;
+    begin
+      if ADoc <> nil then
+        LXml.DoTake(ADoc, "<document>");
+      end;
+      return LXml;
+    end;
   end;
 
   // An attribute as Attributes gives it: its name as written and its value
   XmlAttribute = object
     Name: string;
     Value: string;
+  end;
+
+  /// A pull reader: a document read one node at a time (Read), from a file, a text or an
+  /// IO, holding only the node it is on, for documents too big to hold whole. A value: a
+  /// copy reads the same stream. ReadSubtree takes the element it is on as an Xml.
+  /// @example `LReader := XmlReader.FromFile("big.xml"); while LReader.Read() do .. end;`
+  XmlReader = object
+    // The open reader (nil for a value never made by From*)
+    hidden Code: ref XmlReaderCode;
+
+    // The reader when it can read (no error so far); nil otherwise
+    hidden const method DoReader(): ptr to xmlTextReader;
+    begin
+      if (self.Code = nil) or (len(self.Code.Error) > 0) then
+        return nil;
+      end;
+      return self.Code.Reader;
+    end;
+
+    // A Read / Skip result: true on a node, false at the end; an error kept in ErrorText
+    hidden const method DoStep(const AResult: int32): bool;
+    begin
+      if AResult = 1 then
+        return true;
+      end;
+      if (AResult < 0) and (len(self.Code.Error) = 0) then
+        self.Code.Error := DoReadError(DoErrorName(self.Code.Name, self.Code.Url,
+          self.Code.State), self.Code.State, ADAM_XML_MSG_IO_FAILED);
+      end;
+      return false;
+    end;
+
+    /// A reader of the XML file at APath, read through C's file calls (a HookIO path reads
+    /// its IO).
+    /// @param APath the file
+    /// @returns the reader; IsValid false, ErrorText why ("APath: the file cannot be
+    ///   opened"), when the file cannot be opened
+    /// @example `LReader := XmlReader.FromFile("maps/overworld.tmx");`
+    static method FromFile(const APath: string): XmlReader;
+    begin
+      return XmlReader.FromFile(APath, []);
+    end;
+
+    /// A reader of the XML file at APath, AOptions applied ([XmlReadOption.XInclude] reads
+    /// what each xi:include includes in its place).
+    /// @param APath the file
+    /// @param AOptions what the read does besides parsing
+    /// @returns the reader; IsValid false, ErrorText why, when it cannot start
+    /// @example `LReader := XmlReader.FromFile("book.xml", [XmlReadOption.XInclude]);`
+    static method FromFile(const APath: string; const AOptions: XmlReadOptions): XmlReader;
+    var
+      LReader: XmlReader;
+      LPath: ptr to char;
+      LInput: ptr to xmlParserInputBuffer;
+    begin
+      LReader.Code := ref XmlReaderCode();
+      LReader.Code.Name := APath;
+      LPath := DoFilePath(APath);
+      if LPath = nil then
+        LReader.Code.Error := APath + ": " + ADAM_XML_MSG_NO_ROOM;
+        return LReader;
+      end;
+      LReader.Code.Url := DoText(ptr to const xmlChar(LPath));
+      LInput := xmlParserInputBufferCreateFilename(ptr to const char(LPath),
+        XML_CHAR_ENCODING_NONE);
+      DoFreeChars(LPath);
+      DoOpenReader(LReader.Code, LInput, AOptions, ADAM_XML_MSG_OPEN_FAILED);
+      return LReader;
+    end;
+
+    /// A reader of the XML text AText (read in place, no copy).
+    /// @param AText the XML text
+    /// @returns the reader
+    /// @example `LReader := XmlReader.FromString("<list><item/></list>");`
+    static method FromString(const AText: string): XmlReader;
+    begin
+      return XmlReader.FromString(AText, []);
+    end;
+
+    /// A reader of the XML text AText, AOptions applied.
+    /// @param AText the XML text
+    /// @param AOptions what the read does besides parsing
+    /// @returns the reader; IsValid false when the text is too large (over 2 GB)
+    /// @example `LReader := XmlReader.FromString(LText, [XmlReadOption.XInclude]);`
+    static method FromString(const AText: string; const AOptions: XmlReadOptions): XmlReader;
+    var
+      LReader: XmlReader;
+      LInput: ptr to xmlParserInputBuffer;
+    begin
+      LReader.Code := ref XmlReaderCode();
+      LReader.Code.Name := ADAM_XML_TEXT_NAME;
+      if len(AText) > ADAM_XML_INT32_MAX then
+        LReader.Code.Error := ADAM_XML_TEXT_NAME + ": " + ADAM_XML_MSG_TOO_LARGE;
+        return LReader;
+      end;
+      // The reader reads the text where it is: the code keeps it while it reads
+      LReader.Code.Text := AText;
+      LInput := xmlParserInputBufferCreateStatic(DoChars(LReader.Code.Text),
+        int32(len(LReader.Code.Text)), XML_CHAR_ENCODING_NONE);
+      DoOpenReader(LReader.Code, LInput, AOptions, ADAM_XML_MSG_NO_ROOM);
+      return LReader;
+    end;
+
+    /// A reader of the XML text the IO AIO holds from its place to its end, read in pieces
+    /// through libxml2's IO callbacks; the IO stays the caller's (open while the reader
+    /// reads, not closed by it).
+    /// @param AIO the IO
+    /// @returns the reader; IsValid false ("<io>: no IO") for nil
+    /// @example `LReader := XmlReader.FromIO(LEntry);`
+    static method FromIO(const AIO: IO): XmlReader;
+    begin
+      return XmlReader.FromIO(AIO, []);
+    end;
+
+    /// A reader of the XML text the IO AIO holds, AOptions applied.
+    /// @param AIO the IO
+    /// @param AOptions what the read does besides parsing
+    /// @returns the reader; IsValid false ("<io>: no IO") for nil
+    /// @example `LReader := XmlReader.FromIO(LEntry, [XmlReadOption.XInclude]);`
+    static method FromIO(const AIO: IO; const AOptions: XmlReadOptions): XmlReader;
+    var
+      LReader: XmlReader;
+      LInput: ptr to xmlParserInputBuffer;
+    begin
+      LReader.Code := ref XmlReaderCode();
+      LReader.Code.Name := ADAM_XML_IO_NAME;
+      if AIO = nil then
+        LReader.Code.Error := ADAM_XML_IO_NAME + ": " + ADAM_XML_MSG_NO_IO;
+        return LReader;
+      end;
+      LReader.Code.Source := AIO;
+      LInput := xmlParserInputBufferCreateIO(DoIORead, DoIOClose, ptr(AIO),
+        XML_CHAR_ENCODING_NONE);
+      DoOpenReader(LReader.Code, LInput, AOptions, ADAM_XML_MSG_NO_ROOM);
+      return LReader;
+    end;
+
+    /// Whether the reader has met no error (a file that cannot be opened, XML that is not
+    /// well-formed, a failed include).
+    /// @returns false once an error came; ErrorText says what
+    /// @example `if not LReader.IsValid() then println(LReader.ErrorText()); end;`
+    const method IsValid(): bool;
+    begin
+      return (self.Code <> nil) and (len(self.Code.Error) = 0);
+    end;
+
+    /// Why the reader stopped: "name(line,col): message" as a read's ErrorText.
+    /// @returns the reason; "" while there is none
+    /// @example `println(LReader.ErrorText());`
+    const method ErrorText(): string;
+    begin
+      if self.Code = nil then
+        return "";
+      end;
+      return self.Code.Error;
+    end;
+
+    /// Moves to the next node in document order (an element's start, then what is in it,
+    /// then its end).
+    /// @returns true on a node; false at the end of the document or on an error (IsValid
+    ///   then false)
+    /// @example `while LReader.Read() do println(LReader.Name()); end;`
+    const method Read(): bool;
+    var
+      LReader: ptr to xmlTextReader;
+    begin
+      LReader := self.DoReader();
+      if LReader = nil then
+        return false;
+      end;
+      return self.DoStep(xmlTextReaderRead(LReader));
+    end;
+
+    /// Moves past the node it is on and everything below it, to the node after.
+    /// @returns true on a node; false at the end or on an error
+    /// @example `if LReader.Name() = "skipme" then LReader.Skip(); end;`
+    const method Skip(): bool;
+    var
+      LReader: ptr to xmlTextReader;
+    begin
+      LReader := self.DoReader();
+      if LReader = nil then
+        return false;
+      end;
+      return self.DoStep(xmlTextReaderNext(LReader));
+    end;
+
+    /// What the reader is on.
+    /// @returns the node's kind; XmlReaderNode.None before the first Read and after the last
+    /// @example `if LReader.Kind() = XmlReaderNode.EndElement then .. end;`
+    const method Kind(): XmlReaderNode;
+    var
+      LType: int32;
+    begin
+      LType := xmlTextReaderNodeType(self.DoReader());
+      if LType = XML_READER_TYPE_ELEMENT then
+        return XmlReaderNode.Element;
+      end;
+      if LType = XML_READER_TYPE_END_ELEMENT then
+        return XmlReaderNode.EndElement;
+      end;
+      if LType = XML_READER_TYPE_TEXT then
+        return XmlReaderNode.Text;
+      end;
+      if LType = XML_READER_TYPE_CDATA then
+        return XmlReaderNode.CData;
+      end;
+      if LType = XML_READER_TYPE_COMMENT then
+        return XmlReaderNode.Comment;
+      end;
+      if LType = XML_READER_TYPE_PROCESSING_INSTRUCTION then
+        return XmlReaderNode.Instruction;
+      end;
+      if (LType = XML_READER_TYPE_WHITESPACE) or
+        (LType = XML_READER_TYPE_SIGNIFICANT_WHITESPACE) then
+        return XmlReaderNode.Whitespace;
+      end;
+      if LType = XML_READER_TYPE_DOCUMENT_TYPE then
+        return XmlReaderNode.DocumentType;
+      end;
+      if LType = XML_READER_TYPE_ENTITY_REFERENCE then
+        return XmlReaderNode.EntityReference;
+      end;
+      if LType <= XML_READER_TYPE_NONE then
+        return XmlReaderNode.None;
+      end;
+      return XmlReaderNode.Other;
+    end;
+
+    /// The node's name as written ("prefix:local" for a prefixed one; "#text" for a text).
+    /// @returns the name; "" when it is on no node
+    /// @example `if LReader.Name() = "item" then .. end;`
+    const method Name(): string;
+    begin
+      return DoText(xmlTextReaderConstName(self.DoReader()));
+    end;
+
+    /// The node's name without its prefix.
+    /// @returns the local name; "" when it is on no node
+    /// @example `LLocal := LReader.LocalName();`
+    const method LocalName(): string;
+    begin
+      return DoText(xmlTextReaderConstLocalName(self.DoReader()));
+    end;
+
+    /// The node's namespace prefix.
+    /// @returns the prefix; "" when it has none
+    /// @example `LPrefix := LReader.Prefix();`
+    const method Prefix(): string;
+    begin
+      return DoText(xmlTextReaderConstPrefix(self.DoReader()));
+    end;
+
+    /// The node's namespace URI.
+    /// @returns the URI; "" when it is in no namespace
+    /// @example `if LReader.NamespaceUri() = "urn:shop" then .. end;`
+    const method NamespaceUri(): string;
+    begin
+      return DoText(xmlTextReaderConstNamespaceUri(self.DoReader()));
+    end;
+
+    /// The node's text: a text's, a CDATA section's, a comment's, an instruction's content.
+    /// @returns the text; "" for an element or when it is on no node
+    /// @example `if LReader.Kind() = XmlReaderNode.Text then println(LReader.Value()); end;`
+    const method Value(): string;
+    begin
+      return DoText(xmlTextReaderConstValue(self.DoReader()));
+    end;
+
+    /// How deep the node is (the root element 0, its children 1, ...).
+    /// @returns the depth; 0 when it is on no node
+    /// @example `println(Spaces(LReader.Depth() * 2) + LReader.Name());`
+    const method Depth(): int64;
+    var
+      LDepth: int32;
+    begin
+      LDepth := xmlTextReaderDepth(self.DoReader());
+      if LDepth < 0 then
+        return 0;
+      end;
+      return int64(LDepth);
+    end;
+
+    /// Whether the element it is on is written empty (<item/>), so no EndElement follows.
+    /// @returns true for an empty element
+    /// @example `if LReader.IsEmptyElement() then .. end;`
+    const method IsEmptyElement(): bool;
+    begin
+      return xmlTextReaderIsEmptyElement(self.DoReader()) = 1;
+    end;
+
+    /// The line the node it is on starts on (an element's start tag; for a node libxml2
+    /// keeps no line of, such as an end tag, the line the reader has read up to).
+    /// @returns the 1-based line; 0 when it is on no node
+    /// @example `println("item on line {}", LReader.Line());`
+    const method Line(): int64;
+    var
+      LReader: ptr to xmlTextReader;
+      LNode: ptr to xmlNode;
+      LLine: int64;
+    begin
+      LReader := self.DoReader();
+      // The reader reads ahead: the node's own line, where libxml2 keeps one
+      LNode := xmlTextReaderCurrentNode(LReader);
+      if LNode <> nil then
+        LLine := int64(xmlGetLineNo(ptr to const xmlNode(LNode)));
+        if LLine > 0 then
+          return LLine;
+        end;
+      end;
+      LLine := int64(xmlTextReaderGetParserLineNumber(LReader));
+      if LLine < 0 then
+        return 0;
+      end;
+      return LLine;
+    end;
+
+    /// How many attributes the element it is on has.
+    /// @returns the count; 0 for any other node
+    /// @example `LCount := LReader.AttributeCount();`
+    const method AttributeCount(): int64;
+    var
+      LCount: int32;
+    begin
+      LCount := xmlTextReaderAttributeCount(self.DoReader());
+      if LCount < 0 then
+        return 0;
+      end;
+      return int64(LCount);
+    end;
+
+    /// The attribute AName of the element it is on into AValue.
+    /// @param AName the attribute's name as written ("id", "xlink:href")
+    /// @param AValue its value (unchanged when there is none)
+    /// @returns false when the element has no such attribute
+    /// @example `if LReader.TryGet("id", LId) then .. end;`
+    const method TryGet(const AName: string; var AValue: string): bool;
+    var
+      LName: ptr to xmlChar;
+      LValue: ptr to xmlChar;
+    begin
+      LName := DoNewText(AName);
+      if LName = nil then
+        return false;
+      end;
+      LValue := xmlTextReaderGetAttribute(self.DoReader(), ptr to const xmlChar(LName));
+      DoFreeText(LName);
+      if LValue = nil then
+        return false;
+      end;
+      AValue := DoTakeText(LValue);
+      return true;
+    end;
+
+    /// Whether the element it is on has the attribute AName.
+    /// @param AName the attribute's name as written
+    /// @returns true when it has it
+    /// @example `if LReader.Has("visible") then .. end;`
+    const method Has(const AName: string): bool;
+    var
+      LValue: string;
+    begin
+      return self.TryGet(AName, LValue);
+    end;
+
+    /// The attribute AName of the element it is on.
+    /// @param AName the attribute's name as written
+    /// @returns its value; "" when there is none
+    /// @example `LName := LReader.Get("name");`
+    const method Get(const AName: string): string;
+    var
+      LValue: string;
+    begin
+      LValue := "";
+      self.TryGet(AName, LValue);
+      return LValue;
+    end;
+
+    /// The attribute AName as an int32.
+    /// @param AName the attribute's name as written
+    /// @param ADefault what a missing attribute or one that is no int32 gives
+    /// @returns the value; ADefault when it does not fit
+    /// @example `LWidth := LReader.Get("width", 0);`
+    const method Get(const AName: string; const ADefault: int32): int32;
+    var
+      LValue: int32;
+    begin
+      if not DoTextInt32(self.Get(AName), LValue) then
+        return ADefault;
+      end;
+      return LValue;
+    end;
+
+    /// The attribute AName as an int64.
+    /// @param AName the attribute's name as written
+    /// @param ADefault what a missing attribute or one that is no int64 gives
+    /// @returns the value; ADefault when it does not fit
+    /// @example `LSize := LReader.Get("size", int64(0));`
+    const method Get(const AName: string; const ADefault: int64): int64;
+    var
+      LValue: int64;
+    begin
+      if not DoTextInt64(self.Get(AName), LValue) then
+        return ADefault;
+      end;
+      return LValue;
+    end;
+
+    /// The attribute AName as a float64.
+    /// @param AName the attribute's name as written
+    /// @param ADefault what a missing attribute or one that is no number gives
+    /// @returns the value; ADefault when it does not fit
+    /// @example `LPrice := LReader.Get("price", 0.0);`
+    const method Get(const AName: string; const ADefault: float64): float64;
+    var
+      LValue: float64;
+    begin
+      if not DoTextFloat64(self.Get(AName), LValue) then
+        return ADefault;
+      end;
+      return LValue;
+    end;
+
+    /// The attribute AName as a bool (true / 1, false / 0).
+    /// @param AName the attribute's name as written
+    /// @param ADefault what a missing attribute or one that is neither gives
+    /// @returns the value; ADefault when it does not fit
+    /// @example `if LReader.Get("visible", true) then .. end;`
+    const method Get(const AName: string; const ADefault: bool): bool;
+    var
+      LValue: bool;
+    begin
+      if not DoTextBool(self.Get(AName), LValue) then
+        return ADefault;
+      end;
+      return LValue;
+    end;
+
+    /// The markup inside the element it is on (its content, not its own tags); the reader
+    /// stays where it is.
+    /// @returns the markup; "" for an empty element or any other node
+    /// @example `LBody := LReader.ReadInnerXml();`
+    const method ReadInnerXml(): string;
+    begin
+      return DoTakeText(xmlTextReaderReadInnerXml(self.DoReader()));
+    end;
+
+    /// The markup of the element it is on, its own tags included; the reader stays where it
+    /// is.
+    /// @returns the markup; "" when it is on no node
+    /// @example `LItem := LReader.ReadOuterXml();`
+    const method ReadOuterXml(): string;
+    begin
+      return DoTakeText(xmlTextReaderReadOuterXml(self.DoReader()));
+    end;
+
+    /// The element it is on and everything below it, read in and copied into a document of
+    /// its own (so it lives on as the reader moves); the reader stays where it is: Skip
+    /// moves past it.
+    /// @returns the copy's root element; a missing value when it is on no element or on an
+    ///   error
+    /// @example `LItem := LReader.ReadSubtree(); println(LItem.Get("id")); LReader.Skip();`
+    const method ReadSubtree(): Xml;
+    var
+      LReader: ptr to xmlTextReader;
+      LNode: ptr to xmlNode;
+      LDoc: ptr to xmlDoc;
+      LCopy: ptr to xmlNode;
+      LMissing: Xml;
+    begin
+      LReader := self.DoReader();
+      if xmlTextReaderNodeType(LReader) <> XML_READER_TYPE_ELEMENT then
+        return LMissing;
+      end;
+      LNode := xmlTextReaderExpand(LReader);
+      if LNode = nil then
+        self.DoStep(-1);
+        return LMissing;
+      end;
+      LDoc := xmlNewDoc(ADAM_XML_VERSION);
+      if LDoc = nil then
+        return LMissing;
+      end;
+      LCopy := xmlDocCopyNode(LNode, LDoc, 1);
+      if LCopy = nil then
+        xmlFreeDoc(LDoc);
+        return LMissing;
+      end;
+      xmlDocSetRootElement(LDoc, LCopy);
+      return Xml.TakeDocument(LDoc);
+    end;
+  end;
+
+  /// A streaming writer: XML written start tag by start tag to a file, an IO or a text,
+  /// never held whole (for big documents). Calls chain; the first failing call makes the
+  /// writer invalid (ErrorText says why) and every later one write nothing. A value: a copy
+  /// writes the same stream.
+  /// @example `XmlWriter.ToFile("out.xml").StartDocument().WriteElement("item", "a").Close();`
+  XmlWriter = object
+    // The open writer (nil for a value never made by To*)
+    hidden Code: ref XmlWriterCode;
+
+    // A writer over AOut (nil: it could not be made, AFailed why) named AName, indented
+    // when APretty
+    hidden static method DoNew(const AOut: ptr to xmlOutputBuffer; const AName: string;
+      const APretty: bool; const AFailed: string): XmlWriter;
+    var
+      LWriter: XmlWriter;
+    begin
+      LWriter.Code := ref XmlWriterCode();
+      LWriter.Code.Name := AName;
+      if AOut = nil then
+        LWriter.Code.Error := AName + ": " + AFailed;
+        return LWriter;
+      end;
+      // The writer owns AOut from here on (freeing the writer closes it)
+      LWriter.Code.Writer := xmlNewTextWriter(AOut);
+      if LWriter.Code.Writer = nil then
+        LWriter.Code.Error := AName + ": " + ADAM_XML_MSG_NO_ROOM;
+        return LWriter;
+      end;
+      LWriter.DoIndent(APretty);
+      return LWriter;
+    end;
+
+    // The writer's indent: two spaces a level when APretty, none otherwise
+    hidden const method DoIndent(const APretty: bool);
+    begin
+      if APretty then
+        xmlTextWriterSetIndent(self.Code.Writer, 1);
+        xmlTextWriterSetIndentString(self.Code.Writer, ADAM_XML_INDENT);
+      end;
+    end;
+
+    // Before a libxml2 writer call: false when the writer cannot write (closed, failed);
+    // otherwise this thread's libxml2 reports go to the writer's state until DoEnd
+    hidden const method DoBegin(): bool;
+    begin
+      if (self.Code = nil) or (self.Code.Writer = nil) or (len(self.Code.Error) > 0) then
+        return false;
+      end;
+      xmlSetStructuredErrorFunc(ptr(addr of self.Code.State), DoOnError);
+      return true;
+    end;
+
+    // After a libxml2 writer call that returned AResult: the reports let go; a failure
+    // (AResult < 0) kept in ErrorText ("name: message")
+    hidden const method DoEnd(const AResult: int32);
+    begin
+      xmlSetStructuredErrorFunc(nil, nil);
+      if AResult >= 0 then
+        return;
+      end;
+      if self.Code.State.Found then
+        self.Code.Error := self.Code.Name + ": " + self.Code.State.Message;
+      else
+        self.Code.Error := self.Code.Name + ": " + ADAM_XML_MSG_WRITE_FAILED;
+      end;
+    end;
+
+    /// A writer to the file APath (created or replaced), through C's file calls (a HookIO
+    /// path writes its IO), indented two spaces a level.
+    /// @param APath the file
+    /// @returns the writer; IsValid false ("APath: the file cannot be created") on a failure
+    /// @example `LOut := XmlWriter.ToFile("save.xml");`
+    static method ToFile(const APath: string): XmlWriter;
+    begin
+      return XmlWriter.ToFile(APath, true);
+    end;
+
+    /// A writer to the file APath, indented when APretty, else compact.
+    /// @param APath the file
+    /// @param APretty whether a line per element
+    /// @returns the writer; IsValid false on a failure
+    /// @example `LOut := XmlWriter.ToFile("save.xml", false);`
+    static method ToFile(const APath: string; const APretty: bool): XmlWriter;
+    var
+      LPath: ptr to char;
+      LState: XmlReadState;
+      LOut: ptr to xmlOutputBuffer;
+    begin
+      LPath := DoFilePath(APath);
+      LOut := nil;
+      if LPath <> nil then
+        // A file that cannot be created is reported: this thread's handler takes it
+        xmlSetStructuredErrorFunc(ptr(addr of LState), DoOnError);
+        LOut := xmlOutputBufferCreateFilename(ptr to const char(LPath), nil, 0);
+        xmlSetStructuredErrorFunc(nil, nil);
+        DoFreeChars(LPath);
+      end;
+      return XmlWriter.DoNew(LOut, APath, APretty, ADAM_XML_MSG_CREATE_FAILED);
+    end;
+
+    /// A writer to the IO AIO at its place, through libxml2's IO callbacks (the IO stays
+    /// the caller's, open), indented two spaces a level.
+    /// @param AIO the IO written
+    /// @returns the writer; IsValid false ("<io>: no IO") for nil
+    /// @example `LOut := XmlWriter.ToIO(LMemory);`
+    static method ToIO(const AIO: IO): XmlWriter;
+    begin
+      return XmlWriter.ToIO(AIO, true);
+    end;
+
+    /// A writer to the IO AIO, indented when APretty, else compact.
+    /// @param AIO the IO written
+    /// @param APretty whether a line per element
+    /// @returns the writer; IsValid false for nil
+    /// @example `LOut := XmlWriter.ToIO(LMemory, false);`
+    static method ToIO(const AIO: IO; const APretty: bool): XmlWriter;
+    var
+      LOut: ptr to xmlOutputBuffer;
+    begin
+      LOut := nil;
+      if AIO <> nil then
+        LOut := xmlOutputBufferCreateIO(DoIOWrite, DoIOClose, ptr(AIO), nil);
+      end;
+      return XmlWriter.DoNew(LOut, ADAM_XML_IO_NAME, APretty, ADAM_XML_MSG_NO_IO);
+    end;
+
+    /// A writer to a text kept in memory (Text gives it), indented two spaces a level.
+    /// @returns the writer
+    /// @example `LOut := XmlWriter.ToText(); .. println(LOut.Text());`
+    static method ToText(): XmlWriter;
+    begin
+      return XmlWriter.ToText(true);
+    end;
+
+    /// A writer to a text kept in memory, indented when APretty, else compact.
+    /// @param APretty whether a line per element
+    /// @returns the writer
+    /// @example `LOut := XmlWriter.ToText(false);`
+    static method ToText(const APretty: bool): XmlWriter;
+    var
+      LWriter: XmlWriter;
+    begin
+      LWriter.Code := ref XmlWriterCode();
+      LWriter.Code.Name := ADAM_XML_TEXT_NAME;
+      LWriter.Code.Memory := xmlBufferCreate();
+      if LWriter.Code.Memory <> nil then
+        LWriter.Code.Writer := xmlNewTextWriterMemory(LWriter.Code.Memory, 0);
+      end;
+      if LWriter.Code.Writer = nil then
+        LWriter.Code.Error := ADAM_XML_TEXT_NAME + ": " + ADAM_XML_MSG_NO_ROOM;
+        return LWriter;
+      end;
+      LWriter.DoIndent(APretty);
+      return LWriter;
+    end;
+
+    /// Whether every call so far wrote what it was asked to.
+    /// @returns false once a call failed; ErrorText says why
+    /// @example `if not LOut.IsValid() then println(LOut.ErrorText()); end;`
+    const method IsValid(): bool;
+    begin
+      return (self.Code <> nil) and (len(self.Code.Error) = 0);
+    end;
+
+    /// Why a call failed ("name: message", name the path, "<io>" or "<text>").
+    /// @returns the reason; "" while none has
+    /// @example `println(LOut.ErrorText());`
+    const method ErrorText(): string;
+    begin
+      if self.Code = nil then
+        return "";
+      end;
+      return self.Code.Error;
+    end;
+
+    /// Writes the XML declaration in UTF-8 (<?xml version="1.0" encoding="UTF-8"?>).
+    /// @returns this writer
+    /// @example `LOut.StartDocument().StartElement("config");`
+    const method StartDocument(): XmlWriter;
+    begin
+      return self.StartDocument(ADAM_XML_UTF8);
+    end;
+
+    /// Writes the XML declaration in the encoding AEncoding (what follows is written in it).
+    /// @param AEncoding libxml2's name for it ("UTF-8", "ISO-8859-1" ...)
+    /// @returns this writer
+    /// @example `LOut.StartDocument("ISO-8859-1");`
+    const method StartDocument(const AEncoding: string): XmlWriter;
+    var
+      LEncoding: ptr to char;
+    begin
+      if self.DoBegin() then
+        LEncoding := StringToC(AEncoding);
+        self.DoEnd(xmlTextWriterStartDocument(self.Code.Writer, ADAM_XML_VERSION,
+          ptr to const char(LEncoding), nil));
+        DoFreeChars(LEncoding);
+      end;
+      return self;
+    end;
+
+    /// Ends the document: every element still open is ended.
+    /// @returns this writer
+    /// @example `LOut.EndDocument();`
+    const method EndDocument(): XmlWriter;
+    begin
+      if self.DoBegin() then
+        self.DoEnd(xmlTextWriterEndDocument(self.Code.Writer));
+      end;
+      return self;
+    end;
+
+    /// Starts the element AName (its attributes follow, then its content, then EndElement).
+    /// @param AName the name as written ("item", or "prefix:local" for a prefix declared
+    ///   with the namespace form or an xmlns:prefix attribute)
+    /// @returns this writer
+    /// @example `LOut.StartElement("item").WriteAttribute("id", 7);`
+    const method StartElement(const AName: string): XmlWriter;
+    var
+      LName: ptr to xmlChar;
+    begin
+      if self.DoBegin() then
+        LName := DoNewText(AName);
+        self.DoEnd(xmlTextWriterStartElement(self.Code.Writer, ptr to const xmlChar(LName)));
+        DoFreeText(LName);
+      end;
+      return self;
+    end;
+
+    /// Starts the element AName in the namespace ANamespaceUri, declaring it: a
+    /// "prefix:local" name declares the prefix (xmlns:prefix="uri"), a bare "local" the
+    /// default namespace (xmlns="uri").
+    /// @param AName "local" or "prefix:local"
+    /// @param ANamespaceUri the namespace URI
+    /// @returns this writer
+    /// @example `LOut.StartElement("svg", "http://www.w3.org/2000/svg");`
+    const method StartElement(const AName: string; const ANamespaceUri: string): XmlWriter;
+    var
+      LPrefix: string;
+      LLocal: string;
+      LPrefixText: ptr to xmlChar;
+      LLocalText: ptr to xmlChar;
+      LUri: ptr to xmlChar;
+    begin
+      if self.DoBegin() then
+        DoSplitName(AName, LPrefix, LLocal);
+        LPrefixText := nil;
+        if len(LPrefix) > 0 then
+          LPrefixText := DoNewText(LPrefix);
+        end;
+        LLocalText := DoNewText(LLocal);
+        LUri := DoNewText(ANamespaceUri);
+        self.DoEnd(xmlTextWriterStartElementNS(self.Code.Writer,
+          ptr to const xmlChar(LPrefixText), ptr to const xmlChar(LLocalText),
+          ptr to const xmlChar(LUri)));
+        DoFreeText(LUri);
+        DoFreeText(LLocalText);
+        DoFreeText(LPrefixText);
+      end;
+      return self;
+    end;
+
+    /// Ends the element started last (<item/> when nothing was written in it).
+    /// @returns this writer; a failure when no element is open
+    /// @example `LOut.StartElement("list").EndElement();`
+    const method EndElement(): XmlWriter;
+    begin
+      if self.DoBegin() then
+        self.DoEnd(xmlTextWriterEndElement(self.Code.Writer));
+      end;
+      return self;
+    end;
+
+    /// Writes the element AName holding the text AText (escaped), start to end.
+    /// @param AName the name as written
+    /// @param AText its text
+    /// @returns this writer
+    /// @example `LOut.WriteElement("title", "Tom & Jerry");`
+    const method WriteElement(const AName: string; const AText: string): XmlWriter;
+    var
+      LName: ptr to xmlChar;
+      LText: ptr to xmlChar;
+    begin
+      if self.DoBegin() then
+        LName := DoNewText(AName);
+        LText := DoNewText(AText);
+        self.DoEnd(xmlTextWriterWriteElement(self.Code.Writer, ptr to const xmlChar(LName),
+          ptr to const xmlChar(LText)));
+        DoFreeText(LText);
+        DoFreeText(LName);
+      end;
+      return self;
+    end;
+
+    /// Writes the attribute AName="AValue" (escaped) on the element just started.
+    /// @param AName the name as written ("id", "xmlns:p", "p:kind")
+    /// @param AValue its value
+    /// @returns this writer; a failure after the element's content has begun
+    /// @example `LOut.StartElement("item").WriteAttribute("name", "a<b");`
+    const method WriteAttribute(const AName: string; const AValue: string): XmlWriter;
+    var
+      LName: ptr to xmlChar;
+      LValue: ptr to xmlChar;
+    begin
+      if self.DoBegin() then
+        LName := DoNewText(AName);
+        LValue := DoNewText(AValue);
+        self.DoEnd(xmlTextWriterWriteAttribute(self.Code.Writer, ptr to const xmlChar(LName),
+          ptr to const xmlChar(LValue)));
+        DoFreeText(LValue);
+        DoFreeText(LName);
+      end;
+      return self;
+    end;
+
+    /// Writes the attribute AName as a whole number.
+    /// @param AName the name as written
+    /// @param AValue the value
+    /// @returns this writer
+    /// @example `LOut.WriteAttribute("width", 640);`
+    const method WriteAttribute(const AName: string; const AValue: int32): XmlWriter;
+    begin
+      return self.WriteAttribute(AName, IntToStr(int64(AValue)));
+    end;
+
+    /// Writes the attribute AName as a whole number.
+    /// @param AName the name as written
+    /// @param AValue the value
+    /// @returns this writer
+    /// @example `LOut.WriteAttribute("size", int64(9000000000));`
+    const method WriteAttribute(const AName: string; const AValue: int64): XmlWriter;
+    begin
+      return self.WriteAttribute(AName, IntToStr(AValue));
+    end;
+
+    /// Writes the attribute AName as a number.
+    /// @param AName the name as written
+    /// @param AValue the value
+    /// @returns this writer
+    /// @example `LOut.WriteAttribute("ratio", 0.5);`
+    const method WriteAttribute(const AName: string; const AValue: float64): XmlWriter;
+    begin
+      return self.WriteAttribute(AName, FloatToStr(AValue));
+    end;
+
+    /// Writes the attribute AName as "true" / "false".
+    /// @param AName the name as written
+    /// @param AValue the value
+    /// @returns this writer
+    /// @example `LOut.WriteAttribute("visible", true);`
+    const method WriteAttribute(const AName: string; const AValue: bool): XmlWriter;
+    begin
+      if AValue then
+        return self.WriteAttribute(AName, ADAM_XML_TRUE);
+      end;
+      return self.WriteAttribute(AName, ADAM_XML_FALSE);
+    end;
+
+    /// Writes the text AText (escaped: & < > as entities) in the open element.
+    /// @param AText the text
+    /// @returns this writer
+    /// @example `LOut.StartElement("p").WriteText("1 < 2").EndElement();`
+    const method WriteText(const AText: string): XmlWriter;
+    var
+      LText: ptr to xmlChar;
+    begin
+      if self.DoBegin() then
+        LText := DoNewText(AText);
+        self.DoEnd(xmlTextWriterWriteString(self.Code.Writer, ptr to const xmlChar(LText)));
+        DoFreeText(LText);
+      end;
+      return self;
+    end;
+
+    /// Writes a CDATA section holding AText as it is.
+    /// @param AText the text (it must not hold "]]>")
+    /// @returns this writer
+    /// @example `LOut.WriteCData("<raw>");`
+    const method WriteCData(const AText: string): XmlWriter;
+    var
+      LText: ptr to xmlChar;
+    begin
+      if self.DoBegin() then
+        LText := DoNewText(AText);
+        self.DoEnd(xmlTextWriterWriteCDATA(self.Code.Writer, ptr to const xmlChar(LText)));
+        DoFreeText(LText);
+      end;
+      return self;
+    end;
+
+    /// Writes the comment <!--AText-->.
+    /// @param AText the comment's text
+    /// @returns this writer
+    /// @example `LOut.WriteComment("generated");`
+    const method WriteComment(const AText: string): XmlWriter;
+    var
+      LText: ptr to xmlChar;
+    begin
+      if self.DoBegin() then
+        LText := DoNewText(AText);
+        self.DoEnd(xmlTextWriterWriteComment(self.Code.Writer, ptr to const xmlChar(LText)));
+        DoFreeText(LText);
+      end;
+      return self;
+    end;
+
+    /// Writes the processing instruction <?ATarget AContent?>.
+    /// @param ATarget its target ("xml-stylesheet" ...)
+    /// @param AContent its content
+    /// @returns this writer
+    /// @example `LOut.WriteInstruction("xml-stylesheet", "href=\"s.css\"");`
+    const method WriteInstruction(const ATarget: string; const AContent: string): XmlWriter;
+    var
+      LTarget: ptr to xmlChar;
+      LContent: ptr to xmlChar;
+    begin
+      if self.DoBegin() then
+        LTarget := DoNewText(ATarget);
+        LContent := DoNewText(AContent);
+        self.DoEnd(xmlTextWriterWritePI(self.Code.Writer, ptr to const xmlChar(LTarget),
+          ptr to const xmlChar(LContent)));
+        DoFreeText(LContent);
+        DoFreeText(LTarget);
+      end;
+      return self;
+    end;
+
+    /// Writes the document type <!DOCTYPE AName PUBLIC "APublicId" "ASystemId"> ("" leaves
+    /// an id out).
+    /// @param AName the root element's name
+    /// @param APublicId the public id; "" for none
+    /// @param ASystemId the system id (the DTD's URL); "" for none
+    /// @returns this writer
+    /// @example `LOut.WriteDocType("note", "", "note.dtd");`
+    const method WriteDocType(const AName: string; const APublicId: string;
+      const ASystemId: string): XmlWriter;
+    var
+      LName: ptr to xmlChar;
+      LPublic: ptr to xmlChar;
+      LSystem: ptr to xmlChar;
+    begin
+      if self.DoBegin() then
+        LName := DoNewText(AName);
+        LPublic := nil;
+        if len(APublicId) > 0 then
+          LPublic := DoNewText(APublicId);
+        end;
+        LSystem := nil;
+        if len(ASystemId) > 0 then
+          LSystem := DoNewText(ASystemId);
+        end;
+        self.DoEnd(xmlTextWriterWriteDocType(self.Code.Writer, ptr to const xmlChar(LName),
+          ptr to const xmlChar(LPublic), ptr to const xmlChar(LSystem), nil));
+        DoFreeText(LSystem);
+        DoFreeText(LPublic);
+        DoFreeText(LName);
+      end;
+      return self;
+    end;
+
+    /// Writes AText as it is (no escaping): markup made elsewhere.
+    /// @param AText the markup
+    /// @returns this writer
+    /// @example `LOut.WriteRaw(LItem.ToString());`
+    const method WriteRaw(const AText: string): XmlWriter;
+    var
+      LText: ptr to xmlChar;
+    begin
+      if self.DoBegin() then
+        LText := DoNewText(AText);
+        self.DoEnd(xmlTextWriterWriteRaw(self.Code.Writer, ptr to const xmlChar(LText)));
+        DoFreeText(LText);
+      end;
+      return self;
+    end;
+
+    /// Writes out what the writer holds so far (to the file, the IO or the text).
+    /// @returns false when it could not be written or the writer has failed
+    /// @example `LOut.Flush();`
+    const method Flush(): bool;
+    begin
+      if self.DoBegin() then
+        self.DoEnd(xmlTextWriterFlush(self.Code.Writer));
+      end;
+      return self.IsValid();
+    end;
+
+    /// Ends the document (every element still open is ended), writes out the rest and
+    /// closes the file / lets the IO go (it stays open); a text writer's Text stays
+    /// readable. Later calls write nothing.
+    /// @returns whether everything was written
+    /// @example `if not LOut.Close() then println(LOut.ErrorText()); end;`
+    const method Close(): bool;
+    begin
+      if (self.Code = nil) or (self.Code.Writer = nil) then
+        return self.IsValid();
+      end;
+      self.EndDocument();
+      self.Flush();
+      xmlFreeTextWriter(self.Code.Writer);
+      self.Code.Writer := nil;
+      return self.IsValid();
+    end;
+
+    /// What a ToText writer has written so far (flushed first).
+    /// @returns the text; "" for a writer to a file or an IO
+    /// @example `println(XmlWriter.ToText().WriteElement("a", "b").Text());`
+    const method Text(): string;
+    var
+      LLength: int32;
+    begin
+      if (self.Code = nil) or (self.Code.Memory = nil) then
+        return "";
+      end;
+      if self.Code.Writer <> nil then
+        xmlTextWriterFlush(self.Code.Writer);
+      end;
+      LLength := xmlBufferLength(self.Code.Memory);
+      if LLength <= 0 then
+        return "";
+      end;
+      return StringFromC(ptr to const char(xmlBufferContent(self.Code.Memory)), int64(LLength));
+    end;
   end;
 
 initialize
