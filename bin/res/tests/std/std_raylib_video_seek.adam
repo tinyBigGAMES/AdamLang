@@ -1,0 +1,344 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  std_raylib_video_seek.adam - System.Raylib.Ext's SeekVideo (PLAN-LINUX64
+  LX3d3f4, the seek bar of the raven_cinema example) over the fixture's
+  video.mpg (MP2 audio), read straight from the zip.
+
+  The reference is pl_mpeg itself: the same entry opened from memory, with
+  decode callbacks and the audio lead the player sets, and moved by
+  plm_seek; every seek of the video lands on the reference's time. A
+  stopped video is paused at its new place (the callback told once); a
+  playing one plays on from there (no callback) and a paused one stays
+  paused; a time below 0, NaN and a time past the end land where pl_mpeg
+  puts them (its start, its last frame), and playing on from the last frame
+  reaches the end; the empty video answers false.
+  Then a hidden window: the frame a paused video shows after a seek, drawn
+  into a render texture, equals pl_mpeg's own CPU conversion of the frame
+  its seek found (within rounding).
+
+  Each row prints ok or FAIL with its name; the last is `done <failures>`.
+*******************************************************************************/
+
+/*
+@@test
+  kind run
+  targets x86_64-windows-gnu x86_64-linux-gnu
+  exitcode 0
+  | ok seek reference opens
+  | ok seek video opens
+  | ok seek stopped answers true
+  | ok seek stopped becomes paused
+  | ok seek stopped callback paused
+  | ok seek stopped time as pl_mpeg
+  | ok seek then plays on
+  | ok seek playing answers true
+  | ok seek playing stays playing
+  | ok seek playing no callback
+  | ok seek playing time as pl_mpeg
+  | ok seek paused stays paused
+  | ok seek below start time as pl_mpeg
+  | ok seek nan time as start
+  | ok seek past end time as pl_mpeg
+  | ok seek past end plays to the end
+  | ok seek empty answers false
+  | ok seek window opens
+  | ok seek frame as pl_mpeg
+  | done 0
+  | [Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+@@end
+*/
+
+module exe std_raylib_video_seek;
+
+import System.SysUtils, System.CustomIO, System.LibC.C, System.Raylib.C, System.Raylib.Ext,
+  System.pl_mpeg.C;
+
+const
+  // The fixture: raylib_ext's assets (video.mpg with MP2 audio ..)
+  ZIP_PATH: string = "$P:../../../../res/tests/std/fixtures/std_raylib_io.zip";
+  VIDEO_ENTRY: string = "video.mpg";
+
+type
+  // pl_mpeg over the entry's bytes, the rows' reference: the bytes stay alive as long as
+  // pl_mpeg reads them (created with free_when_done 0)
+  Reference = record
+    Bytes: ByteArray;
+    Plm: ptr to plm_t;
+  end;
+
+var
+  GFails: int32;
+  // The video status callback's record: how many calls, the last status
+  GStatusCalls: int32;
+  GStatusLast: VideoStatus;
+  // The last frame the reference's video callback was given
+  GReferenceFrame: ptr to plm_frame_t;
+
+routine Check(const AName: string; const AOk: bool);
+begin
+  if AOk then
+    println("ok {}", AName);
+  else
+    println("FAIL {}", AName);
+    GFails := GFails + 1;
+  end;
+end;
+
+// The reference's decode callbacks: the player decodes video and audio, so the reference
+// does too (its time then moves the same way); the frame is kept for the frame compare
+routine clink ReferenceOnVideo(self_: ptr to plm_t; frame: ptr to plm_frame_t; user: ptr);
+begin
+  GReferenceFrame := frame;
+end;
+
+routine clink ReferenceOnAudio(self_: ptr to plm_t; samples: ptr to plm_samples_t; user: ptr);
+begin
+end;
+
+// The reference over the zip entry's bytes, set up as System.Raylib.Ext's player sets up
+// its own: both callbacks, no loop, and its audio lead when the player plays the sound
+routine OpenReference(var AReference: Reference; const AWithAudio: bool): bool;
+var
+  LIO: IO;
+  LAll: string;
+  LI: int64;
+  LOk: bool;
+  LRate: int32;
+begin
+  LIO := CreateZipFileIO(ZIP_PATH, VIDEO_ENTRY);
+  if LIO = nil then
+    return false;
+  end;
+  LOk := IOReadAll(LIO, LAll);
+  IOClose(LIO);
+  if (not LOk) or (len(LAll) = 0) then
+    return false;
+  end;
+  setlength(AReference.Bytes, len(LAll));
+  for LI := 0 to len(LAll) - 1 do
+    AReference.Bytes[LI] := uint8(LAll[LI]);
+  end;
+  AReference.Plm := plm_create_with_memory(addr of AReference.Bytes[0],
+    uint64(len(AReference.Bytes)), 0);
+  if AReference.Plm = nil then
+    return false;
+  end;
+  plm_set_video_decode_callback(AReference.Plm, ReferenceOnVideo, nil);
+  plm_set_loop(AReference.Plm, 0);
+  if AWithAudio then
+    LRate := plm_get_samplerate(AReference.Plm);
+    plm_set_audio_enabled(AReference.Plm, 1);
+    plm_set_audio_stream(AReference.Plm, 0);
+    plm_set_audio_decode_callback(AReference.Plm, ReferenceOnAudio, nil);
+    plm_set_audio_lead_time(AReference.Plm,
+      float64(PLM_AUDIO_SAMPLES_PER_FRAME) * 2.0 / float64(LRate));
+  else
+    plm_set_audio_enabled(AReference.Plm, 0);
+  end;
+  return true;
+end;
+
+routine CloseReference(var AReference: Reference);
+begin
+  if AReference.Plm <> nil then
+    plm_destroy(AReference.Plm);
+    AReference.Plm := nil;
+  end;
+  setlength(AReference.Bytes, 0);
+end;
+
+// pl_mpeg's own time after its seek to ASeconds (-1 when it found no frame)
+routine ReferenceSeek(const AReference: Reference; const ASeconds: float64): float64;
+begin
+  if plm_seek(AReference.Plm, ASeconds, 1) = 0 then
+    return -1.0;
+  end;
+  return plm_get_time(AReference.Plm);
+end;
+
+// The video status callback: every change counted, the last one kept
+routine OnVideoStatus(const AStatus: VideoStatus; const AName: ptr to const char);
+begin
+  GStatusCalls := GStatusCalls + 1;
+  GStatusLast := AStatus;
+end;
+
+// Plays AVideo for ASteps fixed steps of 0.04 s
+routine StepVideo(const AVideo: Video; const ASteps: int32);
+var
+  LI: int32;
+begin
+  for LI := 1 to ASteps do
+    UpdateVideo(AVideo, 0.04);
+  end;
+end;
+
+// The seek rules with no window (nothing uploaded; the times and statuses are the same)
+routine TestWindowless(var AReference: Reference);
+var
+  LVideo: Video;
+  LEmpty: Video;
+  LTime: float64;
+  LZero: float64;
+  LSought: bool;
+begin
+  LVideo := LoadVideoZip(ZIP_PATH, VIDEO_ENTRY, "");
+  Check("seek video opens", IsVideoValid(LVideo));
+  SetVideoStatusCallback(LVideo, OnVideoStatus);
+
+  // Stopped: paused at the new place, the callback told once
+  GStatusCalls := 0;
+  LSought := SeekVideo(LVideo, 1.0);
+  Check("seek stopped answers true", LSought);
+  Check("seek stopped becomes paused", GetVideoStatus(LVideo) = VideoStatus.VideoPaused);
+  Check("seek stopped callback paused", (GStatusCalls = 1) and
+    (GStatusLast = VideoStatus.VideoPaused));
+  Check("seek stopped time as pl_mpeg", GetVideoTime(LVideo) = ReferenceSeek(AReference, 1.0));
+
+  // Playing on from there
+  LTime := GetVideoTime(LVideo);
+  PlayVideo(LVideo);
+  StepVideo(LVideo, 5);
+  Check("seek then plays on", IsVideoPlaying(LVideo) and (GetVideoTime(LVideo) > LTime));
+
+  // Playing: plays on from the new place, no status change
+  GStatusCalls := 0;
+  LSought := SeekVideo(LVideo, 0.5);
+  Check("seek playing answers true", LSought);
+  Check("seek playing stays playing", IsVideoPlaying(LVideo));
+  Check("seek playing no callback", GStatusCalls = 0);
+  Check("seek playing time as pl_mpeg", GetVideoTime(LVideo) = ReferenceSeek(AReference, 0.5));
+
+  // Paused: stays paused
+  PauseVideo(LVideo);
+  SeekVideo(LVideo, 2.0);
+  Check("seek paused stays paused", GetVideoStatus(LVideo) = VideoStatus.VideoPaused);
+
+  // Out of range: where pl_mpeg puts it
+  SeekVideo(LVideo, -5.0);
+  Check("seek below start time as pl_mpeg",
+    GetVideoTime(LVideo) = ReferenceSeek(AReference, -5.0));
+  SeekVideo(LVideo, 1.0);
+  LZero := 0.0;
+  SeekVideo(LVideo, LZero / LZero);
+  Check("seek nan time as start", GetVideoTime(LVideo) = ReferenceSeek(AReference, 0.0));
+  SeekVideo(LVideo, 1000.0);
+  Check("seek past end time as pl_mpeg",
+    GetVideoTime(LVideo) = ReferenceSeek(AReference, 1000.0));
+  GStatusCalls := 0;
+  PlayVideo(LVideo);
+  StepVideo(LVideo, 10);
+  Check("seek past end plays to the end",
+    (GetVideoStatus(LVideo) = VideoStatus.VideoStopped) and (GStatusCalls = 2) and
+    (GStatusLast = VideoStatus.VideoStopped));
+  UnloadVideo(LVideo);
+
+  // The empty video: false, nothing else
+  Check("seek empty answers false", not SeekVideo(LEmpty, 1.0));
+  UnloadVideo(LEmpty);
+end;
+
+// The largest colour-channel difference between AImage (RGBA8) and pl_mpeg's own CPU
+// conversion of AFrame; -1 when either is missing or the sizes differ
+routine FrameDiff(const AImage: Image; const AFrame: ptr to plm_frame_t): int32;
+var
+  LOwn: ptr to uint8;
+  LDrawn: ptr to uint8;
+  LSize: int64;
+  LI: int64;
+  LDiff: int32;
+  LMax: int32;
+begin
+  if (AFrame = nil) or (AImage.data = nil) then
+    return -1;
+  end;
+  if (AImage.format <> PIXELFORMAT_UNCOMPRESSED_R8G8B8A8) or
+    (AImage.width <> int32(AFrame^.width)) or (AImage.height <> int32(AFrame^.height)) then
+    return -1;
+  end;
+  LSize := int64(AFrame^.width) * int64(AFrame^.height) * 4;
+  LOwn := ptr to uint8(getmem(LSize));
+  defer freemem(LOwn);
+  memset(LOwn, 255, uint64(LSize));
+  plm_frame_to_rgba(AFrame, LOwn, int32(AFrame^.width) * 4);
+  LDrawn := ptr to uint8(AImage.data);
+  LMax := 0;
+  for LI := 0 to LSize - 1 do
+    // The alpha bytes are not compared
+    if LI mod 4 <> 3 then
+      LDiff := int32(LOwn[LI]) - int32(LDrawn[LI]);
+      if LDiff < 0 then
+        LDiff := -LDiff;
+      end;
+      if LDiff > LMax then
+        LMax := LDiff;
+      end;
+    end;
+  end;
+  return LMax;
+end;
+
+// A paused video's frame after a seek, drawn, against the frame pl_mpeg's seek found
+routine TestSeekFrame(var AReference: Reference);
+var
+  LVideo: Video;
+  LTarget: RenderTexture2D;
+  LImage: Image;
+  LDiff: int32;
+begin
+  SetConfigFlags(uint32(FLAG_WINDOW_HIDDEN));
+  InitWindow(160, 90, "std_raylib_video_seek");
+  Check("seek window opens", IsWindowReady());
+  if not IsWindowReady() then
+    return;
+  end;
+  LVideo := LoadVideoZip(ZIP_PATH, VIDEO_ENTRY, "");
+  SeekVideo(LVideo, 1.5);
+  LTarget := LoadRenderTexture(LVideo.width, LVideo.height);
+  BeginTextureMode(LTarget);
+  ClearBackground(BLACK);
+  DrawVideo(LVideo, 0, 0, WHITE);
+  EndTextureMode();
+  LImage := LoadImageFromTexture(LTarget.texture);
+  // A render texture's rows come back bottom first
+  ImageFlipVertical(addr of LImage);
+  GReferenceFrame := nil;
+  ReferenceSeek(AReference, 1.5);
+  LDiff := FrameDiff(LImage, GReferenceFrame);
+  Check("seek frame as pl_mpeg", (LDiff >= 0) and (LDiff <= 4));
+  UnloadImage(LImage);
+  UnloadRenderTexture(LTarget);
+  UnloadVideo(LVideo);
+  CloseWindow();
+end;
+
+var
+  LReference: Reference;
+
+begin
+  SetTraceLogLevel(LOG_NONE);
+  InitAudioDevice();
+  // The player plays the sound only with the audio device ready: the reference decodes the
+  // same way
+  Check("seek reference opens", OpenReference(LReference, IsAudioDeviceReady()));
+  TestWindowless(LReference);
+  TestSeekFrame(LReference);
+  CloseReference(LReference);
+  if IsAudioDeviceReady() then
+    CloseAudioDevice();
+  end;
+  println("done {}", GFails);
+end.
