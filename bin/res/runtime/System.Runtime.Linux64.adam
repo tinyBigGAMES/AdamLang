@@ -29,8 +29,11 @@
   writes win64's x64 unwind data into adam_xdata / adam_pdata, and DoWalk
   reads it, searching the frames' scopes, then unwinding them to the catch
   (DoDispatch, PlatformFrameHandler); a C frame between unwinds by its
-  .eh_frame CFI. Coroutines run on glibc's ucontext (makecontext /
-  swapcontext) over mmap'd stacks with a guard page. The routines a later
+  .eh_frame CFI. Coroutines run on mmap'd stacks with a guard page. The
+  registers the unwinder starts from, its jump to a catch and a coroutine
+  switch are the ELF linker's register routines (__adam_registers,
+  __adam_resume, __adam_switch: machine code the language cannot write, no
+  system call). The routines a later
   atom of PLAN-LINUX64 fills (threads LX4d, hooks LX4f, loaded libraries
   LX4g, a .so's events LX6b) stop the process with that atom named
   (DoPending) until then.
@@ -385,26 +388,26 @@ begin
   _exit(ACode);
 end;
 
-// glibc: the calling thread's registers saved into a ucontext_t (0), and a saved one
-// resumed (never returns when it works): the unwinder's start and its jump to a catch
-routine getcontext(const AContext: ptr): int32; external "c";
-routine setcontext(const AContext: ptr): int32; external "c";
+// The ELF linker's register routines (its arch's machine code, Adam.Elf.Writer's
+// ElfMachine): the caller's callee-saved registers, rsp and pc (its return address) into
+// the record at ARegs (the other registers left as they are); the callee-saved registers
+// and rsp loaded from the record at ARegs, then a jump to APc (never returns); the
+// callee-saved registers and the floating-point control words pushed, rsp kept at AFrom,
+// rsp taken from ATo and the other stack's pushed state popped (returns on that stack)
+routine DoSaveRegisters(const ARegs: ptr); external name "__adam_registers";
+routine DoResumeAt(const ARegs: ptr; const APc: uint64); noreturn; external name "__adam_resume";
+routine DoSwitchStack(const AFrom: ptr; const ATo: ptr); external name "__adam_switch";
 
 var
   // The linker's bounds of Adam's function table (adam_pdata, plan H1): per function with
   // unwind data its start, end and UNWIND_INFO, each an int32 relative to its own field
   // (Rva32 written as R_X86_64_PC32, LX2a)
-  GPdataStart: uint8; external "c" name "__start_adam_pdata";
-  GPdataStop: uint8; external "c" name "__stop_adam_pdata";
+  GPdataStart: uint8; external name "__start_adam_pdata";
+  GPdataStop: uint8; external name "__stop_adam_pdata";
 
 forward type PlatformFinallyRun;
 
 type
-  // A ucontext_t (glibc x86_64: 968 bytes; its gregs at 40, REG_* order) as getcontext
-  // fills it and setcontext resumes it, in a 1024-byte 16-aligned block read by offset
-  PlatformContext = record align(16)
-    Bytes: array[0..1023] of uint8;
-  end;
   // A frame's registers as the unwinder walks them: the 16 general registers by their
   // unwind number (0 rax, 1 rcx, 2 rdx, 3 rbx, 4 rsp, 5 rbp, 6 rsi, 7 rdi, 8 .. 15 r8 ..
   // r15) and the frame's pc
@@ -478,13 +481,6 @@ const
   ADAM_PLATFORM_RAISE_CODE: uint32 = 0xE0414441;
   ADAM_PLATFORM_ABORT_CODE: uint32 = 0xE0414442;
   ADAM_PLATFORM_FAULT_CODE: uint32 = 0xE0414443;
-  // ucontext_t's gregs (uc_mcontext at 40, gregs first) and REG_RIP; the gregs index of
-  // each unwind number (REG_RAX 13, REG_RCX 14, REG_RDX 12, REG_RBX 11, REG_RSP 15, REG_RBP
-  // 10, REG_RSI 9, REG_RDI 8, REG_R8 .. REG_R15 0 .. 7)
-  ADAM_PLATFORM_CONTEXT_GREGS: uint64 = 40;
-  REG_RIP: uint64 = 16;
-  ADAM_PLATFORM_GREG_OF: array[0..15] of uint64 = [13, 14, 12, 11, 15, 10, 9, 8, 0, 1, 2, 3,
-    4, 5, 6, 7];
   // rsp's unwind number
   ADAM_PLATFORM_UNWIND_RSP: int64 = 4;
   // A function table entry's bytes
@@ -522,13 +518,14 @@ threadstatic
   GFaultPending: int32;
 
 type
-  // A coroutine (LX4e, plan H5): its saved registers while it is not running (a
-  // ucontext_t: swapcontext's), its stack (mmap'd: Map / MapSize the whole mapping, a guard
+  // A coroutine (LX4e, plan H5): its stack pointer while it is not running (its
+  // callee-saved registers and floating-point control words pushed below it:
+  // __adam_switch's), its stack (mmap'd: Map / MapSize the whole mapping, a guard
   // page at its low end; nil for a thread's own coroutine, which runs on the thread's stack),
   // the stack's bounds (StackLow .. StackHigh: what PlatformStackBase and the leak tracker's
   // walk tell), its run and block (nil for a thread's own)
-  PlatformCoroutine = record align(16)
-    Context: PlatformContext;
+  PlatformCoroutine = record
+    SavedRsp: uint64;
     Map: ptr;
     MapSize: uint64;
     StackLow: uint64;
@@ -604,39 +601,6 @@ begin
     return AField - (0x100000000 - LValue);
   end;
   return AField + LValue;
-end;
-
-// AContext's registers (getcontext's) as the walk's
-routine DoContextRegisters(const AContext: ptr to PlatformContext; var ARegs: PlatformRegisters);
-var
-  LGregs: uint64;
-  LI: int64;
-begin
-  LGregs := uint64(ptr(AContext)) + ADAM_PLATFORM_CONTEXT_GREGS;
-  for LI := 0 to 15 do
-    ARegs.Regs[LI] := DoWordAt(LGregs + ADAM_PLATFORM_GREG_OF[LI] * 8);
-  end;
-  ARegs.Pc := DoWordAt(LGregs + REG_RIP * 8);
-end;
-
-// The walk's registers ARegs written into AContext, resumed at APc (setcontext)
-routine DoResume(const AContext: ptr to PlatformContext; const ARegs: PlatformRegisters;
-  const APc: uint64); noreturn;
-var
-  LGregs: uint64;
-  LSlot: ptr to uint64;
-  LI: int64;
-begin
-  LGregs := uint64(ptr(AContext)) + ADAM_PLATFORM_CONTEXT_GREGS;
-  for LI := 0 to 15 do
-    LSlot := ptr to uint64(LGregs + ADAM_PLATFORM_GREG_OF[LI] * 8);
-    LSlot^ := ARegs.Regs[LI];
-  end;
-  LSlot := ptr to uint64(LGregs + REG_RIP * 8);
-  LSlot^ := APc;
-  setcontext(ptr(AContext));
-  DoWriteErrorText(ptr to const char("System.Runtime.Linux64: setcontext failed\n"));
-  abort();
 end;
 
 // Function table entries AA and AB swapped
@@ -1613,13 +1577,13 @@ end;
 // AUnwinding), each frame's handler calls its catching scopes' filters until one catches
 // (ADepth, AFrame: that frame's place in the walk and its base, ATarget the catch's
 // address; true); unwinding, each frame's handler runs its finally funclets, innermost
-// first, up to the catching frame, where the walk resumes at the catch (AContext's
-// registers made the frame's: setcontext). A frame of a handler running a finally
+// first, up to the catching frame, where the walk resumes at the catch (the
+// frame's registers loaded: DoResumeAt). A frame of a handler running a finally
 // (GFinallyRuns: a raise out of that funclet) is passed over to the frame the funclet
 // belongs to, at the scope after it; a foreign frame unwinds by its .eh_frame
 // (DoForeignUnwind). False (searching): no frame catches it
 routine DoWalk(const AStart: PlatformRegisters; const APointers: ptr;
-  const AContext: ptr to PlatformContext; const AUnwinding: bool; var ADepth: int64;
+  const AUnwinding: bool; var ADepth: int64;
   var AFrame: uint64; var ATarget: uint64): bool;
 var
   LRegs: PlatformRegisters;
@@ -1687,7 +1651,7 @@ begin
       if AUnwinding and (LDepth = ADepth) then
         // the catching frame: the finally runs the walk passed over are abandoned with it
         GFinallyRuns := LCursor;
-        DoResume(AContext, LRegs, ATarget);
+        DoResumeAt(ptr(addr of LRegs), ATarget);
       end;
       DoUnwindFrame(LRegs, LFacts);
       LDispatch.ScopeFirst := 0;
@@ -1707,7 +1671,6 @@ end;
 // it never returns
 routine DoDispatch(const ACode: uint32; const AKind: int32); noreturn;
 var
-  LContext: PlatformContext;
   LRecord: PlatformException;
   LPointers: array[0..1] of ptr;
   LStart: PlatformRegisters;
@@ -1717,18 +1680,17 @@ var
 begin
   LRecord.Code := ACode;
   LRecord.Kind := AKind;
-  getcontext(ptr(addr of LContext));
-  DoContextRegisters(addr of LContext, LStart);
+  memset(ptr(addr of LStart), 0, uint64(size(PlatformRegisters)));
+  DoSaveRegisters(ptr(addr of LStart));
   LPointers[0] := ptr(addr of LRecord);
-  LPointers[1] := ptr(addr of LContext);
+  LPointers[1] := ptr(addr of LStart);
   LDepth := -1;
   LFrame := 0;
   LTarget := 0;
-  if not DoWalk(LStart, ptr(addr of LPointers), addr of LContext, false, LDepth, LFrame,
-    LTarget) then
+  if not DoWalk(LStart, ptr(addr of LPointers), false, LDepth, LFrame, LTarget) then
     DoNoCatch(ptr to const char("no catching scope, or a frame no unwind data describes"));
   end;
-  DoWalk(LStart, ptr(addr of LPointers), addr of LContext, true, LDepth, LFrame, LTarget);
+  DoWalk(LStart, ptr(addr of LPointers), true, LDepth, LFrame, LTarget);
   DoNoCatch(ptr to const char("the catching frame was not met again"));
 end;
 
@@ -1974,11 +1936,10 @@ end;
 // Frame 0 of the walk is this routine's own. The walk is the unwinder's (DoFrameFacts,
 // DoUnwindFrame), a frame's facts kept in a per-thread cache by return address; it ends at
 // a frame with no Adam unwind data (glibc's __libc_start_main, a C library's), a slot off
-// the thread's stack or a nil return address. The registers come from getcontext
+// the thread's stack or a nil return address. The registers come from __adam_registers
 public routine PlatformCaptureFrames(const ASkip: int32; const ACount: int32;
   const AFrames: ptr): int32;
 var
-  LContext: PlatformContext;
   LRegs: PlatformRegisters;
   LFrames: ptr to uint64;
   LEntry: ptr to PlatformFrameFacts;
@@ -1995,8 +1956,7 @@ begin
   if GFrameHigh = 0 then
     DoFrameStart();
   end;
-  getcontext(ptr(addr of LContext));
-  DoContextRegisters(addr of LContext, LRegs);
+  DoSaveRegisters(ptr(addr of LRegs));
   LIndex := 0;
   LCaptured := 0;
   while LCaptured < ACount do
@@ -2097,13 +2057,7 @@ begin
   DoPending(ptr to const char("PlatformThreadDetach"), ptr to const char("LX4d"));
 end;
 
-// glibc: a coroutine's context made to start a routine on its own stack (makecontext: the
-// context getcontext filled, its uc_stack set), and the running context saved while
-// another is resumed (swapcontext: the registers, the signal mask with a system call, the
-// floating-point control state); memory mapped, protected and given back
-routine makecontext(const AContext: ptr; const AStart: routine(); const ACount: int32; ...);
-  external "c";
-routine swapcontext(const AFrom: ptr; const ATo: ptr): int32; external "c";
+// glibc: memory mapped, protected and given back
 routine mmap(const AAddress: ptr; const ALength: uint64; const AProtection: int32;
   const AFlags: int32; const AFile: int32; const AOffset: int64): ptr; external "c";
 routine mprotect(const AAddress: ptr; const ALength: uint64; const AProtection: int32): int32;
@@ -2124,10 +2078,12 @@ const
   MAP_ANONYMOUS: int32 = 0x20;
   MAP_STACK: int32 = 0x20000;
   ADAM_PLATFORM_MAP_FAILED: uint64 = 0xFFFFFFFFFFFFFFFF;
-  // ucontext_t's uc_link and uc_stack (stack_t: ss_sp, ss_flags, ss_size)
-  ADAM_PLATFORM_CONTEXT_LINK: uint64 = 8;
-  ADAM_PLATFORM_CONTEXT_STACK_SP: uint64 = 16;
-  ADAM_PLATFORM_CONTEXT_STACK_SIZE: uint64 = 32;
+  // A new coroutine's first switch (its stack's top, as __adam_switch pops it): the
+  // floating-point control words (MXCSR 0x1F80 then the x87 control word 0x037F: the ABI's
+  // initial state), six zeroed callee-saved registers, DoCoroutineStart as the return
+  // address, a nil return address above it (the unwinder's end of the stack)
+  ADAM_PLATFORM_FP_CONTROL: uint64 = 0x0000037F00001F80;
+  ADAM_PLATFORM_COROUTINE_FIRST: int64 = 9;
 
 // The calling thread's stack bounds (pthread_getattr_np: its lowest address and size) into
 // ALow / AHigh; false when they cannot be read
@@ -2153,7 +2109,7 @@ begin
 end;
 
 // The calling thread's own coroutine (GCoroutineThread), made the first time it is asked
-// for: no stack of its own (the thread's: its bounds kept), its context filled the first
+// for: no stack of its own (the thread's: its bounds kept), its stack pointer kept the first
 // time it switches away; nil when there is no room
 routine DoThreadCoroutine(): ptr to PlatformCoroutine;
 var
@@ -2181,10 +2137,10 @@ begin
   return LCoroutine;
 end;
 
-// A coroutine's start (makecontext's routine, on its own stack): the coroutine is the one
-// the switch to it wrote (GCoroutineCurrent), its run called with its block. A run never
-// returns (it ends by switching away for good, System.Runtime's GeneratorEnd): its
-// context links to none (uc_link nil would end the thread), so the process ends here
+// A coroutine's start (its first switch returns here, on its own stack): the coroutine is
+// the one the switch to it wrote (GCoroutineCurrent), its run called with its block. A run
+// never returns (it ends by switching away for good, System.Runtime's GeneratorEnd): there
+// is nothing to return to (the slot above holds nil), so the process ends here
 routine DoCoroutineStart();
 var
   LCoroutine: ptr to PlatformCoroutine;
@@ -2206,7 +2162,9 @@ var
   LCoroutine: ptr to PlatformCoroutine;
   LPage: uint64;
   LMap: ptr;
-  LSlot: ptr to uint64;
+  LSlots: ptr to uint64;
+  LStart: routine();
+  LI: int64;
 begin
   LPage := ADAM_PLATFORM_PAGE_DEFAULT;
   if sysconf(_SC_PAGESIZE) > 0 then
@@ -2223,8 +2181,7 @@ begin
     free(ptr(LCoroutine));
     return nil;
   end;
-  if (mprotect(LMap, LPage, PROT_NONE) <> 0) or
-    (getcontext(ptr(addr of LCoroutine^.Context)) <> 0) then
+  if mprotect(LMap, LPage, PROT_NONE) <> 0 then
     munmap(LMap, ADAM_PLATFORM_COROUTINE_STACK + LPage);
     free(ptr(LCoroutine));
     return nil;
@@ -2235,15 +2192,16 @@ begin
   LCoroutine^.StackHigh := uint64(LMap) + LPage + ADAM_PLATFORM_COROUTINE_STACK;
   LCoroutine^.Run := ARun;
   LCoroutine^.Block := ABlock;
-  // the stack above the guard page, linked to no context
-  LSlot := ptr to uint64(uint64(ptr(addr of LCoroutine^.Context)) + ADAM_PLATFORM_CONTEXT_LINK);
-  LSlot^ := 0;
-  LSlot := ptr to uint64(uint64(ptr(addr of LCoroutine^.Context)) + ADAM_PLATFORM_CONTEXT_STACK_SP);
-  LSlot^ := LCoroutine^.StackLow;
-  LSlot := ptr to uint64(uint64(ptr(addr of LCoroutine^.Context)) +
-    ADAM_PLATFORM_CONTEXT_STACK_SIZE);
-  LSlot^ := ADAM_PLATFORM_COROUTINE_STACK;
-  makecontext(ptr(addr of LCoroutine^.Context), DoCoroutineStart, 0);
+  // its first switch's frame at the stack's top (ADAM_PLATFORM_COROUTINE_FIRST words)
+  LStart := DoCoroutineStart;
+  LSlots := ptr to uint64(LCoroutine^.StackHigh - uint64(ADAM_PLATFORM_COROUTINE_FIRST) * 8);
+  LSlots[0] := ADAM_PLATFORM_FP_CONTROL;
+  for LI := 1 to 6 do
+    LSlots[LI] := 0;
+  end;
+  LSlots[7] := uint64(ptr(LStart));
+  LSlots[8] := 0;
+  LCoroutine^.SavedRsp := uint64(ptr(LSlots));
   return ptr(LCoroutine);
 end;
 
@@ -2283,7 +2241,7 @@ begin
     GFrameHigh := LTo^.StackHigh;
   end;
 @endif
-  swapcontext(ptr(addr of LFrom^.Context), ptr(addr of LTo^.Context));
+  DoSwitchStack(ptr(addr of LFrom^.SavedRsp), ptr(addr of LTo^.SavedRsp));
 end;
 
 // The coroutine ACoroutine (PlatformCoroutineNew's) freed, its stack with it: it is not
