@@ -1185,6 +1185,10 @@ public type
     // function's start, released at its exits
     hidden FRangeScratchOf: array of int64;
     hidden FRangeSlots: ref Int64List;
+    // By an argument's node id: the hidden string slot of the UTF-32 copy a wstring
+    // borrowed as a 32-bit wchar_t C string is passed as (DoIsWideCopy, F3), emptied at
+    // the function's start, released as its full expression ends (DoEndWideCopy); 0: none
+    hidden FWideCopyOf: array of int64;
     // By a canonical type's node id: the data blob of its managed map (DoManagedMap), and of
     // a dynamic array type's element map (DoElementMap); 0: none made yet, -1: refused
     // once, not again
@@ -1372,6 +1376,7 @@ public type
       setlength(self.FDroppedIn, ATree.Count);
       setlength(self.FLiveOf, ATree.Count);
       setlength(self.FRangeScratchOf, ATree.Count);
+      setlength(self.FWideCopyOf, ATree.Count);
       self.FRangeSlots := ref Int64List();
       setlength(self.FManagedMapOf, ATree.Count);
       setlength(self.FElementMapOf, ATree.Count);
@@ -5865,6 +5870,18 @@ public type
         end;
         return self.DoReachArgument(self.DoAnchoredAddress(AArg, false, self.DoIsAggregate(LType)), AArg, LType);
       end;
+      // a string borrowed as a C string (F3): its block held through the call when the
+      // callee could drop it, then its own text passed
+      if self.DoIsTextBorrow(AArg) then
+        LValue := self.DoManagedValue(AArg);
+        if (LValue <> 0) and self.DoNeedsHold(AArg, AParam) then
+          LValue := self.DoHeldValue(AArg, LValue, self.FTree[AArg].ResolvedType);
+        end;
+        if LValue = 0 then
+          return 0;
+        end;
+        return self.DoTextToC(LValue, AArg);
+      end;
       LValue := self.DoValue(AArg);
       if (LValue = 0) or not self.DoNeedsHold(AArg, AParam) then
         return LValue;
@@ -5985,6 +6002,15 @@ public type
     var
       LSig: int64;
     begin
+      // a string borrowed as a C string (F3): held unless stable, whatever the callee's
+      // linkage (C code may call back into Adam code that drops it; an external has no
+      // write summary, DoMayDrop)
+      if self.DoIsTextBorrow(AArg) and not self.FTree[AParam].HasFlag(NodeFlag.VarParam) then
+        if self.DoStableArg(AArg) then
+          return false;
+        end;
+        return self.DoMayDrop(self.FTree.ParentOf(AParam), self.FTree.ParentOf(AArg), AArg);
+      end;
       if not self.DoIsManaged(VariableTypeOf(self.FTree, AParam)) then
         return false;
       end;
@@ -6017,7 +6043,9 @@ public type
       LRoot: int64;
       LDecl: int64;
     begin
-      if (self.FTree[AArg].ResolvedConvert <> 0) and (not self.DoKeepsBlock(AArg)) then
+      // a string borrowed as a C string (F3) keeps its block: judged as that block
+      if (self.FTree[AArg].ResolvedConvert <> 0) and (not self.DoKeepsBlock(AArg)) and
+        (not self.DoIsTextBorrow(AArg)) then
         return false;
       end;
       LRoot := self.DoArgRoot(AArg);
@@ -8806,7 +8834,7 @@ public type
       end;
       if (AKind = RuntimeRoutine.WStrConcat) or (AKind = RuntimeRoutine.WStrFromChar) or
         (AKind = RuntimeRoutine.WStrSetLength) or (AKind = RuntimeRoutine.WStrUnique) or
-        (AKind = RuntimeRoutine.WStrUniqueShared) then
+        (AKind = RuntimeRoutine.WStrUniqueShared) or (AKind = RuntimeRoutine.WStrToUtf32) then
         return "wstring";
       end;
       return "";
@@ -9540,6 +9568,10 @@ public type
         if self.DoIsPropertyTextCompound(LChild) then
           self.DoTemporary(LChild);
         end;
+        // a wstring borrowed as a 32-bit wchar_t C string: its UTF-32 copy's slot (F3)
+        if self.DoIsWideCopy(LChild) then
+          self.DoWideCopySlot(LChild);
+        end;
         if self.DoIsConcat(LChild) then
           self.DoTemporary(LChild);
           if self.DoIsCharSide(self.FTree.FirstOf(LChild, NodeRole.Left)) then
@@ -9665,6 +9697,10 @@ public type
       if self.DoNeedsHold(AArg, AParam) then
         LRoot := self.DoArgRoot(AArg);
         LType := VariableTypeOf(self.FTree, AParam);
+        // a string borrowed as a C string (F3): its text block is what is held
+        if self.DoIsTextBorrow(AArg) then
+          LType := self.FTree[AArg].ResolvedType;
+        end;
         self.DoHoldSlot(LRoot, LType);
         return;
       end;
@@ -11408,6 +11444,7 @@ public type
       end;
       self.DoEndTemporary(AExpr);
       self.DoEndRangeScratch(AExpr);
+      self.DoEndWideCopy(AExpr);
       for LI := 0 to self.FTree.ChildCount(AExpr) - 1 do
         self.DoEndTemporaries(self.FTree.ChildAt(AExpr, LI));
       end;
@@ -18739,6 +18776,109 @@ public type
       return self.DoJoinOf(IrType.Pointer, LResult, LMoveEnd, LNil, LStart, ANode);
     end;
 
+    // True when the expression AId is a string or wstring of no constant text borrowed as
+    // the C string a ptr to const char / wchar / 8-bit integer parameter takes (SEM's F3
+    // form, BNF sec 6): its own text passed (DoTextToC), no copy; a literal's and a
+    // constant's are DoCStringLiteral's
+    hidden const method DoIsTextBorrow(const AId: int64): bool;
+    begin
+      return (self.FTree[AId].ResolvedConvert <> 0) and self.DoIsText(self.FTree[AId].ResolvedType) and
+        IsPointerClass(ClassOf(self.FTree, self.FTree[AId].ResolvedConvert)) and
+        (self.FTree[AId].Kind <> NodeKind.StringLiteral) and
+        (self.FTree[AId].ResolvedConst.Kind <> ConstKind.String);
+    end;
+
+    // True when the argument AId is a wstring borrowed as a ptr to const wchar where the
+    // target's wchar (C's wchar_t) is 32 bits (F3, x86_64-linux-gnu): its text is UTF-16
+    // units, so a UTF-32 copy is what C reads (WStrToUtf32, in FWideCopyOf's slot)
+    hidden const method DoIsWideCopy(const AId: int64): bool;
+    var
+      LPointee: int64;
+    begin
+      if not self.DoIsTextBorrow(AId) or not self.DoIsWideText(self.FTree[AId].ResolvedType) then
+        return false;
+      end;
+      LPointee := TargetOf(self.FTree, self.FTree[AId].ResolvedConvert);
+      return (ClassOf(self.FTree, LPointee) = TypeClass.WideChar) and
+        (TypeSize(self.FTree, self.FTarget, LPointee) = 4);
+    end;
+
+    // The hidden string slot of the UTF-32 copy the argument AId passes (DoIsWideCopy),
+    // empty, one of FManaged (released at its exits and unwinds as a text: its block is
+    // System.Runtime's layout, its units 4 bytes)
+    hidden method DoWideCopySlot(const AId: int64);
+    var
+      LSlot: int64;
+    begin
+      LSlot := self.DoSizedSlot(AId, self.FTarget.PointerSize(), self.FTarget.PointerAlign());
+      self.DoStore(LSlot, self.DoConstant(IrType.Pointer, 0, AId), AId);
+      self.FWideCopyOf[AId] := LSlot;
+      self.DoAddManaged(LSlot, 0, AId);
+    end;
+
+    // The UTF-32 copy of the argument AId (FWideCopyOf; none: nothing) released and
+    // emptied as its full expression ends, as a text temporary is (DoEndTemporary)
+    hidden method DoEndWideCopy(const AId: int64);
+    var
+      LSlot: int64;
+    begin
+      LSlot := self.FWideCopyOf[AId];
+      if LSlot = 0 then
+        return;
+      end;
+      if not self.DoReleaseAt(LSlot, 0, AId) then
+        return;
+      end;
+      self.DoStore(LSlot, self.DoConstant(IrType.Pointer, 0, AId), AId);
+    end;
+
+    // The text block ABlock of the argument ANode (nil or a block in System.Runtime's
+    // layout, its units always followed by a 0 unit: DoTextReady, DoStringBlock,
+    // DoWideBlock) as a C string (F3): its first unit's address, past the header; a wstring
+    // where wchar_t is 32 bits first copied to UTF-32 (DoIsWideCopy, kept in its slot to
+    // the call's end: StrTake releases what an earlier pass left there); nil, the empty
+    // text, a read-only 0 unit of its own (four bytes: a 0 unit of any width)
+    hidden method DoTextToC(const ABlock: int64; const ANode: int64): int64;
+    var
+      LText: int64;
+      LIsNil: int64;
+      LStart: int64;
+      LEmpty: int64;
+      LMove: int64;
+      LJoin: int64;
+      LData: int64;
+      LNul: int64;
+      LMoved: int64;
+    begin
+      LText := ABlock;
+      if self.DoIsWideCopy(ANode) then
+        LText := self.DoCallRuntime(RuntimeRoutine.WStrToUtf32, ABlock, 0, ANode);
+        if LText = 0 then
+          return 0;
+        end;
+        if self.DoCallRuntime(RuntimeRoutine.StrTake, self.FWideCopyOf[ANode], LText, ANode) = 0 then
+          return 0;
+        end;
+      end;
+      LIsNil := self.DoCompareWith(IrPredicate.Equal, LText, self.DoConstant(IrType.Pointer, 0, ANode), ANode);
+      LStart := self.FBlock;
+      LEmpty := self.FModule.AddBlock(self.FFunction);
+      LMove := self.FModule.AddBlock(self.FFunction);
+      LJoin := self.FModule.AddBlock(self.FFunction);
+      self.DoBranchOn(LIsNil, LEmpty, LMove, ANode);
+      self.FBlock := LEmpty;
+      LData := self.DoHelperData(ADAM_LOWERING_TEXT_SYMBOL, 4, ANode);
+      self.DoAddLe32(LData, 0);
+      LNul := self.DoEmit(IrOp.Address, IrType.Pointer, ANode);
+      self.FModule.InstrAt(LNul).Link := LData;
+      self.DoJumpTo(LJoin, ANode);
+      self.FBlock := LMove;
+      LMoved := self.DoByteOffset(LText, ADAM_LOWERING_STRING_HEADER, ANode);
+      self.DoJumpTo(LJoin, ANode);
+      self.FBlock := LJoin;
+      return self.DoJoinOf(IrType.Pointer, LNul, LEmpty, LMoved, LMove, ANode);
+    end;
+
     // The pointer AValue moved by AOffset bytes unless it is nil (nil stays nil: the move is
     // a block of its own past a nil test, joined by a phi), at ANode; AValue itself when
     // AOffset is 0
@@ -18788,12 +18928,15 @@ public type
     end;
 
     // The string literal ALiteral as the C string a ptr to const char / wchar / 8-bit
-    // integer APtrType points at (BNF sec 6 pointer cast, a literal's type-driven form): a
-    // read-only blob of its bytes and a NUL (char, uint8, int8), or its text as UTF-16 code units and a NUL unit (wchar:
-    // the target's 16 bits, a code point past 0xFFFF as its surrogate pair); its address
+    // integer / uint16 APtrType points at (BNF sec 6 pointer cast, a literal's type-driven
+    // form): a read-only blob of its bytes and a NUL (char, uint8, int8); its text as
+    // UTF-16 code units and a 0 unit (uint16, C's char16_t, on every target; wchar where
+    // the target's wchar_t is 16 bits: a code point past 0xFFFF as its surrogate pair); as
+    // UTF-32 code points and a 0 unit (wchar where wchar_t is 32 bits, F3); its address
     hidden method DoCStringLiteral(const ALiteral: int64; const APtrType: int64): int64;
     var
       LText: string;
+      LPointee: int64;
       LWide: bool;
       LData: int64;
       LAddress: int64;
@@ -18801,7 +18944,21 @@ public type
       LI: int64;
     begin
       LText := self.FTree[ALiteral].ResolvedConst.Text;
-      LWide := ClassOf(self.FTree, TargetOf(self.FTree, APtrType)) = TypeClass.WideChar;
+      LPointee := TargetOf(self.FTree, APtrType);
+      if (ClassOf(self.FTree, LPointee) = TypeClass.WideChar) and
+        (TypeSize(self.FTree, self.FTarget, LPointee) = 4) then
+        LData := self.DoHelperData(ADAM_LOWERING_TEXT_SYMBOL, 4, ALiteral);
+        LI := 0;
+        while LI < len(LText) do
+          self.DoAddLe32(LData, int64(DecodeUtf8Char(LText, LI)));
+        end;
+        self.DoAddLe32(LData, 0);
+        LAddress := self.DoEmit(IrOp.Address, IrType.Pointer, ALiteral);
+        self.FModule.InstrAt(LAddress).Link := LData;
+        return LAddress;
+      end;
+      LWide := (ClassOf(self.FTree, LPointee) = TypeClass.WideChar) or
+        (IsIntegerClass(ClassOf(self.FTree, LPointee)) and (self.FTree[LPointee].Text = "uint16"));
       if LWide then
         LData := self.DoHelperData(ADAM_LOWERING_TEXT_SYMBOL,
           2, ALiteral);
@@ -20610,6 +20767,15 @@ public type
         (self.FTree[AId].ResolvedConst.Kind = ConstKind.String) and
         IsPointerClass(ClassOf(self.FTree, self.DoUsedType(AId))) then
         return self.DoCStringLiteral(AId, self.DoUsedType(AId));
+      end;
+      // a string borrowed as a C string (F3): its own text (a call's argument is held by
+      // DoArgument when its callee could drop it)
+      if self.DoIsTextBorrow(AId) then
+        LValue := self.DoManagedValue(AId);
+        if LValue = 0 then
+          return 0;
+        end;
+        return self.DoTextToC(LValue, AId);
       end;
       if self.DoIsFloatConstant(AId) then
         return self.DoFloatConstant(AId);
