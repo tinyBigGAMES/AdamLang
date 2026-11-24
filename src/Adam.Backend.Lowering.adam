@@ -386,6 +386,26 @@ public const
   // The prefix of an async call site's entry function's symbol (its index follows;
   // internal): TaskRun calls it with the task's object, it runs the call (DoTaskBody)
   ADAM_LOWERING_TASK_ENTRY_SYMBOL: string = "__adam_taskentry";
+  // The prefix of a func literal's function's symbol (F2a; its task entry index follows,
+  // internal): its closure's code (DoClosureBody), or a captureless one's routine
+  ADAM_LOWERING_CLOSURE_SYMBOL: string = "__adam_closure";
+  // The prefix of a closure adapter's function's symbol (F2a; its task entry index
+  // follows, internal): a routine run through a closure (DoAdapterBody)
+  ADAM_LOWERING_ADAPTER_SYMBOL: string = "__adam_adapter";
+  // The prefix of a routine's constant closure block's read-only data symbol (F2a; its
+  // data id follows): System.Runtime's ref block, its count ADAM_LOWERING_STRING_CONSTANT_COUNT
+  // (never counted, never freed), its object the adapter's code (DoRoutineClosure)
+  ADAM_LOWERING_CLOSURE_BLOCK_SYMBOL: string = "__adam_closureblock";
+  // A closure's object (F2a, BNF sec 4), past its ref block's header: its code's address at
+  // ADAM_LOWERING_CLOSURE_CODE, then one word per Capture of its literal from
+  // ADAM_LOWERING_CLOSURE_HOLDERS (the ref block holding the captured variable: its box,
+  // or a ref object's own for self; the variable 24 bytes past it, ADAM_LOWERING_REF_HEADER),
+  // or, made from a routine value, that value's code (DoValueClosure)
+  ADAM_LOWERING_CLOSURE_CODE: int64 = 0;
+  ADAM_LOWERING_CLOSURE_HOLDERS: int64 = 8;
+  // The type FManaged keeps for a ref block a function holds that has no canonical type
+  // of its own (F2a: a captured variable's box, DoBoxSlot): released by RefRelease
+  ADAM_LOWERING_BLOCK_TYPE: int64 = -1;
   // The prefix of an async call site's task end function's symbol (its index follows;
   // internal): the descriptor's done when the task's object holds value objects that end
   // by a done (DoTaskEndBody): TaskDone, then those values ended
@@ -942,6 +962,31 @@ public type
     // The slot the current method keeps self in: the address of its object (0: the
     // current function is no method)
     hidden FSelfSlot: int64;
+    // The slot a func literal's function keeps its closure's block in (F2a: its hidden
+    // parameter after the hidden result, DoParams; 0 in any other function)
+    hidden FClosureSlot: int64;
+    // By a variable's or parameter's node id: a func literal captures it (F2a), so it lives
+    // in a box of its own, a ref block holding it 24 bytes in (DoBoxSlot): the slot its
+    // address is kept in its FSlotOf (FByRef), its box's slot (one of FManaged) its FBoxOf.
+    // FPendingBoxes: the current function's boxed variables whose boxes DoMakeBoxes makes
+    // once its slots are made, FPendingCopies beside each 1 when its value is copied in
+    // from where it lies now (a parameter, a task's or a generator's copy), else 0, and
+    // FPendingSlots the slot its address goes in
+    hidden FBoxed: BoolArray;
+    hidden FBoxOf: array of int64;
+    hidden FPendingBoxes: ref Int64List;
+    hidden FPendingCopies: ref Int64List;
+    hidden FPendingSlots: ref Int64List;
+    // The closure adapters (F2a, DoAdapter): by the key of their routine (a declaration)
+    // or routine type and closure type, the function; FAdapterNodes / FAdapterTypes by
+    // task entry index (FTaskEntries holds the function, FTaskNodes the closure type):
+    // the routine (0: a value's) and the routine type; FClosureBlockOf by routine: its
+    // constant closure block's data (DoRoutineClosure)
+    hidden FAdapterOf: ref Int64Map;
+    hidden FAdapterRoutines: ref Int64Map;
+    hidden FAdapterTypes: ref Int64Map;
+    hidden FClosureBlockOf: ref Int64Map;
+    hidden FBoxDescriptorOf: ref Int64Map;
     // The slot a generator method's ramp keeps its hidden holder in (G1c2: the block of the
     // ref its call reached self through, nil for a self the ramp copies; 0: no such method)
     hidden FHolderSlot: int64;
@@ -1310,6 +1355,18 @@ public type
       setlength(self.FHeld, ATree.Count);
       setlength(self.FHeldIn, ATree.Count);
       setlength(self.FUnpinned, ATree.Count);
+      setlength(self.FBoxed, ATree.Count);
+      setlength(self.FBoxOf, ATree.Count);
+      self.FPendingBoxes := ref Int64List();
+      self.FPendingCopies := ref Int64List();
+      self.FPendingSlots := ref Int64List();
+      self.FAdapterOf := ref Int64Map(0);
+      self.FAdapterRoutines := ref Int64Map(0);
+      self.FAdapterTypes := ref Int64Map(0);
+      self.FClosureBlockOf := ref Int64Map(0);
+      self.FBoxDescriptorOf := ref Int64Map(0);
+      self.FClosureSlot := 0;
+      self.DoMarkBoxed();
       setlength(self.FPrimed, ATree.Count);
       setlength(self.FHoldAfter, ATree.Count);
       setlength(self.FDroppedIn, ATree.Count);
@@ -1592,6 +1649,11 @@ public type
       if self.FTree[ASig].ResolvedLinkage <> Linkage.Unset then
         return self.FTree[ASig].ResolvedLinkage;
       end;
+      // a captureless func literal retyped to a plain func (F2a): that routine type's
+      if (self.FTree[ASig].Kind = NodeKind.FuncLiteral) and
+        (ClassOf(self.FTree, self.FTree[ASig].ResolvedType) = TypeClass.RoutineType) then
+        return self.DoLinkageOf(self.FTree[self.FTree[ASig].ResolvedType].ResolvedDecl);
+      end;
       // a method is a C++ member function: its symbol mangles its parameters by C++
       // linkage (Symbols.DoEncoding), so they pass by C++'s rule too
       if self.DoHasSelf(ASig) then
@@ -1794,6 +1856,10 @@ public type
         if self.FHiddenResult[ARoutine] then
           ASignature.AddParam(IrType.Pointer);
         end;
+      end;
+      // a closure's block (F2a)
+      if self.DoTakesClosure(ARoutine) then
+        ASignature.AddParam(IrType.Pointer);
       end;
       if self.DoHasSelf(ARoutine) then
         ASignature.AddParam(IrType.Pointer);
@@ -4208,10 +4274,11 @@ public type
         return false;
       end;
       LClass := ClassOf(self.FTree, AType);
-      // an own, a task and a sequence are ref blocks (DoIsRefValue), a weak watches one
+      // an own, a task, a sequence and a closure are ref blocks (DoIsRefValue), a weak
+      // watches one
       if (LClass = TypeClass.RefType) or (LClass = TypeClass.OwnType) or
         (LClass = TypeClass.TaskType) or (LClass = TypeClass.SequenceType) or
-        (LClass = TypeClass.WeakType) then
+        (LClass = TypeClass.WeakType) or (LClass = TypeClass.ClosureType) then
         return true;
       end;
       if LClass = TypeClass.StaticArray then
@@ -8589,7 +8656,8 @@ public type
       end;
       LClass := ClassOf(self.FTree, AType);
       return (LClass = TypeClass.RefType) or (LClass = TypeClass.OwnType) or
-        (LClass = TypeClass.TaskType) or (LClass = TypeClass.SequenceType);
+        (LClass = TypeClass.TaskType) or (LClass = TypeClass.SequenceType) or
+        (LClass = TypeClass.ClosureType);
     end;
 
     // True when the canonical type AType is an own I or a ref I (I3): its value is nil or
@@ -9041,6 +9109,13 @@ public type
       if self.FPrimed[AId] <> 0 then
         return self.FPrimed[AId];
       end;
+      // a routine value converted to a closure (F2a)
+      if self.DoIsRoutineClosure(AId) then
+        if self.DoNamedRoutine(AId) <> 0 then
+          return self.DoRoutineClosure(AId, self.DoNamedRoutine(AId));
+        end;
+        return self.DoValueClosure(AId);
+      end;
       LValue := self.DoManagedOwn(AId);
       if (LValue = 0) or (self.FTree[AId].ResolvedConvert = 0) then
         return LValue;
@@ -9108,6 +9183,10 @@ public type
       end;
       if self.FTree[AId].Kind = NodeKind.AsyncExpression then
         return self.DoAsync(AId);
+      end;
+      // a func literal's closure (F2a)
+      if self.FTree[AId].Kind = NodeKind.FuncLiteral then
+        return self.DoClosureValue(AId);
       end;
       // `ref S as T`: the ref's block, borrowed as the operand's is, checked (DoAsHolder)
       if self.FTree[AId].Kind = NodeKind.AsExpression then
@@ -9431,8 +9510,18 @@ public type
           self.DoPointerTemporary(LChild, self.DoUsedType(self.FTree.NthOf(LChild, NodeRole.Argument, 0)));
         end;
         if ((self.FTree[LChild].Kind = NodeKind.RefNew) or (self.FTree[LChild].Kind = NodeKind.OwnNew) or
-          (self.FTree[LChild].Kind = NodeKind.AsyncExpression)) and
+          (self.FTree[LChild].Kind = NodeKind.AsyncExpression) or
+          (self.FTree[LChild].Kind = NodeKind.FuncLiteral)) and
           self.DoIsRefValue(self.FTree[LChild].ResolvedType) then
+          self.DoPointerTemporary(LChild, self.FTree[LChild].ResolvedType);
+        end;
+        // a routine value's closure made here (F2a, DoValueClosure)
+        if self.DoIsValueClosure(LChild) then
+          self.DoPointerTemporary(LChild, self.FTree[LChild].ResolvedConvert);
+        end;
+        // a closure call's callee held for the call (F2a, DoClosureCall)
+        if (self.FTree.RoleOf(LChild) = NodeRole.Callee) and self.DoIsClosureValue(LChild) and
+          self.DoHoldsCallee(LChild) then
           self.DoPointerTemporary(LChild, self.FTree[LChild].ResolvedType);
         end;
         if (self.FTree[LChild].Kind = NodeKind.ArrayLiteral) and
@@ -9854,7 +9943,8 @@ public type
               self.DoPathAdd(APath, self.FTree[LNode].ResolvedEmbed);
             end;
             if AWrite and ((LClass = TypeClass.RefType) or (LClass = TypeClass.TaskType) or
-              (LClass = TypeClass.SequenceType) or (LClass = TypeClass.OwnType)) then
+              (LClass = TypeClass.SequenceType) or (LClass = TypeClass.OwnType) or
+              (LClass = TypeClass.ClosureType)) then
               APath.RootKind := PathRoot.None;
               return;
             end;
@@ -10891,9 +10981,10 @@ public type
       end;
       self.FReleaseSeen.Put(AType, 1);
       LClass := ClassOf(self.FTree, AType);
-      // a sequence's last release may abort its generator: its finally / defer run any code
+      // a sequence's last release may abort its generator: its finally / defer run any code;
+      // a closure's releases its environment, whose values' ends run any code (F2a)
       if (LClass = TypeClass.InterfaceType) or (LClass = TypeClass.TaskType) or
-        (LClass = TypeClass.SequenceType) then
+        (LClass = TypeClass.SequenceType) or (LClass = TypeClass.ClosureType) then
         return 2;
       end;
       if (LClass = TypeClass.DynamicArray) or (LClass = TypeClass.StaticArray) or
@@ -11197,7 +11288,7 @@ public type
           return LDecl;
         end;
       end;
-      if self.DoIsRoutineValue(LCallee) then
+      if self.DoIsRoutineValue(LCallee) or self.DoIsClosureValue(LCallee) then
         return self.FTree[self.FTree[LCallee].ResolvedType].ResolvedDecl;
       end;
       return 0;
@@ -11378,6 +11469,10 @@ public type
       self.FManagedType := ref Int64List();
       self.FManagedLive := ref Int64List();
       self.FExitBlocks := ref Int64List();
+      self.FPendingBoxes := ref Int64List();
+      self.FPendingCopies := ref Int64List();
+      self.FPendingSlots := ref Int64List();
+      self.FClosureSlot := 0;
       self.DoStartRegions();
     end;
 
@@ -11423,6 +11518,13 @@ public type
     // then no one's to release)
     hidden method DoAddManaged(const ASlot: int64; const AType: int64; const ANode: int64): bool;
     begin
+      // a box a function holds (F2a: ADAM_LOWERING_BLOCK_TYPE) needs no map, no live flag
+      if AType = ADAM_LOWERING_BLOCK_TYPE then
+        self.FManaged.Add(ASlot);
+        self.FManagedType.Add(AType);
+        self.FManagedLive.Add(0);
+        return true;
+      end;
       if self.DoIsArrayValue(AType) then
         if self.DoElementMapData(AType, ANode) = 0 then
           return false;
@@ -11541,6 +11643,11 @@ public type
       LMap: int64;
       LArgs: ref Int64List;
     begin
+      // a box (F2a): its ref block's last release ends its value
+      if AType = ADAM_LOWERING_BLOCK_TYPE then
+        LValue := self.DoLoad(AAddress, IrType.Pointer, ANode);
+        return self.DoCallRuntime(RuntimeRoutine.RefRelease, LValue, 0, ANode) <> 0;
+      end;
       if (AType = 0) or self.DoIsText(AType) then
         LValue := self.DoLoad(AAddress, IrType.Pointer, ANode);
         return self.DoCallRuntime(RuntimeRoutine.StrRelease, LValue, 0, ANode) <> 0;
@@ -12669,7 +12776,7 @@ public type
       if ADecl <> 0 then
         ASig := ADecl;
       else
-        if not self.DoIsRoutineValue(LCallee) then
+        if not self.DoIsRoutineValue(LCallee) and not self.DoIsClosureValue(LCallee) then
           self.DoRefuse(AAsync, "async of " + self.FTree.ConstructPhrase(ACall));
           return false;
         end;
@@ -13161,6 +13268,12 @@ public type
         return 0;
       end;
       LFirst := self.DoTaskHeads(ACall, ADecl);
+      // a closure's call (F2a): the code word holds the closure
+      if (ADecl = 0) and self.DoIsClosureValue(self.FTree.FirstOf(ACall, NodeRole.Callee)) and
+        (not self.DoManagedRuns(self.FTree[self.FTree.FirstOf(ACall, NodeRole.Callee)].ResolvedType,
+        AOffsets[0], LRuns, AAsync)) then
+        return 0;
+      end;
       LMember := self.DoMethodMember(ACall);
       if LMember <> 0 then
         LHolder := self.DoTaskHolder(LMember);
@@ -13226,6 +13339,821 @@ public type
       self.FTaskEntries.Add(LFunction);
       self.FTaskNodes.Add(AAsync);
       return LFunction;
+    end;
+
+    // Every variable and parameter a func literal captures marked FBoxed (F2a, BNF sec 6):
+    // each Capture of each func literal in the tree names one (a self's names its method:
+    // no variable, the ref object's own block holds it); it lives in a box of its own
+    // (DoBoxSlot), so a closure holds it by that box whatever function reaches it
+    hidden method DoMarkBoxed();
+    var
+      LDecl: int64;
+      LI: int64;
+    begin
+      for LI := 1 to self.FTree.Count - 1 do
+        if (self.FTree[LI].Kind = NodeKind.Capture) and
+          (self.FTree[self.FTree.ParentOf(LI)].Kind = NodeKind.FuncLiteral) then
+          LDecl := self.FTree[LI].ResolvedDecl;
+          if (LDecl > 0) and not IsRoutineLike(self.FTree[LDecl].Kind) then
+            self.FBoxed[LDecl] := true;
+          end;
+        end;
+      end;
+    end;
+
+    // The boxed (FBoxed) variable or parameter ADecl's slots (F2a), made where its own slot
+    // would be (before any of the function's code runs): its box's (FBoxOf), empty, one of
+    // FManaged (the frame's holder, released at every exit), and the one its address is
+    // kept in, its FSlotOf (FByRef: every use reaches it through that address), filled by
+    // DoMakeBoxes once every slot is made. ACopy: its value is copied into the box from where
+    // it lies now (a parameter's slot, a task's or a generator's copy), so FSlotOf changes
+    // only there
+    hidden method DoBoxSlot(const ADecl: int64; const ACopy: bool);
+    var
+      LWord: int64;
+      LAddress: int64;
+      LBox: int64;
+      LCopy: int64;
+    begin
+      LWord := self.FTarget.PointerSize();
+      LBox := self.DoSizedSlot(ADecl, LWord, self.FTarget.PointerAlign());
+      self.DoStore(LBox, self.DoConstant(IrType.Pointer, 0, ADecl), ADecl);
+      if not self.DoAddManaged(LBox, ADAM_LOWERING_BLOCK_TYPE, ADecl) then
+        return;
+      end;
+      self.FBoxOf[ADecl] := LBox;
+      LAddress := self.DoSizedSlot(ADecl, LWord, self.FTarget.PointerAlign());
+      LCopy := 0;
+      if ACopy then
+        LCopy := 1;
+      else
+        self.FSlotOf[ADecl] := LAddress;
+        self.FByRef[ADecl] := true;
+        self.FByCopy[ADecl] := false;
+      end;
+      self.FPendingBoxes.Add(ADecl);
+      self.FPendingCopies.Add(LCopy);
+      self.FPendingSlots.Add(LAddress);
+    end;
+
+    // Each parameter of ARoutine a func literal captures (FBoxed) given its box, its value
+    // copied in (DoBoxSlot, made by DoMakeBoxes)
+    hidden method DoBoxParams(const ARoutine: int64);
+    var
+      LParam: int64;
+      LI: int64;
+    begin
+      for LI := 0 to self.DoParamCount(ARoutine) - 1 do
+        LParam := self.DoParamAt(ARoutine, LI);
+        if (LParam <> 0) and self.FBoxed[LParam] and (self.FSlotOf[LParam] <> 0) then
+          self.DoBoxSlot(LParam, true);
+        end;
+      end;
+    end;
+
+    // The boxes of the current function's boxed variables (DoBoxSlot's, F2a), at ANode once
+    // all its slots are made (a raise on the way finds each later one empty): a new ref
+    // block over its type's box descriptor (DoBoxDescriptorData) kept in its box slot, the
+    // value 24 bytes in (zeroed, or its value copied in: DoTaskCopy, a holder added to each
+    // value it holds, a value object by its type's copy), whose address its FSlotOf holds
+    // from here on; false after LW0001
+    hidden method DoMakeBoxes(const ANode: int64): bool;
+    var
+      LDecl: int64;
+      LType: int64;
+      LData: int64;
+      LDescriptor: int64;
+      LBox: int64;
+      LValue: int64;
+      LSource: int64;
+      LI: int64;
+    begin
+      for LI := 0 to self.FPendingBoxes.Count - 1 do
+        LDecl := self.FPendingBoxes[LI];
+        LType := VariableTypeOf(self.FTree, LDecl);
+        LData := self.DoBoxDescriptorData(LType, LDecl);
+        if LData = 0 then
+          return false;
+        end;
+        LDescriptor := self.DoEmit(IrOp.Address, IrType.Pointer, LDecl);
+        self.FModule.InstrAt(LDescriptor).Link := LData;
+        LBox := self.DoCallRuntimeSiteOne(RuntimeRoutine.RefNew, LDescriptor, LDecl, TypeText(self.FTree, LType));
+        if LBox = 0 then
+          return false;
+        end;
+        self.DoStore(self.FBoxOf[LDecl], LBox, LDecl);
+        LValue := self.DoByteOffset(LBox, ADAM_LOWERING_REF_HEADER, LDecl);
+        if self.FPendingCopies[LI] <> 0 then
+          LSource := self.DoDeclAddress(LDecl, LDecl);
+          if (LSource = 0) or not self.DoTaskCopy(LSource, LType, LValue, LDecl) then
+            return false;
+          end;
+        end;
+        self.DoStore(self.FPendingSlots[LI], LValue, LDecl);
+        // the box's value is shared: never moved out (a value object's own copy, a
+        // parameter's, still ends by its live flag, FManaged's)
+        self.FLiveOf[LDecl] := 0;
+        self.FSlotOf[LDecl] := self.FPendingSlots[LI];
+        self.FByRef[LDecl] := true;
+        self.FByCopy[LDecl] := false;
+      end;
+      self.FPendingBoxes := ref Int64List();
+      self.FPendingCopies := ref Int64List();
+      self.FPendingSlots := ref Int64List();
+      return true;
+    end;
+
+    // The read-only data of the ref descriptor of a box holding a value of the canonical
+    // type AType (F2a), made the first time: an object type's own (DoRefDescriptorData);
+    // any other type's in System.Runtime's layout, its size, the function that ends it
+    // (DoEndFunction, 0 when nothing ends), its managed map (DoMapWords). 0 after LW0001
+    hidden method DoBoxDescriptorData(const AType: int64; const ANode: int64): int64;
+    var
+      LFunction: int64;
+      LWords: ref Int64List;
+      LAddresses: ref Int64List;
+      LData: int64;
+    begin
+      if ClassOf(self.FTree, AType) = TypeClass.ObjectType then
+        return self.DoRefDescriptorData(AType, ANode);
+      end;
+      LData := self.FBoxDescriptorOf.Find(AType);
+      if LData <> 0 then
+        return LData;
+      end;
+      LFunction := 0;
+      if self.DoNeedsEnd(AType) then
+        LFunction := self.DoEndFunction(AType, ANode);
+        if LFunction = 0 then
+          return 0;
+        end;
+      end;
+      LWords := ref Int64List();
+      LWords.Add(TypeSize(self.FTree, self.FTarget, AType));
+      LWords.Add(0);
+      LAddresses := ref Int64List();
+      if not self.DoMapWords(AType, ANode, LWords, ref Int64List(), LAddresses) then
+        return 0;
+      end;
+      LData := self.DoHelperData(ADAM_LOWERING_REF_DESCRIPTOR_SYMBOL, 8, ANode);
+      self.DoAddLe64(LData, LWords[0]);
+      if LFunction = 0 then
+        self.DoAddLe64(LData, 0);
+      else
+        self.FModule.DataAt(LData).AddAddress(self.FModule.FunctionAt(LFunction).Symbol, 0);
+      end;
+      self.DoAddWords(LData, LWords, 2, LAddresses);
+      self.FBoxDescriptorOf.Put(AType, LData);
+      return LData;
+    end;
+
+    // True when the signature ASig takes a closure's block as a hidden ptr parameter after
+    // its hidden result (F2a): a closure type's (its calls pass the closure), a func
+    // literal's typed one (its function is that closure's code); a captureless literal
+    // retyped to a plain func (Semantics, a C callback) takes none
+    hidden const method DoTakesClosure(const ASig: int64): bool;
+    begin
+      if self.FTree[ASig].Kind = NodeKind.ClosureType then
+        return true;
+      end;
+      return (self.FTree[ASig].Kind = NodeKind.FuncLiteral) and
+        (ClassOf(self.FTree, self.FTree[ASig].ResolvedType) = TypeClass.ClosureType);
+    end;
+
+    // True when the callee ACallee is a closure value (its type a closure type, F2a)
+    hidden const method DoIsClosureValue(const ACallee: int64): bool;
+    var
+      LType: int64;
+    begin
+      LType := self.FTree[ACallee].ResolvedType;
+      return (LType <> 0) and (ClassOf(self.FTree, LType) = TypeClass.ClosureType);
+    end;
+
+    // True when the expression AId is a routine value that converts to a closure (F2a,
+    // Semantics' ResolvedConvert): a routine named as one (DoRoutineClosure) or any other
+    // routine value (DoValueClosure)
+    hidden const method DoIsRoutineClosure(const AId: int64): bool;
+    var
+      LTo: int64;
+      LFrom: int64;
+    begin
+      LTo := self.FTree[AId].ResolvedConvert;
+      LFrom := self.FTree[AId].ResolvedType;
+      return (LTo <> 0) and (LFrom <> 0) and (ClassOf(self.FTree, LTo) = TypeClass.ClosureType) and
+        (ClassOf(self.FTree, LFrom) = TypeClass.RoutineType);
+    end;
+
+    // The routine AId names as a value (BNF sec 4 R5: a routine's name, a static method
+    // through its type, J3d); 0 for any other routine value
+    hidden method DoNamedRoutine(const AId: int64): int64;
+    var
+      LKind: NodeKind;
+    begin
+      LKind := NameKindOf(self.FTree, AId);
+      if LKind = NodeKind.ParenExpression then
+        return self.DoNamedRoutine(self.FTree.FirstOf(AId, NodeRole.Operand));
+      end;
+      if LKind = NodeKind.NameExpression then
+        return self.DoCalled(AId);
+      end;
+      if (LKind = NodeKind.MemberExpression) and self.DoIsStaticMethod(self.FTree[AId].ResolvedDecl) then
+        return self.FTree[AId].ResolvedDecl;
+      end;
+      return 0;
+    end;
+
+    // True when the Capture ACapture of a func literal (F2a) has a holder in its closure: a
+    // self (its ref object's block), any variable or parameter but a scalar constant (its
+    // uses are folded: no storage)
+    hidden const method DoCaptureStored(const ACapture: int64): bool;
+    var
+      LDecl: int64;
+    begin
+      LDecl := self.FTree[ACapture].ResolvedDecl;
+      if LDecl <= 0 then
+        return false;
+      end;
+      if IsRoutineLike(self.FTree[LDecl].Kind) then
+        return true;
+      end;
+      if self.FTree[LDecl].Kind = NodeKind.ConstDecl then
+        return self.DoIsAggregate(VariableTypeOf(self.FTree, LDecl));
+      end;
+      return true;
+    end;
+
+    // The block holding what the Capture ACapture of a func literal names, where the
+    // literal is made (F2a): a self's object past its ref block's header (a ref object's,
+    // SEM's F2a0), any variable's box (FBoxed: wherever the current function reaches it,
+    // it lies 24 bytes into its box); 0 after LW0001
+    hidden method DoCaptureHolder(const ACapture: int64): int64;
+    var
+      LDecl: int64;
+      LAddress: int64;
+    begin
+      LDecl := self.FTree[ACapture].ResolvedDecl;
+      if IsRoutineLike(self.FTree[LDecl].Kind) then
+        if self.FSelfSlot = 0 then
+          self.DoRefuse(ACapture, "a capture of self");
+          return 0;
+        end;
+        return self.DoByteOffset(self.DoLoad(self.FSelfSlot, IrType.Pointer, ACapture),
+          -ADAM_LOWERING_REF_HEADER, ACapture);
+      end;
+      LAddress := self.DoDeclAddress(LDecl, ACapture);
+      if LAddress = 0 then
+        // a local refused at its declaration was reported there
+        if not self.FSlotRefused[LDecl] then
+          self.DoRefuse(ACapture, "a capture of " + self.FTree.ConstructPhrase(LDecl));
+        end;
+        return 0;
+      end;
+      return self.DoByteOffset(LAddress, -ADAM_LOWERING_REF_HEADER, ACapture);
+    end;
+
+    // The read-only data of the ref descriptor of a closure block of AHolders holder words
+    // and APlain plain words after them (F2a): its object's size (the code, the holders, the
+    // plain words), no done, its managed map the run of the holders' refs; 0 after LW0001
+    // at ANode
+    hidden method DoClosureDescriptorData(const AHolders: int64; const APlain: int64;
+      const ANode: int64): int64;
+    var
+      LRuns: ref Int64List;
+      LWords: ref Int64List;
+      LAddresses: ref Int64List;
+      LData: int64;
+    begin
+      LRuns := ref Int64List();
+      if AHolders > 0 then
+        self.DoAddRun(LRuns, ADAM_LOWERING_CLOSURE_HOLDERS, AHolders, self.FTarget.PointerSize(),
+          ADAM_LOWERING_REF_ELEMENT);
+      end;
+      LWords := ref Int64List();
+      LWords.Add(ADAM_LOWERING_CLOSURE_HOLDERS + (AHolders + APlain) * self.FTarget.PointerSize());
+      LWords.Add(0);
+      LAddresses := ref Int64List();
+      if not self.DoRunWords(LRuns, ANode, LWords, ref Int64List(), LAddresses) then
+        return 0;
+      end;
+      LData := self.DoHelperData(ADAM_LOWERING_REF_DESCRIPTOR_SYMBOL, 8, ANode);
+      self.DoAddLe64(LData, LWords[0]);
+      self.DoAddLe64(LData, 0);
+      self.DoAddWords(LData, LWords, 2, LAddresses);
+      return LData;
+    end;
+
+    // The function of the func literal ALiteral (F2a), made the first time: internal, its
+    // signature a closure's (DoFillSignature: the closure's block after the hidden result)
+    // or, retyped to a plain func (a captureless one, Semantics), that routine type's; its
+    // body (DoClosureBody) lowered last (DoDeferredBodies) as a task entry's is; 0 after
+    // LW0001
+    hidden method DoLiteralFunction(const ALiteral: int64): int64;
+    var
+      LResult: IrType;
+      LFunction: int64;
+    begin
+      if self.FFunctionOf[ALiteral] <> 0 then
+        return self.FFunctionOf[ALiteral];
+      end;
+      if not self.DoResultIr(ALiteral, LResult) then
+        return 0;
+      end;
+      if not self.DoParamsFit(ALiteral) then
+        return 0;
+      end;
+      LFunction := self.FModule.AddFunction(ADAM_LOWERING_CLOSURE_SYMBOL + IntToStr(self.FTaskEntries.Count),
+        LResult, ALiteral);
+      self.FModule.FunctionAt(LFunction).Internal := true;
+      self.DoFillSignature(ALiteral, self.FModule.FunctionAt(LFunction).Signature);
+      self.FFunctionOf[ALiteral] := LFunction;
+      self.FTaskEntries.Add(LFunction);
+      self.FTaskNodes.Add(ALiteral);
+      return LFunction;
+    end;
+
+    // The func literal AId's closure (F2a, BNF sec 6): a new closure block (RefNew over its
+    // descriptor, DoClosureDescriptorData) kept in AId's hidden slot (DoTemporaries; what
+    // an earlier pass left there released first), its code the literal's function
+    // (DoLiteralFunction), then each Capture's holder (DoCaptureHolder: by reference, the
+    // closure shares the variable's box) with a holder added; that block, 0 after LW0001
+    hidden method DoClosureValue(const AId: int64): int64;
+    var
+      LFunction: int64;
+      LCount: int64;
+      LData: int64;
+      LDescriptor: int64;
+      LBlock: int64;
+      LSlot: int64;
+      LObject: int64;
+      LCode: int64;
+      LCapture: int64;
+      LHolder: int64;
+      LI: int64;
+    begin
+      LFunction := self.DoLiteralFunction(AId);
+      if LFunction = 0 then
+        return 0;
+      end;
+      LCount := self.FTree.CountOf(AId, NodeRole.Capture);
+      LData := self.DoClosureDescriptorData(LCount, 0, AId);
+      if LData = 0 then
+        return 0;
+      end;
+      LDescriptor := self.DoEmit(IrOp.Address, IrType.Pointer, AId);
+      self.FModule.InstrAt(LDescriptor).Link := LData;
+      LBlock := self.DoCallRuntimeSiteOne(RuntimeRoutine.RefNew, LDescriptor, AId, "closure");
+      if LBlock = 0 then
+        return 0;
+      end;
+      LSlot := self.DoTempSlot(AId);
+      if not self.DoReleaseAt(LSlot, self.FTree[AId].ResolvedType, AId) then
+        return 0;
+      end;
+      self.DoStore(LSlot, LBlock, AId);
+      LObject := self.DoByteOffset(LBlock, ADAM_LOWERING_REF_HEADER, AId);
+      LCode := self.DoEmit(IrOp.CodeAddress, IrType.Pointer, AId);
+      self.FModule.InstrAt(LCode).Link := LFunction;
+      self.DoStore(self.DoByteOffset(LObject, ADAM_LOWERING_CLOSURE_CODE, AId), LCode, AId);
+      for LI := 0 to LCount - 1 do
+        LCapture := self.FTree.NthOf(AId, NodeRole.Capture, LI);
+        if not self.DoCaptureStored(LCapture) then
+          skip;
+        end;
+        LHolder := self.DoCaptureHolder(LCapture);
+        if LHolder = 0 then
+          return 0;
+        end;
+        if self.DoCallRuntime(RuntimeRoutine.StrAddRef, LHolder, 0, LCapture) = 0 then
+          return 0;
+        end;
+        self.DoStore(self.DoByteOffset(LObject, ADAM_LOWERING_CLOSURE_HOLDERS +
+          LI * self.FTarget.PointerSize(), LCapture), LHolder, LCapture);
+      end;
+      return LBlock;
+    end;
+
+    // The code address of the captureless func literal AId retyped to a plain func (F2a,
+    // Semantics: a C callback, C++'s captureless lambda): its function's; 0 after LW0001
+    hidden method DoLiteralCode(const AId: int64): int64;
+    var
+      LFunction: int64;
+      LId: int64;
+    begin
+      LFunction := self.DoLiteralFunction(AId);
+      if LFunction = 0 then
+        return 0;
+      end;
+      LId := self.DoEmit(IrOp.CodeAddress, IrType.Pointer, AId);
+      self.FModule.InstrAt(LId).Link := LFunction;
+      return LId;
+    end;
+
+    // The body of the func literal ALiteral's function (F2a; DoLiteralFunction's, in its
+    // fresh function state): its parameters (DoParams: the hidden result, its closure's
+    // block in FClosureSlot, its own); each Capture reached through its closure's holder
+    // (a slot holding the address 24 bytes into it, the variable by reference while this
+    // body is lowered: FSlotOf / FByRef / FByCopy, given back after; a self's its object,
+    // FSelfSlot); its own captured parameters boxed (DoBoxParams), its temporaries and
+    // statement locals (DoCodeTemporaries over the literal, FBodyRoot), the boxes made;
+    // then its statements, its end returning as a routine's does (DoBody). A raise goes to
+    // whoever called the closure, the body's cleanup releasing on the way
+    hidden method DoClosureBody(const ALiteral: int64);
+    var
+      LResult: IrType;
+      LObject: int64;
+      LWord: int64;
+      LCount: int64;
+      LCapture: int64;
+      LDecl: int64;
+      LSlot: int64;
+      LAddress: int64;
+      LBody: int64;
+      LZero: int64;
+      LId: int64;
+      LSavedSlot: ref Int64List;
+      LSavedByRef: BoolArray;
+      LSavedByCopy: BoolArray;
+      LI: int64;
+    begin
+      self.FRoutine := ALiteral;
+      self.FResultSlot := 0;
+      self.FSelfSlot := 0;
+      self.FVarargsSlot := 0;
+      self.FVarargsListSlot := 0;
+      self.FPackSlot := 0;
+      LResult := self.FModule.FunctionAt(self.FFunction).Signature.ResultType;
+      self.DoParams(ALiteral);
+      LWord := self.FTarget.PointerSize();
+      LCount := self.FTree.CountOf(ALiteral, NodeRole.Capture);
+      LSavedSlot := ref Int64List();
+      setlength(LSavedByRef, LCount);
+      setlength(LSavedByCopy, LCount);
+      LObject := 0;
+      if self.FClosureSlot <> 0 then
+        LObject := self.DoByteOffset(self.DoLoad(self.FClosureSlot, IrType.Pointer, ALiteral),
+          ADAM_LOWERING_REF_HEADER, ALiteral);
+      end;
+      for LI := 0 to LCount - 1 do
+        LCapture := self.FTree.NthOf(ALiteral, NodeRole.Capture, LI);
+        LDecl := self.FTree[LCapture].ResolvedDecl;
+        LSavedSlot.Add(self.FSlotOf[LDecl]);
+        LSavedByRef[LI] := self.FByRef[LDecl];
+        LSavedByCopy[LI] := self.FByCopy[LDecl];
+        if (LObject = 0) or not self.DoCaptureStored(LCapture) then
+          skip;
+        end;
+        LAddress := self.DoByteOffset(self.DoLoad(self.DoByteOffset(LObject,
+          ADAM_LOWERING_CLOSURE_HOLDERS + LI * LWord, LCapture), IrType.Pointer, LCapture),
+          ADAM_LOWERING_REF_HEADER, LCapture);
+        LSlot := self.DoSizedSlot(LCapture, LWord, self.FTarget.PointerAlign());
+        self.DoStore(LSlot, LAddress, LCapture);
+        if IsRoutineLike(self.FTree[LDecl].Kind) then
+          self.FSelfSlot := LSlot;
+          self.FModule.FunctionAt(self.FFunction).SelfSlot := LSlot;
+        else
+          self.FSlotOf[LDecl] := LSlot;
+          self.FByRef[LDecl] := true;
+          self.FByCopy[LDecl] := false;
+        end;
+      end;
+      self.DoBoxParams(ALiteral);
+      self.FBodyRoot := ALiteral;
+      self.DoCodeTemporaries(ALiteral);
+      self.FBodyRoot := 0;
+      if self.DoMakeBoxes(ALiteral) then
+        LBody := self.FTree.FirstOf(ALiteral, NodeRole.Body);
+        self.DoStatements(LBody, NodeRole.Statement);
+        if not self.DoEnded() then
+          self.DoReleaseManaged(LBody);
+          if LResult = IrType.Void then
+            self.DoEmit(IrOp.Ret, IrType.Void, LBody);
+          else
+            // A hidden result literal hands back the caller's slot (SM0612 keeps its end
+            // unreachable otherwise: it returns zero)
+            if self.FResultSlot <> 0 then
+              LZero := self.DoLoad(self.FResultSlot, IrType.Pointer, LBody);
+            else
+              LZero := self.DoConstant(LResult, 0, LBody);
+            end;
+            LId := self.DoEmit(IrOp.Ret, IrType.Void, LBody);
+            self.FModule.InstrAt(LId).Operands.Add(LZero);
+          end;
+        end;
+        self.DoCleanupScopes(ALiteral, self.DoLastBlock());
+      end;
+      for LI := 0 to LCount - 1 do
+        LDecl := self.FTree[self.FTree.NthOf(ALiteral, NodeRole.Capture, LI)].ResolvedDecl;
+        self.FSlotOf[LDecl] := LSavedSlot[LI];
+        self.FByRef[LDecl] := LSavedByRef[LI];
+        self.FByCopy[LDecl] := LSavedByCopy[LI];
+      end;
+      self.FSelfSlot := 0;
+      self.FClosureSlot := 0;
+      self.FRoutine := 0;
+    end;
+
+    // The adapter running a routine through a closure of the closure type AClosure (F2a,
+    // BNF sec 4), made the first time for its key (FAdapterOf): for the routine ARoutine
+    // named as a value (its own call), else for any value of the routine type AType (the
+    // code its closure holds: DoValueClosure); internal, its signature the closure's; its
+    // body (DoAdapterBody) lowered last (DoDeferredBodies) as a task entry's is; 0 after
+    // LW0001 at ANode
+    hidden method DoAdapter(const ARoutine: int64; const AType: int64; const AClosure: int64;
+      const ANode: int64): int64;
+    var
+      LKey: int64;
+      LSignature: int64;
+      LFunction: int64;
+    begin
+      if ARoutine <> 0 then
+        LKey := (ARoutine shl 32) | AClosure;
+      else
+        LKey := (AType shl 32) | AClosure;
+      end;
+      LFunction := self.FAdapterOf.Find(LKey);
+      if LFunction <> 0 then
+        return LFunction;
+      end;
+      LSignature := self.DoSignatureOf(AClosure, ANode);
+      if (LSignature = 0) or (self.DoSignatureOf(AType, ANode) = 0) then
+        return 0;
+      end;
+      LFunction := self.FModule.AddFunction(ADAM_LOWERING_ADAPTER_SYMBOL + IntToStr(self.FTaskEntries.Count),
+        self.FModule.SignatureAt(LSignature).ResultType, ANode);
+      self.FModule.FunctionAt(LFunction).Internal := true;
+      self.DoFillSignature(self.FTree[AClosure].ResolvedDecl, self.FModule.FunctionAt(LFunction).Signature);
+      self.FAdapterOf.Put(LKey, LFunction);
+      self.FAdapterRoutines.Put(self.FTaskEntries.Count, ARoutine);
+      self.FAdapterTypes.Put(self.FTaskEntries.Count, AType);
+      self.FTaskEntries.Add(LFunction);
+      self.FTaskNodes.Add(AClosure);
+      return LFunction;
+    end;
+
+    // The body of the adapter AIndex (DoAdapter's function, in its fresh function state,
+    // F2a): its parameters passed on as the routine type's signature takes them (a const
+    // text or dynamic array C passes by value that the routine's C++ linkage takes by
+    // reference from a slot of the adapter's holding it; every other form is the same under
+    // both linkages, BNF sec 4), the hidden result first; the call of the named routine, or
+    // through the code word its closure holds; its result returned. It holds nothing: a
+    // raise passes through
+    hidden method DoAdapterBody(const AIndex: int64);
+    var
+      LClosure: int64;
+      LRoutine: int64;
+      LType: int64;
+      LFromSig: int64;
+      LToSig: int64;
+      LSignature: ref IrSignature;
+      LAt: int64;
+      LHidden: int64;
+      LBlock: int64;
+      LArgs: ref Int64List;
+      LFrom: int64;
+      LTo: int64;
+      LValue: int64;
+      LSlot: int64;
+      LTarget: int64;
+      LKind: IrOp;
+      LLink: int64;
+      LIr: IrType;
+      LId: int64;
+      LRet: int64;
+      LI: int64;
+    begin
+      LClosure := self.FTaskNodes[AIndex];
+      LRoutine := self.FAdapterRoutines.Find(AIndex);
+      LType := self.FAdapterTypes.Find(AIndex);
+      LFromSig := self.FTree[LClosure].ResolvedDecl;
+      LToSig := self.FTree[LType].ResolvedDecl;
+      self.FRoutine := 0;
+      self.FResultSlot := 0;
+      self.FSelfSlot := 0;
+      LSignature := self.FModule.FunctionAt(self.FFunction).Signature;
+      LAt := 0;
+      LHidden := 0;
+      if self.FHiddenResult[LFromSig] then
+        LHidden := self.DoParameterOp(LSignature, 0, LClosure);
+        LAt := 1;
+      end;
+      LBlock := self.DoEmit(IrOp.Parameter, IrType.Pointer, LClosure);
+      self.FModule.InstrAt(LBlock).Imm := LAt;
+      LAt := LAt + 1;
+      LArgs := ref Int64List();
+      for LI := 0 to self.FTree.CountOf(LFromSig, NodeRole.Param) - 1 do
+        LFrom := self.FTree.NthOf(LFromSig, NodeRole.Param, LI);
+        LTo := self.FTree.NthOf(LToSig, NodeRole.Param, LI);
+        LValue := self.DoParameterOp(LSignature, LAt + LI, LFrom);
+        if self.FPassByRef[LTo] and not self.FPassByRef[LFrom] then
+          LSlot := self.DoSizedSlot(LFrom, self.FTarget.PointerSize(), self.FTarget.PointerAlign());
+          self.DoStore(LSlot, LValue, LFrom);
+          LValue := LSlot;
+        end;
+        LArgs.Add(LValue);
+      end;
+      LTarget := 0;
+      if LRoutine = 0 then
+        LKind := IrOp.CallIndirect;
+        LLink := self.DoSignatureOf(LType, LClosure);
+        if LLink = 0 then
+          return;
+        end;
+        LIr := self.FModule.SignatureAt(LLink).ResultType;
+        LTarget := self.DoLoad(self.DoByteOffset(LBlock, ADAM_LOWERING_REF_HEADER + ADAM_LOWERING_CLOSURE_HOLDERS,
+          LClosure), IrType.Pointer, LClosure);
+      else
+        if self.FTree.FirstOf(LRoutine, NodeRole.External) <> 0 then
+          LKind := IrOp.CallExternal;
+          LLink := self.DoExternal(LRoutine);
+          if LLink = 0 then
+            return;
+          end;
+          LIr := self.FModule.ExternalAt(LLink).Signature.ResultType;
+        else
+          LKind := IrOp.Call;
+          LLink := self.FFunctionOf[LRoutine];
+          if LLink = 0 then
+            return;
+          end;
+          LIr := self.FModule.FunctionAt(LLink).Signature.ResultType;
+        end;
+      end;
+      LId := self.DoEmit(LKind, LIr, LClosure);
+      self.FModule.InstrAt(LId).Link := LLink;
+      if LTarget <> 0 then
+        self.FModule.InstrAt(LId).Operands.Add(LTarget);
+      end;
+      if LHidden <> 0 then
+        self.FModule.InstrAt(LId).Operands.Add(LHidden);
+      end;
+      for LI := 0 to LArgs.Count - 1 do
+        self.FModule.InstrAt(LId).Operands.Add(LArgs[LI]);
+      end;
+      LRet := self.DoEmit(IrOp.Ret, IrType.Void, LClosure);
+      if LIr <> IrType.Void then
+        self.FModule.InstrAt(LRet).Operands.Add(LId);
+      end;
+    end;
+
+    // The closure the routine AId names as a value converts to (F2a, BNF sec 4: nothing is
+    // built at run time): its constant closure block (FClosureBlockOf, made the first time
+    // in read-only data: System.Runtime's ref block whose count says constant, never counted
+    // or freed, RefRelease), its code the routine's adapter (DoAdapter); a borrowed value (no
+    // holder: a store adds none either); 0 after LW0001
+    hidden method DoRoutineClosure(const AId: int64; const ARoutine: int64): int64;
+    var
+      LData: int64;
+      LAdapter: int64;
+      LId: int64;
+    begin
+      LData := self.FClosureBlockOf.Find(ARoutine);
+      if LData = 0 then
+        LAdapter := self.DoAdapter(ARoutine, self.FTree[AId].ResolvedType, self.FTree[AId].ResolvedConvert, AId);
+        if LAdapter = 0 then
+          return 0;
+        end;
+        LData := self.DoHelperData(ADAM_LOWERING_CLOSURE_BLOCK_SYMBOL, 8, AId);
+        self.DoAddLe64(LData, ADAM_LOWERING_STRING_CONSTANT_COUNT);
+        self.DoAddLe64(LData, ADAM_LOWERING_STRING_CONSTANT_COUNT);
+        self.DoAddLe64(LData, 0);
+        self.FModule.DataAt(LData).AddAddress(self.FModule.FunctionAt(LAdapter).Symbol, 0);
+        self.FClosureBlockOf.Put(ARoutine, LData);
+      end;
+      LId := self.DoEmit(IrOp.Address, IrType.Pointer, AId);
+      self.FModule.InstrAt(LId).Link := LData;
+      return LId;
+    end;
+
+    // The closure a routine value AId that names no routine converts to (F2a: a variable's,
+    // a field's, a call's ..): a new closure block (RefNew, no holders) kept in AId's hidden
+    // slot (DoTemporaries; what an earlier pass left there released first), its code the
+    // routine type's adapter (DoAdapter), its first word past the code the value itself;
+    // that block, 0 after LW0001
+    hidden method DoValueClosure(const AId: int64): int64;
+    var
+      LValue: int64;
+      LAdapter: int64;
+      LData: int64;
+      LDescriptor: int64;
+      LBlock: int64;
+      LSlot: int64;
+      LObject: int64;
+      LCode: int64;
+    begin
+      LAdapter := self.DoAdapter(0, self.FTree[AId].ResolvedType, self.FTree[AId].ResolvedConvert, AId);
+      if LAdapter = 0 then
+        return 0;
+      end;
+      LValue := self.DoOwnValue(AId);
+      if LValue = 0 then
+        return 0;
+      end;
+      // one plain word past the code: the value (no holder)
+      LData := self.DoClosureDescriptorData(0, 1, AId);
+      if LData = 0 then
+        return 0;
+      end;
+      LDescriptor := self.DoEmit(IrOp.Address, IrType.Pointer, AId);
+      self.FModule.InstrAt(LDescriptor).Link := LData;
+      LBlock := self.DoCallRuntimeSiteOne(RuntimeRoutine.RefNew, LDescriptor, AId, "closure");
+      if LBlock = 0 then
+        return 0;
+      end;
+      LSlot := self.DoTempSlot(AId);
+      if not self.DoReleaseAt(LSlot, self.FTree[AId].ResolvedConvert, AId) then
+        return 0;
+      end;
+      self.DoStore(LSlot, LBlock, AId);
+      LObject := self.DoByteOffset(LBlock, ADAM_LOWERING_REF_HEADER, AId);
+      LCode := self.DoEmit(IrOp.CodeAddress, IrType.Pointer, AId);
+      self.FModule.InstrAt(LCode).Link := LAdapter;
+      self.DoStore(self.DoByteOffset(LObject, ADAM_LOWERING_CLOSURE_CODE, AId), LCode, AId);
+      self.DoStore(self.DoByteOffset(LObject, ADAM_LOWERING_CLOSURE_HOLDERS, AId), LValue, AId);
+      return LBlock;
+    end;
+
+    // True when the expression AId's value converts to a closure that a block made here
+    // holds (DoValueClosure: a routine value naming no routine), which its hidden slot
+    // keeps (DoTemporaries)
+    hidden method DoIsValueClosure(const AId: int64): bool;
+    begin
+      return self.DoIsRoutineClosure(AId) and (self.DoNamedRoutine(AId) = 0);
+    end;
+
+    // The call ACall through the closure value ACallee (F2a, BNF sec 4): the closure's
+    // block (held for the call in the callee's hidden slot, DoTemporaries, unless the callee
+    // is a temporary that holds it already: a func literal, a call; the closure's code may
+    // drop what held it), nil raising code 3 (NilClosureFail, a cold block of its own), its
+    // code read from the block and called (calli of its type's signature) with the block as
+    // its hidden parameter after the hidden result (DoTakesClosure); 0 after LW0001
+    hidden method DoClosureCall(const ACall: int64; const ACallee: int64): int64;
+    var
+      LType: int64;
+      LSignature: int64;
+      LBlock: int64;
+      LSlot: int64;
+      LCode: int64;
+    begin
+      LType := self.FTree[ACallee].ResolvedType;
+      LSignature := self.DoSignatureOf(LType, ACall);
+      if LSignature = 0 then
+        return 0;
+      end;
+      LBlock := self.DoManagedValue(ACallee);
+      if LBlock = 0 then
+        return 0;
+      end;
+      if self.DoHoldsCallee(ACallee) then
+        LSlot := self.DoTempSlot(ACallee);
+        if not self.DoReleaseAt(LSlot, LType, ACall) then
+          return 0;
+        end;
+        if self.DoAddHolder(LBlock, LType, ACall) = 0 then
+          return 0;
+        end;
+        self.DoStore(LSlot, LBlock, ACall);
+      end;
+      if not self.DoCheckNilClosure(LBlock, ACall) then
+        return 0;
+      end;
+      LCode := self.DoLoad(self.DoByteOffset(LBlock, ADAM_LOWERING_REF_HEADER + ADAM_LOWERING_CLOSURE_CODE, ACall),
+        IrType.Pointer, ACall);
+      return self.DoEmitCall(ACall, self.FTree[LType].ResolvedDecl, IrOp.CallIndirect, LSignature,
+        self.FModule.SignatureAt(LSignature).ResultType, LCode, LBlock);
+    end;
+
+    // The nil check of the closure block ABlock before its call at ANode (F2a, BNF sec 4): a
+    // nil block is a cold block of its own calling the runtime's NilClosureFail (code 3),
+    // which never returns (the block still ends in a jump, as every block does). False
+    // after LW0001
+    hidden method DoCheckNilClosure(const ABlock: int64; const ANode: int64): bool;
+    var
+      LHeld: int64;
+      LBad: int64;
+      LGood: int64;
+    begin
+      LHeld := self.DoCompareWith(IrPredicate.NotEqual, ABlock, self.DoConstant(IrType.Pointer, 0, ANode), ANode);
+      LBad := self.FModule.AddBlock(self.FFunction);
+      LGood := self.FModule.AddBlock(self.FFunction);
+      self.DoBranchOn(LHeld, LGood, LBad, ANode);
+      self.FBlock := LBad;
+      if self.DoCallRuntimeArgs(RuntimeRoutine.NilClosureFail, ref Int64List(), ANode) = 0 then
+        return false;
+      end;
+      self.DoJumpTo(LGood, ANode);
+      self.FBlock := LGood;
+      return true;
+    end;
+
+    // True when the closure call's callee ACallee (F2a) is held for the call in a hidden
+    // slot of its own (DoClosureCall): any but a func literal or a call, whose own hidden
+    // slot holds the block already
+    hidden const method DoHoldsCallee(const ACallee: int64): bool;
+    var
+      LKind: NodeKind;
+    begin
+      LKind := self.FTree[ACallee].Kind;
+      return (LKind <> NodeKind.FuncLiteral) and (LKind <> NodeKind.CallExpression);
     end;
 
     // The argument AArg copied into its parameter's place AAddress in a new task's object
@@ -13321,12 +14249,21 @@ public type
         end;
       else
         if LDecl = 0 then
-          LValue := self.DoValue(self.FTree.FirstOf(LCall, NodeRole.Callee));
-          if LValue = 0 then
-            return 0;
-          end;
           LAddress := self.DoByteOffset(LObject, LOffsets[0], AId);
-          self.DoStore(LAddress, LValue, AId);
+          // a closure (F2a): the task holds it (a holder added, its map releases it)
+          if self.DoIsClosureValue(self.FTree.FirstOf(LCall, NodeRole.Callee)) then
+            LValue := self.DoManagedValue(self.FTree.FirstOf(LCall, NodeRole.Callee));
+            if (LValue = 0) or (self.DoStoreManaged(LAddress, LValue,
+              self.FTree[self.FTree.FirstOf(LCall, NodeRole.Callee)].ResolvedType, AId) = 0) then
+              return 0;
+            end;
+          else
+            LValue := self.DoValue(self.FTree.FirstOf(LCall, NodeRole.Callee));
+            if LValue = 0 then
+              return 0;
+            end;
+            self.DoStore(LAddress, LValue, AId);
+          end;
         end;
       end;
       LParams := self.FTree.CountOf(LSig, NodeRole.Param);
@@ -13620,11 +14557,17 @@ public type
           self.FSlotOf[LDecl] := LSlot;
           self.FByRef[LDecl] := true;
           self.FByCopy[LDecl] := false;
+          // a copy a func literal in the block captures gets a box of the task's (F2a: the
+          // literal's closure holds it by its box)
+          if self.FBoxed[LDecl] then
+            self.DoBoxSlot(LDecl, true);
+          end;
         end;
       end;
       self.FBodyRoot := AAsync;
       self.DoCodeTemporaries(AAsync);
       self.FBodyRoot := 0;
+      self.DoMakeBoxes(AAsync);
       LBody := self.FModule.AddBlock(self.FFunction);
       self.DoJumpTo(LBody, AAsync);
       if self.DoArm(LBody, self.FTree.FirstOf(AAsync, NodeRole.Body), NodeRole.Statement) then
@@ -14175,8 +15118,15 @@ public type
         self.FByRef[LParam] := true;
         self.FByCopy[LParam] := false;
       end;
+      self.DoBoxParams(ARoutine);
       self.DoCodeTemporaries(ARoutine);
       self.DoLocalSlots(ARoutine);
+      if not self.DoMakeBoxes(ARoutine) then
+        self.FGeneratorSlot := 0;
+        self.FSelfSlot := 0;
+        self.FRoutine := 0;
+        return;
+      end;
       self.DoLocalInits(ARoutine);
       LBody := self.FTree.FirstOf(ARoutine, NodeRole.Body);
       self.DoStatements(LBody, NodeRole.Statement);
@@ -14788,6 +15738,16 @@ public type
             return;
           end;
           LIrResult := self.FModule.SignatureAt(LLink).ResultType;
+          // a closure (F2a): the code word holds its block, nil raising code 3; its code is
+          // called with the block as its hidden parameter
+          if self.DoIsClosureValue(self.FTree.FirstOf(LCall, NodeRole.Callee)) then
+            LSelf := LTarget;
+            if not self.DoCheckNilClosure(LSelf, AAsync) then
+              return;
+            end;
+            LTarget := self.DoLoad(self.DoByteOffset(LSelf, ADAM_LOWERING_REF_HEADER + ADAM_LOWERING_CLOSURE_CODE,
+              AAsync), IrType.Pointer, AAsync);
+          end;
         else
           if self.FTree.FirstOf(LDecl, NodeRole.External) <> 0 then
             LKind := IrOp.CallExternal;
@@ -14848,6 +15808,15 @@ public type
       self.FFunction := self.FTaskEntries[AIndex];
       self.FBlock := self.FModule.AddBlock(self.FFunction);
       self.DoStartManaged();
+      // a func literal's function (DoClosureBody, F2a), a closure adapter (DoAdapterBody)
+      if self.FTree[self.FTaskNodes[AIndex]].Kind = NodeKind.FuncLiteral then
+        self.DoClosureBody(self.FTaskNodes[AIndex]);
+        return;
+      end;
+      if self.FTree[self.FTaskNodes[AIndex]].Kind = NodeKind.ClosureType then
+        self.DoAdapterBody(AIndex);
+        return;
+      end;
       // a generator's body function (DoGeneratorEntry): its routine's statements
       if self.FTree[self.FTaskNodes[AIndex]].HasFlag(NodeFlag.Generator) then
         self.DoGeneratorBody(self.FTaskNodes[AIndex]);
@@ -15402,7 +16371,8 @@ public type
       LInit: int64;
       LValue: int64;
     begin
-      LSlot := self.FSlotOf[ALocal];
+      // a boxed one's (F2a) through its address
+      LSlot := self.DoDeclAddress(ALocal, ALocal);
       LInit := self.FTree.FirstOf(ALocal, NodeRole.Initializer);
       if LInit = 0 then
         return;
@@ -16330,6 +17300,9 @@ public type
       if LDecl = 0 then
         if self.DoIsRoutineValue(LCallee) then
           return self.DoIndirectCall(ACall, LCallee);
+        end;
+        if self.DoIsClosureValue(LCallee) then
+          return self.DoClosureCall(ACall, LCallee);
         end;
         if NameKindOf(self.FTree, LCallee) <> NodeKind.NameExpression then
           self.DoRefuse(LCallee, "a call through " + self.FTree.ConstructPhrase(LCallee));
@@ -19275,6 +20248,10 @@ public type
         ((LKind = NodeKind.MemberExpression) and self.DoIsStaticMethod(self.FTree[AId].ResolvedDecl)) then
         return self.DoRoutineValue(AId);
       end;
+      // a captureless func literal retyped to a plain func (F2a): its function's code
+      if LKind = NodeKind.FuncLiteral then
+        return self.DoLiteralCode(AId);
+      end;
       // A property read through its accessors (one that is its field is a place)
       if self.DoIsPropertyAccess(AId) then
         return self.DoPropertyGet(AId);
@@ -21082,9 +22059,14 @@ public type
       LSlot := self.DoSlot(LIterator, self.FTree[LIterator].ResolvedType, false);
       if (LIr <> IrType.Void) and (LSlot <> 0) then
         self.DoStore(LSlot, self.DoConvertIr(LValue, LIr, LFor), LFor);
+        // the iterator a func literal captures gets its box (F2a)
+        if self.FBoxed[LIterator] then
+          self.DoBoxSlot(LIterator, true);
+        end;
         self.FBodyRoot := LFor;
         self.DoCodeTemporaries(LFor);
         self.FBodyRoot := 0;
+        self.DoMakeBoxes(LFor);
         LBody := self.FModule.AddBlock(self.FFunction);
         LNext := self.FModule.AddBlock(self.FFunction);
         LExit := self.FModule.AddBlock(self.FFunction);
@@ -21127,7 +22109,8 @@ public type
     var
       LRole: NodeRole;
     begin
-      if self.FTree[ARoot].Kind = NodeKind.AsyncExpression then
+      // a func literal's body belongs to its own function (DoClosureBody, F2a)
+      if (self.FTree[ARoot].Kind = NodeKind.AsyncExpression) or (self.FTree[ARoot].Kind = NodeKind.FuncLiteral) then
         return (self.FTree.RoleOf(AChild) = NodeRole.Body) and (ARoot <> self.FBodyRoot);
       end;
       if (self.FTree[ARoot].Kind <> NodeKind.ForStatement) or
@@ -21187,7 +22170,8 @@ public type
       LType: int64;
       LSlot: int64;
     begin
-      LSlot := self.FSlotOf[AId];
+      // a boxed one's (F2a) through its address
+      LSlot := self.DoDeclAddress(AId, AId);
       if LSlot = 0 then
         // a refused one was reported at its declaration; a scalar constant is folded
         return;
@@ -22017,6 +23001,15 @@ public type
         self.DoStore(self.FResultSlot, LValue, ARoutine);
         LFirst := 1;
       end;
+      // a func literal's closure block (F2a, DoClosureBody)
+      self.FClosureSlot := 0;
+      if self.DoTakesClosure(ARoutine) then
+        LValue := self.DoEmit(IrOp.Parameter, IrType.Pointer, ARoutine);
+        self.FModule.InstrAt(LValue).Imm := LFirst;
+        self.FClosureSlot := self.DoSizedSlot(ARoutine, self.FTarget.PointerSize(), self.FTarget.PointerAlign());
+        self.DoStore(self.FClosureSlot, LValue, ARoutine);
+        LFirst := LFirst + 1;
+      end;
       self.FSelfSlot := 0;
       if self.DoHasSelf(ARoutine) then
         LValue := self.DoEmit(IrOp.Parameter, IrType.Pointer, ARoutine);
@@ -22189,6 +23182,11 @@ public type
       LSlot: int64;
       LSize: int64;
     begin
+      // one a func literal captures lives in a box (F2a: zeroed when made)
+      if self.FBoxed[ALocal] then
+        self.DoBoxSlot(ALocal, false);
+        return;
+      end;
       LSlot := self.DoSlot(ALocal, AType, false);
       if LSlot = 0 then
         return;
@@ -22216,7 +23214,8 @@ public type
       LSource: int64;
       LFrom: int64;
     begin
-      LSlot := self.FSlotOf[ALocal];
+      // a boxed one's (F2a) through its address
+      LSlot := self.DoDeclAddress(ALocal, ALocal);
       LInit := self.FTree.FirstOf(ALocal, NodeRole.Initializer);
       if LInit = 0 then
         // an object built by its init (SEM's pick, the local's ResolvedCallee, with its
@@ -22289,6 +23288,11 @@ public type
         self.DoRefuse(ALocal, "a constructed " + self.FTree.ConstructText(ALocal));
         return;
       end;
+      // one a func literal captures lives in a box (F2a)
+      if self.FBoxed[ALocal] and (ClassOf(self.FTree, LType) <> TypeClass.Varargs) then
+        self.DoBoxSlot(ALocal, false);
+        return;
+      end;
       if self.DoIsAggregate(LType) then
         self.DoAggregateLocalSlot(ALocal, LType);
         return;
@@ -22325,7 +23329,8 @@ public type
         self.DoPackLocal(ALocal);
         return;
       end;
-      LSlot := self.FSlotOf[ALocal];
+      // a boxed one's (F2a) through its address
+      LSlot := self.DoDeclAddress(ALocal, ALocal);
       if LSlot = 0 then
         return;
       end;
@@ -22512,9 +23517,15 @@ public type
         return;
       end;
       // The string temporaries' slots are made before any code that may use them (a
-      // local's initializer included) and before the first branch
+      // local's initializer included) and before the first branch; the boxes of what a func
+      // literal captures once they all are (F2a)
+      self.DoBoxParams(ARoutine);
       self.DoCodeTemporaries(ARoutine);
       self.DoLocalSlots(ARoutine);
+      if not self.DoMakeBoxes(ARoutine) then
+        self.FRoutine := 0;
+        return;
+      end;
       self.DoEnterParts(ARoutine);
       self.DoLocalInits(ARoutine);
       LBody := self.FTree.FirstOf(ARoutine, NodeRole.Body);
@@ -23722,6 +24733,9 @@ public type
       // the temporaries of its locals' initializers too, before the first branch
       self.DoCodeTemporaries(ASection);
       self.DoLocalSlots(ASection);
+      if not self.DoMakeBoxes(ASection) then
+        return;
+      end;
       self.DoLocalInits(ASection);
       self.DoStatements(LBody, NodeRole.Statement);
       if not self.DoEnded() then
@@ -24237,6 +25251,7 @@ public type
       self.DoStartManaged();
       LBody := self.FTree.FirstOf(self.FEntryModule, NodeRole.Body);
       self.DoCodeTemporaries(LBody);
+      self.DoMakeBoxes(LBody);
       self.DoStatements(LBody, NodeRole.Statement);
       if not self.DoEnded() then
         self.DoJumpTo(self.FEntryEnd, LBody);
