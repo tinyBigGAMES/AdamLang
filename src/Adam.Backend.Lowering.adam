@@ -615,6 +615,9 @@ public const
   // An indexed property read or written with no index (SEM reaches one only through an
   // index expression: a broken invariant)
   ADAM_LOWERING_FAULT_PROPERTY_INDEX: string = "Lowering: no index for the indexed property ";
+  // A `const array of T` parameter read as an array value while its slot holds its view
+  // (DoViewOnly let only view reads through: a broken invariant)
+  ADAM_LOWERING_FAULT_VIEW_VALUE: string = "Lowering: an array view read as an array value: ";
 
 // The atomic op the atomic intrinsic AName (IsAtomicIntrinsic) lowers to
 func DoAtomicOpOf(const AName: string): IrOp;
@@ -949,6 +952,11 @@ public type
     // (DoGeneratorBody, G1e0: a self-call in there passes by the parameter's own form)
     hidden FPassByRef: array of bool;
     hidden FPassByCopy: array of bool;
+    // By a parameter's node id: a `const array of T` one (Types.PassedAsView, AS2: it
+    // travels as the address of a view its caller builds) whose slot holds that address in
+    // the function being lowered, every use reading the view (DoViewOnly); false when it is
+    // made an array value at the entry (DoViewParam)
+    hidden FView: array of bool;
     hidden FHiddenResult: array of bool;
     // By a parameter's node id: an aggregate by copy its signature carries as one (its
     // IrAggregate, DoShapeOf). By a routine's or an external's node id: its hidden result
@@ -1332,6 +1340,7 @@ public type
       setlength(self.FByCopy, ATree.Count);
       setlength(self.FPassByRef, ATree.Count);
       setlength(self.FPassByCopy, ATree.Count);
+      setlength(self.FView, ATree.Count);
       setlength(self.FHiddenResult, ATree.Count);
       setlength(self.FPassShaped, ATree.Count);
       setlength(self.FShapedResult, ATree.Count);
@@ -1700,6 +1709,10 @@ public type
       LType: int64;
       LIr: IrType;
     begin
+      // a const array of T: the address of the view its caller builds (AS2), every linkage
+      if PassedAsView(self.FTree, AParam) then
+        return IrType.Pointer;
+      end;
       if PassedByReference(self.FTree, AParam, self.DoLinkageOf(ARoutine)) then
         self.FByRef[AParam] := true;
         self.FPassByRef[AParam] := true;
@@ -2462,6 +2475,37 @@ public type
       return true;
     end;
 
+    // DoCheckLength's check of the index AIndex (an int64, from 0) against ALength, a
+    // `const array of T` parameter's view's count (AS2): one unsigned compare; outside, a
+    // block of its own calls the runtime's IndexFailLength (code 14), which never returns.
+    // False after LW0001
+    hidden method DoCheckViewLength(const ALength: int64; const AIndex: int64; const ANode: int64): bool;
+    var
+      LBad: int64;
+      LGood: int64;
+      LInRange: int64;
+      LArgs: ref Int64List;
+    begin
+      if not OptLevelKeepsIndexChecks(self.FTree.Level) then
+        return true;
+      end;
+      LBad := self.FModule.AddBlock(self.FFunction);
+      LGood := self.FModule.AddBlock(self.FFunction);
+      LInRange := self.DoCompareWith(IrPredicate.ULess, self.DoConvertIr(AIndex, IrType.UInt64, ANode),
+        self.DoConvertIr(ALength, IrType.UInt64, ANode), ANode);
+      self.DoBranchOn(LInRange, LGood, LBad, ANode);
+      self.FBlock := LBad;
+      LArgs := ref Int64List();
+      LArgs.Add(AIndex);
+      LArgs.Add(ALength);
+      if self.DoCallRuntimeArgs(RuntimeRoutine.IndexFailLength, LArgs, ANode) = 0 then
+        return false;
+      end;
+      self.DoJumpTo(LGood, ANode);
+      self.FBlock := LGood;
+      return true;
+    end;
+
     // The address of the element of the static array AArray (of the canonical type AType)
     // the index expression AId names: the array's address first, then the index widened to
     // int64 by its own signedness (a char or a wchar by the target's, as its bounds are
@@ -2629,6 +2673,10 @@ public type
     begin
       LOperand := self.FTree.FirstOf(AId, NodeRole.Operand);
       LType := self.DoUsedType(LOperand);
+      // a const array of T's view (AS2): its elements from its first, its count
+      if (not AWrite) and (self.DoViewOf(LOperand) <> 0) then
+        return self.DoViewElement(AId, self.DoViewOf(LOperand), LType);
+      end;
       if AWrite then
         LSlot := self.DoAddressFor(LOperand, true);
         if LSlot = 0 then
@@ -2662,6 +2710,29 @@ public type
       end;
       LBase := self.DoByteOffset(LBase, ADAM_LOWERING_ARRAY_HEADER, AId);
       return self.DoMovePointer(LBase, LIndex, LType, false, AId);
+    end;
+
+    // The address of the element of the view at AView (a `const array of T` parameter's,
+    // of the dynamic array type AType, AS2) the index expression AId names: the index
+    // checked against the view's count (DoCheckViewLength), moved over by that many
+    // elements from its first; 0 after LW0001
+    hidden method DoViewElement(const AId: int64; const AView: int64; const AType: int64): int64;
+    var
+      LIndex: int64;
+      LLength: int64;
+      LData: int64;
+    begin
+      LIndex := self.DoValue(self.FTree.FirstOf(AId, NodeRole.Index));
+      if LIndex = 0 then
+        return 0;
+      end;
+      LIndex := self.DoConvertIr(LIndex, IrType.Int64, AId);
+      LLength := self.DoLoad(self.DoByteOffset(AView, ADAM_ARRAY_VIEW_LENGTH_AT, AId), IrType.Int64, AId);
+      if not self.DoCheckViewLength(LLength, LIndex, AId) then
+        return 0;
+      end;
+      LData := self.DoLoad(self.DoByteOffset(AView, ADAM_ARRAY_VIEW_DATA_AT, AId), IrType.Pointer, AId);
+      return self.DoMovePointer(LData, LIndex, AType, false, AId);
     end;
 
     // True when the canonical type AType is a record or an overlay: an aggregate of fields
@@ -6009,6 +6080,9 @@ public type
         end;
         return 0;
       end;
+      if self.FView[LDecl] then
+        raise(ADAM_LOWERING_FAULT_VIEW_VALUE + self.FTree.ConstructText(AId));
+      end;
       if self.FByRef[LDecl] then
         return self.DoLoad(self.FSlotOf[LDecl], IrType.Pointer, AId);
       end;
@@ -6046,6 +6120,10 @@ public type
       LSlot: int64;
       LValue: int64;
     begin
+      // a const array of T: the address of a view (AS2)
+      if PassedAsView(self.FTree, AParam) then
+        return self.DoViewArgument(AArg, AParam);
+      end;
       LType := VariableTypeOf(self.FTree, AParam);
       if self.DoIsAggregate(LType) and self.DoHasLifetime(LType) and
         (not self.FTree[AParam].HasFlag(NodeFlag.ConstParam)) and
@@ -6220,8 +6298,13 @@ public type
       if (not self.FTree[AParam].HasFlag(NodeFlag.ConstParam)) or self.FTree[AParam].HasFlag(NodeFlag.VarParam) then
         return false;
       end;
+      // a static array's view (AS2) holds no block: its place's anchor is held
+      // (DoHoldArg); a parameter's own view passed on is its caller's to keep
+      if self.DoIsStaticView(AArg, AParam) or (self.DoViewOf(AArg) <> 0) then
+        return false;
+      end;
       LSig := self.FTree.ParentOf(AParam);
-      if PassedByReference(self.FTree, AParam, self.DoLinkageOf(LSig)) then
+      if self.DoPassedByRef(AParam, self.DoLinkageOf(LSig)) then
         return false;
       end;
       if self.FTree.FirstOf(LSig, NodeRole.External) <> 0 then
@@ -9841,7 +9924,7 @@ public type
         for LI := 0 to OperandCount(self.FTree, ANode) - 1 do
           LParam := self.FTree.NthOf(LSig, NodeRole.Param, LI);
           self.DoHoldArg(OperandAt(self.FTree, ANode, LI), LParam,
-            PassedByReference(self.FTree, LParam, self.DoLinkageOf(LSig)));
+            self.DoPassedByRef(LParam, self.DoLinkageOf(LSig)));
         end;
         return;
       end;
@@ -9902,7 +9985,7 @@ public type
       for LI := 0 to LCount - 1 do
         LArg := self.FTree.NthOf(AHolder, ARole, LI);
         LParam := self.FTree.NthOf(ASig, NodeRole.Param, LI);
-        self.DoHoldArg(LArg, LParam, PassedByReference(self.FTree, LParam, self.DoLinkageOf(ASig)));
+        self.DoHoldArg(LArg, LParam, self.DoPassedByRef(LParam, self.DoLinkageOf(ASig)));
       end;
     end;
 
@@ -9924,10 +10007,19 @@ public type
         self.DoHoldSlot(LRoot, LType);
         return;
       end;
-      if self.FTree[AParam].HasFlag(NodeFlag.VarParam) or AByRef then
+      // a static array's view (AS2) points into its place, as a reference does
+      if self.FTree[AParam].HasFlag(NodeFlag.VarParam) or AByRef or self.DoIsStaticView(AArg, AParam) then
         self.DoHoldAnchor(self.DoAnchorOf(AArg), self.FTree.ParentOf(AParam), 0,
           self.FTree.ParentOf(AArg));
       end;
+    end;
+
+    // True when the argument AArg for the parameter AParam is a static array borrowed as a
+    // `const array of T`'s view (AS2, DoViewArgument)
+    hidden const method DoIsStaticView(const AArg: int64; const AParam: int64): bool;
+    begin
+      return PassedAsView(self.FTree, AParam) and
+        (ClassOf(self.FTree, self.FTree[AArg].ResolvedType) = TypeClass.StaticArray);
     end;
 
     // The holds of the property access AId when an accessor's function runs for it (an
@@ -9973,14 +10065,14 @@ public type
       self.DoHoldAnchor(self.DoObjectAnchor(LObject, LArrow), LFirst, LSecond, AId);
       LParam := self.FTree.FirstOf(LProperty, NodeRole.Param);
       if (LParam <> 0) and (self.FTree[AId].Kind = NodeKind.IndexExpression) then
-        LByRef := PassedByReference(self.FTree, LParam, Linkage.Cpp);
+        LByRef := self.DoPassedByRef(LParam, Linkage.Cpp);
         self.DoHoldArg(self.FTree.FirstOf(AId, NodeRole.Index), LParam, LByRef);
       end;
       LParent := self.FTree.ParentOf(AId);
       if (self.FTree[LParent].Kind = NodeKind.AssignExpression) and (self.FTree.RoleOf(AId) = NodeRole.Target) and
         self.DoRunsAccessor(LProperty, LWrite) then
         LParam := self.DoParamAt(LWrite, self.DoParamCount(LWrite) - 1);
-        LByRef := PassedByReference(self.FTree, LParam, Linkage.Cpp);
+        LByRef := self.DoPassedByRef(LParam, Linkage.Cpp);
         self.DoHoldArg(self.FTree.FirstOf(LParent, NodeRole.Source), LParam, LByRef);
       end;
     end;
@@ -10031,6 +10123,14 @@ public type
       self.FHeld[ARoot] := true;
     end;
 
+    // True when the parameter AParam binds by reference under ALinkage (Types'
+    // PassedByReference) and travels so: a `const array of T` travels as a view under every
+    // linkage (PassedAsView, AS2: DoParamIr), never as a reference to the caller's place
+    hidden const method DoPassedByRef(const AParam: int64; const ALinkage: Linkage): bool;
+    begin
+      return PassedByReference(self.FTree, AParam, ALinkage) and not PassedAsView(self.FTree, AParam);
+    end;
+
     // True when a parameter's caller passes it by reference: a var one, or one its routine's
     // linkage passes so (a const managed one under C++ linkage)
     hidden const method DoParamByRef(const AParam: int64): bool;
@@ -10038,7 +10138,7 @@ public type
       if self.FTree[AParam].HasFlag(NodeFlag.VarParam) then
         return true;
       end;
-      return PassedByReference(self.FTree, AParam, self.DoLinkageOf(self.FTree.ParentOf(AParam)));
+      return self.DoPassedByRef(AParam, self.DoLinkageOf(self.FTree.ParentOf(AParam)));
     end;
 
     // The field a property's access reads (AWrite false) or writes through: its accessor
@@ -14625,7 +14725,27 @@ public type
       LRoot: int64;
       LBase: int64;
       LHolder: int64;
+      LMap: int64;
+      LArgs: ref Int64List;
     begin
+      // a static array for a const array of T (AS2): the task's own array, a copy of its
+      // elements (ArrFromView over its view), the object's reference
+      if self.DoIsArrayValue(AType) and (ClassOf(self.FTree, self.FTree[AArg].ResolvedType) = TypeClass.StaticArray) then
+        LSource := self.DoAggregateSource(AArg);
+        LMap := self.DoElementMap(AType, AArg);
+        if (LSource = 0) or (LMap = 0) then
+          return false;
+        end;
+        LArgs := ref Int64List();
+        LArgs.Add(self.DoStaticView(LSource, ArrayCount(self.FTree, self.FTarget, self.FTree[AArg].ResolvedType), AArg));
+        LArgs.Add(LMap);
+        LValue := self.DoCallRuntimeSite(RuntimeRoutine.ArrFromView, LArgs, AArg, self.DoArrayWhat(AType));
+        if LValue = 0 then
+          return false;
+        end;
+        self.DoStore(AAddress, LValue, AArg);
+        return true;
+      end;
       if self.DoIsManaged(AType) then
         LValue := self.DoValue(AArg);
         if LValue = 0 then
@@ -16099,6 +16219,10 @@ public type
       LIr: IrType;
     begin
       LType := VariableTypeOf(self.FTree, AParam);
+      // a const array of T (AS2): a view over the task's own array
+      if PassedAsView(self.FTree, AParam) then
+        return self.DoBlockView(self.DoLoad(AAddress, IrType.Pointer, ANode), ANode);
+      end;
       if self.FPassByCopy[AParam] or self.FPassByRef[AParam] then
         return AAddress;
       end;
@@ -17307,6 +17431,11 @@ public type
       LArgs: ref Int64List;
     begin
       LFirst := self.FTree.FirstOf(ACall, NodeRole.Argument);
+      // len of a const array of T's view (AS2): its count
+      if (AName = "len") and (self.DoViewOf(LFirst) <> 0) then
+        return self.DoLoad(self.DoByteOffset(self.DoViewOf(LFirst), ADAM_ARRAY_VIEW_LENGTH_AT, ACall),
+          IrType.Int64, ACall);
+      end;
       if AName = "len" then
         LText := self.DoValue(LFirst);
         if LText = 0 then
@@ -18698,6 +18827,10 @@ public type
       LSlot: int64;
     begin
       LType := VariableTypeOf(self.FTree, AParam);
+      // a const array of T (AS2): a view over the block
+      if PassedAsView(self.FTree, AParam) then
+        return self.DoBlockView(AValue, ANode);
+      end;
       if self.DoIsAggregate(LType) then
         return AValue;
       end;
@@ -20391,6 +20524,14 @@ public type
       LSlot: int64;
     begin
       LType := VariableTypeOf(self.FTree, AParam);
+      // a const array of T (AS2): a view over the element (a dynamic array's block, or a
+      // static array's elements where they lie)
+      if PassedAsView(self.FTree, AParam) then
+        if ClassOf(self.FTree, AType) = TypeClass.StaticArray then
+          return self.DoStaticView(AAddress, ArrayCount(self.FTree, self.FTarget, AType), ANode);
+        end;
+        return self.DoBlockView(self.DoLoad(AAddress, IrType.Pointer, ANode), ANode);
+      end;
       LAt := AAddress;
       if LType <> AType then
         LAt := self.DoUpcast(AAddress, AType, LType, ANode);
@@ -22778,6 +22919,7 @@ public type
       LIr: IrType;
       LScale: int64;
       LId: int64;
+      LView: int64;
     begin
       LSubject := self.FTree.FirstOf(AId, NodeRole.Value);
       LIterator := self.FTree.FirstOf(AId, NodeRole.Iterator);
@@ -22800,53 +22942,65 @@ public type
       LHigh := 0;
       LCopy := 0;
       LCountSlot := self.DoSizedSlot(AId, 8, 8);
-      if (LClass = TypeClass.Text) or (LClass = TypeClass.WideText) or (LClass = TypeClass.DynamicArray) then
-        if LClass = TypeClass.DynamicArray then
-          LValue := self.DoValue(LSubject);
-        else
-          LValue := self.DoManagedValue(LSubject);
-        end;
-        if LValue = 0 then
-          return;
-        end;
-        if self.DoAddHolder(LValue, LType, AId) = 0 then
-          return;
-        end;
-        self.DoStore(self.DoTempSlot(AId), LValue, AId);
-        LCount := self.DoCallRuntime(RuntimeRoutine.StrLength, LValue, 0, AId);
-        if LCount = 0 then
-          return;
-        end;
-        self.DoStore(LCountSlot, self.DoConvertIr(LCount, IrType.Int64, AId), AId);
+      LView := self.DoViewOf(LSubject);
+      if LView <> 0 then
+        // a const array of T's view (AS2): walked where it lies, its count and its first
+        // element read once (its caller keeps them for the call), no hold of its own
+        LCopy := self.DoSizedSlot(AId, self.FTarget.PointerSize(), self.FTarget.PointerAlign());
+        self.DoStore(LCopy, self.DoLoad(self.DoByteOffset(LView, ADAM_ARRAY_VIEW_DATA_AT, AId),
+          IrType.Pointer, AId), AId);
+        self.DoStore(LCountSlot, self.DoLoad(self.DoByteOffset(LView, ADAM_ARRAY_VIEW_LENGTH_AT, AId),
+          IrType.Int64, AId), AId);
+        self.DoStore(self.DoTempSlot(AId), self.DoConstant(IrType.Pointer, 0, AId), AId);
       else
-        // a static array or a set: its bytes (or its copy) in a slot of the loop's own
-        LSource := self.DoAggregateSource(LSubject);
-        if LSource = 0 then
-          return;
-        end;
-        LSize := TypeSize(self.FTree, self.FTarget, LType);
-        if self.FTempOf[AId] <> 0 then
-          LCopy := self.FTempOf[AId];
-          if not self.DoCopyValue(LCopy, LSource, LType, AId) then
+        if (LClass = TypeClass.Text) or (LClass = TypeClass.WideText) or (LClass = TypeClass.DynamicArray) then
+          if LClass = TypeClass.DynamicArray then
+            LValue := self.DoValue(LSubject);
+          else
+            LValue := self.DoManagedValue(LSubject);
+          end;
+          if LValue = 0 then
             return;
           end;
-          self.DoSetLive(AId, true, AId);
-        else
-          LCopy := self.DoSizedSlot(AId, LSize, TypeAlign(self.FTree, self.FTarget, LType));
-          self.DoCopyBytes(LCopy, LSource, LSize, AId);
-        end;
-        if LClass = TypeClass.SetType then
-          if not SetRange(self.FTree, self.FTarget, LType, LLow, LHigh) then
-            raise(ADAM_LOWERING_FAULT_LOW_BOUND + TypeText(self.FTree, LType));
+          if self.DoAddHolder(LValue, LType, AId) = 0 then
+            return;
           end;
-          LCount := LHigh - LLow + 1;
-        else
-          LCount := ArrayCount(self.FTree, self.FTarget, LType);
-          if LCount < 0 then
-            raise(ADAM_LOWERING_FAULT_ARRAY_COUNT + TypeText(self.FTree, LType));
+          self.DoStore(self.DoTempSlot(AId), LValue, AId);
+          LCount := self.DoCallRuntime(RuntimeRoutine.StrLength, LValue, 0, AId);
+          if LCount = 0 then
+            return;
           end;
+          self.DoStore(LCountSlot, self.DoConvertIr(LCount, IrType.Int64, AId), AId);
+        else
+          // a static array or a set: its bytes (or its copy) in a slot of the loop's own
+          LSource := self.DoAggregateSource(LSubject);
+          if LSource = 0 then
+            return;
+          end;
+          LSize := TypeSize(self.FTree, self.FTarget, LType);
+          if self.FTempOf[AId] <> 0 then
+            LCopy := self.FTempOf[AId];
+            if not self.DoCopyValue(LCopy, LSource, LType, AId) then
+              return;
+            end;
+            self.DoSetLive(AId, true, AId);
+          else
+            LCopy := self.DoSizedSlot(AId, LSize, TypeAlign(self.FTree, self.FTarget, LType));
+            self.DoCopyBytes(LCopy, LSource, LSize, AId);
+          end;
+          if LClass = TypeClass.SetType then
+            if not SetRange(self.FTree, self.FTarget, LType, LLow, LHigh) then
+              raise(ADAM_LOWERING_FAULT_LOW_BOUND + TypeText(self.FTree, LType));
+            end;
+            LCount := LHigh - LLow + 1;
+          else
+            LCount := ArrayCount(self.FTree, self.FTarget, LType);
+            if LCount < 0 then
+              raise(ADAM_LOWERING_FAULT_ARRAY_COUNT + TypeText(self.FTree, LType));
+            end;
+          end;
+          self.DoStore(LCountSlot, self.DoConstant(IrType.Int64, LCount, AId), AId);
         end;
-        self.DoStore(LCountSlot, self.DoConstant(IrType.Int64, LCount, AId), AId);
       end;
       // S is read once: its temporaries end here
       self.DoEndTemporaries(LSubject);
@@ -22909,11 +23063,15 @@ public type
           self.FModule.InstrAt(LAt).Operands.Add(LBase);
           self.FModule.InstrAt(LAt).Operands.Add(LIndex);
         else
-          if LClass = TypeClass.DynamicArray then
-            LBase := self.DoByteOffset(self.DoLoad(self.DoTempSlot(AId), IrType.Pointer, AId),
-              ADAM_LOWERING_ARRAY_HEADER, AId);
+          if LView <> 0 then
+            LBase := self.DoLoad(LCopy, IrType.Pointer, AId);
           else
-            LBase := LCopy;
+            if LClass = TypeClass.DynamicArray then
+              LBase := self.DoByteOffset(self.DoLoad(self.DoTempSlot(AId), IrType.Pointer, AId),
+                ADAM_LOWERING_ARRAY_HEADER, AId);
+            else
+              LBase := LCopy;
+            end;
           end;
           LAt := self.DoMovePointer(LBase, LIndex, LType, false, AId);
         end;
@@ -24290,14 +24448,264 @@ public type
       for LI := LFirst to LLast do
         LParam := self.DoParamAt(ARoutine, LI - LFirst);
         LValue := self.DoParameterOp(LSignature, LI, LParam);
-        LSlot := self.DoSlot(LParam, VariableTypeOf(self.FTree, LParam), self.FByRef[LParam]);
-        if LSlot <> 0 then
-          self.DoStore(LSlot, LValue, LParam);
-          self.DoOwnParam(LParam, LSlot, LValue);
+        if PassedAsView(self.FTree, LParam) then
+          self.DoViewParam(ARoutine, LParam, LValue);
+        else
+          LSlot := self.DoSlot(LParam, VariableTypeOf(self.FTree, LParam), self.FByRef[LParam]);
+          if LSlot <> 0 then
+            self.DoStore(LSlot, LValue, LParam);
+            self.DoOwnParam(LParam, LSlot, LValue);
+          end;
         end;
       end;
       self.DoPackParam(ARoutine);
       self.DoVarargsCursor(ARoutine);
+    end;
+
+    // The `const array of T` parameter AParam of ARoutine (PassedAsView, BNF sec 6, AS2),
+    // AView the address of the view its caller built. When every use of it reads the view
+    // (DoViewOnly) its slot holds a copy of the view (FView: an index, len, for .. in and a
+    // pass on read it there, the debug information names it so); else it is made an array
+    // value once, here (ArrFromView: the view's block one more holder, or a block copying a
+    // static array's elements), its slot then one of FManaged as a dynamic array's is, and
+    // every use reads it as one
+    hidden method DoViewParam(const ARoutine: int64; const AParam: int64; const AView: int64);
+    var
+      LType: int64;
+      LSlot: int64;
+      LMap: int64;
+      LArgs: ref Int64List;
+      LValue: int64;
+    begin
+      self.FView[AParam] := false;
+      LType := VariableTypeOf(self.FTree, AParam);
+      if self.DoViewOnly(ARoutine, AParam) then
+        LSlot := self.DoSizedSlot(AParam, ADAM_ARRAY_VIEW_SIZE, self.FTarget.PointerAlign());
+        self.FSlotOf[AParam] := LSlot;
+        self.DoCopyBytes(LSlot, AView, ADAM_ARRAY_VIEW_SIZE, AParam);
+        self.FView[AParam] := true;
+        return;
+      end;
+      LSlot := self.DoSlot(AParam, LType, false);
+      if LSlot = 0 then
+        return;
+      end;
+      LMap := self.DoElementMap(LType, AParam);
+      if LMap = 0 then
+        return;
+      end;
+      LArgs := ref Int64List();
+      LArgs.Add(AView);
+      LArgs.Add(LMap);
+      LValue := self.DoCallRuntimeSite(RuntimeRoutine.ArrFromView, LArgs, AParam, self.DoArrayWhat(LType));
+      if LValue = 0 then
+        return;
+      end;
+      self.DoStore(LSlot, LValue, AParam);
+      self.DoAddManaged(LSlot, LType, AParam);
+    end;
+
+    // True when every use of the `const array of T` parameter AParam in ARoutine reads its
+    // view (DoViewUse): none in a generator (its body runs after the call, from its object's
+    // copy), none captured (a func literal's, a for parallel's or an async block's Capture:
+    // captured by value, BNF sec 6) or boxed
+    hidden method DoViewOnly(const ARoutine: int64; const AParam: int64): bool;
+    begin
+      if self.FTree[ARoutine].HasFlag(NodeFlag.Generator) or self.FBoxed[AParam] then
+        return false;
+      end;
+      return self.DoViewUses(self.FTree.FirstOf(ARoutine, NodeRole.Body), AParam);
+    end;
+
+    // True when no node under ARoot uses AParam but to read its view (DoViewUse), none
+    // captures it
+    hidden method DoViewUses(const ARoot: int64; const AParam: int64): bool;
+    var
+      LChild: int64;
+      LI: int64;
+    begin
+      if ARoot = 0 then
+        return true;
+      end;
+      for LI := 0 to self.FTree.ChildCount(ARoot) - 1 do
+        LChild := self.FTree.ChildAt(ARoot, LI);
+        if (self.FTree[LChild].Kind = NodeKind.Capture) and (self.FTree[LChild].ResolvedDecl = AParam) then
+          return false;
+        end;
+        if (self.FTree[LChild].Kind = NodeKind.NameExpression) and (self.FTree[LChild].ResolvedDecl = AParam) and
+          not self.DoViewUse(LChild) then
+          return false;
+        end;
+        if not self.DoViewUses(LChild, AParam) then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    // True when the use AUse of a `const array of T` parameter (through parentheses) reads
+    // its view: the array of an index (DoDynamicElement), len's argument, a for .. in's
+    // value (DoForIn), or an argument passed on to another `const array of T` parameter
+    // by a call that is no async one (DoViewArgument); any other use takes it as an array
+    // value
+    hidden const method DoViewUse(const AUse: int64): bool;
+    var
+      LUp: int64;
+      LParent: int64;
+      LRole: NodeRole;
+      LCallee: int64;
+      LSig: int64;
+      LIndex: int64;
+      LI: int64;
+    begin
+      LUp := AUse;
+      while self.FTree[self.FTree.ParentOf(LUp)].Kind = NodeKind.ParenExpression do
+        LUp := self.FTree.ParentOf(LUp);
+      end;
+      LParent := self.FTree.ParentOf(LUp);
+      LRole := self.FTree.RoleOf(LUp);
+      if (self.FTree[LParent].Kind = NodeKind.IndexExpression) and (LRole = NodeRole.Operand) then
+        return true;
+      end;
+      if (self.FTree[LParent].Kind = NodeKind.ForInStatement) and (LRole = NodeRole.Value) then
+        return true;
+      end;
+      if (self.FTree[LParent].Kind <> NodeKind.CallExpression) or (LRole <> NodeRole.Argument) then
+        return false;
+      end;
+      if self.DoIsIntrinsicCallee(LParent) then
+        LCallee := self.FTree.FirstOf(LParent, NodeRole.Callee);
+        return (self.FTree[self.FTree[LCallee].ResolvedDecl].Text = "len") and
+          (self.FTree.FirstOf(LParent, NodeRole.Argument) = LUp);
+      end;
+      if self.FTree[self.FTree.ParentOf(LParent)].Kind = NodeKind.AsyncExpression then
+        return false;
+      end;
+      LSig := self.DoCallSig(LParent);
+      if LSig = 0 then
+        return false;
+      end;
+      LIndex := -1;
+      for LI := 0 to self.FTree.CountOf(LParent, NodeRole.Argument) - 1 do
+        if self.FTree.NthOf(LParent, NodeRole.Argument, LI) = LUp then
+          LIndex := LI;
+        end;
+      end;
+      if (LIndex < 0) or (LIndex >= self.FTree.CountOf(LSig, NodeRole.Param)) then
+        return false;
+      end;
+      return PassedAsView(self.FTree, self.FTree.NthOf(LSig, NodeRole.Param, LIndex));
+    end;
+
+    // The address of the view the expression AId (through parentheses) reads when it names a
+    // `const array of T` parameter whose slot holds its view (FView); 0 for any other
+    hidden const method DoViewOf(const AId: int64): int64;
+    var
+      LAt: int64;
+      LDecl: int64;
+    begin
+      LAt := self.DoArgRoot(AId);
+      if self.FTree[LAt].Kind <> NodeKind.NameExpression then
+        return 0;
+      end;
+      LDecl := self.FTree[LAt].ResolvedDecl;
+      if (LDecl <= 0) or (self.FTree[LDecl].Kind <> NodeKind.Param) or not self.FView[LDecl] then
+        return 0;
+      end;
+      return self.FSlotOf[LDecl];
+    end;
+
+    // A view (a slot of the call's, keyed by ANode) over the dynamic array block ABlock (nil
+    // when empty, AS2): its first element and length, nil and 0 for none, and the block;
+    // the slot's address
+    hidden method DoBlockView(const ABlock: int64; const ANode: int64): int64;
+    var
+      LSlot: int64;
+      LHeld: int64;
+      LHas: int64;
+      LNone: int64;
+      LDone: int64;
+    begin
+      LSlot := self.DoSizedSlot(ANode, ADAM_ARRAY_VIEW_SIZE, self.FTarget.PointerAlign());
+      self.DoStore(self.DoByteOffset(LSlot, ADAM_ARRAY_VIEW_BLOCK_AT, ANode), ABlock, ANode);
+      LHeld := self.DoCompareWith(IrPredicate.NotEqual, ABlock, self.DoConstant(IrType.Pointer, 0, ANode), ANode);
+      LHas := self.FModule.AddBlock(self.FFunction);
+      LNone := self.FModule.AddBlock(self.FFunction);
+      LDone := self.FModule.AddBlock(self.FFunction);
+      self.DoBranchOn(LHeld, LHas, LNone, ANode);
+      self.FBlock := LHas;
+      self.DoStore(self.DoByteOffset(LSlot, ADAM_ARRAY_VIEW_DATA_AT, ANode),
+        self.DoByteOffset(ABlock, ADAM_LOWERING_ARRAY_HEADER, ANode), ANode);
+      self.DoStore(self.DoByteOffset(LSlot, ADAM_ARRAY_VIEW_LENGTH_AT, ANode),
+        self.DoLoad(self.DoByteOffset(ABlock, ADAM_LOWERING_BLOCK_LENGTH, ANode), IrType.Int64, ANode), ANode);
+      self.DoJumpTo(LDone, ANode);
+      self.FBlock := LNone;
+      self.DoStore(self.DoByteOffset(LSlot, ADAM_ARRAY_VIEW_DATA_AT, ANode),
+        self.DoConstant(IrType.Pointer, 0, ANode), ANode);
+      self.DoStore(self.DoByteOffset(LSlot, ADAM_ARRAY_VIEW_LENGTH_AT, ANode),
+        self.DoConstant(IrType.Int64, 0, ANode), ANode);
+      self.DoJumpTo(LDone, ANode);
+      self.FBlock := LDone;
+      return LSlot;
+    end;
+
+    // A view (a slot of the call's, keyed by ANode) over the ACount elements of a static
+    // array from the first at AAddress, no block (AS2: borrowed, no copy); the slot's address
+    hidden method DoStaticView(const AAddress: int64; const ACount: int64; const ANode: int64): int64;
+    var
+      LSlot: int64;
+    begin
+      LSlot := self.DoSizedSlot(ANode, ADAM_ARRAY_VIEW_SIZE, self.FTarget.PointerAlign());
+      self.DoStore(self.DoByteOffset(LSlot, ADAM_ARRAY_VIEW_DATA_AT, ANode), AAddress, ANode);
+      self.DoStore(self.DoByteOffset(LSlot, ADAM_ARRAY_VIEW_LENGTH_AT, ANode),
+        self.DoConstant(IrType.Int64, ACount, ANode), ANode);
+      self.DoStore(self.DoByteOffset(LSlot, ADAM_ARRAY_VIEW_BLOCK_AT, ANode),
+        self.DoConstant(IrType.Pointer, 0, ANode), ANode);
+      return LSlot;
+    end;
+
+    // The operand the argument AArg passes for the `const array of T` parameter AParam
+    // (PassedAsView, BNF sec 6, AS2): a view's address. A parameter's own view passed on as
+    // it is (DoViewOf); a static array's elements where they lie (DoAggregateSource: a
+    // place's own, a call's result or a literal in its slot) with its count and no block,
+    // never copied; a dynamic array's block (held by the call when the callee could drop
+    // it, DoNeedsHold, as a const one by value always was) in a view of the call's
+    // (DoBlockView); 0 after LW0001
+    hidden method DoViewArgument(const AArg: int64; const AParam: int64): int64;
+    var
+      LView: int64;
+      LType: int64;
+      LCount: int64;
+      LSource: int64;
+      LValue: int64;
+    begin
+      LView := self.DoViewOf(AArg);
+      if LView <> 0 then
+        return LView;
+      end;
+      LType := self.FTree[AArg].ResolvedType;
+      if ClassOf(self.FTree, LType) = TypeClass.StaticArray then
+        LCount := ArrayCount(self.FTree, self.FTarget, LType);
+        if LCount < 0 then
+          raise(ADAM_LOWERING_FAULT_ARRAY_COUNT + TypeText(self.FTree, LType));
+        end;
+        LSource := self.DoAggregateSource(AArg);
+        if LSource = 0 then
+          return 0;
+        end;
+        return self.DoStaticView(LSource, LCount, AArg);
+      end;
+      LValue := self.DoValue(AArg);
+      if LValue = 0 then
+        return 0;
+      end;
+      if self.DoNeedsHold(AArg, AParam) then
+        LValue := self.DoHeldValue(AArg, LValue, VariableTypeOf(self.FTree, AParam));
+        if LValue = 0 then
+          return 0;
+        end;
+      end;
+      return self.DoBlockView(LValue, AArg);
     end;
 
     // The parameter AParam (its slot ASlot, its incoming value AValue) made the routine's
