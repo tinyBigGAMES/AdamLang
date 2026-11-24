@@ -392,6 +392,13 @@ public const
   // The prefix of a closure adapter's function's symbol (F2a; its task entry index
   // follows, internal): a routine run through a closure (DoAdapterBody)
   ADAM_LOWERING_ADAPTER_SYMBOL: string = "__adam_adapter";
+  // The prefix of a C callback's chain entry's function's symbol (CB1; its task entry index
+  // follows, internal): a thunk's target, calling the closure its data word names
+  // (DoChainEntryBody)
+  ADAM_LOWERING_CHAIN_SYMBOL: string = "__adam_chain";
+  // The prefix of its outer chain entry's (CB1; its task entry index follows, internal): the
+  // chain entry's call on a thread Adam never entered, that thread's last catching scope
+  ADAM_LOWERING_CHAIN_OUTER_SYMBOL: string = "__adam_chainouter";
   // The prefix of a routine's constant closure block's read-only data symbol (F2a; its
   // data id follows): System.Runtime's ref block, its count ADAM_LOWERING_STRING_CONSTANT_COUNT
   // (never counted, never freed), its object the adapter's code (DoRoutineClosure)
@@ -1002,6 +1009,14 @@ public type
     hidden FAdapterOf: ref Int64Map;
     hidden FAdapterRoutines: ref Int64Map;
     hidden FAdapterTypes: ref Int64Map;
+    // A C callback's chain entries (CB1, DoChainEntry): FChainEntryOf / FChainOuterOf by
+    // the plain func type T, its chain entry's / outer chain entry's function; FChainTypes
+    // by task entry index (FTaskNodes holds T's closure type), T; FChainOuter by task entry
+    // index, 1 for an outer chain entry
+    hidden FChainEntryOf: ref Int64Map;
+    hidden FChainOuterOf: ref Int64Map;
+    hidden FChainTypes: ref Int64Map;
+    hidden FChainOuter: ref Int64Map;
     hidden FClosureBlockOf: ref Int64Map;
     hidden FBoxDescriptorOf: ref Int64Map;
     // The slot a generator method's ramp keeps its hidden holder in (G1c2: the block of the
@@ -1399,6 +1414,10 @@ public type
       self.FAdapterOf := ref Int64Map(0);
       self.FAdapterRoutines := ref Int64Map(0);
       self.FAdapterTypes := ref Int64Map(0);
+      self.FChainEntryOf := ref Int64Map(0);
+      self.FChainOuterOf := ref Int64Map(0);
+      self.FChainTypes := ref Int64Map(0);
+      self.FChainOuter := ref Int64Map(0);
       self.FClosureBlockOf := ref Int64Map(0);
       self.FBoxDescriptorOf := ref Int64Map(0);
       self.FClosureSlot := 0;
@@ -14489,6 +14508,231 @@ public type
       end;
     end;
 
+    // The chain entry of the plain func type AType (CB1, BNF sec 6: CCallback<T>'s), its
+    // closure type AClosure, made the first time for AType (FChainEntryOf) with its outer
+    // chain entry (FChainOuterOf): both internal, AType's own signature and linkage (a C
+    // caller calls the chain entry as AType; the outer one takes the chain word as one more
+    // ptr after AType's parameters); the chain entry is the target a thunk jumps to with its
+    // data word in the chain register; their bodies (DoChainEntryBody) lowered last
+    // (DoDeferredBodies) as a task entry's are; 0 after LW0001 at ANode
+    hidden method DoChainEntry(const AType: int64; const AClosure: int64; const ANode: int64): int64;
+    var
+      LSignature: int64;
+      LFunction: int64;
+      LOuter: int64;
+    begin
+      LFunction := self.FChainEntryOf.Find(AType);
+      if LFunction <> 0 then
+        return LFunction;
+      end;
+      if self.DoSignatureOf(AClosure, ANode) = 0 then
+        return 0;
+      end;
+      LSignature := self.DoSignatureOf(AType, ANode);
+      if LSignature = 0 then
+        return 0;
+      end;
+      LOuter := self.FModule.AddFunction(ADAM_LOWERING_CHAIN_OUTER_SYMBOL + IntToStr(self.FTaskEntries.Count),
+        self.FModule.SignatureAt(LSignature).ResultType, ANode);
+      self.FModule.FunctionAt(LOuter).Internal := true;
+      self.DoFillSignature(self.FTree[AType].ResolvedDecl, self.FModule.FunctionAt(LOuter).Signature);
+      self.FModule.FunctionAt(LOuter).Signature.AddParam(IrType.Pointer);
+      self.FChainOuterOf.Put(AType, LOuter);
+      self.FChainTypes.Put(self.FTaskEntries.Count, AType);
+      self.FChainOuter.Put(self.FTaskEntries.Count, 1);
+      self.FTaskEntries.Add(LOuter);
+      self.FTaskNodes.Add(AClosure);
+      LFunction := self.FModule.AddFunction(ADAM_LOWERING_CHAIN_SYMBOL + IntToStr(self.FTaskEntries.Count),
+        self.FModule.SignatureAt(LSignature).ResultType, ANode);
+      self.FModule.FunctionAt(LFunction).Internal := true;
+      self.DoFillSignature(self.FTree[AType].ResolvedDecl, self.FModule.FunctionAt(LFunction).Signature);
+      self.FChainEntryOf.Put(AType, LFunction);
+      self.FChainTypes.Put(self.FTaskEntries.Count, AType);
+      self.FTaskEntries.Add(LFunction);
+      self.FTaskNodes.Add(AClosure);
+      return LFunction;
+    end;
+
+    // The body of the chain entry or outer chain entry AIndex (DoChainEntry's functions, in
+    // a fresh function state, CB1). The chain word (the chain register's, the outer one's
+    // last parameter) is the address of the closure a CCallback<T> holds (its FClosure).
+    // The chain entry asks the runtime's CallbackEnter first: on a thread Adam never
+    // entered (a C-made one) it calls the outer chain entry with its parameters as they
+    // came and the chain word, and returns its result; on any other thread it calls the
+    // closure itself. The closure call: the closure's block, nil checked (NilClosureFail),
+    // held for the call in a managed slot of its own (a callback may drop its own
+    // CCallback: released at the exit, by the cleanup on a raise), called through its code
+    // word with the parameters passed on as the closure's signature takes them
+    // (DoAdapterBody's rule: a const text or dynamic array C passes by value that the
+    // closure takes by reference from a slot holding it), the hidden result first; its
+    // result returned. The outer chain entry is then that thread's outermost Adam frame: it
+    // calls CallbackLeave before it returns, and holds the thread's last catching scope
+    // (ThreadRun's: a raise nothing inside catches is reported, Unhandled)
+    hidden method DoChainEntryBody(const AIndex: int64);
+    var
+      LClosure: int64;
+      LType: int64;
+      LOuter: bool;
+      LFromSig: int64;
+      LToSig: int64;
+      LSignature: ref IrSignature;
+      LAt: int64;
+      LCount: int64;
+      LHidden: int64;
+      LChain: int64;
+      LRaw: ref Int64List;
+      LArgs: ref Int64List;
+      LFrom: int64;
+      LTo: int64;
+      LValue: int64;
+      LSlot: int64;
+      LHold: int64;
+      LEntered: int64;
+      LForeign: int64;
+      LHere: int64;
+      LBlock: int64;
+      LCode: int64;
+      LLink: int64;
+      LIr: IrType;
+      LId: int64;
+      LRet: int64;
+      LI: int64;
+    begin
+      LClosure := self.FTaskNodes[AIndex];
+      LType := self.FChainTypes.Find(AIndex);
+      LOuter := self.FChainOuter.Find(AIndex) <> 0;
+      LFromSig := self.FTree[LType].ResolvedDecl;
+      LToSig := self.FTree[LClosure].ResolvedDecl;
+      self.FRoutine := 0;
+      self.FResultSlot := 0;
+      self.FSelfSlot := 0;
+      LSignature := self.FModule.FunctionAt(self.FFunction).Signature;
+      LCount := self.FTree.CountOf(LFromSig, NodeRole.Param);
+      // every parameter read in the entry block (IrOp.Parameter / ChainParameter live there)
+      LAt := 0;
+      LHidden := 0;
+      if self.FHiddenResult[LFromSig] then
+        LHidden := self.DoParameterOp(LSignature, 0, LClosure);
+        LAt := 1;
+      end;
+      LRaw := ref Int64List();
+      for LI := 0 to LCount - 1 do
+        LRaw.Add(self.DoParameterOp(LSignature, LAt + LI, self.FTree.NthOf(LFromSig, NodeRole.Param, LI)));
+      end;
+      if LOuter then
+        LChain := self.DoParameterOp(LSignature, LAt + LCount, LClosure);
+      else
+        LChain := self.DoEmit(IrOp.ChainParameter, IrType.Pointer, LClosure);
+      end;
+      LArgs := ref Int64List();
+      for LI := 0 to LCount - 1 do
+        LFrom := self.FTree.NthOf(LFromSig, NodeRole.Param, LI);
+        LTo := self.FTree.NthOf(LToSig, NodeRole.Param, LI);
+        LValue := LRaw[LI];
+        if self.FPassByRef[LTo] and not self.FPassByRef[LFrom] then
+          LSlot := self.DoSizedSlot(LFrom, self.FTarget.PointerSize(), self.FTarget.PointerAlign());
+          self.DoStore(LSlot, LValue, LFrom);
+          LValue := LSlot;
+        end;
+        LArgs.Add(LValue);
+      end;
+      // the hold: empty until the block is known to be there
+      LHold := self.DoSizedSlot(LClosure, self.FTarget.PointerSize(), self.FTarget.PointerAlign());
+      self.DoStore(LHold, self.DoConstant(IrType.Pointer, 0, LClosure), LClosure);
+      LIr := self.FModule.FunctionAt(self.FFunction).Signature.ResultType;
+      if not LOuter then
+        // a thread Adam never entered: the outer chain entry, its parameters as they came
+        LEntered := self.DoCallRuntimeArgs(RuntimeRoutine.CallbackEnter, ref Int64List(), LClosure);
+        if LEntered = 0 then
+          return;
+        end;
+        LForeign := self.FModule.AddBlock(self.FFunction);
+        LHere := self.FModule.AddBlock(self.FFunction);
+        self.DoBranchOn(LEntered, LForeign, LHere, LClosure);
+        self.FBlock := LForeign;
+        LId := self.DoEmit(IrOp.Call, LIr, LClosure);
+        self.FModule.InstrAt(LId).Link := self.FChainOuterOf.Find(LType);
+        if LHidden <> 0 then
+          self.FModule.InstrAt(LId).Operands.Add(LHidden);
+        end;
+        for LI := 0 to LRaw.Count - 1 do
+          self.FModule.InstrAt(LId).Operands.Add(LRaw[LI]);
+        end;
+        self.FModule.InstrAt(LId).Operands.Add(LChain);
+        LRet := self.DoEmit(IrOp.Ret, IrType.Void, LClosure);
+        if LIr <> IrType.Void then
+          self.FModule.InstrAt(LRet).Operands.Add(LId);
+        end;
+        self.FBlock := LHere;
+      end;
+      if not self.DoAddManaged(LHold, LClosure, LClosure) then
+        return;
+      end;
+      LBlock := self.DoLoad(LChain, IrType.Pointer, LClosure);
+      if not self.DoCheckNilClosure(LBlock, LClosure) then
+        return;
+      end;
+      if self.DoAddHolder(LBlock, LClosure, LClosure) = 0 then
+        return;
+      end;
+      self.DoStore(LHold, LBlock, LClosure);
+      LLink := self.DoSignatureOf(LClosure, LClosure);
+      if LLink = 0 then
+        return;
+      end;
+      LIr := self.FModule.SignatureAt(LLink).ResultType;
+      LCode := self.DoLoad(self.DoByteOffset(LBlock, ADAM_LOWERING_REF_HEADER + ADAM_LOWERING_CLOSURE_CODE,
+        LClosure), IrType.Pointer, LClosure);
+      LId := self.DoEmit(IrOp.CallIndirect, LIr, LClosure);
+      self.FModule.InstrAt(LId).Link := LLink;
+      self.FModule.InstrAt(LId).Operands.Add(LCode);
+      if LHidden <> 0 then
+        self.FModule.InstrAt(LId).Operands.Add(LHidden);
+      end;
+      self.FModule.InstrAt(LId).Operands.Add(LBlock);
+      for LI := 0 to LArgs.Count - 1 do
+        self.FModule.InstrAt(LId).Operands.Add(LArgs[LI]);
+      end;
+      self.DoReleaseManaged(LClosure);
+      if LOuter then
+        if self.DoCallRuntimeArgs(RuntimeRoutine.CallbackLeave, ref Int64List(), LClosure) = 0 then
+          return;
+        end;
+      end;
+      LRet := self.DoEmit(IrOp.Ret, IrType.Void, LClosure);
+      if LIr <> IrType.Void then
+        self.FModule.InstrAt(LRet).Operands.Add(LId);
+      end;
+      self.DoCleanupScopes(LClosure, self.DoLastBlock());
+      if LOuter then
+        self.DoCatchAll(LClosure, RuntimeRoutine.CatchRaise, RuntimeRoutine.Unhandled);
+      end;
+    end;
+
+    // __adam_cthunk(T) (CB1, BNF sec 6): the code address of T's chain entry (DoChainEntry),
+    // T and its closure type from the argument's ResolvedType / ResolvedJump (Semantics'
+    // DoCThunk wrote them); 0 after
+    // LW0001
+    hidden method DoCThunkIntrinsic(const ACall: int64): int64;
+    var
+      LArg: int64;
+      LFunction: int64;
+      LId: int64;
+    begin
+      LArg := self.FTree.FirstOf(ACall, NodeRole.Argument);
+      if (LArg = 0) or (self.FTree[LArg].ResolvedType = 0) or (self.FTree[LArg].ResolvedJump = 0) then
+        self.DoRefuse(ACall, self.FTree.ConstructPhrase(ACall));
+        return 0;
+      end;
+      LFunction := self.DoChainEntry(self.FTree[LArg].ResolvedType, self.FTree[LArg].ResolvedJump, ACall);
+      if LFunction = 0 then
+        return 0;
+      end;
+      LId := self.DoEmit(IrOp.CodeAddress, IrType.Pointer, ACall);
+      self.FModule.InstrAt(LId).Link := LFunction;
+      return LId;
+    end;
+
     // The closure the routine AId names as a value converts to (F2a, BNF sec 4: nothing is
     // built at run time): its constant closure block (FClosureBlockOf, made the first time
     // in read-only data: System.Runtime's ref block whose count says constant, never counted
@@ -16519,6 +16763,11 @@ public type
       self.FFunction := self.FTaskEntries[AIndex];
       self.FBlock := self.FModule.AddBlock(self.FFunction);
       self.DoStartManaged();
+      // a C callback's chain entry (DoChainEntryBody, CB1)
+      if self.FChainTypes.Find(AIndex) <> 0 then
+        self.DoChainEntryBody(AIndex);
+        return;
+      end;
       // a func literal's function (DoClosureBody, F2a), a closure adapter (DoAdapterBody)
       if self.FTree[self.FTaskNodes[AIndex]].Kind = NodeKind.FuncLiteral then
         self.DoClosureBody(self.FTaskNodes[AIndex]);
@@ -16982,10 +17231,11 @@ public type
       return self.DoByteOffset(LBlock, ADAM_LOWERING_REF_HEADER, AOperand);
     end;
 
-    // The address the text or dynamic array argument AArg is passed at for a const
-    // parameter by reference: a place's own (DoAddress), a temporary's hidden slot (its
-    // value made first), else (a literal, a conditional's value) a slot holding its
-    // borrowed value; 0 after LW0001
+    // The address the managed argument AArg (a text, a dynamic array, a closure) is passed
+    // at for a const parameter by reference: a place's own (DoAddress), a temporary's
+    // hidden slot (its value made first), else (a literal, a conditional's value, a routine
+    // or method named as a closure: no place, its closure a value, F2a / F2b) a slot holding
+    // its borrowed value; 0 after LW0001
     hidden method DoManagedReference(const AArg: int64): int64;
     var
       LRoot: int64;
@@ -17000,7 +17250,8 @@ public type
       // an own or a ref given for an own I / ref I moves to its itable word (I3): its own
       // slot holds the block, so a slot of its own holds the word
       LMoves := self.DoMovesOwner(AArg) or self.DoMovesOwner(LRoot);
-      if self.DoIsPlace(LRoot) and (self.FTree[LRoot].ResolvedConst.Kind <> ConstKind.String) and not LMoves then
+      if self.DoIsPlace(LRoot) and (self.FTree[LRoot].ResolvedConst.Kind <> ConstKind.String) and not LMoves and
+        not self.DoIsRoutineClosure(AArg) then
         return self.DoAddress(LRoot);
       end;
       LValue := self.DoValue(AArg);
@@ -18014,6 +18265,10 @@ public type
         if (LDecl <> 0) and (self.FTree[LDecl].Kind = NodeKind.IntrinsicDecl) and
           (self.FTree[LDecl].Text = "pull") then
           return self.DoPull(ACall);
+        end;
+        if (LDecl <> 0) and (self.FTree[LDecl].Kind = NodeKind.IntrinsicDecl) and
+          (self.FTree[LDecl].Text = ADAM_CTHUNK_NAME) then
+          return self.DoCThunkIntrinsic(ACall);
         end;
         if (LDecl <> 0) and (self.FTree[LDecl].Kind = NodeKind.IntrinsicDecl) and
           ((self.FTree[LDecl].Text = "cancel") or (self.FTree[LDecl].Text = "cancelled")) then

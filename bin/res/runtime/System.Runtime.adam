@@ -50,7 +50,9 @@
   C runtime's or a loaded library's (System.HookAbi's HookReal). ThreadStart
   and ThreadJoin start a thread and wait for its end; LockCreate, LockEnter,
   LockLeave and LockFree are the OS's lock (H4t2b). The type VarKind is what
-  varargs.kind(I) answers with (M3.8h).
+  varargs.kind(I) answers with (M3.8h). CCallback<T> is a closure as a plain C
+  function pointer of the func type T (CB1: a thunk ThunkNew makes, freed with
+  its last copy), CCallbackHold<T> what its copies share.
 
   Threads: every routine here may run on any thread at once. The heap counts
   and every string, dynamic array and ref count change only through the
@@ -168,6 +170,10 @@ threadstatic
   // it is threaded code, where a shared array or string is never copied on write (BNF
   // sec 5: ArrUniqueShared / TextUniqueShared raise)
   GThreaded: bool;
+  // True on a thread Adam entered: the main one (this unit's initialize), one ThreadStart
+  // started (ThreadRun), and a C-made one while a C callback runs on it (CallbackEnter to
+  // CallbackLeave, CB1): one with its last catching scope below the running code
+  GThreadEntered: bool;
   // The object of the generator whose body runs on this thread now (nil: none; G1),
   // written by the switch that starts or leaves a body (DoGeneratorEnter, GeneratorYield,
   // GeneratorEnd: the one it switches to), never read once a switch returns (a generator
@@ -7306,6 +7312,7 @@ begin
   LEntry := ThreadEntry(LSlots[0]);
   LArg := LSlots[1];
   GThreaded := true;
+  GThreadEntered := true;
   LEntry(LArg);
 end;
 
@@ -9154,6 +9161,186 @@ begin
   end;
 end;
 
+// A C callback's chain entry asks this first (CB1, Lowering's DoChainEntryBody): false on a
+// thread Adam entered (its code runs above that thread's last catching scope); on any
+// other (a C-made thread) true, and the thread is entered now as ThreadRun enters one
+// (threaded code, BNF sec 5): the chain entry then runs the callback through its outer
+// chain entry, which holds the thread's last catching scope and calls CallbackLeave
+func CallbackEnter(): bool;
+begin
+  if GThreadEntered then
+    return false;
+  end;
+  GThreadEntered := true;
+  GThreaded := true;
+  return true;
+end;
+
+// The outer chain entry's leave (CB1): the C-made thread is no longer entered (its next
+// callback enters it again); what it holds in its threadstatics stays until it ends
+// (ThreadEnded)
+func CallbackLeave();
+begin
+  GThreadEntered := false;
+  GThreaded := false;
+end;
+
+const
+  // A C callback's thunk (CB1, ThunkNew): its slot's bytes in a page, the page's bytes (a
+  // run of slots: Windows reserves memory 64 KiB at a time) and the code a slot holds,
+  // x86_64: `mov r10, <data>` (49 BA imm64: bytes 0..9), `mov r11, <code>` (49 BB
+  // imm64: bytes 10..19), `jmp r11` (41 FF E3: bytes 20..22): the data word in the chain
+  // register (AbiPart.ChainRegister), then the chain entry
+  ADAM_RUNTIME_THUNK_BYTES: int64 = 32;
+  ADAM_RUNTIME_THUNK_PAGE: int64 = 65536;
+  ADAM_RUNTIME_THUNK_DATA: int64 = 2;
+  ADAM_RUNTIME_THUNK_CODE: int64 = 12;
+  ADAM_RUNTIME_THUNK_JUMP: int64 = 20;
+
+var
+  // The free thunk slots (each holds the next's address in its first word; nil: none) and
+  // the mutex that guards them (any thread may make or free a thunk)
+  GThunkFree: ptr;
+  GThunkMutex: MutexWords;
+
+// A new thunk (CB1): a slot of a page that may run (PlatformExecAlloc, a new page when no
+// slot is free; pages are kept for the process's life and their slots used again), written
+// to put AData in the chain register and jump to ACode (a chain entry: __adam_cthunk(T)).
+// Raises code 12 when the OS gives no page
+func ThunkNew(const AData: ptr; const ACode: ptr): ptr;
+var
+  LPage: ptr to uint8;
+  LSlot: ptr to uint8;
+  LWord: ptr to ptr;
+  LI: int64;
+begin
+  MutexEnter(addr of GThunkMutex);
+  if GThunkFree = nil then
+    LPage := ptr to uint8(PlatformExecAlloc(ADAM_RUNTIME_THUNK_PAGE));
+    if LPage = nil then
+      MutexLeave(addr of GThunkMutex);
+      MemoryFail(ptr to const char("out of memory (a C callback thunk page of "), ADAM_RUNTIME_THUNK_PAGE,
+        ptr to const char(" bytes)"));
+    end;
+    // the page's slots on the free list, the first slot first
+    LI := ADAM_RUNTIME_THUNK_PAGE div ADAM_RUNTIME_THUNK_BYTES - 1;
+    while LI >= 0 do
+      LWord := ptr to ptr(addr of LPage[LI * ADAM_RUNTIME_THUNK_BYTES]);
+      LWord^ := GThunkFree;
+      GThunkFree := ptr(LWord);
+      LI := LI - 1;
+    end;
+  end;
+  LSlot := ptr to uint8(GThunkFree);
+  LWord := ptr to ptr(LSlot);
+  GThunkFree := LWord^;
+  MutexLeave(addr of GThunkMutex);
+  // mov r10, AData
+  LSlot[0] := 0x49;
+  LSlot[1] := 0xBA;
+  LWord := ptr to ptr(addr of LSlot[ADAM_RUNTIME_THUNK_DATA]);
+  LWord^ := AData;
+  // mov r11, ACode
+  LSlot[10] := 0x49;
+  LSlot[11] := 0xBB;
+  LWord := ptr to ptr(addr of LSlot[ADAM_RUNTIME_THUNK_CODE]);
+  LWord^ := ACode;
+  // jmp r11
+  LSlot[ADAM_RUNTIME_THUNK_JUMP] := 0x41;
+  LSlot[ADAM_RUNTIME_THUNK_JUMP + 1] := 0xFF;
+  LSlot[ADAM_RUNTIME_THUNK_JUMP + 2] := 0xE3;
+  return ptr(LSlot);
+end;
+
+// The thunk AThunk (ThunkNew's) back on the free list; nil does nothing. Nothing may call
+// it afterwards (its CCallback let go of it: CB1)
+func ThunkFree(const AThunk: ptr);
+var
+  LWord: ptr to ptr;
+begin
+  if AThunk = nil then
+    return;
+  end;
+  MutexEnter(addr of GThunkMutex);
+  LWord := ptr to ptr(AThunk);
+  LWord^ := GThunkFree;
+  GThunkFree := AThunk;
+  MutexLeave(addr of GThunkMutex);
+end;
+
+public type
+  /// What a `CCallback<T>` shares between its copies: the closure and the thunk that calls
+  /// it. Not made by a program: `CCallback<T>` makes it, and the last copy to let go frees
+  /// the thunk.
+  CCallbackHold<T> = object
+    FClosure: __adam_closureof(T);
+    FStub: ptr;
+
+    done;
+    begin
+      ThunkFree(self.FStub);
+      self.FStub := nil;
+    end;
+  end;
+
+  /// A closure as a plain C function pointer: a thunk made at run time that C calls as `T`
+  /// (a plain `func` type) and that runs the closure, captures and all. Copies share one
+  /// thunk; it is freed when the last copy lets go, so keep a copy alive while C may still
+  /// call it. It may be called on any thread, a C-made one too.
+  ///
+  /// @example
+  /// ```adam
+  /// type
+  ///   Compare = func(const A: ptr to const; const B: ptr to const): int32;
+  /// var
+  ///   LCalls: int64;
+  ///   LCompare: CCallback<Compare>;
+  /// begin
+  ///   LCompare := CCallback<Compare>(func(const A: ptr to const; const B: ptr to const): int32
+  ///     begin
+  ///       LCalls := LCalls + 1;
+  ///       return int32(int32(A^) - int32(B^));
+  ///     end);
+  ///   qsort(addr of LItems[0], 10, 4, LCompare.Func());
+  /// end;
+  /// ```
+  CCallback<T> = object
+    hidden FHold: ref CCallbackHold<T>;
+
+    /// An empty callback: `Func()` is nil, `IsValid()` false.
+    init();
+    begin
+      self.FHold := nil;
+    end;
+
+    /// A callback that runs `AFunc`.
+    /// @param AFunc the closure C's calls run (a func literal, a routine, a method of a ref
+    /// object: anything `ref func` of `T`'s shape takes)
+    init(const AFunc: __adam_closureof(T));
+    begin
+      self.FHold := ref CCallbackHold<T>();
+      self.FHold.FClosure := AFunc;
+      self.FHold.FStub := ThunkNew(addr of self.FHold.FClosure, __adam_cthunk(T));
+    end;
+
+    /// The C function pointer to hand to C (nil when empty).
+    /// @returns the thunk as `T`
+    const method Func(): T;
+    begin
+      if self.FHold = nil then
+        return nil;
+      end;
+      return T(self.FHold.FStub);
+    end;
+
+    /// True when the callback runs a closure (made with one).
+    /// @returns whether `Func()` is a C function pointer
+    const method IsValid(): bool;
+    begin
+      return self.FHold <> nil;
+    end;
+  end;
+
 // The heap report turned on; the entry registers it (ReportHeap) as the first exit handler,
 // before any module's initialize, so it runs after every module's teardown, by whatever exit
 // (BNF sec 1). The thread end is registered with the platform here, before any other thread
@@ -9163,6 +9350,7 @@ begin
 @ifdef DEBUG
   GHeapReport := true;
 @endif
+  GThreadEntered := true;
   PlatformAtThreadEnd(ThreadEnded);
   PlatformAtFault(FaultUnhandled);
 end;
