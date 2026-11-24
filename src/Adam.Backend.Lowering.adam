@@ -601,6 +601,9 @@ public const
   // A static array holding texts whose element count Layout did not give (it sized the
   // type, so the bounds folded: a broken invariant)
   ADAM_LOWERING_FAULT_ARRAY_COUNT: string = "Lowering: no element count for the static array ";
+  // A record literal's borrowed C string field (F4b, DoLiteralHolds) not under the literal
+  // its value is copied from
+  ADAM_LOWERING_FAULT_LITERAL_TEXT: string = "Lowering: no place in its literal for the borrowed text of ";
   // A dispatched method with no vtable slot (Layout numbers every virtual member: a
   // broken invariant)
   ADAM_LOWERING_FAULT_SLOT: string = "Lowering: no vtable slot for the method ";
@@ -977,6 +980,11 @@ public type
     hidden FPendingBoxes: ref Int64List;
     hidden FPendingCopies: ref Int64List;
     hidden FPendingSlots: ref Int64List;
+    // The texts record literals' C string fields borrow (F4b, DoFieldInit): three words
+    // each, the field init, the text block its field points into, 1 when the block is the
+    // literal's own (a UTF-32 copy: taken) else 0; DoLiteralHolds gives them to the holder
+    // of the variable the literal goes into
+    hidden FLiteralTexts: ref Int64List;
     // The closure adapters (F2a, DoAdapter): by the key of their routine (a declaration)
     // or routine type and closure type, the function; FAdapterNodes / FAdapterTypes by
     // task entry index (FTaskEntries holds the function, FTaskNodes the closure type):
@@ -1417,6 +1425,7 @@ public type
       self.FElementTriples := ref Int64List();
       self.FTaskEndFunctions := ref Int64List();
       self.FTaskEndNodes := ref Int64List();
+      self.FLiteralTexts := ref Int64List();
     end;
 
     // The IR made so far
@@ -4752,6 +4761,12 @@ public type
       LFieldType := VariableTypeOf(self.FTree, LField);
       LValueExpr := self.FTree.FirstOf(AInit, NodeRole.Value);
       LAddress := self.DoByteOffset(ARecord, self.DoMemberOffset(AType, LField), AInit);
+      // a string borrowed as the field's C string (F4b): the field points into its text,
+      // kept for DoLiteralHolds (a wstring where wchar_t is 32 bits: its UTF-32 copy)
+      if self.DoIsTextBorrow(LValueExpr) then
+        self.DoFieldText(AInit, LValueExpr, LAddress);
+        return;
+      end;
       if self.DoIsAggregate(LFieldType) then
         LSource := self.DoAggregateSource(LValueExpr);
         if LSource <> 0 then
@@ -4770,6 +4785,150 @@ public type
       self.DoStore(LAddress, LValue, AInit);
     end;
 
+    // The string AValue of the record literal's field init AInit (or the static array
+    // literal's element AInit) borrowed as the C string its field at AAddress takes (F4b,
+    // Semantics' DoLiteralCText): the field gets its
+    // text's address (DoTextPointer), and the block (a wstring's UTF-32 copy where
+    // wchar_t is 32 bits, the literal's own) is kept in FLiteralTexts until the holder of
+    // the variable the literal goes into takes it (DoLiteralHolds)
+    hidden method DoFieldText(const AInit: int64; const AValue: int64; const AAddress: int64);
+    var
+      LBlock: int64;
+      LText: int64;
+      LTake: int64;
+      LPointer: int64;
+    begin
+      LBlock := self.DoManagedValue(AValue);
+      if LBlock = 0 then
+        return;
+      end;
+      LText := LBlock;
+      LTake := 0;
+      if self.DoIsWideCopy(AValue) then
+        LText := self.DoCallRuntime(RuntimeRoutine.WStrToUtf32, LBlock, 0, AInit);
+        if LText = 0 then
+          return;
+        end;
+        LTake := 1;
+      end;
+      LPointer := self.DoTextPointer(LText, AInit);
+      if LPointer = 0 then
+        return;
+      end;
+      self.DoStore(AAddress, LPointer, AInit);
+      self.FLiteralTexts.Add(AInit);
+      self.FLiteralTexts.Add(LText);
+      self.FLiteralTexts.Add(LTake);
+    end;
+
+    // The byte offset of the field the field init AInit names inside the value of the
+    // literal ALiteral that holds it (F4b): each field init's field offset in its record
+    // literal and each element's index times the element's size in its static array
+    // literal, up through the literals (and parentheses) between them; -1 when AInit lies
+    // in no literal ALiteral reaches
+    hidden method DoLiteralOffset(const ALiteral: int64; const AInit: int64): int64;
+    var
+      LOffset: int64;
+      LAt: int64;
+      LLiteral: int64;
+      LI: int64;
+    begin
+      LOffset := 0;
+      LAt := AInit;
+      while LAt <> 0 do
+        LLiteral := self.FTree.ParentOf(LAt);
+        if self.FTree[LAt].Kind = NodeKind.FieldInit then
+          LOffset := LOffset + self.DoMemberOffset(self.FTree[LLiteral].ResolvedType, self.FTree[LAt].ResolvedDecl);
+        else
+          if (self.FTree.RoleOf(LAt) <> NodeRole.Element) or (self.FTree[LLiteral].Kind <> NodeKind.ArrayLiteral) then
+            return -1;
+          end;
+          for LI := 0 to self.FTree.CountOf(LLiteral, NodeRole.Element) - 1 do
+            if self.FTree.NthOf(LLiteral, NodeRole.Element, LI) = LAt then
+              LOffset := LOffset + LI * self.DoElementSize(self.FTree[LLiteral].ResolvedType);
+            end;
+          end;
+        end;
+        if LLiteral = ALiteral then
+          return LOffset;
+        end;
+        // up from the literal through its parentheses: a field init or an element
+        LAt := self.FTree.ParentOf(LLiteral);
+        while (LAt <> 0) and (self.FTree[LAt].Kind = NodeKind.ParenExpression) do
+          LAt := self.FTree.ParentOf(LAt);
+        end;
+      end;
+      return -1;
+    end;
+
+    // The texts the record literals in the literal ASource (through parentheses) borrowed
+    // (FLiteralTexts, DoFieldText) given to the holder of the variable ARoot, the
+    // literal's value copied to ADest (a place in ARoot) at ANode (F4b): each its field's
+    // element (DoHolderSlot), a borrowed block StrAssign-ed, the literal's own copy
+    // StrTake-n; those entries then gone. Nothing for another source; false after LW0001
+    hidden method DoLiteralHolds(const ARoot: int64; const ADest: int64; const ASource: int64;
+      const ANode: int64): bool;
+    var
+      LLiteral: int64;
+      LKept: ref Int64List;
+      LInit: int64;
+      LOffset: int64;
+      LSlot: int64;
+      LI: int64;
+    begin
+      LLiteral := self.DoUnparen(ASource);
+      if (self.FLiteralTexts.Count = 0) or ((self.FTree[LLiteral].Kind <> NodeKind.RecordLiteral) and
+        (self.FTree[LLiteral].Kind <> NodeKind.ArrayLiteral)) then
+        return true;
+      end;
+      LKept := ref Int64List();
+      LI := 0;
+      while LI < self.FLiteralTexts.Count do
+        LInit := self.FLiteralTexts[LI];
+        if not self.FTree.IsAncestor(LLiteral, LInit) then
+          LKept.Add(LInit);
+          LKept.Add(self.FLiteralTexts[LI + 1]);
+          LKept.Add(self.FLiteralTexts[LI + 2]);
+          LI := LI + 3;
+          skip;
+        end;
+        LOffset := self.DoLiteralOffset(LLiteral, LInit);
+        if LOffset < 0 then
+          raise(ADAM_LOWERING_FAULT_LITERAL_TEXT + self.FTree.ConstructText(LInit));
+        end;
+        LSlot := self.DoHolderSlot(ARoot, self.DoByteOffset(ADest, LOffset, ANode), ANode);
+        if LSlot = 0 then
+          return false;
+        end;
+        if self.FLiteralTexts[LI + 2] <> 0 then
+          if self.DoCallRuntime(RuntimeRoutine.StrTake, LSlot, self.FLiteralTexts[LI + 1], ANode) = 0 then
+            return false;
+          end;
+        else
+          if self.DoCallRuntime(RuntimeRoutine.StrAssign, LSlot, self.FLiteralTexts[LI + 1], ANode) = 0 then
+            return false;
+          end;
+        end;
+        LI := LI + 3;
+      end;
+      self.FLiteralTexts := LKept;
+      return true;
+    end;
+
+    // The holder of the variable ARoot (if it has one, F4 / F4b) after the value of the
+    // expression ASource, at ASourceAt, of type AType was copied to ADest (a place in ARoot)
+    // at ANode: its elements there take the source variable's borrowed texts (DoCopyHolds:
+    // SEM's ResolvedJump on the source; none: emptied), then a literal's own (DoLiteralHolds)
+    hidden method DoTakeHolds(const ARoot: int64; const ADest: int64; const ASource: int64;
+      const ASourceAt: int64; const AType: int64; const ANode: int64);
+    begin
+      if (self.DoHolderOf(ARoot) = 0) or not HoldsCText(self.FTree, AType) then
+        return;
+      end;
+      if self.DoCopyHolds(ARoot, ADest, self.FTree[self.DoUnparen(ASource)].ResolvedJump, ASourceAt, AType, ANode) then
+        self.DoLiteralHolds(ARoot, ADest, ASource, ANode);
+      end;
+    end;
     // The record literal AId (BNF sec 6, `T(F: v, ...)`) built in its own slot: the slot
     // zeroed (a field the literal does not name is zero), then each field init written in
     // the order written (DoFieldInit); the slot's address. Building apart from where the
@@ -4817,6 +4976,12 @@ public type
         else
           self.DoCopyBytes(AAddress, LSource, TypeSize(self.FTree, self.FTarget, AType), ANode);
         end;
+        return true;
+      end;
+      // a string borrowed by a static array literal's C string element (F4b): kept for
+      // DoLiteralHolds under its element
+      if (not AOwned) and self.DoIsTextBorrow(AExpr) then
+        self.DoFieldText(self.FTree.ParentOf(AExpr), AExpr, AAddress);
         return true;
       end;
       LValue := self.DoValue(AExpr);
@@ -13277,9 +13442,10 @@ public type
     // its own end, DoTaskEnds), then the managed map over the object: the raise's text, the
     // result's values, the ref holding a method's object (DoTaskHolder: the last head),
     // each parameter's and extra argument's copy's at AOffsets (DoTaskLayout's; the code
-    // and self, addresses, hold none); 0 after LW0001
+    // and self, addresses, hold none), then the task's own holders at AHolds (F4b,
+    // DoTaskHolds); 0 after LW0001
     hidden method DoTaskDescriptorData(const AAsync: int64; const ACall: int64; const ADecl: int64;
-      const ASig: int64; const AOffsets: ref Int64List; const ASize: int64): int64;
+      const ASig: int64; const AOffsets: ref Int64List; const ASize: int64; const AHolds: ref Int64List): int64;
     var
       LDone: int64;
       LRuns: ref Int64List;
@@ -13333,6 +13499,12 @@ public type
         LArg := self.FTree.NthOf(ACall, NodeRole.Argument, LParams + LI);
         if not self.DoManagedRuns(self.DoTaskExtraType(LArg), AOffsets[LFirst + LParams + LI], LRuns, AAsync) then
           return 0;
+        end;
+      end;
+      // the task's own holders of its copies' borrowed texts (F4b, DoTaskHolds), last
+      for LI := 0 to AHolds.Count - 1 do
+        if AHolds[LI] <> 0 then
+          self.DoAddRun(LRuns, AHolds[LI], self.DoTaskHoldWords(ASig, LI), self.FTarget.PointerSize(), 0);
         end;
       end;
       return self.DoTaskDescriptorWords(AAsync, LRuns, ASize, LDone);
@@ -14382,12 +14554,17 @@ public type
     // with a holder added (DoStoreManaged), an aggregate copied (DoCopyValue: a holder added
     // to each value it holds, a value object by its type's copy) or, a value object that is
     // a call's result, moved in (DoMoveObject: its temporary no longer live), any other
-    // value stored; false after LW0001
-    hidden method DoTaskArgument(const AArg: int64; const AType: int64; const AAddress: int64): bool;
+    // value stored; a copy of a variable with a holder gives its borrowed texts to the
+    // task's own holder at AHold (0: none, F4b); false after LW0001
+    hidden method DoTaskArgument(const AArg: int64; const AType: int64; const AAddress: int64;
+      const AHold: int64): bool;
     var
       LValue: int64;
       LSource: int64;
       LFrom: int64;
+      LRoot: int64;
+      LBase: int64;
+      LHolder: int64;
     begin
       if self.DoIsManaged(AType) then
         LValue := self.DoValue(AArg);
@@ -14406,7 +14583,21 @@ public type
           self.DoMoveObject(AAddress, LSource, LFrom, AType, AArg);
           return true;
         end;
-        return self.DoCopyValue(AAddress, LSource, AType, AArg);
+        if not self.DoCopyValue(AAddress, LSource, AType, AArg) then
+          return false;
+        end;
+        // the copy of a variable whose C string fields hold borrowed strings: the task's
+        // own holder of it at AHold takes the texts (F4b, DoTaskHolds)
+        if AHold <> 0 then
+          LRoot := self.FTree[self.DoUnparen(AArg)].ResolvedJump;
+          LBase := self.DoVarStorage(LRoot, AArg);
+          LHolder := self.DoVarStorage(self.DoHolderOf(LRoot), AArg);
+          if (LBase = 0) or (LHolder = 0) then
+            return false;
+          end;
+          return self.DoCopyHoldsIn(AAddress, AHold, AAddress, LBase, LHolder, LSource, AType, 0, AArg);
+        end;
+        return true;
       end;
       LValue := self.DoValue(AArg);
       if LValue = 0 then
@@ -14414,6 +14605,63 @@ public type
       end;
       self.DoStore(AAddress, LValue, AArg);
       return true;
+    end;
+
+    // The variable whose copy the async call ACall's argument LI is, for its parameter of
+    // the signature ASig (F4b): a parameter of a type holding C string pointers
+    // (HoldsCText) given (a part of) a variable with a holder (SEM's DoAsync notes it on
+    // the argument); 0 for any other
+    hidden const method DoTaskHoldRoot(const ACall: int64; const ASig: int64; const AIndex: int64): int64;
+    var
+      LRoot: int64;
+    begin
+      if (AIndex >= self.FTree.CountOf(ACall, NodeRole.Argument)) or
+        not HoldsCText(self.FTree, VariableTypeOf(self.FTree, self.FTree.NthOf(ASig, NodeRole.Param, AIndex))) then
+        return 0;
+      end;
+      LRoot := self.FTree[self.DoUnparen(self.FTree.NthOf(ACall, NodeRole.Argument, AIndex))].ResolvedJump;
+      if self.DoHolderOf(LRoot) = 0 then
+        return 0;
+      end;
+      return LRoot;
+    end;
+
+    // The task's own holders past the object of ASize bytes (F4b): for each parameter of
+    // the signature ASig the async call ACall gives a variable's copy (DoTaskHoldRoot), its
+    // holder's words (one string per 8 bytes of the parameter's type, DoSlotIn's elements)
+    // at an offset added to AHolds, else 0; released with the task (its descriptor's map,
+    // DoTaskDescriptorData); the object's new size, a multiple of 8
+    hidden method DoTaskHolds(const ACall: int64; const ASig: int64; const ASize: int64;
+      const AHolds: ref Int64List): int64;
+    var
+      LAt: int64;
+      LWords: int64;
+      LI: int64;
+    begin
+      LAt := AlignUp(ASize, 8);
+      for LI := 0 to self.FTree.CountOf(ASig, NodeRole.Param) - 1 do
+        if self.DoTaskHoldRoot(ACall, ASig, LI) = 0 then
+          AHolds.Add(0);
+          skip;
+        end;
+        LWords := self.DoTaskHoldWords(ASig, LI);
+        AHolds.Add(LAt);
+        LAt := LAt + LWords * 8;
+      end;
+      return LAt;
+    end;
+
+    // The words of the task's own holder of its copy for the parameter LI of the signature
+    // ASig (F4b): one per 8 bytes of the parameter's type, at least one
+    hidden const method DoTaskHoldWords(const ASig: int64; const AIndex: int64): int64;
+    var
+      LSize: int64;
+    begin
+      LSize := TypeSize(self.FTree, self.FTarget, VariableTypeOf(self.FTree, self.FTree.NthOf(ASig, NodeRole.Param, AIndex)));
+      if LSize < 8 then
+        return 1;
+      end;
+      return (LSize + 7) div 8;
     end;
 
     // The async expression AId (`async F(..)`, BNF sec 6): a new task block (RefNew with the
@@ -14444,6 +14692,8 @@ public type
       LParam: int64;
       LType: int64;
       LBuilt: int64;
+      LHolds: ref Int64List;
+      LHold: int64;
       LI: int64;
     begin
       if self.DoIsAsyncBlock(AId) then
@@ -14454,7 +14704,9 @@ public type
       end;
       LOffsets := ref Int64List();
       LSize := self.DoTaskLayout(AId, LCall, LDecl, LSig, LOffsets);
-      LData := self.DoTaskDescriptorData(AId, LCall, LDecl, LSig, LOffsets, LSize);
+      LHolds := ref Int64List();
+      LSize := self.DoTaskHolds(LCall, LSig, LSize, LHolds);
+      LData := self.DoTaskDescriptorData(AId, LCall, LDecl, LSig, LOffsets, LSize, LHolds);
       if LData = 0 then
         return 0;
       end;
@@ -14505,7 +14757,11 @@ public type
         LParam := self.FTree.NthOf(LSig, NodeRole.Param, LI);
         LType := VariableTypeOf(self.FTree, LParam);
         LAddress := self.DoByteOffset(LObject, LOffsets[LFirst + LI], AId);
-        if not self.DoTaskArgument(self.FTree.NthOf(LCall, NodeRole.Argument, LI), LType, LAddress) then
+        LHold := 0;
+        if LHolds[LI] <> 0 then
+          LHold := self.DoByteOffset(LObject, LHolds[LI], AId);
+        end;
+        if not self.DoTaskArgument(self.FTree.NthOf(LCall, NodeRole.Argument, LI), LType, LAddress, LHold) then
           return 0;
         end;
         if (LBuilt <> 0) and self.DoNeedsEnd(LType) then
@@ -14516,7 +14772,7 @@ public type
         LArg := self.FTree.NthOf(LCall, NodeRole.Argument, LParams + LI);
         LType := self.DoTaskExtraType(LArg);
         LAddress := self.DoByteOffset(LObject, LOffsets[LFirst + LParams + LI], AId);
-        if not self.DoTaskArgument(LArg, LType, LAddress) then
+        if not self.DoTaskArgument(LArg, LType, LAddress, 0) then
           return 0;
         end;
         if (LBuilt <> 0) and self.DoNeedsEnd(LType) then
@@ -18914,29 +19170,39 @@ public type
     end;
 
     // The element of the variable ARoot's holder (DoHolderOf) that keeps the text of the C
-    // string field at AField (an address inside ARoot's storage), at ANode: the field's
-    // byte offset in the variable, F, rounded down to a word (element F div 8: two
-    // pointer fields never share a word, packed or not), added to the holder's address; 0
-    // after LW0001
+    // string field at AField (an address inside ARoot's storage), at ANode (DoSlotIn over
+    // the variable's and its holder's storage); 0 after LW0001
     hidden method DoHolderSlot(const ARoot: int64; const AField: int64; const ANode: int64): int64;
     var
       LBase: int64;
       LHolder: int64;
-      LOffset: int64;
-      LWord: int64;
-      LId: int64;
     begin
       LBase := self.DoVarStorage(ARoot, ANode);
       LHolder := self.DoVarStorage(self.DoHolderOf(ARoot), ANode);
       if (LBase = 0) or (LHolder = 0) then
         return 0;
       end;
+      return self.DoSlotIn(LBase, LHolder, AField, ANode);
+    end;
+
+    // The holder element that keeps the text of the C string field at AField, inside a
+    // value at ABase whose holder's elements start at AHolder (a variable's hidden holder,
+    // or a task's own holder of an argument's copy, F4b), at ANode: the field's byte
+    // offset in the value, F, rounded down to a word (element F div 8: two pointer fields
+    // never share a word, packed or not), added to AHolder
+    hidden method DoSlotIn(const ABase: int64; const AHolder: int64; const AField: int64;
+      const ANode: int64): int64;
+    var
+      LOffset: int64;
+      LWord: int64;
+      LId: int64;
+    begin
       LOffset := self.DoBinaryIr(IrOp.Sub, IrType.Int64, self.DoConvertIr(AField, IrType.Int64, ANode),
-        self.DoConvertIr(LBase, IrType.Int64, ANode), ANode);
+        self.DoConvertIr(ABase, IrType.Int64, ANode), ANode);
       LWord := self.DoBinaryIr(IrOp.BitAnd, IrType.Int64, LOffset,
         self.DoConstant(IrType.Int64, -self.FTarget.PointerSize(), ANode), ANode);
       LId := self.DoEmit(IrOp.Offset, IrType.Pointer, ANode);
-      self.FModule.InstrAt(LId).Operands.Add(LHolder);
+      self.FModule.InstrAt(LId).Operands.Add(AHolder);
       self.FModule.InstrAt(LId).Operands.Add(LWord);
       return LId;
     end;
@@ -19016,22 +19282,40 @@ public type
     hidden method DoCopyHolds(const ATarget: int64; const ATargetAt: int64; const ASource: int64;
       const ASourceAt: int64; const AType: int64; const ANode: int64): bool;
     var
-      LSource: int64;
+      LTargetBase: int64;
+      LTargetHold: int64;
+      LSourceBase: int64;
+      LSourceHold: int64;
     begin
-      LSource := ASource;
-      if self.DoHolderOf(LSource) = 0 then
-        LSource := 0;
+      LTargetBase := self.DoVarStorage(ATarget, ANode);
+      LTargetHold := self.DoVarStorage(self.DoHolderOf(ATarget), ANode);
+      if (LTargetBase = 0) or (LTargetHold = 0) then
+        return false;
       end;
-      return self.DoCopyHoldsIn(ATarget, ATargetAt, LSource, ASourceAt, AType, 0, ANode);
+      LSourceBase := 0;
+      LSourceHold := 0;
+      if self.DoHolderOf(ASource) <> 0 then
+        LSourceBase := self.DoVarStorage(ASource, ANode);
+        LSourceHold := self.DoVarStorage(self.DoHolderOf(ASource), ANode);
+        if (LSourceBase = 0) or (LSourceHold = 0) then
+          return false;
+        end;
+      end;
+      return self.DoCopyHoldsIn(LTargetBase, LTargetHold, ATargetAt, LSourceBase, LSourceHold, ASourceAt,
+        AType, 0, ANode);
     end;
 
-    // DoCopyHolds' walk of AType (ADepth levels down): a C string pointer's one element
-    // (the source's loaded and StrAssign-ed into the target's, else StrTake of nil); a
-    // record's or an overlay's parent part, fields and anonymous parts at their offsets; a
-    // static array's elements by a loop (DoEachElement's form); nothing for a type that
-    // holds no C string pointer (HoldsCText); false after LW0001
-    hidden method DoCopyHoldsIn(const ATarget: int64; const ATargetAt: int64; const ASource: int64;
-      const ASourceAt: int64; const AType: int64; const ADepth: int64; const ANode: int64): bool;
+    // DoCopyHolds' walk of AType (ADepth levels down) between two holders: the target value
+    // at ATargetAt, inside the value at ATargetBase whose holder's elements start at
+    // ATargetHold, takes the source's, ASourceAt inside ASourceBase held at ASourceHold
+    // (0: no source, each element emptied); DoSlotIn finds each element. A C string
+    // pointer's one element (the source's loaded and StrAssign-ed into the target's, else
+    // StrTake of nil); a record's or an overlay's parent part, fields and anonymous parts at
+    // their offsets; a static array's elements by a loop (DoEachElement's form); nothing for
+    // a type that holds no C string pointer (HoldsCText); false after LW0001
+    hidden method DoCopyHoldsIn(const ATargetBase: int64; const ATargetHold: int64; const ATargetAt: int64;
+      const ASourceBase: int64; const ASourceHold: int64; const ASourceAt: int64; const AType: int64;
+      const ADepth: int64; const ANode: int64): bool;
     var
       LClass: TypeClass;
       LDest: int64;
@@ -19042,32 +19326,29 @@ public type
         return true;
       end;
       if IsCTextPointer(self.FTree, AType) then
-        LDest := self.DoHolderSlot(ATarget, ATargetAt, ANode);
-        if LDest = 0 then
-          return false;
-        end;
-        if ASource = 0 then
+        LDest := self.DoSlotIn(ATargetBase, ATargetHold, ATargetAt, ANode);
+        if ASourceHold = 0 then
           return self.DoCallRuntime(RuntimeRoutine.StrTake, LDest, self.DoConstant(IrType.Pointer, 0, ANode), ANode) <> 0;
         end;
-        LFrom := self.DoHolderSlot(ASource, ASourceAt, ANode);
-        if LFrom = 0 then
-          return false;
-        end;
+        LFrom := self.DoSlotIn(ASourceBase, ASourceHold, ASourceAt, ANode);
         LValue := self.DoLoad(LFrom, IrType.Pointer, ANode);
         return self.DoCallRuntime(RuntimeRoutine.StrAssign, LDest, LValue, ANode) <> 0;
       end;
       LClass := ClassOf(self.FTree, AType);
       if LClass = TypeClass.StaticArray then
-        return self.DoCopyHoldsEach(ATarget, ATargetAt, ASource, ASourceAt, AType, ADepth, ANode);
+        return self.DoCopyHoldsEach(ATargetBase, ATargetHold, ATargetAt, ASourceBase, ASourceHold, ASourceAt,
+          AType, ADepth, ANode);
       end;
-      return self.DoCopyHoldsBody(ATarget, ATargetAt, ASource, ASourceAt, BodyOf(self.FTree, AType), ADepth, ANode);
+      return self.DoCopyHoldsBody(ATargetBase, ATargetHold, ATargetAt, ASourceBase, ASourceHold, ASourceAt,
+        BodyOf(self.FTree, AType), ADepth, ANode);
     end;
 
     // DoCopyHoldsIn over the record or overlay body ABody: its parent part at the part's
     // offset, each field at its own, an anonymous record's or overlay's fields (their
     // declaring type's offsets, from the same start); false after LW0001
-    hidden method DoCopyHoldsBody(const ATarget: int64; const ATargetAt: int64; const ASource: int64;
-      const ASourceAt: int64; const ABody: int64; const ADepth: int64; const ANode: int64): bool;
+    hidden method DoCopyHoldsBody(const ATargetBase: int64; const ATargetHold: int64; const ATargetAt: int64;
+      const ASourceBase: int64; const ASourceHold: int64; const ASourceAt: int64; const ABody: int64;
+      const ADepth: int64; const ANode: int64): bool;
     var
       LPart: int64;
       LMember: int64;
@@ -19080,11 +19361,11 @@ public type
       if LPart <> 0 then
         LOffset := self.FTree[LPart].ResolvedOffset;
         LFrom := 0;
-        if ASource <> 0 then
+        if ASourceHold <> 0 then
           LFrom := self.DoByteOffset(ASourceAt, LOffset, ANode);
         end;
-        if not self.DoCopyHoldsIn(ATarget, self.DoByteOffset(ATargetAt, LOffset, ANode), ASource, LFrom,
-          CanonicalOf(self.FTree, LPart), ADepth + 1, ANode) then
+        if not self.DoCopyHoldsIn(ATargetBase, ATargetHold, self.DoByteOffset(ATargetAt, LOffset, ANode),
+          ASourceBase, ASourceHold, LFrom, CanonicalOf(self.FTree, LPart), ADepth + 1, ANode) then
           return false;
         end;
       end;
@@ -19094,16 +19375,17 @@ public type
         if LKind = NodeKind.FieldDecl then
           LOffset := self.FTree[LMember].ResolvedOffset;
           LFrom := 0;
-          if ASource <> 0 then
+          if ASourceHold <> 0 then
             LFrom := self.DoByteOffset(ASourceAt, LOffset, ANode);
           end;
-          if not self.DoCopyHoldsIn(ATarget, self.DoByteOffset(ATargetAt, LOffset, ANode), ASource, LFrom,
-            VariableTypeOf(self.FTree, LMember), ADepth + 1, ANode) then
+          if not self.DoCopyHoldsIn(ATargetBase, ATargetHold, self.DoByteOffset(ATargetAt, LOffset, ANode),
+            ASourceBase, ASourceHold, LFrom, VariableTypeOf(self.FTree, LMember), ADepth + 1, ANode) then
             return false;
           end;
         end;
         if (LKind = NodeKind.AnonRecord) or (LKind = NodeKind.AnonOverlay) then
-          if not self.DoCopyHoldsBody(ATarget, ATargetAt, ASource, ASourceAt, LMember, ADepth + 1, ANode) then
+          if not self.DoCopyHoldsBody(ATargetBase, ATargetHold, ATargetAt, ASourceBase, ASourceHold, ASourceAt,
+            LMember, ADepth + 1, ANode) then
             return false;
           end;
         end;
@@ -19115,8 +19397,9 @@ public type
     // slot from 0; a head testing it against the count, to the body or the exit; the body
     // each side's element (DoMovePointer) walked, the counter one on, back to the head;
     // false after LW0001
-    hidden method DoCopyHoldsEach(const ATarget: int64; const ATargetAt: int64; const ASource: int64;
-      const ASourceAt: int64; const AType: int64; const ADepth: int64; const ANode: int64): bool;
+    hidden method DoCopyHoldsEach(const ATargetBase: int64; const ATargetHold: int64; const ATargetAt: int64;
+      const ASourceBase: int64; const ASourceHold: int64; const ASourceAt: int64; const AType: int64;
+      const ADepth: int64; const ANode: int64): bool;
     var
       LCount: int64;
       LCounter: int64;
@@ -19147,11 +19430,11 @@ public type
       self.FBlock := LBody;
       LIndex := self.DoLoad(LCounter, IrType.Int64, ANode);
       LFrom := 0;
-      if ASource <> 0 then
+      if ASourceHold <> 0 then
         LFrom := self.DoMovePointer(ASourceAt, LIndex, AType, false, ANode);
       end;
-      if not self.DoCopyHoldsIn(ATarget, self.DoMovePointer(ATargetAt, LIndex, AType, false, ANode), ASource,
-        LFrom, TargetOf(self.FTree, AType), ADepth + 1, ANode) then
+      if not self.DoCopyHoldsIn(ATargetBase, ATargetHold, self.DoMovePointer(ATargetAt, LIndex, AType, false, ANode),
+        ASourceBase, ASourceHold, LFrom, TargetOf(self.FTree, AType), ADepth + 1, ANode) then
         return false;
       end;
       LIndex := self.DoLoad(LCounter, IrType.Int64, ANode);
@@ -21379,12 +21662,10 @@ public type
         end;
       end;
       self.DoAggregateCopy(LDest, LSource, self.FTree[LTarget].ResolvedType, AId);
-      // the target's holder takes the source's borrowed strings, or lets its own go (F4)
-      if self.DoHolderOf(self.FTree[AId].ResolvedJump) <> 0 then
-        self.DoCopyHolds(self.FTree[AId].ResolvedJump, LDest,
-          self.FTree[self.DoUnparen(self.FTree.FirstOf(AId, NodeRole.Source))].ResolvedJump, LSource,
-          self.FTree[LTarget].ResolvedType, AId);
-      end;
+      // the target's holder takes the source's borrowed strings, or lets its own go (F4),
+      // and a literal's (F4b)
+      self.DoTakeHolds(self.FTree[AId].ResolvedJump, LDest, self.FTree.FirstOf(AId, NodeRole.Source), LSource,
+        self.FTree[LTarget].ResolvedType, AId);
     end;
 
     // The assignment AId of a value object whose type runs code where it is copied or
@@ -21456,6 +21737,9 @@ public type
         self.DoCopyBytes(LDest, LTemp, LSize, AId);
       end;
       self.DoSetLive(LTo, true, AId);
+      // the target's holder takes the borrowed strings as a plain copy's does (F4 / F4b)
+      self.DoTakeHolds(self.FTree[AId].ResolvedJump, LDest, self.FTree.FirstOf(AId, NodeRole.Source), LSource,
+        LType, AId);
     end;
 
     // The return statement AId, with or without a value; in the program block it ends the
@@ -23888,20 +24172,19 @@ public type
       if LFrom <> 0 then
         self.DoMoveObject(LSlot, LSource, LFrom, AType, ALocal);
         self.DoSetLive(ALocal, true, ALocal);
-        return;
-      end;
-      if self.DoHasLifetime(AType) then
-        if self.DoCopyValue(LSlot, LSource, AType, ALocal) then
+      else
+        if self.DoHasLifetime(AType) then
+          if not self.DoCopyValue(LSlot, LSource, AType, ALocal) then
+            return;
+          end;
           self.DoSetLive(ALocal, true, ALocal);
+        else
+          self.DoAggregateCopy(LSlot, LSource, AType, ALocal);
         end;
-        return;
       end;
-      self.DoAggregateCopy(LSlot, LSource, AType, ALocal);
       // a copy of a variable's C string fields takes its borrowed strings into this one's
-      // holder (F4)
-      if self.DoHolderOf(ALocal) <> 0 then
-        self.DoCopyHolds(ALocal, LSlot, self.FTree[self.DoUnparen(LInit)].ResolvedJump, LSource, AType, ALocal);
-      end;
+      // holder (F4), a literal's its own (F4b)
+      self.DoTakeHolds(ALocal, LSlot, LInit, LSource, AType, ALocal);
     end;
 
     // True when the local variable ALocal has init arguments while its type is no object
@@ -25228,6 +25511,7 @@ public type
       LValue: int64;
       LType: int64;
       LSource: int64;
+      LDest: int64;
     begin
       if (self.FTree[ADecl].Kind <> NodeKind.VarDecl) and (self.FTree[ADecl].Kind <> NodeKind.ConstDecl) then
         return;
@@ -25254,8 +25538,12 @@ public type
       if self.DoIsAggregate(LType) then
         LSource := self.DoAggregateSource(LInit);
         if LSource <> 0 then
-          // the variable is still empty at the entry: its value is copied in (DoCopyValue)
-          self.DoCopyValue(self.DoDataAddress(ADecl, LInit), LSource, LType, LInit);
+          // the variable is still empty at the entry: its value is copied in (DoCopyValue);
+          // its holder takes the borrowed strings (F4b)
+          LDest := self.DoDataAddress(ADecl, LInit);
+          if self.DoCopyValue(LDest, LSource, LType, LInit) then
+            self.DoTakeHolds(ADecl, LDest, LInit, LSource, LType, LInit);
+          end;
         end;
         return;
       end;
