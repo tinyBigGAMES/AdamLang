@@ -312,10 +312,124 @@ begin
   end;
   return 0;
 end;
-// True when APath names a virtual path (io://, after HookIOSkipCurrentFolder)
-public func cpplink HookIOIsVirtual(const APath: string): bool;
+// The working folder a hooked chdir moved into ("" for none: the C runtime's own applies): a
+// folder of the path source ("res/assets/models") or of a registered source
+// ("io://3/models"). A relative path is joined to it before any lookup (HookIOJoinWorkFolder),
+// as the C runtime joins its own; process-wide like that one, under GLock
+var
+  GWorkFolder: string;
+
+// True when APath names its place by itself (never joined to a working folder): empty, a
+// root (a separator first; on x86_64-windows-gnu a drive's "X:" too) or a virtual path
+func DoRootedPath(const APath: string): bool;
 begin
+  if (len(APath) = 0) or HookIOIsSeparator(APath[0]) then
+    return true;
+  end;
+@ifdef TARGET_X86_64_WINDOWS_GNU
+  if (len(APath) >= 2) and (APath[1] = ':') then
+    return true;
+  end;
+@endif
   return HookIOSchemeAt(APath, HookIOSkipCurrentFolder(APath));
+end;
+
+// AFolder's segments (separators of the target) as one lexical path, '/' separated: "" and
+// "." segments drop out, ".." removes the segment before it. AOk false when a ".." would
+// climb above the start (a source has nothing above its root)
+func DoFolderSegments(const AFolder: string; var AOk: bool): string;
+var
+  LParts: array of string;
+  LCount: int64;
+  LPart: string;
+  LResult: string;
+  LAt: int64;
+  LStart: int64;
+  LI: int64;
+begin
+  AOk := true;
+  setlength(LParts, 0);
+  LCount := 0;
+  LAt := 0;
+  while LAt <= len(AFolder) do
+    LStart := LAt;
+    while (LAt < len(AFolder)) and not HookIOIsSeparator(AFolder[LAt]) do
+      LAt := LAt + 1;
+    end;
+    LPart := Substring(AFolder, LStart, LAt - LStart);
+    if LPart = ".." then
+      if LCount = 0 then
+        AOk := false;
+        return "";
+      end;
+      LCount := LCount - 1;
+    else
+      if (len(LPart) <> 0) and (LPart <> ".") then
+        if LCount >= len(LParts) then
+          setlength(LParts, LCount + 1);
+        end;
+        LParts[LCount] := LPart;
+        LCount := LCount + 1;
+      end;
+    end;
+    LAt := LAt + 1;
+  end;
+  LResult := "";
+  for LI := 0 to LCount - 1 do
+    if LI > 0 then
+      LResult := LResult + "/";
+    end;
+    LResult := LResult + LParts[LI];
+  end;
+  return LResult;
+end;
+
+// APath joined to the working folder a hooked chdir set: a relative path (not DoRootedPath)
+// becomes "<folder>/<path>"; any other path, or every path while none is set or inside
+// HookIO's own path work, is APath itself
+public func cpplink HookIOJoinWorkFolder(const APath: string): string;
+var
+  LFolder: string;
+begin
+  if (GPathDepth <> 0) or DoRootedPath(APath) then
+    return APath;
+  end;
+  lock (GLock) do
+    LFolder := GWorkFolder;
+  end;
+  if len(LFolder) = 0 then
+    return APath;
+  end;
+  return LFolder + "/" + APath;
+end;
+
+// The working folder a hooked chdir set ("" for none: the C runtime's applies)
+public func cpplink HookIOWorkFolder(): string;
+var
+  LFolder: string;
+begin
+  lock (GLock) do
+    LFolder := GWorkFolder;
+  end;
+  return LFolder;
+end;
+
+// The C runtime's working folder applies again (a real chdir succeeded)
+public func cpplink HookIOClearWorkFolder();
+begin
+  lock (GLock) do
+    GWorkFolder := "";
+  end;
+end;
+
+// True when APath names a virtual path (io://, after HookIOSkipCurrentFolder; a relative
+// path in an io:// working folder too, HookIOJoinWorkFolder)
+public func cpplink HookIOIsVirtual(const APath: string): bool;
+var
+  LPath: string;
+begin
+  LPath := HookIOJoinWorkFolder(APath);
+  return HookIOSchemeAt(LPath, HookIOSkipCurrentFolder(LPath));
 end;
 // The registered entry of AId copied out under the lock, its stream lock with one more user
 // (the open gives it back when it is done); false when none
@@ -564,21 +678,96 @@ begin
   end;
   return LName;
 end;
+// A hooked chdir to APath (joined to the working folder first): true when APath is a folder
+// of a registered source (io://<n>[/<folder>]) or of the path source, which becomes the
+// working folder (a source wins over the disk, as HookIOResolve's lookup does); false for
+// anything else, the C runtime's chdir to answer it. Inside HookIO's own path work, false
+public func cpplink HookIOChangeFolder(const APath: string): bool;
+var
+  LPath: string;
+  LEntry: HookEntry;
+  LId: uint64;
+  LRest: string;
+  LName: string;
+  LFolder: string;
+  LOk: bool;
+  LExists: bool;
+begin
+  if (GPathDepth <> 0) or (len(APath) = 0) then
+    return false;
+  end;
+  LPath := HookIOJoinWorkFolder(APath);
+  if HookIOParse(LPath, HookIOSkipCurrentFolder(LPath), LId, LRest) then
+    if (LId = 0) or not HookIOFind(LId, LEntry) then
+      return false;
+    end;
+    HookIOReleaseLock(LEntry.Lock);
+    if LEntry.Source = nil then
+      return false;
+    end;
+    LName := DoFolderSegments(LRest, LOk);
+    if not LOk then
+      return false;
+    end;
+    LFolder := ADAM_HOOKIO_SCHEME + UIntToStr(LId);
+    // Its root is a folder of every source; any other folder is asked
+    if len(LName) <> 0 then
+      GPathDepth := GPathDepth + 1;
+      LExists := IOSourceFolderExists(LEntry.Source, LName);
+      GPathDepth := GPathDepth - 1;
+      if not LExists then
+        return false;
+      end;
+      LFolder := LFolder + "/" + LName;
+    end;
+  else
+    if not HookIOPathSourceActive() then
+      return false;
+    end;
+    if not HookIOFind(HookIOActivePathSourceId(), LEntry) then
+      return false;
+    end;
+    HookIOReleaseLock(LEntry.Lock);
+    if LEntry.Source = nil then
+      return false;
+    end;
+    LName := DoFolderSegments(LPath, LOk);
+    if (not LOk) or (len(LName) = 0) then
+      return false;
+    end;
+    // The lookup is HookIO's own path work: a source that opens files reaches the real ones
+    GPathDepth := GPathDepth + 1;
+    LExists := IOSourceFolderExists(LEntry.Source, LName);
+    GPathDepth := GPathDepth - 1;
+    if not LExists then
+      return false;
+    end;
+    LFolder := LName;
+  end;
+  lock (GLock) do
+    GWorkFolder := LFolder;
+  end;
+  return true;
+end;
+
 // As HookIOParse (after HookIOSkipCurrentFolder), and a plain path the path source holds (this
 // thread's own when set, else the program's): then AId is that source's prefix number and
-// ARest "/<entry>". A plain path the source lacks (or any path while no source is set, or
+// ARest "/<entry>". A relative path is joined to the working folder first. A plain path the source lacks (or any path while no source is set, or
 // inside HookIO's own path work) is false: the C runtime gets it
 public func cpplink HookIOResolve(const APath: string; var AId: uint64; var ARest: string): bool;
 var
   LEntry: HookEntry;
   LSourceId: uint64;
+  LPath: string;
   LName: string;
   LExists: bool;
 begin
-  if HookIOParse(APath, HookIOSkipCurrentFolder(APath), AId, ARest) then
+  // A relative path in a working folder a hooked chdir set is looked up there
+  LPath := HookIOJoinWorkFolder(APath);
+  if HookIOParse(LPath, HookIOSkipCurrentFolder(LPath), AId, ARest) then
     return true;
   end;
-  if (len(APath) = 0) or (not HookIOPathSourceActive()) then
+  if (len(LPath) = 0) or (not HookIOPathSourceActive()) then
     return false;
   end;
   LSourceId := HookIOActivePathSourceId();
@@ -590,7 +779,7 @@ begin
   if LEntry.Source = nil then
     return false;
   end;
-  LName := HookIOPathEntryName(APath);
+  LName := HookIOPathEntryName(LPath);
   if len(LName) = 0 then
     return false;
   end;
