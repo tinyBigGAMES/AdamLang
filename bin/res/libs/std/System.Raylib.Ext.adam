@@ -85,11 +85,16 @@
   shares, the last copy unloads; `Adopt` takes a .C record over, `Handle()`
   lends it back): ImageRes (CPU pixels, changed and drawn on in fluent
   chains), TextureRes, RenderTextureRes (Begin / End inside the frame too),
-  FontRes and GlyphsRes. They load by path from the source Assets mounts
-  (the examples' assets.zip). Teardown is order-proof: the Window's last
-  release unloads every GPU resource still alive before CloseWindow, a
-  window the program closes itself gives up its GPU resources with it, and
-  a copy released later does nothing.
+  FontRes, GlyphsRes, ShaderRes, MeshRes, MaterialRes, ModelRes,
+  ModelAnimationRes; WaveRes, SoundRes, MusicRes, AudioStreamRes and
+  VideoRes over the AudioDevice (audio callbacks and processors are
+  closures, run on raylib's audio thread). They load by path from the
+  source Assets mounts (the examples' assets.zip). Teardown is order-proof:
+  the Window's last release unloads every GPU resource still alive before
+  CloseWindow, the AudioDevice's last release every sound, music, stream
+  and video before CloseAudioDevice, a window the program closes itself
+  gives up its GPU resources with it, and a copy released later does
+  nothing.
 
   The program icon, with no call of the program's own: the icon @exeicon
   gives is set on raylib's window as GLFW makes it (the platform unit's
@@ -4567,31 +4572,65 @@ var
   // is gone are dropped once the list reaches GGpuHoldsRoom
   GGpuHolds: List<weak ResHold>;
   GGpuHoldsRoom: int64;
+  // The audio holders alive (sounds, music, streams, videos), watched the same way and
+  // unloaded by DoReleaseAudio before the audio device closes
+  GAudioRes: List<weak ResHold>;
+  GAudioResRoom: int64;
   // The mounted source (nil: none)
   GAssets: ref AssetsHold;
 
-// Lists AHold as a GPU holder (DoReleaseGpu unloads it if it is still alive then)
-func DoTrackGpu(const AHold: ref ResHold);
+// Lists AHold in AHolds (watched, not held); once the list reaches ARoom the watched holders
+// that are gone leave first, then there is room for as many again (64 the least)
+func DoTrackIn(var AHolds: List<weak ResHold>; var ARoom: int64; const AHold: ref ResHold);
 var
   LWatch: weak ResHold;
   LI: int64;
 begin
-  if GGpuHolds.Count >= GGpuHoldsRoom then
-    // The watched holders that are gone leave; then room for as many again (64 the least)
-    LI := GGpuHolds.Count - 1;
+  if AHolds.Count >= ARoom then
+    LI := AHolds.Count - 1;
     while LI >= 0 do
-      if not alive(GGpuHolds.Items[LI]) then
-        GGpuHolds.Delete(LI);
+      if not alive(AHolds.Items[LI]) then
+        AHolds.Delete(LI);
       end;
       LI -= 1;
     end;
-    GGpuHoldsRoom := GGpuHolds.Count * 2;
-    if GGpuHoldsRoom < 64 then
-      GGpuHoldsRoom := 64;
+    ARoom := AHolds.Count * 2;
+    if ARoom < 64 then
+      ARoom := 64;
     end;
   end;
   LWatch := AHold;
-  GGpuHolds.Add(LWatch);
+  AHolds.Add(LWatch);
+end;
+
+// Lists AHold as a GPU holder (DoReleaseGpu unloads it if it is still alive then)
+func DoTrackGpu(const AHold: ref ResHold);
+begin
+  DoTrackIn(GGpuHolds, GGpuHoldsRoom, AHold);
+end;
+
+// Lists AHold as an audio holder (DoReleaseAudio unloads it if it is still alive then)
+func DoTrackAudio(const AHold: ref ResHold);
+begin
+  DoTrackIn(GAudioRes, GAudioResRoom, AHold);
+end;
+
+// Unloads every audio resource still alive (the audio device is about to close), the newest
+// first (a sound alias before the sound it shares): a copy released later does nothing
+func DoReleaseAudio();
+var
+  LHold: ref ResHold;
+  LI: int64;
+begin
+  LI := GAudioRes.Count - 1;
+  while LI >= 0 do
+    LHold := lock(GAudioRes.Items[LI]);
+    if LHold <> nil then
+      LHold.Release();
+    end;
+    LI -= 1;
+  end;
+  GAudioRes.Clear();
 end;
 
 // Unloads every GPU resource still alive (the window is about to close): a copy released
@@ -7263,6 +7302,1363 @@ public type
   end;
 
 // ============================================================================
+// Audio and video (sec 6): the audio device, waves, sounds, music, raw audio
+// streams and MPEG-1 videos as shared handles on the same holders as the GPU
+// resources. AudioDevice opens raylib's audio device (a copy shares it, the
+// last copy's done closes it), first unloading every sound, music, stream
+// and video still alive, so a global SoundRes never outlives the device.
+// A wave is plain memory (no device needed). Audio callbacks and processors
+// are closures, run on the audio device's own thread (CCallback<T>).
+// ============================================================================
+
+public type
+  /// A routine raylib's audio thread calls with sample frames: an audio stream's callback
+  /// (it fills `ABuffer` with `AFrames` frames) or a processor (it changes them in place,
+  /// float32 samples, interleaved). A closure, so it may hold what it reads or writes; it
+  /// runs on the audio thread, while raylib holds its audio lock.
+  /// @example `LTone.Callback(func(ABuffer: ptr; AFrames: uint32) begin FillTone(ABuffer, AFrames); end);`
+  AudioFunc = ref func(ABuffer: ptr; AFrames: uint32);
+
+  /// An audio processor: a closure raylib runs over sample frames (float32, interleaved, in
+  /// place) as they go to the speakers, attached to one stream (`AudioStreamRes.Attach`) or
+  /// to everything mixed (`AudioDevice.AttachMixed`). A copy is the same processor, so the
+  /// value attached is the one to detach.
+  /// @example `LHalf := AudioProcessor(func(ABuffer: ptr; AFrames: uint32) begin Scale(ABuffer, AFrames, 0.5f); end); LStream.Attach(LHalf);`
+  AudioProcessor = object
+    hidden FCall: CCallback<AudioCallback>;
+
+    /// No processor (`IsValid()` false: attaching it does nothing).
+    init();
+    begin
+    end;
+
+    /// A processor running `AFunc` on each block of frames.
+    /// @param AFunc the closure the audio thread runs
+    init(const AFunc: AudioFunc);
+    begin
+      if AFunc <> nil then
+        self.FCall := CCallback<AudioCallback>(AFunc);
+      end;
+    end;
+
+    /// True when it runs a closure.
+    /// @returns whether it can be attached
+    const method IsValid(): bool;
+    begin
+      return self.FCall.IsValid();
+    end;
+
+    /// The C function pointer raylib calls (nil when empty): for the .C attach calls, which
+    /// then need this value kept alive while attached.
+    /// @returns the thunk as raylib's AudioCallback
+    const method Func(): AudioCallback;
+    begin
+      return self.FCall.Func();
+    end;
+  end;
+
+type
+  // A wave's holder (memory only)
+  WaveHold = object(ResHold)
+    FWave: Wave;
+
+    done;
+    begin
+      self.Release();
+    end;
+
+    override method Unload(const AWhole: bool);
+    begin
+      UnloadWave(self.FWave);
+    end;
+  end;
+
+  // A sound's holder; an alias (LoadSoundAlias) holds the sound whose data it plays, so that
+  // one outlives it
+  SoundHold = object(ResHold)
+    FSound: Sound;
+    FSource: ref SoundHold;
+
+    done;
+    begin
+      self.Release();
+    end;
+
+    // Nothing is left to unload once the device is gone (raylib's buffers went with it)
+    override method Unload(const AWhole: bool);
+    begin
+      if not IsAudioDeviceReady() then
+        return;
+      end;
+      if self.FSource <> nil then
+        UnloadSoundAlias(self.FSound);
+      else
+        UnloadSound(self.FSound);
+      end;
+    end;
+  end;
+
+  // A music stream's holder: one from an IO keeps its IO registered (UnloadMusicStreamIO),
+  // one from memory keeps the file bytes raylib decodes while it plays
+  MusicHold = object(ResHold)
+    FMusic: Music;
+    FFromIO: bool;
+    FData: array of uint8;
+
+    done;
+    begin
+      self.Release();
+    end;
+
+    override method Unload(const AWhole: bool);
+    begin
+      if IsAudioDeviceReady() then
+        if self.FFromIO then
+          UnloadMusicStreamIO(self.FMusic);
+        else
+          UnloadMusicStream(self.FMusic);
+        end;
+        return;
+      end;
+      // The device is gone with the stream: only the IO's registration is the holder's
+      if self.FFromIO then
+        UnregisterIO(DoTakeMusic(self.FMusic.ctxData));
+      end;
+    end;
+  end;
+
+  // An audio stream's holder: its callback and the processors attached to it, kept alive
+  // while raylib may call them (detached before the stream goes)
+  AudioStreamHold = object(ResHold)
+    FStream: AudioStream;
+    FCallback: CCallback<AudioCallback>;
+    FProcessors: List<AudioProcessor>;
+
+    done;
+    begin
+      self.Release();
+    end;
+
+    override method Unload(const AWhole: bool);
+    var
+      LI: int64;
+    begin
+      if not IsAudioDeviceReady() then
+        return;
+      end;
+      for LI := 0 to self.FProcessors.Count - 1 do
+        DetachAudioStreamProcessor(self.FStream, self.FProcessors.Items[LI].Func());
+      end;
+      UnloadAudioStream(self.FStream);
+    end;
+  end;
+
+  // A video's holder (its player, LoadVideo's): listed with the GPU holders and the audio
+  // ones, its window known once its first frame is shown (DoVideoBind); its status callback
+  // kept alive while the player may call it
+  VideoHold = object(ResHold)
+    FPlayer: ptr to VideoPlayer;
+    FStatus: CCallback<VideoStatusCallback>;
+
+    done;
+    begin
+      self.Release();
+    end;
+
+    // The GPU part is left when its window went (AWhole false), the audio stream when the
+    // device did; the rest (decoder, buffers, its own IO) is freed
+    override method Unload(const AWhole: bool);
+    begin
+      if self.FPlayer = nil then
+        return;
+      end;
+      if not AWhole then
+        self.FPlayer^.Gpu := false;
+        self.FPlayer^.PlaneY.id := 0;
+        self.FPlayer^.PlaneCb.id := 0;
+        self.FPlayer^.PlaneCr.id := 0;
+        self.FPlayer^.Frame.id := 0;
+      end;
+      if not IsAudioDeviceReady() then
+        self.FPlayer^.HasAudio := false;
+      end;
+      DoVideoClose(self.FPlayer);
+    end;
+  end;
+
+var
+  // The AudioDevice values holding the device and the session they hold (0: none): the
+  // last one's done closes it. A value from a session closed since holds nothing.
+  GAudioHolds: int64;
+  GAudioHeld: int64;
+  GAudioSessions: int64;
+  // The mixed processors attached (AudioDevice.AttachMixed), kept alive while attached
+  GAudioMixed: List<AudioProcessor>;
+
+// One more AudioDevice value holding the device as it is now: its session (0: no device
+// open, nothing counted)
+func DoAudioHold(): int64;
+begin
+  if not IsAudioDeviceReady() then
+    return 0;
+  end;
+  if GAudioHeld = 0 then
+    GAudioSessions += 1;
+    GAudioHeld := GAudioSessions;
+    GAudioHolds := 0;
+  end;
+  GAudioHolds += 1;
+  return GAudioHeld;
+end;
+
+// A copy of an AudioDevice value holding ASession: counted while that session is held
+func DoAudioShare(const ASession: int64): int64;
+begin
+  if (ASession = 0) or (ASession <> GAudioHeld) then
+    return 0;
+  end;
+  GAudioHolds += 1;
+  return ASession;
+end;
+
+// An AudioDevice value holding ASession goes: the last one unloads every audio resource
+// still alive, detaches the mixed processors and closes the device
+func DoAudioRelease(const ASession: int64);
+var
+  LI: int64;
+begin
+  if (ASession = 0) or (ASession <> GAudioHeld) or (GAudioHolds <= 0) then
+    return;
+  end;
+  GAudioHolds -= 1;
+  if GAudioHolds <> 0 then
+    return;
+  end;
+  GAudioHeld := 0;
+  if not IsAudioDeviceReady() then
+    return;
+  end;
+  DoReleaseAudio();
+  for LI := 0 to GAudioMixed.Count - 1 do
+    DetachAudioMixedProcessor(GAudioMixed.Items[LI].Func());
+  end;
+  GAudioMixed.Clear();
+  CloseAudioDevice();
+end;
+
+// The index of AProcessor (a copy of it: the same thunk) in AList (-1: none)
+func DoProcessorIndex(const AList: List<AudioProcessor>;
+  const AProcessor: AudioProcessor): int64;
+var
+  LI: int64;
+begin
+  for LI := 0 to AList.Count - 1 do
+    if ptr(AList.Items[LI].Func()) = ptr(AProcessor.Func()) then
+      return LI;
+    end;
+  end;
+  return -1;
+end;
+
+// A holder of AWave (owned; nothing to own for a wave raylib could not load)
+func DoWaveHold(const AWave: Wave): ref WaveHold;
+var
+  LHold: ref WaveHold;
+begin
+  LHold := ref WaveHold();
+  LHold.FWave := AWave;
+  LHold.Live := IsWaveValid(AWave);
+  return LHold;
+end;
+
+// A holder of ASound (an alias of ASource's sound when ASource is set), listed for the
+// device's close
+func DoSoundHold(const ASound: Sound; const ASource: ref SoundHold): ref SoundHold;
+var
+  LHold: ref SoundHold;
+begin
+  LHold := ref SoundHold();
+  LHold.FSound := ASound;
+  LHold.FSource := ASource;
+  LHold.Live := IsSoundValid(ASound);
+  if LHold.Live then
+    DoTrackAudio(LHold);
+  end;
+  return LHold;
+end;
+
+// A holder of AMusic (AFromIO: LoadMusicStreamIO's), listed for the device's close
+func DoMusicHold(const AMusic: Music; const AFromIO: bool): ref MusicHold;
+var
+  LHold: ref MusicHold;
+begin
+  LHold := ref MusicHold();
+  LHold.FMusic := AMusic;
+  LHold.FFromIO := AFromIO;
+  LHold.Live := IsMusicValid(AMusic);
+  if LHold.Live then
+    DoTrackAudio(LHold);
+  end;
+  return LHold;
+end;
+
+// A holder of AStream, listed for the device's close
+func DoAudioStreamHold(const AStream: AudioStream): ref AudioStreamHold;
+var
+  LHold: ref AudioStreamHold;
+begin
+  LHold := ref AudioStreamHold();
+  LHold.FStream := AStream;
+  LHold.Live := IsAudioStreamValid(AStream);
+  if LHold.Live then
+    DoTrackAudio(LHold);
+  end;
+  return LHold;
+end;
+
+// A holder of AVideo's player, listed for the window's close and the device's
+func DoVideoHold(const AVideo: Video): ref VideoHold;
+var
+  LHold: ref VideoHold;
+begin
+  LHold := ref VideoHold();
+  LHold.FPlayer := DoPlayer(AVideo.ctxData);
+  LHold.Native := 0;
+  LHold.Live := LHold.FPlayer <> nil;
+  if LHold.Live then
+    DoTrackGpu(LHold);
+    DoTrackAudio(LHold);
+  end;
+  return LHold;
+end;
+
+public type
+  /// raylib's audio device: open while any copy is held (a copy shares it; the last copy's
+  /// done unloads every sound, music, stream and video still alive, then closes it). Sounds,
+  /// music and streams need it open; waves do not.
+  /// @example `LAudio: AudioDevice; LAudio.Volume := 0.8f; LCoin := SoundRes("res/assets/audio/sfx/coin_pickup.ogg");`
+  AudioDevice = object
+    // The device session this value holds (0: none)
+    hidden FSession: int64;
+
+    /// Opens the device (holds the one open already, if any). `Ready()` false when no
+    /// device could be opened. C: InitAudioDevice
+    init();
+    begin
+      if not IsAudioDeviceReady() then
+        InitAudioDevice();
+      end;
+      self.FSession := DoAudioHold();
+    end;
+
+    copy(const ASource: AudioDevice);
+    begin
+      self.FSession := DoAudioShare(ASource.FSession);
+    end;
+
+    done;
+    begin
+      DoAudioRelease(self.FSession);
+    end;
+
+    /// True while the device is open. C: IsAudioDeviceReady
+    /// @returns whether sounds play
+    const method Ready(): bool;
+    begin
+      return (self.FSession <> 0) and (self.FSession = GAudioHeld) and IsAudioDeviceReady();
+    end;
+
+    /// The master volume, 0 (silent) to 1 (full). C: Get / SetMasterVolume
+    property Volume: float32
+    read
+    begin
+      return GetMasterVolume();
+    end;
+    write(AVolume)
+    begin
+      SetMasterVolume(AVolume);
+    end;
+
+    /// The buffer size, in sample frames, of the streams loaded after it (0: raylib's).
+    /// C: SetAudioStreamBufferSizeDefault
+    /// @param AFrames the frames of each buffer
+    static method BufferSize(const AFrames: int32);
+    begin
+      SetAudioStreamBufferSizeDefault(AFrames);
+    end;
+
+    /// Runs `AProcessor` over everything mixed, kept alive until DetachMixed or the
+    /// device's close. C: AttachAudioMixedProcessor
+    /// @param AProcessor the processor
+    /// @returns false when the device is not open or the processor is empty (nothing
+    ///   attached); attaching one already attached does nothing more
+    static method AttachMixed(const AProcessor: AudioProcessor): bool;
+    begin
+      if not IsAudioDeviceReady() or not AProcessor.IsValid() then
+        return false;
+      end;
+      if DoProcessorIndex(GAudioMixed, AProcessor) < 0 then
+        AttachAudioMixedProcessor(AProcessor.Func());
+        GAudioMixed.Add(AProcessor);
+      end;
+      return true;
+    end;
+
+    /// Stops running `AProcessor` (the value AttachMixed was given, or a copy of it) over the
+    /// mix. C: DetachAudioMixedProcessor
+    /// @param AProcessor the processor
+    static method DetachMixed(const AProcessor: AudioProcessor);
+    var
+      LI: int64;
+    begin
+      LI := DoProcessorIndex(GAudioMixed, AProcessor);
+      if LI < 0 then
+        return;
+      end;
+      if IsAudioDeviceReady() then
+        DetachAudioMixedProcessor(AProcessor.Func());
+      end;
+      GAudioMixed.Delete(LI);
+    end;
+  end;
+
+  /// Wave data (samples in memory, no device needed): a shared handle, unloaded with the
+  /// last copy. Its changes (Crop, ToFormat) change it for every copy; `Copy()` gives one of
+  /// its own.
+  /// @example `LHit := WaveRes("res/assets/audio/sfx/explo_rock.ogg").Crop(0, 22050); LSound := LHit.ToSound();`
+  WaveRes = object
+    hidden FHold: ref WaveHold;
+
+    /// An empty handle (holds nothing: `IsValid()` false, its changes do nothing).
+    init();
+    begin
+    end;
+
+    // The wave changed in place (nil when this value holds none)
+    hidden method DoAt(): ptr to Wave;
+    begin
+      if (self.FHold = nil) or not self.FHold.Live or self.FHold.Released then
+        return nil;
+      end;
+      return addr of self.FHold.FWave;
+    end;
+
+    /// Loads the sound file at `APath` (from the mounted source: .wav, .ogg, .mp3, .qoa,
+    /// .flac). C: LoadWave
+    init(const APath: string);
+    begin
+      self.FHold := DoWaveHold(LoadWave(APath));
+    end;
+
+    /// Takes the .C wave `AWave` over: unloaded with the last copy.
+    static method Adopt(const AWave: Wave): WaveRes;
+    var
+      LRes: WaveRes;
+    begin
+      LRes.FHold := DoWaveHold(AWave);
+      return LRes;
+    end;
+
+    /// Loads a wave of type `AType` (".wav" ...) from `AIO` (the IO stays the caller's).
+    /// C: LoadWaveIO
+    static method FromIO(const AIO: IO; const AType: string): WaveRes;
+    begin
+      return WaveRes.Adopt(LoadWaveIO(AIO, AType));
+    end;
+
+    /// Loads a wave of type `AType` (".wav" ...) from the file bytes `AData`.
+    /// C: LoadWaveFromMemory
+    static method FromMemory(const AType: string; const AData: array of uint8): WaveRes;
+    var
+      LNone: Wave;
+    begin
+      if len(AData) = 0 then
+        return WaveRes.Adopt(LNone);
+      end;
+      return WaveRes.Adopt(LoadWaveFromMemory(AType, addr of AData[0], int32(len(AData))));
+    end;
+
+    /// The .C wave (borrowed, for .C calls; an empty one when none is held).
+    const method Handle(): Wave;
+    var
+      LNone: Wave;
+    begin
+      if (self.FHold = nil) or self.FHold.Released then
+        return LNone;
+      end;
+      return self.FHold.FWave;
+    end;
+
+    /// True when it holds sample data. C: IsWaveValid
+    const method IsValid(): bool;
+    begin
+      return IsWaveValid(self.Handle());
+    end;
+
+    /// A wave of its own with the same samples. C: WaveCopy
+    const method Copy(): WaveRes;
+    var
+      LNone: Wave;
+    begin
+      if not self.IsValid() then
+        return WaveRes.Adopt(LNone);
+      end;
+      return WaveRes.Adopt(WaveCopy(self.Handle()));
+    end;
+
+    /// Keeps the frames `AFirst` up to (not including) `ALast` only. C: WaveCrop
+    method Crop(const AFirst: int32; const ALast: int32): self;
+    var
+      LWave: ptr to Wave;
+    begin
+      LWave := self.DoAt();
+      if LWave <> nil then
+        WaveCrop(LWave, AFirst, ALast);
+      end;
+      return self;
+    end;
+
+    /// Converts the samples to `ASampleRate` Hz, `ASampleSize` bits (8, 16 or 32: float) and
+    /// `AChannels` channels. C: WaveFormat
+    method ToFormat(const ASampleRate: int32; const ASampleSize: int32;
+      const AChannels: int32): self;
+    var
+      LWave: ptr to Wave;
+    begin
+      LWave := self.DoAt();
+      if LWave <> nil then
+        WaveFormat(LWave, ASampleRate, ASampleSize, AChannels);
+      end;
+      return self;
+    end;
+
+    /// The samples as float32 (-1 .. 1), interleaved: Frames() x Channels() of them.
+    /// C: LoadWaveSamples / UnloadWaveSamples
+    const method Samples(): array of float32;
+    var
+      LResult: array of float32;
+      LSamples: ptr to float32;
+      LCount: int64;
+      LI: int64;
+    begin
+      if not self.IsValid() then
+        return LResult;
+      end;
+      LSamples := LoadWaveSamples(self.Handle());
+      if LSamples = nil then
+        return LResult;
+      end;
+      LCount := int64(self.Handle().frameCount) * int64(self.Handle().channels);
+      setlength(LResult, LCount);
+      for LI := 0 to LCount - 1 do
+        LResult[LI] := LSamples[LI];
+      end;
+      UnloadWaveSamples(LSamples);
+      return LResult;
+    end;
+
+    /// Its length in sample frames.
+    const method Frames(): int32;
+    begin
+      return int32(self.Handle().frameCount);
+    end;
+
+    /// Its sample rate in Hz.
+    const method SampleRate(): int32;
+    begin
+      return int32(self.Handle().sampleRate);
+    end;
+
+    /// Bits per sample (8, 16 or 32).
+    const method SampleSize(): int32;
+    begin
+      return int32(self.Handle().sampleSize);
+    end;
+
+    /// Its channels (1 mono, 2 stereo).
+    const method Channels(): int32;
+    begin
+      return int32(self.Handle().channels);
+    end;
+
+    /// Writes the wave to the file `APath` (.wav or .qoa). C: ExportWave
+    /// @returns false when it could not be written
+    const method Export(const APath: string): bool;
+    begin
+      return self.IsValid() and ExportWave(self.Handle(), APath);
+    end;
+
+    /// Writes the samples as a C header to `APath`. C: ExportWaveAsCode
+    /// @returns false when it could not be written
+    const method ExportAsCode(const APath: string): bool;
+    begin
+      return self.IsValid() and ExportWaveAsCode(self.Handle(), APath);
+    end;
+  end;
+
+  /// A sound effect (fully in memory, played at once): a shared handle, unloaded with the last
+  /// copy or the device's close. Needs the audio device. `Alias()` gives one more voice of
+  /// the same data, to play over itself.
+  /// @example `LCoin := SoundRes("res/assets/audio/sfx/coin_pickup.ogg").Volume(0.6f); LCoin.Play();`
+  SoundRes = object
+    hidden FHold: ref SoundHold;
+
+    /// An empty handle (holds nothing: `IsValid()` false, its changes do nothing).
+    init();
+    begin
+    end;
+
+    /// Loads the sound file at `APath` (from the mounted source). C: LoadSound
+    init(const APath: string);
+    var
+      LNone: ref SoundHold;
+    begin
+      self.FHold := DoSoundHold(LoadSound(APath), LNone);
+    end;
+
+    /// Takes the .C sound `ASound` over: unloaded with the last copy (or the device).
+    static method Adopt(const ASound: Sound): SoundRes;
+    var
+      LRes: SoundRes;
+      LNone: ref SoundHold;
+    begin
+      LRes.FHold := DoSoundHold(ASound, LNone);
+      return LRes;
+    end;
+
+    /// Loads a sound of type `AType` (".wav" ...) from `AIO` (the IO stays the caller's).
+    /// C: LoadSoundIO
+    static method FromIO(const AIO: IO; const AType: string): SoundRes;
+    begin
+      return SoundRes.Adopt(LoadSoundIO(AIO, AType));
+    end;
+
+    /// A sound of `AWave`'s samples (copied: the wave may go). C: LoadSoundFromWave
+    static method FromWave(const AWave: WaveRes): SoundRes;
+    var
+      LNone: Sound;
+    begin
+      if not AWave.IsValid() then
+        return SoundRes.Adopt(LNone);
+      end;
+      return SoundRes.Adopt(LoadSoundFromWave(AWave.Handle()));
+    end;
+
+    /// The .C sound (borrowed, for .C calls; an empty one when none is held).
+    const method Handle(): Sound;
+    var
+      LNone: Sound;
+    begin
+      if (self.FHold = nil) or self.FHold.Released then
+        return LNone;
+      end;
+      return self.FHold.FSound;
+    end;
+
+    /// True when it holds a sound the device can play. C: IsSoundValid
+    const method IsValid(): bool;
+    begin
+      return IsSoundValid(self.Handle());
+    end;
+
+    /// One more voice playing this sound's data (its own volume, pitch, pan, position): the
+    /// data stays while any alias does. C: LoadSoundAlias / UnloadSoundAlias
+    const method Alias(): SoundRes;
+    var
+      LRes: SoundRes;
+      LSource: ref SoundHold;
+    begin
+      if not self.IsValid() then
+        return LRes;
+      end;
+      // An alias of an alias plays the same data: it holds the sound that owns it
+      LSource := self.FHold;
+      if LSource.FSource <> nil then
+        LSource := LSource.FSource;
+      end;
+      LRes.FHold := DoSoundHold(LoadSoundAlias(LSource.FSound), LSource);
+      return LRes;
+    end;
+
+    /// Plays it from its start. C: PlaySound
+    method Play(): self;
+    begin
+      if self.IsValid() then
+        PlaySound(self.Handle());
+      end;
+      return self;
+    end;
+
+    /// Stops it. C: StopSound
+    method Stop(): self;
+    begin
+      if self.IsValid() then
+        StopSound(self.Handle());
+      end;
+      return self;
+    end;
+
+    /// Pauses it where it is. C: PauseSound
+    method Pause(): self;
+    begin
+      if self.IsValid() then
+        PauseSound(self.Handle());
+      end;
+      return self;
+    end;
+
+    /// Plays on from where it paused. C: ResumeSound
+    method Resume(): self;
+    begin
+      if self.IsValid() then
+        ResumeSound(self.Handle());
+      end;
+      return self;
+    end;
+
+    /// True while it plays. C: IsSoundPlaying
+    const method Playing(): bool;
+    begin
+      return self.IsValid() and IsSoundPlaying(self.Handle());
+    end;
+
+    /// Its volume, 0 (silent) to 1 (full). C: SetSoundVolume
+    method Volume(const AVolume: float32): self;
+    begin
+      if self.IsValid() then
+        SetSoundVolume(self.Handle(), AVolume);
+      end;
+      return self;
+    end;
+
+    /// Its pitch (1: as recorded). C: SetSoundPitch
+    method Pitch(const APitch: float32): self;
+    begin
+      if self.IsValid() then
+        SetSoundPitch(self.Handle(), APitch);
+      end;
+      return self;
+    end;
+
+    /// Its pan, 0 (left) to 1 (right), 0.5 the middle. C: SetSoundPan
+    method Pan(const APan: float32): self;
+    begin
+      if self.IsValid() then
+        SetSoundPan(self.Handle(), APan);
+      end;
+      return self;
+    end;
+
+    /// Replaces its samples with `AFrames` frames at `AData` (its own format). C: UpdateSound
+    method Update(const AData: ptr to const; const AFrames: int32): self;
+    begin
+      if self.IsValid() then
+        UpdateSound(self.Handle(), AData, AFrames);
+      end;
+      return self;
+    end;
+  end;
+
+public extend WaveRes
+  /// The wave as a sound (the device must be open). C: LoadSoundFromWave
+  const method ToSound(): SoundRes;
+  begin
+    return SoundRes.FromWave(self);
+  end;
+end;
+
+public type
+  /// Music, decoded as it plays (call `Update()` once a frame): a shared handle, unloaded
+  /// with the last copy or the device's close. Needs the audio device.
+  /// @example `LSong := MusicRes("res/assets/audio/music/song01.ogg").Looping(true).Play(); ... LSong.Update();`
+  MusicRes = object
+    hidden FHold: ref MusicHold;
+
+    /// An empty handle (holds nothing: `IsValid()` false, its changes do nothing).
+    init();
+    begin
+    end;
+
+    /// Opens the music file at `APath` (from the mounted source). C: LoadMusicStream
+    init(const APath: string);
+    begin
+      self.FHold := DoMusicHold(LoadMusicStream(APath), false);
+    end;
+
+    /// Opens music of type `AType` (".ogg" ...) read from `AIO` while it plays (the IO stays
+    /// the caller's: open until the last copy goes). C: LoadMusicStreamIO
+    static method FromIO(const AIO: IO; const AType: string): MusicRes;
+    var
+      LRes: MusicRes;
+    begin
+      LRes.FHold := DoMusicHold(LoadMusicStreamIO(AIO, AType), true);
+      return LRes;
+    end;
+
+    /// Opens music of type `AType` (".ogg" ...) from the file bytes `AData` (kept with it
+    /// while it plays). C: LoadMusicStreamFromMemory
+    static method FromMemory(const AType: string; const AData: array of uint8): MusicRes;
+    var
+      LRes: MusicRes;
+      LNone: Music;
+      LData: array of uint8;
+    begin
+      if len(AData) = 0 then
+        LRes.FHold := DoMusicHold(LNone, false);
+        return LRes;
+      end;
+      // raylib decodes from the bytes as it plays: the holder keeps its own copy
+      LData := AData;
+      LRes.FHold := DoMusicHold(LoadMusicStreamFromMemory(AType, addr of LData[0],
+        int32(len(LData))), false);
+      LRes.FHold.FData := LData;
+      return LRes;
+    end;
+
+    /// The .C music (borrowed, for .C calls; an empty one when none is held).
+    const method Handle(): Music;
+    var
+      LNone: Music;
+    begin
+      if (self.FHold = nil) or self.FHold.Released then
+        return LNone;
+      end;
+      return self.FHold.FMusic;
+    end;
+
+    /// True when it holds music the device can play. C: IsMusicValid
+    const method IsValid(): bool;
+    begin
+      return IsMusicValid(self.Handle());
+    end;
+
+    /// Plays it (from its start, or from where it paused). C: PlayMusicStream
+    method Play(): self;
+    begin
+      if self.IsValid() then
+        PlayMusicStream(self.Handle());
+      end;
+      return self;
+    end;
+
+    /// Stops it (back to its start). C: StopMusicStream
+    method Stop(): self;
+    begin
+      if self.IsValid() then
+        StopMusicStream(self.Handle());
+      end;
+      return self;
+    end;
+
+    /// Pauses it where it is. C: PauseMusicStream
+    method Pause(): self;
+    begin
+      if self.IsValid() then
+        PauseMusicStream(self.Handle());
+      end;
+      return self;
+    end;
+
+    /// Plays on from where it paused. C: ResumeMusicStream
+    method Resume(): self;
+    begin
+      if self.IsValid() then
+        ResumeMusicStream(self.Handle());
+      end;
+      return self;
+    end;
+
+    /// Decodes the next part into its buffers: once a frame while it plays.
+    /// C: UpdateMusicStream
+    method Update();
+    begin
+      if self.IsValid() then
+        UpdateMusicStream(self.Handle());
+      end;
+    end;
+
+    /// True while it plays. C: IsMusicStreamPlaying
+    const method Playing(): bool;
+    begin
+      return self.IsValid() and IsMusicStreamPlaying(self.Handle());
+    end;
+
+    /// Moves it to `ASeconds` from its start. C: SeekMusicStream
+    method Seek(const ASeconds: float32): self;
+    begin
+      if self.IsValid() then
+        SeekMusicStream(self.Handle(), ASeconds);
+      end;
+      return self;
+    end;
+
+    /// Its volume, 0 (silent) to 1 (full). C: SetMusicVolume
+    method Volume(const AVolume: float32): self;
+    begin
+      if self.IsValid() then
+        SetMusicVolume(self.Handle(), AVolume);
+      end;
+      return self;
+    end;
+
+    /// Its pitch (1: as recorded). C: SetMusicPitch
+    method Pitch(const APitch: float32): self;
+    begin
+      if self.IsValid() then
+        SetMusicPitch(self.Handle(), APitch);
+      end;
+      return self;
+    end;
+
+    /// Its pan, 0 (left) to 1 (right), 0.5 the middle. C: SetMusicPan
+    method Pan(const APan: float32): self;
+    begin
+      if self.IsValid() then
+        SetMusicPan(self.Handle(), APan);
+      end;
+      return self;
+    end;
+
+    /// Plays again from its start at its end (true) or stops there. C: music.looping
+    method Looping(const ALoop: bool): self;
+    begin
+      if self.IsValid() then
+        self.FHold.FMusic.looping := ALoop;
+      end;
+      return self;
+    end;
+
+    /// True when it plays again from its start at its end. C: music.looping
+    const method Looping(): bool;
+    begin
+      return self.Handle().looping;
+    end;
+
+    /// Its length in seconds. C: GetMusicTimeLength
+    const method Length(): float32;
+    begin
+      if not self.IsValid() then
+        return 0.0f;
+      end;
+      return GetMusicTimeLength(self.Handle());
+    end;
+
+    /// The seconds played since its start. C: GetMusicTimePlayed
+    const method Played(): float32;
+    begin
+      if not self.IsValid() then
+        return 0.0f;
+      end;
+      return GetMusicTimePlayed(self.Handle());
+    end;
+  end;
+
+  /// A raw audio stream the program feeds (Update with frames, or a Callback raylib calls
+  /// for them): a shared handle, unloaded with the last copy or the device's close. Needs
+  /// the audio device.
+  /// @example `LTone := AudioStreamRes(44100, 32, 1).Callback(func(ABuffer: ptr; AFrames: uint32) begin Sine(ABuffer, AFrames); end).Play();`
+  AudioStreamRes = object
+    hidden FHold: ref AudioStreamHold;
+
+    /// An empty handle (holds nothing: `IsValid()` false, its changes do nothing).
+    init();
+    begin
+    end;
+
+    /// A stream of `ASampleRate` Hz, `ASampleSize` bits (8, 16 or 32: float) and `AChannels`
+    /// channels. C: LoadAudioStream
+    init(const ASampleRate: uint32; const ASampleSize: uint32; const AChannels: uint32);
+    begin
+      self.FHold := DoAudioStreamHold(LoadAudioStream(ASampleRate, ASampleSize, AChannels));
+    end;
+
+    /// The .C stream (borrowed, for .C calls; an empty one when none is held).
+    const method Handle(): AudioStream;
+    var
+      LNone: AudioStream;
+    begin
+      if (self.FHold = nil) or self.FHold.Released then
+        return LNone;
+      end;
+      return self.FHold.FStream;
+    end;
+
+    /// True when it holds a stream the device plays. C: IsAudioStreamValid
+    const method IsValid(): bool;
+    begin
+      return IsAudioStreamValid(self.Handle());
+    end;
+
+    /// Queues `AFrames` frames at `AData` (the stream's format) when a buffer is free
+    /// (Processed). C: UpdateAudioStream
+    method Update(const AData: ptr to const; const AFrames: int32): self;
+    begin
+      if self.IsValid() then
+        UpdateAudioStream(self.Handle(), AData, AFrames);
+      end;
+      return self;
+    end;
+
+    /// True when a buffer is free for Update. C: IsAudioStreamProcessed
+    const method Processed(): bool;
+    begin
+      return self.IsValid() and IsAudioStreamProcessed(self.Handle());
+    end;
+
+    /// Plays it. C: PlayAudioStream
+    method Play(): self;
+    begin
+      if self.IsValid() then
+        PlayAudioStream(self.Handle());
+      end;
+      return self;
+    end;
+
+    /// Pauses it. C: PauseAudioStream
+    method Pause(): self;
+    begin
+      if self.IsValid() then
+        PauseAudioStream(self.Handle());
+      end;
+      return self;
+    end;
+
+    /// Plays on from where it paused. C: ResumeAudioStream
+    method Resume(): self;
+    begin
+      if self.IsValid() then
+        ResumeAudioStream(self.Handle());
+      end;
+      return self;
+    end;
+
+    /// Stops it. C: StopAudioStream
+    method Stop(): self;
+    begin
+      if self.IsValid() then
+        StopAudioStream(self.Handle());
+      end;
+      return self;
+    end;
+
+    /// True while it plays. C: IsAudioStreamPlaying
+    const method Playing(): bool;
+    begin
+      return self.IsValid() and IsAudioStreamPlaying(self.Handle());
+    end;
+
+    /// Its volume, 0 (silent) to 1 (full). C: SetAudioStreamVolume
+    method Volume(const AVolume: float32): self;
+    begin
+      if self.IsValid() then
+        SetAudioStreamVolume(self.Handle(), AVolume);
+      end;
+      return self;
+    end;
+
+    /// Its pitch (1: as fed). C: SetAudioStreamPitch
+    method Pitch(const APitch: float32): self;
+    begin
+      if self.IsValid() then
+        SetAudioStreamPitch(self.Handle(), APitch);
+      end;
+      return self;
+    end;
+
+    /// Its pan, 0 (left) to 1 (right), 0.5 the middle. C: SetAudioStreamPan
+    method Pan(const APan: float32): self;
+    begin
+      if self.IsValid() then
+        SetAudioStreamPan(self.Handle(), APan);
+      end;
+      return self;
+    end;
+
+    /// Has raylib's audio thread call `AFunc` for frames whenever the stream needs them
+    /// (nil: none, fed by Update again); the closure is kept while the stream may call it.
+    /// C: SetAudioStreamCallback
+    method Callback(const AFunc: AudioFunc): self;
+    var
+      LOld: CCallback<AudioCallback>;
+    begin
+      if not self.IsValid() then
+        return self;
+      end;
+      // The old closure stays alive until raylib (under its audio lock) no longer calls it
+      LOld := self.FHold.FCallback;
+      if AFunc = nil then
+        self.FHold.FCallback := CCallback<AudioCallback>();
+      else
+        self.FHold.FCallback := CCallback<AudioCallback>(AFunc);
+      end;
+      SetAudioStreamCallback(self.FHold.FStream, self.FHold.FCallback.Func());
+      return self;
+    end;
+
+    /// Runs `AProcessor` over the stream's frames (after any attached before it), kept
+    /// alive until Detach or the stream goes. Attaching one attached already does nothing
+    /// more. C: AttachAudioStreamProcessor
+    method Attach(const AProcessor: AudioProcessor): self;
+    begin
+      if not self.IsValid() or not AProcessor.IsValid() then
+        return self;
+      end;
+      if DoProcessorIndex(self.FHold.FProcessors, AProcessor) < 0 then
+        AttachAudioStreamProcessor(self.FHold.FStream, AProcessor.Func());
+        self.FHold.FProcessors.Add(AProcessor);
+      end;
+      return self;
+    end;
+
+    /// Stops running `AProcessor` (the value Attach was given, or a copy of it).
+    /// C: DetachAudioStreamProcessor
+    method Detach(const AProcessor: AudioProcessor): self;
+    var
+      LI: int64;
+    begin
+      if not self.IsValid() then
+        return self;
+      end;
+      LI := DoProcessorIndex(self.FHold.FProcessors, AProcessor);
+      if LI >= 0 then
+        DetachAudioStreamProcessor(self.FHold.FStream, AProcessor.Func());
+        self.FHold.FProcessors.Delete(LI);
+      end;
+      return self;
+    end;
+  end;
+
+  /// A video's status handler: called with its new status on every change (Play, Pause,
+  /// Stop, and its end when it does not loop).
+  /// @example `LIntro.OnStatus(func(const AStatus: VideoStatus) begin LEnded := AStatus = VideoStatus.VideoStopped; end);`
+  VideoStatusHandler = ref func(const AStatus: VideoStatus);
+
+  /// An MPEG-1 video (pl_mpeg) with its MP2 audio, played as MusicRes is: `Play()`, then
+  /// `Update()` once a frame and `Draw.Video` it. A shared handle, unloaded with the last
+  /// copy, the window's close or the audio device's. The sound plays when the audio device
+  /// was open at the load. It loads with no window: frames are uploaded once one is open.
+  /// @example `LIntro := VideoRes("res/assets/videos/intro.mpg").Looping(true).Play(); ... LIntro.Update(); Draw.Video(LIntro, Vector2(x: 0, y: 0), WHITE);`
+  VideoRes = object
+    hidden FHold: ref VideoHold;
+
+    /// An empty handle (holds nothing: `IsValid()` false, its changes do nothing).
+    init();
+    begin
+    end;
+
+    /// Opens the .mpg at `APath` (an entry of the mounted source, else a file).
+    /// C: LoadVideo / LoadVideoIO
+    init(const APath: string);
+    var
+      LIO: IO;
+    begin
+      if GAssets = nil then
+        self.FHold := DoVideoHold(LoadVideo(APath));
+        return;
+      end;
+      LIO := IOSourceOpen(GAssets.Source, APath);
+      if LIO = nil then
+        self.FHold := DoVideoHold(DoVideoRecord(nil));
+        return;
+      end;
+      // The video owns the entry's IO (closed with it)
+      self.FHold := DoVideoHold(DoVideoRecord(DoVideoOpen(LIO, true, APath)));
+    end;
+
+    /// Opens a video read from `AIO` (the IO stays the caller's: open while the video is);
+    /// `AName` names it. C: LoadVideoIO
+    static method FromIO(const AIO: IO; const AName: string): VideoRes;
+    var
+      LRes: VideoRes;
+    begin
+      LRes.FHold := DoVideoHold(LoadVideoIO(AIO, AName));
+      return LRes;
+    end;
+
+    /// The .C video (borrowed, for the procedural calls; an empty one when none is held).
+    const method Handle(): Video;
+    var
+      LNone: Video;
+    begin
+      if (self.FHold = nil) or self.FHold.Released then
+        return LNone;
+      end;
+      return DoVideoRecord(self.FHold.FPlayer);
+    end;
+
+    /// True when it holds a video. C: IsVideoValid
+    const method IsValid(): bool;
+    begin
+      return IsVideoValid(self.Handle());
+    end;
+
+    // The window its frames were uploaded to, noted once its first frame is (so that
+    // window's destruction abandons its textures)
+    hidden method DoBind();
+    begin
+      if (self.FHold = nil) or (self.FHold.Native <> 0) or (self.FHold.FPlayer = nil) then
+        return;
+      end;
+      if self.FHold.FPlayer^.Decided then
+        self.FHold.Native := DoWindowNative();
+      end;
+    end;
+
+    /// Plays it (from where it paused, or from its start). C: PlayVideo
+    method Play(): self;
+    begin
+      PlayVideo(self.Handle());
+      return self;
+    end;
+
+    /// Pauses it, its frame still drawn. C: PauseVideo
+    method Pause(): self;
+    begin
+      PauseVideo(self.Handle());
+      return self;
+    end;
+
+    /// Stops it (back to its start, no frame drawn until it plays). C: StopVideo
+    method Stop(): self;
+    begin
+      StopVideo(self.Handle());
+      return self;
+    end;
+
+    /// Plays on by the time since the last update: once a frame. C: UpdateVideo
+    method Update();
+    begin
+      UpdateVideo(self.Handle());
+      self.DoBind();
+    end;
+
+    /// Plays on by `ASeconds` (a fixed step). C: UpdateVideo
+    method Update(const ASeconds: float64);
+    begin
+      UpdateVideo(self.Handle(), ASeconds);
+      self.DoBind();
+    end;
+
+    /// Moves it to `ASeconds` from its start. C: SeekVideo
+    /// @returns false when it holds no video or cannot seek there
+    method Seek(const ASeconds: float64): bool;
+    begin
+      return SeekVideo(self.Handle(), ASeconds);
+    end;
+
+    /// Where it stands (stopped, playing, paused). C: GetVideoStatus
+    const method Status(): VideoStatus;
+    begin
+      return GetVideoStatus(self.Handle());
+    end;
+
+    /// True while it plays. C: IsVideoPlaying
+    const method Playing(): bool;
+    begin
+      return IsVideoPlaying(self.Handle());
+    end;
+
+    /// Plays again from its start at its end (true) or stops there. C: SetVideoLooping
+    method Looping(const ALoop: bool): self;
+    begin
+      SetVideoLooping(self.Handle(), ALoop);
+      return self;
+    end;
+
+    /// True when it plays again from its start at its end. C: IsVideoLooping
+    const method Looping(): bool;
+    begin
+      return IsVideoLooping(self.Handle());
+    end;
+
+    /// Its sound's volume, 0 (silent) to 1 (full; clamped). C: SetVideoVolume
+    method Volume(const AVolume: float32): self;
+    begin
+      SetVideoVolume(self.Handle(), AVolume);
+      return self;
+    end;
+
+    /// Its sound's volume. C: GetVideoVolume
+    const method Volume(): float32;
+    begin
+      return GetVideoVolume(self.Handle());
+    end;
+
+    /// Calls `AHandler` with its new status on every change (nil: none). The handler is
+    /// kept while the video is. C: SetVideoStatusCallback
+    method OnStatus(const AHandler: VideoStatusHandler): self;
+    var
+      LOld: CCallback<VideoStatusCallback>;
+    begin
+      if not self.IsValid() then
+        return self;
+      end;
+      LOld := self.FHold.FStatus;
+      if AHandler = nil then
+        self.FHold.FStatus := CCallback<VideoStatusCallback>();
+      else
+        // The player's callback gives the name too: the handler is the video's own
+        self.FHold.FStatus := CCallback<VideoStatusCallback>(
+          func(const AStatus: VideoStatus; const AName: ptr to const char)
+          begin
+            AHandler(AStatus);
+          end);
+      end;
+      SetVideoStatusCallback(self.Handle(), self.FHold.FStatus.Func());
+      return self;
+    end;
+
+    /// True when it has a sound track. C: HasVideoAudio
+    const method HasAudio(): bool;
+    begin
+      return HasVideoAudio(self.Handle());
+    end;
+
+    /// True when its frames are converted on the GPU (decided at its first frame with a
+    /// window). C: IsVideoShaderUsed
+    const method ShaderUsed(): bool;
+    begin
+      return IsVideoShaderUsed(self.Handle());
+    end;
+
+    /// Its frames per second. C: GetVideoFrameRate
+    const method FrameRate(): float64;
+    begin
+      return GetVideoFrameRate(self.Handle());
+    end;
+
+    /// Its length in seconds. C: GetVideoDuration
+    const method Duration(): float64;
+    begin
+      return GetVideoDuration(self.Handle());
+    end;
+
+    /// The seconds played since its start. C: GetVideoTime
+    const method Time(): float64;
+    begin
+      return GetVideoTime(self.Handle());
+    end;
+
+    /// Its sound's sample rate in Hz (0: no sound). C: GetVideoSampleRate
+    const method SampleRate(): int32;
+    begin
+      return GetVideoSampleRate(self.Handle());
+    end;
+
+    /// Its frame width in pixels.
+    const method Width(): int32;
+    begin
+      return self.Handle().width;
+    end;
+
+    /// Its frame height in pixels.
+    const method Height(): int32;
+    begin
+      return self.Handle().height;
+    end;
+  end;
+
+// ============================================================================
 // The window, the frame, time (sec 3): the entry point. Window is the frame
 // window (InitFrameWindow's DPI-scaled, letterboxed window) as an object: a
 // copy shares it, the last copy's done closes it. WindowConfig builds one
@@ -9202,6 +10598,50 @@ public type
     begin
       DrawTexturePro(ATarget.Handle().texture, DoUpright(ATarget, ASource), ADest, AOrigin,
         ARotation, ATint);
+    end;
+
+    /// `AVideo`'s frame at `APos` (nothing before its first frame). C: DrawVideo
+    /// @example `LIntro.Update(); Draw.Video(LIntro, Vector2(x: 0.0f, y: 0.0f), WHITE);`
+    static method Video(const AVideo: VideoRes; const APos: Vector2; const ATint: Color);
+    begin
+      Draw.Video(AVideo, DoWholeVideo(AVideo), Rectangle(x: APos.x, y: APos.y,
+        width: float32(AVideo.Width()), height: float32(AVideo.Height())),
+        Vector2(x: 0.0f, y: 0.0f), 0.0f, ATint);
+    end;
+
+    /// `AVideo`'s frame turned `ARotation` degrees about its corner and scaled by `AScale`.
+    /// C: DrawVideoPro
+    static method Video(const AVideo: VideoRes; const APos: Vector2; const ARotation: float32;
+      const AScale: float32; const ATint: Color);
+    begin
+      Draw.Video(AVideo, DoWholeVideo(AVideo), Rectangle(x: APos.x, y: APos.y,
+        width: float32(AVideo.Width()) * AScale, height: float32(AVideo.Height()) * AScale),
+        Vector2(x: 0.0f, y: 0.0f), ARotation, ATint);
+    end;
+
+    /// The part `ASource` (in its pixels) of `AVideo`'s frame at `APos`. C: DrawVideoPro
+    static method Video(const AVideo: VideoRes; const ASource: Rectangle; const APos: Vector2;
+      const ATint: Color);
+    begin
+      Draw.Video(AVideo, ASource, Rectangle(x: APos.x, y: APos.y, width: ASource.width,
+        height: ASource.height), Vector2(x: 0.0f, y: 0.0f), 0.0f, ATint);
+    end;
+
+    /// The part `ASource` of `AVideo`'s frame scaled into `ADest`, turned `ARotation`
+    /// degrees about `AOrigin` (from the destination's corner). C: DrawVideoPro
+    /// @example `Draw.Video(LIntro, Rectangle(x: 0, y: 0, width: 320, height: 180), Rectangle(x: 0, y: 0, width: 640, height: 360), Vector2(x: 0, y: 0), 0.0f, WHITE);`
+    static method Video(const AVideo: VideoRes; const ASource: Rectangle;
+      const ADest: Rectangle; const AOrigin: Vector2; const ARotation: float32;
+      const ATint: Color);
+    begin
+      DrawVideoPro(AVideo.Handle(), ASource, ADest, AOrigin, ARotation, ATint);
+    end;
+
+    // The whole of AVideo's frame
+    hidden static method DoWholeVideo(const AVideo: VideoRes): Rectangle;
+    begin
+      return Rectangle(x: 0.0f, y: 0.0f, width: float32(AVideo.Width()),
+        height: float32(AVideo.Height()));
     end;
 
     // The whole of ATarget's picture, top-down
