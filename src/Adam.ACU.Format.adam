@@ -1,0 +1,400 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.ACU.Format.adam - an Adam compiled unit's (.acu) layout (DESIGN sec 3)
+
+  An .acu is one object file of the target's format per unit: the unit's
+  object as Adam.Backend.Generate's GenerateObject makes it (its code
+  sections, its import list; SU2.4b), merged into a build as it is when the
+  unit is current, and one Info section (SectionKind.Info: kept by no
+  linker) holding the payload Adam.ACU.Writer makes and Adam.ACU.Reader
+  reads. The payload, every fixed-width number little-endian, every other
+  number a var (LEB128: 7 bits a byte, the lowest first, the top bit set on
+  every byte but the last) or, when it can be negative, a signed var (the
+  var of its zigzag: 2n for n >= 0, -2n - 1 for n < 0):
+
+    magic         ADAM_ACU_MAGIC's 8 bytes, then the format version (u32)
+    header        ACUHeader's fields in their order: a text is its byte
+                  count (var) and its bytes; a number 8 bytes; Imports its
+                  count (u32), then each name followed by that unit's
+                  interface hash (u64) as the unit was compiled against it.
+                  Readable alone: the currency check (SU2.3) reads no
+                  further
+    strings       the pool: its count (u32), then each text; a text field
+                  below is its pool id (var), 0 for ""
+    nodes         their count (u32), then each node's record (the writer's
+                  DoPutNode: its kind, parent, role and place, then a mask
+                  (var, ACUField's bits) of the fields that differ from a
+                  new node's, then only those, in Node's order); a node is
+                  its slice index 1 .. count, in tree order (a parent before
+                  its children, children in order)
+    runtime       1 when the unit is the runtime (the tree's RuntimeRoutines,
+                  VarKind and AllocSite follow as references), else 0
+
+  A reference (a link field, a node's parent) is its ACURefKind (u8) and:
+    None          nothing (0: no node)
+    Local         the slice index (var) of a node the payload holds
+    Fixed         the fixed id (var: the program, the system scope, the
+                  derived types)
+    System        the system scope's node by ACUPathOf below the system scope
+    Foreign       another unit's node: the unit's name and ACUPathOf below
+                  its Module node (bound by name when the payload is read, so
+                  a declaration the unit no longer has is found, never a
+                  stale id)
+
+  ACUPathOf     a node's place below a root as segments joined by '/': a
+                declaration (ACUNamesNode) by its name, with '#n' when n
+                earlier named siblings of any kind share that name
+                (overloads, a forward and its declaration);
+                any other node '@' and its child index
+  ACUBuffer     the growing byte block both sides write and read by
+
+  A unit's interface hash (Adam.ACU.Writer's ACUInterfaceHash) is what an
+  importer compiled against it depends on: the records of its public
+  declarations and of everything they reach in the unit, with no node id,
+  place or source offset in them, and no body of a routine that is not
+  generic (an importer never sees one). A change in a private routine's body
+  keeps it, so the unit's importers stay current; a change any importer could
+  see moves it, so they are compiled again
+*******************************************************************************/
+
+module unit Adam.ACU.Format;
+
+import System.SysUtils, Adam.Core.Common, Adam.Compiler.AST;
+
+public const
+  // The payload's first 8 bytes, then ADAM_ACU_FORMAT_VERSION (a change to the layout above
+  // moves the version: an .acu of another version is never read, only rewritten)
+  ADAM_ACU_MAGIC: string = "ADAM.ACU";
+  // (4: the object holds the unit's code, SU2.4b; 5: var numbers and a node's field mask,
+  // SU2.8d; 6: every routine's write summary, its WriteEffects node, SU2.8 e4; 7: a
+  // dispatched method's summary holds its overrides', SU2.8 e5; 8: the runtime's IsInstance
+  // and InvalidCast, I1; 9: IntfAddRef, IntfRelease, IntfAssign and InterfaceOffset, I3;
+  // 10: an implements name's Forward children, I4; 11: a for parallel's flag and Capture
+  // children, the runtime's ParallelRun, the intrinsics workerindex / workercount, T2; 12:
+  // the intrinsics cancel / cancelled and the runtime's TaskCancel, TaskCancelled,
+  // TaskCancelledSelf, T3; 13: the runtime's ResDataTable, AUD7; 14: NodeKind's
+  // DeferStatement, D1; 15: NodeKind's SequenceType, ForInStatement, YieldStatement and
+  // NodeFlag's Generator, G1; 16: the platform's CatchAbort and the runtime's GeneratorRun,
+  // GeneratorEnd, GeneratorResume, GeneratorYield, GeneratorAbort, GeneratorDone, G1b; 17:
+  // the runtime's GeneratorCopyFail and a generator method's hidden holder, G1c2; 18: a
+  // generator's built word and the runtime's GeneratorCopyFail taking no block, G1c3; 19:
+  // NodeKind's YieldElement, NodeFlag's YieldFrom, the runtime's GeneratorDelegate and a
+  // generator's delegate words, G1e; 20: the intrinsic pull, G1f; 21: NodeFlag's
+  // GenericUse, a slice carrying the generic instances it reaches in other units, M10f; 22:
+  // NodeFlag's Instanced, an instance's methods checked and compiled only when used, M10g;
+  // 23: NodeFlag's Static, a static method, J3d; 24: a node's DocText, M11b L3; 25:
+  // RuntimeRoutine's *UniqueShared, NodeKind / NodeRole Unshare: shared writes, BNF sec 5;
+  // 26: NodeKind ExtendDecl, NodeRole ExtendTarget: extend declarations, F1; 27: NodeKind
+  // ClosureType / FuncLiteral, closures, F2a; NodeFlag's RefOnly, ref objects, F2a0; 28:
+  // the runtime's WStrToUTF32, a wstring borrowed as a 32-bit wchar_t C string, F3; 29:
+  // NodeFlag's Construction, a value construction T(args), VC1; 30: the runtime's
+  // ArrFromView / IndexFailLength, `const array of T` parameters as views, AS2; 31: NodeKind
+  // ClosureOfType and the intrinsic __adam_cthunk, a C callback's thunk, CB1)
+  ADAM_ACU_FORMAT_VERSION: int64 = 31;
+  // A var's 7 value bits a byte, and the bit that says another byte follows
+  ADAM_ACU_VAR_BITS: uint64 = 127;
+  ADAM_ACU_VAR_MORE: uint64 = 128;
+  // Between the predefined symbols a header's Defines joins
+  ADAM_ACU_DEFINE_SEPARATOR: string = ",";
+  // ACUPathOf's spelling: between segments, before a child index, before an overload's number
+  ADAM_ACU_PATH_SEPARATOR: string = "/";
+  ADAM_ACU_PATH_INDEX: string = "@";
+  ADAM_ACU_PATH_OVERLOAD: string = "#";
+  // An ACUBuffer's first storage, doubled each time it is full
+  ADAM_ACU_FIRST_CAPACITY: int64 = 4096;
+
+public type
+  // What a reference in the payload is (see the header)
+  ACURefKind = choices(None, Local, Fixed, System, Foreign);
+
+  // A node record's fields after its place, in Node's order: bit n of the record's mask
+  // (ACUFieldBit) is set when the field numbered n differs from a new node's and is written
+  // (a value appended here is appended to both sides; the mask holds up to 64)
+  ACUField = choices(Text, Decoded, DecodedWide, NarrowFault, WideFault, ResolvedPath, Op,
+    Flags, Module, IntValue, Suffix, ResolvedDecl, ResolvedUnit, ResolvedJump, ResolvedType,
+    ResolvedConvert, ResolvedEmbed, ResolvedCallee, ResolvedConst, ResolvedLinkage,
+    ResolvedSymbol, ResolvedSize, ResolvedAlign, ResolvedOffset, ResolvedBitOffset,
+    ResolvedBitWidth, ResolvedSlot, ResolvedInstance, ResolvedFormat, DocText);
+
+  // Interface hashes, one per name of a list beside them
+  ACUHashArray = array of uint64;
+
+  // An .acu's header: what decides whether it is current (SU2.3). CompilerId: a hash of the
+  // compiler's version and its exe's size and write time (any other compiler is another id);
+  // Mode ACUModeOf's text; Defines the symbols every file of the build started defined with
+  // (Adam.Compiler.Conditionals' PredefinedSymbols, joined by ADAM_ACU_DEFINE_SEPARATOR); the
+  // source as it was compiled (its path, the size and write time it had when it was read, and
+  // Fnv1a64 of the text compiled); ProjectKey the build's pack key (0 outside a project: a
+  // password change recompiles); InterfaceHash the unit's own (see the header); Imports the
+  // units the unit's import clauses name, then every other unit its records reference (the
+  // runtime's names), ImportHashes each one's interface hash as this unit was compiled
+  // against it, at the same index
+  ACUHeader = record
+    FormatVersion: int64;
+    CompilerVersion: string;
+    CompilerId: uint64;
+    Triple: string;
+    Mode: string;
+    Defines: string;
+    UnitName: string;
+    SourcePath: string;
+    SourceSize: int64;
+    SourceTime: int64;
+    SourceHash: uint64;
+    ProjectKey: uint64;
+    InterfaceHash: uint64;
+    Imports: StringArray;
+    ImportHashes: ACUHashArray;
+  end;
+
+  // A unit of the tree and its interface hash: what the writer records for each import
+  ACUUnitHash = record
+    UnitName: string;
+    Hash: uint64;
+  end;
+
+  ACUUnitHashArray = array of ACUUnitHash;
+
+  // A block of bytes written in order (see the header)
+  ACUBuffer = object
+    hidden FBytes: ByteArray;
+    hidden FCount: int64;
+
+    init();
+    begin
+      setlength(self.FBytes, ADAM_ACU_FIRST_CAPACITY);
+      self.FCount := 0;
+    end;
+
+    // How many bytes are written
+    property Count: int64 read FCount;
+
+    // Appends the low ACount bytes of AValue, least significant first
+    hidden method DoPut(const AValue: uint64; const ACount: int64);
+    begin
+      if self.FCount + ACount > len(self.FBytes) then
+        setlength(self.FBytes, len(self.FBytes) * 2 + ACount);
+      end;
+      PutLe(self.FBytes, self.FCount, AValue, ACount);
+      self.FCount := self.FCount + ACount;
+    end;
+
+    // Appends one byte, or 2, 4, 8 little-endian bytes of AValue
+    method Put8(const AValue: uint64);
+    begin
+      self.DoPut(AValue, 1);
+    end;
+
+    method Put16(const AValue: uint64);
+    begin
+      self.DoPut(AValue, 2);
+    end;
+
+    method Put32(const AValue: uint64);
+    begin
+      self.DoPut(AValue, 4);
+    end;
+
+    method Put64(const AValue: uint64);
+    begin
+      self.DoPut(AValue, 8);
+    end;
+
+    // Appends 1 for true, 0 for false
+    method PutBool(const AValue: bool);
+    begin
+      if AValue then
+        self.DoPut(1, 1);
+      else
+        self.DoPut(0, 1);
+      end;
+    end;
+
+    // Appends AValue as a var (see the header): one byte below 128, at most 10
+    method PutVar(const AValue: uint64);
+    var
+      LRest: uint64;
+    begin
+      LRest := AValue;
+      while LRest > ADAM_ACU_VAR_BITS do
+        self.DoPut((LRest & ADAM_ACU_VAR_BITS) | ADAM_ACU_VAR_MORE, 1);
+        LRest := LRest shr uint64(7);
+      end;
+      self.DoPut(LRest, 1);
+    end;
+
+    // Appends AValue as a signed var: the var of its zigzag (see the header), so a small
+    // negative number (-1: unset) is one byte too
+    method PutSigned(const AValue: int64);
+    begin
+      if AValue < 0 then
+        // -(AValue + 1) holds for the least int64 too
+        self.PutVar((uint64(-(AValue + 1)) shl uint64(1)) | uint64(1));
+      else
+        self.PutVar(uint64(AValue) shl uint64(1));
+      end;
+    end;
+
+    // Appends a text inline: its byte count (var), then its bytes in one block
+    method PutText(const AText: string);
+    var
+      LCount: int64;
+    begin
+      LCount := len(AText);
+      self.PutVar(uint64(LCount));
+      if LCount = 0 then
+        return;
+      end;
+      if self.FCount + LCount > len(self.FBytes) then
+        setlength(self.FBytes, len(self.FBytes) * 2 + LCount);
+      end;
+      CopyBytes(addr of self.FBytes[self.FCount], ptr to const uint8(ptr(addr of AText[0])),
+        LCount);
+      self.FCount := self.FCount + LCount;
+    end;
+
+    // Appends every byte another buffer holds
+    method PutBuffer(const ABuffer: ref ACUBuffer);
+    var
+      LI: int64;
+    begin
+      for LI := 0 to ABuffer.Count - 1 do
+        self.DoPut(uint64(ABuffer.ByteAt(LI)), 1);
+      end;
+    end;
+
+    // The byte at AIndex (0 .. Count - 1)
+    const method ByteAt(const AIndex: int64): uint8;
+    begin
+      return self.FBytes[AIndex];
+    end;
+
+    // FNV-1a 64 (System.SysUtils' Fnv1a64) over the bytes written
+    const method Hash(): uint64;
+    var
+      LHash: uint64;
+      LI: int64;
+    begin
+      LHash := ADAM_SYSUTILS_FNV_OFFSET;
+      for LI := 0 to self.FCount - 1 do
+        LHash := LHash xor uint64(self.FBytes[LI]);
+        LHash := LHash * ADAM_SYSUTILS_FNV_PRIME;
+      end;
+      return LHash;
+    end;
+
+    // The bytes written, as an array of exactly Count bytes
+    const method Bytes(): ByteArray;
+    var
+      LBytes: ByteArray;
+      LI: int64;
+    begin
+      setlength(LBytes, self.FCount);
+      for LI := 0 to self.FCount - 1 do
+        LBytes[LI] := self.FBytes[LI];
+      end;
+      return LBytes;
+    end;
+  end;
+
+// The mode an .acu of a build at ALevel is kept under (<output>\acu\<triple>\<mode>\), the
+// one cell every output part shares: debug, release_safe, release_fast, release_small
+public func ACUModeOf(const ALevel: OptLevel): string;
+begin
+  return OptLevelMode(ALevel);
+end;
+
+// The .acu file name of the unit AUnitName
+public func ACUFileName(const AUnitName: string): string;
+begin
+  return AUnitName + ADAM_EXT_ACU;
+end;
+
+// AField's bit in a node record's mask (see ACUField)
+public func ACUFieldBit(const AField: ACUField): uint64;
+begin
+  return uint64(1) shl uint64(int32(AField));
+end;
+
+// True for the kinds ACUPathOf names by their text: every declaration a scope or an
+// aggregate declares by name
+public func ACUNamesNode(const AKind: NodeKind): bool;
+begin
+  return (AKind = NodeKind.VarDecl) or (AKind = NodeKind.ConstDecl) or
+    (AKind = NodeKind.TypeDecl) or (AKind = NodeKind.RoutineDecl) or
+    (AKind = NodeKind.ForwardRoutine) or (AKind = NodeKind.ForwardType) or
+    (AKind = NodeKind.Param) or (AKind = NodeKind.GenericParam) or
+    (AKind = NodeKind.ChoiceValue) or (AKind = NodeKind.FieldDecl) or
+    (AKind = NodeKind.EmbedDecl) or (AKind = NodeKind.MethodDecl) or
+    (AKind = NodeKind.PropertyDecl) or (AKind = NodeKind.InitDecl) or
+    (AKind = NodeKind.CopyDecl) or (AKind = NodeKind.DoneDecl) or
+    (AKind = NodeKind.OperatorDecl) or (AKind = NodeKind.BuiltinTypeDecl) or
+    (AKind = NodeKind.IntrinsicDecl);
+end;
+
+// AId's segment below its parent (see the header)
+func DoSegment(const ATree: ref SyntaxTree; const AId: int64): string;
+var
+  LParent: int64;
+  LIndex: int64;
+  LSame: int64;
+  LI: int64;
+  LChild: int64;
+begin
+  LParent := ATree.ParentOf(AId);
+  LIndex := -1;
+  LSame := 0;
+  for LI := 0 to ATree.ChildCount(LParent) - 1 do
+    LChild := ATree.ChildAt(LParent, LI);
+    if LChild = AId then
+      LIndex := LI;
+      leave;
+    end;
+    // Counted over every named kind, not AId's alone: a path segment carries no kind (a
+    // forward routine and its routine share a name)
+    if ACUNamesNode(ATree[LChild].Kind) and (ATree[LChild].Text = ATree[AId].Text) then
+      LSame := LSame + 1;
+    end;
+  end;
+  if ACUNamesNode(ATree[AId].Kind) and (ATree[AId].Text <> "") then
+    if LSame = 0 then
+      return ATree[AId].Text;
+    end;
+    return ATree[AId].Text + ADAM_ACU_PATH_OVERLOAD + IntToStr(LSame);
+  end;
+  return ADAM_ACU_PATH_INDEX + IntToStr(LIndex);
+end;
+
+// AId's place below ARoot, which is above it (see the header); "" for ARoot itself
+public func ACUPathOf(const ATree: ref SyntaxTree; const AId: int64; const ARoot: int64): string;
+var
+  LPath: string;
+  LAt: int64;
+begin
+  LPath := "";
+  LAt := AId;
+  while (LAt <> ARoot) and (LAt <> 0) do
+    if LPath = "" then
+      LPath := DoSegment(ATree, LAt);
+    else
+      LPath := DoSegment(ATree, LAt) + ADAM_ACU_PATH_SEPARATOR + LPath;
+    end;
+    LAt := ATree.ParentOf(LAt);
+  end;
+  return LPath;
+end;
+
+end.

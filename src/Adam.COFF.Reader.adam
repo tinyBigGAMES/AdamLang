@@ -1,0 +1,604 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.COFF.Reader.adam - a COFF object read: its sections, relocations and
+  symbols (DESIGN sec 7: the foreign objects a static library's members are)
+
+  Every layout fact is Microsoft's "PE Format" page (COFF File Header,
+  Section Table (Section Headers), Section Flags, COFF Relocations (Object
+  Only), COFF Symbol Table, Section Number Values, Storage Class, Auxiliary
+  Format 5: Section Definitions, COMDAT Sections (Object Only), COFF String
+  Table); the relocation-count overflow as Adam.COFF.Writer writes it (the
+  first record's VirtualAddress is the count, that record included).
+
+  ReadCOFFObject  the bytes of one object, a slice of a larger buffer (an
+                  archive member's data) -> its Machine; its sections in
+                  section-number order: the name, the Characteristics, the
+                  alignment bits 20..23 give (1 when they give none), the raw
+                  data's place in the buffer and its size (an uninitialized
+                  section's size, with no place), its relocations, and a
+                  COMDAT section's selection and Number from its section
+                  definition record; its relocations (offset, symbol table
+                  index, type: the machine's to name); its symbol table, one
+                  entry per record, a symbol (name, value, section number
+                  (signed), type, storage class, aux count; a weak external's
+                  default record and search kind from Auxiliary Format 3) or
+                  an aux record (IsAux), each with its place in the buffer. A
+                  name of 8 bytes or less is read in place; a symbol name
+                  whose first 4 bytes are zero, and a section name "/N", from
+                  the string table.
+
+  Nothing raises but a slice outside the buffer (a caller's bug): a header,
+  a table, a name, an aux count, a section's data or relocations past the
+  object's end, an alignment field naming no alignment, a relocation count
+  of 0 kept in the first relocation, a relocation to a symbol past the
+  table, or a weak external with no aux record or with a default past the
+  table or naming an aux record are reported (OB0001) at the place the
+  caller gives, under the label it names the object by, and false is
+  returned. What the object holds is the linker's to judge: its Machine,
+  the relocation types and the symbol forms it links.
+*******************************************************************************/
+
+module unit Adam.COFF.Reader;
+
+import System.SysUtils, Adam.Core.Messages, Adam.Compiler.SourceText, Adam.Compiler.Diagnostics,
+  Adam.COFF.Writer, System.Windows;
+
+public const
+  // Reported (see the header)
+  ADAM_ERR_READER_001: string = "OB0001";   // a damaged object
+  // Raised (see the header)
+  ADAM_READER_FAULT_SLICE: string = "COFF reader: a slice outside its buffer: ";
+  // COFF File Header: the fields read
+  ADAM_READER_SECTION_COUNT_AT: int64 = 2;
+  ADAM_READER_SYMBOL_TABLE_AT: int64 = 8;
+  ADAM_READER_SYMBOL_COUNT_AT: int64 = 12;
+  ADAM_READER_OPTIONAL_SIZE_AT: int64 = 16;
+  // Section Table: the fields read in a section header
+  ADAM_READER_RAW_SIZE_AT: int64 = 16;
+  ADAM_READER_RAW_AT: int64 = 20;
+  ADAM_READER_RELOCS_AT: int64 = 24;
+  ADAM_READER_RELOC_COUNT_AT: int64 = 32;
+  ADAM_READER_FLAGS_AT: int64 = 36;
+  // COFF Relocations: the fields after VirtualAddress
+  ADAM_READER_RELOC_SYMBOL_AT: int64 = 4;
+  ADAM_READER_RELOC_TYPE_AT: int64 = 8;
+  // COFF Symbol Table: a long name's string table offset, then the fields after the name
+  ADAM_READER_NAME_OFFSET_AT: int64 = 4;
+  ADAM_READER_VALUE_AT: int64 = 8;
+  ADAM_READER_SECTION_NUMBER_AT: int64 = 12;
+  ADAM_READER_TYPE_AT: int64 = 14;
+  ADAM_READER_CLASS_AT: int64 = 16;
+  ADAM_READER_AUX_COUNT_AT: int64 = 17;
+  // Auxiliary Format 5 (Section Definitions): Number and Selection
+  ADAM_READER_AUX_NUMBER_AT: int64 = 12;
+  ADAM_READER_AUX_SELECTION_AT: int64 = 14;
+  // Auxiliary Format 3 (Weak Externals): TagIndex and Characteristics
+  ADAM_READER_AUX_TAG_AT: int64 = 0;
+  ADAM_READER_AUX_SEARCH_AT: int64 = 4;
+  // SectionNumber is signed 16-bit: its sign bit and the span it wraps by
+  ADAM_READER_SECTION_SIGN: int64 = 0x8000;
+  ADAM_READER_SECTION_SPAN: int64 = 0x10000;
+  // Section Flags read beyond the writer's: the alignment bits' mask and their largest
+  // value (IMAGE_SCN_ALIGN_8192BYTES; 15 names none)
+  ADAM_COFF_SCN_ALIGN_MASK: int64 = 0xF;
+  ADAM_COFF_SCN_ALIGN_LAST: int64 = 14;
+
+public type
+  // One section (see the header); its number is its index + 1
+  COFFSection = record
+    SectionName: string;
+    Characteristics: int64;
+    Align: int64;
+    // The raw data's offset in the buffer (0: none) and SizeOfRawData
+    DataAt: int64;
+    DataSize: int64;
+    // Its relocations: the first one's index in the object's Relocs, and how many
+    RelocFirst: int64;
+    RelocCount: int64;
+    // A COMDAT section's Selection and Number (its section definition record); 0 for none
+    Selection: int64;
+    Associated: int64;
+  end;
+
+  COFFSectionArray = array of COFFSection;
+
+  // One relocation (see the header)
+  COFFReloc = record
+    Offset: int64;
+    SymbolIndex: int64;
+    RelocType: int64;
+  end;
+
+  COFFRelocArray = array of COFFReloc;
+
+  // One symbol table record (see the header); an aux record holds only IsAux and RecordAt
+  COFFSymbol = record
+    IsAux: bool;
+    RecordAt: int64;
+    SymbolName: string;
+    SymbolValue: int64;
+    SectionNumber: int64;
+    SymbolType: int64;
+    StorageClass: int64;
+    AuxCount: int64;
+    // A weak external's default (its aux record's TagIndex: a symbol record's index) and
+    // search kind; -1 and 0 for any other record
+    WeakDefault: int64;
+    WeakSearch: int64;
+  end;
+
+  COFFSymbolArray = array of COFFSymbol;
+
+  // One object read (see the header)
+  COFFObjectData = record
+    Machine: int64;
+    Sections: COFFSectionArray;
+    Relocs: COFFRelocArray;
+    Symbols: COFFSymbolArray;
+  end;
+
+type
+  // Where one object's parts are in the buffer while it is read (the header's fields once
+  // DoReadHeader has read them), and how a report names it
+  ReadContext = object
+    Start: int64;
+    Size: int64;
+    ObjectLabel: string;
+    Place: SourcePlace;
+    SectionsAt: int64;
+    SectionCount: int64;
+    SymbolsAt: int64;
+    SymbolCount: int64;
+    StringsAt: int64;
+    StringsSize: int64;
+
+    init(const AStart: int64; const ASize: int64; const AObjectLabel: string;
+      const APlace: SourcePlace);
+    begin
+      self.Start := AStart;
+      self.Size := ASize;
+      self.ObjectLabel := AObjectLabel;
+      self.Place := APlace;
+      self.SectionsAt := 0;
+      self.SectionCount := 0;
+      self.SymbolsAt := 0;
+      self.SymbolCount := 0;
+      self.StringsAt := 0;
+      self.StringsSize := 0;
+    end;
+  end;
+
+// The ACount-byte little-endian value at AAt in ABytes
+func DoGet(const ABytes: ByteArray; const AAt: int64; const ACount: int64): int64;
+begin
+  return int64(GetLe(ABytes, AAt, ACount));
+end;
+
+// True when the ACount bytes at AAt lie inside the object
+func DoFits(const AContext: ref ReadContext; const AAt: int64; const ACount: int64): bool;
+begin
+  if (ACount < 0) or (AAt < AContext.Start) then
+    return false;
+  end;
+  return AAt + ACount <= AContext.Start + AContext.Size;
+end;
+
+// Reports the object damaged for AReason (OB0001): false
+func DoDamaged(const AContext: ref ReadContext; const ADiagnostics: ref Diagnostics;
+  const AReason: string): bool;
+begin
+  ADiagnostics.Add(Severity.Error, ADAM_ERR_READER_001, AContext.Place, ADAM_MSG_READER_DAMAGED,
+    NoArgs().Str(AContext.ObjectLabel).Str(AReason));
+  return false;
+end;
+
+// The name in the 8-byte field at AAt: its bytes up to the first zero byte or the field's end
+func DoShortName(const ABytes: ByteArray; const AAt: int64): string;
+var
+  LText: string;
+  LI: int64;
+begin
+  LText := "";
+  for LI := AAt to AAt + IMAGE_SIZEOF_SHORT_NAME - 1 do
+    if ABytes[LI] = 0 then
+      return LText;
+    end;
+    LText := LText + char(ABytes[LI]);
+  end;
+  return LText;
+end;
+
+// The name at AOffset in the string table into AText: false when the offset is not past the
+// size field and inside the table, or no zero byte ends the name inside it
+func DoTableName(const ABytes: ByteArray; const AContext: ref ReadContext; const AOffset: int64;
+  var AText: string): bool;
+var
+  LAt: int64;
+  LEnd: int64;
+begin
+  if (AOffset < ADAM_COFF_STRINGS_SIZE_FIELD) or (AOffset >= AContext.StringsSize) then
+    return false;
+  end;
+  LEnd := AContext.StringsAt + AContext.StringsSize;
+  LAt := AContext.StringsAt + AOffset;
+  AText := "";
+  while LAt < LEnd do
+    if ABytes[LAt] = 0 then
+      return true;
+    end;
+    AText := AText + char(ABytes[LAt]);
+    LAt := LAt + 1;
+  end;
+  return false;
+end;
+
+// The section name in the section header at AAt into AText: in place, or "/N" read from the
+// string table; false when "/N" names no place it holds
+func DoSectionName(const ABytes: ByteArray; const AContext: ref ReadContext; const AAt: int64;
+  var AText: string): bool;
+var
+  LShort: string;
+  LOffset: int64;
+begin
+  LShort := DoShortName(ABytes, AAt);
+  if not StartsStr("/", LShort) then
+    AText := LShort;
+    return true;
+  end;
+  if not TryStrToInt(Substring(LShort, 1, len(LShort) - 1), LOffset) then
+    return false;
+  end;
+  return DoTableName(ABytes, AContext, LOffset, AText);
+end;
+
+// The file header: the Machine into AObject; where the section table, the symbol table and
+// the string table are into AContext; false after a report when one runs past the end
+func DoReadHeader(const ABytes: ByteArray; const AContext: ref ReadContext;
+  const ADiagnostics: ref Diagnostics; var AObject: COFFObjectData): bool;
+var
+  LStart: int64;
+begin
+  LStart := AContext.Start;
+  if not DoFits(AContext, LStart, IMAGE_SIZEOF_FILE_HEADER) then
+    return DoDamaged(AContext, ADiagnostics, ADAM_MSG_READER_REASON_HEADER);
+  end;
+  AObject.Machine := DoGet(ABytes, LStart, 2);
+  AContext.SectionCount := DoGet(ABytes, LStart + ADAM_READER_SECTION_COUNT_AT, 2);
+  AContext.SectionsAt := LStart + IMAGE_SIZEOF_FILE_HEADER +
+    DoGet(ABytes, LStart + ADAM_READER_OPTIONAL_SIZE_AT, 2);
+  if not DoFits(AContext, AContext.SectionsAt,
+    IMAGE_SIZEOF_SECTION_HEADER * AContext.SectionCount) then
+    return DoDamaged(AContext, ADiagnostics, ADAM_MSG_READER_REASON_SECTIONS);
+  end;
+  AContext.SymbolCount := DoGet(ABytes, LStart + ADAM_READER_SYMBOL_COUNT_AT, 4);
+  AContext.SymbolsAt := 0;
+  AContext.StringsAt := 0;
+  AContext.StringsSize := 0;
+  if AContext.SymbolCount = 0 then
+    return true;
+  end;
+  AContext.SymbolsAt := LStart + DoGet(ABytes, LStart + ADAM_READER_SYMBOL_TABLE_AT, 4);
+  if not DoFits(AContext, AContext.SymbolsAt, IMAGE_SIZEOF_SYMBOL * AContext.SymbolCount) then
+    return DoDamaged(AContext, ADiagnostics, ADAM_MSG_READER_REASON_SYMBOLS);
+  end;
+  // The string table follows the symbol table; its first 4 bytes are its size, them included
+  AContext.StringsAt := AContext.SymbolsAt + IMAGE_SIZEOF_SYMBOL * AContext.SymbolCount;
+  if not DoFits(AContext, AContext.StringsAt, ADAM_COFF_STRINGS_SIZE_FIELD) then
+    return DoDamaged(AContext, ADiagnostics, ADAM_MSG_READER_REASON_STRINGS);
+  end;
+  AContext.StringsSize := DoGet(ABytes, AContext.StringsAt, 4);
+  if (AContext.StringsSize < ADAM_COFF_STRINGS_SIZE_FIELD) or
+    (not DoFits(AContext, AContext.StringsAt, AContext.StringsSize)) then
+    return DoDamaged(AContext, ADiagnostics, ADAM_MSG_READER_REASON_STRINGS);
+  end;
+  return true;
+end;
+
+// An aux record at AAt
+func DoAuxRecord(const AAt: int64): COFFSymbol;
+var
+  LAux: COFFSymbol;
+begin
+  LAux.IsAux := true;
+  LAux.RecordAt := AAt;
+  LAux.SymbolName := "";
+  LAux.SymbolValue := 0;
+  LAux.SectionNumber := 0;
+  LAux.SymbolType := 0;
+  LAux.StorageClass := 0;
+  LAux.AuxCount := 0;
+  LAux.WeakDefault := -1;
+  LAux.WeakSearch := 0;
+  return LAux;
+end;
+
+// The symbol record AIndex at AAt into ASymbol; false after a report when its long name is
+// not in the string table
+func DoReadSymbol(const ABytes: ByteArray; const AContext: ref ReadContext;
+  const ADiagnostics: ref Diagnostics; const AIndex: int64; const AAt: int64;
+  var ASymbol: COFFSymbol): bool;
+var
+  LName: string;
+begin
+  LName := "";
+  if DoGet(ABytes, AAt, 4) = 0 then
+    if not DoTableName(ABytes, AContext, DoGet(ABytes, AAt + ADAM_READER_NAME_OFFSET_AT, 4),
+      LName) then
+      return DoDamaged(AContext, ADiagnostics,
+        NoArgs().Int(AIndex).Fill(ADAM_MSG_READER_REASON_SYMBOL_NAME));
+    end;
+  else
+    LName := DoShortName(ABytes, AAt);
+  end;
+  ASymbol.IsAux := false;
+  ASymbol.RecordAt := AAt;
+  ASymbol.SymbolName := LName;
+  ASymbol.SymbolValue := DoGet(ABytes, AAt + ADAM_READER_VALUE_AT, 4);
+  ASymbol.SectionNumber := DoGet(ABytes, AAt + ADAM_READER_SECTION_NUMBER_AT, 2);
+  if ASymbol.SectionNumber >= ADAM_READER_SECTION_SIGN then
+    ASymbol.SectionNumber := ASymbol.SectionNumber - ADAM_READER_SECTION_SPAN;
+  end;
+  ASymbol.SymbolType := DoGet(ABytes, AAt + ADAM_READER_TYPE_AT, 2);
+  ASymbol.StorageClass := DoGet(ABytes, AAt + ADAM_READER_CLASS_AT, 1);
+  ASymbol.AuxCount := DoGet(ABytes, AAt + ADAM_READER_AUX_COUNT_AT, 1);
+  ASymbol.WeakDefault := -1;
+  ASymbol.WeakSearch := 0;
+  return true;
+end;
+
+// The symbol table into AObject.Symbols, one entry per record (see the header); false after
+// a report
+func DoReadSymbols(const ABytes: ByteArray; const AContext: ref ReadContext;
+  const ADiagnostics: ref Diagnostics; var AObject: COFFObjectData): bool;
+var
+  LIndex: int64;
+  LAt: int64;
+  LK: int64;
+  LSymbol: COFFSymbol;
+begin
+  setlength(AObject.Symbols, AContext.SymbolCount);
+  LIndex := 0;
+  while LIndex < AContext.SymbolCount do
+    LAt := AContext.SymbolsAt + IMAGE_SIZEOF_SYMBOL * LIndex;
+    if not DoReadSymbol(ABytes, AContext, ADiagnostics, LIndex, LAt, LSymbol) then
+      return false;
+    end;
+    if LIndex + LSymbol.AuxCount >= AContext.SymbolCount then
+      return DoDamaged(AContext, ADiagnostics,
+        NoArgs().Int(LIndex).Int(LSymbol.AuxCount).Fill(ADAM_MSG_READER_REASON_AUX));
+    end;
+    AObject.Symbols[LIndex] := LSymbol;
+    for LK := 1 to LSymbol.AuxCount do
+      AObject.Symbols[LIndex + LK] := DoAuxRecord(LAt + IMAGE_SIZEOF_SYMBOL * LK);
+    end;
+    LIndex := LIndex + 1 + LSymbol.AuxCount;
+  end;
+  return true;
+end;
+
+// The section AIndex's relocations appended to AObject.Relocs, its first and count into
+// ASection; false after a report (ANumber: the section's number as reports name it)
+func DoReadRelocs(const ABytes: ByteArray; const AContext: ref ReadContext;
+  const ADiagnostics: ref Diagnostics; const AHeaderAt: int64; const ANumber: int64;
+  var ASection: COFFSection; var AObject: COFFObjectData): bool;
+var
+  LCount: int64;
+  LAt: int64;
+  LFirst: int64;
+  LI: int64;
+  LReloc: COFFReloc;
+begin
+  LCount := DoGet(ABytes, AHeaderAt + ADAM_READER_RELOC_COUNT_AT, 2);
+  LAt := AContext.Start + DoGet(ABytes, AHeaderAt + ADAM_READER_RELOCS_AT, 4);
+  if ((ASection.Characteristics & IMAGE_SCN_LNK_NRELOC_OVFL) <> 0) and
+    (LCount = ADAM_COFF_RELOC_OVERFLOW) then
+    if not DoFits(AContext, LAt, IMAGE_SIZEOF_RELOCATION) then
+      return DoDamaged(AContext, ADiagnostics,
+        NoArgs().Int(ANumber).Fill(ADAM_MSG_READER_REASON_RELOCS));
+    end;
+    // The first record's VirtualAddress is the count, that record included
+    LCount := DoGet(ABytes, LAt, 4) - 1;
+    if LCount < 0 then
+      return DoDamaged(AContext, ADiagnostics,
+        NoArgs().Int(ANumber).Fill(ADAM_MSG_READER_REASON_OVERFLOW));
+    end;
+    LAt := LAt + IMAGE_SIZEOF_RELOCATION;
+  end;
+  if (LCount > 0) and (not DoFits(AContext, LAt, IMAGE_SIZEOF_RELOCATION * LCount)) then
+    return DoDamaged(AContext, ADiagnostics,
+      NoArgs().Int(ANumber).Fill(ADAM_MSG_READER_REASON_RELOCS));
+  end;
+  LFirst := len(AObject.Relocs);
+  setlength(AObject.Relocs, LFirst + LCount);
+  for LI := 0 to LCount - 1 do
+    LReloc.Offset := DoGet(ABytes, LAt, 4);
+    LReloc.SymbolIndex := DoGet(ABytes, LAt + ADAM_READER_RELOC_SYMBOL_AT, 4);
+    LReloc.RelocType := DoGet(ABytes, LAt + ADAM_READER_RELOC_TYPE_AT, 2);
+    if LReloc.SymbolIndex >= AContext.SymbolCount then
+      return DoDamaged(AContext, ADiagnostics,
+        NoArgs().Int(ANumber).Int(LReloc.SymbolIndex).Fill(ADAM_MSG_READER_REASON_RELOC_SYMBOL));
+    end;
+    AObject.Relocs[LFirst + LI] := LReloc;
+    LAt := LAt + IMAGE_SIZEOF_RELOCATION;
+  end;
+  ASection.RelocFirst := LFirst;
+  ASection.RelocCount := LCount;
+  return true;
+end;
+
+// The section header AIndex (0-based) into AObject.Sections[AIndex], its relocations into
+// AObject.Relocs; false after a report
+func DoReadSection(const ABytes: ByteArray; const AContext: ref ReadContext;
+  const ADiagnostics: ref Diagnostics; const AIndex: int64; var AObject: COFFObjectData): bool;
+var
+  LAt: int64;
+  LNumber: int64;
+  LName: string;
+  LShift: int64;
+  LSection: COFFSection;
+begin
+  LAt := AContext.SectionsAt + IMAGE_SIZEOF_SECTION_HEADER * AIndex;
+  LNumber := AIndex + 1;
+  LName := "";
+  if not DoSectionName(ABytes, AContext, LAt, LName) then
+    return DoDamaged(AContext, ADiagnostics,
+      NoArgs().Int(LNumber).Fill(ADAM_MSG_READER_REASON_SECTION_NAME));
+  end;
+  LSection.SectionName := LName;
+  LSection.Characteristics := DoGet(ABytes, LAt + ADAM_READER_FLAGS_AT, 4);
+  LShift := (LSection.Characteristics shr ADAM_COFF_SCN_ALIGN_SHIFT) & ADAM_COFF_SCN_ALIGN_MASK;
+  if LShift > ADAM_COFF_SCN_ALIGN_LAST then
+    return DoDamaged(AContext, ADiagnostics,
+      NoArgs().Int(LNumber).Fill(ADAM_MSG_READER_REASON_ALIGN));
+  end;
+  // IMAGE_SCN_ALIGN_<2^k>BYTES is k + 1; 0 names no alignment, read as 1
+  LSection.Align := 1;
+  if LShift > 0 then
+    LSection.Align := 1 shl (LShift - 1);
+  end;
+  LSection.DataSize := DoGet(ABytes, LAt + ADAM_READER_RAW_SIZE_AT, 4);
+  LSection.DataAt := 0;
+  if ((LSection.Characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA) = 0) and
+    (LSection.DataSize > 0) then
+    LSection.DataAt := AContext.Start + DoGet(ABytes, LAt + ADAM_READER_RAW_AT, 4);
+    if not DoFits(AContext, LSection.DataAt, LSection.DataSize) then
+      return DoDamaged(AContext, ADiagnostics,
+        NoArgs().Int(LNumber).Fill(ADAM_MSG_READER_REASON_DATA));
+    end;
+  end;
+  LSection.Selection := 0;
+  LSection.Associated := 0;
+  LSection.RelocFirst := 0;
+  LSection.RelocCount := 0;
+  if not DoReadRelocs(ABytes, AContext, ADiagnostics, LAt, LNumber, LSection, AObject) then
+    return false;
+  end;
+  AObject.Sections[AIndex] := LSection;
+  return true;
+end;
+
+// True when ASymbol is the section definition of a COMDAT section of AObject whose selection
+// is not read yet: a STATIC symbol of the section's name, at value 0, with an aux record
+func DoIsComdatDefinition(const AObject: COFFObjectData; const ASymbol: COFFSymbol): bool;
+var
+  LSection: COFFSection;
+begin
+  if ASymbol.IsAux or (ASymbol.StorageClass <> IMAGE_SYM_CLASS_STATIC) then
+    return false;
+  end;
+  if (ASymbol.AuxCount < 1) or (ASymbol.SymbolValue <> 0) then
+    return false;
+  end;
+  if (ASymbol.SectionNumber < 1) or (ASymbol.SectionNumber > len(AObject.Sections)) then
+    return false;
+  end;
+  LSection := AObject.Sections[ASymbol.SectionNumber - 1];
+  if (LSection.Characteristics & IMAGE_SCN_LNK_COMDAT) = 0 then
+    return false;
+  end;
+  return (LSection.Selection = 0) and (LSection.SectionName = ASymbol.SymbolName);
+end;
+
+// Every COMDAT section's Selection and Number from its section definition's aux record
+func DoReadComdats(const ABytes: ByteArray; var AObject: COFFObjectData);
+var
+  LIndex: int64;
+  LAux: int64;
+  LSection: COFFSection;
+  LNumber: int64;
+begin
+  for LIndex := 0 to len(AObject.Symbols) - 1 do
+    if DoIsComdatDefinition(AObject, AObject.Symbols[LIndex]) then
+      LNumber := AObject.Symbols[LIndex].SectionNumber - 1;
+      LAux := AObject.Symbols[LIndex + 1].RecordAt;
+      LSection := AObject.Sections[LNumber];
+      LSection.Selection := DoGet(ABytes, LAux + ADAM_READER_AUX_SELECTION_AT, 1);
+      LSection.Associated := DoGet(ABytes, LAux + ADAM_READER_AUX_NUMBER_AT, 2);
+      AObject.Sections[LNumber] := LSection;
+    end;
+  end;
+end;
+
+// Every weak external's default and search kind from its aux record (Auxiliary Format 3);
+// false after a report: one with no aux record, or a default that is past the table or an
+// aux record
+func DoReadWeaks(const ABytes: ByteArray; const AContext: ref ReadContext;
+  const ADiagnostics: ref Diagnostics; var AObject: COFFObjectData): bool;
+var
+  LIndex: int64;
+  LAux: int64;
+  LDefault: int64;
+  LSymbol: COFFSymbol;
+begin
+  for LIndex := 0 to len(AObject.Symbols) - 1 do
+    LSymbol := AObject.Symbols[LIndex];
+    if (not LSymbol.IsAux) and (LSymbol.StorageClass = IMAGE_SYM_CLASS_WEAK_EXTERNAL) then
+      if LSymbol.AuxCount < 1 then
+        return DoDamaged(AContext, ADiagnostics,
+          NoArgs().Int(LIndex).Fill(ADAM_MSG_READER_REASON_WEAK_AUX));
+      end;
+      LAux := AObject.Symbols[LIndex + 1].RecordAt;
+      LDefault := DoGet(ABytes, LAux + ADAM_READER_AUX_TAG_AT, 4);
+      if (LDefault >= len(AObject.Symbols)) or AObject.Symbols[LDefault].IsAux then
+        return DoDamaged(AContext, ADiagnostics,
+          NoArgs().Int(LIndex).Int(LDefault).Fill(ADAM_MSG_READER_REASON_WEAK_DEFAULT));
+      end;
+      LSymbol.WeakDefault := LDefault;
+      LSymbol.WeakSearch := DoGet(ABytes, LAux + ADAM_READER_AUX_SEARCH_AT, 4);
+      AObject.Symbols[LIndex] := LSymbol;
+    end;
+  end;
+  return true;
+end;
+
+// The object in the ASize bytes at AStart of ABytes, named ALabel in a report at APlace,
+// read into AObject (see the header): true when it is read whole; else the fault is reported
+// into ADiagnostics (OB0001) and false returned. Raises for a slice outside ABytes
+public func ReadCOFFObject(const ABytes: ByteArray; const AStart: int64; const ASize: int64;
+  const ALabel: string; const APlace: SourcePlace; const ADiagnostics: ref Diagnostics;
+  var AObject: COFFObjectData): bool;
+var
+  LContext: ref ReadContext;
+  LI: int64;
+begin
+  if (AStart < 0) or (ASize < 0) or (AStart + ASize > len(ABytes)) then
+    raise(ADAM_READER_FAULT_SLICE + ALabel + " " + IntToStr(AStart) + " " + IntToStr(ASize));
+  end;
+  AObject.Machine := 0;
+  setlength(AObject.Sections, 0);
+  setlength(AObject.Relocs, 0);
+  setlength(AObject.Symbols, 0);
+  LContext := ref ReadContext(AStart, ASize, ALabel, APlace);
+  if not DoReadHeader(ABytes, LContext, ADiagnostics, AObject) then
+    return false;
+  end;
+  if not DoReadSymbols(ABytes, LContext, ADiagnostics, AObject) then
+    return false;
+  end;
+  if not DoReadWeaks(ABytes, LContext, ADiagnostics, AObject) then
+    return false;
+  end;
+  setlength(AObject.Sections, LContext.SectionCount);
+  for LI := 0 to LContext.SectionCount - 1 do
+    if not DoReadSection(ABytes, LContext, ADiagnostics, LI, AObject) then
+      return false;
+    end;
+  end;
+  DoReadComdats(ABytes, AObject);
+  return true;
+end;
+
+end.

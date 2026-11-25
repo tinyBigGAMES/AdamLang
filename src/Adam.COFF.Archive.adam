@@ -1,0 +1,511 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.COFF.Archive.adam - an ar archive's COFF members read and written: a
+  static lib (.a / .lib) or an import lib (.dll.a / import .lib), DESIGN
+  sec 7
+
+  The ar container itself (signature, member headers, long names, the
+  symbol index, the writer's COFF kind with its second linker member) is
+  Adam.Backend.Archive's, below the format parts; this unit adds what is
+  COFF's. Every layout fact is Microsoft's "PE Format" page (Archive
+  (Library) File Format; Import Library Format: Import Header), the same
+  layout GNU ar writes for COFF (the fixtures of PLAN-ADAM M3.13 are zig's).
+
+  ReadArchive   an archive's bytes -> its members in file order
+                (Adam.Backend.Archive's entries: each with its header's
+                offset, its data's offset and size and its name), each
+                classed: the symbol index (both linker members, "/"), the
+                long-name table, a short import (its data starts 00 00 FF
+                FF: the symbol, the DLL, the Machine, the ordinal / hint, the
+                import type and the name type its Import Header holds) or a
+                COFF object; then the first linker member's symbol index,
+                each symbol tied to its member. The second (MS) linker
+                member holds the same symbols sorted; it is kept as a member
+                and not read.
+  ImportNameOf  the name a short import is imported by, by its name type.
+  WriteImportArchive  a DLL's import library (M8b), llvm-dlltool's member
+                set so link.exe, GNU ld and lld take it as Adam's linker
+                does: the import descriptor object (__IMPORT_DESCRIPTOR_<dll
+                stem>: the .idata$2 directory entry, its tables at the start
+                of the image's .idata$4 and .idata$5, its name in .idata$6),
+                the null import descriptor (__NULL_IMPORT_DESCRIPTOR,
+                .idata$3), the null thunk (DEL <dll stem>_NULL_THUNK_DATA,
+                the zero ends of .idata$5 and .idata$4), each a COFF object
+                Adam.COFF.Writer writes from a SectionSet; then one short
+                import per export, by name, its hint its place in the DLL's
+                sorted name pointer table: a routine Code (defining its name
+                and __imp_<name>), a variable Data (__imp_<name> only); the
+                archive Adam.Backend.Archive's WriteArchive of the COFF kind.
+
+  Nothing raises: what Adam.Backend.Archive reports (AR0001..AR0004), and a
+  short import that does not hold its two names (AR0005), are reported at
+  the place the caller gives, and false is returned. Machine, version and
+  time stamp are the linker's to check.
+*******************************************************************************/
+
+module unit Adam.COFF.Archive;
+
+import System.SysUtils, Adam.Core.Messages, Adam.Core.Containers, Adam.Compiler.SourceText,
+  Adam.Compiler.Diagnostics, Adam.Backend.Sections, Adam.Backend.Archive, Adam.COFF.Writer,
+  System.Windows;
+
+public const
+  // Reported (see the header; AR0001..AR0004 are Adam.Backend.Archive's)
+  ADAM_ERR_ARCHIVE_005: string = "AR0005";   // a short import that does not hold its names
+
+  // A short import's Import Header: its size, the offsets of its Ordinal/Hint and Type
+  ADAM_ARCHIVE_IMPORT_HEADER: int64 = 20;
+  ADAM_ARCHIVE_IMPORT_MACHINE_AT: int64 = 6;
+  ADAM_ARCHIVE_IMPORT_HINT_AT: int64 = 16;
+  ADAM_ARCHIVE_IMPORT_TYPE_AT: int64 = 18;
+  // The rest of an Import Header the writer fills: Sig2 and its value, SizeOfData, the Type
+  // field's import types and name type (Import Type, Import Name Type)
+  ADAM_ARCHIVE_IMPORT_SIG2_AT: int64 = 2;
+  ADAM_ARCHIVE_IMPORT_SIZE_AT: int64 = 12;
+  ADAM_ARCHIVE_IMPORT_NAMING_SHIFT: int64 = 2;
+
+  // An import library's objects (see the header): their sections, the descriptor's size and
+  // alignment and its fields' offsets (Import Directory Table), a thunk's size (PE32+)
+  ADAM_ARCHIVE_IDATA_ENTRY: string = ".idata$2";
+  ADAM_ARCHIVE_IDATA_END: string = ".idata$3";
+  ADAM_ARCHIVE_IDATA_LOOKUP: string = ".idata$4";
+  ADAM_ARCHIVE_IDATA_ADDRESSES: string = ".idata$5";
+  ADAM_ARCHIVE_IDATA_NAMES: string = ".idata$6";
+  ADAM_ARCHIVE_DESCRIPTOR_SIZE: int64 = 20;
+  ADAM_ARCHIVE_DESCRIPTOR_ALIGN: int64 = 4;
+  ADAM_ARCHIVE_DESCRIPTOR_LOOKUP_AT: int64 = 0;
+  ADAM_ARCHIVE_DESCRIPTOR_NAME_AT: int64 = 12;
+  ADAM_ARCHIVE_DESCRIPTOR_ADDRESSES_AT: int64 = 16;
+  ADAM_ARCHIVE_THUNK_SIZE: int64 = 8;
+  // Their symbols: the descriptor's (then the DLL's stem), the null descriptor's, the null
+  // thunk's (DEL, the stem, then the suffix), the descriptor's own name of its DLL's name
+  ADAM_ARCHIVE_DESCRIPTOR_PREFIX: string = "__IMPORT_DESCRIPTOR_";
+  ADAM_ARCHIVE_NULL_DESCRIPTOR: string = "__NULL_IMPORT_DESCRIPTOR";
+  ADAM_ARCHIVE_NULL_THUNK_LEAD: int64 = 0x7F;
+  ADAM_ARCHIVE_NULL_THUNK_SUFFIX: string = "_NULL_THUNK_DATA";
+  ADAM_ARCHIVE_DLL_NAME_SYMBOL: string = "__adam_import_dll_name";
+
+public type
+  // What one member holds (see the header)
+  MemberKind = choices(SymbolIndex, NameTable, COFFObject, ShortImport);
+
+  // A short import's Import Type (its Type field's bits 0-1)
+  ImportKind = choices(Code, Data, Constant, Reserved);
+
+  // A short import's Import Name Type (its Type field's bits 2-4)
+  ImportNaming = choices(Ordinal, Name, NoPrefix, Undecorate, ExportAs, Reserved);
+
+  // One member (see the header); the Import* fields only for a ShortImport
+  ArchiveMember = record
+    Kind: MemberKind;
+    MemberName: string;
+    HeaderAt: int64;
+    DataAt: int64;
+    Size: int64;
+    ImportSymbol: string;
+    ImportDLL: string;
+    ImportMachine: int64;
+    OrdinalHint: int64;
+    Imported: ImportKind;
+    Naming: ImportNaming;
+  end;
+
+  // An archive's members, in file order
+  ArchiveMemberArray = array of ArchiveMember;
+
+  // One archive read (see the header)
+  ArchiveData = record
+    Members: ArchiveMemberArray;
+    Symbols: ArchiveSymbolArray;
+  end;
+
+// The member of the entry AEntry: a symbol index or the long-name table as it is, any other
+// entry a COFF object until DoReadImports finds a short import in it
+func DoMember(const AEntry: ArchiveEntry): ArchiveMember;
+var
+  LMember: ArchiveMember;
+begin
+  LMember.Kind := MemberKind.COFFObject;
+  if AEntry.Kind = ArchiveEntryKind.SymbolIndex then
+    LMember.Kind := MemberKind.SymbolIndex;
+  end;
+  if AEntry.Kind = ArchiveEntryKind.NameTable then
+    LMember.Kind := MemberKind.NameTable;
+  end;
+  LMember.MemberName := AEntry.EntryName;
+  LMember.HeaderAt := AEntry.HeaderAt;
+  LMember.DataAt := AEntry.DataAt;
+  LMember.Size := AEntry.Size;
+  LMember.ImportSymbol := "";
+  LMember.ImportDLL := "";
+  LMember.ImportMachine := 0;
+  LMember.OrdinalHint := 0;
+  LMember.Imported := ImportKind.Code;
+  LMember.Naming := ImportNaming.Name;
+  return LMember;
+end;
+
+// The Import Type held in a short import's Type field ATypeField (bits 0-1)
+func DoImportKind(const ATypeField: int64): ImportKind;
+var
+  LBits: int64;
+begin
+  LBits := ATypeField & 3;
+  if LBits = 0 then
+    return ImportKind.Code;
+  end;
+  if LBits = 1 then
+    return ImportKind.Data;
+  end;
+  if LBits = 2 then
+    return ImportKind.Constant;
+  end;
+  return ImportKind.Reserved;
+end;
+
+// The Import Name Type held in a short import's Type field ATypeField (bits 2-4)
+func DoImportNaming(const ATypeField: int64): ImportNaming;
+var
+  LBits: int64;
+begin
+  LBits := (ATypeField shr 2) & 7;
+  if LBits = 0 then
+    return ImportNaming.Ordinal;
+  end;
+  if LBits = 1 then
+    return ImportNaming.Name;
+  end;
+  if LBits = 2 then
+    return ImportNaming.NoPrefix;
+  end;
+  if LBits = 3 then
+    return ImportNaming.Undecorate;
+  end;
+  if LBits = 4 then
+    return ImportNaming.ExportAs;
+  end;
+  return ImportNaming.Reserved;
+end;
+
+// True when the member AMember's data starts as a short import's does: 00 00 FF FF
+func DoIsShortImport(const ABytes: ByteArray; const AMember: ArchiveMember): bool;
+begin
+  if AMember.Size < 4 then
+    return false;
+  end;
+  return (ABytes[AMember.DataAt] = 0) and (ABytes[AMember.DataAt + 1] = 0) and
+    (ABytes[AMember.DataAt + 2] = 0xFF) and (ABytes[AMember.DataAt + 3] = 0xFF);
+end;
+
+// Every object member that is a short import read as one (its Import Header, then the
+// NUL-ended symbol and DLL names); one too short to hold them is reported (AR0005): false
+func DoReadImports(const ABytes: ByteArray; const APath: string; const APlace: SourcePlace;
+  const ADiagnostics: ref Diagnostics; var AArchive: ArchiveData): bool;
+var
+  LI: int64;
+  LAt: int64;
+  LEnd: int64;
+  LSymbolEnd: int64;
+  LDLLEnd: int64;
+  LType: int64;
+begin
+  for LI := 0 to len(AArchive.Members) - 1 do
+    if (AArchive.Members[LI].Kind = MemberKind.COFFObject) and
+      DoIsShortImport(ABytes, AArchive.Members[LI]) then
+      LAt := AArchive.Members[LI].DataAt;
+      LEnd := LAt + AArchive.Members[LI].Size;
+      LSymbolEnd := -1;
+      LDLLEnd := -1;
+      if AArchive.Members[LI].Size >= ADAM_ARCHIVE_IMPORT_HEADER then
+        LSymbolEnd := ArchiveNulAt(ABytes, LAt + ADAM_ARCHIVE_IMPORT_HEADER, LEnd);
+      end;
+      if LSymbolEnd >= 0 then
+        LDLLEnd := ArchiveNulAt(ABytes, LSymbolEnd + 1, LEnd);
+      end;
+      if LDLLEnd < 0 then
+        ADiagnostics.Add(Severity.Error, ADAM_ERR_ARCHIVE_005, APlace, ADAM_MSG_ARCHIVE_BAD_IMPORT,
+          NoArgs().Str(APath).Int(AArchive.Members[LI].HeaderAt));
+        return false;
+      end;
+      AArchive.Members[LI].Kind := MemberKind.ShortImport;
+      AArchive.Members[LI].ImportSymbol := ArchiveText(ABytes, LAt + ADAM_ARCHIVE_IMPORT_HEADER,
+        LSymbolEnd - LAt - ADAM_ARCHIVE_IMPORT_HEADER);
+      AArchive.Members[LI].ImportDLL := ArchiveText(ABytes, LSymbolEnd + 1, LDLLEnd - LSymbolEnd - 1);
+      AArchive.Members[LI].ImportMachine :=
+        int64(GetLe(ABytes, LAt + ADAM_ARCHIVE_IMPORT_MACHINE_AT, 2));
+      AArchive.Members[LI].OrdinalHint := int64(GetLe(ABytes, LAt + ADAM_ARCHIVE_IMPORT_HINT_AT, 2));
+      LType := int64(GetLe(ABytes, LAt + ADAM_ARCHIVE_IMPORT_TYPE_AT, 2));
+      AArchive.Members[LI].Imported := DoImportKind(LType);
+      AArchive.Members[LI].Naming := DoImportNaming(LType);
+    end;
+  end;
+  return true;
+end;
+
+// The name the short import AMember is imported by from its DLL, by its Import Name Type
+// (PE Format "Import Name Type"): Name, the symbol as it is; NoPrefix, the symbol without one
+// leading '?', '@' or '_'; Undecorate, that cut at its first '@'. "" when it is imported by
+// no name read here: Ordinal (by its ordinal), ExportAs and Reserved
+public func ImportNameOf(const AMember: ArchiveMember): string;
+var
+  LName: string;
+  LAt: int64;
+begin
+  if AMember.Naming = ImportNaming.Name then
+    return AMember.ImportSymbol;
+  end;
+  if (AMember.Naming <> ImportNaming.NoPrefix) and (AMember.Naming <> ImportNaming.Undecorate) then
+    return "";
+  end;
+  LName := AMember.ImportSymbol;
+  if StartsStr("?", LName) or StartsStr("@", LName) or StartsStr("_", LName) then
+    LName := Substring(LName, 1, len(LName) - 1);
+  end;
+  if AMember.Naming = ImportNaming.Undecorate then
+    LAt := IndexOf("@", LName, 0);
+    if LAt >= 0 then
+      LName := Substring(LName, 0, LAt);
+    end;
+  end;
+  return LName;
+end;
+
+// Reads the archive ABytes (the file APath, named in a report at APlace) into AArchive (see
+// the header): true when it is read whole; else every fault is reported into ADiagnostics
+// (AR codes) and false returned, AArchive holding what was read before it
+public func ReadArchive(const ABytes: ByteArray; const APath: string;
+  const APlace: SourcePlace; const ADiagnostics: ref Diagnostics; var AArchive: ArchiveData): bool;
+var
+  LContents: ArchiveContents;
+  LRead: bool;
+  LI: int64;
+begin
+  LRead := ReadArchiveContents(ABytes, APath, APlace, ADiagnostics, LContents);
+  // The entries read (all of them, or those before a fault), each a member in the same order
+  setlength(AArchive.Members, len(LContents.Entries));
+  for LI := 0 to len(LContents.Entries) - 1 do
+    AArchive.Members[LI] := DoMember(LContents.Entries[LI]);
+  end;
+  AArchive.Symbols := LContents.Symbols;
+  if not LRead then
+    return false;
+  end;
+  return DoReadImports(ABytes, APath, APlace, ADiagnostics, AArchive);
+end;
+
+// ---------------------------------------------------------------------------------------
+// The import library (WriteImportArchive; see the header)
+
+// A member of the import library of the DLL ADLLName: its name the DLL's, ABytes, defining
+// ADefines
+func DoImportMember(const ADLLName: string; const ABytes: ByteArray;
+  const ADefines: StringArray): ArchiveInput;
+var
+  LMember: ArchiveInput;
+begin
+  LMember.MemberName := ADLLName;
+  LMember.Bytes := ABytes;
+  LMember.Defines := ADefines;
+  return LMember;
+end;
+
+// The one-name list AName
+func DoOneName(const AName: string): StringArray;
+var
+  LNames: StringArray;
+begin
+  setlength(LNames, 1);
+  LNames[0] := AName;
+  return LNames;
+end;
+
+// The two-name list AFirst, ASecond
+func DoTwoNames(const AFirst: string; const ASecond: string): StringArray;
+var
+  LNames: StringArray;
+begin
+  setlength(LNames, 2);
+  LNames[0] := AFirst;
+  LNames[1] := ASecond;
+  return LNames;
+end;
+
+// The null thunk's name of the import library of ALibrary (the DLL's name without its
+// ending): DEL, the library, _NULL_THUNK_DATA
+func DoNullThunkName(const ALibrary: string): string;
+begin
+  return char(uint8(ADAM_ARCHIVE_NULL_THUNK_LEAD)) + ALibrary + ADAM_ARCHIVE_NULL_THUNK_SUFFIX;
+end;
+
+// A new section of ASet named AName holding ASize zero bytes, aligned to AAlign: its id
+func DoZeroSection(const ASet: ref SectionSet; const AName: string; const ASize: int64;
+  const AAlign: int64): int64;
+var
+  LId: int64;
+begin
+  LId := ASet.AddSection(AName, SectionKind.Data, AAlign);
+  ASet.SectionAt(LId).PutZeros(ASize);
+  return LId;
+end;
+
+// The import descriptor object of the DLL ADLLName (ALibrary its name without its ending):
+// .idata$2 the directory entry (its import lookup table at .idata$4's start, its name at
+// .idata$6, its import address table at .idata$5's start), .idata$6 the DLL's name; it
+// names the null descriptor and the null thunk, so a linker that takes it takes them too
+func DoDescriptorObject(const ADLLName: string; const ALibrary: string;
+  const AMachine: ref COFFMachine): ByteArray;
+var
+  LSet: ref SectionSet;
+  LEntry: int64;
+  LNames: int64;
+  LName: int64;
+  LLookup: int64;
+  LAddresses: int64;
+  LBytes: ByteArray;
+begin
+  LSet := ref SectionSet();
+  LEntry := DoZeroSection(LSet, ADAM_ARCHIVE_IDATA_ENTRY, ADAM_ARCHIVE_DESCRIPTOR_SIZE,
+    ADAM_ARCHIVE_DESCRIPTOR_ALIGN);
+  LNames := LSet.AddSection(ADAM_ARCHIVE_IDATA_NAMES, SectionKind.Data, 2);
+  setlength(LBytes, ArchivePadded(len(ADLLName) + 1));
+  LBytes[len(LBytes) - 1] := uint8(0);
+  PutNulEnded(LBytes, 0, ADLLName);
+  LSet.SectionAt(LNames).PutBytes(LBytes);
+  LSet.DefineSymbol(ADAM_ARCHIVE_DESCRIPTOR_PREFIX + ALibrary, LEntry, 0, 0);
+  LName := LSet.DefineSymbol(ADAM_ARCHIVE_DLL_NAME_SYMBOL, LNames, 0, 0);
+  LSet.MakeInternal(LName);
+  LLookup := LSet.ReferGroupStart(ADAM_ARCHIVE_IDATA_LOOKUP);
+  LAddresses := LSet.ReferGroupStart(ADAM_ARCHIVE_IDATA_ADDRESSES);
+  LSet.ReferSymbol(ADAM_ARCHIVE_NULL_DESCRIPTOR, 0);
+  LSet.ReferSymbol(DoNullThunkName(ALibrary), 0);
+  LSet.AddReloc(LEntry, ADAM_ARCHIVE_DESCRIPTOR_LOOKUP_AT, RelocKind.RVA32, LLookup, 0);
+  LSet.AddReloc(LEntry, ADAM_ARCHIVE_DESCRIPTOR_NAME_AT, RelocKind.RVA32, LName, 0);
+  LSet.AddReloc(LEntry, ADAM_ARCHIVE_DESCRIPTOR_ADDRESSES_AT, RelocKind.RVA32, LAddresses, 0);
+  return WriteCOFFObject(LSet, AMachine);
+end;
+
+// The null import descriptor object: .idata$3, the zero entry that ends the import directory
+func DoNullDescriptorObject(const AMachine: ref COFFMachine): ByteArray;
+var
+  LSet: ref SectionSet;
+  LEntry: int64;
+begin
+  LSet := ref SectionSet();
+  LEntry := DoZeroSection(LSet, ADAM_ARCHIVE_IDATA_END, ADAM_ARCHIVE_DESCRIPTOR_SIZE,
+    ADAM_ARCHIVE_DESCRIPTOR_ALIGN);
+  LSet.DefineSymbol(ADAM_ARCHIVE_NULL_DESCRIPTOR, LEntry, 0, 0);
+  return WriteCOFFObject(LSet, AMachine);
+end;
+
+// The null thunk object of ALibrary: the zero slots that end its import address table
+// (.idata$5) and its import lookup table (.idata$4)
+func DoNullThunkObject(const ALibrary: string; const AMachine: ref COFFMachine): ByteArray;
+var
+  LSet: ref SectionSet;
+  LAddresses: int64;
+begin
+  LSet := ref SectionSet();
+  LAddresses := DoZeroSection(LSet, ADAM_ARCHIVE_IDATA_ADDRESSES, ADAM_ARCHIVE_THUNK_SIZE,
+    ADAM_ARCHIVE_THUNK_SIZE);
+  DoZeroSection(LSet, ADAM_ARCHIVE_IDATA_LOOKUP, ADAM_ARCHIVE_THUNK_SIZE,
+    ADAM_ARCHIVE_THUNK_SIZE);
+  LSet.DefineSymbol(DoNullThunkName(ALibrary), LAddresses, 0, 0);
+  return WriteCOFFObject(LSet, AMachine);
+end;
+
+// The short import of AName from ADLLName (Import Header, the name, the DLL's name): by
+// name, its hint AHint (its place in the DLL's name pointer table), data (a variable) when
+// AIsData, else code
+func DoShortImport(const ADLLName: string; const AName: string; const AHint: int64;
+  const AIsData: bool; const AMachine: ref COFFMachine): ByteArray;
+var
+  LBytes: ByteArray;
+  LType: int64;
+  LAt: int64;
+begin
+  setlength(LBytes, ADAM_ARCHIVE_IMPORT_HEADER + len(AName) + 1 + len(ADLLName) + 1);
+  for LAt := 0 to ADAM_ARCHIVE_IMPORT_HEADER - 1 do
+    LBytes[LAt] := uint8(0);
+  end;
+  // Sig1 0, Sig2 0xFFFF, Version 0, Machine, TimeDateStamp 0 (AD.7), SizeOfData,
+  // Ordinal/Hint, Type
+  PutLe(LBytes, ADAM_ARCHIVE_IMPORT_SIG2_AT, uint64(IMPORT_OBJECT_HDR_SIG2), 2);
+  PutLe(LBytes, ADAM_ARCHIVE_IMPORT_MACHINE_AT, uint64(AMachine.Machine), 2);
+  PutLe(LBytes, ADAM_ARCHIVE_IMPORT_SIZE_AT,
+    uint64(len(LBytes) - ADAM_ARCHIVE_IMPORT_HEADER), 4);
+  PutLe(LBytes, ADAM_ARCHIVE_IMPORT_HINT_AT, uint64(AHint), 2);
+  LType := IMPORT_OBJECT_CODE;
+  if AIsData then
+    LType := IMPORT_OBJECT_DATA;
+  end;
+  LType := LType | (IMPORT_OBJECT_NAME shl ADAM_ARCHIVE_IMPORT_NAMING_SHIFT);
+  PutLe(LBytes, ADAM_ARCHIVE_IMPORT_TYPE_AT, uint64(LType), 2);
+  LAt := PutNulEnded(LBytes, ADAM_ARCHIVE_IMPORT_HEADER, AName);
+  PutNulEnded(LBytes, LAt, ADLLName);
+  return LBytes;
+end;
+
+// The import library of the DLL ADLLName exporting ANames (ANames[i] a variable when
+// AData[i]) for the arch AMachine describes (see the header): an archive (WriteArchive) of
+// the import descriptor, the null import descriptor, the null thunk, then one short import
+// per name in the DLL's name pointer table order (sorted byte-wise; each one's hint its
+// place there); a routine defines its name and its __imp_ slot, a variable its slot alone
+public func WriteImportArchive(const ADLLName: string; const ANames: StringArray;
+  const AData: BoolArray; const AMachine: ref COFFMachine): ByteArray;
+var
+  LLibrary: string;
+  LSorted: StringArray;
+  LDataOf: ref StringIdMap;
+  LMembers: ArchiveInputArray;
+  LDefines: StringArray;
+  LIsData: bool;
+  LI: int64;
+begin
+  LLibrary := ChangeFileExt(ADLLName, "");
+  // The names sorted on a copy of their own (ANames stays as given); each one's kind by name
+  // (1 code, 2 data: 0 is none in a StringIdMap)
+  LDataOf := ref StringIdMap(0);
+  setlength(LSorted, len(ANames));
+  for LI := 0 to len(ANames) - 1 do
+    LSorted[LI] := ANames[LI];
+    if AData[LI] then
+      LDataOf.Put(ANames[LI], 2);
+    else
+      LDataOf.Put(ANames[LI], 1);
+    end;
+  end;
+  SortStrings(LSorted);
+  setlength(LMembers, len(LSorted) + 3);
+  LMembers[0] := DoImportMember(ADLLName, DoDescriptorObject(ADLLName, LLibrary, AMachine),
+    DoOneName(ADAM_ARCHIVE_DESCRIPTOR_PREFIX + LLibrary));
+  LMembers[1] := DoImportMember(ADLLName, DoNullDescriptorObject(AMachine),
+    DoOneName(ADAM_ARCHIVE_NULL_DESCRIPTOR));
+  LMembers[2] := DoImportMember(ADLLName, DoNullThunkObject(LLibrary, AMachine),
+    DoOneName(DoNullThunkName(LLibrary)));
+  for LI := 0 to len(LSorted) - 1 do
+    LIsData := LDataOf.Find(LSorted[LI]) = 2;
+    if LIsData then
+      LDefines := DoOneName(ADAM_COFF_IMPORT_PREFIX + LSorted[LI]);
+    else
+      LDefines := DoTwoNames(LSorted[LI], ADAM_COFF_IMPORT_PREFIX + LSorted[LI]);
+    end;
+    LMembers[LI + 3] := DoImportMember(ADLLName,
+      DoShortImport(ADLLName, LSorted[LI], LI, LIsData, AMachine), LDefines);
+  end;
+  return WriteArchive(LMembers, ArchiveKind.COFF);
+end;
+
+end.

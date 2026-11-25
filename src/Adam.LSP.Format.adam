@@ -1,0 +1,2210 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.LSP.Format - document formatting for the language server (M11b L7)
+
+  FormatSource(text, tree, module, syntax clean, options) formats one
+  buffer (an LSPFormatResult: the edits, the formatted text, a refusal).
+  The gap model (prior art PaskalCPP.LSP.Formatter): a gap is the text
+  between two tokens (blanks, line endings, comments); the formatter
+  writes gaps only, never a token's bytes, and keeps every comment's text.
+  The layout comes from the checked tree of the same text (AA.2: nothing is
+  parsed again):
+    R1 / R2 lines and levels: one declaration, member, statement or match
+      arm per line; a block's statements one level in, its end / else /
+      except / finally / until at the construct's level; a var / const /
+      type block word at its level, its entries one in; a record / object /
+      overlay / interface body member by member one in; a property's inline
+      accessor (its word, locals and body) one in, as Adam's own sources lay
+      it out; the module's import word at column 0, its names after it.
+    R3 spacing inside a line, by what the tree says a token is: operators
+      (binary, assignment, ?: and a bitfield's ':') one space each side
+      (options), prefix / postfix operators and the '(' / '[' of a call,
+      index, cast or heading hug, closers and separators hug what is before
+      them, a ',' / ';' one space after; a gap no rule decides stays.
+    R4 comments: never changed; an own-line comment takes the level of the
+      code line after it (one in before an end / else / until / except /
+      finally).
+    R5 long lines: every line ending inside a statement or declaration is
+      joined, then a line past MaxLineLength breaks at its best place (a
+      ',' / ';' first, then the outermost operator, an assignment last;
+      the shallowest bracket depth first), each continuation one level in
+      from its statement; a constant's value written over several lines
+      (a table) keeps its lines.
+    R6 the file: no leading blank lines, at most MaxBlankLines blank lines
+      in a row, no trailing blanks, one final line ending, the file's own
+      line ending (its first, else LF).
+  A buffer the check found a lexer / conditional / parser error in is
+  refused (LSPFormatRefusal.Syntax), so is a result that would not lex
+  back to the same tokens and comments (Verify). Tokens a conditional
+  branch left out (no node holds them) and the conditional directives keep
+  the gaps beside them as written; a gap holding anything but blanks and
+  comments is written as it stands. A gap that starts a statement or
+  declaration the layout did not place (a form no rule above names) keeps
+  its line ending as written: nothing is joined into another line by a
+  rule that does not know it. Formatting twice gives what formatting once
+  gives.
+
+  Offsets are byte offsets into the buffer (tokens, gaps, edits); columns
+  count characters (UTF-8 lead bytes). A BOM is never touched.
+
+  Prior art: PaskalCPP.LSP.Formatter (CONCEPT: the gaps, R1..R6, the fit
+  ranking, the verify; GEOMETRY rejected: Adam's node ids and roles, the
+  construct keywords found as the node's own tokens).
+*******************************************************************************/
+
+module unit Adam.LSP.Format;
+
+import System.SysUtils, Adam.Core.Common, Adam.Core.Containers, Adam.Compiler.SourceText,
+  Adam.Compiler.Diagnostics, Adam.Compiler.Lexer, Adam.Compiler.Conditionals,
+  Adam.Compiler.AST;
+
+public const
+  // The report budget of the formatter's own lexer runs (their reports only refuse)
+  ADAM_LSP_FORMAT_BUDGET: int64 = 1000;
+
+public type
+  // How a buffer is formatted (LSP FormattingOptions + the editor's adam.* keys)
+  LSPFormatOptions = record
+    IndentSize: int64;
+    UseTabs: bool;
+    SpaceAroundAssign: bool;
+    SpaceAroundOperators: bool;
+    SpaceAfterComma: bool;
+    SpaceBeforeColon: bool;
+    SpaceAfterColon: bool;
+    MaxBlankLines: int64;
+    TrimTrailingWhitespace: bool;
+    FinalNewline: bool;
+    MaxLineLength: int64;
+  end;
+
+  // Replace the buffer's bytes [StartOffset, EndOffset) with NewText
+  LSPFormatEdit = record
+    StartOffset: int64;
+    EndOffset: int64;
+    NewText: string;
+  end;
+
+  LSPFormatEdits = array of LSPFormatEdit;
+
+  // Why a buffer was not formatted: None (formatted), Syntax (the check found a lexer /
+  // conditional / parser error, or there is no tree), Verify (the result would not lex
+  // back to the same tokens and comments)
+  LSPFormatRefusal = choices(None, Syntax, Verify);
+
+  // A run's answer: the refusal, the edits (one per changed gap, in buffer order; none
+  // when nothing changes or it was refused) and the formatted text
+  LSPFormatResult = record
+    Refusal: LSPFormatRefusal;
+    Edits: LSPFormatEdits;
+    Text: string;
+  end;
+
+type
+  // Keep: the gap is written as it stands; Hard: the token after it starts a line at
+  // Level; Space: the spacing rule (or a join) decided its Text
+  FormatGapKind = choices(Keep, Hard, Space);
+
+  // What the tree says a token is (R3): Operator = a binary / assignment / ?: operator (a
+  // bitfield's ':' too), Prefix / Postfix = a unary operator before / after its operand,
+  // CallOpen = the '(' / '[' of a call, an index, a cast or a heading
+  FormatRole = choices(Nothing, Operator, Prefix, Postfix, CallOpen);
+
+  // R3 for one gap on a line: as written, nothing, one space
+  FormatWant = choices(AsWritten, NoSpace, OneSpace);
+
+  // The bytes [StartOffset, EndOffset) before a token (gap I before token I; the last gap
+  // after the last token to the end of the buffer); Original its text, the comments in
+  // it [CommentStarts, CommentEnds), Text what the render writes. Locked: it holds
+  // something besides blanks and comments (written as it stands). IsContinue: a Hard
+  // continuation line (its statement's base level stays); Broken: made by the fit (one
+  // line ending + the indent); Table: inside a constant value written over several lines
+  // (its lines kept at TableLevel)
+  FormatGap = record
+    StartOffset: int64;
+    EndOffset: int64;
+    Original: string;
+    CommentStarts: Int64Array;
+    CommentEnds: Int64Array;
+    Kind: FormatGapKind;
+    Level: int64;
+    Locked: bool;
+    Text: string;
+    IsContinue: bool;
+    Broken: bool;
+    Table: bool;
+    TableLevel: int64;
+  end;
+
+  // R5: a gap a long line may break at; lower ranks are better, in the order RankAssign
+  // (an assignment last), Depth (bracket depth), RankKind (',' / ';' before an operator),
+  // RankPrec (the operator's nesting: the outermost first)
+  FormatCandidate = record
+    Gap: int64;
+    Column: int64;
+    RankAssign: int64;
+    Depth: int64;
+    RankKind: int64;
+    RankPrec: int64;
+  end;
+
+  FormatCandidateArray = array of FormatCandidate;
+
+// The byte AIndex of AText as 0..255
+func DoByteOf(const AText: string; const AIndex: int64): int32;
+begin
+  return int32(uint8(AText[AIndex]));
+end;
+
+// The line endings in AText (CR LF, LF and a lone CR count once each)
+func DoCountEols(const AText: string): int64;
+var
+  LCount: int64;
+  LI: int64;
+  LByte: int32;
+begin
+  LCount := 0;
+  LI := 0;
+  while LI < len(AText) do
+    LByte := DoByteOf(AText, LI);
+    if LByte = 13 then
+      LCount := LCount + 1;
+      if (LI + 1 < len(AText)) and (DoByteOf(AText, LI + 1) = 10) then
+        LI := LI + 1;
+      end;
+    else
+      if LByte = 10 then
+        LCount := LCount + 1;
+      end;
+    end;
+    LI := LI + 1;
+  end;
+  return LCount;
+end;
+
+// AText cut at its line endings: one more part than DoCountEols
+func DoSplitLines(const AText: string): StringArray;
+var
+  LParts: StringArray;
+  LStart: int64;
+  LI: int64;
+  LByte: int32;
+  LCount: int64;
+begin
+  setlength(LParts, 0);
+  LStart := 0;
+  LI := 0;
+  while LI < len(AText) do
+    LByte := DoByteOf(AText, LI);
+    if (LByte = 13) or (LByte = 10) then
+      LCount := len(LParts);
+      setlength(LParts, LCount + 1);
+      LParts[LCount] := Substring(AText, LStart, LI - LStart);
+      if (LByte = 13) and (LI + 1 < len(AText)) and (DoByteOf(AText, LI + 1) = 10) then
+        LI := LI + 1;
+      end;
+      LStart := LI + 1;
+    end;
+    LI := LI + 1;
+  end;
+  LCount := len(LParts);
+  setlength(LParts, LCount + 1);
+  LParts[LCount] := Substring(AText, LStart, len(AText) - LStart);
+  return LParts;
+end;
+
+// The characters of AText (UTF-8: every byte that is no continuation byte)
+func DoWidth(const AText: string): int64;
+var
+  LCount: int64;
+  LI: int64;
+  LByte: int32;
+begin
+  LCount := 0;
+  for LI := 0 to len(AText) - 1 do
+    LByte := DoByteOf(AText, LI);
+    if (LByte < 0x80) or (LByte >= 0xC0) then
+      LCount := LCount + 1;
+    end;
+  end;
+  return LCount;
+end;
+
+// The characters of AText before its first line ending
+func DoFirstLineWidth(const AText: string): int64;
+var
+  LI: int64;
+  LByte: int32;
+begin
+  for LI := 0 to len(AText) - 1 do
+    LByte := DoByteOf(AText, LI);
+    if (LByte = 13) or (LByte = 10) then
+      return DoWidth(Substring(AText, 0, LI));
+    end;
+  end;
+  return DoWidth(AText);
+end;
+
+// The text of AText after its last line ending (all of it when it has none)
+func DoLastLinePart(const AText: string): string;
+var
+  LI: int64;
+  LByte: int32;
+begin
+  LI := len(AText) - 1;
+  while LI >= 0 do
+    LByte := DoByteOf(AText, LI);
+    if (LByte = 13) or (LByte = 10) then
+      return Substring(AText, LI + 1, len(AText) - LI - 1);
+    end;
+    LI := LI - 1;
+  end;
+  return AText;
+end;
+
+// True when AText ends in a line ending
+func DoEndsLine(const AText: string): bool;
+var
+  LByte: int32;
+begin
+  if len(AText) = 0 then
+    return false;
+  end;
+  LByte := DoByteOf(AText, len(AText) - 1);
+  return (LByte = 13) or (LByte = 10);
+end;
+
+// A byte of an identifier, keyword or number
+func DoIsWordByte(const AByte: int32): bool;
+begin
+  if (AByte >= 0x30) and (AByte <= 0x39) then
+    return true;
+  end;
+  if (AByte >= 0x41) and (AByte <= 0x5A) then
+    return true;
+  end;
+  if (AByte >= 0x61) and (AByte <= 0x7A) then
+    return true;
+  end;
+  return (AByte = 0x5F) or (AByte >= 0x80);
+end;
+
+// A byte that joins into a longer operator ('.' is checked on its own)
+func DoIsOperatorByte(const AByte: int32): bool;
+begin
+  match AByte of
+    0x2B, 0x2D, 0x2A, 0x2F, 0x25, 0x3D, 0x3C, 0x3E, 0x21, 0x26, 0x7C, 0x5E, 0x7E, 0x3A,
+    0x3F:
+      return true;
+  else
+    return false;
+  end;
+end;
+
+// The comments of AText's bytes [AStart, AEnd) into AStarts / AEnds; false when the span
+// holds anything but blanks, line endings and comments (a splice, a byte the Lexer took)
+func DoScanComments(const AText: string; const AStart: int64; const AEnd: int64;
+  var AStarts: Int64Array; var AEnds: Int64Array): bool;
+var
+  LAt: int64;
+  LFrom: int64;
+  LByte: int32;
+  LNext: int32;
+  LCount: int64;
+begin
+  setlength(AStarts, 0);
+  setlength(AEnds, 0);
+  LAt := AStart;
+  while LAt < AEnd do
+    LByte := DoByteOf(AText, LAt);
+    if (LByte = 32) or (LByte = 9) or (LByte = 11) or (LByte = 12) or (LByte = 13) or
+      (LByte = 10) then
+      LAt := LAt + 1;
+      skip;
+    end;
+    LNext := -1;
+    if LAt + 1 < AEnd then
+      LNext := DoByteOf(AText, LAt + 1);
+    end;
+    if (LByte <> 0x2F) or ((LNext <> 0x2F) and (LNext <> 0x2A)) then
+      return false;
+    end;
+    LFrom := LAt;
+    if LNext = 0x2F then
+      // A line comment runs to its line's end
+      LAt := LAt + 2;
+      while (LAt < AEnd) and (DoByteOf(AText, LAt) <> 13) and (DoByteOf(AText, LAt) <> 10) do
+        LAt := LAt + 1;
+      end;
+    else
+      // A block comment runs past its closer (comments do not nest)
+      LAt := LAt + 2;
+      while (LAt + 1 < AEnd) and not ((DoByteOf(AText, LAt) = 0x2A) and
+        (DoByteOf(AText, LAt + 1) = 0x2F)) do
+        LAt := LAt + 1;
+      end;
+      if LAt + 1 >= AEnd then
+        return false;
+      end;
+      LAt := LAt + 2;
+    end;
+    LCount := len(AStarts);
+    setlength(AStarts, LCount + 1);
+    setlength(AEnds, LCount + 1);
+    AStarts[LCount] := LFrom;
+    AEnds[LCount] := LAt;
+  end;
+  return true;
+end;
+
+// True for a token kind an assignment is spelled with (SpaceAroundAssign's, R5's last)
+func DoIsAssignKind(const AKind: TokenKind): bool;
+begin
+  match AKind of
+    TokenKind.Assign, TokenKind.PlusAssign, TokenKind.MinusAssign, TokenKind.StarAssign,
+    TokenKind.SlashAssign, TokenKind.PercentAssign, TokenKind.AmpAssign,
+    TokenKind.PipeAssign, TokenKind.ShiftLeftAssign, TokenKind.ShiftRightAssign:
+      return true;
+  else
+    return false;
+  end;
+end;
+
+// True for a node kind that is one line item: a statement, a declaration, a member, a
+// match arm (the safety rule of the joins: see the header)
+func DoIsItemKind(const AKind: NodeKind): bool;
+begin
+  match AKind of
+    NodeKind.Directive, NodeKind.InitializeSection, NodeKind.FinalizeSection,
+    NodeKind.TestBlock, NodeKind.VarDecl, NodeKind.ConstDecl, NodeKind.TypeDecl,
+    NodeKind.RoutineDecl, NodeKind.ForwardRoutine, NodeKind.ForwardType,
+    NodeKind.FieldDecl, NodeKind.EmbedDecl, NodeKind.MethodDecl, NodeKind.PropertyDecl,
+    NodeKind.InitDecl, NodeKind.CopyDecl, NodeKind.DoneDecl, NodeKind.OperatorDecl,
+    NodeKind.Block, NodeKind.IfStatement, NodeKind.WhileStatement, NodeKind.ForStatement,
+    NodeKind.ForInStatement, NodeKind.RepeatStatement, NodeKind.MatchStatement,
+    NodeKind.MatchArm, NodeKind.GuardStatement, NodeKind.LockStatement,
+    NodeKind.TryLockStatement, NodeKind.DeferStatement, NodeKind.YieldStatement,
+    NodeKind.ReturnStatement, NodeKind.LeaveStatement, NodeKind.SkipStatement,
+    NodeKind.ExpressionStatement:
+      return true;
+  else
+    return false;
+  end;
+end;
+
+// True for a role whose child is no part of this text's syntax (instances, the
+// compiler's own facts)
+func DoIsForeignRole(const ARole: NodeRole): bool;
+begin
+  match ARole of
+    NodeRole.Instance, NodeRole.Effects, NodeRole.EmbedStep, NodeRole.Forward,
+    NodeRole.Capture:
+      return true;
+  else
+    return false;
+  end;
+end;
+
+// ALeft ranks strictly better than ARight (a tie is not better)
+func DoIsBetter(const ALeft: FormatCandidate; const ARight: FormatCandidate): bool;
+begin
+  if ALeft.RankAssign <> ARight.RankAssign then
+    return ALeft.RankAssign < ARight.RankAssign;
+  end;
+  if ALeft.Depth <> ARight.Depth then
+    return ALeft.Depth < ARight.Depth;
+  end;
+  if ALeft.RankKind <> ARight.RankKind then
+    return ALeft.RankKind < ARight.RankKind;
+  end;
+  return ALeft.RankPrec < ARight.RankPrec;
+end;
+
+// The default options (pcpp's, the editor's own defaults)
+public func FormatDefaults(): LSPFormatOptions;
+var
+  LOptions: LSPFormatOptions;
+begin
+  LOptions.IndentSize := 2;
+  LOptions.UseTabs := false;
+  LOptions.SpaceAroundAssign := true;
+  LOptions.SpaceAroundOperators := true;
+  LOptions.SpaceAfterComma := true;
+  LOptions.SpaceBeforeColon := false;
+  LOptions.SpaceAfterColon := true;
+  LOptions.MaxBlankLines := 1;
+  LOptions.TrimTrailingWhitespace := true;
+  LOptions.FinalNewline := true;
+  LOptions.MaxLineLength := 80;
+  return LOptions;
+end;
+
+// AValue kept inside [ALow, AHigh]
+func DoClampValue(const AValue: int64; const ALow: int64; const AHigh: int64): int64;
+begin
+  if AValue < ALow then
+    return ALow;
+  end;
+  if AValue > AHigh then
+    return AHigh;
+  end;
+  return AValue;
+end;
+
+// AOptions' numbers into their ranges (a client may send anything)
+public func ClampFormat(var AOptions: LSPFormatOptions);
+begin
+  AOptions.IndentSize := DoClampValue(AOptions.IndentSize, 1, 8);
+  AOptions.MaxBlankLines := DoClampValue(AOptions.MaxBlankLines, 0, 9);
+  AOptions.MaxLineLength := DoClampValue(AOptions.MaxLineLength, 60, 200);
+end;
+
+// The comment texts in AText's gaps between the tokens [AStarts, AEnds) (the first gap
+// from AFirst; a gap that holds something else gives none)
+func DoCommentTexts(const AText: string; const AFirst: int64; const AStarts: Int64Array;
+  const AEnds: Int64Array): StringArray;
+var
+  LTexts: StringArray;
+  LFrom: Int64Array;
+  LTo: Int64Array;
+  LGapStart: int64;
+  LCount: int64;
+  LI: int64;
+  LJ: int64;
+begin
+  setlength(LTexts, 0);
+  for LI := 0 to len(AStarts) - 1 do
+    if LI = 0 then
+      LGapStart := AFirst;
+    else
+      LGapStart := AEnds[LI - 1];
+    end;
+    if DoScanComments(AText, LGapStart, AStarts[LI], LFrom, LTo) then
+      for LJ := 0 to len(LFrom) - 1 do
+        LCount := len(LTexts);
+        setlength(LTexts, LCount + 1);
+        LTexts[LCount] := Substring(AText, LFrom[LJ], LTo[LJ] - LFrom[LJ]);
+      end;
+    end;
+  end;
+  return LTexts;
+end;
+
+type
+  // One formatting run (see the header)
+  LSPFormatter = object
+    hidden FText: string;
+    hidden FSource: ref SourceText;
+    hidden FTree: ref SyntaxTree;
+    hidden FModule: int64;
+    hidden FFile: string;
+    hidden FOptions: LSPFormatOptions;
+    // The buffer's tokens (EndOfFile last): kind, bytes, spelling as written
+    hidden FCount: int64;
+    hidden FKinds: array of TokenKind;
+    hidden FStarts: Int64Array;
+    hidden FEnds: Int64Array;
+    hidden FSpell: StringArray;
+    hidden FIndexAt: ref Int64Map;
+    hidden FGaps: array of FormatGap;
+    hidden FRoles: array of FormatRole;
+    // A binary / ?: operator token's nesting in its operator chain (0 the outermost; -1
+    // none: R5's ranks)
+    hidden FOpDepth: Int64Array;
+    hidden FDropped: BoolArray;
+    // A token an item node starts at (the joins' safety rule)
+    hidden FItemStart: BoolArray;
+    hidden FModuleEnd: int64;
+    hidden FHasBody: bool;
+    hidden FEol: string;
+
+    init(const AText: string; const ATree: ref SyntaxTree; const AModule: int64;
+      const AOptions: LSPFormatOptions);
+    begin
+      self.FText := AText;
+      self.FTree := ATree;
+      self.FModule := AModule;
+      self.FFile := ATree[AModule].Place.FileName;
+      self.FOptions := AOptions;
+      ClampFormat(self.FOptions);
+      self.FIndexAt := ref Int64Map(-1);
+      self.FModuleEnd := -1;
+      self.FHasBody := false;
+      self.FEol := "\n";
+    end;
+
+    // The run: false when refused (ARefusal says why); AEdits / AResult the answer
+    method Run(var AEdits: LSPFormatEdits; var AResult: string;
+      var ARefusal: LSPFormatRefusal): bool;
+    begin
+      setlength(AEdits, 0);
+      AResult := self.FText;
+      ARefusal := LSPFormatRefusal.None;
+      // An empty or all-blank buffer stays as it is
+      if Trim(self.FText) = "" then
+        return true;
+      end;
+      if not self.DoLex() then
+        ARefusal := LSPFormatRefusal.Syntax;
+        return false;
+      end;
+      if not self.DoInitGaps() then
+        ARefusal := LSPFormatRefusal.Verify;
+        return false;
+      end;
+      self.FEol := self.DoFindEol();
+      self.DoMarkDropped();
+      self.DoMarkItems(self.FModule);
+      self.DoLayoutModule();
+      self.DoSpacing();
+      self.DoJoinLines();
+      self.DoFit();
+      self.DoGapTexts();
+      AResult := self.DoRender(AEdits);
+      if not self.DoVerify(AResult) then
+        setlength(AEdits, 0);
+        AResult := self.FText;
+        ARefusal := LSPFormatRefusal.Verify;
+        return false;
+      end;
+      return true;
+    end;
+
+    // -- The buffer's tokens and gaps
+
+    // The raw tokens of the buffer (left-out branches too: the conditional filter runs
+    // apart); a lexer error or an Invalid token refuses
+    hidden method DoLex(): bool;
+    var
+      LReports: ref Diagnostics;
+      LLexer: ref Lexer;
+      LTokens: TokenList;
+      LToken: ref Token;
+      LI: int64;
+    begin
+      self.FSource := ref SourceText(self.FFile, self.FText);
+      LReports := ref Diagnostics(ADAM_LSP_FORMAT_BUDGET);
+      LLexer := ref Lexer(self.FSource, LReports);
+      LTokens := LLexer.ReadAll();
+      if LReports.HasErrors() then
+        return false;
+      end;
+      self.FCount := LTokens.Count;
+      setlength(self.FKinds, self.FCount);
+      setlength(self.FStarts, self.FCount);
+      setlength(self.FEnds, self.FCount);
+      setlength(self.FSpell, self.FCount);
+      for LI := 0 to self.FCount - 1 do
+        LToken := LTokens[LI];
+        if LToken.Kind = TokenKind.Invalid then
+          return false;
+        end;
+        self.FKinds[LI] := LToken.Kind;
+        self.FStarts[LI] := LToken.StartOffset;
+        self.FEnds[LI] := LToken.EndOffset;
+        self.FSpell[LI] := self.FSource.Slice(LToken.StartOffset, LToken.EndOffset);
+        self.FIndexAt.Put(LToken.StartOffset, LI);
+      end;
+      setlength(self.FRoles, self.FCount);
+      setlength(self.FOpDepth, self.FCount);
+      setlength(self.FDropped, self.FCount);
+      setlength(self.FItemStart, self.FCount);
+      for LI := 0 to self.FCount - 1 do
+        self.FRoles[LI] := FormatRole.Nothing;
+        self.FOpDepth[LI] := -1;
+        self.FDropped[LI] := false;
+        self.FItemStart[LI] := false;
+      end;
+      return self.FCount > 1;
+    end;
+
+    // One gap before each token (EndOfFile's too) and one after the last token to the end;
+    // every gap starts kept as written. The first starts after a BOM (never touched).
+    // False when the tokens do not tile the buffer (a broken stream: refused)
+    hidden method DoInitGaps(): bool;
+    var
+      LI: int64;
+      LStart: int64;
+      LEnd: int64;
+      LStarts: Int64Array;
+      LEnds: Int64Array;
+    begin
+      setlength(self.FGaps, self.FCount + 1);
+      for LI := 0 to self.FCount do
+        if LI = 0 then
+          LStart := self.FSource.FirstLineStart;
+        else
+          LStart := self.FEnds[LI - 1];
+        end;
+        if LI < self.FCount then
+          LEnd := self.FStarts[LI];
+        else
+          LEnd := len(self.FText);
+        end;
+        if LEnd < LStart then
+          return false;
+        end;
+        self.FGaps[LI].StartOffset := LStart;
+        self.FGaps[LI].EndOffset := LEnd;
+        self.FGaps[LI].Original := Substring(self.FText, LStart, LEnd - LStart);
+        self.FGaps[LI].Kind := FormatGapKind.Keep;
+        self.FGaps[LI].Level := 0;
+        self.FGaps[LI].Locked := not DoScanComments(self.FText, LStart, LEnd, LStarts, LEnds);
+        if self.FGaps[LI].Locked then
+          setlength(LStarts, 0);
+          setlength(LEnds, 0);
+        end;
+        self.FGaps[LI].CommentStarts := LStarts;
+        self.FGaps[LI].CommentEnds := LEnds;
+        self.FGaps[LI].Text := self.FGaps[LI].Original;
+        self.FGaps[LI].IsContinue := false;
+        self.FGaps[LI].Broken := false;
+        self.FGaps[LI].Table := false;
+        self.FGaps[LI].TableLevel := 0;
+      end;
+      return true;
+    end;
+
+    // The buffer's first line ending, else LF
+    hidden method DoFindEol(): string;
+    var
+      LI: int64;
+      LByte: int32;
+    begin
+      for LI := 0 to len(self.FText) - 1 do
+        LByte := DoByteOf(self.FText, LI);
+        if LByte = 13 then
+          if (LI + 1 < len(self.FText)) and (DoByteOf(self.FText, LI + 1) = 10) then
+            return "\r\n";
+          end;
+          return "\r";
+        end;
+        if LByte = 10 then
+          return "\n";
+        end;
+      end;
+      return "\n";
+    end;
+
+    // The tokens the check's own conditional filter left out (and the conditional
+    // directives it took): no node holds them, so the gaps beside them stay as written
+    hidden method DoMarkDropped();
+    var
+      LReports: ref Diagnostics;
+      LLexer: ref Lexer;
+      LTokens: TokenList;
+      LFilter: ref ConditionalFilter;
+      LActive: TokenList;
+      LActiveAt: ref Int64Map;
+      LI: int64;
+    begin
+      LReports := ref Diagnostics(ADAM_LSP_FORMAT_BUDGET);
+      LLexer := ref Lexer(self.FSource, LReports);
+      LTokens := LLexer.ReadAll();
+      LFilter := ref ConditionalFilter(LReports);
+      LActive := LFilter.Filter(LTokens, self.FTree.Triple, "", "", self.FTree.Level, true,
+        OptLevel.Debug, false);
+      LActiveAt := ref Int64Map(-1);
+      for LI := 0 to LActive.Count - 1 do
+        LActiveAt.Put(LActive[LI].StartOffset, LI);
+      end;
+      for LI := 0 to self.FCount - 2 do
+        self.FDropped[LI] := LActiveAt.Find(self.FStarts[LI]) < 0;
+      end;
+    end;
+
+    // -- Tokens of the tree
+
+    // The token starting at byte AOffset; -1 for none
+    hidden const method DoTokenAt(const AOffset: int64): int64;
+    begin
+      return self.FIndexAt.Find(AOffset);
+    end;
+
+    // The kind of the token AIndex; EndOfFile outside the list
+    hidden const method DoKindAt(const AIndex: int64): TokenKind;
+    begin
+      if (AIndex < 0) or (AIndex >= self.FCount) then
+        return TokenKind.EndOfFile;
+      end;
+      return self.FKinds[AIndex];
+    end;
+
+    // True for a node of this file's text (a place in the module's own file)
+    hidden const method DoIsOwn(const AId: int64): bool;
+    begin
+      if AId <= 0 then
+        return false;
+      end;
+      if self.FTree[AId].Place.IsNone() then
+        return false;
+      end;
+      return self.FTree[AId].Place.FileName = self.FFile;
+    end;
+
+    // The node's first token; -1 for none
+    hidden const method DoFirst(const AId: int64): int64;
+    begin
+      if not self.DoIsOwn(AId) then
+        return -1;
+      end;
+      return self.DoTokenAt(self.FTree[AId].StartOffset);
+    end;
+
+    // The node's last token: the last one starting before its end (its first when its
+    // range is no longer than its first token); -1 for none
+    hidden const method DoLast(const AId: int64): int64;
+    var
+      LFirst: int64;
+      LEnd: int64;
+      LLow: int64;
+      LHigh: int64;
+      LMid: int64;
+      LFound: int64;
+    begin
+      LFirst := self.DoFirst(AId);
+      if LFirst < 0 then
+        return -1;
+      end;
+      LEnd := self.FTree[AId].EndOffset;
+      LLow := LFirst;
+      LHigh := self.FCount - 2;
+      LFound := LFirst;
+      while LLow <= LHigh do
+        LMid := (LLow + LHigh) div 2;
+        if self.FStarts[LMid] < LEnd then
+          LFound := LMid;
+          LLow := LMid + 1;
+        else
+          LHigh := LMid - 1;
+        end;
+      end;
+      return LFound;
+    end;
+
+    // The node's own token of AKind (one no child's range holds): the first, or the last
+    // when ALast; -1 for none. The construct keywords (end, else, except, finally, until,
+    // default) are found this way: no node holds them
+    hidden const method DoOwnToken(const AId: int64; const AKind: TokenKind;
+      const ALast: bool): int64;
+    var
+      LFirst: int64;
+      LLast: int64;
+      LFroms: Int64Array;
+      LTos: Int64Array;
+      LCount: int64;
+      LChild: int64;
+      LFrom: int64;
+      LTo: int64;
+      LI: int64;
+      LJ: int64;
+      LAt: int64;
+      LFound: int64;
+    begin
+      LFirst := self.DoFirst(AId);
+      LLast := self.DoLast(AId);
+      if (LFirst < 0) or (LLast < LFirst) then
+        return -1;
+      end;
+      // The children's token ranges, by first token (an insertion sort: few children)
+      setlength(LFroms, 0);
+      setlength(LTos, 0);
+      for LI := 0 to self.FTree.ChildCount(AId) - 1 do
+        LChild := self.FTree.ChildAt(AId, LI);
+        if DoIsForeignRole(self.FTree.RoleOf(LChild)) then
+          skip;
+        end;
+        LFrom := self.DoFirst(LChild);
+        LTo := self.DoLast(LChild);
+        if (LFrom < 0) or (LTo < LFrom) then
+          skip;
+        end;
+        LCount := len(LFroms);
+        setlength(LFroms, LCount + 1);
+        setlength(LTos, LCount + 1);
+        LJ := LCount;
+        while (LJ > 0) and (LFroms[LJ - 1] > LFrom) do
+          LFroms[LJ] := LFroms[LJ - 1];
+          LTos[LJ] := LTos[LJ - 1];
+          LJ := LJ - 1;
+        end;
+        LFroms[LJ] := LFrom;
+        LTos[LJ] := LTo;
+      end;
+      // A sweep over the node's tokens, the children's ranges skipped
+      LFound := -1;
+      LAt := LFirst;
+      LJ := 0;
+      while LAt <= LLast do
+        while (LJ < len(LFroms)) and (LTos[LJ] < LAt) do
+          LJ := LJ + 1;
+        end;
+        if (LJ < len(LFroms)) and (LFroms[LJ] <= LAt) then
+          LAt := LTos[LJ] + 1;
+          skip;
+        end;
+        if self.FKinds[LAt] = AKind then
+          if not ALast then
+            return LAt;
+          end;
+          LFound := LAt;
+        end;
+        LAt := LAt + 1;
+      end;
+      return LFound;
+    end;
+
+    // The first token of AKind in [AFrom, ATo] before any token of AStop; -1 for none
+    hidden const method DoFindBefore(const AFrom: int64; const ATo: int64;
+      const AKind: TokenKind; const AStop: TokenKind): int64;
+    var
+      LAt: int64;
+    begin
+      if AFrom < 0 then
+        return -1;
+      end;
+      LAt := AFrom;
+      while (LAt <= ATo) and (LAt < self.FCount - 1) do
+        if self.FKinds[LAt] = AKind then
+          return LAt;
+        end;
+        if self.FKinds[LAt] = AStop then
+          return -1;
+        end;
+        LAt := LAt + 1;
+      end;
+      return -1;
+    end;
+
+    // -- Layout (R1 / R2): which tokens start a line, at which level
+
+    // The token AIndex starts a line at ALevel. The first token starts the file, EndOfFile
+    // never moves, a token a branch left out stays, and a token after a ',' is the next
+    // of a list (a name of `A, B: T`), never a line of its own
+    hidden method DoHard(const AIndex: int64; const ALevel: int64);
+    begin
+      if (AIndex <= 0) or (AIndex >= self.FCount - 1) then
+        return;
+      end;
+      if self.FDropped[AIndex] or (self.FKinds[AIndex - 1] = TokenKind.Comma) then
+        return;
+      end;
+      self.FGaps[AIndex].Kind := FormatGapKind.Hard;
+      self.FGaps[AIndex].Level := ALevel;
+    end;
+
+    // True for a word an item's line starts at when it comes before the item's node
+    // (public routine, forward type, hidden FField, virtual / override method)
+    hidden const method DoIsPrefixWord(const AIndex: int64): bool;
+    var
+      LText: string;
+    begin
+      if IsPublicWord(self.FKinds[AIndex]) or (self.FKinds[AIndex] = TokenKind.KwForward) or
+        (self.FKinds[AIndex] = TokenKind.KwVirtual) then
+        return true;
+      end;
+      if self.FKinds[AIndex] <> TokenKind.Identifier then
+        return false;
+      end;
+      LText := self.FSpell[AIndex];
+      return (LText = "hidden") or (LText = "static") or (LText = "override") or
+        (LText = "final");
+    end;
+
+    // An item's line at ALevel: from its prefix words when it has any
+    hidden method DoHardItem(const AIndex: int64; const ALevel: int64);
+    var
+      LAt: int64;
+    begin
+      if AIndex < 0 then
+        return;
+      end;
+      LAt := AIndex;
+      while (LAt > 0) and self.DoIsPrefixWord(LAt - 1) do
+        LAt := LAt - 1;
+      end;
+      self.DoHard(LAt, ALevel);
+    end;
+
+    // Every item node's first token marked (the joins' safety rule)
+    hidden method DoMarkItems(const AId: int64);
+    var
+      LFirst: int64;
+      LChild: int64;
+      LI: int64;
+    begin
+      if not self.DoIsOwn(AId) then
+        return;
+      end;
+      if DoIsItemKind(self.FTree[AId].Kind) then
+        LFirst := self.DoFirst(AId);
+        if LFirst >= 0 then
+          self.FItemStart[LFirst] := true;
+        end;
+      end;
+      for LI := 0 to self.FTree.ChildCount(AId) - 1 do
+        LChild := self.FTree.ChildAt(AId, LI);
+        if not DoIsForeignRole(self.FTree.RoleOf(LChild)) then
+          self.DoMarkItems(LChild);
+        end;
+      end;
+    end;
+
+    // The module: its header, directives, the import word, declarations and sections at
+    // column 0, its body's statements one in, its end at 0, then its tests
+    hidden method DoLayoutModule();
+    var
+      LChild: int64;
+      LRole: NodeRole;
+      LFirst: int64;
+      LImported: bool;
+      LI: int64;
+    begin
+      LImported := false;
+      for LI := 0 to self.FTree.ChildCount(self.FModule) - 1 do
+        LChild := self.FTree.ChildAt(self.FModule, LI);
+        LRole := self.FTree.RoleOf(LChild);
+        match LRole of
+          NodeRole.Directive:
+            self.DoHard(self.DoFirst(LChild), 0);
+          NodeRole.Import:
+            if not LImported then
+              LImported := true;
+              LFirst := self.DoFirst(LChild);
+              if (LFirst > 0) and (self.FKinds[LFirst - 1] = TokenKind.KwImport) then
+                self.DoHard(LFirst - 1, 0);
+              end;
+            end;
+          NodeRole.Declaration:
+            self.DoLayoutDecl(LChild, 0);
+          NodeRole.Initialize, NodeRole.Finalize:
+            self.DoLayoutRoutine(LChild, 0);
+          NodeRole.Body:
+            // The module's begin; its end is the module's own
+            self.FHasBody := true;
+            self.DoHard(self.DoFirst(LChild), 0);
+            self.DoLayoutList(LChild, NodeRole.Statement, 1);
+          NodeRole.Test:
+            self.DoLayoutRoutine(LChild, 0);
+        else
+        end;
+      end;
+      self.FModuleEnd := self.DoOwnToken(self.FModule, TokenKind.KwEnd, true);
+      self.DoHard(self.FModuleEnd, 0);
+      // Expression statements' async blocks and the operators: over the whole tree
+      self.DoMarkRoles(self.FModule, 0);
+    end;
+
+    // AParent's children playing ARole, each one item at ALevel
+    hidden method DoLayoutList(const AParent: int64; const ARole: NodeRole; const ALevel: int64);
+    var
+      LChild: int64;
+      LI: int64;
+    begin
+      for LI := 0 to self.FTree.ChildCount(AParent) - 1 do
+        LChild := self.FTree.ChildAt(AParent, LI);
+        if self.FTree.RoleOf(LChild) = ARole then
+          self.DoLayoutStatement(LChild, ALevel);
+        end;
+      end;
+    end;
+
+    // A declaration at ALevel: a var / const / type entry's block word at ALevel (with a
+    // public word before it), the entry one in; a routine, forward or directive an item
+    hidden method DoLayoutDecl(const AId: int64; const ALevel: int64);
+    var
+      LFirst: int64;
+      LWord: int64;
+      LKind: NodeKind;
+    begin
+      LFirst := self.DoFirst(AId);
+      if LFirst < 0 then
+        return;
+      end;
+      LKind := self.FTree[AId].Kind;
+      if (LKind = NodeKind.RoutineDecl) or (LKind = NodeKind.ForwardRoutine) or
+        (LKind = NodeKind.InitializeSection) or (LKind = NodeKind.FinalizeSection) or
+        (LKind = NodeKind.TestBlock) then
+        self.DoLayoutRoutine(AId, ALevel);
+        return;
+      end;
+      if LKind = NodeKind.ForwardType then
+        if (self.DoKindAt(LFirst - 1) = TokenKind.KwType) and
+          (self.DoKindAt(LFirst - 2) = TokenKind.KwForward) then
+          self.DoHardItem(LFirst - 2, ALevel);
+        else
+          self.DoHardItem(LFirst, ALevel);
+        end;
+        return;
+      end;
+      if (LKind <> NodeKind.VarDecl) and (LKind <> NodeKind.ConstDecl) and
+        (LKind <> NodeKind.TypeDecl) then
+        self.DoHardItem(LFirst, ALevel);
+        self.DoLayoutAsyncs(AId, ALevel);
+        return;
+      end;
+      // The block word before the block's first entry (var / const / type, a threadstatic
+      // block's own word)
+      LWord := LFirst - 1;
+      if (self.DoKindAt(LWord) = TokenKind.KwVar) or (self.DoKindAt(LWord) = TokenKind.KwConst) or
+        (self.DoKindAt(LWord) = TokenKind.KwType) or
+        (self.DoKindAt(LWord) = TokenKind.KwThreadstatic) then
+        if IsPublicWord(self.DoKindAt(LWord - 1)) or
+          (self.DoKindAt(LWord - 1) = TokenKind.KwThreadstatic) then
+          LWord := LWord - 1;
+        end;
+        self.DoHard(LWord, ALevel);
+      end;
+      self.DoHardItem(LFirst, ALevel + 1);
+      if LKind = NodeKind.TypeDecl then
+        self.DoLayoutType(self.FTree.FirstOf(AId, NodeRole.TypeOf), ALevel + 1);
+      else
+        if LKind = NodeKind.ConstDecl then
+          self.DoMarkTable(self.FTree.FirstOf(AId, NodeRole.Initializer), ALevel + 2);
+        end;
+        self.DoLayoutAsyncs(AId, ALevel + 1);
+      end;
+    end;
+
+    // A routine, method, init / copy / done, operator, section or test at ALevel: its
+    // heading (parameters stay on its line), local blocks at ALevel with their entries
+    // one in, its body's begin / end at ALevel
+    hidden method DoLayoutRoutine(const AId: int64; const ALevel: int64);
+    var
+      LChild: int64;
+      LI: int64;
+    begin
+      self.DoHardItem(self.DoFirst(AId), ALevel);
+      for LI := 0 to self.FTree.ChildCount(AId) - 1 do
+        LChild := self.FTree.ChildAt(AId, LI);
+        match self.FTree.RoleOf(LChild) of
+          NodeRole.Local:
+            self.DoLayoutDecl(LChild, ALevel);
+          NodeRole.Body:
+            if self.FTree[LChild].Kind = NodeKind.Block then
+              self.DoLayoutBlock(LChild, ALevel);
+            end;
+        else
+        end;
+      end;
+    end;
+
+    // begin at ALevel, its statements one in, its end at ALevel
+    hidden method DoLayoutBlock(const AId: int64; const ALevel: int64);
+    begin
+      self.DoHard(self.DoFirst(AId), ALevel);
+      self.DoLayoutInlineBlock(AId, ALevel);
+    end;
+
+    // A block whose begin stays where it is (after defer, in an async expression): its
+    // statements one in from ALevel, its end at ALevel
+    hidden method DoLayoutInlineBlock(const AId: int64; const ALevel: int64);
+    begin
+      self.DoLayoutList(AId, NodeRole.Statement, ALevel + 1);
+      self.DoHard(self.DoOwnToken(AId, TokenKind.KwEnd, true), ALevel);
+    end;
+
+    // AId's own keyword of AKind at ALevel (first one), its children playing ARole one in
+    hidden method DoLayoutPart(const AId: int64; const AKind: TokenKind; const ARole: NodeRole;
+      const ALevel: int64);
+    var
+      LWord: int64;
+    begin
+      LWord := self.DoOwnToken(AId, AKind, false);
+      if LWord >= 0 then
+        self.DoHard(LWord, ALevel);
+      end;
+      self.DoLayoutList(AId, ARole, ALevel + 1);
+    end;
+
+    // One statement at ALevel (R2)
+    hidden method DoLayoutStatement(const AId: int64; const ALevel: int64);
+    var
+      LFirst: int64;
+      LChild: int64;
+      LI: int64;
+    begin
+      if not self.DoIsOwn(AId) then
+        return;
+      end;
+      LFirst := self.DoFirst(AId);
+      match self.FTree[AId].Kind of
+        NodeKind.Block:
+          self.DoLayoutBlock(AId, ALevel);
+        NodeKind.VarDecl, NodeKind.ConstDecl, NodeKind.TypeDecl:
+          self.DoLayoutDecl(AId, ALevel);
+        NodeKind.IfStatement:
+          self.DoHard(LFirst, ALevel);
+          self.DoLayoutAsyncs(AId, ALevel);
+          self.DoLayoutList(AId, NodeRole.Then, ALevel + 1);
+          self.DoLayoutPart(AId, TokenKind.KwElse, NodeRole.Else, ALevel);
+          self.DoHard(self.DoOwnToken(AId, TokenKind.KwEnd, true), ALevel);
+        NodeKind.WhileStatement, NodeKind.ForStatement, NodeKind.ForInStatement,
+        NodeKind.LockStatement:
+          self.DoHard(LFirst, ALevel);
+          self.DoLayoutAsyncs(AId, ALevel);
+          self.DoLayoutList(AId, NodeRole.Statement, ALevel + 1);
+          self.DoHard(self.DoOwnToken(AId, TokenKind.KwEnd, true), ALevel);
+        NodeKind.TryLockStatement:
+          self.DoHard(LFirst, ALevel);
+          self.DoLayoutList(AId, NodeRole.Statement, ALevel + 1);
+          self.DoLayoutPart(AId, TokenKind.KwElse, NodeRole.Else, ALevel);
+          self.DoHard(self.DoOwnToken(AId, TokenKind.KwEnd, true), ALevel);
+        NodeKind.RepeatStatement:
+          self.DoHard(LFirst, ALevel);
+          self.DoLayoutList(AId, NodeRole.Statement, ALevel + 1);
+          self.DoHard(self.DoOwnToken(AId, TokenKind.KwUntil, true), ALevel);
+          self.DoLayoutAsyncs(AId, ALevel);
+        NodeKind.MatchStatement:
+          self.DoHard(LFirst, ALevel);
+          self.DoLayoutAsyncs(AId, ALevel);
+          for LI := 0 to self.FTree.ChildCount(AId) - 1 do
+            LChild := self.FTree.ChildAt(AId, LI);
+            if self.FTree.RoleOf(LChild) = NodeRole.Arm then
+              self.DoHard(self.DoFirst(LChild), ALevel + 1);
+              self.DoLayoutList(LChild, NodeRole.Statement, ALevel + 2);
+            end;
+          end;
+          self.DoLayoutPart(AId, TokenKind.KwElse, NodeRole.Else, ALevel);
+          self.DoHard(self.DoOwnToken(AId, TokenKind.KwEnd, true), ALevel);
+        NodeKind.GuardStatement:
+          self.DoHard(LFirst, ALevel);
+          self.DoLayoutList(AId, NodeRole.Statement, ALevel + 1);
+          self.DoLayoutPart(AId, TokenKind.KwExcept, NodeRole.Except, ALevel);
+          self.DoLayoutPart(AId, TokenKind.KwFinally, NodeRole.Finally, ALevel);
+          self.DoHard(self.DoOwnToken(AId, TokenKind.KwEnd, true), ALevel);
+        NodeKind.DeferStatement:
+          self.DoHard(LFirst, ALevel);
+          for LI := 0 to self.FTree.ChildCount(AId) - 1 do
+            LChild := self.FTree.ChildAt(AId, LI);
+            if self.FTree[LChild].Kind = NodeKind.Block then
+              self.DoLayoutInlineBlock(LChild, ALevel);
+            end;
+          end;
+          self.DoLayoutAsyncs(AId, ALevel);
+      else
+        self.DoHard(LFirst, ALevel);
+        self.DoLayoutAsyncs(AId, ALevel);
+      end;
+    end;
+
+    // The async blocks in AId's expressions (not inside a nested statement or block): each
+    // block's statements one in from ALevel, its end at ALevel
+    hidden method DoLayoutAsyncs(const AId: int64; const ALevel: int64);
+    var
+      LChild: int64;
+      LBody: int64;
+      LI: int64;
+    begin
+      for LI := 0 to self.FTree.ChildCount(AId) - 1 do
+        LChild := self.FTree.ChildAt(AId, LI);
+        if DoIsForeignRole(self.FTree.RoleOf(LChild)) or not self.DoIsOwn(LChild) then
+          skip;
+        end;
+        if DoIsItemKind(self.FTree[LChild].Kind) then
+          skip;
+        end;
+        if self.FTree[LChild].Kind = NodeKind.AsyncExpression then
+          LBody := self.FTree.FirstOf(LChild, NodeRole.Body);
+          if (LBody <> 0) and (self.FTree[LBody].Kind = NodeKind.Block) then
+            self.DoLayoutInlineBlock(LBody, ALevel);
+          end;
+        else
+          self.DoLayoutAsyncs(LChild, ALevel);
+        end;
+      end;
+    end;
+
+    // A type entry's type at the entry's level ALevel: a record / object / overlay /
+    // interface body member by member one in, its end at ALevel; any other type stays
+    hidden method DoLayoutType(const AType: int64; const ALevel: int64);
+    begin
+      if not self.DoIsOwn(AType) then
+        return;
+      end;
+      match self.FTree[AType].Kind of
+        NodeKind.RecordType, NodeKind.ObjectType, NodeKind.OverlayType,
+        NodeKind.InterfaceType, NodeKind.AnonRecord, NodeKind.AnonOverlay:
+          self.DoLayoutMembers(AType, ALevel + 1);
+          self.DoHard(self.DoOwnToken(AType, TokenKind.KwEnd, true), ALevel);
+      else
+      end;
+    end;
+
+    // AOwner's members at ALevel
+    hidden method DoLayoutMembers(const AOwner: int64; const ALevel: int64);
+    var
+      LChild: int64;
+      LI: int64;
+    begin
+      for LI := 0 to self.FTree.ChildCount(AOwner) - 1 do
+        LChild := self.FTree.ChildAt(AOwner, LI);
+        if (self.FTree.RoleOf(LChild) <> NodeRole.Member) or not self.DoIsOwn(LChild) then
+          skip;
+        end;
+        match self.FTree[LChild].Kind of
+          NodeKind.MethodDecl, NodeKind.InitDecl, NodeKind.CopyDecl, NodeKind.DoneDecl,
+          NodeKind.OperatorDecl:
+            self.DoLayoutRoutine(LChild, ALevel);
+          NodeKind.PropertyDecl:
+            self.DoLayoutProperty(LChild, ALevel);
+          NodeKind.AnonRecord, NodeKind.AnonOverlay:
+            self.DoHard(self.DoFirst(LChild), ALevel);
+            self.DoLayoutType(LChild, ALevel);
+          NodeKind.FieldDecl:
+            self.DoHardItem(self.DoFirst(LChild), ALevel);
+            self.DoLayoutType(self.FTree.FirstOf(LChild, NodeRole.TypeOf), ALevel);
+        else
+          self.DoHardItem(self.DoFirst(LChild), ALevel);
+        end;
+      end;
+    end;
+
+    // A property's line at ALevel; an inline accessor (one with a body) one in: its word
+    // on its own line, its local blocks and its begin / end there, its statements two in;
+    // after a body, each later accessor and the property's `default` one in (Adam's own
+    // sources)
+    hidden method DoLayoutProperty(const AId: int64; const ALevel: int64);
+    var
+      LChild: int64;
+      LRole: NodeRole;
+      LAfterBody: bool;
+      LDefault: int64;
+      LI: int64;
+    begin
+      self.DoHardItem(self.DoFirst(AId), ALevel);
+      LAfterBody := false;
+      for LI := 0 to self.FTree.ChildCount(AId) - 1 do
+        LChild := self.FTree.ChildAt(AId, LI);
+        LRole := self.FTree.RoleOf(LChild);
+        if (LRole <> NodeRole.Read) and (LRole <> NodeRole.Write) then
+          skip;
+        end;
+        if self.FTree.FirstOf(LChild, NodeRole.Body) <> 0 then
+          self.DoLayoutRoutine(LChild, ALevel + 1);
+          LAfterBody := true;
+        else
+          if LAfterBody then
+            self.DoHardItem(self.DoFirst(LChild), ALevel + 1);
+          end;
+        end;
+      end;
+      if LAfterBody then
+        LDefault := self.DoOwnToken(AId, TokenKind.KwDefault, true);
+        if LDefault >= 0 then
+          self.DoHard(LDefault, ALevel + 1);
+        end;
+      end;
+    end;
+
+    // R5: a constant value written over several lines (a table) keeps its lines, each at
+    // ALevel; one written on one line is an ordinary line
+    hidden method DoMarkTable(const AValue: int64; const ALevel: int64);
+    var
+      LFirst: int64;
+      LLast: int64;
+      LSpread: bool;
+      LI: int64;
+    begin
+      if AValue = 0 then
+        return;
+      end;
+      LFirst := self.DoFirst(AValue);
+      LLast := self.DoLast(AValue);
+      if (LFirst < 0) or (LLast < LFirst) then
+        return;
+      end;
+      LSpread := false;
+      for LI := LFirst to LLast do
+        if DoCountEols(self.FGaps[LI].Original) > 0 then
+          LSpread := true;
+          leave;
+        end;
+      end;
+      if not LSpread then
+        return;
+      end;
+      for LI := LFirst to LLast do
+        self.FGaps[LI].Table := true;
+        self.FGaps[LI].TableLevel := ALevel;
+      end;
+    end;
+
+    // -- Spacing (R3)
+
+    // ARole for the token AIndex
+    hidden method DoRole(const AIndex: int64; const ARole: FormatRole);
+    begin
+      if (AIndex >= 0) and (AIndex < self.FCount) then
+        self.FRoles[AIndex] := ARole;
+      end;
+    end;
+
+    // A binary / ?: operator: its role and its R5 nesting
+    hidden method DoOperator(const AIndex: int64; const ADepth: int64);
+    begin
+      if (AIndex >= 0) and (AIndex < self.FCount) then
+        self.FRoles[AIndex] := FormatRole.Operator;
+        self.FOpDepth[AIndex] := ADepth;
+      end;
+    end;
+
+    // The operator token between ALeft and ARight: the one token between them that is no
+    // parenthesis; none or several: -1 (nothing is decided)
+    hidden const method DoOpBetween(const ALeft: int64; const ARight: int64): int64;
+    var
+      LFrom: int64;
+      LTo: int64;
+      LFound: int64;
+      LI: int64;
+    begin
+      if (ALeft = 0) or (ARight = 0) then
+        return -1;
+      end;
+      LFrom := self.DoLast(ALeft);
+      LTo := self.DoFirst(ARight);
+      if (LFrom < 0) or (LTo < 0) then
+        return -1;
+      end;
+      LFound := -1;
+      for LI := LFrom + 1 to LTo - 1 do
+        if (self.FKinds[LI] = TokenKind.LParen) or (self.FKinds[LI] = TokenKind.RParen) then
+          skip;
+        end;
+        if LFound >= 0 then
+          return -1;
+        end;
+        LFound := LI;
+      end;
+      return LFound;
+    end;
+
+    // The first '(' / '[' (AOpen) of AId's own heading: before its first ';' / ':' / begin
+    // at bracket depth 0 (a routine's parameters, a property's index, a cast's operand)
+    hidden const method DoHeadingOpen(const AId: int64; const AOpen: TokenKind): int64;
+    var
+      LAt: int64;
+      LLast: int64;
+      LKind: TokenKind;
+    begin
+      LAt := self.DoFirst(AId);
+      LLast := self.DoLast(AId);
+      if LAt < 0 then
+        return -1;
+      end;
+      while LAt <= LLast do
+        LKind := self.FKinds[LAt];
+        if LKind = AOpen then
+          return LAt;
+        end;
+        if (LKind = TokenKind.Semicolon) or (LKind = TokenKind.Colon) or
+          (LKind = TokenKind.KwBegin) or (LKind = TokenKind.LParen) or
+          (LKind = TokenKind.LBracket) then
+          return -1;
+        end;
+        LAt := LAt + 1;
+      end;
+      return -1;
+    end;
+
+    // The tokens whose spacing the tree decides, over the whole tree. ADepth: how many
+    // binary / ?: nodes this one sits in with no other node kind between (R5: a chain's
+    // outermost operator is its lowest precedence one)
+    hidden method DoMarkRoles(const AId: int64; const ADepth: int64);
+    var
+      LNode: ref Node;
+      LOperand: int64;
+      LFirst: int64;
+      LNext: int64;
+      LChild: int64;
+      LChildDepth: int64;
+      LI: int64;
+    begin
+      if not self.DoIsOwn(AId) then
+        return;
+      end;
+      LNode := self.FTree[AId];
+      match LNode.Kind of
+        NodeKind.BinaryExpression:
+          self.DoOperator(self.DoOpBetween(self.FTree.FirstOf(AId, NodeRole.Left),
+            self.FTree.FirstOf(AId, NodeRole.Right)), ADepth);
+        NodeKind.AssignExpression:
+          self.DoRole(self.DoOpBetween(self.FTree.FirstOf(AId, NodeRole.Target),
+            self.FTree.FirstOf(AId, NodeRole.Source)), FormatRole.Operator);
+        NodeKind.ForStatement:
+          self.DoRole(self.DoOpBetween(self.FTree.FirstOf(AId, NodeRole.Iterator),
+            self.FTree.FirstOf(AId, NodeRole.Start)), FormatRole.Operator);
+        NodeKind.ConditionalExpression:
+          self.DoOperator(self.DoOpBetween(self.FTree.FirstOf(AId, NodeRole.Condition),
+            self.FTree.FirstOf(AId, NodeRole.Then)), ADepth);
+          self.DoOperator(self.DoOpBetween(self.FTree.FirstOf(AId, NodeRole.Then),
+            self.FTree.FirstOf(AId, NodeRole.Else)), ADepth);
+        NodeKind.UnaryExpression, NodeKind.PostfixExpression:
+          // Prefix: the node starts at its operator; postfix (p^, i++): the operator
+          // follows its operand inside the node
+          LOperand := self.FTree.FirstOf(AId, NodeRole.Operand);
+          LFirst := self.DoFirst(AId);
+          if (LOperand <> 0) and (LFirst >= 0) and (self.DoFirst(LOperand) >= 0) then
+            if (LFirst < self.DoFirst(LOperand)) and (self.FKinds[LFirst] <> TokenKind.LParen) then
+              self.DoRole(LFirst, FormatRole.Prefix);
+            else
+              LNext := self.DoLast(LOperand) + 1;
+              if (LNext <= self.DoLast(AId)) and ((self.DoKindAt(LNext) = TokenKind.Caret) or
+                (self.DoKindAt(LNext) = TokenKind.PlusPlus) or
+                (self.DoKindAt(LNext) = TokenKind.MinusMinus)) then
+                self.DoRole(LNext, FormatRole.Postfix);
+              end;
+            end;
+          end;
+        NodeKind.CallExpression:
+          LOperand := self.FTree.FirstOf(AId, NodeRole.Callee);
+          if (LOperand <> 0) and (self.DoLast(LOperand) >= 0) then
+            LNext := self.DoLast(LOperand) + 1;
+            if self.DoKindAt(LNext) = TokenKind.LParen then
+              self.DoRole(LNext, FormatRole.CallOpen);
+            end;
+          end;
+        NodeKind.IndexExpression:
+          LOperand := self.FTree.FirstOf(AId, NodeRole.Operand);
+          if (LOperand <> 0) and (self.DoLast(LOperand) >= 0) then
+            LNext := self.DoLast(LOperand) + 1;
+            if self.DoKindAt(LNext) = TokenKind.LBracket then
+              self.DoRole(LNext, FormatRole.CallOpen);
+            end;
+          end;
+        NodeKind.TypeCast, NodeKind.PointerCast, NodeKind.RefNew, NodeKind.OwnNew,
+        NodeKind.WeakNew, NodeKind.RoutineDecl, NodeKind.ForwardRoutine, NodeKind.MethodDecl,
+        NodeKind.InitDecl, NodeKind.CopyDecl, NodeKind.DoneDecl, NodeKind.OperatorDecl,
+        NodeKind.RoutineType, NodeKind.ClosureType, NodeKind.FuncLiteral, NodeKind.ClosureOfType:
+          self.DoRole(self.DoHeadingOpen(AId, TokenKind.LParen), FormatRole.CallOpen);
+        NodeKind.PropertyDecl:
+          self.DoRole(self.DoHeadingOpen(AId, TokenKind.LBracket), FormatRole.CallOpen);
+        NodeKind.FieldDecl:
+          LOperand := self.FTree.FirstOf(AId, NodeRole.BitWidth);
+          if LOperand <> 0 then
+            LNext := self.DoFirst(LOperand) - 1;
+            if self.DoKindAt(LNext) = TokenKind.Colon then
+              self.DoRole(LNext, FormatRole.Operator);
+            end;
+          end;
+      else
+      end;
+      if (LNode.Kind = NodeKind.BinaryExpression) or
+        (LNode.Kind = NodeKind.ConditionalExpression) then
+        LChildDepth := ADepth + 1;
+      else
+        LChildDepth := 0;
+      end;
+      for LI := 0 to self.FTree.ChildCount(AId) - 1 do
+        LChild := self.FTree.ChildAt(AId, LI);
+        if not DoIsForeignRole(self.FTree.RoleOf(LChild)) then
+          self.DoMarkRoles(LChild, LChildDepth);
+        end;
+      end;
+    end;
+
+    // R3 for every gap inside a line no other rule owns: not a line start, not locked, no
+    // comment, no line ending (the joins' job), not before EndOfFile
+    hidden method DoSpacing();
+    var
+      LI: int64;
+      LWant: FormatWant;
+    begin
+      for LI := 1 to self.FCount - 2 do
+        if (self.FGaps[LI].Kind <> FormatGapKind.Keep) or self.FGaps[LI].Locked or
+          (len(self.FGaps[LI].CommentStarts) > 0) or
+          (DoCountEols(self.FGaps[LI].Original) > 0) then
+          skip;
+        end;
+        LWant := self.DoWant(LI - 1, LI);
+        if (LWant = FormatWant.NoSpace) and (self.FGaps[LI].Original <> "") and
+          not self.DoWouldFuse(LI - 1, LI) then
+          self.FGaps[LI].Kind := FormatGapKind.Space;
+          self.FGaps[LI].Text := "";
+        else
+          if (LWant = FormatWant.OneSpace) and (self.FGaps[LI].Original = "") then
+            self.FGaps[LI].Kind := FormatGapKind.Space;
+            self.FGaps[LI].Text := " ";
+          end;
+        end;
+      end;
+    end;
+
+    // AOption's want: one space, else nothing
+    hidden const method DoOption(const AOption: bool): FormatWant;
+    begin
+      if AOption then
+        return FormatWant.OneSpace;
+      end;
+      return FormatWant.NoSpace;
+    end;
+
+    // What R3 wants between the tokens ALeft and ARight
+    hidden const method DoWant(const ALeft: int64; const ARight: int64): FormatWant;
+    var
+      LLeft: TokenKind;
+      LRight: TokenKind;
+    begin
+      LLeft := self.FKinds[ALeft];
+      LRight := self.FKinds[ARight];
+      // Text no node holds (left-out branches, conditional directives) and a directive's
+      // own word stay as written
+      if self.FDropped[ALeft] or self.FDropped[ARight] then
+        return FormatWant.AsWritten;
+      end;
+      if (LLeft = TokenKind.Directive) or (LRight = TokenKind.Directive) then
+        return FormatWant.AsWritten;
+      end;
+      // Closers and separators hug what is before them, openers what is after
+      if (LRight = TokenKind.Comma) or (LRight = TokenKind.Semicolon) or
+        (LRight = TokenKind.RParen) or (LRight = TokenKind.RBracket) then
+        return FormatWant.NoSpace;
+      end;
+      if (LLeft = TokenKind.LParen) or (LLeft = TokenKind.LBracket) then
+        return FormatWant.NoSpace;
+      end;
+      // Unary operators hug their operand (a word operator, not / addr, keeps its gap)
+      if self.FRoles[ALeft] = FormatRole.Prefix then
+        if IsKeywordKind(LLeft) then
+          return FormatWant.AsWritten;
+        end;
+        return FormatWant.NoSpace;
+      end;
+      if (self.FRoles[ARight] = FormatRole.Postfix) or
+        (self.FRoles[ARight] = FormatRole.CallOpen) then
+        return FormatWant.NoSpace;
+      end;
+      // Member access: no spaces (a '.' after a number would make a real number: only after
+      // a name, a closer, self / parent, a '^' or a type argument list's '>')
+      if (LRight = TokenKind.Dot) or (LRight = TokenKind.Arrow) then
+        if (LLeft = TokenKind.Identifier) or (LLeft = TokenKind.RParen) or
+          (LLeft = TokenKind.RBracket) or (LLeft = TokenKind.KwSelf) or
+          (LLeft = TokenKind.KwParent) or (LLeft = TokenKind.Caret) or
+          (LLeft = TokenKind.Greater) then
+          return FormatWant.NoSpace;
+        end;
+        return FormatWant.AsWritten;
+      end;
+      if (LLeft = TokenKind.Dot) or (LLeft = TokenKind.Arrow) then
+        return FormatWant.NoSpace;
+      end;
+      if (LLeft = TokenKind.DotDot) or (LRight = TokenKind.DotDot) then
+        return FormatWant.NoSpace;
+      end;
+      // Operators the tree names: the options
+      if (self.FRoles[ALeft] = FormatRole.Operator) or
+        (self.FRoles[ARight] = FormatRole.Operator) then
+        if DoIsAssignKind(LLeft) or DoIsAssignKind(LRight) then
+          return self.DoOption(self.FOptions.SpaceAroundAssign);
+        end;
+        return self.DoOption(self.FOptions.SpaceAroundOperators);
+      end;
+      // Colons, separators, a declaration's '='
+      if LRight = TokenKind.Colon then
+        return self.DoOption(self.FOptions.SpaceBeforeColon);
+      end;
+      if LLeft = TokenKind.Colon then
+        return self.DoOption(self.FOptions.SpaceAfterColon);
+      end;
+      if LLeft = TokenKind.Comma then
+        return self.DoOption(self.FOptions.SpaceAfterComma);
+      end;
+      if LLeft = TokenKind.Semicolon then
+        return FormatWant.OneSpace;
+      end;
+      if (LLeft = TokenKind.Equal) or (LRight = TokenKind.Equal) then
+        return FormatWant.OneSpace;
+      end;
+      return FormatWant.AsWritten;
+    end;
+
+    // Taking the gap out would lex differently: two words glued, a number swallowing a
+    // '.', two operator spellings forming another (or a comment)
+    hidden const method DoWouldFuse(const ALeft: int64; const ARight: int64): bool;
+    var
+      LLeft: string;
+      LRight: string;
+      LLast: int32;
+      LFirst: int32;
+    begin
+      LLeft := self.FSpell[ALeft];
+      LRight := self.FSpell[ARight];
+      if (len(LLeft) = 0) or (len(LRight) = 0) then
+        return false;
+      end;
+      LLast := DoByteOf(LLeft, len(LLeft) - 1);
+      LFirst := DoByteOf(LRight, 0);
+      if DoIsWordByte(LLast) and DoIsWordByte(LFirst) then
+        return true;
+      end;
+      if ((self.FKinds[ALeft] = TokenKind.IntLiteral) or
+        (self.FKinds[ALeft] = TokenKind.FloatLiteral)) and (LFirst = 0x2E) then
+        return true;
+      end;
+      return DoIsOperatorByte(LLast) and DoIsOperatorByte(LFirst);
+    end;
+
+    // -- Long lines (R5)
+
+    // A gap whose line the formatter decides: inside the file, before a real token, not
+    // locked, no comment in it (nothing is joined after a // comment), not beside text no
+    // node holds or a directive's word, not after a token that ends its own line, and not
+    // a line the layout did not place (an item's start, a construct keyword: see the header)
+    hidden const method DoIsOwnedGap(const AIndex: int64): bool;
+    var
+      LLeft: TokenKind;
+      LRight: TokenKind;
+    begin
+      if (AIndex <= 0) or (AIndex >= self.FCount - 1) then
+        return false;
+      end;
+      if self.FGaps[AIndex].Locked or (len(self.FGaps[AIndex].CommentStarts) > 0) then
+        return false;
+      end;
+      if self.FDropped[AIndex - 1] or self.FDropped[AIndex] then
+        return false;
+      end;
+      LLeft := self.FKinds[AIndex - 1];
+      LRight := self.FKinds[AIndex];
+      if (LLeft = TokenKind.Directive) or (LRight = TokenKind.Directive) then
+        return false;
+      end;
+      if self.DoPrevEndsLine(AIndex) then
+        return false;
+      end;
+      if self.FItemStart[AIndex] then
+        return false;
+      end;
+      match LRight of
+        TokenKind.KwEnd, TokenKind.KwElse, TokenKind.KwUntil, TokenKind.KwExcept,
+        TokenKind.KwFinally, TokenKind.KwBegin:
+          return false;
+      else
+      end;
+      match LLeft of
+        TokenKind.KwBegin, TokenKind.KwThen, TokenKind.KwDo, TokenKind.KwRepeat,
+        TokenKind.KwElse, TokenKind.KwExcept, TokenKind.KwFinally:
+          return false;
+      else
+      end;
+      return true;
+    end;
+
+    // A joined line ending: R3's want ('' or one space; a gap R3 leaves to the writer is
+    // one space: the written gap was blanks)
+    hidden const method DoJoinText(const AIndex: int64): string;
+    begin
+      if (self.DoWant(AIndex - 1, AIndex) = FormatWant.NoSpace) and
+        not self.DoWouldFuse(AIndex - 1, AIndex) then
+        return "";
+      end;
+      return " ";
+    end;
+
+    // Every line ending inside a statement or declaration joined (the fit breaks what is
+    // then too long); inside a constant table each written line kept, at the table's level
+    hidden method DoJoinLines();
+    var
+      LI: int64;
+    begin
+      for LI := 1 to self.FCount - 2 do
+        if (self.FGaps[LI].Kind <> FormatGapKind.Keep) or
+          (DoCountEols(self.FGaps[LI].Original) = 0) or not self.DoIsOwnedGap(LI) then
+          skip;
+        end;
+        if self.FGaps[LI].Table then
+          self.FGaps[LI].Kind := FormatGapKind.Hard;
+          self.FGaps[LI].Level := self.FGaps[LI].TableLevel;
+          self.FGaps[LI].IsContinue := true;
+        else
+          self.FGaps[LI].Kind := FormatGapKind.Space;
+          self.FGaps[LI].Text := self.DoJoinText(LI);
+        end;
+      end;
+    end;
+
+    // A line starts at gap AIndex: a layout break, or a line ending no rule joined;
+    // EndOfFile ends every line
+    hidden const method DoIsLineStart(const AIndex: int64): bool;
+    begin
+      if AIndex >= self.FCount - 1 then
+        return true;
+      end;
+      if self.FGaps[AIndex].Kind = FormatGapKind.Hard then
+        return true;
+      end;
+      return (self.FGaps[AIndex].Kind = FormatGapKind.Keep) and
+        (DoCountEols(self.FGaps[AIndex].Original) > 0);
+    end;
+
+    // The statement level a line belongs to: a layout break sets it; a continuation, table
+    // or kept line keeps the one before
+    hidden const method DoLineBase(const AStart: int64; const ABase: int64): int64;
+    begin
+      if AStart = 0 then
+        return 0;
+      end;
+      if (self.FGaps[AStart].Kind = FormatGapKind.Hard) and not self.FGaps[AStart].IsContinue then
+        return self.FGaps[AStart].Level;
+      end;
+      return ABase;
+    end;
+
+    // The last token of the line from AStart (a token holding a line ending ends it)
+    hidden const method DoLineEnd(const AStart: int64): int64;
+    var
+      LAt: int64;
+    begin
+      LAt := AStart;
+      while (LAt < self.FCount - 2) and not self.DoIsLineStart(LAt + 1) and
+        (DoCountEols(self.FSpell[LAt]) = 0) do
+        LAt := LAt + 1;
+      end;
+      return LAt;
+    end;
+
+    // A level's width in columns (a tab counts IndentSize)
+    hidden const method DoIndentWidth(const ALevel: int64): int64;
+    begin
+      if ALevel < 0 then
+        return 0;
+      end;
+      return ALevel * self.FOptions.IndentSize;
+    end;
+
+    // Where the line's first token starts: a break's indent; after a token holding a line
+    // ending, that token's last line and the gap; a kept line, after the gap's last line
+    // ending
+    hidden const method DoStartColumn(const AStart: int64): int64;
+    begin
+      if AStart = 0 then
+        return 0;
+      end;
+      if self.FGaps[AStart].Kind = FormatGapKind.Hard then
+        return self.DoIndentWidth(self.FGaps[AStart].Level);
+      end;
+      if DoCountEols(self.FSpell[AStart - 1]) > 0 then
+        return DoWidth(DoLastLinePart(self.FSpell[AStart - 1])) + DoWidth(self.FGaps[AStart].Text);
+      end;
+      return DoWidth(DoLastLinePart(self.FGaps[AStart].Original));
+    end;
+
+    // R5 break points, after the token: ',' / ';' first, then a binary / ?: operator (not
+    // between two operator tokens), the assignments last; never inside a table or a gap the
+    // formatter does not own (a break there would be kept by the next run: not idempotent)
+    hidden const method DoCandidate(const AIndex: int64; const AColumn: int64; const ADepth: int64;
+      var ACandidate: FormatCandidate): bool;
+    var
+      LLeft: int64;
+    begin
+      ACandidate.Gap := AIndex;
+      ACandidate.Column := AColumn;
+      ACandidate.Depth := ADepth;
+      ACandidate.RankAssign := 0;
+      ACandidate.RankKind := 0;
+      ACandidate.RankPrec := 0;
+      if (self.FGaps[AIndex].Kind = FormatGapKind.Hard) or self.FGaps[AIndex].Table or
+        not self.DoIsOwnedGap(AIndex) then
+        return false;
+      end;
+      LLeft := AIndex - 1;
+      if (self.FKinds[LLeft] = TokenKind.Comma) or (self.FKinds[LLeft] = TokenKind.Semicolon) then
+        return true;
+      end;
+      if (self.FOpDepth[LLeft] >= 0) and (self.FOpDepth[AIndex] < 0) then
+        ACandidate.RankKind := 1;
+        ACandidate.RankPrec := self.FOpDepth[LLeft];
+        return true;
+      end;
+      if (self.FRoles[LLeft] = FormatRole.Operator) and DoIsAssignKind(self.FKinds[LLeft]) then
+        ACandidate.RankAssign := 1;
+        return true;
+      end;
+      return false;
+    end;
+
+    // The gap to break the line AStart..AEnd at, -1 when it fits or has no break point:
+    // the best ranked candidate, the rightmost of those that still fit, else the leftmost
+    // (a token longer than the limit stays whole)
+    hidden const method DoFitLine(const AStart: int64; const AEnd: int64): int64;
+    var
+      LCandidates: FormatCandidateArray;
+      LCandidate: FormatCandidate;
+      LBest: FormatCandidate;
+      LHaveBest: bool;
+      LFits: bool;
+      LColumn: int64;
+      LDepth: int64;
+      LCount: int64;
+      LI: int64;
+    begin
+      setlength(LCandidates, 0);
+      LColumn := self.DoStartColumn(AStart);
+      LDepth := 0;
+      for LI := AStart to AEnd do
+        if LI > AStart then
+          if self.DoCandidate(LI, LColumn, LDepth, LCandidate) then
+            LCount := len(LCandidates);
+            setlength(LCandidates, LCount + 1);
+            LCandidates[LCount] := LCandidate;
+          end;
+          if self.FGaps[LI].Kind = FormatGapKind.Space then
+            LColumn := LColumn + DoWidth(self.FGaps[LI].Text);
+          else
+            LColumn := LColumn + DoWidth(self.FGaps[LI].Original);
+          end;
+        end;
+        LColumn := LColumn + DoFirstLineWidth(self.FSpell[LI]);
+        if (self.FKinds[LI] = TokenKind.LParen) or (self.FKinds[LI] = TokenKind.LBracket) then
+          LDepth := LDepth + 1;
+        else
+          if (self.FKinds[LI] = TokenKind.RParen) or (self.FKinds[LI] = TokenKind.RBracket) then
+            LDepth := LDepth - 1;
+          end;
+        end;
+      end;
+      if (LColumn <= self.FOptions.MaxLineLength) or (len(LCandidates) = 0) then
+        return -1;
+      end;
+      LBest := LCandidates[0];
+      LHaveBest := false;
+      LFits := false;
+      for LI := 0 to len(LCandidates) - 1 do
+        LCandidate := LCandidates[LI];
+        if LCandidate.Column <= self.FOptions.MaxLineLength then
+          // The rightmost of the best that fit: a later equal one wins
+          if (not LFits) or DoIsBetter(LCandidate, LBest) or not DoIsBetter(LBest, LCandidate) then
+            LBest := LCandidate;
+            LFits := true;
+            LHaveBest := true;
+          end;
+        else
+          // None fits yet: the leftmost of the best
+          if (not LFits) and ((not LHaveBest) or DoIsBetter(LCandidate, LBest)) then
+            LBest := LCandidate;
+            LHaveBest := true;
+          end;
+        end;
+      end;
+      return LBest.Gap;
+    end;
+
+    // A line over MaxLineLength breaks at its best candidate, again until it fits or has
+    // none left; every continuation line sits one level in from its statement's base
+    hidden method DoFit();
+    var
+      LStart: int64;
+      LEnd: int64;
+      LBase: int64;
+      LBreak: int64;
+    begin
+      LStart := 0;
+      LBase := 0;
+      while LStart < self.FCount - 1 do
+        LBase := self.DoLineBase(LStart, LBase);
+        LEnd := self.DoLineEnd(LStart);
+        LBreak := self.DoFitLine(LStart, LEnd);
+        if LBreak > 0 then
+          self.FGaps[LBreak].Kind := FormatGapKind.Hard;
+          self.FGaps[LBreak].Level := LBase + 1;
+          self.FGaps[LBreak].IsContinue := true;
+          self.FGaps[LBreak].Broken := true;
+          LEnd := LBreak - 1;
+        end;
+        LStart := LEnd + 1;
+      end;
+    end;
+
+    // -- Output
+
+    // A tab per level, else IndentSize spaces per level
+    hidden const method DoIndentText(const ALevel: int64): string;
+    var
+      LCount: int64;
+    begin
+      LCount := ALevel;
+      if LCount < 0 then
+        LCount := 0;
+      end;
+      if self.FOptions.UseTabs then
+        return StringOfChar('\t', LCount);
+      end;
+      return StringOfChar(' ', LCount * self.FOptions.IndentSize);
+    end;
+
+    // The token before gap AIndex already ends its line (its text ends in a line ending)
+    hidden const method DoPrevEndsLine(const AIndex: int64): bool;
+    begin
+      if AIndex <= 0 then
+        return false;
+      end;
+      return DoEndsLine(self.FSpell[AIndex - 1]);
+    end;
+
+    // R6: ARun's line endings, at least AMin, at most MaxBlankLines blank lines, each the
+    // file's own; trailing blanks only when TrimTrailingWhitespace is off
+    hidden const method DoEolRun(const ARun: string; const AMin: int64): string;
+    var
+      LParts: StringArray;
+      LCount: int64;
+      LText: string;
+      LI: int64;
+    begin
+      LParts := DoSplitLines(ARun);
+      LCount := DoCountEols(ARun);
+      if LCount < AMin then
+        LCount := AMin;
+      end;
+      if LCount > self.FOptions.MaxBlankLines + 1 then
+        LCount := self.FOptions.MaxBlankLines + 1;
+      end;
+      LText := "";
+      for LI := 0 to LCount - 1 do
+        if (not self.FOptions.TrimTrailingWhitespace) and (LI < len(LParts) - 1) then
+          LText := LText + LParts[LI];
+        end;
+        LText := LText + self.FEol;
+      end;
+      return LText;
+    end;
+
+    // A line start: the line endings as written (at least one, unless the token before
+    // already ends its line), then the indent
+    hidden const method DoBreakText(const AIndex: int64): string;
+    var
+      LMin: int64;
+    begin
+      LMin := 1;
+      if self.DoPrevEndsLine(AIndex) then
+        LMin := 0;
+      end;
+      return self.DoEolRun(self.FGaps[AIndex].Original, LMin) +
+        self.DoIndentText(self.FGaps[AIndex].Level);
+    end;
+
+    // R4: an own-line comment's level: the code line's after it; before end / else / until
+    // / except / finally the body's (one in), except the end of a module with no body
+    hidden const method DoCommentLevel(const AIndex: int64): int64;
+    begin
+      if AIndex >= self.FCount - 1 then
+        return 0;
+      end;
+      match self.FKinds[AIndex] of
+        TokenKind.KwEnd, TokenKind.KwElse, TokenKind.KwUntil, TokenKind.KwExcept,
+        TokenKind.KwFinally:
+          if (AIndex = self.FModuleEnd) and not self.FHasBody then
+            return self.FGaps[AIndex].Level;
+          end;
+          return self.FGaps[AIndex].Level + 1;
+      else
+        return self.FGaps[AIndex].Level;
+      end;
+    end;
+
+    // R4: only the blank runs between the comments change, never a comment's text. A run
+    // on one line (a trailing comment) stays; a run holding a line ending starts the
+    // comment on its own line at the comment level. The file starts with its first comment;
+    // the run after the last comment starts the token's line, or at the file's end is its
+    // one final line ending
+    hidden const method DoCommentGapText(const AIndex: int64; const AIsEnd: bool): string;
+    var
+      LText: string;
+      LLevel: int64;
+      LAt: int64;
+      LRun: string;
+      LI: int64;
+    begin
+      LLevel := self.DoCommentLevel(AIndex);
+      LAt := self.FGaps[AIndex].StartOffset;
+      LText := "";
+      for LI := 0 to len(self.FGaps[AIndex].CommentStarts) - 1 do
+        LRun := Substring(self.FText, LAt, self.FGaps[AIndex].CommentStarts[LI] - LAt);
+        if not ((LI = 0) and (AIndex = 0)) then
+          if DoCountEols(LRun) = 0 then
+            LText := LText + LRun;
+          else
+            LText := LText + self.DoEolRun(LRun, 1) + self.DoIndentText(LLevel);
+          end;
+        end;
+        LText := LText + Substring(self.FText, self.FGaps[AIndex].CommentStarts[LI],
+          self.FGaps[AIndex].CommentEnds[LI] - self.FGaps[AIndex].CommentStarts[LI]);
+        LAt := self.FGaps[AIndex].CommentEnds[LI];
+      end;
+      LRun := Substring(self.FText, LAt, self.FGaps[AIndex].EndOffset - LAt);
+      if AIsEnd then
+        if self.FOptions.FinalNewline then
+          return LText + self.FEol;
+        end;
+        return LText + LRun;
+      end;
+      return LText + self.DoEolRun(LRun, 1) + self.DoIndentText(self.FGaps[AIndex].Level);
+    end;
+
+    // R6: the file ends with one line ending (none more when the last token already ends
+    // its line); FinalNewline off: as written
+    hidden const method DoEndText(const AIndex: int64): string;
+    begin
+      if not self.FOptions.FinalNewline then
+        return self.FGaps[AIndex].Original;
+      end;
+      if self.DoPrevEndsLine(AIndex) then
+        return "";
+      end;
+      return self.FEol;
+    end;
+
+    // Each gap's text: the file's start and end (R6), a line start (with its comments,
+    // R4), a spaced or joined gap (its Text already); everything else as it stands
+    hidden method DoGapTexts();
+    var
+      LI: int64;
+      LIsEnd: bool;
+      LHasComment: bool;
+    begin
+      for LI := 0 to self.FCount do
+        if self.FGaps[LI].Kind = FormatGapKind.Space then
+          skip;
+        end;
+        if self.FGaps[LI].Locked or (LI >= self.FCount) then
+          self.FGaps[LI].Text := self.FGaps[LI].Original;
+          skip;
+        end;
+        LIsEnd := self.FKinds[LI] = TokenKind.EndOfFile;
+        LHasComment := len(self.FGaps[LI].CommentStarts) > 0;
+        if LHasComment and ((LI = 0) or LIsEnd or (self.FGaps[LI].Kind = FormatGapKind.Hard)) then
+          self.FGaps[LI].Text := self.DoCommentGapText(LI, LIsEnd);
+        else
+          if LIsEnd then
+            self.FGaps[LI].Text := self.DoEndText(LI);
+          else
+            if LI = 0 then
+              self.FGaps[LI].Text := "";
+            else
+              if self.FGaps[LI].Broken then
+                // A break the fit made is one line ending and the indent (never a blank
+                // line: the next run joins and breaks it the same)
+                self.FGaps[LI].Text := self.FEol + self.DoIndentText(self.FGaps[LI].Level);
+              else
+                if self.FGaps[LI].Kind = FormatGapKind.Hard then
+                  self.FGaps[LI].Text := self.DoBreakText(LI);
+                else
+                  self.FGaps[LI].Text := self.FGaps[LI].Original;
+                end;
+              end;
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // The buffer's BOM, then gaps and tokens in order; one edit per gap whose text changed,
+    // on the buffer's offsets
+    hidden method DoRender(var AEdits: LSPFormatEdits): string;
+    var
+      LBuilder: ref TextBuilder;
+      LCount: int64;
+      LI: int64;
+    begin
+      LBuilder := ref TextBuilder();
+      setlength(AEdits, 0);
+      LBuilder.Add(Substring(self.FText, 0, self.FGaps[0].StartOffset));
+      for LI := 0 to self.FCount do
+        LBuilder.Add(self.FGaps[LI].Text);
+        if self.FGaps[LI].Text <> self.FGaps[LI].Original then
+          LCount := len(AEdits);
+          setlength(AEdits, LCount + 1);
+          AEdits[LCount].StartOffset := self.FGaps[LI].StartOffset;
+          AEdits[LCount].EndOffset := self.FGaps[LI].EndOffset;
+          AEdits[LCount].NewText := self.FGaps[LI].Text;
+        end;
+        if LI < self.FCount then
+          LBuilder.Add(self.FSpell[LI]);
+        end;
+      end;
+      return LBuilder.Text();
+    end;
+
+    // The result lexes back with no error to the same token kinds and spellings and the
+    // same comment texts
+    hidden method DoVerify(const AText: string): bool;
+    var
+      LSource: ref SourceText;
+      LReports: ref Diagnostics;
+      LLexer: ref Lexer;
+      LTokens: TokenList;
+      LToken: ref Token;
+      LOld: StringArray;
+      LNew: StringArray;
+      LStarts: Int64Array;
+      LEnds: Int64Array;
+      LI: int64;
+    begin
+      LSource := ref SourceText(self.FFile, AText);
+      LReports := ref Diagnostics(ADAM_LSP_FORMAT_BUDGET);
+      LLexer := ref Lexer(LSource, LReports);
+      LTokens := LLexer.ReadAll();
+      if LReports.HasErrors() or (LTokens.Count <> self.FCount) then
+        return false;
+      end;
+      for LI := 0 to self.FCount - 1 do
+        LToken := LTokens[LI];
+        if (LToken.Kind <> self.FKinds[LI]) or
+          (LSource.Slice(LToken.StartOffset, LToken.EndOffset) <> self.FSpell[LI]) then
+          return false;
+        end;
+      end;
+      LOld := DoCommentTexts(self.FText, self.FGaps[0].StartOffset, self.FStarts, self.FEnds);
+      setlength(LStarts, LTokens.Count);
+      setlength(LEnds, LTokens.Count);
+      for LI := 0 to LTokens.Count - 1 do
+        LStarts[LI] := LTokens[LI].StartOffset;
+        LEnds[LI] := LTokens[LI].EndOffset;
+      end;
+      LNew := DoCommentTexts(AText, LSource.FirstLineStart, LStarts, LEnds);
+      if len(LOld) <> len(LNew) then
+        return false;
+      end;
+      for LI := 0 to len(LOld) - 1 do
+        if LOld[LI] <> LNew[LI] then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+  end;
+
+// AText formatted with AOptions over ATree's module AModule, the
+// check of that same text. ASyntaxClean: the check reported no lexer / conditional /
+// parser error for the file (else, or with no module, the run is refused: Syntax)
+public func FormatSource(const AText: string; const ATree: ref SyntaxTree;
+  const AModule: int64; const ASyntaxClean: bool; const AOptions: LSPFormatOptions): LSPFormatResult;
+var
+  LResult: LSPFormatResult;
+  LFormatter: ref LSPFormatter;
+begin
+  setlength(LResult.Edits, 0);
+  LResult.Text := AText;
+  LResult.Refusal := LSPFormatRefusal.None;
+  if (not ASyntaxClean) or (ATree = nil) or (AModule = 0) then
+    LResult.Refusal := LSPFormatRefusal.Syntax;
+    return LResult;
+  end;
+  LFormatter := ref LSPFormatter(AText, ATree, AModule, AOptions);
+  LFormatter.Run(LResult.Edits, LResult.Text, LResult.Refusal);
+  return LResult;
+end;
+
+end.

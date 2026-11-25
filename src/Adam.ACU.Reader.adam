@@ -1,0 +1,1140 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.ACU.Reader.adam - a compiled unit's (.acu) payload back into the tree
+  (DESIGN sec 3)
+
+  ReadACUHeader   the header alone (Adam.ACU.Format's layout): what the
+                  currency check (SU2.3) compares; false when the bytes are
+                  no payload of this format version
+  ACUGroupReader  payloads read into a tree as one group (the units the
+                  parser loads from .acu in one go, imports first; units that
+                  import each other, like the runtime and its platform unit,
+                  are members of one group). Append reads one: its nodes
+                  added in slice order (a slice index k is the tree id base
+                  + k - 1, so a Local reference is bound before its node is
+                  read), each fixed node kept, the system scope's and an
+                  attached unit's declarations found by name (ACUPathOf), a
+                  reference into a unit not attached yet kept as a
+                  placeholder, the formats and the runtime's facts read.
+                  Finish then attaches every member in slice order
+                  (children in order), binds the placeholders, attaches the
+                  generic instances a member carries from other units under
+                  their generics' parents (M10f), makes the derived types the
+                  members copied in and every instance read canonical in one
+                  pass (Adam.Compiler.Types' InternCopies: one instance per
+                  key in the tree, a second copy merged into the first),
+                  sends every link through that and marks every node
+                  Compiled. A name another
+                  unit no longer declares is an AU0002 at the place the
+                  caller gives (the importer's import), a unit not loaded an
+                  AU0003, a damaged payload an AU0001: never a crash
+*******************************************************************************/
+
+module unit Adam.ACU.Reader;
+
+import System.SysUtils, Adam.Core.Common, Adam.Core.Containers, Adam.Core.Messages,
+  Adam.Compiler.SourceText, Adam.Compiler.Diagnostics, Adam.Compiler.Literals,
+  Adam.Compiler.AST, Adam.Compiler.Scopes, Adam.Compiler.Types, Adam.ACU.Format;
+
+const
+  ADAM_ERR_ACU_001: string = "AU0001";   // a damaged compiled unit
+  ADAM_ERR_ACU_002: string = "AU0002";   // a compiled unit uses a declaration its import no longer has
+  ADAM_ERR_ACU_003: string = "AU0003";   // a compiled unit uses a unit that is not loaded
+  // Raised (an invariant broken): the tree handed out another id than the slice index names
+  ADAM_ACU_READER_FAULT_ID: string = "ACU.Reader: a node did not get its slice id: #";
+
+// ACount bytes of ABytes at AAt copied to ADest in one block. Through a const parameter: its
+// element's address is a ptr to const that shares the block (BNF sec 4), so the payload a
+// cursor shares with its caller is read where it is, never copied first
+func DoCopyOut(const ADest: ptr to uint8; const ABytes: ByteArray; const AAt: int64;
+  const ACount: int64);
+begin
+  CopyBytes(ADest, addr of ABytes[AAt], ACount);
+end;
+
+type
+  // The payload's bytes read in order; reading past the end reads 0 and marks it Short
+  ACUCursor = object
+    hidden FBytes: ByteArray;
+    hidden FAt: int64;
+    hidden FShort: bool;
+
+    init(const ABytes: ByteArray);
+    begin
+      self.FBytes := ABytes;
+      self.FAt := 0;
+      self.FShort := false;
+    end;
+
+    // True once a read ran past the end
+    property Short: bool read FShort;
+
+    // How many bytes are left to read
+    const method Remaining(): int64;
+    begin
+      return len(self.FBytes) - self.FAt;
+    end;
+
+    hidden method DoGet(const ACount: int64): uint64;
+    var
+      LValue: uint64;
+    begin
+      if self.FShort or (self.FAt + ACount > len(self.FBytes)) then
+        self.FShort := true;
+        return 0;
+      end;
+      LValue := GetLe(self.FBytes, self.FAt, ACount);
+      self.FAt := self.FAt + ACount;
+      return LValue;
+    end;
+
+    // One byte, or 2, 4, 8 little-endian bytes (a byte read straight: the records' most
+    // read field, a reference's kind and every bool)
+    method Get8(): uint64;
+    var
+      LValue: uint64;
+    begin
+      if self.FShort or (self.FAt >= len(self.FBytes)) then
+        self.FShort := true;
+        return 0;
+      end;
+      LValue := uint64(self.FBytes[self.FAt]);
+      self.FAt := self.FAt + 1;
+      return LValue;
+    end;
+
+    method Get32(): uint64;
+    begin
+      return self.DoGet(4);
+    end;
+
+    method Get64(): uint64;
+    begin
+      return self.DoGet(8);
+    end;
+
+    method GetBool(): bool;
+    begin
+      return self.Get8() <> 0;
+    end;
+
+    // A var (Adam.ACU.Format's header): 7 bits a byte, the lowest first, while the top bit
+    // is set; one of more than 10 bytes is damaged (read as Short)
+    method GetVar(): uint64;
+    var
+      LValue: uint64;
+      LByte: uint64;
+      LShift: uint64;
+    begin
+      LValue := 0;
+      LShift := 0;
+      while true do
+        if self.FShort or (self.FAt >= len(self.FBytes)) or (LShift > uint64(63)) then
+          self.FShort := true;
+          return 0;
+        end;
+        LByte := uint64(self.FBytes[self.FAt]);
+        self.FAt := self.FAt + 1;
+        LValue := LValue | ((LByte & ADAM_ACU_VAR_BITS) shl LShift);
+        if (LByte & ADAM_ACU_VAR_MORE) = 0 then
+          return LValue;
+        end;
+        LShift := LShift + uint64(7);
+      end;
+    end;
+
+    // A signed var: its zigzag undone (2n -> n, 2n + 1 -> -n - 1)
+    method GetSigned(): int64;
+    var
+      LValue: uint64;
+    begin
+      LValue := self.GetVar();
+      if (LValue & uint64(1)) <> 0 then
+        return -int64(LValue shr uint64(1)) - 1;
+      end;
+      return int64(LValue shr uint64(1));
+    end;
+
+    // An inline text: its byte count (var), then its bytes, copied in one block
+    method GetText(): string;
+    var
+      LCount: int64;
+      LText: string;
+    begin
+      LCount := int64(self.GetVar());
+      if self.FShort or (LCount < 0) or (self.FAt + LCount > len(self.FBytes)) then
+        self.FShort := true;
+        return "";
+      end;
+      if LCount = 0 then
+        return "";
+      end;
+      setlength(LText, LCount);
+      DoCopyOut(ptr to uint8(ptr(addr of LText[0])), self.FBytes, self.FAt, LCount);
+      self.FAt := self.FAt + LCount;
+      return LText;
+    end;
+  end;
+
+// AHeader from ACursor at the payload's start; false when it is no payload of this format
+// version (AReason: why, an ADAM_MSG_ACU_REASON_*)
+func DoGetHeader(const ACursor: ref ACUCursor; var AHeader: ACUHeader; var AReason: string): bool;
+var
+  LI: int64;
+  LCount: int64;
+begin
+  for LI := 0 to len(ADAM_ACU_MAGIC) - 1 do
+    if ACursor.Get8() <> uint64(uint8(ADAM_ACU_MAGIC[LI])) then
+      AReason := ADAM_MSG_ACU_REASON_MAGIC;
+      return false;
+    end;
+  end;
+  AHeader.FormatVersion := int64(ACursor.Get32());
+  if AHeader.FormatVersion <> ADAM_ACU_FORMAT_VERSION then
+    AReason := ADAM_MSG_ACU_REASON_VERSION;
+    return false;
+  end;
+  AHeader.CompilerVersion := ACursor.GetText();
+  AHeader.CompilerId := ACursor.Get64();
+  AHeader.Triple := ACursor.GetText();
+  AHeader.Mode := ACursor.GetText();
+  AHeader.Defines := ACursor.GetText();
+  AHeader.UnitName := ACursor.GetText();
+  AHeader.SourcePath := ACursor.GetText();
+  AHeader.SourceSize := int64(ACursor.Get64());
+  AHeader.SourceTime := int64(ACursor.Get64());
+  AHeader.SourceHash := ACursor.Get64();
+  AHeader.ProjectKey := ACursor.Get64();
+  AHeader.InterfaceHash := ACursor.Get64();
+  LCount := int64(ACursor.Get32());
+  if ACursor.Short then
+    AReason := ADAM_MSG_ACU_REASON_SHORT;
+    return false;
+  end;
+  setlength(AHeader.Imports, 0);
+  setlength(AHeader.ImportHashes, 0);
+  for LI := 0 to LCount - 1 do
+    if ACursor.Short then
+      leave;
+    end;
+    setlength(AHeader.Imports, LI + 1);
+    AHeader.Imports[LI] := ACursor.GetText();
+    setlength(AHeader.ImportHashes, LI + 1);
+    AHeader.ImportHashes[LI] := ACursor.Get64();
+  end;
+  if ACursor.Short then
+    AReason := ADAM_MSG_ACU_REASON_SHORT;
+    return false;
+  end;
+  return true;
+end;
+
+// The header of the payload ABytes; false when ABytes is no payload of this format version
+public func ReadACUHeader(const ABytes: ByteArray; var AHeader: ACUHeader): bool;
+var
+  LCursor: ref ACUCursor;
+  LReason: string;
+begin
+  LCursor := ref ACUCursor(ABytes);
+  LReason := "";
+  return DoGetHeader(LCursor, AHeader, LReason);
+end;
+
+type
+  // One payload being read into a tree (see the header)
+  ACUSliceReader = object
+    hidden FTree: ref SyntaxTree;
+    hidden FDiagnostics: ref Diagnostics;
+    hidden FCursor: ref ACUCursor;
+    // The unit being read (its header's name) and the place an error is told at
+    hidden FLabel: string;
+    hidden FPlace: SourcePlace;
+    // The string pool: id n is FPool[n] (FPool[0] is "")
+    hidden FPool: StringArray;
+    // The slice: index k is tree id FBase + k - 1, k = 1 .. FCount
+    hidden FBase: int64;
+    hidden FCount: int64;
+    // Each slice node's parent (a bound reference) and role, attached once all is bound
+    hidden FParents: Int64Array;
+    hidden FRoles: array of NodeRole;
+    // The slice indexes (0-based) of the generic instances the payload carries from other
+    // units (Adam.ACU.Writer's DoCarriedRoot: a GenericInstance whose parent is no slice
+    // node), attached by AttachCarried once their parents are bound
+    hidden FCarried: ref Int64List;
+    // A unit's Module node by name, found once
+    hidden FModules: ref StringIdMap;
+    // What was told already (a damaged payload once; a missing unit or name once each)
+    hidden FTold: ref StringIdMap;
+    // The group's bound references (ACUGroupReader's, shared by its members): a System path
+    // and a unit + path found once each, as every payload names the same few many times
+    hidden FSystemIds: ref StringIdMap;
+    hidden FForeignIds: ref StringIdMap;
+    hidden FDamaged: bool;
+    hidden FFailed: bool;
+    // A reference into a unit not attached yet (one read in the same group, DoGetRef): the
+    // unit and path of placeholder -(n + 1), bound by Resolve
+    hidden FDeferUnits: StringArray;
+    hidden FDeferPaths: StringArray;
+    hidden FDeferIds: Int64Array;
+    // The runtime's facts as read (FIsRuntime), recorded by Settle
+    hidden FIsRuntime: bool;
+    hidden FRuntime: Int64Array;
+    hidden FVarKind: int64;
+    hidden FAllocSite: int64;
+
+    init(const ATree: ref SyntaxTree; const ADiagnostics: ref Diagnostics;
+      const ABytes: ByteArray; const APlace: SourcePlace; const ASystemIds: ref StringIdMap;
+      const AForeignIds: ref StringIdMap);
+    begin
+      self.FTree := ATree;
+      self.FDiagnostics := ADiagnostics;
+      self.FSystemIds := ASystemIds;
+      self.FForeignIds := AForeignIds;
+      self.FCursor := ref ACUCursor(ABytes);
+      self.FLabel := "";
+      self.FPlace := APlace;
+      setlength(self.FPool, 1);
+      self.FPool[0] := "";
+      self.FBase := 0;
+      self.FCount := 0;
+      setlength(self.FParents, 0);
+      setlength(self.FRoles, 0);
+      self.FCarried := ref Int64List();
+      self.FModules := ref StringIdMap(0);
+      self.FTold := ref StringIdMap(0);
+      self.FDamaged := false;
+      self.FFailed := false;
+      setlength(self.FDeferUnits, 0);
+      setlength(self.FDeferPaths, 0);
+      setlength(self.FDeferIds, 0);
+      self.FIsRuntime := false;
+      setlength(self.FRuntime, 0);
+      self.FVarKind := 0;
+      self.FAllocSite := 0;
+    end;
+
+    // The payload is damaged (AReason an ADAM_MSG_ACU_REASON_*): told once
+    hidden method DoDamaged(const AReason: string);
+    begin
+      self.FFailed := true;
+      if self.FDamaged then
+        return;
+      end;
+      self.FDamaged := true;
+      self.FDiagnostics.Add(Severity.Error, ADAM_ERR_ACU_001, self.FPlace, ADAM_MSG_ACU_DAMAGED,
+        NoArgs().Str(self.FLabel).Str(AReason));
+    end;
+
+    // A text field: its pool id
+    hidden method DoGetString(): string;
+    var
+      LId: int64;
+    begin
+      LId := int64(self.FCursor.GetVar());
+      if (LId < 0) or (LId >= len(self.FPool)) then
+        self.DoDamaged(ADAM_MSG_ACU_REASON_STRING);
+        return "";
+      end;
+      return self.FPool[LId];
+    end;
+
+    // The Module node of the unit AName in the tree (0: not loaded)
+    hidden method DoModule(const AName: string): int64;
+    var
+      LId: int64;
+      LI: int64;
+      LChild: int64;
+    begin
+      LId := self.FModules.Find(AName);
+      if LId <> 0 then
+        return LId;
+      end;
+      for LI := 0 to self.FTree.ChildCount(ADAM_AST_PROGRAM) - 1 do
+        LChild := self.FTree.ChildAt(ADAM_AST_PROGRAM, LI);
+        if (self.FTree[LChild].Kind = NodeKind.Module) and (self.FTree[LChild].Text = AName) then
+          self.FModules.Put(AName, LChild);
+          return LChild;
+        end;
+      end;
+      return 0;
+    end;
+
+    // The child of AAt one ACUPathOf segment names (0: none)
+    hidden const method DoStep(const AAt: int64; const ASegment: string): int64;
+    var
+      LName: string;
+      LNumber: int64;
+      LMark: int64;
+      LI: int64;
+      LChild: int64;
+      LSeen: int64;
+    begin
+      if StartsStr(ADAM_ACU_PATH_INDEX, ASegment) then
+        if not TryStrToInt(Substring(ASegment, 1, len(ASegment) - 1), LNumber) then
+          return 0;
+        end;
+        if (LNumber < 0) or (LNumber >= self.FTree.ChildCount(AAt)) then
+          return 0;
+        end;
+        return self.FTree.ChildAt(AAt, LNumber);
+      end;
+      // A name, then '#n' when n earlier named siblings share it
+      LName := ASegment;
+      LNumber := 0;
+      LMark := -1;
+      for LI := 0 to len(ASegment) - 1 do
+        if ASegment[LI] = ADAM_ACU_PATH_OVERLOAD[0] then
+          LMark := LI;
+        end;
+      end;
+      if LMark >= 0 then
+        LName := Substring(ASegment, 0, LMark);
+        if not TryStrToInt(Substring(ASegment, LMark + 1, len(ASegment) - LMark - 1), LNumber) then
+          return 0;
+        end;
+      end;
+      LSeen := 0;
+      for LI := 0 to self.FTree.ChildCount(AAt) - 1 do
+        LChild := self.FTree.ChildAt(AAt, LI);
+        if ACUNamesNode(self.FTree[LChild].Kind) and (self.FTree[LChild].Text = LName) then
+          if LSeen = LNumber then
+            return LChild;
+          end;
+          LSeen := LSeen + 1;
+        end;
+      end;
+      return 0;
+    end;
+
+    // The node APath (ACUPathOf) names below ARoot ("" ARoot itself; 0: none)
+    hidden const method DoFind(const ARoot: int64; const APath: string): int64;
+    var
+      LAt: int64;
+      LSegments: StringArray;
+      LI: int64;
+    begin
+      if APath = "" then
+        return ARoot;
+      end;
+      LSegments := SplitString(APath, ADAM_ACU_PATH_SEPARATOR);
+      LAt := ARoot;
+      for LI := 0 to len(LSegments) - 1 do
+        LAt := self.DoStep(LAt, LSegments[LI]);
+        if LAt = 0 then
+          return 0;
+        end;
+      end;
+      return LAt;
+    end;
+
+    // A reference bound to a tree id (see Adam.ACU.Format's header; 0 when it names none, an
+    // error told; a negative placeholder when it names a unit not attached yet, bound by
+    // Resolve)
+    hidden method DoGetRef(): int64;
+    var
+      LRaw: uint64;
+      LKind: ACURefKind;
+      LIndex: int64;
+      LUnit: string;
+      LPath: string;
+      LId: int64;
+    begin
+      LRaw := self.FCursor.Get8();
+      if LRaw > uint64(int32(ACURefKind.Foreign)) then
+        self.DoDamaged(ADAM_MSG_ACU_REASON_KIND);
+        return 0;
+      end;
+      LKind := ACURefKind(int32(LRaw));
+      if LKind = ACURefKind.None then
+        return 0;
+      end;
+      if LKind = ACURefKind.Local then
+        LIndex := int64(self.FCursor.GetVar());
+        if (LIndex < 1) or (LIndex > self.FCount) then
+          self.DoDamaged(ADAM_MSG_ACU_REASON_LOCAL);
+          return 0;
+        end;
+        return self.FBase + LIndex - 1;
+      end;
+      if LKind = ACURefKind.Fixed then
+        LIndex := int64(self.FCursor.GetVar());
+        if (LIndex < 0) or (LIndex > ADAM_AST_DERIVED) then
+          self.DoDamaged(ADAM_MSG_ACU_REASON_LOCAL);
+          return 0;
+        end;
+        return LIndex;
+      end;
+      if LKind = ACURefKind.System then
+        // The System tree never changes: a path found once is that node for the group
+        LPath := self.DoGetString();
+        LId := self.FSystemIds.Find(LPath);
+        if LId <> 0 then
+          return LId;
+        end;
+        LId := self.DoFind(ADAM_AST_SYSTEM, LPath);
+        if LId = 0 then
+          self.DoDamaged(ADAM_MSG_ACU_REASON_SYSTEM);
+        else
+          self.FSystemIds.Put(LPath, LId);
+        end;
+        return LId;
+      end;
+      // Foreign: another unit's declaration, found by name in the unit as it is now; a unit
+      // not attached yet (read in the same group) is bound by Resolve
+      LUnit := self.DoGetString();
+      LPath := self.DoGetString();
+      if self.DoModule(LUnit) = 0 then
+        LIndex := len(self.FDeferUnits);
+        setlength(self.FDeferUnits, LIndex + 1);
+        setlength(self.FDeferPaths, LIndex + 1);
+        self.FDeferUnits[LIndex] := LUnit;
+        self.FDeferPaths[LIndex] := LPath;
+        return -(LIndex + 1);
+      end;
+      return self.DoForeign(LUnit, LPath);
+    end;
+
+    // The declaration APath (ACUPathOf) of the unit AUnit as the tree has it now; 0 when it
+    // has none, the error told once
+    hidden method DoForeign(const AUnit: string; const APath: string): int64;
+    var
+      LModule: int64;
+      LId: int64;
+      LKey: string;
+    begin
+      // An attached unit's declarations keep their ids: one found once is found for the
+      // group (a missing one is not kept, so each member tells its own error)
+      LKey := AUnit + ADAM_ACU_PATH_SEPARATOR + APath;
+      LId := self.FForeignIds.Find(LKey);
+      if LId <> 0 then
+        return LId;
+      end;
+      LModule := self.DoModule(AUnit);
+      if LModule = 0 then
+        self.FFailed := true;
+        if self.FTold.Find(AUnit) = 0 then
+          self.FTold.Put(AUnit, 1);
+          self.FDiagnostics.Add(Severity.Error, ADAM_ERR_ACU_003, self.FPlace, ADAM_MSG_ACU_NO_UNIT,
+            NoArgs().Str(self.FLabel).Str(AUnit));
+        end;
+        return 0;
+      end;
+      LId := self.DoFind(LModule, APath);
+      if LId = 0 then
+        self.FFailed := true;
+        if self.FTold.Find(LKey) = 0 then
+          self.FTold.Put(LKey, 1);
+          self.FDiagnostics.Add(Severity.Error, ADAM_ERR_ACU_002, self.FPlace, ADAM_MSG_ACU_MISSING,
+            NoArgs().Str(self.FLabel).Str(APath).Str(AUnit));
+        end;
+      else
+        self.FForeignIds.Put(LKey, LId);
+      end;
+      return LId;
+    end;
+
+    // A literal's fault in one encoding (the writer's DoPutFault)
+    hidden method DoGetFault(): EncodingFault;
+    var
+      LFault: EncodingFault;
+    begin
+      LFault.Reason := self.DoGetString();
+      LFault.IsWarning := self.FCursor.GetBool();
+      return LFault;
+    end;
+
+    // A UTF-16 text (the writer's DoPutWide)
+    hidden method DoGetWide(): wstring;
+    var
+      LWide: wstring;
+      LCount: int64;
+      LI: int64;
+    begin
+      LCount := int64(self.FCursor.GetVar());
+      setlength(LWide, 0);
+      for LI := 0 to LCount - 1 do
+        if self.FCursor.Short then
+          leave;
+        end;
+        setlength(LWide, LI + 1);
+        LWide[LI] := wchar(uint16(self.FCursor.GetVar()));
+      end;
+      return LWide;
+    end;
+
+    // A node's flags from their mask (the writer's DoFlagsMask)
+    hidden method DoGetFlags(): NodeFlags;
+    var
+      LMask: uint64;
+      LFlags: NodeFlags;
+      LFlag: NodeFlag;
+    begin
+      LMask := self.FCursor.GetVar();
+      LFlags := [];
+      // NodeFlag's first value to the last one a compiled unit keeps (the writer's bound)
+      for LFlag := NodeFlag.Public to NodeFlag.SelfReturn do
+        if (LMask & (uint64(1) shl uint64(int32(LFlag)))) <> 0 then
+          LFlags += [LFlag];
+        end;
+      end;
+      return LFlags;
+    end;
+
+    // One level of a placeholder's spec (the writer's DoPutSpec)
+    hidden method DoGetSpec(): FormatSpec;
+    var
+      LSpec: FormatSpec;
+    begin
+      LSpec := DefaultFormatSpec();
+      LSpec.Fill := self.DoGetString();
+      LSpec.Align := FormatAlign(int32(self.FCursor.GetVar()));
+      LSpec.Sign := FormatSign(int32(self.FCursor.GetVar()));
+      LSpec.Alternate := self.FCursor.GetBool();
+      LSpec.ZeroPad := self.FCursor.GetBool();
+      LSpec.Width := int32(self.FCursor.GetSigned());
+      LSpec.WidthArgument := int32(self.FCursor.GetSigned());
+      LSpec.Precision := int32(self.FCursor.GetSigned());
+      LSpec.PrecisionArgument := int32(self.FCursor.GetSigned());
+      LSpec.Localized := self.FCursor.GetBool();
+      LSpec.ClearBrackets := self.FCursor.GetBool();
+      LSpec.Presentation := self.DoGetString();
+      return LSpec;
+    end;
+
+    // A print / println / FormatStr format (the writer's DoPutFormat)
+    hidden method DoGetFormat(): FormatPlan;
+    var
+      LPlan: FormatPlan;
+      LCount: int64;
+      LSpecs: int64;
+      LI: int64;
+      LJ: int64;
+    begin
+      LCount := int64(self.FCursor.GetVar());
+      setlength(LPlan.Items, 0);
+      for LI := 0 to LCount - 1 do
+        if self.FCursor.Short then
+          leave;
+        end;
+        setlength(LPlan.Items, LI + 1);
+        LPlan.Items[LI].Text := self.DoGetString();
+        LPlan.Items[LI].Argument := int32(self.FCursor.GetSigned());
+        LSpecs := int64(self.FCursor.GetVar());
+        setlength(LPlan.Items[LI].Specs, 0);
+        for LJ := 0 to LSpecs - 1 do
+          if self.FCursor.Short then
+            leave;
+          end;
+          setlength(LPlan.Items[LI].Specs, LJ + 1);
+          LPlan.Items[LI].Specs[LJ] := self.DoGetSpec();
+        end;
+      end;
+      LPlan.Tail := self.DoGetString();
+      LPlan.AtRunTime := self.FCursor.GetBool();
+      return LPlan;
+    end;
+
+    // True when AField's bit is set in AMask
+    hidden const method DoHas(const AMask: uint64; const AField: ACUField): bool;
+    begin
+      return (AMask & ACUFieldBit(AField)) <> 0;
+    end;
+
+    // The slice node AIndex (1 .. FCount) from its record (the writer's DoPutNode), added to
+    // the tree; its parent and role kept for the attach. A field its mask leaves out keeps
+    // the value the tree's Add gave it (a new node's)
+    hidden method DoGetNode(const AIndex: int64);
+    var
+      LKind: NodeKind;
+      LParent: int64;
+      LRole: NodeRole;
+      LFile: string;
+      LLine: int32;
+      LColumn: int32;
+      LStart: int64;
+      LEnd: int64;
+      LId: int64;
+      LNode: ref Node;
+      LMask: uint64;
+    begin
+      LKind := NodeKind(int32(self.FCursor.GetVar()));
+      LParent := self.DoGetRef();
+      LRole := NodeRole(int32(self.FCursor.GetVar()));
+      LFile := self.DoGetString();
+      LLine := int32(self.FCursor.GetSigned());
+      LColumn := int32(self.FCursor.GetSigned());
+      LStart := self.FCursor.GetSigned();
+      LEnd := self.FCursor.GetSigned();
+      LId := self.FTree.Add(LKind, PlaceAt(LFile, LLine, LColumn), LStart, LEnd);
+      if LId <> self.FBase + AIndex - 1 then
+        raise(ADAM_ACU_READER_FAULT_ID + IntToStr(LId));
+      end;
+      self.FParents[AIndex - 1] := LParent;
+      self.FRoles[AIndex - 1] := LRole;
+
+      LNode := self.FTree[LId];
+      LMask := self.FCursor.GetVar();
+      // ACUField's last value is the mask's highest bit: one above it is no field
+      if LMask >= (ACUFieldBit(ACUField.DocText) shl uint64(1)) then
+        self.DoDamaged(ADAM_MSG_ACU_REASON_FIELD);
+        return;
+      end;
+      if self.DoHas(LMask, ACUField.Text) then
+        LNode.Text := self.DoGetString();
+      end;
+      if self.DoHas(LMask, ACUField.Decoded) then
+        LNode.Decoded := self.DoGetString();
+      end;
+      if self.DoHas(LMask, ACUField.DecodedWide) then
+        LNode.DecodedWide := self.DoGetWide();
+      end;
+      if self.DoHas(LMask, ACUField.NarrowFault) then
+        LNode.NarrowFault := self.DoGetFault();
+      end;
+      if self.DoHas(LMask, ACUField.WideFault) then
+        LNode.WideFault := self.DoGetFault();
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedPath) then
+        LNode.ResolvedPath := self.DoGetString();
+      end;
+      if self.DoHas(LMask, ACUField.Op) then
+        LNode.Op := OperatorKind(int32(self.FCursor.GetVar()));
+      end;
+      if self.DoHas(LMask, ACUField.Flags) then
+        LNode.Flags := self.DoGetFlags();
+      end;
+      if self.DoHas(LMask, ACUField.Module) then
+        LNode.Module := ModuleKind(int32(self.FCursor.GetVar()));
+      end;
+      if self.DoHas(LMask, ACUField.IntValue) then
+        LNode.IntValue := self.FCursor.GetVar();
+      end;
+      if self.DoHas(LMask, ACUField.Suffix) then
+        LNode.Suffix := self.DoGetString();
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedDecl) then
+        LNode.ResolvedDecl := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedUnit) then
+        LNode.ResolvedUnit := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedJump) then
+        LNode.ResolvedJump := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedType) then
+        LNode.ResolvedType := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedConvert) then
+        LNode.ResolvedConvert := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedEmbed) then
+        LNode.ResolvedEmbed := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedCallee) then
+        LNode.ResolvedCallee := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedConst) then
+        LNode.ResolvedConst.Kind := ConstKind(int32(self.FCursor.GetVar()));
+        LNode.ResolvedConst.Bits := self.FCursor.GetVar();
+        LNode.ResolvedConst.Float := Float64FromBits(self.FCursor.Get64());
+        LNode.ResolvedConst.Text := self.DoGetString();
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedLinkage) then
+        LNode.ResolvedLinkage := Linkage(int32(self.FCursor.GetVar()));
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedSymbol) then
+        LNode.ResolvedSymbol := self.DoGetString();
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedSize) then
+        LNode.ResolvedSize := self.FCursor.GetSigned();
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedAlign) then
+        LNode.ResolvedAlign := self.FCursor.GetSigned();
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedOffset) then
+        LNode.ResolvedOffset := self.FCursor.GetSigned();
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedBitOffset) then
+        LNode.ResolvedBitOffset := int32(self.FCursor.GetSigned());
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedBitWidth) then
+        LNode.ResolvedBitWidth := int32(self.FCursor.GetSigned());
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedSlot) then
+        LNode.ResolvedSlot := int32(self.FCursor.GetSigned());
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedInstance) then
+        LNode.ResolvedInstance := self.DoGetRef();
+      end;
+      if self.DoHas(LMask, ACUField.ResolvedFormat) then
+        self.FTree.SetFormat(LId, self.DoGetFormat());
+      end;
+      if self.DoHas(LMask, ACUField.DocText) then
+        LNode.DocText := self.DoGetString();
+      end;
+    end;
+
+    // ALink sent through AMap (a copied derived type to its canonical one)
+    hidden const method DoMapped(const AMap: ref Int64Map; const ALink: int64): int64;
+    var
+      LTo: int64;
+    begin
+      if ALink = 0 then
+        return 0;
+      end;
+      LTo := AMap.Find(ALink);
+      if LTo = 0 then
+        return ALink;
+      end;
+      return LTo;
+    end;
+
+    // ALink with a placeholder of DoGetRef bound (Resolve's FDeferIds)
+    hidden const method DoBound(const ALink: int64): int64;
+    begin
+      if ALink >= 0 then
+        return ALink;
+      end;
+      return self.FDeferIds[-ALink - 1];
+    end;
+
+    // The payload's header, strings, nodes and runtime facts read, its nodes added to the
+    // tree, nothing attached yet (see the header): its Module node, 0 when an error was told
+    method Read(): int64;
+    var
+      LHeader: ACUHeader;
+      LReason: string;
+      LCount: int64;
+      LI: int64;
+      LKind: RuntimeRoutine;
+    begin
+      LReason := "";
+      if not DoGetHeader(self.FCursor, LHeader, LReason) then
+        self.DoDamaged(LReason);
+        return 0;
+      end;
+      self.FLabel := LHeader.UnitName;
+      LCount := int64(self.FCursor.Get32());
+      // Every text is at least its one-byte count: a count past the bytes left is damaged
+      if LCount > self.FCursor.Remaining() then
+        self.DoDamaged(ADAM_MSG_ACU_REASON_SHORT);
+        return 0;
+      end;
+      setlength(self.FPool, LCount + 1);
+      for LI := 0 to LCount - 1 do
+        if self.FCursor.Short then
+          leave;
+        end;
+        self.FPool[LI + 1] := self.FCursor.GetText();
+      end;
+      self.FCount := int64(self.FCursor.Get32());
+      // A record is several bytes: a count past the bytes left is damaged
+      if self.FCursor.Short or (self.FCount > self.FCursor.Remaining()) then
+        self.DoDamaged(ADAM_MSG_ACU_REASON_SHORT);
+        return 0;
+      end;
+      self.FBase := self.FTree.Count;
+      setlength(self.FParents, self.FCount);
+      setlength(self.FRoles, self.FCount);
+      for LI := 1 to self.FCount do
+        // A damaged record (told) leaves the rest unread: its bytes say nothing more
+        if self.FCursor.Short or self.FDamaged then
+          leave;
+        end;
+        self.DoGetNode(LI);
+      end;
+
+      // The runtime's facts, recorded by Settle once everything is bound
+      self.FIsRuntime := self.FCursor.GetBool();
+      if self.FIsRuntime then
+        // RuntimeRoutine's first to its last value (the writer's bound), counted, then read
+        LI := 0;
+        for LKind := RuntimeRoutine.StrRelease to ADAM_AST_RUNTIME_LAST do
+          LI := LI + 1;
+        end;
+        setlength(self.FRuntime, LI);
+        LI := 0;
+        for LKind := RuntimeRoutine.StrRelease to ADAM_AST_RUNTIME_LAST do
+          self.FRuntime[LI] := self.DoGetRef();
+          LI := LI + 1;
+        end;
+        self.FVarKind := self.DoGetRef();
+        self.FAllocSite := self.DoGetRef();
+      end;
+      if self.FCursor.Short then
+        self.DoDamaged(ADAM_MSG_ACU_REASON_SHORT);
+      end;
+      if self.FFailed or (self.FCount = 0) then
+        return 0;
+      end;
+      // Slice index 1 is the Module node (the writer collects it first)
+      return self.FBase;
+    end;
+
+    // True when ALink (a read reference) is a node of this slice
+    hidden const method DoIsLocal(const ALink: int64): bool;
+    begin
+      return (ALink >= self.FBase) and (ALink < self.FBase + self.FCount);
+    end;
+
+    // Every slice node attached in slice order (a parent before its children, children in
+    // order) but the derived types it copied in, which join ACopies, and the generic
+    // instances it carries from other units (their parents another unit's nodes, maybe not
+    // attached yet: AttachCarried). A copied node no module held keeps no parent, as it had
+    // none
+    method Link(const ACopies: ref NodeList);
+    var
+      LI: int64;
+      LId: int64;
+    begin
+      for LI := 0 to self.FCount - 1 do
+        LId := self.FBase + LI;
+        if self.FParents[LI] = ADAM_AST_DERIVED then
+          ACopies.Add(LId);
+        else
+          if (self.FTree[LId].Kind = NodeKind.GenericInstance) and (self.FParents[LI] <> 0) and
+            not self.DoIsLocal(self.FParents[LI]) then
+            self.FCarried.Add(LI);
+          else
+            if self.FParents[LI] <> 0 then
+              self.FTree.Attach(self.FParents[LI], self.FRoles[LI], LId);
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    // Every carried generic instance (FCarried) attached under its parent, bound by now
+    // (Resolve): each of the group's copies of one instance is made one by InternCopies
+    method AttachCarried();
+    var
+      LI: int64;
+      LIndex: int64;
+    begin
+      for LI := 0 to self.FCarried.Count - 1 do
+        LIndex := self.FCarried[LI];
+        if self.FParents[LIndex] > 0 then
+          self.FTree.Attach(self.FParents[LIndex], self.FRoles[LIndex], self.FBase + LIndex);
+        end;
+      end;
+    end;
+
+    // Every generic instance of the slice (its own and the carried ones, nested ones too)
+    // added to AInstances, in slice order (an enclosing one first)
+    method AddInstances(const AInstances: ref NodeList);
+    var
+      LI: int64;
+    begin
+      for LI := 0 to self.FCount - 1 do
+        if self.FTree[self.FBase + LI].Kind = NodeKind.GenericInstance then
+          AInstances.Add(self.FBase + LI);
+        end;
+      end;
+    end;
+
+    // Every placeholder bound, the group's units attached by now: false when a unit or a
+    // declaration it names is missing (told once each; that link is then 0)
+    method Resolve(): bool;
+    var
+      LI: int64;
+      LNode: ref Node;
+    begin
+      setlength(self.FDeferIds, len(self.FDeferUnits));
+      for LI := 0 to len(self.FDeferUnits) - 1 do
+        self.FDeferIds[LI] := self.DoForeign(self.FDeferUnits[LI], self.FDeferPaths[LI]);
+      end;
+      for LI := 0 to self.FCarried.Count - 1 do
+        self.FParents[self.FCarried[LI]] := self.DoBound(self.FParents[self.FCarried[LI]]);
+      end;
+      for LI := 0 to self.FCount - 1 do
+        LNode := self.FTree[self.FBase + LI];
+        LNode.ResolvedDecl := self.DoBound(LNode.ResolvedDecl);
+        LNode.ResolvedUnit := self.DoBound(LNode.ResolvedUnit);
+        LNode.ResolvedJump := self.DoBound(LNode.ResolvedJump);
+        LNode.ResolvedType := self.DoBound(LNode.ResolvedType);
+        LNode.ResolvedConvert := self.DoBound(LNode.ResolvedConvert);
+        LNode.ResolvedEmbed := self.DoBound(LNode.ResolvedEmbed);
+        LNode.ResolvedCallee := self.DoBound(LNode.ResolvedCallee);
+        LNode.ResolvedInstance := self.DoBound(LNode.ResolvedInstance);
+      end;
+      for LI := 0 to len(self.FRuntime) - 1 do
+        self.FRuntime[LI] := self.DoBound(self.FRuntime[LI]);
+      end;
+      self.FVarKind := self.DoBound(self.FVarKind);
+      self.FAllocSite := self.DoBound(self.FAllocSite);
+      return not self.FFailed;
+    end;
+
+    // Every link sent through AMap (the group's derived types made canonical), each slice
+    // node marked Compiled, the runtime's facts recorded
+    method Settle(const AMap: ref Int64Map);
+    var
+      LI: int64;
+      LNode: ref Node;
+      LKind: RuntimeRoutine;
+    begin
+      for LI := 0 to self.FCount - 1 do
+        LNode := self.FTree[self.FBase + LI];
+        // Final as read: no phase of the front end visits it again
+        LNode.AddFlag(NodeFlag.Compiled);
+        LNode.ResolvedDecl := self.DoMapped(AMap, LNode.ResolvedDecl);
+        LNode.ResolvedUnit := self.DoMapped(AMap, LNode.ResolvedUnit);
+        LNode.ResolvedJump := self.DoMapped(AMap, LNode.ResolvedJump);
+        LNode.ResolvedType := self.DoMapped(AMap, LNode.ResolvedType);
+        LNode.ResolvedConvert := self.DoMapped(AMap, LNode.ResolvedConvert);
+        LNode.ResolvedEmbed := self.DoMapped(AMap, LNode.ResolvedEmbed);
+        LNode.ResolvedCallee := self.DoMapped(AMap, LNode.ResolvedCallee);
+        LNode.ResolvedInstance := self.DoMapped(AMap, LNode.ResolvedInstance);
+      end;
+      if self.FIsRuntime then
+        LI := 0;
+        for LKind := RuntimeRoutine.StrRelease to ADAM_AST_RUNTIME_LAST do
+          self.FTree.SetRuntimeRoutine(LKind, self.DoMapped(AMap, self.FRuntime[LI]));
+          LI := LI + 1;
+        end;
+        self.FTree.SetVarKind(self.DoMapped(AMap, self.FVarKind));
+        self.FTree.SetAllocSite(self.DoMapped(AMap, self.FAllocSite));
+      end;
+    end;
+  end;
+
+public type
+  // The payloads of a group of units read into a tree as one (see the header): each read by
+  // Append as its unit is loaded (its imports first), then the whole group attached, bound
+  // and made final by Finish, so units that import each other (the runtime and its platform
+  // unit) load together
+  ACUGroupReader = object
+    hidden FTree: ref SyntaxTree;
+    hidden FDiagnostics: ref Diagnostics;
+    hidden FReaders: array of ref ACUSliceReader;
+    // The references bound so far, for every member of every group this reader reads into
+    // the one tree (see ACUSliceReader's FSystemIds)
+    hidden FSystemIds: ref StringIdMap;
+    hidden FForeignIds: ref StringIdMap;
+
+    init(const ATree: ref SyntaxTree; const ADiagnostics: ref Diagnostics);
+    begin
+      self.FTree := ATree;
+      self.FDiagnostics := ADiagnostics;
+      setlength(self.FReaders, 0);
+      self.FSystemIds := ref StringIdMap(0);
+      self.FForeignIds := ref StringIdMap(0);
+    end;
+
+    // The payload ABytes of a unit imported at APlace read, its nodes added to the tree: its
+    // Module node, 0 when an error was told (the unit then joins no group)
+    method Append(const ABytes: ByteArray; const APlace: SourcePlace): int64;
+    var
+      LReader: ref ACUSliceReader;
+      LId: int64;
+    begin
+      LReader := ref ACUSliceReader(self.FTree, self.FDiagnostics, ABytes, APlace,
+        self.FSystemIds, self.FForeignIds);
+      LId := LReader.Read();
+      if LId <> 0 then
+        setlength(self.FReaders, len(self.FReaders) + 1);
+        self.FReaders[len(self.FReaders) - 1] := LReader;
+      end;
+      return LId;
+    end;
+
+    // The dormant methods (Scopes' IsDormantMethod: no build using them so far) of every
+    // instance in AInstances still in the tree (one InternCopies kept) left to this build:
+    // Compiled taken off each and everything under it, so the build that first uses one
+    // checks, names, lays out and compiles it (BNF sec 10, M10g)
+    hidden method DoOpenDormant(const AInstances: ref NodeList);
+    var
+      LStack: ref NodeList;
+      LOpen: ref NodeList;
+      LNode: int64;
+      LI: int64;
+      LJ: int64;
+    begin
+      LStack := ref NodeList();
+      LOpen := ref NodeList();
+      for LI := 0 to AInstances.Count - 1 do
+        if self.FTree.ParentOf(AInstances[LI]) = 0 then
+          skip;
+        end;
+        LStack.Add(AInstances[LI]);
+        while LStack.Count > 0 do
+          LNode := LStack.RemoveLast();
+          if IsDormantMethod(self.FTree, LNode) then
+            LOpen.Add(LNode);
+            skip;
+          end;
+          for LJ := 0 to self.FTree.ChildCount(LNode) - 1 do
+            // a nested instance is in AInstances itself
+            if self.FTree[self.FTree.ChildAt(LNode, LJ)].Kind <> NodeKind.GenericInstance then
+              LStack.Add(self.FTree.ChildAt(LNode, LJ));
+            end;
+          end;
+        end;
+      end;
+      // each dormant method's whole subtree
+      while LOpen.Count > 0 do
+        LNode := LOpen.RemoveLast();
+        self.FTree[LNode].RemoveFlag(NodeFlag.Compiled);
+        for LJ := 0 to self.FTree.ChildCount(LNode) - 1 do
+          LOpen.Add(self.FTree.ChildAt(LNode, LJ));
+        end;
+      end;
+    end;
+
+    // Every unit Append read since the last Finish attached, its references bound, the
+    // derived types the group copied in and its generic instances (the members' own and
+    // the ones they carry, M10f) made canonical in one pass (a routine type's key reads its
+    // declaration, which may be another member's; an instance's key its arguments) and
+    // every link sent through them; false when a unit or a declaration a member names is
+    // missing (told; those links are then 0 and the copies are left out, the nodes still
+    // marked Compiled so no phase visits them)
+    method Finish(): bool;
+    var
+      LCopies: ref NodeList;
+      LInstances: ref NodeList;
+      LMap: ref Int64Map;
+      LI: int64;
+      LOk: bool;
+    begin
+      LCopies := ref NodeList();
+      LInstances := ref NodeList();
+      for LI := 0 to len(self.FReaders) - 1 do
+        self.FReaders[LI].Link(LCopies);
+      end;
+      LOk := true;
+      for LI := 0 to len(self.FReaders) - 1 do
+        if not self.FReaders[LI].Resolve() then
+          LOk := false;
+        end;
+      end;
+      for LI := 0 to len(self.FReaders) - 1 do
+        self.FReaders[LI].AttachCarried();
+        self.FReaders[LI].AddInstances(LInstances);
+      end;
+      LMap := ref Int64Map(0);
+      if LOk then
+        InternCopies(self.FTree, LCopies, LInstances, LMap);
+      end;
+      for LI := 0 to len(self.FReaders) - 1 do
+        self.FReaders[LI].Settle(LMap);
+      end;
+      self.DoOpenDormant(LInstances);
+      setlength(self.FReaders, 0);
+      return LOk;
+    end;
+  end;
+
+end.

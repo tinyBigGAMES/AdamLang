@@ -1,0 +1,719 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.COFF.Exports.adam - a library found, a DLL's export names read
+  (DESIGN sec 7, BNF sec 2)
+
+  Every layout fact is Microsoft's "PE Format" page (MS-DOS Stub, Signature,
+  COFF File Header, Optional Header and its Data Directories, Section Table,
+  The .edata Section: Export Directory Table, Export Name Pointer Table).
+
+  LibraryPaths  the folders a library is searched in: the build's library
+                paths in their order, then Windows' system folder
+                (SystemDir), where the system DLLs (ucrtbase.dll) are
+  FindLibrary   BNF sec 2's search (lld's MinGW driver's): a bare name is
+                looked for in each folder in order, and in each folder the
+                first of libname.dll.a, name.dll.a, libname.a, name.lib,
+                libname.dll, name.dll; a name ending in .lib or .dll (any
+                case) is that one file; a name holding a folder ('/', '\'
+                or ':') is an error. The file found, in ResolvePath's form
+  ReadLibraryTable  the library file found, as the linker reads it: an
+                archive (Adam.Backend.Archive's IsArchive) as an import library
+                (its Code and Data short imports imported by name, sorted
+                as a name pointer table, each with its recorded hint; its DLL
+                name and Machine; EX0007 for imports from two DLLs), else
+                ReadExports
+  ReadExports   a PE32+ image's export names in its name pointer table's
+                order (sorted: the loader binary-searches it), with its
+                Machine field and the DLL name its export directory holds.
+                An image with no export table has no names.
+
+  Nothing raises: a file that cannot be read, one that is no PE image, one
+  that is not PE32+, or headers / tables outside the file's bytes are
+  reported (EX codes) at the place the caller gives (the declaration that
+  needs the library), and the result is "" / nil. A name the table lacks,
+  a Machine that is not the target's and a file the search found that is
+  no DLL are the linker's to report (M2.11). A section's bytes are the ones
+  both its raw data and its loaded size hold (raw data cut to VirtualSize,
+  and to the file's end), so a table in a section's zero fill or past a
+  cut-off file is outside. A forwarded export is an export like any other:
+  the loader follows the forward.
+*******************************************************************************/
+
+module unit Adam.COFF.Exports;
+
+import System.SysUtils, System.IO, Adam.Core.Common, Adam.Core.Messages, Adam.Core.Containers,
+  Adam.Compiler.SourceText, Adam.Compiler.Diagnostics, Adam.Backend.Archive, Adam.COFF.Archive, System.Windows;
+
+public const
+  // Reported (see the header)
+  ADAM_ERR_EXPORTS_001: string = "EX0001";   // a library name that holds a folder
+  ADAM_ERR_EXPORTS_002: string = "EX0002";   // a library in no library path
+  ADAM_ERR_EXPORTS_003: string = "EX0003";   // a file that cannot be read
+  ADAM_ERR_EXPORTS_004: string = "EX0004";   // a file that is no PE image
+  ADAM_ERR_EXPORTS_005: string = "EX0005";   // a PE image that is not PE32+
+  ADAM_ERR_EXPORTS_006: string = "EX0006";   // headers or a table outside the file's bytes
+  ADAM_ERR_EXPORTS_007: string = "EX0007";   // an import library importing from two DLLs
+  // What a library's GNU file names start with (libname.dll.a, libname.a, libname.dll)
+  ADAM_EXPORTS_LIB_PREFIX: string = "lib";
+  // MS-DOS Stub: the PE signature's file offset is the 4 bytes at 0x3C
+  ADAM_EXPORTS_SIGNATURE_POINTER_AT: int64 = 0x3C;
+  ADAM_EXPORTS_SIGNATURE_SIZE: int64 = 4;
+  // COFF File Header: its size and the fields read (Machine, NumberOfSections,
+  // SizeOfOptionalHeader)
+  ADAM_EXPORTS_MACHINE_AT: int64 = 0;
+  ADAM_EXPORTS_SECTION_COUNT_AT: int64 = 2;
+  ADAM_EXPORTS_OPTIONAL_SIZE_AT: int64 = 16;
+  // Optional Header (PE32+): Magic, NumberOfRvaAndSizes (the bytes up to its end), the Export
+  // Table data directory (RVA, then Size; the bytes up to its end)
+  ADAM_EXPORTS_RVA_COUNT_AT: int64 = 108;
+  ADAM_EXPORTS_RVA_COUNT_END: int64 = 112;
+  ADAM_EXPORTS_EXPORT_TABLE_AT: int64 = 112;
+  ADAM_EXPORTS_EXPORT_TABLE_END: int64 = 120;
+  // Section Table: an entry's size and the fields read
+  ADAM_EXPORTS_VIRTUAL_SIZE_AT: int64 = 8;
+  ADAM_EXPORTS_VIRTUAL_ADDRESS_AT: int64 = 12;
+  ADAM_EXPORTS_RAW_SIZE_AT: int64 = 16;
+  ADAM_EXPORTS_RAW_AT: int64 = 20;
+  // Export Directory Table: its size and the fields read (Name RVA, Number of Name Pointers,
+  // Name Pointer RVA); a name pointer is a 4-byte RVA
+  ADAM_EXPORTS_DIRECTORY_SIZE: int64 = 40;
+  ADAM_EXPORTS_DLL_NAME_AT: int64 = 12;
+  ADAM_EXPORTS_NAME_COUNT_AT: int64 = 24;
+  ADAM_EXPORTS_NAME_POINTERS_AT: int64 = 32;
+  ADAM_EXPORTS_NAME_POINTER_SIZE: int64 = 4;
+
+// -1, 0 or 1 as ALeft sorts before, with or after ARight, byte by byte (the order the loader's
+// binary search over the name pointer table compares in)
+func DoCompare(const ALeft: string; const ARight: string): int64;
+var
+  LCount: int64;
+  LI: int64;
+  LLeft: uint8;
+  LRight: uint8;
+begin
+  LCount := len(ALeft);
+  if len(ARight) < LCount then
+    LCount := len(ARight);
+  end;
+  for LI := 0 to LCount - 1 do
+    LLeft := uint8(ALeft[LI]);
+    LRight := uint8(ARight[LI]);
+    if LLeft <> LRight then
+      if LLeft < LRight then
+        return -1;
+      end;
+      return 1;
+    end;
+  end;
+  if len(ALeft) < len(ARight) then
+    return -1;
+  end;
+  if len(ALeft) > len(ARight) then
+    return 1;
+  end;
+  return 0;
+end;
+
+// AValue as "0x" and its hex digits (RVAs, offsets and fields in messages)
+func DoHex(const AValue: int64): string;
+begin
+  return "0x" + IntToHex(uint64(AValue), 1);
+end;
+
+public type
+  // A DLL's export names (see the header)
+  ExportTable = object
+    hidden FFilePath: string;
+    hidden FMachine: int64;
+    hidden FDLLName: string;
+    hidden FNames: StringArray;
+    hidden FHints: Int64Array;
+    hidden FImportLibrary: bool;
+
+    init(const AFilePath: string; const AMachine: int64; const ADLLName: string;
+      const ANames: StringArray);
+    begin
+      self.FFilePath := AFilePath;
+      self.FMachine := AMachine;
+      self.FDLLName := ADLLName;
+      self.FNames := ANames;
+      setlength(self.FHints, 0);
+      self.FImportLibrary := false;
+    end;
+
+    // Marks the table as an import library's (ReadImportLibrary): AHints the hint each name
+    // has in its DLL, in the names' order
+    method MarkImportLibrary(const AHints: Int64Array);
+    begin
+      self.FHints := AHints;
+      self.FImportLibrary := true;
+    end;
+
+    // True for an import library's table (its file is an archive, its DLLName the DLL the
+    // image imports from); false for a DLL's own
+    property IsImportLibrary: bool read FImportLibrary;
+
+    // The hint an import of the name at AIndex gives the loader: its index in the DLL's name
+    // pointer table (a DLL's own table: AIndex itself; an import library's: what it records)
+    const method HintAt(const AIndex: int64): int64;
+    begin
+      if self.FImportLibrary then
+        return self.FHints[AIndex];
+      end;
+      return AIndex;
+    end;
+
+    // The file the names were read from
+    property FilePath: string read FFilePath;
+    // The COFF file header's Machine field (the linker checks it is the target's)
+    property Machine: int64 read FMachine;
+    // The name the export directory gives the DLL; "" when it gives none
+    property DLLName: string read FDLLName;
+
+    // How many names it exports
+    property Count: int64
+      read
+      begin
+        return len(self.FNames);
+      end;
+
+    // The export name at AIndex (0-based, in the name pointer table's order)
+    property Names[AIndex: int64]: string
+      read
+      begin
+        return self.FNames[AIndex];
+      end;
+
+    // AName's index in the name pointer table (the hint an import of it gives), -1 when the
+    // DLL does not export it. A binary search byte by byte, the loader's: a name a damaged
+    // DLL lists out of order may be missed, as the loader would miss it
+    const method IndexOf(const AName: string): int64;
+    var
+      LLow: int64;
+      LHigh: int64;
+      LMid: int64;
+      LOrder: int64;
+    begin
+      LLow := 0;
+      LHigh := len(self.FNames) - 1;
+      while LLow <= LHigh do
+        LMid := LLow + (LHigh - LLow) div 2;
+        LOrder := DoCompare(AName, self.FNames[LMid]);
+        if LOrder = 0 then
+          return LMid;
+        end;
+        if LOrder < 0 then
+          LHigh := LMid - 1;
+        else
+          LLow := LMid + 1;
+        end;
+      end;
+      return -1;
+    end;
+
+    // True when the DLL exports AName
+    const method Has(const AName: string): bool;
+    begin
+      return self.IndexOf(AName) >= 0;
+    end;
+  end;
+
+type
+  // One ReadExports call: the file's bytes, where its reports go, the headers' places and the
+  // section table
+  ExportReader = object
+    hidden FFilePath: string;
+    hidden FBytes: ByteArray;
+    hidden FDiagnostics: ref Diagnostics;
+    hidden FPlace: SourcePlace;
+    hidden FMachine: int64;
+    // The optional header's file offset and its size (SizeOfOptionalHeader)
+    hidden FOptionalAt: int64;
+    hidden FOptionalSize: int64;
+    // Per section: its RVA, the count of its bytes the file holds (see the header) and the file
+    // offset they start at
+    hidden FSectionRvas: Int64Array;
+    hidden FSectionSizes: Int64Array;
+    hidden FSectionAts: Int64Array;
+
+    init(const AFilePath: string; const ADiagnostics: ref Diagnostics;
+      const APlace: SourcePlace);
+    begin
+      self.FFilePath := AFilePath;
+      self.FDiagnostics := ADiagnostics;
+      self.FPlace := APlace;
+      self.FMachine := 0;
+      self.FOptionalAt := 0;
+      self.FOptionalSize := 0;
+    end;
+
+    // Error ACode at the caller's place; false, so a failing step returns it
+    hidden method DoFail(const ACode: string; const ATemplate: string;
+      const AArgs: MessageArgs): bool;
+    begin
+      self.FDiagnostics.Add(Severity.Error, ACode, self.FPlace, ATemplate, AArgs);
+      return false;
+    end;
+
+    // EX0004: the file is no PE image, AReason saying why
+    hidden method DoNotPE(const AReason: string): bool;
+    begin
+      return self.DoFail(ADAM_ERR_EXPORTS_004, ADAM_MSG_EXPORTS_NOT_PE,
+        NoArgs().Str(self.FFilePath).Str(AReason));
+    end;
+
+    // EX0006: its headers or a table lie outside its bytes, AReason saying which
+    hidden method DoDamaged(const AReason: string): bool;
+    begin
+      return self.DoFail(ADAM_ERR_EXPORTS_006, ADAM_MSG_EXPORTS_DAMAGED,
+        NoArgs().Str(self.FFilePath).Str(AReason));
+    end;
+
+    // EX0006 for an optional header of the size it has, shorter than ANeed
+    hidden method DoShortOptional(const ANeed: int64): bool;
+    begin
+      return self.DoDamaged(NoArgs().Int(self.FOptionalSize).Int(ANeed).Fill(
+        ADAM_MSG_EXPORTS_REASON_OPTIONAL));
+    end;
+
+    // The ACount bytes at AAt as a number; the caller has checked they are in the file
+    hidden const method DoGet(const AAt: int64; const ACount: int64): int64;
+    begin
+      return int64(GetLe(self.FBytes, AAt, ACount));
+    end;
+
+    // True when the 4 bytes at AAt are the PE signature, "PE" and two zero bytes
+    hidden const method DoIsSignature(const AAt: int64): bool;
+    begin
+      if AAt + ADAM_EXPORTS_SIGNATURE_SIZE > len(self.FBytes) then
+        return false;
+      end;
+      return (self.FBytes[AAt] = 0x50) and (self.FBytes[AAt + 1] = 0x45) and
+        (self.FBytes[AAt + 2] = 0) and (self.FBytes[AAt + 3] = 0);
+    end;
+
+    // Records section AIndex from its section table entry at AAt: its RVA, the bytes the file
+    // holds of it (its raw data cut to a nonzero VirtualSize, then to the file's end) and their
+    // file offset
+    hidden method DoSection(const AIndex: int64; const AAt: int64);
+    var
+      LVirtualSize: int64;
+      LRawSize: int64;
+      LRawAt: int64;
+      LSize: int64;
+    begin
+      LVirtualSize := self.DoGet(AAt + ADAM_EXPORTS_VIRTUAL_SIZE_AT, 4);
+      LRawSize := self.DoGet(AAt + ADAM_EXPORTS_RAW_SIZE_AT, 4);
+      LRawAt := self.DoGet(AAt + ADAM_EXPORTS_RAW_AT, 4);
+      // SizeOfRawData is rounded up to FileAlignment: the loaded section is VirtualSize long
+      LSize := LRawSize;
+      if (LVirtualSize <> 0) and (LVirtualSize < LSize) then
+        LSize := LVirtualSize;
+      end;
+      if LRawAt >= len(self.FBytes) then
+        LSize := 0;
+      else
+        if LRawAt + LSize > len(self.FBytes) then
+          LSize := len(self.FBytes) - LRawAt;
+        end;
+      end;
+      self.FSectionRvas[AIndex] := self.DoGet(AAt + ADAM_EXPORTS_VIRTUAL_ADDRESS_AT, 4);
+      self.FSectionSizes[AIndex] := LSize;
+      self.FSectionAts[AIndex] := LRawAt;
+    end;
+
+    // The MS-DOS stub's pointer, the signature, the COFF file header, the optional header
+    // (PE32+, holding NumberOfRvaAndSizes) and the section table; false after EX0004 / EX0005 /
+    // EX0006
+    hidden method DoHeaders(): bool;
+    var
+      LSize: int64;
+      LSignatureAt: int64;
+      LHeaderAt: int64;
+      LSectionCount: int64;
+      LTableAt: int64;
+      LMagic: int64;
+      LI: int64;
+    begin
+      LSize := len(self.FBytes);
+      if LSize < ADAM_EXPORTS_SIGNATURE_POINTER_AT + 4 then
+        return self.DoNotPE(NoArgs().Int(LSize).Fill(ADAM_MSG_EXPORTS_REASON_SHORT));
+      end;
+      LSignatureAt := self.DoGet(ADAM_EXPORTS_SIGNATURE_POINTER_AT, 4);
+      if not self.DoIsSignature(LSignatureAt) then
+        return self.DoNotPE(NoArgs().Str(DoHex(LSignatureAt)).Fill(
+          ADAM_MSG_EXPORTS_REASON_NO_SIGNATURE));
+      end;
+      LHeaderAt := LSignatureAt + ADAM_EXPORTS_SIGNATURE_SIZE;
+      if LHeaderAt + IMAGE_SIZEOF_FILE_HEADER > LSize then
+        return self.DoDamaged(ADAM_MSG_EXPORTS_REASON_HEADERS);
+      end;
+      self.FMachine := self.DoGet(LHeaderAt + ADAM_EXPORTS_MACHINE_AT, 2);
+      LSectionCount := self.DoGet(LHeaderAt + ADAM_EXPORTS_SECTION_COUNT_AT, 2);
+      self.FOptionalSize := self.DoGet(LHeaderAt + ADAM_EXPORTS_OPTIONAL_SIZE_AT, 2);
+      self.FOptionalAt := LHeaderAt + IMAGE_SIZEOF_FILE_HEADER;
+      LTableAt := self.FOptionalAt + self.FOptionalSize;
+      if LTableAt + LSectionCount * IMAGE_SIZEOF_SECTION_HEADER > LSize then
+        return self.DoDamaged(ADAM_MSG_EXPORTS_REASON_HEADERS);
+      end;
+      // The magic is the optional header's first 2 bytes
+      if self.FOptionalSize < 2 then
+        return self.DoShortOptional(ADAM_EXPORTS_RVA_COUNT_END);
+      end;
+      LMagic := self.DoGet(self.FOptionalAt, 2);
+      if LMagic <> IMAGE_NT_OPTIONAL_HDR64_MAGIC then
+        return self.DoFail(ADAM_ERR_EXPORTS_005, ADAM_MSG_EXPORTS_NOT_PE32PLUS,
+          NoArgs().Str(self.FFilePath).Str(DoHex(LMagic)));
+      end;
+      if self.FOptionalSize < ADAM_EXPORTS_RVA_COUNT_END then
+        return self.DoShortOptional(ADAM_EXPORTS_RVA_COUNT_END);
+      end;
+      setlength(self.FSectionRvas, LSectionCount);
+      setlength(self.FSectionSizes, LSectionCount);
+      setlength(self.FSectionAts, LSectionCount);
+      for LI := 0 to LSectionCount - 1 do
+        self.DoSection(LI, LTableAt + LI * IMAGE_SIZEOF_SECTION_HEADER);
+      end;
+      return true;
+    end;
+
+    // The file offset of ARVA into AAt and the end of its section's bytes in the file into
+    // AEnd; false when no section's bytes hold it
+    hidden const method DoLocate(const ARVA: int64; var AAt: int64; var AEnd: int64): bool;
+    var
+      LI: int64;
+    begin
+      for LI := 0 to len(self.FSectionRvas) - 1 do
+        if (ARVA >= self.FSectionRvas[LI]) and
+          (ARVA < self.FSectionRvas[LI] + self.FSectionSizes[LI]) then
+          AAt := self.FSectionAts[LI] + (ARVA - self.FSectionRvas[LI]);
+          AEnd := self.FSectionAts[LI] + self.FSectionSizes[LI];
+          return true;
+        end;
+      end;
+      return false;
+    end;
+
+    // The file offset of the ASize-byte table AWhat at ARVA into AAt; false after EX0006 when
+    // one section's bytes do not hold all of it
+    hidden method DoTable(const ARVA: int64; const ASize: int64; const AWhat: string;
+      var AAt: int64): bool;
+    var
+      LEnd: int64;
+    begin
+      LEnd := 0;
+      if (not self.DoLocate(ARVA, AAt, LEnd)) or (AAt + ASize > LEnd) then
+        return self.DoDamaged(NoArgs().Str(AWhat).Str(DoHex(ARVA)).Fill(
+          ADAM_MSG_EXPORTS_REASON_OUTSIDE));
+      end;
+      return true;
+    end;
+
+    // The zero-ended ASCII string AWhat at ARVA into AText; false after EX0006 when no section
+    // holds its start, or its section ends before its zero byte
+    hidden method DoString(const ARVA: int64; const AWhat: string; var AText: string): bool;
+    var
+      LAt: int64;
+      LEnd: int64;
+      LStop: int64;
+      LI: int64;
+    begin
+      AText := "";
+      LAt := 0;
+      LEnd := 0;
+      if not self.DoLocate(ARVA, LAt, LEnd) then
+        return self.DoDamaged(NoArgs().Str(AWhat).Str(DoHex(ARVA)).Fill(
+          ADAM_MSG_EXPORTS_REASON_OUTSIDE));
+      end;
+      LStop := LAt;
+      while (LStop < LEnd) and (self.FBytes[LStop] <> 0) do
+        LStop := LStop + 1;
+      end;
+      if LStop = LEnd then
+        return self.DoDamaged(NoArgs().Str(AWhat).Str(DoHex(ARVA)).Fill(
+          ADAM_MSG_EXPORTS_REASON_UNENDED));
+      end;
+      setlength(AText, LStop - LAt);
+      for LI := 0 to LStop - LAt - 1 do
+        AText[LI] := char(self.FBytes[LAt + LI]);
+      end;
+      return true;
+    end;
+
+    // The export directory at its file offset ADirectoryAt: the DLL name and the name pointer
+    // table's names into ADLLName and ANames; false after EX0006
+    hidden method DoNames(const ADirectoryAt: int64; var ADLLName: string;
+      var ANames: StringArray): bool;
+    var
+      LDLLNameRVA: int64;
+      LCount: int64;
+      LPointersAt: int64;
+      LName: string;
+      LI: int64;
+    begin
+      LDLLNameRVA := self.DoGet(ADirectoryAt + ADAM_EXPORTS_DLL_NAME_AT, 4);
+      if LDLLNameRVA <> 0 then
+        if not self.DoString(LDLLNameRVA, ADAM_MSG_EXPORTS_WHAT_DLL_NAME, ADLLName) then
+          return false;
+        end;
+      end;
+      LCount := self.DoGet(ADirectoryAt + ADAM_EXPORTS_NAME_COUNT_AT, 4);
+      if LCount = 0 then
+        return true;
+      end;
+      LPointersAt := 0;
+      if not self.DoTable(self.DoGet(ADirectoryAt + ADAM_EXPORTS_NAME_POINTERS_AT, 4),
+        LCount * ADAM_EXPORTS_NAME_POINTER_SIZE, ADAM_MSG_EXPORTS_WHAT_NAME_POINTERS,
+        LPointersAt) then
+        return false;
+      end;
+      setlength(ANames, LCount);
+      for LI := 0 to LCount - 1 do
+        LName := "";
+        if not self.DoString(self.DoGet(LPointersAt + LI * ADAM_EXPORTS_NAME_POINTER_SIZE, 4),
+          ADAM_MSG_EXPORTS_WHAT_NAME, LName) then
+          return false;
+        end;
+        ANames[LI] := LName;
+      end;
+      return true;
+    end;
+
+    // The file read and its export table; nil after an EX report
+    method Run(): ref ExportTable;
+    var
+      LBytes: ByteArray;
+      LExportRVA: int64;
+      LDirectoryAt: int64;
+      LDLLName: string;
+      LNames: StringArray;
+    begin
+      if not ReadAllBytes(self.FFilePath, LBytes) then
+        self.DoFail(ADAM_ERR_EXPORTS_003, ADAM_MSG_EXPORTS_CANNOT_READ,
+          NoArgs().Str(self.FFilePath));
+        return nil;
+      end;
+      self.FBytes := LBytes;
+      if not self.DoHeaders() then
+        return nil;
+      end;
+      LDLLName := "";
+      // No data directories, or an empty Export Table entry: an image that exports nothing
+      if self.DoGet(self.FOptionalAt + ADAM_EXPORTS_RVA_COUNT_AT, 4) = 0 then
+        return ref ExportTable(self.FFilePath, self.FMachine, LDLLName, LNames);
+      end;
+      if self.FOptionalSize < ADAM_EXPORTS_EXPORT_TABLE_END then
+        self.DoShortOptional(ADAM_EXPORTS_EXPORT_TABLE_END);
+        return nil;
+      end;
+      LExportRVA := self.DoGet(self.FOptionalAt + ADAM_EXPORTS_EXPORT_TABLE_AT, 4);
+      if LExportRVA = 0 then
+        return ref ExportTable(self.FFilePath, self.FMachine, LDLLName, LNames);
+      end;
+      LDirectoryAt := 0;
+      if not self.DoTable(LExportRVA, ADAM_EXPORTS_DIRECTORY_SIZE,
+        ADAM_MSG_EXPORTS_WHAT_DIRECTORY, LDirectoryAt) then
+        return nil;
+      end;
+      if not self.DoNames(LDirectoryAt, LDLLName, LNames) then
+        return nil;
+      end;
+      return ref ExportTable(self.FFilePath, self.FMachine, LDLLName, LNames);
+    end;
+  end;
+
+// True when AName holds a folder: a separator, or ':' (a drive, or a $P: form)
+func DoHasFolder(const AName: string): bool;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(AName) - 1 do
+    if (AName[LI] = '/') or (AName[LI] = '\\') or (AName[LI] = ':') then
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+// The file names BNF sec 2's search tries for AName in one folder, in its order
+func DoCandidates(const AName: string): StringArray;
+var
+  LNames: StringArray;
+  LLower: string;
+begin
+  LLower := LowerCase(AName);
+  if EndsStr(ADAM_EXT_COFF_LIB, LLower) or EndsStr(ADAM_EXT_COFF_DLL, LLower) then
+    setlength(LNames, 1);
+    LNames[0] := AName;
+    return LNames;
+  end;
+  setlength(LNames, 6);
+  LNames[0] := ADAM_EXPORTS_LIB_PREFIX + AName + ADAM_EXT_COFF_DLL_IMPORT;
+  LNames[1] := AName + ADAM_EXT_COFF_DLL_IMPORT;
+  LNames[2] := ADAM_EXPORTS_LIB_PREFIX + AName + ADAM_EXT_AR;
+  LNames[3] := AName + ADAM_EXT_COFF_LIB;
+  LNames[4] := ADAM_EXPORTS_LIB_PREFIX + AName + ADAM_EXT_COFF_DLL;
+  LNames[5] := AName + ADAM_EXT_COFF_DLL;
+  return LNames;
+end;
+
+// The folders a library is searched in: AAdded (the build's library paths) in their order,
+// then Windows' system folder when the system names one
+public func LibraryPaths(const AAdded: StringArray): StringArray;
+var
+  LPaths: StringArray;
+  LSystem: string;
+  LCount: int64;
+begin
+  LPaths := AAdded;
+  LSystem := SystemDir();
+  if LSystem <> "" then
+    LCount := len(LPaths);
+    setlength(LPaths, LCount + 1);
+    LPaths[LCount] := LSystem;
+  end;
+  return LPaths;
+end;
+
+// The file BNF sec 2's search finds for the library AName in APaths (see the header); "" after
+// EX0001 (a name holding a folder) or EX0002 (found nowhere), reported at APlace
+public func FindLibrary(const AName: string; const APaths: StringArray;
+  const ADiagnostics: ref Diagnostics; const APlace: SourcePlace): string;
+var
+  LCandidates: StringArray;
+  LFile: string;
+  LWhere: string;
+  LI: int64;
+  LJ: int64;
+begin
+  if DoHasFolder(AName) then
+    ADiagnostics.Add(Severity.Error, ADAM_ERR_EXPORTS_001, APlace, ADAM_MSG_EXPORTS_PATH_NAME,
+      NoArgs().Str(AName));
+    return "";
+  end;
+  LCandidates := DoCandidates(AName);
+  for LI := 0 to len(APaths) - 1 do
+    for LJ := 0 to len(LCandidates) - 1 do
+      LFile := ResolvePath(LCandidates[LJ], APaths[LI]);
+      if FileExists(LFile) then
+        return LFile;
+      end;
+    end;
+  end;
+  LWhere := JoinStrings(APaths, "; ");
+  if len(APaths) = 0 then
+    LWhere := ADAM_MSG_EXPORTS_NO_PATHS;
+  end;
+  ADiagnostics.Add(Severity.Error, ADAM_ERR_EXPORTS_002, APlace, ADAM_MSG_EXPORTS_NOT_FOUND,
+    NoArgs().Str(AName).Str(JoinStrings(LCandidates, ", ")).Str(LWhere));
+  return "";
+end;
+
+// The export names of the PE32+ image AFilePath (see the header); nil after an EX report at
+// APlace
+public func ReadExports(const AFilePath: string; const ADiagnostics: ref Diagnostics;
+  const APlace: SourcePlace): ref ExportTable;
+var
+  LReader: ref ExportReader;
+begin
+  LReader := ref ExportReader(AFilePath, ADiagnostics, APlace);
+  return LReader.Run();
+end;
+
+// The import library ABytes (the file AFilePath) as an export table (see the header): every
+// short import of Code or Data type (a routine, a variable: M8d2) that is imported by a name (Adam.COFF.Archive's ImportNameOf),
+// sorted as a name pointer table is, each with the hint its Import Header records; the DLL
+// name and Machine of its imports. An archive with no such import (a static library) is a
+// table with no names. nil after a report at APlace: a damaged archive (AR codes), imports
+// from two DLLs (EX0007)
+func DoImportLibrary(const AFilePath: string; const ABytes: ByteArray;
+  const ADiagnostics: ref Diagnostics; const APlace: SourcePlace): ref ExportTable;
+var
+  LArchive: ArchiveData;
+  LNames: StringArray;
+  LHintOf: ref StringIdMap;
+  LHints: Int64Array;
+  LDLL: string;
+  LMachine: int64;
+  LName: string;
+  LI: int64;
+  LCount: int64;
+  LTable: ref ExportTable;
+begin
+  if not ReadArchive(ABytes, AFilePath, APlace, ADiagnostics, LArchive) then
+    return nil;
+  end;
+  setlength(LNames, 0);
+  LHintOf := ref StringIdMap(0);
+  LDLL := "";
+  LMachine := 0;
+  for LI := 0 to len(LArchive.Members) - 1 do
+    LName := "";
+    if (LArchive.Members[LI].Kind = MemberKind.ShortImport) and
+      ((LArchive.Members[LI].Imported = ImportKind.Code) or
+      (LArchive.Members[LI].Imported = ImportKind.Data)) then
+      LName := ImportNameOf(LArchive.Members[LI]);
+    end;
+    if LName <> "" then
+      if LDLL = "" then
+        LDLL := LArchive.Members[LI].ImportDLL;
+        LMachine := LArchive.Members[LI].ImportMachine;
+      end;
+      if LowerCase(LArchive.Members[LI].ImportDLL) <> LowerCase(LDLL) then
+        ADiagnostics.Add(Severity.Error, ADAM_ERR_EXPORTS_007, APlace, ADAM_MSG_EXPORTS_TWO_DLLS,
+          NoArgs().Str(AFilePath).Str(LDLL).Str(LArchive.Members[LI].ImportDLL));
+        return nil;
+      end;
+      // A name met twice keeps its first hint
+      if LHintOf.Find(LName) = 0 then
+        LHintOf.Put(LName, LArchive.Members[LI].OrdinalHint + 1);
+        LCount := len(LNames);
+        setlength(LNames, LCount + 1);
+        LNames[LCount] := LName;
+      end;
+    end;
+  end;
+  // The loader binary-searches the names byte by byte: the same order SortStrings gives
+  SortStrings(LNames);
+  setlength(LHints, len(LNames));
+  for LI := 0 to len(LNames) - 1 do
+    LHints[LI] := LHintOf.Find(LNames[LI]) - 1;
+  end;
+  LTable := ref ExportTable(AFilePath, LMachine, LDLL, LNames);
+  LTable.MarkImportLibrary(LHints);
+  return LTable;
+end;
+
+// The library file AFilePath, found by FindLibrary, as an export table: an archive (it starts
+// with !<arch>) read as an import library, any other file as a DLL (ReadExports); nil after a
+// report at APlace
+public func ReadLibraryTable(const AFilePath: string; const ADiagnostics: ref Diagnostics;
+  const APlace: SourcePlace): ref ExportTable;
+var
+  LBytes: ByteArray;
+begin
+  if not ReadAllBytes(AFilePath, LBytes) then
+    ADiagnostics.Add(Severity.Error, ADAM_ERR_EXPORTS_003, APlace, ADAM_MSG_EXPORTS_CANNOT_READ,
+      NoArgs().Str(AFilePath));
+    return nil;
+  end;
+  if IsArchive(LBytes) then
+    return DoImportLibrary(AFilePath, LBytes, ADiagnostics, APlace);
+  end;
+  return ReadExports(AFilePath, ADiagnostics, APlace);
+end;
+
+end.

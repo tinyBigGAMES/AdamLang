@@ -1,0 +1,842 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.PDB.Merge.adam - one object's CodeView merged into a link's PDBInput
+
+  The linker (Adam.COFF.Linker) hands over, per object (one PDB module), its
+  .debug$T and its .debug$S sections with their relocations applied (every
+  address a section-relative offset and an image section number, 0 for a
+  section the link removed). Adam's own objects and a C compiler's (clang,
+  zig cc, MSVC) are read alike, lld-link's way; where a record keeps its
+  indices is Adam.PDB.Refs' (LLVM's TypeIndexDiscovery):
+
+  PDBMerger      one link's type merge and every module's records:
+    types        an object's .debug$T records in order (one index space:
+                 types and ids mixed), each record's indices remapped to the
+                 PDB's (a builtin below 0x1000 kept, an object's own index to
+                 the merged record it became, in the space Refs gives the
+                 field), padded to 4 bytes, then deduplicated by content
+                 across the whole link: a type record into the TPI, an id
+                 record (LF_FUNC_ID, LF_STRING_ID, LF_BUILDINFO ..) into the IPI
+    files        the object's string table and file checksums: every entry
+                 becomes the module's next file, in order, its checksum kept
+                 (PDBModule.AddFileEntry), so a checksum offset the object's
+                 records hold (an inline site's annotations, an inlinee
+                 line) names the same file in the PDB
+    symbols      every symbol record of every symbols subsection, in section
+                 order, its indices remapped and padded to 4 bytes; an
+                 S_GPROC32_ID / S_LPROC32_ID becomes an S_GPROC32 /
+                 S_LPROC32 of its function id's type, S_PROC_ID_END an S_END
+                 (lld-link's translation: a reader looks a procedure's type
+                 up in the TPI); a top-level record whose address is in a
+                 section the link removed is left out with its whole scope
+                 (a foreign object's; Adam's never: its debug pieces go with
+                 their functions); the PDB writer routes them and sets the
+                 scopes
+    lines        every lines subsection as a PDBLines (its section, offset
+                 and size from the applied relocations; each row's line
+                 word, columns when it has them); one of a removed section
+                 left out
+    inlinees     an inlinee lines subsection, its inlinee ids remapped, kept
+                 for the module (its file offsets name the same files)
+
+  AddObject      merges one object; for a foreign object it cannot merge (a
+                 leaf, record or subsection kind Refs does not know: a type
+                 server's, a precompiled header's; damaged bytes) it returns
+                 why and adds nothing (the linker warns, LK0008); for Adam's
+                 own object (its S_COMPILE3 names Adam: IsAdamCodeView) that
+                 is a compiler bug and raises.
+
+  Frame data (0xF5, x86 only: Adam targets 64-bit only), the COFF symbol RVA
+  list (0xFD, an object's own, lld-link's skip too) and a subsection flagged
+  to ignore are not merged.
+*******************************************************************************/
+
+module unit Adam.PDB.Merge;
+
+import System.SysUtils, System.Collections, Adam.Core.Containers, Adam.Core.Messages,
+  Adam.Compiler.Diagnostics, Adam.PDB.CodeView, Adam.PDB.Refs, Adam.PDB.Writer;
+
+public const
+  // Raised (a compiler bug): Adam's own CodeView that does not merge (the reason after)
+  ADAM_PDB_MERGE_FAULT_ADAM: string = "PDB merge: Adam's own CodeView does not merge: ";
+  // Raised (a merger bug): bytes the check accepted that the merge does not take
+  ADAM_PDB_MERGE_FAULT_CHECKED: string = "PDB merge: checked CodeView fails its merge: ";
+
+// The AWidth-byte little-endian value at AAt of ABytes; -1 past their end
+func DoField(const ABytes: ByteArray; const AAt: int64; const AWidth: int64): int64;
+begin
+  if (AAt < 0) or (AAt + AWidth > len(ABytes)) then
+    return -1;
+  end;
+  return int64(GetLe(ABytes, AAt, AWidth));
+end;
+
+// The ACount bytes at AAt of ABytes (the caller checked the range)
+func DoSlice(const ABytes: ByteArray; const AAt: int64; const ACount: int64): ByteArray;
+var
+  LOut: ByteArray;
+  LI: int64;
+begin
+  setlength(LOut, ACount);
+  for LI := 0 to ACount - 1 do
+    LOut[LI] := ABytes[AAt + LI];
+  end;
+  return LOut;
+end;
+
+// ABytes as a text of the same bytes (a map key)
+func DoKeyOf(const ABytes: ByteArray): string;
+var
+  LText: string;
+  LI: int64;
+begin
+  setlength(LText, len(ABytes));
+  for LI := 0 to len(ABytes) - 1 do
+    LText[LI] := char(ABytes[LI]);
+  end;
+  return LText;
+end;
+
+// The NUL-ended text at AAt of ABytes; AFound false when it does not end before their end
+func DoTextAt(const ABytes: ByteArray; const AAt: int64; var AFound: bool): string;
+var
+  LText: string;
+  LStop: int64;
+  LI: int64;
+begin
+  AFound := false;
+  LText := "";
+  if AAt < 0 then
+    return LText;
+  end;
+  LStop := AAt;
+  while (LStop < len(ABytes)) and (ABytes[LStop] <> 0) do
+    LStop := LStop + 1;
+  end;
+  if LStop >= len(ABytes) then
+    return LText;
+  end;
+  setlength(LText, LStop - AAt);
+  for LI := 0 to LStop - AAt - 1 do
+    LText[LI] := char(ABytes[AAt + LI]);
+  end;
+  AFound := true;
+  return LText;
+end;
+
+// ARecord (a symbol record) padded with zeros to a 4-byte length, its length field set
+func DoPadSymbol(var ARecord: ByteArray);
+var
+  LCount: int64;
+  LI: int64;
+begin
+  LCount := len(ARecord);
+  if (LCount & 3) = 0 then
+    return;
+  end;
+  setlength(ARecord, (LCount + 3) & -4);
+  for LI := LCount to len(ARecord) - 1 do
+    ARecord[LI] := 0;
+  end;
+  PutLe(ARecord, 0, uint64(len(ARecord) - 2), 2);
+end;
+
+// ARecord (a type record) padded with LF_PAD bytes (0xF0 + the bytes left) to a 4-byte
+// length, its length field set
+func DoPadType(var ARecord: ByteArray);
+var
+  LCount: int64;
+  LI: int64;
+begin
+  LCount := len(ARecord);
+  if (LCount & 3) = 0 then
+    return;
+  end;
+  setlength(ARecord, (LCount + 3) & -4);
+  for LI := LCount to len(ARecord) - 1 do
+    ARecord[LI] := uint8(LF_PAD0 + len(ARecord) - LI);
+  end;
+  PutLe(ARecord, 0, uint64(len(ARecord) - 2), 2);
+end;
+
+// AValue as hex text (a reason's argument)
+func DoHex(const AValue: int64): string;
+begin
+  return IntToHex(uint64(AValue), 4);
+end;
+
+public type
+  // One link's merge of its objects' CodeView into a PDBInput (see the header)
+  PDBMerger = object
+    hidden FInput: ref PDBInput;
+    // A merged record's bytes -> its PDB index (deduplication across the link): types
+    // (TPI), ids (IPI)
+    hidden FTypeOf: ref StringIdMap;
+    hidden FIdOf: ref StringIdMap;
+    // The object being merged, per own index (its index - 0x1000): its PDB index (0 while
+    // checking), whether it is an id, a function id's function type (PDB index; 0 none)
+    hidden FMap: Int64Array;
+    hidden FIsId: BoolArray;
+    hidden FFuncType: Int64Array;
+    hidden FMapCount: int64;
+    // The object being merged: its string table and file checksums (found once), each
+    // checksum entry's offset and the module file it became (in offset order)
+    hidden FStrings: ByteArray;
+    hidden FChecksums: ByteArray;
+    hidden FHasStrings: bool;
+    hidden FHasChecksums: bool;
+    hidden FEntryOffsets: Int64Array;
+    hidden FEntryFiles: Int64Array;
+    hidden FEntryCount: int64;
+    // The module the records go to; true while merging (false: checking, nothing added);
+    // the object is Adam's own (a reason raises)
+    hidden FModule: ref PDBModule;
+    hidden FApply: bool;
+    hidden FIsAdam: bool;
+    hidden FRefs: ref List<CvRef>;
+    // The object's symbol scopes across its subsections: how deep the next record is, the
+    // depth a left-out scope ends at (-1: none being left out)
+    hidden FDepth: int64;
+    hidden FSkipTo: int64;
+
+    init(const AInput: ref PDBInput);
+    begin
+      self.FInput := AInput;
+      self.FTypeOf := ref StringIdMap(0);
+      self.FIdOf := ref StringIdMap(0);
+      setlength(self.FMap, 0);
+      setlength(self.FIsId, 0);
+      setlength(self.FFuncType, 0);
+      self.FMapCount := 0;
+      self.FModule := nil;
+      self.FApply := false;
+      self.FIsAdam := false;
+      self.FRefs := ref List<CvRef>();
+      self.FDepth := 0;
+      self.FSkipTo := -1;
+    end;
+
+    // The index field ARef of ARecord checked (an earlier record of its space, a builtin
+    // type, or no id) and, while merging, remapped in place; "" or why not
+    hidden method DoRef(var ARecord: ByteArray; const ARef: CvRef): string;
+    var
+      LIndex: int64;
+      LOwn: int64;
+    begin
+      LIndex := DoField(ARecord, ARef.At, 4);
+      if LIndex < CV_FIRST_NONPRIM then
+        // a builtin type; an id field holds 0 (none) there
+        if (ARef.Space = CvIndexSpace.Ids) and (LIndex <> 0) then
+          return NoArgs().Str(DoHex(LIndex)).Fill(ADAM_MSG_PDB_MERGE_REASON_INDEX_ID);
+        end;
+        return "";
+      end;
+      LOwn := LIndex - CV_FIRST_NONPRIM;
+      if (LOwn >= self.FMapCount) or (self.FIsId[LOwn] <> (ARef.Space = CvIndexSpace.Ids)) then
+        if ARef.Space = CvIndexSpace.Ids then
+          return NoArgs().Str(DoHex(LIndex)).Fill(ADAM_MSG_PDB_MERGE_REASON_INDEX_ID);
+        end;
+        return NoArgs().Str(DoHex(LIndex)).Fill(ADAM_MSG_PDB_MERGE_REASON_INDEX_TYPE);
+      end;
+      if self.FApply then
+        PutLe(ARecord, ARef.At, uint64(self.FMap[LOwn]), 4);
+      end;
+      return "";
+    end;
+
+    // Every index field of ARecord (FRefs, found by Refs) as DoRef does; "" or why not
+    hidden method DoRefs(var ARecord: ByteArray): string;
+    var
+      LRef: CvRef;
+      LWhy: string;
+      LI: int64;
+    begin
+      for LI := 0 to self.FRefs.Count - 1 do
+        LRef := self.FRefs.Items[LI];
+        LWhy := self.DoRef(ARecord, LRef);
+        if LWhy <> "" then
+          return LWhy;
+        end;
+      end;
+      return "";
+    end;
+
+    // The object's next own index: its PDB index, whether it is an id, its function type
+    hidden method DoMapNext(const AIndex: int64; const AIsId: bool; const AFuncType: int64);
+    begin
+      if self.FMapCount >= len(self.FMap) then
+        setlength(self.FMap, self.FMapCount * 2 + 64);
+        setlength(self.FIsId, len(self.FMap));
+        setlength(self.FFuncType, len(self.FMap));
+      end;
+      self.FMap[self.FMapCount] := AIndex;
+      self.FIsId[self.FMapCount] := AIsId;
+      self.FFuncType[self.FMapCount] := AFuncType;
+      self.FMapCount := self.FMapCount + 1;
+    end;
+
+    // The record ARecord (remapped) added to the TPI or the IPI unless an identical one is
+    // there; its PDB index
+    hidden method DoAddRecord(const ARecord: ByteArray; const AIsId: bool): int64;
+    var
+      LKey: string;
+      LIndex: int64;
+    begin
+      LKey := DoKeyOf(ARecord);
+      if AIsId then
+        LIndex := self.FIdOf.Find(LKey);
+        if LIndex = 0 then
+          LIndex := self.FInput.AddId(ARecord);
+          self.FIdOf.Put(LKey, LIndex);
+        end;
+        return LIndex;
+      end;
+      LIndex := self.FTypeOf.Find(LKey);
+      if LIndex = 0 then
+        LIndex := self.FInput.AddType(ARecord);
+        self.FTypeOf.Put(LKey, LIndex);
+      end;
+      return LIndex;
+    end;
+
+    // The object's .debug$T bytes ATypes (empty: none) record by record: checked and,
+    // while merging, remapped and added; the object's index map made; "" or why not
+    hidden method DoTypes(const ATypes: ByteArray): string;
+    var
+      LAt: int64;
+      LSize: int64;
+      LLeaf: int64;
+      LRecord: ByteArray;
+      LWhy: string;
+      LIndex: int64;
+      LFuncType: int64;
+      LIsId: bool;
+    begin
+      self.FMapCount := 0;
+      if len(ATypes) = 0 then
+        return "";
+      end;
+      if DoField(ATypes, 0, 4) <> CV_SIGNATURE_C13 then
+        return NoArgs().Str(ADAM_CV_SECTION_TYPES).Fill(ADAM_MSG_PDB_MERGE_REASON_SIGNATURE);
+      end;
+      LAt := 4;
+      while LAt < len(ATypes) do
+        LSize := DoField(ATypes, LAt, 2) + 2;
+        if (LSize < 4) or (LAt + LSize > len(ATypes)) then
+          return NoArgs().Str(ADAM_CV_SECTION_TYPES).Int(LAt).Fill(ADAM_MSG_PDB_MERGE_REASON_CUT);
+        end;
+        LRecord := DoSlice(ATypes, LAt, LSize);
+        DoPadType(LRecord);
+        LLeaf := DoField(LRecord, 2, 2);
+        if not CvTypeRefs(LRecord, self.FRefs) then
+          return NoArgs().Str(DoHex(CV_FIRST_NONPRIM + self.FMapCount)).Str(DoHex(LLeaf)).Fill(
+            ADAM_MSG_PDB_MERGE_REASON_TYPE_LEAF);
+        end;
+        LWhy := self.DoRefs(LRecord);
+        if LWhy <> "" then
+          return LWhy;
+        end;
+        LIsId := CvIsIdLeaf(LLeaf);
+        // a function id's (or method id's) function type at 8, now the PDB's index
+        LFuncType := 0;
+        if (LLeaf = LF_FUNC_ID) or (LLeaf = LF_MFUNC_ID) then
+          LFuncType := DoField(LRecord, 8, 4);
+        end;
+        LIndex := 0;
+        if self.FApply then
+          LIndex := self.DoAddRecord(LRecord, LIsId);
+        end;
+        self.DoMapNext(LIndex, LIsId, LFuncType);
+        LAt := LAt + LSize;
+      end;
+      return "";
+    end;
+
+    // A procedure of id ARecord (S_GPROC32_ID / S_LPROC32_ID / S_LPROC32_DPC_ID): while
+    // merging, made the plain procedure of its function id's type (lld-link's translation);
+    // "" or why not
+    hidden method DoProcId(var ARecord: ByteArray; const AKind: int64): string;
+    var
+      LIndex: int64;
+      LOwn: int64;
+    begin
+      LIndex := DoField(ARecord, 28, 4);
+      LOwn := LIndex - CV_FIRST_NONPRIM;
+      if (LOwn < 0) or (LOwn >= self.FMapCount) or (not self.FIsId[LOwn]) or
+        (self.FFuncType[LOwn] = 0) then
+        return NoArgs().Str(DoHex(LIndex)).Fill(ADAM_MSG_PDB_MERGE_REASON_PROC_ID);
+      end;
+      if self.FApply then
+        if AKind = S_GPROC32_ID then
+          PutLe(ARecord, 2, uint64(S_GPROC32), 2);
+        else
+          if AKind = S_LPROC32_ID then
+            PutLe(ARecord, 2, uint64(S_LPROC32), 2);
+          else
+            PutLe(ARecord, 2, uint64(S_LPROC32_DPC), 2);
+          end;
+        end;
+        // the type the function id names (the PDB's: its record was remapped)
+        PutLe(ARecord, 28, uint64(self.FFuncType[LOwn]), 4);
+      end;
+      return "";
+    end;
+
+    // The symbol record ARecord checked and, while merging, remapped; "" or why not
+    hidden method DoSymbol(var ARecord: ByteArray): string;
+    var
+      LKind: int64;
+    begin
+      LKind := DoField(ARecord, 2, 2);
+      if not CvSymbolRefs(ARecord, self.FRefs) then
+        return NoArgs().Str(DoHex(LKind)).Fill(ADAM_MSG_PDB_MERGE_REASON_SYMBOL_KIND);
+      end;
+      if (LKind = S_GPROC32_ID) or (LKind = S_LPROC32_ID) or
+        (LKind = S_LPROC32_DPC_ID) then
+        // its one index field is the id DoProcId turns into a type
+        return self.DoProcId(ARecord, LKind);
+      end;
+      if (LKind = S_PROC_ID_END) and self.FApply then
+        PutLe(ARecord, 2, uint64(S_END), 2);
+      end;
+      return self.DoRefs(ARecord);
+    end;
+
+    // True when ARecord (a symbol of AKind) has an address in a section the link removed
+    // (its section number 0)
+    hidden const method DoInRemoved(const ARecord: ByteArray; const AKind: int64): bool;
+    var
+      LAt: int64;
+    begin
+      LAt := CvSegmentAt(AKind);
+      return (LAt >= 0) and (DoField(ARecord, LAt, 2) = 0);
+    end;
+
+    // The symbols subsection AAt..AEnd of ABytes record by record: checked and, while
+    // merging, into the module; a top-level record of a removed section left out with its
+    // scope (a foreign object's); "" or why not
+    hidden method DoSymbols(const ABytes: ByteArray; const AAt: int64; const AEnd: int64): string;
+    var
+      LAt: int64;
+      LSize: int64;
+      LKind: int64;
+      LRecord: ByteArray;
+      LWhy: string;
+    begin
+      LAt := AAt;
+      while LAt < AEnd do
+        LSize := DoField(ABytes, LAt, 2) + 2;
+        if (LSize < 4) or (LAt + LSize > AEnd) then
+          return NoArgs().Str(ADAM_CV_SECTION_SYMBOLS).Int(LAt).Fill(ADAM_MSG_PDB_MERGE_REASON_CUT);
+        end;
+        LKind := DoField(ABytes, LAt + 2, 2);
+        LRecord := DoSlice(ABytes, LAt, LSize);
+        LAt := LAt + LSize;
+        if CvClosesScope(LKind) and (self.FDepth = 0) then
+          return ADAM_MSG_PDB_MERGE_REASON_SCOPES;
+        end;
+        if self.FSkipTo >= 0 then
+          // inside a left-out scope: its records go with it
+          if CvOpensScope(LKind) then
+            self.FDepth := self.FDepth + 1;
+          end;
+          if CvClosesScope(LKind) then
+            self.FDepth := self.FDepth - 1;
+            if self.FDepth = self.FSkipTo then
+              self.FSkipTo := -1;
+            end;
+          end;
+          skip;
+        end;
+        if (self.FDepth = 0) and self.DoInRemoved(LRecord, LKind) then
+          if self.FIsAdam then
+            return NoArgs().Str(DoHex(LKind)).Fill(ADAM_MSG_PDB_MERGE_REASON_REMOVED);
+          end;
+          if CvOpensScope(LKind) then
+            self.FSkipTo := self.FDepth;
+            self.FDepth := self.FDepth + 1;
+          end;
+          skip;
+        end;
+        LWhy := self.DoSymbol(LRecord);
+        if LWhy <> "" then
+          return LWhy;
+        end;
+        if CvOpensScope(LKind) then
+          self.FDepth := self.FDepth + 1;
+        end;
+        if CvClosesScope(LKind) then
+          self.FDepth := self.FDepth - 1;
+        end;
+        if self.FApply then
+          DoPadSymbol(LRecord);
+          self.FModule.AddSymbol(LRecord);
+        end;
+      end;
+      return "";
+    end;
+
+    // The module file of the checksum entry at AOffset; -1 when no entry starts there
+    hidden const method DoFileOf(const AOffset: int64): int64;
+    var
+      LLow: int64;
+      LHigh: int64;
+      LMiddle: int64;
+    begin
+      // the entries are in offset order
+      LLow := 0;
+      LHigh := self.FEntryCount - 1;
+      while LLow <= LHigh do
+        LMiddle := (LLow + LHigh) div 2;
+        if self.FEntryOffsets[LMiddle] = AOffset then
+          return self.FEntryFiles[LMiddle];
+        end;
+        if self.FEntryOffsets[LMiddle] < AOffset then
+          LLow := LMiddle + 1;
+        else
+          LHigh := LMiddle - 1;
+        end;
+      end;
+      return -1;
+    end;
+
+    // The object's file checksums entry by entry: checked (each name in the string table,
+    // the entries laid end to end, each to a 4-byte end, as the PDB writer lays them) and,
+    // while merging, each the module's next file; "" or why not
+    hidden method DoFiles(): string;
+    var
+      LAt: int64;
+      LSize: int64;
+      LKind: int64;
+      LName: string;
+      LFile: int64;
+      LFound: bool;
+    begin
+      self.FEntryCount := 0;
+      setlength(self.FEntryOffsets, 0);
+      setlength(self.FEntryFiles, 0);
+      if self.FApply and (len(self.FModule.Files) <> 0) then
+        raise(ADAM_PDB_MERGE_FAULT_CHECKED + self.FModule.ModuleName);
+      end;
+      LAt := 0;
+      while LAt < len(self.FChecksums) do
+        // its name's string table offset 4, its checksum's size 1 and kind 1, the checksum
+        LSize := DoField(self.FChecksums, LAt + 4, 1);
+        LKind := DoField(self.FChecksums, LAt + 5, 1);
+        if (LSize < 0) or (LKind < 0) or (LAt + 6 + LSize > len(self.FChecksums)) then
+          return NoArgs().Str(ADAM_CV_SECTION_SYMBOLS).Int(LAt).Fill(ADAM_MSG_PDB_MERGE_REASON_CUT);
+        end;
+        LName := DoTextAt(self.FStrings, DoField(self.FChecksums, LAt, 4), LFound);
+        if not LFound then
+          return NoArgs().Int(LAt).Fill(ADAM_MSG_PDB_MERGE_REASON_FILE_NAME);
+        end;
+        LFile := self.FEntryCount;
+        if self.FApply then
+          LFile := self.FModule.AddFileEntry(LName, LKind,
+            DoSlice(self.FChecksums, LAt + 6, LSize));
+        end;
+        setlength(self.FEntryOffsets, self.FEntryCount + 1);
+        setlength(self.FEntryFiles, self.FEntryCount + 1);
+        self.FEntryOffsets[self.FEntryCount] := LAt;
+        self.FEntryFiles[self.FEntryCount] := LFile;
+        self.FEntryCount := self.FEntryCount + 1;
+        LAt := (LAt + 6 + LSize + 3) & -4;
+      end;
+      if LAt <> len(self.FChecksums) then
+        return NoArgs().Str(ADAM_CV_SECTION_SYMBOLS).Int(LAt).Fill(ADAM_MSG_PDB_MERGE_REASON_CUT);
+      end;
+      return "";
+    end;
+
+    // The lines subsection AAt..AEnd of ABytes: checked and, while merging, a PDBLines of
+    // the module; one of a removed section left out (a foreign object's); "" or why not
+    hidden method DoLines(const ABytes: ByteArray; const AAt: int64; const AEnd: int64): string;
+    var
+      LLines: ref PDBLines;
+      LColumns: bool;
+      LAt: int64;
+      LFile: int64;
+      LCount: int64;
+      LBlock: int64;
+      LEntry: int64;
+      LColumn: int64;
+      LI: int64;
+    begin
+      // offset 4, section 2, flags 2, code size 4
+      if AAt + ADAM_CV_LINES_HEADER > AEnd then
+        return NoArgs().Str(ADAM_CV_SECTION_SYMBOLS).Int(AAt).Fill(ADAM_MSG_PDB_MERGE_REASON_CUT);
+      end;
+      if DoField(ABytes, AAt + 4, 2) = 0 then
+        if self.FIsAdam then
+          return NoArgs().Str(DoHex(DEBUG_S_LINES)).Fill(ADAM_MSG_PDB_MERGE_REASON_REMOVED);
+        end;
+        return "";
+      end;
+      LColumns := (DoField(ABytes, AAt + 6, 2) & CV_LINES_HAVE_COLUMNS) <> 0;
+      LLines := nil;
+      if self.FApply then
+        LLines := ref PDBLines(DoField(ABytes, AAt + 4, 2), DoField(ABytes, AAt, 4),
+          DoField(ABytes, AAt + 8, 4));
+      end;
+      LAt := AAt + ADAM_CV_LINES_HEADER;
+      while LAt < AEnd do
+        // the block: its file's checksum offset, its line count, its byte size; its lines,
+        // then its columns
+        LCount := DoField(ABytes, LAt + 4, 4);
+        LBlock := DoField(ABytes, LAt + 8, 4);
+        LColumn := LAt + ADAM_CV_LINES_BLOCK + ADAM_CV_LINES_ENTRY * LCount;
+        LEntry := LColumn;
+        if LColumns then
+          LEntry := LEntry + ADAM_CV_COLUMN_ENTRY * LCount;
+        end;
+        if (LCount < 0) or (LBlock < ADAM_CV_LINES_BLOCK) or (LAt + LBlock > AEnd) or
+          (LEntry > LAt + LBlock) then
+          return NoArgs().Str(ADAM_CV_SECTION_SYMBOLS).Int(LAt).Fill(ADAM_MSG_PDB_MERGE_REASON_CUT);
+        end;
+        LFile := self.DoFileOf(DoField(ABytes, LAt, 4));
+        if LFile < 0 then
+          return NoArgs().Int(DoField(ABytes, LAt, 4)).Fill(ADAM_MSG_PDB_MERGE_REASON_FILE);
+        end;
+        if self.FApply then
+          for LI := 0 to LCount - 1 do
+            LLines.AddWord(DoField(ABytes, LAt + ADAM_CV_LINES_BLOCK + ADAM_CV_LINES_ENTRY * LI, 4),
+              DoField(ABytes, LAt + ADAM_CV_LINES_BLOCK + ADAM_CV_LINES_ENTRY * LI + 4, 4), LFile);
+            if LColumns then
+              LLines.AddColumns(DoField(ABytes, LColumn + ADAM_CV_COLUMN_ENTRY * LI, 2),
+                DoField(ABytes, LColumn + ADAM_CV_COLUMN_ENTRY * LI + 2, 2));
+            end;
+          end;
+        end;
+        LAt := LAt + LBlock;
+      end;
+      if self.FApply then
+        self.FModule.AddLines(LLines);
+      end;
+      return "";
+    end;
+
+    // The inlinee lines subsection AAt..AEnd of ABytes: checked (each inlinee an id, each
+    // file an entry) and, while merging, the module's with its inlinees remapped; "" or why
+    hidden method DoInlinees(const ABytes: ByteArray; const AAt: int64; const AEnd: int64): string;
+    var
+      LOut: ByteArray;
+      LRef: CvRef;
+      LSignature: int64;
+      LAt: int64;
+      LExtra: int64;
+      LWhy: string;
+      LI: int64;
+    begin
+      // the subsection's bytes from 0 with a record's 4-byte prefix, so DoRef's offsets
+      // (4 up) reach every field
+      setlength(LOut, AEnd - AAt + 4);
+      for LI := 0 to 3 do
+        LOut[LI] := 0;
+      end;
+      for LI := 0 to AEnd - AAt - 1 do
+        LOut[4 + LI] := ABytes[AAt + LI];
+      end;
+      LSignature := DoField(LOut, 4, 4);
+      if (LSignature <> 0) and (LSignature <> CV_INLINEE_SOURCE_LINE_SIGNATURE_EX) then
+        return NoArgs().Str(ADAM_CV_SECTION_SYMBOLS).Int(AAt).Fill(ADAM_MSG_PDB_MERGE_REASON_CUT);
+      end;
+      LAt := 8;
+      while LAt < len(LOut) do
+        // the inlinee's id 4, its file's checksum offset 4, its source line 4, then with
+        // extra files their count 4 and their checksum offsets
+        LExtra := 0;
+        if LSignature = CV_INLINEE_SOURCE_LINE_SIGNATURE_EX then
+          LExtra := DoField(LOut, LAt + 12, 4);
+        end;
+        if (LExtra < 0) or (LAt + 12 + 4 * LSignature + 4 * LExtra > len(LOut)) then
+          return NoArgs().Str(ADAM_CV_SECTION_SYMBOLS).Int(AAt).Fill(ADAM_MSG_PDB_MERGE_REASON_CUT);
+        end;
+        LRef.At := LAt;
+        LRef.Space := CvIndexSpace.Ids;
+        LWhy := self.DoRef(LOut, LRef);
+        if LWhy <> "" then
+          return LWhy;
+        end;
+        if self.DoFileOf(DoField(LOut, LAt + 4, 4)) < 0 then
+          return NoArgs().Int(DoField(LOut, LAt + 4, 4)).Fill(ADAM_MSG_PDB_MERGE_REASON_FILE);
+        end;
+        for LI := 0 to LExtra - 1 do
+          if self.DoFileOf(DoField(LOut, LAt + 16 + 4 * LI, 4)) < 0 then
+            return NoArgs().Int(DoField(LOut, LAt + 16 + 4 * LI, 4)).Fill(
+              ADAM_MSG_PDB_MERGE_REASON_FILE);
+          end;
+        end;
+        LAt := LAt + 12 + 4 * LSignature + 4 * LExtra;
+      end;
+      if self.FApply then
+        self.FModule.AddSubsection(DEBUG_S_INLINEELINES, DoSlice(LOut, 4, len(LOut) - 4));
+      end;
+      return "";
+    end;
+
+    // The string table and file checksums of the .debug$S bytes ABytes (each found once
+    // across the object's sections); "" or why not
+    hidden method DoTables(const ABytes: ByteArray): string;
+    var
+      LAt: int64;
+      LKind: int64;
+      LEnd: int64;
+    begin
+      if DoField(ABytes, 0, 4) <> CV_SIGNATURE_C13 then
+        return NoArgs().Str(ADAM_CV_SECTION_SYMBOLS).Fill(ADAM_MSG_PDB_MERGE_REASON_SIGNATURE);
+      end;
+      LAt := 4;
+      while LAt < len(ABytes) do
+        LKind := DoField(ABytes, LAt, 4);
+        LEnd := LAt + 8 + DoField(ABytes, LAt + 4, 4);
+        if (LKind < 0) or (LEnd < LAt + 8) or (LEnd > len(ABytes)) then
+          return NoArgs().Str(ADAM_CV_SECTION_SYMBOLS).Int(LAt).Fill(ADAM_MSG_PDB_MERGE_REASON_CUT);
+        end;
+        if (LKind = DEBUG_S_STRINGTABLE) or (LKind = DEBUG_S_FILECHKSMS) then
+          if ((LKind = DEBUG_S_STRINGTABLE) and self.FHasStrings) or
+            ((LKind = DEBUG_S_FILECHKSMS) and self.FHasChecksums) then
+            return ADAM_MSG_PDB_MERGE_REASON_TABLES;
+          end;
+          if LKind = DEBUG_S_STRINGTABLE then
+            self.FStrings := DoSlice(ABytes, LAt + 8, LEnd - LAt - 8);
+            self.FHasStrings := true;
+          else
+            self.FChecksums := DoSlice(ABytes, LAt + 8, LEnd - LAt - 8);
+            self.FHasChecksums := true;
+          end;
+        end;
+        // the next subsection at a 4-byte boundary
+        LAt := (LEnd + 3) & -4;
+      end;
+      return "";
+    end;
+
+    // The records of the .debug$S bytes ABytes (the tables read first) subsection by
+    // subsection; "" or why not
+    hidden method DoRecords(const ABytes: ByteArray): string;
+    var
+      LAt: int64;
+      LKind: int64;
+      LEnd: int64;
+      LWhy: string;
+    begin
+      LAt := 4;
+      while LAt < len(ABytes) do
+        LKind := DoField(ABytes, LAt, 4);
+        LEnd := LAt + 8 + DoField(ABytes, LAt + 4, 4);
+        LWhy := "";
+        if LKind = DEBUG_S_SYMBOLS then
+          LWhy := self.DoSymbols(ABytes, LAt + 8, LEnd);
+        else
+          if LKind = DEBUG_S_LINES then
+            LWhy := self.DoLines(ABytes, LAt + 8, LEnd);
+          else
+            if LKind = DEBUG_S_INLINEELINES then
+              LWhy := self.DoInlinees(ABytes, LAt + 8, LEnd);
+            else
+              // the tables (read first), x86 frame data, the object's symbol RVA list, one
+              // flagged to ignore: no PDB module form here (see the header)
+              if (LKind <> DEBUG_S_STRINGTABLE) and (LKind <> DEBUG_S_FILECHKSMS) and
+                (LKind <> DEBUG_S_FRAMEDATA) and (LKind <> DEBUG_S_COFF_SYMBOL_RVA) and
+                ((LKind & DEBUG_S_IGNORE) = 0) then
+                LWhy := NoArgs().Str(DoHex(LKind)).Fill(ADAM_MSG_PDB_MERGE_REASON_SUBSECTION);
+              end;
+            end;
+          end;
+        end;
+        if LWhy <> "" then
+          return LWhy;
+        end;
+        LAt := (LEnd + 3) & -4;
+      end;
+      return "";
+    end;
+
+    // One pass over the object (FApply: merging, else checking); "" or why not
+    hidden method DoPass(const ATypes: ByteArray; const ASymbols: ref List<ByteArray>): string;
+    var
+      LSection: ByteArray;
+      LWhy: string;
+      LI: int64;
+    begin
+      self.FHasStrings := false;
+      self.FHasChecksums := false;
+      self.FDepth := 0;
+      self.FSkipTo := -1;
+      setlength(self.FStrings, 0);
+      setlength(self.FChecksums, 0);
+      LWhy := self.DoTypes(ATypes);
+      for LI := 0 to ASymbols.Count - 1 do
+        if LWhy = "" then
+          LSection := ASymbols.Items[LI];
+          LWhy := self.DoTables(LSection);
+        end;
+      end;
+      if LWhy = "" then
+        LWhy := self.DoFiles();
+      end;
+      for LI := 0 to ASymbols.Count - 1 do
+        if LWhy = "" then
+          LSection := ASymbols.Items[LI];
+          LWhy := self.DoRecords(LSection);
+        end;
+      end;
+      if (LWhy = "") and (self.FDepth <> 0) then
+        LWhy := ADAM_MSG_PDB_MERGE_REASON_SCOPES;
+      end;
+      return LWhy;
+    end;
+
+    // One object's CodeView into AModule (see the header): ATypes its .debug$T (empty:
+    // none), ASymbols its .debug$S sections in the object's order, relocations applied.
+    // "" when merged; else why not, nothing added (raised for Adam's own object)
+    method AddObject(const AModule: ref PDBModule; const ATypes: ByteArray;
+      const ASymbols: ref List<ByteArray>): string;
+    var
+      LSection: ByteArray;
+      LWhy: string;
+      LI: int64;
+    begin
+      self.FModule := AModule;
+      self.FIsAdam := false;
+      for LI := 0 to ASymbols.Count - 1 do
+        LSection := ASymbols.Items[LI];
+        if IsAdamCodeView(LSection, 0, len(LSection)) then
+          self.FIsAdam := true;
+        end;
+      end;
+      // checked whole first, so a foreign object that does not merge adds nothing
+      self.FApply := false;
+      LWhy := self.DoPass(ATypes, ASymbols);
+      if LWhy <> "" then
+        self.FModule := nil;
+        if self.FIsAdam then
+          raise(ADAM_PDB_MERGE_FAULT_ADAM + LWhy);
+        end;
+        return LWhy;
+      end;
+      self.FApply := true;
+      LWhy := self.DoPass(ATypes, ASymbols);
+      self.FApply := false;
+      self.FModule := nil;
+      if LWhy <> "" then
+        raise(ADAM_PDB_MERGE_FAULT_CHECKED + LWhy);
+      end;
+      return "";
+    end;
+  end;
+
+end.
