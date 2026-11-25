@@ -38,6 +38,8 @@ import System.SysUtils, System.Linux;
 const
   // A folder made with every permission the umask leaves (0777), as mkdir(1) does
   ADAM_IO_LINUX_FOLDER_MODE: uint32 = 0x1FF;
+  // The bytes CopyFile reads and writes at a time (1 MiB)
+  ADAM_IO_LINUX_COPY_CHUNK: int64 = 1048576;
   // The most bytes one getrandom call is asked for (the kernel's own cap, 32 MiB - 1)
   ADAM_IO_LINUX_RANDOM_MAX: int64 = 33554431;
   // Where an x86_64 glibc system keeps its libraries (Debian's multiarch folders, then the
@@ -649,8 +651,88 @@ begin
   return LOk;
 end;
 
+// The file ASource copied to ATarget (both resolved): its bytes in ADAM_IO_LINUX_COPY_CHUNK
+// reads, its permission bits, a file at ATarget replaced only when AOverwrite (else the
+// create is exclusive: O_EXCL). False when ASource cannot be read, the two are one file, or
+// a read / write fails (a partial ATarget removed)
+func DoCopy(const ASource: string; const ATarget: string; const AOverwrite: bool): bool;
+var
+  LStat: stat;
+  LOther: stat;
+  LMode: uint32;
+  LFlags: int32;
+  LIn: int32;
+  LOut: int32;
+  LBuffer: ByteArray;
+  LGot: int64;
+  LPut: int64;
+  LDone: int64;
+  LOk: bool;
+begin
+  if __xstat(_STAT_VER, ASource, LStat) <> 0 then
+    return false;
+  end;
+  if __xstat(_STAT_VER, ATarget, LOther) = 0 then
+    if not AOverwrite then
+      return false;
+    end;
+    // One file under two names: opening the target with O_TRUNC would empty the source
+    if (LOther.st_dev = LStat.st_dev) and (LOther.st_ino = LStat.st_ino) then
+      return false;
+    end;
+  end;
+  LMode := LStat.st_mode & ~S_IFMT;
+  LIn := open(ASource, O_RDONLY | O_CLOEXEC);
+  if LIn < 0 then
+    return false;
+  end;
+  LFlags := O_WRONLY | O_CREAT | O_CLOEXEC;
+  if AOverwrite then
+    LFlags := LFlags | O_TRUNC;
+  else
+    LFlags := LFlags | O_EXCL;
+  end;
+  LOut := open(ATarget, LFlags, LMode);
+  if LOut < 0 then
+    close(LIn);
+    return false;
+  end;
+  setlength(LBuffer, ADAM_IO_LINUX_COPY_CHUNK);
+  LOk := true;
+  while LOk do
+    LGot := read(LIn, addr of LBuffer[0], uint64(ADAM_IO_LINUX_COPY_CHUNK));
+    if LGot < 0 then
+      // A signal broke the read off: read again
+      LOk := CErrno() = EINTR;
+    else
+      if LGot = 0 then
+        leave;
+      end;
+      LDone := 0;
+      while LOk and (LDone < LGot) do
+        LPut := write(LOut, addr of LBuffer[LDone], uint64(LGot - LDone));
+        if LPut < 0 then
+          LOk := CErrno() = EINTR;
+        else
+          LDone := LDone + LPut;
+        end;
+      end;
+    end;
+  end;
+  close(LIn);
+  if close(LOut) <> 0 then
+    LOk := false;
+  end;
+  if not LOk then
+    RemoveFile(ATarget);
+    return false;
+  end;
+  // An existing target kept its own bits through O_TRUNC: the source's set as well
+  return chmod(ATarget, LMode) = 0;
+end;
+
 // System.IO's RenameFile: rename(2) of a file onto a name nothing holds (a dangling link is a
-// name too: never replaced)
+// name too: never replaced); across file systems (EXDEV) the file copied, then removed
 public func cpplink IoPlatformRenameFile(const AOldPath: string; const ANewPath: string): bool;
 var
   LOld: string;
@@ -669,6 +751,15 @@ begin
   LOk := (LOld <> "") and (LNew <> "");
   if LOk then
     LOk := rename(LOld, LNew) = 0;
+    // Another file system: a copy (never onto anything), then the old file removed; a copy
+    // the old file cannot leave is taken back
+    if not LOk and (CErrno() = EXDEV) then
+      LOk := DoCopy(LOld, LNew, false);
+      if LOk and not RemoveFile(LOld) then
+        RemoveFile(LNew);
+        LOk := false;
+      end;
+    end;
   end;
   return LOk;
 end;
@@ -740,6 +831,67 @@ begin
   LFormatted := StringFromC(LText, int64(LLength));
   free(ptr(LText));
   return LFormatted;
+end;
+
+
+// System.IO's IsFileHidden by Linux's rule: an existing file or folder whose name starts with
+// '.' (a dot file: what ls and file managers leave out)
+public func cpplink IoPlatformIsFileHidden(const APath: string): bool;
+var
+  LText: string;
+  LName: string;
+  LSize: int64;
+begin
+  if DoKind(APath, LSize) = ADAM_PATH_NONE then
+    return false;
+  end;
+  // The resolved path has "." and ".." folded and no trailing '/', so its name part is the
+  // item's own ("" for the root)
+  LText := IoPlatformResolvePath(APath);
+  LName := ExtractFileName(LText);
+  return (LName <> "") and (LName[0] = '.');
+end;
+
+// System.IO's IsPathAbsolute by Linux's rule, as text: rooted at '/' ('\' read as '/')
+public func cpplink IoPlatformIsPathAbsolute(const APath: string): bool;
+begin
+  return (len(APath) > 0) and ((APath[0] = '/') or (APath[0] = '\\'));
+end;
+
+// System.IO's SetCurrentDir: the kernel's chdir (SYS_chdir through syscall: HookIO's chdir hook,
+// which can enter a mounted source's folder, is not between), so the working folder is the
+// OS's own on both targets; false for a file, a missing path or one the kernel refuses
+public func cpplink IoPlatformSetCurrentDir(const APath: string): bool;
+var
+  LText: string;
+begin
+  if not IoPlatformDirectoryExists(APath) then
+    return false;
+  end;
+  LText := IoPlatformResolvePath(APath);
+  if LText = "" then
+    return false;
+  end;
+  return syscall(SYS_chdir, LText) = 0;
+end;
+
+// System.IO's CopyFile: DoCopy over the two paths resolved; false when ASourcePath is not a file
+// or ATargetPath is a folder
+public func cpplink IoPlatformCopyFile(const ASourcePath: string; const ATargetPath: string;
+  const AOverwrite: bool): bool;
+var
+  LSource: string;
+  LTarget: string;
+begin
+  if not IoPlatformFileExists(ASourcePath) or IoPlatformDirectoryExists(ATargetPath) then
+    return false;
+  end;
+  LSource := IoPlatformResolvePath(ASourcePath);
+  LTarget := IoPlatformResolvePath(ATargetPath);
+  if (LSource = "") or (LTarget = "") then
+    return false;
+  end;
+  return DoCopy(LSource, LTarget, AOverwrite);
 end;
 
 end.
