@@ -1687,7 +1687,8 @@ public type
 
     // The leaves of the members of the record, object or overlay body (or anonymous part)
     // ABody at ABase added to AShape: its parent part at the part's offset, each field and
-    // embed at its ResolvedOffset (a bitfield: its unit, an integer leaf of its type), an
+    // embed at its ResolvedOffset (a bitfield: its unit, an integer leaf of its type; one
+    // stored in the bytes its bits span: those bytes, an integer leaf never unaligned), an
     // anonymous record's or overlay's members at their own offsets (they count from the
     // declaring type, DoManagedRunsIn's rule)
     hidden method DoShapeMembers(const ABody: int64; const ABase: int64; const AShape: ref IRAggregate);
@@ -1713,11 +1714,19 @@ public type
             raise(ADAM_LOWERING_FAULT_FIELD_OFFSET + self.FTree[LMember].Text);
           end;
           LType := self.DoPartType(LMember);
-          if (LKind = NodeKind.FieldDecl) and (self.FTree[LMember].ResolvedBitWidth >= 0) then
-            AShape.AddLeaf(ABase + self.FTree[LMember].ResolvedOffset, TypeSize(self.FTree, self.FTarget, LType),
-              TypeAlign(self.FTree, self.FTarget, LType), false);
+          if (LKind = NodeKind.FieldDecl) and (self.FTree[LMember].ResolvedSize > 0) and
+            (self.FTree[LMember].ResolvedBitWidth >= 0) then
+            // a bitfield stored in the bytes its bits span: an integer leaf of those bytes,
+            // never unaligned (clang classifies a bitfield by the eightbytes it touches, a
+            // packed bitfield never sends its record to MEMORY)
+            AShape.AddLeaf(ABase + self.FTree[LMember].ResolvedOffset, self.FTree[LMember].ResolvedSize, 1, false);
           else
-            self.DoShapeLeaves(LType, ABase + self.FTree[LMember].ResolvedOffset, AShape);
+            if (LKind = NodeKind.FieldDecl) and (self.FTree[LMember].ResolvedBitWidth >= 0) then
+              AShape.AddLeaf(ABase + self.FTree[LMember].ResolvedOffset, TypeSize(self.FTree, self.FTarget, LType),
+                TypeAlign(self.FTree, self.FTarget, LType), false);
+            else
+              self.DoShapeLeaves(LType, ABase + self.FTree[LMember].ResolvedOffset, AShape);
+            end;
           end;
         end;
         if (LKind = NodeKind.AnonRecord) or (LKind = NodeKind.AnonOverlay) then
@@ -4872,7 +4881,8 @@ public type
     end;
 
     // The value of the bitfield AField read from its lane at AAddress, at ANode (DoBitRead's
-    // way, by the field: a property bound to a bitfield reads it so)
+    // way, by the field: a property bound to a bitfield reads it so; one stored in the bytes
+    // its bits span: DoSpanBitRead)
     hidden method DoFieldBitRead(const AField: int64; const AAddress: int64; const ANode: int64): int64;
     var
       LBit: int64;
@@ -4881,6 +4891,9 @@ public type
       LDown: IROp;
       LValue: int64;
     begin
+      if self.FTree[AField].ResolvedSize > 0 then
+        return self.DoSpanBitRead(AField, AAddress, ANode);
+      end;
       LBit := int64(self.FTree[AField].ResolvedBitOffset);
       LWidth := int64(self.FTree[AField].ResolvedBitWidth);
       LLane := self.DoFieldLane(AField);
@@ -4909,7 +4922,8 @@ public type
     end;
 
     // AValue stored into the bitfield AField in its lane at AAddress, at ANode (DoBitWrite's
-    // way, by the field: a property bound to a bitfield writes it so)
+    // way, by the field: a property bound to a bitfield writes it so; one stored in the bytes
+    // its bits span: DoSpanBitWrite)
     hidden method DoFieldBitWrite(const AField: int64; const AAddress: int64; const AValue: int64;
       const ANode: int64);
     var
@@ -4920,6 +4934,10 @@ public type
       LPart: int64;
       LNew: int64;
     begin
+      if self.FTree[AField].ResolvedSize > 0 then
+        self.DoSpanBitWrite(AField, AAddress, AValue, ANode);
+        return;
+      end;
       LBit := int64(self.FTree[AField].ResolvedBitOffset);
       LMask := BitMask(int64(self.FTree[AField].ResolvedBitWidth), LBit);
       LLane := self.DoFieldLane(AField);
@@ -4932,6 +4950,155 @@ public type
       self.FModule.InstrAt(LNew).Operands.Add(LOld);
       self.FModule.InstrAt(LNew).Operands.Add(LPart);
       self.DoStore(AAddress, self.DoConvertIR(LNew, LLane, ANode), ANode);
+    end;
+
+    // The bytes of the piece at AAt (from a span's start) of a span of ASpan bytes, as a
+    // bitfield's span is read and written: the widest of 8 / 4 / 2 / 1 bytes that the rest
+    // holds (a 9-byte span: 8 + 1, a 5-byte one: 4 + 1)
+    hidden const method DoSpanPiece(const AAt: int64; const ASpan: int64): int64;
+    var
+      LPiece: int64;
+    begin
+      LPiece := 8;
+      while LPiece > ASpan - AAt do
+        LPiece := LPiece div 2;
+      end;
+      return LPiece;
+    end;
+
+    // The unsigned IR type of a piece of ABytes bytes (1 / 2 / 4 / 8)
+    hidden const method DoPieceType(const ABytes: int64): IRType;
+    begin
+      if ABytes = 8 then
+        return IRType.UInt64;
+      end;
+      if ABytes = 4 then
+        return IRType.UInt32;
+      end;
+      if ABytes = 2 then
+        return IRType.UInt16;
+      end;
+      return IRType.UInt8;
+    end;
+
+    // The value of the bitfield AField whose storage is the bytes its bits span (Layout's
+    // ResolvedSize, Itanium under a pack limit: its bits may pass its type's width, its type's
+    // unit may pass the aggregate's end) at AAddress, at ANode: each piece of the span
+    // (DoSpanPiece) loaded and widened unsigned, the field's bits in it moved down to bit 0,
+    // masked and moved up to their place in the field's value, or-ed together; then the
+    // value's top bit copied up for a signed field (shl / sar by 64 - width), narrowed to the
+    // field's type; a bool field compared with 0
+    hidden method DoSpanBitRead(const AField: int64; const AAddress: int64; const ANode: int64): int64;
+    var
+      LBit: int64;
+      LWidth: int64;
+      LSpan: int64;
+      LLane: IRType;
+      LAt: int64;
+      LPiece: int64;
+      LLow: int64;
+      LHigh: int64;
+      LPart: int64;
+      LValue: int64;
+      LJoin: int64;
+      LDown: IROp;
+    begin
+      LBit := int64(self.FTree[AField].ResolvedBitOffset);
+      LWidth := int64(self.FTree[AField].ResolvedBitWidth);
+      LSpan := self.FTree[AField].ResolvedSize;
+      LLane := self.DoFieldLane(AField);
+      LValue := 0;
+      LAt := 0;
+      while LAt < LSpan do
+        LPiece := self.DoSpanPiece(LAt, LSpan);
+        // the field's bits [LLow, LHigh) this piece holds, counted from the span's start
+        LLow := LAt * 8;
+        if LBit > LLow then
+          LLow := LBit;
+        end;
+        LHigh := (LAt + LPiece) * 8;
+        if LBit + LWidth < LHigh then
+          LHigh := LBit + LWidth;
+        end;
+        LPart := self.DoConvertIR(self.DoLoad(self.DoByteOffset(AAddress, LAt, ANode),
+          self.DoPieceType(LPiece), ANode), IRType.Int64, ANode);
+        LPart := self.DoShiftBy(IROp.Shr, LPart, LLow - LAt * 8, ANode);
+        LPart := self.DoMaskWith(IROp.BitAnd, LPart, BitMask(LHigh - LLow, 0), ANode);
+        LPart := self.DoShiftBy(IROp.Shl, LPart, LLow - LBit, ANode);
+        if LValue = 0 then
+          LValue := LPart;
+        else
+          LJoin := self.DoEmit(IROp.BitOr, IRType.Int64, ANode);
+          self.FModule.InstrAt(LJoin).Operands.Add(LValue);
+          self.FModule.InstrAt(LJoin).Operands.Add(LPart);
+          LValue := LJoin;
+        end;
+        LAt := LAt + LPiece;
+      end;
+      if self.DoIRType(VariableTypeOf(self.FTree, AField)) = IRType.Bool then
+        return self.DoCompareWith(IRPredicate.NotEqual, LValue,
+          self.DoConstant(IRType.Int64, 0, ANode), ANode);
+      end;
+      if IsSignedType(LLane) then
+        LDown := IROp.Sar;
+        LValue := self.DoShiftBy(IROp.Shl, LValue, 64 - LWidth, ANode);
+        LValue := self.DoShiftBy(LDown, LValue, 64 - LWidth, ANode);
+      end;
+      return self.DoConvertIR(LValue, LLane, ANode);
+    end;
+
+    // AValue stored into the bitfield AField whose storage is the bytes its bits span
+    // (DoSpanBitRead's form) at AAddress, at ANode: AValue widened to int64; per piece of
+    // the span, the piece read and widened, the field's bits in it cleared, the value's bits
+    // for them moved down from their place in the field and up to theirs in the piece, masked
+    // and or-ed in, the piece narrowed and stored back (the neighbours' bits as they were)
+    hidden method DoSpanBitWrite(const AField: int64; const AAddress: int64; const AValue: int64;
+      const ANode: int64);
+    var
+      LBit: int64;
+      LWidth: int64;
+      LSpan: int64;
+      LAt: int64;
+      LPiece: int64;
+      LType: IRType;
+      LLow: int64;
+      LHigh: int64;
+      LMask: int64;
+      LWide: int64;
+      LPlace: int64;
+      LOld: int64;
+      LPart: int64;
+      LNew: int64;
+    begin
+      LBit := int64(self.FTree[AField].ResolvedBitOffset);
+      LWidth := int64(self.FTree[AField].ResolvedBitWidth);
+      LSpan := self.FTree[AField].ResolvedSize;
+      LWide := self.DoConvertIR(AValue, IRType.Int64, ANode);
+      LAt := 0;
+      while LAt < LSpan do
+        LPiece := self.DoSpanPiece(LAt, LSpan);
+        LType := self.DoPieceType(LPiece);
+        LLow := LAt * 8;
+        if LBit > LLow then
+          LLow := LBit;
+        end;
+        LHigh := (LAt + LPiece) * 8;
+        if LBit + LWidth < LHigh then
+          LHigh := LBit + LWidth;
+        end;
+        LMask := BitMask(LHigh - LLow, LLow - LAt * 8);
+        LPlace := self.DoByteOffset(AAddress, LAt, ANode);
+        LOld := self.DoConvertIR(self.DoLoad(LPlace, LType, ANode), IRType.Int64, ANode);
+        LOld := self.DoMaskWith(IROp.BitAnd, LOld, ~LMask, ANode);
+        LPart := self.DoShiftBy(IROp.Shr, LWide, LLow - LBit, ANode);
+        LPart := self.DoShiftBy(IROp.Shl, LPart, LLow - LAt * 8, ANode);
+        LPart := self.DoMaskWith(IROp.BitAnd, LPart, LMask, ANode);
+        LNew := self.DoEmit(IROp.BitOr, IRType.Int64, ANode);
+        self.FModule.InstrAt(LNew).Operands.Add(LOld);
+        self.FModule.InstrAt(LNew).Operands.Add(LPart);
+        self.DoStore(LPlace, self.DoConvertIR(LNew, LType, ANode), ANode);
+        LAt := LAt + LPiece;
+      end;
     end;
 
     // ASize bytes at the address AAddress set to zero, at ANode (a record's start, BNF sec 4)
@@ -26181,7 +26348,8 @@ public type
 
     // The folded value AValue of the bitfield AField or-ed into its lane at ALane in ABytes
     // (the lane the field type's size; the value moved to the field's bit and masked to its
-    // width: the bits a run-time DoBitWrite leaves); false when AValue did not fold
+    // width: the bits a run-time DoBitWrite leaves; a field stored in the bytes its bits span
+    // into those bytes); false when AValue did not fold
     hidden method DoConstLane(const AValue: int64; const AField: int64; var ABytes: ByteArray;
       const ALane: int64): bool;
     var
@@ -26190,12 +26358,37 @@ public type
       LMask: uint64;
       LPart: uint64;
       LLane: uint64;
+      LWidth: int64;
+      LAt: int64;
+      LLow: int64;
+      LHigh: int64;
     begin
       if not self.DoIsFolded(AValue) then
         return false;
       end;
-      LSize := TypeSize(self.FTree, self.FTarget, VariableTypeOf(self.FTree, AField));
       LBit := int64(self.FTree[AField].ResolvedBitOffset);
+      if self.FTree[AField].ResolvedSize > 0 then
+        // stored in the bytes its bits span (DoSpanBitWrite's form): byte by byte, each
+        // byte's share of the field's bits put in, the neighbours' bits kept
+        LWidth := int64(self.FTree[AField].ResolvedBitWidth);
+        LPart := uint64(self.DoConstBits(AValue, self.FTree[AValue].ResolvedType));
+        for LAt := 0 to self.FTree[AField].ResolvedSize - 1 do
+          LLow := LAt * 8;
+          if LBit > LLow then
+            LLow := LBit;
+          end;
+          LHigh := LAt * 8 + 8;
+          if LBit + LWidth < LHigh then
+            LHigh := LBit + LWidth;
+          end;
+          LMask := uint64(BitMask(LHigh - LLow, LLow - LAt * 8));
+          LLane := GetLe(ABytes, ALane + LAt, 1);
+          LLane := (LLane & (~LMask)) | (((LPart shr uint64(LLow - LBit)) shl uint64(LLow - LAt * 8)) & LMask);
+          PutLe(ABytes, ALane + LAt, LLane, 1);
+        end;
+        return true;
+      end;
+      LSize := TypeSize(self.FTree, self.FTarget, VariableTypeOf(self.FTree, AField));
       LMask := uint64(BitMask(int64(self.FTree[AField].ResolvedBitWidth), LBit));
       LPart := uint64(self.DoConstBits(AValue, self.FTree[AValue].ResolvedType));
       LPart := (LPart shl uint64(LBit)) & LMask;
