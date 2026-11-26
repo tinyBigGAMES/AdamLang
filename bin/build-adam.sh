@@ -16,9 +16,12 @@
 #---------------------------------------------------------------------------#
 # build-adam.sh -- Adam builds itself, then adamtest, into this folder      #
 #                                                                           #
-# build-adam.cmd's linux twin: one line over adam --dev-build-adam          #
-# (Adam.Dev.BuildAdam, the same job on every host). It ends with BUILD OK,  #
-# or BUILD FAILED - <step> and exit code 1.                                 #
+# One line over adam's own job, adam --dev-build-adam (Adam.Dev.BuildAdam,  #
+# the same on every host; build-adam.cmd is its Windows twin): a snapshot   #
+# of the inputs, stage A / B / C with B = C byte-identical, adamtest, the   #
+# other host's pair cross-built (B = C too), the install (the adam it       #
+# replaces kept as adam-prev) and the res/acu prebuild. It ends with        #
+# BUILD OK, or BUILD FAILED - <step> and exit code 1.                       #
 #                                                                           #
 # Usage:   ./build-adam.sh                                                  #
 #############################################################################
