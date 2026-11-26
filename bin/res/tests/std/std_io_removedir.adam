@@ -1,0 +1,227 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  std_io_removedir.adam - System.IO's RemoveDir(APath, ARecursive) (LX7c,
+  his name 2026-11-26: the self-build remakes its snapshot from empty): a
+  tree of folders and files, a read-only file, a link to a folder outside
+  it (win64 a junction, linux a symbolic link) and a broken link (its
+  folder removed) all go; the folder outside and its file are kept (a link
+  is never followed); without ARecursive a folder that holds anything is
+  refused; a missing path and a file are refused; a top-level link to a
+  folder is removed as the link alone. The junction is made as
+  std_customio_ziplink makes it (no admin rights, no mklink). Each line ok
+  or FAIL with its name; everything made is removed.
+*******************************************************************************/
+
+/*
+@@test
+  kind run
+  targets x86_64-windows-gnu x86_64-linux-gnu
+  exitcode 0
+  | ok made
+  | ok links made
+  | ok not recursive refused
+  | ok removed
+  | ok gone
+  | ok outside kept
+  | ok missing refused
+  | ok file refused
+  | ok top link removed
+  | ok top link target kept
+  | ok cleaned
+  | done 0
+  | [Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+@@end
+*/
+
+module exe std_io_removedir;
+
+import System.SysUtils, System.IO
+@ifdef TARGET_X86_64_WINDOWS_GNU
+  , System.Windows
+@elseif TARGET_X86_64_LINUX_GNU
+  , System.Linux
+@endif
+  ;
+
+const
+  // The row's exe lands in repo\bin\output\bin\<triple>\<mode>: `$P:` is that folder
+  CDir: string = "$P:std_io_removedir_dir";
+  CKeep: string = "$P:std_io_removedir_keep";
+  CGone: string = "$P:std_io_removedir_gone";
+  CFile: string = "$P:std_io_removedir_file.txt";
+  CTop: string = "$P:std_io_removedir_top";
+@ifdef TARGET_X86_64_WINDOWS_GNU
+  // kernel32's values: GENERIC_WRITE, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS |
+  // FILE_FLAG_OPEN_REPARSE_POINT (a folder opened as itself), INVALID_HANDLE_VALUE,
+  // FSCTL_SET_REPARSE_POINT, IO_REPARSE_TAG_MOUNT_POINT (a junction)
+  CGenericWrite: uint32 = 0x40000000;
+  COpenExisting: uint32 = 3;
+  COpenFlags: uint32 = 0x02200000;
+  CInvalidHandle: uint64 = 0xFFFFFFFFFFFFFFFF;
+  CSetReparsePoint: uint32 = 0x000900A4;
+  CMountPointTag: uint32 = 0xA0000003;
+  // The REPARSE_DATA_BUFFER's header (tag, data length, reserved) and its mount point
+  // header (substitute / print name offsets and lengths) in bytes
+  CReparseHeader: int32 = 8;
+  CMountHeader: int32 = 8;
+@endif
+
+var
+  GFails: int32;
+@ifdef TARGET_X86_64_WINDOWS_GNU
+  GWide: WideBuffer;
+  GBuffer: array[0..16383] of uint8;
+@endif
+
+// One line: ok or FAIL with AName
+func Check(const AName: string; const AOk: bool);
+begin
+  if AOk then
+    println("ok {}", AName);
+  else
+    println("FAIL {}", AName);
+    GFails := GFails + 1;
+  end;
+end;
+
+@ifdef TARGET_X86_64_WINDOWS_GNU
+func CreateFileW(const AFileName: ptr to uint16; const AAccess: uint32;
+  const AShare: uint32; const ASecurity: ptr; const ACreation: uint32; const AFlags: uint32;
+  const ATemplate: uint64): uint64; external "kernel32";
+func DeviceIoControl(const ADevice: uint64; const ACode: uint32; const AIn: ptr;
+  const AInSize: uint32; const AOut: ptr; const AOutSize: uint32; var AReturned: uint32;
+  const AOverlapped: ptr): int32; external "kernel32";
+func CloseHandle(const AHandle: uint64): int32; external "kernel32";
+
+// AValue's low 16 bits at GBuffer[AAt], little-endian
+func Put16(const AAt: int32; const AValue: int32);
+begin
+  GBuffer[AAt] := uint8(AValue & 0xFF);
+  GBuffer[AAt + 1] := uint8((AValue shr 8) & 0xFF);
+end;
+
+// AValue at GBuffer[AAt], little-endian
+func Put32(const AAt: int32; const AValue: uint32);
+begin
+  GBuffer[AAt] := uint8(AValue & 0xFF);
+  GBuffer[AAt + 1] := uint8((AValue shr 8) & 0xFF);
+  GBuffer[AAt + 2] := uint8((AValue shr 16) & 0xFF);
+  GBuffer[AAt + 3] := uint8((AValue shr 24) & 0xFF);
+end;
+
+// The UTF-16 units in GWide before its NUL
+func WideCount(): int32;
+var
+  LCount: int32;
+begin
+  LCount := 0;
+  while GWide[LCount] <> 0 do
+    LCount := LCount + 1;
+  end;
+  return LCount;
+end;
+
+// APath resolved (`$P:`) with Windows' own separator
+func WindowsPath(const APath: string): string;
+begin
+  return ReplaceStr(ResolvePath(APath), "/", "\\");
+end;
+
+// Makes the empty folder ALink a junction to the folder ATarget: a REPARSE_DATA_BUFFER
+// (IO_REPARSE_TAG_MOUNT_POINT) whose substitute name is the NT path \??\<target>, set on
+// the folder opened as itself. True when the OS took it
+func MakeJunction(const ALink: string; const ATarget: string): bool;
+var
+  LUnits: int32;
+  LBytes: int32;
+  LDataLength: int32;
+  LTotal: int32;
+  LI: int32;
+  LHandle: uint64;
+  LReturned: uint32;
+  LOk: bool;
+begin
+  if not UTF8ToWide("\\??\\" + WindowsPath(ATarget), GWide) then
+    return false;
+  end;
+  LUnits := WideCount();
+  LBytes := LUnits * 2;
+  // The substitute name and its NUL, then an empty print name (its NUL)
+  LDataLength := CMountHeader + LBytes + 2 + 2;
+  LTotal := CReparseHeader + LDataLength;
+  if LTotal > 16384 then
+    return false;
+  end;
+  Put32(0, CMountPointTag);
+  Put16(4, LDataLength);
+  Put16(6, 0);
+  Put16(8, 0);
+  Put16(10, LBytes);
+  Put16(12, LBytes + 2);
+  Put16(14, 0);
+  for LI := 0 to LUnits do
+    Put16(16 + LI * 2, int32(GWide[LI]));
+  end;
+  Put16(16 + LBytes + 2, 0);
+  if not UTF8ToWide(WindowsPath(ALink), GWide) then
+    return false;
+  end;
+  LHandle := CreateFileW(addr of GWide[0], CGenericWrite, 0, nil, COpenExisting, COpenFlags, 0);
+  if LHandle = CInvalidHandle then
+    return false;
+  end;
+  LReturned := 0;
+  LOk := DeviceIoControl(LHandle, CSetReparsePoint, ptr(addr of GBuffer[0]), uint32(LTotal),
+    nil, 0, LReturned, nil) <> 0;
+  CloseHandle(LHandle);
+  return LOk;
+end;
+
+// ALink made a link to the folder ATarget: a junction (an empty folder made one)
+func MakeLink(const ALink: string; const ATarget: string): bool;
+begin
+  return CreateDir(ALink) and MakeJunction(ALink, ATarget);
+end;
+@elseif TARGET_X86_64_LINUX_GNU
+// ALink made a link to the folder ATarget: a symbolic link to its full path
+func MakeLink(const ALink: string; const ATarget: string): bool;
+begin
+  return symlink(ResolvePath(ATarget), ResolvePath(ALink)) = 0;
+end;
+@endif
+
+begin
+  GFails := 0;
+  Check("made", ForceDirectories(CDir + "/sub/deep") and WriteAllText(CDir + "/a.txt", "a") and
+    WriteAllText(CDir + "/sub/b.txt", "b") and WriteAllText(CDir + "/sub/deep/c.txt", "c") and
+    WriteAllText(CDir + "/ro.txt", "r") and SetFileReadOnly(CDir + "/ro.txt", true) and
+    ForceDirectories(CKeep) and WriteAllText(CKeep + "/k.txt", "k") and ForceDirectories(CGone));
+  // The broken link's folder goes once the link is made
+  Check("links made", MakeLink(CDir + "/sub/link", CKeep) and MakeLink(CDir + "/broken", CGone) and
+    RemoveDir(CGone));
+  Check("not recursive refused", (not RemoveDir(CDir, false)) and DirectoryExists(CDir));
+  Check("removed", RemoveDir(CDir, true));
+  Check("gone", (not DirectoryExists(CDir)) and (not FileExists(CDir + "/a.txt")));
+  Check("outside kept", FileExists(CKeep + "/k.txt"));
+  Check("missing refused", not RemoveDir(CDir, true));
+  Check("file refused", WriteAllText(CFile, "f") and (not RemoveDir(CFile, true)) and
+    FileExists(CFile) and DeleteFile(CFile));
+  Check("top link removed", MakeLink(CTop, CKeep) and RemoveDir(CTop, true) and
+    (not DirectoryExists(CTop)));
+  Check("top link target kept", FileExists(CKeep + "/k.txt"));
+  Check("cleaned", DeleteFile(CKeep + "/k.txt") and RemoveDir(CKeep));
+  println("done {}", GFails);
+end.

@@ -1,0 +1,599 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  Adam.Dev.BuildAdam.adam - adam --dev-build-adam (PLAN-LINUX64 LX7c, his
+  name 2026-11-26): Adam builds itself on whichever host it runs, a
+  developer's job (never in the help, as --dev-editor), so a linux-only
+  user rebuilds adam as a win64 one does; build-adam.cmd / build-adam.sh
+  are one-line wrappers over it. From adam's folder (repo\bin, `$P:`):
+    0 snapshot: ..\src, ..\projects\adam and ..\projects\adamtest without
+      their output\, res\libs, res\runtime, res\assets\icons (the exes'
+      @exeicon) and the running adam copied into
+      ..\projects\adam\output\snapshot, each folder made again from empty,
+      so the sources can be edited while it runs: every stage reads the
+      snapshot alone (each runs from the snapshot's bin\)
+    1 stage A: the snapshot's adam builds the compiler (a plain debug build)
+    2 stage B: A builds it again as the compiler's own build
+      (--adam-self-build -opt fast); 3 stage C: B builds it the same way
+    4 B and C compared byte for byte: the compiler reproduces itself, else
+      nothing is installed
+    5 B builds adamtest for the host
+    6 the other host's pair: B builds adam (the compiler's own build) and
+      adamtest for the other target; C builds that adam too and the two are
+      compared byte for byte (the cross build reproduces itself as well)
+    install: the running adam renamed to adam-prev (the last good compiler,
+      the one before replaced), then B's adam, the host's adamtest and the
+      other host's pair copied beside it (one bin\ and res\ for both hosts:
+      adam.exe / adamtest.exe and adam / adamtest)
+    7 prebuild: the new adam builds a program importing every std unit
+      (each target's own units under its @ifdef) for every target at every
+      level (debug, then -opt safe / fast / small), filling res\acu
+  Every stage's own output goes to the console as it runs; each step's line
+  ([0/7] .. [7/7]) and the last one (BUILD OK, or BUILD FAILED - <step>)
+  are adam's. Stage files land in projects\*\output (ignored by git).
+*******************************************************************************/
+
+module unit Adam.Dev.BuildAdam;
+
+import System.SysUtils, System.IO, System.Process, Adam.Core.Common, Adam.Core.Messages,
+  Adam.Compiler.Diagnostics, Adam.Target, Adam.Target.Registry, Adam.Backend.Parts,
+  Adam.Backend.Targets;
+
+const
+  // The places, from adam's folder (repo\bin)
+  ADAM_DEV_BUILD_SRC: string = "$P:../src";
+  ADAM_DEV_BUILD_PROJECT: string = "$P:../projects/adam";
+  ADAM_DEV_BUILD_TESTER: string = "$P:../projects/adamtest";
+  ADAM_DEV_BUILD_OUT: string = "$P:../projects/adam/output";
+  ADAM_DEV_BUILD_TESTER_OUT: string = "$P:../projects/adamtest/output";
+  ADAM_DEV_BUILD_LIBS: string = "$P:res/libs";
+  ADAM_DEV_BUILD_RUNTIME: string = "$P:res/runtime";
+  ADAM_DEV_BUILD_ICONS: string = "$P:res/assets/icons";
+  ADAM_DEV_BUILD_STD: string = "$P:res/libs/std";
+  // In the output folder: the snapshot, the stages, the prebuild's own folder
+  ADAM_DEV_BUILD_SNAPSHOT: string = "snapshot";
+  ADAM_DEV_BUILD_STAGE_A: string = "stageA";
+  ADAM_DEV_BUILD_STAGE_B: string = "stageB";
+  ADAM_DEV_BUILD_STAGE_C: string = "stageC";
+  ADAM_DEV_BUILD_STAGE_X: string = "stageX";
+  ADAM_DEV_BUILD_STAGE_XC: string = "stageXC";
+  ADAM_DEV_BUILD_PREBUILD: string = "prebuild";
+  ADAM_DEV_BUILD_PREBUILD_NAME: string = "adam_prebuild";
+  // A project's own output folder, never copied into the snapshot
+  ADAM_DEV_BUILD_SKIP: string = "output/";
+  // The main modules, from the snapshot's bin\ (where every stage runs)
+  ADAM_DEV_BUILD_MAIN: string = "../projects/adam/src/adam" + ADAM_EXT_SOURCE;
+  ADAM_DEV_BUILD_TESTER_MAIN: string = "../projects/adamtest/src/adamtest" + ADAM_EXT_SOURCE;
+  // The programs' names before their target's exe extension
+  ADAM_DEV_BUILD_ADAM: string = "adam";
+  ADAM_DEV_BUILD_ADAMTEST: string = "adamtest";
+  ADAM_DEV_BUILD_PREV: string = "adam-prev";
+  // The stage copies in the snapshot's bin\ (removed at the end)
+  ADAM_DEV_BUILD_COPY_A: string = "adam-stageA";
+  ADAM_DEV_BUILD_COPY_B: string = "adam-stageB";
+  ADAM_DEV_BUILD_COPY_C: string = "adam-stageC";
+  // The compiler's own build: a release one at fast (the switch alone means safe); a plain
+  // build is a debug one. Each exe lands in <output>\bin\<triple>\<mode>
+  ADAM_DEV_BUILD_SELF_LEVEL: string = "fast";
+  ADAM_DEV_BUILD_RELEASE_MODE: string = "release_" + ADAM_DEV_BUILD_SELF_LEVEL;
+  ADAM_DEV_BUILD_DEBUG_MODE: string = "debug";
+  // The command line's words a stage is run with
+  ADAM_DEV_BUILD_ARG_BUILD: string = "build";
+  ADAM_DEV_BUILD_ARG_OUT: string = "-o";
+  ADAM_DEV_BUILD_ARG_TARGET: string = "-t";
+  ADAM_DEV_BUILD_ARG_SELF: string = "--adam-self-build";
+  ADAM_DEV_BUILD_ARG_LEVEL: string = "-opt";
+  // The levels the prebuild fills after the debug one
+  ADAM_DEV_BUILD_LEVELS: array[0..2] of string = ["safe", "fast", "small"];
+  // A std unit that is one target's own: the endings and the binding units' prefixes
+  ADAM_DEV_BUILD_WIN64_END: string = ".Win64";
+  ADAM_DEV_BUILD_WIN64_UNITS: string = "System.Windows";
+  ADAM_DEV_BUILD_LINUX64_END: string = ".Linux64";
+  ADAM_DEV_BUILD_LINUX64_UNITS: string = "System.Linux";
+
+type
+  // What a run of the job knows: the folders, the two targets, the stage copies' paths
+  BuildPlaces = record
+    Bin: string;
+    Out: string;
+    Snap: string;
+    SnapBin: string;
+    Host: string;
+    HostExt: string;
+    Other: string;
+    OtherExt: string;
+    CopyA: string;
+    CopyB: string;
+    CopyC: string;
+  end;
+
+// One step's line, as it happens (the stages' own output comes between)
+func DoLine(const AText: string);
+begin
+  println(AText);
+  FlushOutput();
+end;
+
+// The last line of a failed run (BUILD FAILED - AWhat), then false
+func DoFailed(const AWhat: string): bool;
+begin
+  DoLine(NoArgs().Str(AWhat).Fill(ADAM_MSG_DEV_BUILD_FAILED));
+  return false;
+end;
+
+// The exe extension of ATriple's object format ("" when Adam has no backend for it)
+func DoExeExtension(const ATriple: string): string;
+var
+  LBackend: ref Backend;
+begin
+  LBackend := BackendFor(ATriple);
+  if LBackend = nil then
+    return "";
+  end;
+  return LBackend.Format.ExeExtension();
+end;
+
+// The places of this run: the host's target (the default) and the one other target
+func DoPlaces(var APlaces: BuildPlaces): bool;
+var
+  LList: TargetList;
+  LI: int64;
+begin
+  APlaces.Bin := ExeDir();
+  APlaces.Out := ResolvePath(ADAM_DEV_BUILD_OUT);
+  APlaces.Snap := APlaces.Out + "/" + ADAM_DEV_BUILD_SNAPSHOT;
+  APlaces.SnapBin := APlaces.Snap + "/bin";
+  APlaces.Host := DefaultTriple();
+  APlaces.HostExt := DoExeExtension(APlaces.Host);
+  APlaces.Other := "";
+  LList := AllTargets();
+  for LI := 0 to len(LList) - 1 do
+    if LList[LI].Triple() <> APlaces.Host then
+      APlaces.Other := LList[LI].Triple();
+    end;
+  end;
+  APlaces.OtherExt := DoExeExtension(APlaces.Other);
+  APlaces.CopyA := APlaces.SnapBin + "/" + ADAM_DEV_BUILD_COPY_A + APlaces.HostExt;
+  APlaces.CopyB := APlaces.SnapBin + "/" + ADAM_DEV_BUILD_COPY_B + APlaces.HostExt;
+  APlaces.CopyC := APlaces.SnapBin + "/" + ADAM_DEV_BUILD_COPY_C + APlaces.HostExt;
+  return (APlaces.Bin <> "") and (APlaces.Out <> "") and (APlaces.Other <> "");
+end;
+
+// The folder ASource copied into ATarget, ATarget made again from empty (a file renamed in
+// case only keeps no old spelling); with ASkipOutput a file under its output\ is left out
+func DoMirror(const ASource: string; const ATarget: string; const ASkipOutput: bool): bool;
+var
+  LFiles: StringArray;
+  LFrom: string;
+  LTo: string;
+  LI: int64;
+begin
+  if DirectoryExists(ATarget) and not RemoveDir(ATarget, true) then
+    return false;
+  end;
+  if not GetFiles(ASource, "", true, LFiles) then
+    return false;
+  end;
+  if not ForceDirectories(ATarget) then
+    return false;
+  end;
+  for LI := 0 to len(LFiles) - 1 do
+    if not (ASkipOutput and StartsStr(ADAM_DEV_BUILD_SKIP, LFiles[LI])) then
+      LFrom := ASource + "/" + LFiles[LI];
+      LTo := ATarget + "/" + LFiles[LI];
+      if not ForceDirectories(ExtractFileDir(LTo)) then
+        return false;
+      end;
+      if not CopyFile(LFrom, LTo, true) then
+        return false;
+      end;
+    end;
+  end;
+  return true;
+end;
+
+// Step 0: the build's inputs copied into the snapshot (see the header)
+func DoSnapshot(const APlaces: BuildPlaces): bool;
+var
+  LRunning: string;
+begin
+  if not DoMirror(ResolvePath(ADAM_DEV_BUILD_SRC), APlaces.Snap + "/src", false) then
+    return false;
+  end;
+  if not DoMirror(ResolvePath(ADAM_DEV_BUILD_PROJECT), APlaces.Snap + "/projects/adam", true) then
+    return false;
+  end;
+  if not DoMirror(ResolvePath(ADAM_DEV_BUILD_TESTER), APlaces.Snap + "/projects/adamtest", true) then
+    return false;
+  end;
+  if not DoMirror(ResolvePath(ADAM_DEV_BUILD_LIBS), APlaces.SnapBin + "/res/libs", false) then
+    return false;
+  end;
+  if not DoMirror(ResolvePath(ADAM_DEV_BUILD_RUNTIME), APlaces.SnapBin + "/res/runtime", false) then
+    return false;
+  end;
+  // adam / adamtest carry the Adam logo icon (@exeicon ADAM_LOGO_ICON, $R: relative)
+  if not DoMirror(ResolvePath(ADAM_DEV_BUILD_ICONS), APlaces.SnapBin + "/res/assets/icons", false) then
+    return false;
+  end;
+  LRunning := APlaces.Bin + "/" + ADAM_DEV_BUILD_ADAM + APlaces.HostExt;
+  return CopyFile(LRunning, APlaces.SnapBin + "/" + ADAM_DEV_BUILD_ADAM + APlaces.HostExt, true);
+end;
+
+// AExe run with AArgs from the snapshot's bin\ on this console: true when it ran and ended 0
+func DoRun(const APlaces: BuildPlaces; const AExe: string; const AArgs: StringArray): bool;
+var
+  LCode: uint32;
+begin
+  LCode := 0;
+  if not RunAttached(AExe, AArgs, APlaces.SnapBin, LCode) then
+    return false;
+  end;
+  return LCode = 0;
+end;
+
+// The build words: build AMain -o AOut, then -t ATriple unless "", then the compiler's own
+// build's switches with ASelf
+func DoArgs(const AMain: string; const AOut: string; const ATriple: string;
+  const ASelf: bool): StringArray;
+var
+  LArgs: StringArray;
+  LCount: int64;
+begin
+  setlength(LArgs, 7);
+  LArgs[0] := ADAM_DEV_BUILD_ARG_BUILD;
+  LArgs[1] := AMain;
+  LArgs[2] := ADAM_DEV_BUILD_ARG_OUT;
+  LArgs[3] := AOut;
+  LCount := 4;
+  if ATriple <> "" then
+    setlength(LArgs, 9);
+    LArgs[LCount] := ADAM_DEV_BUILD_ARG_TARGET;
+    LArgs[LCount + 1] := ATriple;
+    LCount := LCount + 2;
+  end;
+  if ASelf then
+    LArgs[LCount] := ADAM_DEV_BUILD_ARG_SELF;
+    LArgs[LCount + 1] := ADAM_DEV_BUILD_ARG_LEVEL;
+    LArgs[LCount + 2] := ADAM_DEV_BUILD_SELF_LEVEL;
+    LCount := LCount + 3;
+  end;
+  setlength(LArgs, LCount);
+  return LArgs;
+end;
+
+// The exe a build of AName for ATriple (extension AExt) wrote into AStage, in AMode
+func DoBuilt(const AStage: string; const ATriple: string; const AMode: string; const AName: string;
+  const AExt: string): string;
+begin
+  return AStage + "/bin/" + ATriple + "/" + AMode + "/" + AName + AExt;
+end;
+
+// One build by AExe of AMain into AStage (the exe it writes, AWrote, removed first so an old
+// one is never taken): true when it ran, ended 0 and wrote AWrote
+func DoStage(const APlaces: BuildPlaces; const AExe: string; const AMain: string;
+  const AStage: string; const ATriple: string; const ASelf: bool; const AWrote: string): bool;
+var
+  LTriple: string;
+begin
+  if FileExists(AWrote) then
+    DeleteFile(AWrote);
+  end;
+  LTriple := "";
+  if ATriple <> APlaces.Host then
+    LTriple := ATriple;
+  end;
+  if not DoRun(APlaces, AExe, DoArgs(AMain, AStage, LTriple, ASelf)) then
+    return false;
+  end;
+  return FileExists(AWrote);
+end;
+
+// True when the two files hold the same bytes
+func DoSameBytes(const AFirst: string; const ASecond: string): bool;
+var
+  LFirst: ByteArray;
+  LSecond: ByteArray;
+  LI: int64;
+begin
+  if (not ReadAllBytes(AFirst, LFirst)) or (not ReadAllBytes(ASecond, LSecond)) then
+    return false;
+  end;
+  if len(LFirst) <> len(LSecond) then
+    return false;
+  end;
+  for LI := 0 to len(LFirst) - 1 do
+    if LFirst[LI] <> LSecond[LI] then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// The stage copies in the snapshot's bin\ removed (a missing one is no failure)
+func DoClean(const APlaces: BuildPlaces);
+begin
+  if FileExists(APlaces.CopyA) then
+    DeleteFile(APlaces.CopyA);
+  end;
+  if FileExists(APlaces.CopyB) then
+    DeleteFile(APlaces.CopyB);
+  end;
+  if FileExists(APlaces.CopyC) then
+    DeleteFile(APlaces.CopyC);
+  end;
+end;
+
+// ASource copied over ATarget in adam's folder; false with ATarget's name reported failed
+func DoInstall(const ASource: string; const ATarget: string): bool;
+begin
+  if not CopyFile(ASource, ATarget, true) then
+    return DoFailed(NoArgs().Str(ExtractFileName(ATarget)).Fill(ADAM_MSG_DEV_BUILD_NOT_INSTALLED));
+  end;
+  return true;
+end;
+
+// The install (see the header): the running adam kept as adam-prev, then the four programs
+func DoInstallAll(const APlaces: BuildPlaces): bool;
+var
+  LRunning: string;
+  LPrev: string;
+begin
+  LRunning := APlaces.Bin + "/" + ADAM_DEV_BUILD_ADAM + APlaces.HostExt;
+  LPrev := APlaces.Bin + "/" + ADAM_DEV_BUILD_PREV + APlaces.HostExt;
+  // A running program can be renamed on both hosts, never written over on win64
+  if FileExists(LPrev) and not DeleteFile(LPrev) then
+    return DoFailed(NoArgs().Str(ExtractFileName(LPrev)).Fill(ADAM_MSG_DEV_BUILD_NOT_INSTALLED));
+  end;
+  if not RenameFile(LRunning, LPrev) then
+    return DoFailed(NoArgs().Str(ExtractFileName(LPrev)).Fill(ADAM_MSG_DEV_BUILD_NOT_INSTALLED));
+  end;
+  if not DoInstall(DoBuilt(APlaces.Out + "/" + ADAM_DEV_BUILD_STAGE_B, APlaces.Host,
+    ADAM_DEV_BUILD_RELEASE_MODE, ADAM_DEV_BUILD_ADAM, APlaces.HostExt), LRunning) then
+    return false;
+  end;
+  if not DoInstall(DoBuilt(ResolvePath(ADAM_DEV_BUILD_TESTER_OUT), APlaces.Host,
+    ADAM_DEV_BUILD_DEBUG_MODE, ADAM_DEV_BUILD_ADAMTEST, APlaces.HostExt),
+    APlaces.Bin + "/" + ADAM_DEV_BUILD_ADAMTEST + APlaces.HostExt) then
+    return false;
+  end;
+  if not DoInstall(DoBuilt(APlaces.Out + "/" + ADAM_DEV_BUILD_STAGE_X, APlaces.Other,
+    ADAM_DEV_BUILD_RELEASE_MODE, ADAM_DEV_BUILD_ADAM, APlaces.OtherExt),
+    APlaces.Bin + "/" + ADAM_DEV_BUILD_ADAM + APlaces.OtherExt) then
+    return false;
+  end;
+  return DoInstall(DoBuilt(ResolvePath(ADAM_DEV_BUILD_TESTER_OUT), APlaces.Other,
+    ADAM_DEV_BUILD_DEBUG_MODE, ADAM_DEV_BUILD_ADAMTEST, APlaces.OtherExt),
+    APlaces.Bin + "/" + ADAM_DEV_BUILD_ADAMTEST + APlaces.OtherExt);
+end;
+
+// AList's names from AFrom on joined, each after ", " (none: "")
+func DoJoin(const AList: StringArray; const AFrom: int64): string;
+var
+  LText: string;
+  LI: int64;
+begin
+  LText := "";
+  for LI := AFrom to len(AList) - 1 do
+    LText := LText + ", " + AList[LI];
+  end;
+  return LText;
+end;
+
+// The prebuild's program written to APath: one import clause naming every std unit (each
+// name its file's without .adam) and an empty body; a target's own units (*.Win64 and the
+// System.Windows binding units; *.Linux64 and the System.Linux ones) only under that
+// target's @ifdef, so each triple's build takes its own platform units and never another's
+func DoPrebuildSource(const APath: string): bool;
+var
+  LFiles: StringArray;
+  LCommon: StringArray;
+  LWin64: StringArray;
+  LLinux64: StringArray;
+  LName: string;
+  LText: string;
+  LI: int64;
+begin
+  if not GetFiles(ResolvePath(ADAM_DEV_BUILD_STD), "*" + ADAM_EXT_SOURCE, false, LFiles) then
+    return false;
+  end;
+  setlength(LCommon, 0);
+  setlength(LWin64, 0);
+  setlength(LLinux64, 0);
+  for LI := 0 to len(LFiles) - 1 do
+    LName := ChangeFileExt(LFiles[LI], "");
+    if EndsStr(ADAM_DEV_BUILD_WIN64_END, LName) or StartsStr(ADAM_DEV_BUILD_WIN64_UNITS, LName) then
+      setlength(LWin64, len(LWin64) + 1);
+      LWin64[len(LWin64) - 1] := LName;
+    else
+      if EndsStr(ADAM_DEV_BUILD_LINUX64_END, LName) or StartsStr(ADAM_DEV_BUILD_LINUX64_UNITS, LName) then
+        setlength(LLinux64, len(LLinux64) + 1);
+        LLinux64[len(LLinux64) - 1] := LName;
+      else
+        setlength(LCommon, len(LCommon) + 1);
+        LCommon[len(LCommon) - 1] := LName;
+      end;
+    end;
+  end;
+  if len(LCommon) = 0 then
+    return false;
+  end;
+  // The first common unit opens the clause, every other name follows its ", "
+  LText := "module exe " + ADAM_DEV_BUILD_PREBUILD_NAME + ";\n\nimport " + LCommon[0] +
+    DoJoin(LCommon, 1) + "\n" +
+    "@ifdef TARGET_X86_64_WINDOWS_GNU\n  " + DoJoin(LWin64, 0) + "\n" +
+    "@elseif TARGET_X86_64_LINUX_GNU\n  " + DoJoin(LLinux64, 0) + "\n" +
+    "@endif\n  ;\n\nbegin\nend.\n";
+  return ForceDirectories(ExtractFileDir(APath)) and WriteAllText(APath, LText);
+end;
+
+// Step 7: the new adam builds the prebuild's program for every target at every level
+func DoPrebuild(const APlaces: BuildPlaces): bool;
+var
+  LDir: string;
+  LSource: string;
+  LAdam: string;
+  LList: TargetList;
+  LArgs: StringArray;
+  LBase: StringArray;
+  LCode: uint32;
+  LI: int64;
+  LK: int64;
+  LTriple: string;
+  LLevels: array[0..2] of string;
+begin
+  LDir := APlaces.Out + "/" + ADAM_DEV_BUILD_PREBUILD;
+  LSource := LDir + "/" + ADAM_DEV_BUILD_PREBUILD_NAME + ADAM_EXT_SOURCE;
+  if not DoPrebuildSource(LSource) then
+    return DoFailed(ADAM_MSG_DEV_BUILD_STEP_PREBUILD_SOURCE);
+  end;
+  LAdam := APlaces.Bin + "/" + ADAM_DEV_BUILD_ADAM + APlaces.HostExt;
+  LLevels := ADAM_DEV_BUILD_LEVELS;
+  LList := AllTargets();
+  for LI := 0 to len(LList) - 1 do
+    LTriple := LList[LI].Triple();
+    LBase := DoArgs(LSource, LDir, LTriple, false);
+    LCode := 0;
+    if (not RunAttached(LAdam, LBase, APlaces.Bin, LCode)) or (LCode <> 0) then
+      return DoFailed(NoArgs().Str(LTriple).Str(ADAM_DEV_BUILD_DEBUG_MODE)
+        .Fill(ADAM_MSG_DEV_BUILD_STEP_PREBUILD));
+    end;
+    for LK := 0 to 2 do
+      LArgs := LBase;
+      setlength(LArgs, len(LBase) + 2);
+      LArgs[len(LBase)] := ADAM_DEV_BUILD_ARG_LEVEL;
+      LArgs[len(LBase) + 1] := LLevels[LK];
+      LCode := 0;
+      if (not RunAttached(LAdam, LArgs, APlaces.Bin, LCode)) or (LCode <> 0) then
+        return DoFailed(NoArgs().Str(LTriple).Str(LLevels[LK]).Fill(ADAM_MSG_DEV_BUILD_STEP_PREBUILD));
+      end;
+    end;
+  end;
+  return true;
+end;
+
+// Steps 1 to 6 (see the header): false after the failed step's line
+func DoStages(const APlaces: BuildPlaces): bool;
+var
+  LSnapAdam: string;
+  LA: string;
+  LB: string;
+  LC: string;
+  LX: string;
+  LXC: string;
+  LTester: string;
+begin
+  LSnapAdam := APlaces.SnapBin + "/" + ADAM_DEV_BUILD_ADAM + APlaces.HostExt;
+  DoLine(ADAM_MSG_DEV_BUILD_STAGE_A);
+  LA := DoBuilt(APlaces.Out + "/" + ADAM_DEV_BUILD_STAGE_A, APlaces.Host, ADAM_DEV_BUILD_DEBUG_MODE,
+    ADAM_DEV_BUILD_ADAM, APlaces.HostExt);
+  if not DoStage(APlaces, LSnapAdam, ADAM_DEV_BUILD_MAIN, APlaces.Out + "/" + ADAM_DEV_BUILD_STAGE_A,
+    APlaces.Host, false, LA) then
+    return DoFailed(ADAM_MSG_DEV_BUILD_STEP_A);
+  end;
+  if not CopyFile(LA, APlaces.CopyA, true) then
+    return DoFailed(ADAM_MSG_DEV_BUILD_STEP_A);
+  end;
+
+  DoLine(ADAM_MSG_DEV_BUILD_STAGE_B);
+  LB := DoBuilt(APlaces.Out + "/" + ADAM_DEV_BUILD_STAGE_B, APlaces.Host, ADAM_DEV_BUILD_RELEASE_MODE,
+    ADAM_DEV_BUILD_ADAM, APlaces.HostExt);
+  if not DoStage(APlaces, APlaces.CopyA, ADAM_DEV_BUILD_MAIN, APlaces.Out + "/" + ADAM_DEV_BUILD_STAGE_B,
+    APlaces.Host, true, LB) then
+    return DoFailed(ADAM_MSG_DEV_BUILD_STEP_B);
+  end;
+  if not CopyFile(LB, APlaces.CopyB, true) then
+    return DoFailed(ADAM_MSG_DEV_BUILD_STEP_B);
+  end;
+
+  DoLine(ADAM_MSG_DEV_BUILD_STAGE_C);
+  LC := DoBuilt(APlaces.Out + "/" + ADAM_DEV_BUILD_STAGE_C, APlaces.Host, ADAM_DEV_BUILD_RELEASE_MODE,
+    ADAM_DEV_BUILD_ADAM, APlaces.HostExt);
+  if not DoStage(APlaces, APlaces.CopyB, ADAM_DEV_BUILD_MAIN, APlaces.Out + "/" + ADAM_DEV_BUILD_STAGE_C,
+    APlaces.Host, true, LC) then
+    return DoFailed(ADAM_MSG_DEV_BUILD_STEP_C);
+  end;
+  if not CopyFile(LC, APlaces.CopyC, true) then
+    return DoFailed(ADAM_MSG_DEV_BUILD_STEP_C);
+  end;
+
+  DoLine(ADAM_MSG_DEV_BUILD_COMPARE);
+  if not DoSameBytes(LB, LC) then
+    return DoFailed(ADAM_MSG_DEV_BUILD_STEP_DIFFER);
+  end;
+
+  DoLine(ADAM_MSG_DEV_BUILD_TESTER);
+  LTester := DoBuilt(ResolvePath(ADAM_DEV_BUILD_TESTER_OUT), APlaces.Host, ADAM_DEV_BUILD_DEBUG_MODE,
+    ADAM_DEV_BUILD_ADAMTEST, APlaces.HostExt);
+  if not DoStage(APlaces, APlaces.CopyB, ADAM_DEV_BUILD_TESTER_MAIN, ResolvePath(ADAM_DEV_BUILD_TESTER_OUT),
+    APlaces.Host, false, LTester) then
+    return DoFailed(ADAM_MSG_DEV_BUILD_STEP_TESTER);
+  end;
+
+  DoLine(NoArgs().Str(APlaces.Other).Fill(ADAM_MSG_DEV_BUILD_OTHER));
+  LX := DoBuilt(APlaces.Out + "/" + ADAM_DEV_BUILD_STAGE_X, APlaces.Other, ADAM_DEV_BUILD_RELEASE_MODE,
+    ADAM_DEV_BUILD_ADAM, APlaces.OtherExt);
+  if not DoStage(APlaces, APlaces.CopyB, ADAM_DEV_BUILD_MAIN, APlaces.Out + "/" + ADAM_DEV_BUILD_STAGE_X,
+    APlaces.Other, true, LX) then
+    return DoFailed(NoArgs().Str(APlaces.Other).Fill(ADAM_MSG_DEV_BUILD_STEP_OTHER_B));
+  end;
+  LXC := DoBuilt(APlaces.Out + "/" + ADAM_DEV_BUILD_STAGE_XC, APlaces.Other, ADAM_DEV_BUILD_RELEASE_MODE,
+    ADAM_DEV_BUILD_ADAM, APlaces.OtherExt);
+  if not DoStage(APlaces, APlaces.CopyC, ADAM_DEV_BUILD_MAIN, APlaces.Out + "/" + ADAM_DEV_BUILD_STAGE_XC,
+    APlaces.Other, true, LXC) then
+    return DoFailed(NoArgs().Str(APlaces.Other).Fill(ADAM_MSG_DEV_BUILD_STEP_OTHER_C));
+  end;
+  if not DoSameBytes(LX, LXC) then
+    return DoFailed(NoArgs().Str(APlaces.Other).Fill(ADAM_MSG_DEV_BUILD_STEP_OTHER_DIFFER));
+  end;
+  LTester := DoBuilt(ResolvePath(ADAM_DEV_BUILD_TESTER_OUT), APlaces.Other, ADAM_DEV_BUILD_DEBUG_MODE,
+    ADAM_DEV_BUILD_ADAMTEST, APlaces.OtherExt);
+  if not DoStage(APlaces, APlaces.CopyB, ADAM_DEV_BUILD_TESTER_MAIN, ResolvePath(ADAM_DEV_BUILD_TESTER_OUT),
+    APlaces.Other, false, LTester) then
+    return DoFailed(NoArgs().Str(APlaces.Other).Fill(ADAM_MSG_DEV_BUILD_STEP_OTHER_TESTER));
+  end;
+  return true;
+end;
+
+// adam --dev-build-adam (see the header): true after BUILD OK, false after BUILD FAILED - <step>
+public func DevBuildAdam(): bool;
+var
+  LPlaces: BuildPlaces;
+  LOk: bool;
+begin
+  DoLine(ADAM_MSG_DEV_BUILD_SNAPSHOT);
+  if not DoPlaces(LPlaces) then
+    return DoFailed(ADAM_MSG_DEV_BUILD_STEP_SNAPSHOT);
+  end;
+  if not DoSnapshot(LPlaces) then
+    return DoFailed(ADAM_MSG_DEV_BUILD_STEP_SNAPSHOT);
+  end;
+  LOk := DoStages(LPlaces);
+  if LOk then
+    LOk := DoInstallAll(LPlaces);
+  end;
+  DoClean(LPlaces);
+  if not LOk then
+    return false;
+  end;
+  DoLine(ADAM_MSG_DEV_BUILD_PREBUILD);
+  if not DoPrebuild(LPlaces) then
+    return false;
+  end;
+  DoLine(ADAM_MSG_DEV_BUILD_OK);
+  return true;
+end;
+
+end.
