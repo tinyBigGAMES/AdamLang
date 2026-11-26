@@ -1,0 +1,360 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.Runtime.FaultChain.adam - The one owner of the process's fault
+  action that every Adam runtime in a process shares (an exe's and each
+  Adam shared object's / dll's, or only shared objects' in a C host): a
+  chain, a mapping of its own that belongs to no image, holding a stub
+  (the action the OS calls: it counts itself in flight and calls through
+  the chain's slot, or its fallback when no runtime holds the slot), the
+  slot (one joined runtime's dispatch), the fallback (the platform's code
+  acting as the action the chain replaced), that action (the platform's
+  bytes) and each joined runtime's code range with its own fault taker. A runtime joins the chain it finds as
+  the process's action, or makes one; leaving it moves the slot to
+  another runtime and waits until no call is in flight, so nothing calls
+  into an image once it is unmapped; the last one out puts the replaced
+  action back and frees the chain, unless an action set over the chain
+  still reaches its stub: then the chain stays, its fallback answering as
+  the replaced action would. Join and leave run at an image's load
+  or unload (the loader's lock) or at the process's start, so they take
+  no lock of their own; the stub and FaultChainTake read only, so a
+  signal handler may call them.
+  x86_64 code on every x86_64 target (the stack step is the ABI's); names
+  no OS; imports nothing but System.Runtime.LibC.
+*******************************************************************************/
+
+module unit System.Runtime.FaultChain;
+
+import System.Runtime.LibC;
+
+public const
+  // A chain's first word ("ADAMFLT1" as a little-endian word), its mapping's bytes (one
+  // mapping per chain, zeroed), the page its stub's address is masked to (the smallest
+  // x86_64 page: the stub's page always starts a chain), the stub's offset there, the
+  // platform's fallback code's (Spare) and the replaced action's bytes' (Before): the
+  // offsets the platform's rip-relative fields reach (FaultChainSpareRel)
+  ADAM_FAULT_CHAIN_MAGIC: uint64 = 0x31544C464D414441;
+  ADAM_FAULT_CHAIN_SIZE: uint64 = 16384;
+  ADAM_FAULT_CHAIN_PAGE: uint64 = 4096;
+  ADAM_FAULT_CHAIN_CODE: uint64 = 64;
+  ADAM_FAULT_CHAIN_SPARE: uint64 = 128;
+  ADAM_FAULT_CHAIN_BEFORE: uint64 = 256;
+  // The bytes of the platform's fallback code and of the replaced action, and the entries
+  // one chain mapping holds (another mapping follows through Next when they are all used)
+  ADAM_FAULT_CHAIN_SPARE_BYTES: int64 = 128;
+  ADAM_FAULT_CHAIN_BEFORE_BYTES: int64 = 1024;
+  ADAM_FAULT_CHAIN_ENTRIES: int64 = 377;
+
+const
+  // The fields the stub reaches rip-relative: InFlight's, Slot's and Fallback's offsets
+  ADAM_FAULT_CHAIN_IN_FLIGHT: uint64 = 16;
+  ADAM_FAULT_CHAIN_SLOT: uint64 = 24;
+  ADAM_FAULT_CHAIN_FALLBACK: uint64 = 32;
+
+public type
+  // One joined runtime: its image's code range (Low .. High; Low = High: none, its faults
+  // are no other runtime's), its fault taker (the platform's handler shape, called for a
+  // fault whose pc is in the range) and its dispatch (what the slot calls); Active 1 while
+  // joined (set last at the join, cleared first at the leave)
+  FaultChainEntry = record
+    Low: uint64;
+    High: uint64;
+    Take: ptr;
+    Dispatch: ptr;
+    Active: uint64;
+  end;
+
+  // A chain's mapping (ADAM_FAULT_CHAIN_SIZE bytes): the magic, the mapping's size, the
+  // calls in flight (the stub's count), the slot the stub calls through (0: none), the
+  // fallback it calls when the slot is 0 (the platform's code in Spare,
+  // FaultChainSpareDone), the next mapping of entries, the entries used so far (never
+  // lowered: a left entry is reused), the stub's code, the platform's fallback code, the
+  // replaced action, the entries
+  FaultChain = record
+    Magic: uint64;
+    Size: uint64;
+    InFlight: uint64;
+    Slot: uint64;
+    Fallback: uint64;
+    Next: ptr;
+    Count: int64;
+    Pad: uint64;
+    Code: array[0..63] of uint8;
+    Spare: array[0..127] of uint8;
+    Before: array[0..1023] of uint8;
+    Entries: array[0..376] of FaultChainEntry;
+  end;
+
+// One byte of the stub at AAt, AAt moved past it
+func DoCodeByte(const AChain: ptr to FaultChain; var AAt: int64; const AByte: uint8);
+begin
+  AChain^.Code[AAt] := AByte;
+  AAt := AAt + 1;
+end;
+
+// A rip-relative 32-bit field at AAt reaching the chain's field at offset AField: the
+// field is the instruction's last 4 bytes, so rip is the stub's start + AAt + 4
+func DoCodeRel(const AChain: ptr to FaultChain; var AAt: int64; const AField: uint64);
+var
+  LRel: int64;
+  LI: int64;
+begin
+  LRel := int64(AField) - (int64(ADAM_FAULT_CHAIN_CODE) + AAt + 4);
+  for LI := 0 to 3 do
+    DoCodeByte(AChain, AAt, uint8((uint64(LRel) shr uint64(LI * 8)) & 255));
+  end;
+end;
+
+// One byte of the platform's fallback code at AAt (a Spare index), AAt moved past it
+public func FaultChainSpareByte(const AChain: ptr to FaultChain; var AAt: int64;
+  const AByte: uint8);
+begin
+  AChain^.Spare[AAt] := AByte;
+  AAt := AAt + 1;
+end;
+
+// A rip-relative 32-bit field of the fallback code at AAt reaching the chain's byte at
+// offset AField (ADAM_FAULT_CHAIN_BEFORE + n: the replaced action's bytes); the field is
+// its instruction's last 4 bytes
+public func FaultChainSpareRel(const AChain: ptr to FaultChain; var AAt: int64;
+  const AField: uint64);
+var
+  LRel: int64;
+  LI: int64;
+begin
+  LRel := int64(AField) - (int64(ADAM_FAULT_CHAIN_SPARE) + AAt + 4);
+  for LI := 0 to 3 do
+    FaultChainSpareByte(AChain, AAt, uint8((uint64(LRel) shr uint64(LI * 8)) & 255));
+  end;
+end;
+
+// The platform's fallback code (written into Spare) made the stub's fallback
+public func FaultChainSpareDone(const AChain: ptr to FaultChain);
+begin
+  atomicstore(AChain^.Fallback, uint64(AChain) + ADAM_FAULT_CHAIN_SPARE);
+end;
+
+// The chain at AMap (ADAM_FAULT_CHAIN_SIZE zeroed bytes the caller mapped, page aligned)
+// made ready, its stub written; the stub's address (the action the platform installs once
+// it wrote its fallback, FaultChainSpareDone). The stub (x86_64): lock inc InFlight; sub
+// rsp, AStackStep; rax = Slot; a held slot called (call rax), else the fallback (call
+// [Fallback]: the platform's code answering as the replaced action, for a chain no runtime
+// holds that an action set over it still reaches); add rsp, AStackStep; lock dec
+// InFlight; ret. AStackStep keeps the call's stack as the ABI wants it (8 where the stub is
+// entered as a called routine with no home area, SysV; 40 with the callee's 32-byte home
+// area, Win64); the handler's arguments and rax, the call's result, pass through
+public func FaultChainMake(const AMap: ptr; const AStackStep: uint8): ptr;
+var
+  LChain: ptr to FaultChain;
+  LAt: int64;
+begin
+  LChain := ptr to FaultChain(AMap);
+  LChain^.Size := ADAM_FAULT_CHAIN_SIZE;
+  LAt := 0;
+  // lock inc qword [rip + InFlight]
+  DoCodeByte(LChain, LAt, 0xF0);
+  DoCodeByte(LChain, LAt, 0x48);
+  DoCodeByte(LChain, LAt, 0xFF);
+  DoCodeByte(LChain, LAt, 0x05);
+  DoCodeRel(LChain, LAt, ADAM_FAULT_CHAIN_IN_FLIGHT);
+  // sub rsp, AStackStep
+  DoCodeByte(LChain, LAt, 0x48);
+  DoCodeByte(LChain, LAt, 0x83);
+  DoCodeByte(LChain, LAt, 0xEC);
+  DoCodeByte(LChain, LAt, AStackStep);
+  // mov rax, [rip + Slot]
+  DoCodeByte(LChain, LAt, 0x48);
+  DoCodeByte(LChain, LAt, 0x8B);
+  DoCodeByte(LChain, LAt, 0x05);
+  DoCodeRel(LChain, LAt, ADAM_FAULT_CHAIN_SLOT);
+  // test rax, rax; jz +4 (to the fallback's call)
+  DoCodeByte(LChain, LAt, 0x48);
+  DoCodeByte(LChain, LAt, 0x85);
+  DoCodeByte(LChain, LAt, 0xC0);
+  DoCodeByte(LChain, LAt, 0x74);
+  DoCodeByte(LChain, LAt, 0x04);
+  // call rax; jmp +6 (past the fallback's call)
+  DoCodeByte(LChain, LAt, 0xFF);
+  DoCodeByte(LChain, LAt, 0xD0);
+  DoCodeByte(LChain, LAt, 0xEB);
+  DoCodeByte(LChain, LAt, 0x06);
+  // call qword [rip + Fallback]
+  DoCodeByte(LChain, LAt, 0xFF);
+  DoCodeByte(LChain, LAt, 0x15);
+  DoCodeRel(LChain, LAt, ADAM_FAULT_CHAIN_FALLBACK);
+  // add rsp, AStackStep
+  DoCodeByte(LChain, LAt, 0x48);
+  DoCodeByte(LChain, LAt, 0x83);
+  DoCodeByte(LChain, LAt, 0xC4);
+  DoCodeByte(LChain, LAt, AStackStep);
+  // lock dec qword [rip + InFlight]
+  DoCodeByte(LChain, LAt, 0xF0);
+  DoCodeByte(LChain, LAt, 0x48);
+  DoCodeByte(LChain, LAt, 0xFF);
+  DoCodeByte(LChain, LAt, 0x0D);
+  DoCodeRel(LChain, LAt, ADAM_FAULT_CHAIN_IN_FLIGHT);
+  // ret
+  DoCodeByte(LChain, LAt, 0xC3);
+  // the magic last: a chain is found only once its stub is whole
+  atomicstore(LChain^.Magic, ADAM_FAULT_CHAIN_MAGIC);
+  return ptr(uint64(AMap) + ADAM_FAULT_CHAIN_CODE);
+end;
+
+// The chain whose stub AHandler is (the process's action as the platform read it), else
+// nil: AHandler's page starts a chain whose stub is at AHandler. Reading that page is safe:
+// AHandler is code the OS would call, so its page is mapped
+public func FaultChainOf(const AHandler: ptr): ptr to FaultChain;
+var
+  LBase: uint64;
+  LChain: ptr to FaultChain;
+begin
+  if uint64(AHandler) < ADAM_FAULT_CHAIN_PAGE then
+    return nil;
+  end;
+  LBase := uint64(AHandler) - (uint64(AHandler) & (ADAM_FAULT_CHAIN_PAGE - 1));
+  if uint64(AHandler) <> LBase + ADAM_FAULT_CHAIN_CODE then
+    return nil;
+  end;
+  LChain := ptr to FaultChain(LBase);
+  if atomicload(LChain^.Magic) <> ADAM_FAULT_CHAIN_MAGIC then
+    return nil;
+  end;
+  return LChain;
+end;
+
+// The chain's stub (the action its platform installed)
+public func FaultChainStub(const AChain: ptr to FaultChain): ptr;
+begin
+  return ptr(uint64(AChain) + ADAM_FAULT_CHAIN_CODE);
+end;
+
+// A runtime joined to the chain: its range, taker and dispatch in a free entry of the
+// chain or a mapping after it; the slot made its dispatch when it held none. The entry
+// (kept until FaultChainLeave), or nil when every mapping is full: the caller then adds one
+// (FaultChainExtend) and joins again
+public func FaultChainJoin(const AChain: ptr to FaultChain; const ALow: uint64;
+  const AHigh: uint64; const ATake: ptr; const ADispatch: ptr): ptr to FaultChainEntry;
+var
+  LPart: ptr to FaultChain;
+  LEntry: ptr to FaultChainEntry;
+  LI: int64;
+begin
+  LPart := AChain;
+  while LPart <> nil do
+    for LI := 0 to ADAM_FAULT_CHAIN_ENTRIES - 1 do
+      LEntry := ptr to FaultChainEntry(addr of LPart^.Entries[LI]);
+      if atomicload(LEntry^.Active) = 0 then
+        LEntry^.Low := ALow;
+        LEntry^.High := AHigh;
+        LEntry^.Take := ATake;
+        LEntry^.Dispatch := ADispatch;
+        if LI >= LPart^.Count then
+          atomicstore(LPart^.Count, LI + 1);
+        end;
+        atomicstore(LEntry^.Active, 1);
+        if atomicload(AChain^.Slot) = 0 then
+          atomicstore(AChain^.Slot, uint64(ADispatch));
+        end;
+        return LEntry;
+      end;
+    end;
+    LPart := ptr to FaultChain(LPart^.Next);
+  end;
+  return nil;
+end;
+
+// AMap (ADAM_FAULT_CHAIN_SIZE zeroed bytes) linked after the chain's last mapping, its
+// entries free for FaultChainJoin
+public func FaultChainExtend(const AChain: ptr to FaultChain; const AMap: ptr);
+var
+  LPart: ptr to FaultChain;
+  LMore: ptr to FaultChain;
+begin
+  LPart := AChain;
+  while LPart^.Next <> nil do
+    LPart := ptr to FaultChain(LPart^.Next);
+  end;
+  LMore := ptr to FaultChain(AMap);
+  LMore^.Size := ADAM_FAULT_CHAIN_SIZE;
+  atomicstore(LPart^.Next, AMap);
+end;
+
+// AEntry's runtime gone from the chain: the entry freed, the slot moved to another joined
+// runtime's dispatch when it was AEntry's (0 when none is left: the stub then calls the
+// fallback). True when no runtime is
+// left. The caller then waits for the calls in flight (FaultChainSettle) before its image
+// goes: a call that took the old slot may still run in it
+public func FaultChainLeave(const AChain: ptr to FaultChain;
+  const AEntry: ptr to FaultChainEntry): bool;
+var
+  LPart: ptr to FaultChain;
+  LEntry: ptr to FaultChainEntry;
+  LNext: uint64;
+  LI: int64;
+begin
+  atomicstore(AEntry^.Active, 0);
+  LNext := 0;
+  LPart := AChain;
+  while (LPart <> nil) and (LNext = 0) do
+    for LI := 0 to atomicload(LPart^.Count) - 1 do
+      LEntry := ptr to FaultChainEntry(addr of LPart^.Entries[LI]);
+      if (LNext = 0) and (atomicload(LEntry^.Active) <> 0) then
+        LNext := uint64(LEntry^.Dispatch);
+      end;
+    end;
+    LPart := ptr to FaultChain(LPart^.Next);
+  end;
+  if atomicload(AChain^.Slot) = uint64(AEntry^.Dispatch) then
+    atomicstore(AChain^.Slot, LNext);
+  end;
+  return LNext = 0;
+end;
+
+// The taker of the joined runtime whose code range holds APc, else nil (the slot's
+// runtime takes it); reads only, so a signal handler may call it
+public func FaultChainTake(const AChain: ptr to FaultChain; const APc: uint64): ptr;
+var
+  LPart: ptr to FaultChain;
+  LEntry: ptr to FaultChainEntry;
+  LI: int64;
+begin
+  LPart := AChain;
+  while LPart <> nil do
+    for LI := 0 to atomicload(LPart^.Count) - 1 do
+      LEntry := ptr to FaultChainEntry(addr of LPart^.Entries[LI]);
+      if (atomicload(LEntry^.Active) <> 0) and (APc >= LEntry^.Low) and
+        (APc < LEntry^.High) then
+        return LEntry^.Take;
+      end;
+    end;
+    LPart := ptr to FaultChain(atomicload(LPart^.Next));
+  end;
+  return nil;
+end;
+
+// Until no call is in flight in the chain's stub (each yield gives the CPU away once):
+// after a FaultChainLeave moved the slot, or the action was put back, no call reaches the
+// left runtime's code past this
+public func FaultChainSettle(const AChain: ptr to FaultChain; const AYield: func());
+begin
+  while atomicload(AChain^.InFlight) <> 0 do
+    AYield();
+  end;
+end;
+
+end.

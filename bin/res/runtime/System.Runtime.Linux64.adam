@@ -47,7 +47,8 @@
 module unit System.Runtime.Linux64;
 
 // libc.a's pure C routines: memcpy, memset, strcmp, strlen (the same on every target)
-import System.Runtime.LibC;
+// and the process's one fault action every Adam runtime in it shares (PlatformAtFault)
+import System.Runtime.LibC, System.Runtime.FaultChain;
 
 type
   // struct timespec: seconds and nanoseconds (clock_gettime, nanosleep, struct stat)
@@ -186,6 +187,8 @@ func pthread_mutex_lock(const AMutex: ptr): int32; external "c";
 func pthread_mutex_unlock(const AMutex: ptr): int32; external "c";
 func pthread_mutex_destroy(const AMutex: ptr): int32; external "c";
 func pthread_self(): uint64; external "c";
+// sched.h: the CPU given away once (the fault chain's wait, DoFaultYield)
+func sched_yield(): int32; external "c";
 func pthread_getattr_np(const AThread: uint64; const AAttributes: ptr): int32; external "c";
 func pthread_attr_getstack(const AAttributes: ptr; var AStack: ptr; var ASize: uint64): int32;
   external "c";
@@ -200,6 +203,11 @@ const
   // dlfcn.h's modes (x86_64): resolve every symbol now, only a library already loaded
   RTLD_NOW: int32 = 0x00002;
   RTLD_NOLOAD: int32 = 0x00004;
+  // dlfcn.h's RTLD_NEXT (((void *) -1l)): dlsym's handle of the next object after the
+  // caller's (a run-time hook's original: the runtime is the exe's)
+  RTLD_NEXT: uint64 = 0xFFFFFFFFFFFFFFFF;
+  // The hook table's symbol (the compiler's ADAM_HOOK_TABLE_SYMBOL): an exe exports it
+  ADAM_PLATFORM_HOOK_TABLE: string = "__adam_hook_table";
   // The C runtime's library (glibc), loaded with every Adam program (Adam.SysV.ABI's C runtime)
   ADAM_PLATFORM_C_RUNTIME: string = "libc.so.6";
   // sys/syscall.h (x86_64): the kernel's stat (a link followed), fstat and lstat (the link
@@ -308,8 +316,14 @@ var
   // System.Runtime's report of a hardware fault no guard took (PlatformAtFault: it never
   // returns); nil until then
   GFaultHandler: func(const AKind: int32);
-  // A .so's runtime (LX6b): true once its load began; an exe's is always false
+  // A .so's runtime (LX6b): true once its load began; an exe's is always false. Its own
+  // exit-time handlers (GDLLExits, GDLLExitCount of them in a C heap block of GDLLExitRoom
+  // slots), run at its unload, the last registered first: never glibc's exit list, which
+  // outlives the .so (a handler there would run after its code is gone)
   GDLLMode: bool;
+  GDLLExits: ptr to func();
+  GDLLExitCount: int64;
+  GDLLExitRoom: int64;
 
 threadstatic
   // True once this thread's end ran (PlatformThreadCallback): a second call is nothing
@@ -319,18 +333,6 @@ threadstatic
 func DoWriteErrorText(const AText: ptr to const char);
 begin
   write(STDERR_FILENO, AText, strlen(AText));
-end;
-
-// The platform routine AName, which PLAN-LINUX64's atom AAtom gives its body: the process
-// stops (SIGABRT) with the two named on stderr, never running on as if it had done its work
-func DoPending(const AName: ptr to const char; const AAtom: ptr to const char); noreturn;
-begin
-  DoWriteErrorText(ptr to const char("System.Runtime.Linux64: "));
-  DoWriteErrorText(AName);
-  DoWriteErrorText(ptr to const char(" is not built yet (PLAN-LINUX64 "));
-  DoWriteErrorText(AAtom);
-  DoWriteErrorText(ptr to const char(")\n"));
-  abort();
 end;
 
 // The calling thread's C errno (glibc's: what C functions report), read and set
@@ -412,6 +414,10 @@ var
   // (RVA32 written as R_X86_64_PC32, LX2a)
   GPdataStart: uint8; external name "__start_adam_pdata";
   GPdataStop: uint8; external name "__stop_adam_pdata";
+  // The image's run-time hook table (LX4f2, the linker's: its count, then a
+  // PlatformHookLink per hook name the program's constants install; count 0 in a shared
+  // object or a C program's link)
+  GHookTableCount: int64; external name "__adam_hook_table";
 
 forward type PlatformFinallyRun;
 
@@ -965,6 +971,7 @@ type
 const
   // dl_phdr_info's fields, an Elf64_Phdr's bytes and fields, the segment kinds read
   ADAM_PLATFORM_PHDR_INFO_ADDR: uint64 = 0;
+  ADAM_PLATFORM_PHDR_INFO_NAME: uint64 = 8;
   ADAM_PLATFORM_PHDR_INFO_PHDR: uint64 = 16;
   ADAM_PLATFORM_PHDR_INFO_PHNUM: uint64 = 24;
   ADAM_PLATFORM_PHDR_BYTES: uint64 = 56;
@@ -1876,26 +1883,78 @@ begin
   return int32(syscall(SYS_lstat, APath, addr of AStat));
 end;
 
+const
+  // The dll entry's reasons (its init / fini arrays' stubs, Adam.ELF.Writer: the same words
+  // as System.Runtime.Win64's loader reasons) and a .so's first exit-list room
+  ADAM_RUNTIME_LINUX_DLL_UNLOAD: int32 = 0;
+  ADAM_RUNTIME_LINUX_DLL_LOAD: int32 = 1;
+  ADAM_RUNTIME_LINUX_DLL_EXITS: int64 = 32;
+
 // The stand-in for C's atexit, which libc_nonshared.a defines and an Adam image does not
 // carry: registers AHandler in the exit-time list glibc's exit runs (__cxa_atexit, the
 // program's own: no dso handle); 0, or nonzero when the list has no room
 public func PlatformCAtExit(const AHandler: func()): int32;
+var
+  LRoom: int64;
+  LBlock: ptr to func();
 begin
-  return __cxa_atexit(AHandler, nil, nil);
+  if not GDLLMode then
+    return __cxa_atexit(AHandler, nil, nil);
+  end;
+  // a .so's: its own list, grown by doubling
+  if GDLLExitCount = GDLLExitRoom then
+    LRoom := GDLLExitRoom * 2;
+    if LRoom = 0 then
+      LRoom := ADAM_RUNTIME_LINUX_DLL_EXITS;
+    end;
+    LBlock := ptr to func()(realloc(GDLLExits, uint64(LRoom * size(func()))));
+    if LBlock = nil then
+      return -1;
+    end;
+    GDLLExits := LBlock;
+    GDLLExitRoom := LRoom;
+  end;
+  GDLLExits[GDLLExitCount] := AHandler;
+  GDLLExitCount := GDLLExitCount + 1;
+  return 0;
 end;
 
 // AHandler run when the process ends through exit, however it is called (the runtime's
-// Halt or a program's own call of glibc's exit), the last one registered first
+// Halt or a program's own call of glibc's exit), the last one registered first; in a .so
+// at its unload (PlatformDLLEvent)
 public func PlatformAtExit(const AHandler: func());
 begin
   PlatformCAtExit(AHandler);
 end;
 
-// A .so's load and unload handed on (System.Runtime.Win64's loader events; LX6b: its
-// init / fini arrays)
+forward func DoUnloadPlatform();
+
+// A .so's load and unload (LX6b2: its init array's stub calls the dll entry with the load,
+// its fini array's with the unload): at the load its exit-time handlers get their own list
+// (GDLLMode) and the answer is true (the compiler's entry then starts it: its units' inits
+// and starts, their teardowns registered in that list); at the unload (dlclose, or the
+// process's end) that list runs, the last registered first, then stdout is flushed
 public func PlatformDLLEvent(const AModule: ptr; const AReason: int32; const AReserved: ptr): bool;
+var
+  LI: int64;
 begin
-  DoPending(ptr to const char("PlatformDLLEvent"), ptr to const char("LX6b"));
+  if AReason = ADAM_RUNTIME_LINUX_DLL_LOAD then
+    GDLLMode := true;
+    GDLLExitCount := 0;
+    return true;
+  end;
+  if AReason = ADAM_RUNTIME_LINUX_DLL_UNLOAD then
+    LI := GDLLExitCount - 1;
+    while LI >= 0 do
+      GDLLExits[LI]();
+      LI := LI - 1;
+    end;
+    GDLLExitCount := 0;
+    PlatformFlush();
+    // what the .so put into the process goes back: its code is gone after the unload
+    DoUnloadPlatform();
+  end;
+  return false;
 end;
 
 // AHandler run on each thread but the main one as it ends (PlatformThreadCallback), the
@@ -2482,9 +2541,14 @@ const
   REG_RIP: int64 = 16;
   // sys/mman.h: no swap space reserved for a mapping
   MAP_NORESERVE: int32 = 0x4000;
-  // The signals the fault handler takes, in GFaultBefore's order
+  // The signals the fault handler takes, in the order the fault chain keeps the actions it
+  // replaced (its Before bytes as PlatformSigaction records)
   ADAM_PLATFORM_FAULT_SIGNALS: array[0..3] of int32 = [11, 7, 8, 4];
   ADAM_PLATFORM_FAULT_SIGNAL_COUNT: int64 = 4;
+  // Where the kernel's form of the replaced actions starts in the fault chain's Before
+  // bytes (past the 4 PlatformSigaction records), 32 bytes at each signal's number (up to
+  // 11: SIGSEGV), for the chain's fallback (DoFaultFallbackWrite)
+  ADAM_PLATFORM_FAULT_KERNEL_AT: uint64 = 608;
   // signal.h: pthread_sigmask's how that takes a set's signals out of the mask; glibc's
   // sigset_t in 64-bit words (1024 bits, signal N at bit N - 1)
   SIG_UNBLOCK: int32 = 1;
@@ -2513,12 +2577,15 @@ const
   ADAM_PLATFORM_STACK_GAP: uint64 = 1048576;
 
 var
-  // True once the fault handler is installed (PlatformAtFault), with the page size it uses
-  // and the actions it replaced, by ADAM_PLATFORM_FAULT_SIGNALS' order (put back for a
-  // signal that is no fault: DoFaultPassOn)
+  // True once the fault handler is installed (PlatformAtFault), with the page size it uses;
+  // the process's fault chain this runtime joined (System.Runtime.FaultChain: the one
+  // action every Adam runtime in the process shares, holding the actions it replaced, by
+  // ADAM_PLATFORM_FAULT_SIGNALS' order) and this runtime's entry in it (left at its unload,
+  // DoUnloadPlatform)
   GFaultReady: bool;
   GFaultPage: uint64;
-  GFaultBefore: array[0..3] of PlatformSigaction;
+  GFaultChain: ptr to FaultChain;
+  GFaultEntry: ptr to FaultChainEntry;
 
 threadstatic
   // This thread's alternate signal stack (DoFaultThreadReady: GSignalMap the whole
@@ -2851,23 +2918,90 @@ begin
   DoNoCatch(ptr to const char("a hardware fault no guard takes"));
 end;
 
+// A walk for the object holding Address (DoFaultObjectVisit): its range once found (Low ..
+// High, the lowest PT_LOAD to past the highest)
+type
+  PlatformFaultWalk = record
+    Address: uint64;
+    Low: uint64;
+    High: uint64;
+  end;
+
+// dl_iterate_phdr's visitor finding the object whose PT_LOAD segments hold the walk's
+// address: its whole loaded range kept (1: the walk stops)
+func DoFaultObjectVisit(const AInfo: ptr; const ASize: uint64; const AData: ptr): int32;
+var
+  LWalk: ptr to PlatformFaultWalk;
+  LBias: uint64;
+  LPhdrs: uint64;
+  LCount: uint64;
+  LPhdr: uint64;
+  LLow: uint64;
+  LHigh: uint64;
+  LStart: uint64;
+  LEnd: uint64;
+  LHolds: bool;
+  LI: uint64;
+begin
+  LWalk := ptr to PlatformFaultWalk(AData);
+  LBias := DoWordAt(uint64(AInfo) + ADAM_PLATFORM_PHDR_INFO_ADDR);
+  LPhdrs := DoWordAt(uint64(AInfo) + ADAM_PLATFORM_PHDR_INFO_PHDR);
+  LCount := DoHalfAt(uint64(AInfo) + ADAM_PLATFORM_PHDR_INFO_PHNUM);
+  LLow := 0xFFFFFFFFFFFFFFFF;
+  LHigh := 0;
+  LHolds := false;
+  for LI := 0 to LCount - 1 do
+    LPhdr := LPhdrs + LI * ADAM_PLATFORM_PHDR_BYTES;
+    if uint32(DoLongAt(LPhdr)) = PT_LOAD then
+      LStart := LBias + DoWordAt(LPhdr + ADAM_PLATFORM_PHDR_VADDR);
+      LEnd := LStart + DoWordAt(LPhdr + ADAM_PLATFORM_PHDR_MEMSZ);
+      if LStart < LLow then
+        LLow := LStart;
+      end;
+      if LEnd > LHigh then
+        LHigh := LEnd;
+      end;
+      if (LWalk^.Address >= LStart) and (LWalk^.Address < LEnd) then
+        LHolds := true;
+      end;
+    end;
+  end;
+  if not LHolds then
+    return 0;
+  end;
+  LWalk^.Low := LLow;
+  LWalk^.High := LHigh;
+  return 1;
+end;
+
+// The actions the fault chain replaced, by ADAM_PLATFORM_FAULT_SIGNALS' order (its
+// Before bytes)
+func DoFaultBefore(): ptr to PlatformSigaction;
+begin
+  return ptr to PlatformSigaction(addr of GFaultChain^.Before[0]);
+end;
+
 // A signal of ADAM_PLATFORM_FAULT_SIGNALS that is no hardware fault (sent by kill /
-// tgkill / sigqueue: si_code 0 or below): the action the fault handler replaced is put back
-// and the signal sent to this thread again, pending until the handler returns (the signal
-// is blocked in it), then taken as it would have been
+// tgkill / sigqueue: si_code 0 or below): the action the fault chain replaced (the one
+// before any Adam runtime's, never another runtime's code) is put back and the signal sent
+// to this thread again, pending until the handler returns (the signal is blocked in it),
+// then taken as it would have been
 func DoFaultPassOn(const ASignal: int32);
 var
+  LBefore: ptr to PlatformSigaction;
   LI: int64;
 begin
+  LBefore := DoFaultBefore();
   for LI := 0 to ADAM_PLATFORM_FAULT_SIGNAL_COUNT - 1 do
     if ADAM_PLATFORM_FAULT_SIGNALS[LI] = ASignal then
-      sigaction(ASignal, ptr(addr of GFaultBefore[LI]), nil);
+      sigaction(ASignal, ptr(addr of LBefore[LI]), nil);
     end;
   end;
   pthread_kill(pthread_self(), ASignal);
 end;
 
-// The fault handler (SA_SIGINFO | SA_ONSTACK: on the thread's alternate signal stack): the
+// A fault taken by this runtime (the fault chain's taker for a pc in its image, or the
+// dispatch's for one in no Adam image): the
 // faulting frame's registers (the ucontext's gregs) and the fault's kind kept for its
 // dispatch (GFaultStart, GFaultKind), then the ucontext's rip set to DoFaultRaise and its
 // rsp below the faulting frame (past the red zone), or at the alternate signal stack's top
@@ -2877,7 +3011,7 @@ end;
 // as ordinary code once the handler returns, so no handler frame lies between it and the
 // faulting frame. A fault while a dispatch searches (the unwinder's own) is reported at
 // once, as one no guard took
-func DoFaultSignal(ASignal: int32; AInfo: ptr; AContext: ptr);
+func DoFaultTake(ASignal: int32; AInfo: ptr; AContext: ptr);
 var
   LCode: int32;
   LAddress: uint64;
@@ -2893,10 +3027,6 @@ var
   LI: int64;
 begin
   LCode := (ptr to int32(uint64(AInfo) + ADAM_PLATFORM_SI_CODE))^;
-  if LCode <= 0 then
-    DoFaultPassOn(ASignal);
-    return;
-  end;
   LAddress := (ptr to uint64(uint64(AInfo) + ADAM_PLATFORM_SI_ADDR))^;
   LGregs := ptr to uint64(uint64(AContext) + ADAM_PLATFORM_UC_GREGS);
   for LI := 0 to 15 do
@@ -2928,16 +3058,178 @@ begin
   LGregs[REG_RIP] := uint64(ptr(LRaise));
 end;
 
+// The fault chain's dispatch (what its slot calls while this runtime holds it; SA_SIGINFO |
+// SA_ONSTACK, on the thread's alternate signal stack): a signal no hardware fault sent is
+// passed on (DoFaultPassOn); a fault in a joined Adam runtime's image is that runtime's
+// (its taker, as win64's per-module tables route it); any other this runtime takes
+func DoFaultSignal(ASignal: int32; AInfo: ptr; AContext: ptr);
+var
+  LGregs: ptr to uint64;
+  LTake: ptr;
+  LTaker: PlatformSignalHandler;
+begin
+  if (ptr to int32(uint64(AInfo) + ADAM_PLATFORM_SI_CODE))^ <= 0 then
+    DoFaultPassOn(ASignal);
+    return;
+  end;
+  LGregs := ptr to uint64(uint64(AContext) + ADAM_PLATFORM_UC_GREGS);
+  LTake := FaultChainTake(GFaultChain, LGregs[REG_RIP]);
+  if LTake = nil then
+    DoFaultTake(ASignal, AInfo, AContext);
+    return;
+  end;
+  LTaker := PlatformSignalHandler(LTake);
+  LTaker(ASignal, AInfo, AContext);
+end;
+
+// ADAM_FAULT_CHAIN_SIZE zeroed bytes that may be written and run (a fault chain's mapping,
+// System.Runtime.FaultChain), page aligned; nil when the OS refused
+func DoFaultChainMap(): ptr;
+var
+  LMap: ptr;
+begin
+  LMap := mmap(nil, ADAM_FAULT_CHAIN_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
+    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if uint64(LMap) = ADAM_PLATFORM_MAP_FAILED then
+    return nil;
+  end;
+  return LMap;
+end;
+
+// The CPU given away once (FaultChainSettle's wait)
+func DoFaultYield();
+begin
+  sched_yield();
+end;
+
+// The fault chain's fallback (System.Runtime.FaultChain: what its stub calls once no Adam
+// runtime holds its slot, an action set over the chain still reaching it): answers as the
+// replaced action would. A handler is called as the OS would have called it; SIG_DFL /
+// SIG_IGN is put back as DoFaultPassOn does and the signal sent to this thread again, so
+// it is taken as that action takes it (a hardware fault runs again on the return and meets
+// it; a sent one is pending until the handler returns). Raw code and system calls (no Adam
+// image may be left to call), over the kernel's own form of each replaced action (struct
+// k_sigaction: handler, flags, restorer, the first mask word), 32 bytes at the signal's
+// number from ADAM_PLATFORM_FAULT_KERNEL_AT in the chain's Before bytes
+func DoFaultFallbackWrite();
+var
+  LBefore: ptr to PlatformSigaction;
+  LKernel: ptr to uint64;
+  LAt: int64;
+  LI: int64;
+begin
+  LBefore := DoFaultBefore();
+  for LI := 0 to ADAM_PLATFORM_FAULT_SIGNAL_COUNT - 1 do
+    LKernel := ptr to uint64(uint64(GFaultChain) + ADAM_FAULT_CHAIN_BEFORE +
+      ADAM_PLATFORM_FAULT_KERNEL_AT + uint64(ADAM_PLATFORM_FAULT_SIGNALS[LI]) * 32);
+    LKernel[0] := uint64(LBefore[LI].sa_sigaction);
+    LKernel[1] := uint64(uint32(LBefore[LI].sa_flags));
+    LKernel[2] := uint64(LBefore[LI].sa_restorer);
+    LKernel[3] := LBefore[LI].sa_mask[0];
+  end;
+  LAt := 0;
+  // push rdi (the signal); r11 = the signal's kernel action (32 bytes at its number):
+  // mov eax, edi; shl rax, 5; lea r11, [rip + the kernel actions]; add r11, rax
+  FaultChainSpareByte(GFaultChain, LAt, 0x57);
+  FaultChainSpareByte(GFaultChain, LAt, 0x89);
+  FaultChainSpareByte(GFaultChain, LAt, 0xF8);
+  FaultChainSpareByte(GFaultChain, LAt, 0x48);
+  FaultChainSpareByte(GFaultChain, LAt, 0xC1);
+  FaultChainSpareByte(GFaultChain, LAt, 0xE0);
+  FaultChainSpareByte(GFaultChain, LAt, 0x05);
+  FaultChainSpareByte(GFaultChain, LAt, 0x4C);
+  FaultChainSpareByte(GFaultChain, LAt, 0x8D);
+  FaultChainSpareByte(GFaultChain, LAt, 0x1D);
+  FaultChainSpareRel(GFaultChain, LAt, ADAM_FAULT_CHAIN_BEFORE + ADAM_PLATFORM_FAULT_KERNEL_AT);
+  FaultChainSpareByte(GFaultChain, LAt, 0x49);
+  FaultChainSpareByte(GFaultChain, LAt, 0x01);
+  FaultChainSpareByte(GFaultChain, LAt, 0xC3);
+  // a handler replaced (above SIG_IGN's 1) is called as the OS would have called it, its
+  // arguments as they came: mov rax, [r11]; cmp rax, 1; jbe +3; pop rdi; jmp rax
+  FaultChainSpareByte(GFaultChain, LAt, 0x49);
+  FaultChainSpareByte(GFaultChain, LAt, 0x8B);
+  FaultChainSpareByte(GFaultChain, LAt, 0x03);
+  FaultChainSpareByte(GFaultChain, LAt, 0x48);
+  FaultChainSpareByte(GFaultChain, LAt, 0x83);
+  FaultChainSpareByte(GFaultChain, LAt, 0xF8);
+  FaultChainSpareByte(GFaultChain, LAt, 0x01);
+  FaultChainSpareByte(GFaultChain, LAt, 0x76);
+  FaultChainSpareByte(GFaultChain, LAt, 0x03);
+  FaultChainSpareByte(GFaultChain, LAt, 0x5F);
+  FaultChainSpareByte(GFaultChain, LAt, 0xFF);
+  FaultChainSpareByte(GFaultChain, LAt, 0xE0);
+  // SIG_DFL / SIG_IGN: rt_sigaction(signal, its replaced action, nil, 8): mov rsi, r11;
+  // xor edx, edx; mov r10d, 8; mov eax, 13; syscall
+  FaultChainSpareByte(GFaultChain, LAt, 0x4C);
+  FaultChainSpareByte(GFaultChain, LAt, 0x89);
+  FaultChainSpareByte(GFaultChain, LAt, 0xDE);
+  FaultChainSpareByte(GFaultChain, LAt, 0x31);
+  FaultChainSpareByte(GFaultChain, LAt, 0xD2);
+  FaultChainSpareByte(GFaultChain, LAt, 0x41);
+  FaultChainSpareByte(GFaultChain, LAt, 0xBA);
+  FaultChainSpareByte(GFaultChain, LAt, 0x08);
+  FaultChainSpareByte(GFaultChain, LAt, 0x00);
+  FaultChainSpareByte(GFaultChain, LAt, 0x00);
+  FaultChainSpareByte(GFaultChain, LAt, 0x00);
+  FaultChainSpareByte(GFaultChain, LAt, 0xB8);
+  FaultChainSpareByte(GFaultChain, LAt, 0x0D);
+  FaultChainSpareByte(GFaultChain, LAt, 0x00);
+  FaultChainSpareByte(GFaultChain, LAt, 0x00);
+  FaultChainSpareByte(GFaultChain, LAt, 0x00);
+  FaultChainSpareByte(GFaultChain, LAt, 0x0F);
+  FaultChainSpareByte(GFaultChain, LAt, 0x05);
+  // getpid: mov eax, 39; syscall; push rax
+  FaultChainSpareByte(GFaultChain, LAt, 0xB8);
+  FaultChainSpareByte(GFaultChain, LAt, 0x27);
+  FaultChainSpareByte(GFaultChain, LAt, 0x00);
+  FaultChainSpareByte(GFaultChain, LAt, 0x00);
+  FaultChainSpareByte(GFaultChain, LAt, 0x00);
+  FaultChainSpareByte(GFaultChain, LAt, 0x0F);
+  FaultChainSpareByte(GFaultChain, LAt, 0x05);
+  FaultChainSpareByte(GFaultChain, LAt, 0x50);
+  // gettid: mov eax, 186; syscall; mov esi, eax
+  FaultChainSpareByte(GFaultChain, LAt, 0xB8);
+  FaultChainSpareByte(GFaultChain, LAt, 0xBA);
+  FaultChainSpareByte(GFaultChain, LAt, 0x00);
+  FaultChainSpareByte(GFaultChain, LAt, 0x00);
+  FaultChainSpareByte(GFaultChain, LAt, 0x00);
+  FaultChainSpareByte(GFaultChain, LAt, 0x0F);
+  FaultChainSpareByte(GFaultChain, LAt, 0x05);
+  FaultChainSpareByte(GFaultChain, LAt, 0x89);
+  FaultChainSpareByte(GFaultChain, LAt, 0xC6);
+  // tgkill(pid, tid, signal): pop rdi; pop rdx; mov eax, 234; syscall; ret
+  FaultChainSpareByte(GFaultChain, LAt, 0x5F);
+  FaultChainSpareByte(GFaultChain, LAt, 0x5A);
+  FaultChainSpareByte(GFaultChain, LAt, 0xB8);
+  FaultChainSpareByte(GFaultChain, LAt, 0xEA);
+  FaultChainSpareByte(GFaultChain, LAt, 0x00);
+  FaultChainSpareByte(GFaultChain, LAt, 0x00);
+  FaultChainSpareByte(GFaultChain, LAt, 0x00);
+  FaultChainSpareByte(GFaultChain, LAt, 0x0F);
+  FaultChainSpareByte(GFaultChain, LAt, 0x05);
+  FaultChainSpareByte(GFaultChain, LAt, 0xC3);
+  FaultChainSpareDone(GFaultChain);
+end;
+
 // AHandler called with the fault kind (ADAM_PLATFORM_FAULT_*) of a hardware fault no guard
 // took, on the faulting thread with nothing unwound (DoFaultRaise); it reports the fault and
-// ends the process, never returning. The fault handler (DoFaultSignal) installed for SIGSEGV,
-// SIGBUS, SIGFPE and SIGILL and the main thread's fault state made ready (a thread
+// ends the process, never returning. This runtime joined to the process's fault chain (the
+// one found as SIGSEGV's action, else a new one installed for SIGSEGV, SIGBUS, SIGFPE and
+// SIGILL over the actions it replaces; the runtime's image range found now, never in the
+// handler: dl_iterate_phdr is no signal-safe call) and the main thread's fault state made
+// ready (a thread
 // PlatformThreadStart makes gets its own at its start, and so does one C code starts:
 // pthread_create hooked here, DoHookThreads)
 public func PlatformAtFault(const AHandler: func(const AKind: int32));
 var
   LAction: PlatformSigaction;
+  LCurrent: PlatformSigaction;
   LSignal: PlatformSignalHandler;
+  LTake: PlatformSignalHandler;
+  LWalk: PlatformFaultWalk;
+  LMap: ptr;
+  LMade: bool;
+  LBefore: ptr to PlatformSigaction;
   LI: int64;
 begin
   GFaultHandler := AHandler;
@@ -2948,15 +3240,52 @@ begin
   if sysconf(_SC_PAGESIZE) > 0 then
     GFaultPage := uint64(sysconf(_SC_PAGESIZE));
   end;
+  LSignal := DoFaultSignal;
+  LTake := DoFaultTake;
+  memset(ptr(addr of LWalk), 0, uint64(size(PlatformFaultWalk)));
+  LWalk.Address := uint64(ptr(LSignal));
+  dl_iterate_phdr(DoFaultObjectVisit, ptr(addr of LWalk));
+  memset(ptr(addr of LCurrent), 0, uint64(size(PlatformSigaction)));
+  sigaction(ADAM_PLATFORM_FAULT_SIGNALS[0], nil, ptr(addr of LCurrent));
+  GFaultChain := nil;
+  if (LCurrent.sa_flags & SA_SIGINFO) <> 0 then
+    GFaultChain := FaultChainOf(LCurrent.sa_sigaction);
+  end;
+  LMade := false;
+  if GFaultChain = nil then
+    LMap := DoFaultChainMap();
+    if LMap = nil then
+      // no chain, so no handler: the OS refused the mapping (faults end the process as the
+      // OS ends them)
+      return;
+    end;
+    FaultChainMake(LMap, 8);
+    GFaultChain := ptr to FaultChain(LMap);
+    LMade := true;
+  end;
+  GFaultEntry := FaultChainJoin(GFaultChain, LWalk.Low, LWalk.High, ptr(LTake), ptr(LSignal));
+  while GFaultEntry = nil do
+    LMap := DoFaultChainMap();
+    if LMap = nil then
+      return;
+    end;
+    FaultChainExtend(GFaultChain, LMap);
+    GFaultEntry := FaultChainJoin(GFaultChain, LWalk.Low, LWalk.High, ptr(LTake),
+      ptr(LSignal));
+  end;
   GFaultReady := true;
   DoFaultThreadReady();
-  memset(ptr(addr of LAction), 0, uint64(size(PlatformSigaction)));
-  LSignal := DoFaultSignal;
-  LAction.sa_sigaction := ptr(LSignal);
-  LAction.sa_flags := SA_SIGINFO | SA_ONSTACK;
-  for LI := 0 to ADAM_PLATFORM_FAULT_SIGNAL_COUNT - 1 do
-    sigaction(ADAM_PLATFORM_FAULT_SIGNALS[LI], ptr(addr of LAction),
-      ptr(addr of GFaultBefore[LI]));
+  // a new chain's stub installed once its slot holds this runtime's dispatch (the join)
+  if LMade then
+    LBefore := DoFaultBefore();
+    memset(ptr(addr of LAction), 0, uint64(size(PlatformSigaction)));
+    LAction.sa_sigaction := FaultChainStub(GFaultChain);
+    LAction.sa_flags := SA_SIGINFO | SA_ONSTACK;
+    for LI := 0 to ADAM_PLATFORM_FAULT_SIGNAL_COUNT - 1 do
+      sigaction(ADAM_PLATFORM_FAULT_SIGNALS[LI], ptr(addr of LAction),
+        ptr(addr of LBefore[LI]));
+    end;
+    DoFaultFallbackWrite();
   end;
   DoHookThreads();
 end;
@@ -3784,18 +4113,25 @@ begin
 end;
 
 // The run-time hooks (PlatformHookInstall / PlatformHookUninstall, PaskalCPP's HookABI run-time
-// level; LX4f, the win64 import-table patch's linux form): a hook writes its replacement into
-// every GOT slot of its C name (a R_X86_64_JUMP_SLOT or R_X86_64_GLOB_DAT relocation naming
-// it) in every loaded object, records each slot and what it held, and puts exactly that back
-// into every recorded slot whose object is still loaded. A slot in the object's RELRO range
-// is made writable for its store and read-only again after it. glibc has no load
-// notification (win64's loader DLL notification): the first install hooks dlopen and dlclose
-// themselves (internal hooks, the same GOT patch), so an object loaded through dlopen gets
-// every hook written into it as its dlopen returns, and an unload through dlclose drops its
-// slots. An object glibc loads on its own (NSS, gconv) is not patched (his OK 2026-11-25).
-// Calls that do not go through a slot (inside the defining object, a link-time hook's own
-// symbol) are the link-time level's. Every walk of the objects runs under the table lock and
-// inside dl_iterate_phdr, whose loader lock keeps a visited object mapped (no pin needed).
+// level; LX4f2, the win64 import-table patch's linux form). A hook name is a compile-time
+// constant (PlatformHookInstall's AName is a literal parameter): an exe's link exports one
+// interposer stub per name (Adam.ELF.Linker, unversioned in .dynsym), so every object loaded
+// now or later, its constructors and its function pointers (NSS and gconv modules too) bind
+// to the stub, which jumps through the name's slot in the exe's hook table
+// (GHookTableCount); the slot first finds the next object's function (dlsym RTLD_NEXT) when
+// it is first called. An install swaps that one slot (its original: what the slot reaches),
+// an uninstall puts back exactly what it held; glibc's calls to itself are untouched (win64's
+// import tables). A name the table lacks (a shared object's runtime: its table is empty, as
+// in a C program) is hooked in every GOT slot of the name (a R_X86_64_JUMP_SLOT or
+// R_X86_64_GLOB_DAT relocation naming it) in every object loaded at the install: each slot
+// and what it held recorded, exactly that put back into every recorded slot whose object
+// (the same .dynamic address and name) is still loaded; a slot in the object's RELRO range
+// is made writable for its store and read-only again after it. An object loaded after such
+// an install is not patched: glibc has no load notification, and a dlopen'd shared object
+// cannot interpose its host (docgen known-issues). Calls that do not go through a slot or a
+// stub (inside the defining object, a link-time hook's own symbol) are the link-time level's.
+// Every walk of the objects runs under the table lock and inside dl_iterate_phdr, whose
+// loader lock keeps a visited object mapped (no pin needed).
 
 const
   // elf.h: the dynamic tags read, the program header kinds, the relocation kinds that are
@@ -3819,23 +4155,36 @@ const
 
 type
   // One GOT slot a run-time hook wrote: the slot, what it held, the object it is in (its
-  // .dynamic's loaded address: one per loaded object, never 0); Keep: a walk's mark
+  // .dynamic's loaded address: one per loaded object, never 0, and a copy of its name, so an
+  // object loaded later at a freed one's address is never taken for it); Keep: a walk's mark
   // (DoHookPrune: its object was seen; DoHookRestoreLocked: it could not go back)
   PlatformHookSlot = record
     Address: ptr to uint64;
     Old: uint64;
     Base: uint64;
+    Object: ptr to char;
     Keep: bool;
   end;
 
-  // A run-time hook: its C name (a copy, NUL-terminated), the replacement, every slot it
-  // wrote (Slots: SlotCount of SlotCapacity used); Removing: its slots are being put back, an
-  // object loaded now is not patched with it; Internal: the runtime's own (dlopen's /
-  // dlclose's, DoHookLoads; pthread_create's, DoHookThreads), never a user's, never
-  // uninstalled
+  // An exe's run-time hook name as its link wrote it in the hook table (the compiler's
+  // ADAM_HOOK_TABLE_* layout, LX4f2): its C name, the slot its interposer stub jumps through,
+  // the pending entry the slot holds until the name is first called
+  PlatformHookLink = record
+    Name: ptr to const char;
+    Slot: uint64;
+    Pending: uint64;
+  end;
+
+  // A run-time hook: its C name (a copy, NUL-terminated), the replacement; Link its name's
+  // entry in the exe's hook table (nil: the GOT path) and LinkOld what that slot held; else
+  // every slot it wrote (Slots: SlotCount of SlotCapacity used); Removing: its slots are being
+  // put back; Internal: the runtime's own (pthread_create's, DoHookThreads), never a user's,
+  // never uninstalled
   PlatformHookEntry = record
     Name: ptr to char;
     Replacement: uint64;
+    Link: ptr to PlatformHookLink;
+    LinkOld: uint64;
     Slots: ptr to PlatformHookSlot;
     SlotCount: int64;
     SlotCapacity: int64;
@@ -3843,11 +4192,12 @@ type
     Internal: bool;
   end;
 
-  // A loaded object's import tables (DoHookObjectOf): its id (its .dynamic's address), load
-  // bias, string and symbol tables, its .rela.dyn and .rela.plt (address, bytes), its RELRO
-  // range (Low .. High: none when equal)
+  // A loaded object's import tables (DoHookObjectOf): its id (its .dynamic's address), its
+  // name (dl_phdr_info's: "" for the exe), load bias, string and symbol tables, its .rela.dyn
+  // and .rela.plt (address, bytes), its RELRO range (Low .. High: none when equal)
   PlatformHookObject = record
     Id: uint64;
+    Name: ptr to const char;
     Bias: uint64;
     StrTab: uint64;
     SymTab: uint64;
@@ -3869,9 +4219,6 @@ type
     Found: uint64;
   end;
 
-  // glibc's dlopen and dlclose as the internal hooks call them
-  PlatformDlopen = func(AFile: ptr to const char; AMode: int32): ptr;
-  PlatformDlclose = func(AHandle: ptr): int32;
   // A thread's start routine as pthread_create takes it, and glibc's pthread_create as its
   // internal hook calls it (AThread: where the new pthread_t goes)
   PlatformThreadEntry = func(AArgument: ptr): ptr;
@@ -3882,18 +4229,18 @@ var
   // The run-time hooks: the run lock makes installs and uninstalls run one at a time; the
   // table lock (taken first, then the loader's in dl_iterate_phdr: always in that order)
   // guards the list and every hook's slots; GHookEntries: GHookEntryCount entry addresses of
-  // GHookEntryCapacity, the internal hooks first; GHookLoadsReady once dlopen / dlclose are
-  // hooked, GHookDlopen / GHookDlclose what they reached (glibc's); GHookPthreadCreate what
-  // pthread_create's slots reached when DoHookThreads hooked it (nil before)
+  // GHookEntryCapacity, the internal hooks first; GHookPthreadCreate what pthread_create
+  // reached when DoHookThreads hooked it (nil before)
   GHookRunLock: array[0..4] of uint64;
   GHookTableLock: array[0..4] of uint64;
   GHookEntries: ptr to uint64;
   GHookEntryCount: int64;
   GHookEntryCapacity: int64;
-  GHookLoadsReady: bool;
-  GHookDlopen: PlatformDlopen;
-  GHookDlclose: PlatformDlclose;
   GHookPthreadCreate: PlatformThreadCreate;
+  // The hook table the hooks use (DoHookTable: the image's own, else its host exe's; nil:
+  // none), found once (GHookTableFound)
+  GHookTable: ptr to int64;
+  GHookTableFound: bool;
 
 // A d_ptr of .dynamic: glibc rewrites it to an address as it loads an object (the vDSO's,
 // read-only, stays relative to ABias)
@@ -3920,6 +4267,7 @@ var
 begin
   memset(ptr(addr of AObject), 0, uint64(size(PlatformHookObject)));
   AObject.Bias := DoWordAt(uint64(AInfo) + ADAM_PLATFORM_PHDR_INFO_ADDR);
+  AObject.Name := ptr to const char(DoWordAt(uint64(AInfo) + ADAM_PLATFORM_PHDR_INFO_NAME));
   LPhdrs := DoWordAt(uint64(AInfo) + ADAM_PLATFORM_PHDR_INFO_PHDR);
   LCount := DoHalfAt(uint64(AInfo) + ADAM_PLATFORM_PHDR_INFO_PHNUM);
   LDynamic := 0;
@@ -4047,19 +4395,50 @@ begin
   return -1;
 end;
 
-// The slot ASlot of the object ABase, holding AOld, recorded for the hook AEntry; false when
-// its list cannot grow
+// True when the slot ASlot's object is the loaded object AObject: the same .dynamic address
+// and the same name (a freed object's address can be a later one's)
+func DoHookSlotIn(const ASlot: PlatformHookSlot; const AObject: PlatformHookObject): bool;
+var
+  LName: ptr to const char;
+begin
+  if ASlot.Base <> AObject.Id then
+    return false;
+  end;
+  LName := AObject.Name;
+  if LName = nil then
+    LName := ptr to const char("");
+  end;
+  return strcmp(ptr to const char(ASlot.Object), LName) = 0;
+end;
+
+// The slot ASlot of the object AObject, holding AOld, recorded for the hook AEntry (with a
+// copy of the object's name); false when its list cannot grow or the copy cannot be made
 func DoHookAddSlot(const AEntry: ptr to PlatformHookEntry; const ASlot: ptr to uint64;
-  const AOld: uint64; const ABase: uint64): bool;
+  const AOld: uint64; const AObject: PlatformHookObject): bool;
 var
   LRoom: int64;
   LSlots: ptr to PlatformHookSlot;
+  LName: ptr to const char;
+  LLength: uint64;
+  LCopy: ptr to char;
 begin
+  LName := AObject.Name;
+  if LName = nil then
+    LName := ptr to const char("");
+  end;
+  LLength := strlen(LName);
+  LCopy := ptr to char(malloc(LLength + 1));
+  if LCopy = nil then
+    return false;
+  end;
+  // the name's bytes and its NUL
+  memcpy(ptr(LCopy), ptr(LName), LLength + 1);
   if AEntry^.SlotCount = AEntry^.SlotCapacity then
     LRoom := (AEntry^.SlotCapacity * 2) + 4;
     LSlots := ptr to PlatformHookSlot(realloc(ptr(AEntry^.Slots),
       uint64(LRoom) * uint64(size(PlatformHookSlot))));
     if LSlots = nil then
+      free(ptr(LCopy));
       return false;
     end;
     AEntry^.Slots := LSlots;
@@ -4067,13 +4446,15 @@ begin
   end;
   AEntry^.Slots[AEntry^.SlotCount].Address := ASlot;
   AEntry^.Slots[AEntry^.SlotCount].Old := AOld;
-  AEntry^.Slots[AEntry^.SlotCount].Base := ABase;
+  AEntry^.Slots[AEntry^.SlotCount].Base := AObject.Id;
+  AEntry^.Slots[AEntry^.SlotCount].Object := LCopy;
   AEntry^.Slots[AEntry^.SlotCount].Keep := true;
   AEntry^.SlotCount := AEntry^.SlotCount + 1;
   return true;
 end;
 
-// The hook AEntry's slots not marked Keep dropped (the others keep their order)
+// The hook AEntry's slots not marked Keep dropped with their names' copies (the others keep
+// their order)
 func DoHookDropUnkept(const AEntry: ptr to PlatformHookEntry);
 var
   LI: int64;
@@ -4084,6 +4465,8 @@ begin
     if AEntry^.Slots[LI].Keep then
       AEntry^.Slots[LOut] := AEntry^.Slots[LI];
       LOut := LOut + 1;
+    else
+      free(ptr(AEntry^.Slots[LI].Object));
     end;
   end;
   AEntry^.SlotCount := LOut;
@@ -4105,11 +4488,12 @@ begin
   LSlot := DoHookImportSlot(AObject, AEntry^.Name, LIndex);
   while LSlot <> nil do
     if DoHookSlotIndex(AEntry, uint64(LSlot)) < 0 then
-      if not DoHookAddSlot(AEntry, LSlot, LSlot^, AObject.Id) then
+      if not DoHookAddSlot(AEntry, LSlot, LSlot^, AObject) then
         return ADAM_PLATFORM_ENOMEM;
       end;
       if not DoHookWriteSlot(AObject, LSlot, AEntry^.Replacement) then
         AEntry^.SlotCount := AEntry^.SlotCount - 1;
+        free(ptr(AEntry^.Slots[AEntry^.SlotCount].Object));
         return ADAM_PLATFORM_EACCES;
       end;
     end;
@@ -4161,7 +4545,7 @@ begin
   for LI := 0 to GHookEntryCount - 1 do
     LEntry := ptr to PlatformHookEntry(GHookEntries[LI]);
     for LJ := 0 to LEntry^.SlotCount - 1 do
-      if LEntry^.Slots[LJ].Base = LObject.Id then
+      if DoHookSlotIn(LEntry^.Slots[LJ], LObject) then
         LEntry^.Slots[LJ].Keep := true;
       end;
     end;
@@ -4204,7 +4588,7 @@ begin
   end;
   LEntry := LWalk^.Entry;
   for LJ := 0 to LEntry^.SlotCount - 1 do
-    if LEntry^.Slots[LJ].Base = LObject.Id then
+    if DoHookSlotIn(LEntry^.Slots[LJ], LObject) then
       LEntry^.Slots[LJ].Keep := not DoHookWriteSlot(LObject, LEntry^.Slots[LJ].Address,
         LEntry^.Slots[LJ].Old);
     end;
@@ -4212,14 +4596,20 @@ begin
   return 0;
 end;
 
-// Every slot of the hook AEntry whose object is still loaded given back what it held; those
-// that went back and those of gone objects dropped: 0 when none is left, EACCES when one
-// could not go back. The caller holds the table lock
+// The hook AEntry's slots given back what they held: its hook table entry's slot; else every
+// GOT slot whose object is still loaded, those that went back and those of gone objects
+// dropped: 0 when none is left, EACCES when one could not go back. The caller holds the
+// table lock
 func DoHookRestoreLocked(const AEntry: ptr to PlatformHookEntry): int32;
 var
   LWalk: PlatformHookWalk;
   LJ: int64;
 begin
+  // a hook table entry's slot: exactly what it held back (the exe is always loaded)
+  if AEntry^.Link <> nil then
+    AEntry^.Link^.Slot := AEntry^.LinkOld;
+    return 0;
+  end;
   for LJ := 0 to AEntry^.SlotCount - 1 do
     AEntry^.Slots[LJ].Keep := false;
   end;
@@ -4279,45 +4669,6 @@ begin
   LWalk.Entry := AEntry;
   dl_iterate_phdr(DoHookPatchVisit, ptr(addr of LWalk));
   return LWalk.Code;
-end;
-
-// The internal hook of dlopen: glibc's dlopen, then (it loaded something) the slots of
-// unloaded objects dropped and every hook written into every object (a new one gets them
-// all; what is recorded is not written again); C's errno kept as dlopen left it
-func DoHookDlopenHook(AFile: ptr to const char; AMode: int32): ptr;
-var
-  LHandle: ptr;
-  LErrno: int32;
-  LWalk: PlatformHookWalk;
-begin
-  LHandle := GHookDlopen(AFile, AMode);
-  if LHandle = nil then
-    return nil;
-  end;
-  LErrno := DoErrno();
-  pthread_mutex_lock(ptr(addr of GHookTableLock));
-  DoHookPrune();
-  memset(ptr(addr of LWalk), 0, uint64(size(PlatformHookWalk)));
-  dl_iterate_phdr(DoHookPatchVisit, ptr(addr of LWalk));
-  pthread_mutex_unlock(ptr(addr of GHookTableLock));
-  DoSetErrno(LErrno);
-  return LHandle;
-end;
-
-// The internal hook of dlclose: glibc's dlclose, then the slots of the objects it unloaded
-// dropped; C's errno kept as dlclose left it
-func DoHookDlcloseHook(AHandle: ptr): int32;
-var
-  LResult: int32;
-  LErrno: int32;
-begin
-  LResult := GHookDlclose(AHandle);
-  LErrno := DoErrno();
-  pthread_mutex_lock(ptr(addr of GHookTableLock));
-  DoHookPrune();
-  pthread_mutex_unlock(ptr(addr of GHookTableLock));
-  DoSetErrno(LErrno);
-  return LResult;
 end;
 
 // Where the hook whose record is at the address AEntry is among the hooks; -1 when it is
@@ -4412,6 +4763,8 @@ begin
   end;
   LEntry^.Name := LName;
   LEntry^.Replacement := uint64(AReplacement);
+  LEntry^.Link := nil;
+  LEntry^.LinkOld := 0;
   LEntry^.Slots := nil;
   LEntry^.SlotCount := 0;
   LEntry^.SlotCapacity := 0;
@@ -4420,23 +4773,117 @@ begin
   return LEntry;
 end;
 
-// The hook record AEntry freed with its name and its slot list
+// The hook record AEntry freed with its name and its slot list (each slot's object name)
 func DoHookFreeEntry(const AEntry: ptr to PlatformHookEntry);
+var
+  LI: int64;
 begin
+  for LI := 0 to AEntry^.SlotCount - 1 do
+    free(ptr(AEntry^.Slots[LI].Object));
+  end;
   free(ptr(AEntry^.Name));
   free(ptr(AEntry^.Slots));
   free(ptr(AEntry));
 end;
 
-// A new hook of AName by AReplacement joined and written everywhere (AOriginal: what its
-// slots reached); 0 with AEntry set, else C's errno value with nothing installed (every slot
-// written put back). The caller holds the table lock
+// The hook table the runtime's hooks use (LX4f2): the image's own when it has names (an
+// exe's), else its host exe's (an Adam shared object in an Adam program: the exe exports
+// its table, so the shared object's hooks swap the exe's stubs too, reaching every object
+// loaded now or later); nil when neither has one (a shared object in a C program: the GOT
+// path). Found once. The caller holds the table lock
+func DoHookTable(): ptr to int64;
+begin
+  if not GHookTableFound then
+    GHookTable := ptr to int64(addr of GHookTableCount);
+    if GHookTableCount = 0 then
+      GHookTable := ptr to int64(dlsym(nil, ADAM_PLATFORM_HOOK_TABLE));
+    end;
+    GHookTableFound := true;
+  end;
+  return GHookTable;
+end;
+
+// The hook table entry of the C name AName (LX4f2, DoHookTable's); nil when the table has
+// none (a C program's link has an empty table, and no exe's to use)
+func DoHookLinkOf(const AName: ptr to const char): ptr to PlatformHookLink;
+var
+  LTable: ptr to int64;
+  LLink: ptr to PlatformHookLink;
+  LI: int64;
+begin
+  LTable := DoHookTable();
+  if LTable = nil then
+    return nil;
+  end;
+  // the entries follow the count
+  for LI := 0 to LTable^ - 1 do
+    LLink := ptr to PlatformHookLink(uint64(LTable) + ADAM_PLATFORM_ADDRESS_SIZE +
+      (uint64(LI) * uint64(size(PlatformHookLink))));
+    if strcmp(LLink^.Name, AName) = 0 then
+      return LLink;
+    end;
+  end;
+  return nil;
+end;
+
+// What the hook table entry ALink's stub reaches now: its slot, or (still its pending entry:
+// never called yet) the next object's function of its name, as the stub's first call finds
+// it (dlsym RTLD_NEXT: from the exe's code the objects after it; from a shared object's the
+// objects its own scope holds after it, never the exe); 0 when no object defines it
+func DoHookLinkValue(const ALink: ptr to PlatformHookLink): uint64;
+begin
+  if ALink^.Slot <> ALink^.Pending then
+    return ALink^.Slot;
+  end;
+  return uint64(dlsym(ptr(RTLD_NEXT), ALink^.Name));
+end;
+
+// What a hook of AName would get as its original: its hook table entry's (DoHookLinkValue),
+// else what its GOT slots reach (DoHookOriginal); 0 when nothing does. The caller holds the
+// table lock
+func DoHookCurrent(const AName: ptr to const char): uint64;
+var
+  LLink: ptr to PlatformHookLink;
+begin
+  LLink := DoHookLinkOf(AName);
+  if LLink <> nil then
+    return DoHookLinkValue(LLink);
+  end;
+  return DoHookOriginal(AName);
+end;
+
+// A new hook of AName by AReplacement joined and written (AOriginal: what it reached): its
+// hook table entry's slot when the exe has one (one aligned 8-byte store: a thread calling
+// through the stub meanwhile reads the old or the new value), else every GOT slot of the
+// objects loaded now; 0 with AEntry set, else C's errno value with nothing installed (every
+// slot written put back). The caller holds the table lock
 func DoHookAddLocked(const AName: ptr to const char; const AReplacement: ptr;
   const AInternal: bool; var AOriginal: uint64; var AEntry: ptr to PlatformHookEntry): int32;
 var
   LCode: int32;
+  LLink: ptr to PlatformHookLink;
 begin
   AEntry := nil;
+  LLink := DoHookLinkOf(AName);
+  if LLink <> nil then
+    AOriginal := DoHookLinkValue(LLink);
+    if AOriginal = 0 then
+      return ADAM_PLATFORM_ENOENT;
+    end;
+    AEntry := DoHookNewEntry(AName, AReplacement, AInternal);
+    if AEntry = nil then
+      return ADAM_PLATFORM_ENOMEM;
+    end;
+    if not DoHookJoin(AEntry) then
+      DoHookFreeEntry(AEntry);
+      AEntry := nil;
+      return ADAM_PLATFORM_ENOMEM;
+    end;
+    AEntry^.Link := LLink;
+    AEntry^.LinkOld := AOriginal;
+    LLink^.Slot := uint64(AReplacement);
+    return 0;
+  end;
   AOriginal := DoHookOriginal(AName);
   if AOriginal = 0 then
     return ADAM_PLATFORM_ENOENT;
@@ -4460,47 +4907,6 @@ begin
     AEntry := nil;
   end;
   return LCode;
-end;
-
-// dlopen and dlclose hooked once (the first install), so objects loaded later get the hooks
-// and unloaded ones drop their slots; false leaves a hook to patch only the objects loaded
-// now. The caller holds the table lock
-func DoHookLoads(): bool;
-var
-  LOpen: uint64;
-  LClose: uint64;
-  LOpenEntry: ptr to PlatformHookEntry;
-  LCloseEntry: ptr to PlatformHookEntry;
-  LOpenHook: PlatformDlopen;
-  LCloseHook: PlatformDlclose;
-begin
-  if GHookLoadsReady then
-    return true;
-  end;
-  LOpenHook := DoHookDlopenHook;
-  LCloseHook := DoHookDlcloseHook;
-  LOpen := DoHookOriginal(ptr to const char("dlopen"));
-  LClose := DoHookOriginal(ptr to const char("dlclose"));
-  if (LOpen = 0) or (LClose = 0) then
-    return false;
-  end;
-  // the originals are set before any slot reaches the hooks
-  GHookDlopen := PlatformDlopen(ptr(LOpen));
-  GHookDlclose := PlatformDlclose(ptr(LClose));
-  if DoHookAddLocked(ptr to const char("dlopen"), ptr(LOpenHook), true, LOpen,
-    LOpenEntry) <> 0 then
-    return false;
-  end;
-  if DoHookAddLocked(ptr to const char("dlclose"), ptr(LCloseHook), true, LClose,
-    LCloseEntry) <> 0 then
-    LOpenEntry^.Removing := true;
-    DoHookRestoreLocked(LOpenEntry);
-    DoHookLeave(LOpenEntry);
-    DoHookFreeEntry(LOpenEntry);
-    return false;
-  end;
-  GHookLoadsReady := true;
-  return true;
 end;
 
 // The start of a thread C code started (the pthread_create hook's, DoHookThreadCreate):
@@ -4557,32 +4963,6 @@ begin
   return LCode;
 end;
 
-// pthread_create hooked once, at the runtime's start (PlatformAtFault; an internal hook as
-// dlopen's / dlclose's, which it needs so a C library loaded later is patched too): every
-// thread C code starts through a slot runs DoHookThreadProc first. A user's hook of
-// pthread_create chains onto it (its original is this hook). A call that reaches no slot
-// (inside glibc itself) is not seen
-func DoHookThreads();
-var
-  LCreate: uint64;
-  LHook: PlatformThreadCreate;
-  LEntry: ptr to PlatformHookEntry;
-begin
-  LHook := DoHookThreadCreate;
-  LEntry := nil;
-  pthread_mutex_lock(ptr(addr of GHookRunLock));
-  pthread_mutex_lock(ptr(addr of GHookTableLock));
-  DoHookLoads();
-  LCreate := DoHookOriginal(ptr to const char("pthread_create"));
-  if LCreate <> 0 then
-    // the original is set before any slot reaches the hook
-    GHookPthreadCreate := PlatformThreadCreate(ptr(LCreate));
-    DoHookAddLocked(ptr to const char("pthread_create"), ptr(LHook), true, LCreate, LEntry);
-  end;
-  pthread_mutex_unlock(ptr(addr of GHookTableLock));
-  pthread_mutex_unlock(ptr(addr of GHookRunLock));
-end;
-
 // PlatformHookInstall's work under the run lock: AOriginal and AEntry set when it returns 0
 func DoHookInstallLocked(const AName: ptr to const char; const AReplacement: ptr;
   var AOriginal: uint64; var AEntry: ptr to PlatformHookEntry): int32;
@@ -4594,26 +4974,23 @@ begin
     pthread_mutex_unlock(ptr(addr of GHookTableLock));
     return ADAM_PLATFORM_EEXIST;
   end;
-  if DoHookOriginal(AName) = 0 then
-    pthread_mutex_unlock(ptr(addr of GHookTableLock));
-    return ADAM_PLATFORM_ENOENT;
-  end;
-  // dlopen / dlclose hooked before the hook joins: an object loaded after it joins is
-  // patched by the dlopen hook, never missed
-  DoHookLoads();
+  // the slots of objects unloaded since are no slots to write
+  DoHookPrune();
   LCode := DoHookAddLocked(AName, AReplacement, false, AOriginal, AEntry);
   pthread_mutex_unlock(ptr(addr of GHookTableLock));
   return LCode;
 end;
 
-// A run-time hook installed (System.Runtime's InstallHook): the C name AName's GOT slot in
-// every loaded object takes AReplacement, and so does every object loaded later through
-// dlopen. 0 with AOriginal (what the slots reached) and AState (the hook's record) set; else
+// A run-time hook installed (System.Runtime's InstallHook; AName a literal parameter, LX4f2:
+// a constant, so an exe's link makes its interposer stub): in an exe the name's stub slot
+// takes AReplacement, every object loaded now or later reaching it; a name the exe's table
+// lacks (a shared object's runtime) in every GOT slot of the objects loaded now. 0 with
+// AOriginal (what the stub or the slots reached) and AState (the hook's record) set; else
 // C's errno value of the failure, nothing installed: EINVAL (nil or empty AName, nil
-// AReplacement), EEXIST (AState is set, or AName is hooked already), ENOENT (no loaded object
-// imports or defines AName), EACCES (a slot could not be written: every slot written is put
-// back), ENOMEM. Installs and uninstalls run one at a time.
-public func PlatformHookInstall(const AName: ptr to const char; const AReplacement: ptr;
+// AReplacement), EEXIST (AState is set, or AName is hooked already), ENOENT (no object
+// defines AName, or none loaded imports it), EACCES (a slot could not be written: every slot
+// written is put back), ENOMEM. Installs and uninstalls run one at a time.
+public func PlatformHookInstall(literal AName: ptr to const char; const AReplacement: ptr;
   var AOriginal: ptr; var AState: ptr): int32;
 var
   LOriginal: uint64;
@@ -4659,6 +5036,8 @@ begin
     pthread_mutex_unlock(ptr(addr of GHookTableLock));
     return ADAM_PLATFORM_EINVAL;
   end;
+  // the slots of objects unloaded since are no slots to write back
+  DoHookPrune();
   LEntry := ptr to PlatformHookEntry(AState);
   if LEntry^.Internal then
     pthread_mutex_unlock(ptr(addr of GHookTableLock));
@@ -4697,6 +5076,94 @@ begin
     AState := nil;
   end;
   return LCode;
+end;
+
+// pthread_create hooked once, at the runtime's start (PlatformAtFault; an internal hook): in
+// an exe its interposer stub's slot (a constant name, as every hook's: PlatformHookInstall),
+// so every thread C code starts, a library loaded later included, runs DoHookThreadProc
+// first; in a shared object the GOT slots of what is loaded then. A user's hook of
+// pthread_create chains onto it (its original is this hook). A call that reaches no slot
+// (inside glibc itself) is not seen
+func DoHookThreads();
+var
+  LCreate: uint64;
+  LHook: PlatformThreadCreate;
+  LOriginal: ptr;
+  LState: ptr;
+  LEntry: ptr to PlatformHookEntry;
+begin
+  LHook := DoHookThreadCreate;
+  pthread_mutex_lock(ptr(addr of GHookTableLock));
+  LCreate := DoHookCurrent(ptr to const char("pthread_create"));
+  pthread_mutex_unlock(ptr(addr of GHookTableLock));
+  if LCreate = 0 then
+    return;
+  end;
+  // the original is set before any slot reaches the hook
+  GHookPthreadCreate := PlatformThreadCreate(ptr(LCreate));
+  LOriginal := nil;
+  LState := nil;
+  if PlatformHookInstall("pthread_create", ptr(LHook), LOriginal, LState) <> 0 then
+    return;
+  end;
+  // the runtime's own: never a user's to uninstall, a user's hook of the name chains onto it
+  LEntry := ptr to PlatformHookEntry(LState);
+  pthread_mutex_lock(ptr(addr of GHookTableLock));
+  LEntry^.Internal := true;
+  pthread_mutex_unlock(ptr(addr of GHookTableLock));
+end;
+
+// A .so's unload (PlatformDLLEvent): every run-time hook's slots (the internal one too:
+// pthread_create's) given back what they held in every object still loaded,
+// and this runtime gone from the process's fault chain (the slot moved to another joined
+// runtime; the last one out puts the actions the chain replaced back, then frees it, as
+// System.Runtime.Win64 does the process's filter), waiting until no fault call is in
+// flight: nothing in the process reaches the .so's code once it is unmapped
+func DoUnloadPlatform();
+var
+  LBefore: ptr to PlatformSigaction;
+  LNow: PlatformSigaction;
+  LAll: bool;
+  LPart: ptr;
+  LNext: ptr;
+  LI: int64;
+begin
+  pthread_mutex_lock(ptr(addr of GHookRunLock));
+  pthread_mutex_lock(ptr(addr of GHookTableLock));
+  for LI := 0 to GHookEntryCount - 1 do
+    DoHookRestoreLocked(ptr to PlatformHookEntry(GHookEntries[LI]));
+  end;
+  pthread_mutex_unlock(ptr(addr of GHookTableLock));
+  pthread_mutex_unlock(ptr(addr of GHookRunLock));
+  if GFaultReady then
+    GFaultReady := false;
+    if not FaultChainLeave(GFaultChain, GFaultEntry) then
+      FaultChainSettle(GFaultChain, DoFaultYield);
+      return;
+    end;
+    // the last runtime out: each signal whose action is still the chain's stub gets the
+    // action the chain replaced back
+    LBefore := DoFaultBefore();
+    LAll := true;
+    for LI := 0 to ADAM_PLATFORM_FAULT_SIGNAL_COUNT - 1 do
+      memset(ptr(addr of LNow), 0, uint64(size(PlatformSigaction)));
+      sigaction(ADAM_PLATFORM_FAULT_SIGNALS[LI], nil, ptr(addr of LNow));
+      if LNow.sa_sigaction = FaultChainStub(GFaultChain) then
+        sigaction(ADAM_PLATFORM_FAULT_SIGNALS[LI], ptr(addr of LBefore[LI]), nil);
+      else
+        LAll := false;
+      end;
+    end;
+    FaultChainSettle(GFaultChain, DoFaultYield);
+    if LAll then
+      LPart := ptr(GFaultChain);
+      while LPart <> nil do
+        LNext := ptr to FaultChain(LPart)^.Next;
+        munmap(LPart, ADAM_FAULT_CHAIN_SIZE);
+        LPart := LNext;
+      end;
+    end;
+  end;
 end;
 
 end.

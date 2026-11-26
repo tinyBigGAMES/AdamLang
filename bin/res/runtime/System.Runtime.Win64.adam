@@ -31,7 +31,8 @@
 module unit System.Runtime.Win64;
 
 // libc.a's pure C routines: memcpy, memset, strcmp, strlen (the same on every target)
-import System.Runtime.LibC;
+// and the process's one last filter every Adam runtime in it shares (PlatformAtFault)
+import System.Runtime.LibC, System.Runtime.FaultChain;
 
 // ucrtbase: the stream table (1 = stdout, 2 = stderr), its writer and flush, the process
 // exit (exit runs the exit-time handlers, _exit ends at once: no handler, no flush)
@@ -305,7 +306,8 @@ type
   PlatformDLLNotification = func(const AReason: uint32; const AData: ptr; const AContext: ptr);
 
   // The process's last filter of an exception no frame took (SetUnhandledExceptionFilter's),
-  // the type a dll puts the one it replaced back as (PlatformDLLEvent)
+  // the type the fault chain's last runtime puts the one it replaced back as
+  // (PlatformDLLEvent)
   PlatformFaultFilter = func(const APointers: ptr): int32;
 
   // What a thread PlatformThreadStart made runs first (System.Runtime's ThreadRun), given
@@ -549,12 +551,15 @@ var
   GFaultHandler: func(const AKind: int32);
   // A dll's runtime (M8a, PlatformDLLEvent): GDLLMode once its load began, its own exit-time
   // handler list (an _onexit_table_t, run at its unload: never the process's, which outlives
-  // it), and the process's last filter it replaced (put back at its unload, GDLLFilterSet
-  // once it was replaced: a dll's code is gone after its unload)
+  // it)
   GDLLMode: bool;
   GDLLExits: array[0..2] of ptr;
-  GDLLFilterSet: bool;
-  GDLLFilterBefore: ptr;
+  // The process's fault chain this runtime joined (System.Runtime.FaultChain: the one last
+  // filter every Adam runtime in the process shares, its Before bytes the filter it
+  // replaced) and this runtime's entry in it (left at a dll's unload: its code is gone
+  // after it); nil until PlatformAtFault
+  GFaultChain: ptr to FaultChain;
+  GFaultEntry: ptr to FaultChainEntry;
 
 threadstatic
   // True once this thread's end ran (PlatformThreadCallback): the loader calls every
@@ -773,19 +778,103 @@ begin
   return 0;
 end;
 
+// ADAM_FAULT_CHAIN_SIZE zeroed bytes that may be written and run (a fault chain's mapping),
+// page aligned, nil when the OS refused; a mapping given back
+forward func DoFaultChainMap(): ptr;
+forward func DoFaultChainFree(const AMap: ptr);
+
+// The filter the fault chain replaced (its Before bytes' first word)
+func DoFaultBefore(): ptr to ptr;
+begin
+  return ptr to ptr(addr of GFaultChain^.Before[0]);
+end;
+
+// The CPU given away once (FaultChainSettle's wait)
+func DoFaultYield();
+begin
+  Sleep(0);
+end;
+
+// The fault chain's fallback (System.Runtime.FaultChain: what its stub calls once no Adam
+// runtime holds its slot, a filter set over the chain still reaching it): the filter the
+// chain replaced called as if the chain were not there, or 0 (go on searching) when there
+// was none; it reads the replaced filter when it runs
+func DoFaultFallbackWrite();
+var
+  LAt: int64;
+begin
+  LAt := 0;
+  // mov rax, [rip + the replaced filter]; test rax, rax; jz +2; jmp rax (its call, the
+  // pointers in rcx); xor eax, eax; ret (EXCEPTION_CONTINUE_SEARCH: no filter was there)
+  FaultChainSpareByte(GFaultChain, LAt, 0x48);
+  FaultChainSpareByte(GFaultChain, LAt, 0x8B);
+  FaultChainSpareByte(GFaultChain, LAt, 0x05);
+  FaultChainSpareRel(GFaultChain, LAt, ADAM_FAULT_CHAIN_BEFORE);
+  FaultChainSpareByte(GFaultChain, LAt, 0x48);
+  FaultChainSpareByte(GFaultChain, LAt, 0x85);
+  FaultChainSpareByte(GFaultChain, LAt, 0xC0);
+  FaultChainSpareByte(GFaultChain, LAt, 0x74);
+  FaultChainSpareByte(GFaultChain, LAt, 0x02);
+  FaultChainSpareByte(GFaultChain, LAt, 0xFF);
+  FaultChainSpareByte(GFaultChain, LAt, 0xE0);
+  FaultChainSpareByte(GFaultChain, LAt, 0x31);
+  FaultChainSpareByte(GFaultChain, LAt, 0xC0);
+  FaultChainSpareByte(GFaultChain, LAt, 0xC3);
+  FaultChainSpareDone(GFaultChain);
+end;
+
 // AHandler called with the fault kind (ADAM_PLATFORM_FAULT_*) of a hardware fault no guard
 // took, on the faulting thread with nothing unwound (DoUnhandledFault); it reports the
-// fault and ends the process (PlatformWriteErrorDirect, PlatformTerminate), never returning
+// fault and ends the process (PlatformWriteErrorDirect, PlatformTerminate), never returning.
+// This runtime joined to the process's fault chain: the one whose stub is the process's
+// last filter, else a new one whose stub is made that filter (once the join gave its slot
+// DoUnhandledFault), the filter it replaced kept; a fault no frame took reaches one joined
+// runtime's DoUnhandledFault (they all report it alike), whichever dlls come and go
 public func PlatformAtFault(const AHandler: func(const AKind: int32));
 var
-  LBefore: ptr;
+  LCurrent: ptr;
+  LMap: ptr;
+  LMade: bool;
+  LFilter: PlatformFaultFilter;
+  LDispatch: PlatformFaultFilter;
+  LBefore: ptr to ptr;
 begin
   GFaultHandler := AHandler;
-  LBefore := SetUnhandledExceptionFilter(DoUnhandledFault);
-  // a dll puts the process's filter back at its unload (PlatformDLLEvent)
-  if GDLLMode and not GDLLFilterSet then
-    GDLLFilterBefore := LBefore;
-    GDLLFilterSet := true;
+  if GFaultEntry <> nil then
+    return;
+  end;
+  // the last filter read: set and put straight back (Windows has no read alone)
+  LCurrent := SetUnhandledExceptionFilter(nil);
+  SetUnhandledExceptionFilter(PlatformFaultFilter(LCurrent));
+  GFaultChain := FaultChainOf(LCurrent);
+  LDispatch := DoUnhandledFault;
+  LMade := false;
+  if GFaultChain = nil then
+    LMap := DoFaultChainMap();
+    if LMap = nil then
+      // no chain, so no filter: the OS refused the memory (a fault no frame took ends the
+      // process as Windows ends it)
+      return;
+    end;
+    // the home area of the filter's call: 32 bytes + 8 keeping rsp 16-byte aligned
+    FaultChainMake(LMap, 40);
+    GFaultChain := ptr to FaultChain(LMap);
+    LMade := true;
+  end;
+  GFaultEntry := FaultChainJoin(GFaultChain, 0, 0, nil, ptr(LDispatch));
+  while GFaultEntry = nil do
+    LMap := DoFaultChainMap();
+    if LMap = nil then
+      return;
+    end;
+    FaultChainExtend(GFaultChain, LMap);
+    GFaultEntry := FaultChainJoin(GFaultChain, 0, 0, nil, ptr(LDispatch));
+  end;
+  if LMade then
+    DoFaultFallbackWrite();
+    LFilter := PlatformFaultFilter(FaultChainStub(GFaultChain));
+    LBefore := DoFaultBefore();
+    LBefore^ := SetUnhandledExceptionFilter(LFilter);
   end;
 end;
 
@@ -861,6 +950,41 @@ const
 // report; stdout flushed), and the process's filter the dll replaced is put back; a
 // thread's start or end
 // asks nothing here (the TLS callback, PlatformThreadCallback, ends a thread's copies)
+// This runtime gone from the process's fault chain (a dll's unload): the slot moved to
+// another joined runtime; the last one out puts the filter the chain replaced back (when
+// the chain's stub is still the filter: else the filter set over it keeps it, and the
+// chain stays) and frees the chain; then a wait until no filter call is in flight, so
+// nothing reaches the dll's code once it is unmapped
+func DoFaultLeave();
+var
+  LNow: ptr;
+  LPart: ptr;
+  LNext: ptr;
+begin
+  if GFaultEntry = nil then
+    return;
+  end;
+  if not FaultChainLeave(GFaultChain, GFaultEntry) then
+    GFaultEntry := nil;
+    FaultChainSettle(GFaultChain, DoFaultYield);
+    return;
+  end;
+  GFaultEntry := nil;
+  LNow := SetUnhandledExceptionFilter(PlatformFaultFilter(DoFaultBefore()^));
+  if LNow <> FaultChainStub(GFaultChain) then
+    SetUnhandledExceptionFilter(PlatformFaultFilter(LNow));
+    FaultChainSettle(GFaultChain, DoFaultYield);
+    return;
+  end;
+  FaultChainSettle(GFaultChain, DoFaultYield);
+  LPart := ptr(GFaultChain);
+  while LPart <> nil do
+    LNext := ptr to FaultChain(LPart)^.Next;
+    DoFaultChainFree(LPart);
+    LPart := LNext;
+  end;
+end;
+
 public func PlatformDLLEvent(const AModule: ptr; const AReason: int32; const AReserved: ptr): bool;
 begin
   if AReason = DLL_PROCESS_ATTACH then
@@ -873,10 +997,7 @@ begin
     // what the handlers printed goes out now: at the process's end its exit flushed stdout
     // before the unload, and nothing flushes it after
     PlatformFlush();
-    if GDLLFilterSet then
-      SetUnhandledExceptionFilter(PlatformFaultFilter(GDLLFilterBefore));
-      GDLLFilterSet := false;
-    end;
+    DoFaultLeave();
   end;
   return false;
 end;
@@ -1637,6 +1758,24 @@ const
 public func PlatformExecAlloc(const ASize: int64): ptr;
 begin
   return VirtualAlloc(nil, uint64(ASize), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+end;
+
+// kernel32: memory VirtualAlloc gave, given back whole (MEM_RELEASE: size 0)
+func VirtualFree(const AAddress: ptr; const ASize: uint64; const AType: uint32): int32;
+  external "kernel32";
+
+const
+  // VirtualFree's type (winnt.h)
+  MEM_RELEASE: uint32 = 0x8000;
+
+func DoFaultChainMap(): ptr;
+begin
+  return PlatformExecAlloc(int64(ADAM_FAULT_CHAIN_SIZE));
+end;
+
+func DoFaultChainFree(const AMap: ptr);
+begin
+  VirtualFree(AMap, 0, MEM_RELEASE);
 end;
 
 // The processors this process may run on, every group's (a for parallel's workers when it
@@ -3156,8 +3295,10 @@ end;
 // value of the failure, nothing installed: EINVAL (nil or empty AName, nil AReplacement),
 // EEXIST (AState is set, or AName is hooked already), ENOENT (no loaded module imports or
 // exports AName), EACCES (a slot could not be written: every slot written is put back),
-// ENOMEM. Installs and uninstalls run one at a time.
-public func PlatformHookInstall(const AName: ptr to const char; const AReplacement: ptr;
+// ENOMEM. Installs and uninstalls run one at a time. AName is a literal parameter (LX4f2,
+// a constant on every target: the linux exe's link makes a stub per name; win64's import
+// tables need none)
+public func PlatformHookInstall(literal AName: ptr to const char; const AReplacement: ptr;
   var AOriginal: ptr; var AState: ptr): int32;
 var
   LOriginal: uint64;
