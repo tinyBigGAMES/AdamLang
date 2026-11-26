@@ -29,7 +29,10 @@
   writes win64's x64 unwind data into adam_xdata / adam_pdata, and DoWalk
   reads it, searching the frames' scopes, then unwinding them to the catch
   (DoDispatch, PlatformFrameHandler); a C frame between unwinds by its
-  .eh_frame CFI. Threads are pthreads (a thread's end runs from a thread
+  .eh_frame CFI. A hardware fault (SIGSEGV / SIGBUS / SIGFPE / SIGILL, a
+  stack overflow) is taken by a signal handler on the thread's alternate
+  signal stack, which returns to the fault's dispatch from the faulting
+  frame (plan H2). Threads are pthreads (a thread's end runs from a thread
   key's destructor), their waits futexes. Coroutines run on mmap'd stacks
   with a guard page. The
   registers the unwinder starts from, its jump to a catch and a coroutine
@@ -301,8 +304,8 @@ var
   // System.Runtime's thread end (PlatformAtThreadEnd), run on each thread but the main one
   // as it ends (PlatformThreadCallback); nil until then
   GThreadEnd: func();
-  // System.Runtime's report of a hardware fault no guard took (PlatformAtFault); nil until
-  // then (the signal handlers that call it are LX4c's)
+  // System.Runtime's report of a hardware fault no guard took (PlatformAtFault: it never
+  // returns); nil until then
   GFaultHandler: func(const AKind: int32);
   // A .so's runtime (LX6b): true once its load began; an exe's is always false
   GDLLMode: bool;
@@ -444,29 +447,33 @@ type
   end;
   // The exception being dispatched (the filters' pointers' first word points at it, as
   // an EXCEPTION_RECORD's first DWORD is its code): ADAM_PLATFORM_RAISE_CODE,
-  // ADAM_PLATFORM_ABORT_CODE or ADAM_PLATFORM_FAULT_CODE (LX4c, its Kind an
+  // ADAM_PLATFORM_ABORT_CODE or ADAM_PLATFORM_FAULT_CODE (its Kind an
   // ADAM_PLATFORM_FAULT_*)
   PlatformException = record
     Code: uint32;
     Kind: int32;
   end;
   // A finally funclet's run (PlatformFrameHandler, unwinding): the frame it belongs to as
-  // it was before the unwind left it, the scope after its own, the run around it (nil: the
-  // thread's first). A raise out of the funclet meets the handler's frame and goes on from
-  // that frame at that scope (Windows' collided unwind): the frames between, partly
-  // unwound already, are not walked a second time
+  // it was before the unwind left it (PcReturn: its pc a return address; false for a
+  // faulting frame's), the scope after its own, the run around it (nil: the thread's
+  // first). A raise out of the funclet meets the handler's frame and goes on from that
+  // frame at that scope (Windows' collided unwind): the frames between, partly unwound
+  // already, are not walked a second time
   PlatformFinallyRun = record
     Regs: PlatformRegisters;
+    PcReturn: bool;
     ScopeNext: int64;
     Outer: ptr to PlatformFinallyRun;
   end;
   // What the walk (DoWalk) hands a frame's handler (PlatformFrameHandler's ADispatch): the
   // frame's scope table (its count, then 16 bytes per scope), the first scope to look at,
-  // the phase; unwinding: the catching frame is this one (IsTarget) and its catch's
-  // address (TargetPc); searching: the catch the handler found (Found)
+  // whether the frame's pc is a return address (false: a faulting frame's), the phase;
+  // unwinding: the catching frame is this one (IsTarget) and its catch's address
+  // (TargetPc); searching: the catch the handler found (Found)
   PlatformDispatch = record
     Scopes: uint64;
     ScopeFirst: int64;
+    PcReturn: bool;
     Unwinding: bool;
     IsTarget: bool;
     TargetPc: uint64;
@@ -481,7 +488,7 @@ type
 
 const
   // Exception codes of a dispatch (System.Runtime.Win64's values, so a code reads the same
-  // on both targets): the runtime's raise, a generator's abort, a hardware fault (LX4c)
+  // on both targets): the runtime's raise, a generator's abort, a hardware fault
   ADAM_PLATFORM_RAISE_CODE: uint32 = 0xE0414441;
   ADAM_PLATFORM_ABORT_CODE: uint32 = 0xE0414442;
   ADAM_PLATFORM_FAULT_CODE: uint32 = 0xE0414443;
@@ -520,6 +527,14 @@ threadstatic
   // The hardware fault kind (ADAM_PLATFORM_FAULT_*) a guard's filter took on this thread
   // (PlatformCatch), waiting for that guard's except part (PlatformFaultTaken); 0 when none
   GFaultPending: int32;
+  // A hardware fault the signal handler took on this thread (DoFaultSignal), waiting for
+  // its dispatch (DoFaultRaise, where the handler returns to): the faulting frame's
+  // registers and its kind (ADAM_PLATFORM_FAULT_*)
+  GFaultStart: PlatformRegisters;
+  GFaultKind: int32;
+  // True while a dispatch searches the frames (DoTryDispatch): a fault then is the
+  // unwinder's own, reported as one no guard took
+  GFaultSearching: bool;
 
 type
   // What a thread PlatformThreadStart made runs first (System.Runtime's ThreadRun), given
@@ -779,7 +794,7 @@ end;
 // before it: the function is looked up there, past a call that ends its function); false
 // when its unwind data is beyond this unwinder (chained info, an unknown code). The codes
 // run last prologue step first; one whose prologue offset is past APc's has not run yet
-// (a fault inside a prologue, LX4c). Without Adam unwind data AFacts are a bare leaf's
+// (a fault inside a prologue). Without Adam unwind data AFacts are a bare leaf's
 // (its return address at its rsp) with no Entry
 func DoFrameFacts(const APc: uint64; const AReturn: bool; var AFacts: PlatformFrameFacts): bool;
 var
@@ -1364,11 +1379,12 @@ end;
 
 // ARegs unwound out of a foreign frame (code with no Adam unwind data: a C library's,
 // glibc's) by its .eh_frame CFI: the object holding the pc (dl_iterate_phdr), its FDE
-// (.eh_frame_hdr's table), the CIE's and FDE's instructions run up to the call (the return
-// address less 1), then the CFA and every saved register read back. False when there is no
-// FDE for it or its CFI is beyond this reader (a 64-bit record, an augmentation it does not
-// know, an expression); a C frame has no scopes to run
-func DoForeignUnwind(var ARegs: PlatformRegisters): bool;
+// (.eh_frame_hdr's table), the CIE's and FDE's instructions run up to the call (AReturn:
+// the pc is a return address, so the return address less 1; else the pc of a faulting
+// instruction, as it is), then the CFA and every saved register read back. False when there
+// is no FDE for it or its CFI is beyond this reader (a 64-bit record, an augmentation it
+// does not know, an expression); a C frame has no scopes to run
+func DoForeignUnwind(var ARegs: PlatformRegisters; const AReturn: bool): bool;
 var
   LSearch: PlatformObjectSearch;
   LFde: uint64;
@@ -1391,7 +1407,10 @@ var
   LLetter: uint64;
   LI: int64;
 begin
-  LPc := ARegs.Pc - 1;
+  LPc := ARegs.Pc;
+  if AReturn then
+    LPc := ARegs.Pc - 1;
+  end;
   LSearch.Pc := LPc;
   LSearch.Header := 0;
   dl_iterate_phdr(DoPhdrVisit, ptr(addr of LSearch));
@@ -1567,6 +1586,7 @@ begin
         if LDispatch^.Unwinding then
           // a finally: a raise out of it goes on from this frame past this scope
           LRun.Regs := LRegs^;
+          LRun.PcReturn := LDispatch^.PcReturn;
           LRun.ScopeNext := LI + 1;
           LRun.Outer := GFinallyRuns;
           GFinallyRuns := addr of LRun;
@@ -1589,9 +1609,12 @@ end;
 // frame's registers loaded: DoResumeAt). A frame of a handler running a finally
 // (GFinallyRuns: a raise out of that funclet) is passed over to the frame the funclet
 // belongs to, at the scope after it; a foreign frame unwinds by its .eh_frame
-// (DoForeignUnwind). False (searching): no frame catches it
+// (DoForeignUnwind). AFault: AStart is a faulting frame (LX4c), its pc the instruction
+// that faulted, not a return address (every frame after it is a caller's); with no unwind
+// data of any kind it is a bare leaf's (its return address at its rsp), as Windows unwinds
+// a frame no function entry describes. False (searching): no frame catches it
 func DoWalk(const AStart: PlatformRegisters; const APointers: ptr;
-  const AUnwinding: bool; var ADepth: int64;
+  const AUnwinding: bool; const AFault: bool; var ADepth: int64;
   var AFrame: uint64; var ATarget: uint64): bool;
 var
   LRegs: PlatformRegisters;
@@ -1604,25 +1627,32 @@ var
   LDepth: int64;
   LResult: int32;
   LSelf: PlatformHandlerRoutine;
+  LReturn: bool;
 begin
   LSelf := PlatformFrameHandler;
   LRegs := AStart;
   LCursor := GFinallyRuns;
   LDispatch.ScopeFirst := 0;
   LDepth := 0;
+  LReturn := not AFault;
   while true do
-    if not DoFrameFacts(LRegs.Pc, true, LFacts) then
+    if not DoFrameFacts(LRegs.Pc, LReturn, LFacts) then
       DoNoCatch(ptr to const char("unwind data the unwinder cannot read"));
     end;
     if LFacts.Entry = nil then
       // a foreign frame (a C library's, glibc's: a callback's caller) has no scopes: its
       // .eh_frame unwinds it
-      if not DoForeignUnwind(LRegs) then
-        if AUnwinding then
-          DoNoCatch(ptr to const char("a frame no unwind data describes, while unwinding"));
+      if not DoForeignUnwind(LRegs, LReturn) then
+        if LReturn then
+          if AUnwinding then
+            DoNoCatch(ptr to const char("a frame no unwind data describes, while unwinding"));
+          end;
+          return false;
         end;
-        return false;
+        // the faulting frame with no unwind data at all: a bare leaf (AFacts say so)
+        DoUnwindFrame(LRegs, LFacts);
       end;
+      LReturn := true;
       LDispatch.ScopeFirst := 0;
       LDepth := LDepth + 1;
       if LRegs.Pc = 0 then
@@ -1638,11 +1668,13 @@ begin
       // a handler running a finally: on from the funclet's own frame, past its scope
       LRegs := LCursor^.Regs;
       LDispatch.ScopeFirst := LCursor^.ScopeNext;
+      LReturn := LCursor^.PcReturn;
       LCursor := LCursor^.Outer;
     else
       LBase := DoFrameBase(LRegs, LFacts);
       if LData <> 0 then
         LDispatch.Scopes := LData + 4;
+        LDispatch.PcReturn := LReturn;
         LDispatch.Unwinding := AUnwinding;
         LDispatch.IsTarget := AUnwinding and (LDepth = ADepth) and (LBase = AFrame);
         LDispatch.TargetPc := ATarget;
@@ -1662,6 +1694,7 @@ begin
         DoResumeAt(ptr(addr of LRegs), ATarget);
       end;
       DoUnwindFrame(LRegs, LFacts);
+      LReturn := true;
       LDispatch.ScopeFirst := 0;
       LDepth := LDepth + 1;
       if LRegs.Pc = 0 then
@@ -1674,10 +1707,13 @@ begin
   end;
 end;
 
-// The exception ACode (AKind: a fault's kind) dispatched from the caller's frame on: the
-// frames are searched for a catching scope, then unwound to it, where the code resumes;
-// it never returns
-func DoDispatch(const ACode: uint32; const AKind: int32); noreturn;
+// The exception ACode (AKind: a fault's kind) dispatched from the frame AStart describes
+// (AFault: a faulting frame, its pc the instruction that faulted): the frames are searched
+// for a catching scope, then unwound to it, where the code resumes (never returning). It
+// returns when no frame catches it, nothing unwound. While it searches a fault is the
+// unwinder's own (GFaultSearching: the signal handler reports it as no guard took it)
+func DoTryDispatch(const AStart: PlatformRegisters; const ACode: uint32; const AKind: int32;
+  const AFault: bool);
 var
   LRecord: PlatformException;
   LPointers: array[0..1] of ptr;
@@ -1685,21 +1721,36 @@ var
   LDepth: int64;
   LFrame: uint64;
   LTarget: uint64;
+  LFound: bool;
 begin
   LRecord.Code := ACode;
   LRecord.Kind := AKind;
-  memset(ptr(addr of LStart), 0, uint64(size(PlatformRegisters)));
-  DoSaveRegisters(ptr(addr of LStart));
+  LStart := AStart;
   LPointers[0] := ptr(addr of LRecord);
   LPointers[1] := ptr(addr of LStart);
   LDepth := -1;
   LFrame := 0;
   LTarget := 0;
-  if not DoWalk(LStart, ptr(addr of LPointers), false, LDepth, LFrame, LTarget) then
-    DoNoCatch(ptr to const char("no catching scope, or a frame no unwind data describes"));
+  GFaultSearching := true;
+  LFound := DoWalk(LStart, ptr(addr of LPointers), false, AFault, LDepth, LFrame, LTarget);
+  GFaultSearching := false;
+  if not LFound then
+    return;
   end;
-  DoWalk(LStart, ptr(addr of LPointers), true, LDepth, LFrame, LTarget);
+  DoWalk(LStart, ptr(addr of LPointers), true, AFault, LDepth, LFrame, LTarget);
   DoNoCatch(ptr to const char("the catching frame was not met again"));
+end;
+
+// The exception ACode (AKind: a fault's kind) dispatched from the caller's frame on
+// (DoTryDispatch); it never returns
+func DoDispatch(const ACode: uint32; const AKind: int32); noreturn;
+var
+  LStart: PlatformRegisters;
+begin
+  memset(ptr(addr of LStart), 0, uint64(size(PlatformRegisters)));
+  DoSaveRegisters(ptr(addr of LStart));
+  DoTryDispatch(LStart, ACode, AKind, false);
+  DoNoCatch(ptr to const char("no catching scope, or a frame no unwind data describes"));
 end;
 
 // Raises the runtime's exception (ADAM_PLATFORM_RAISE_CODE): the unwinder walks the frames
@@ -1775,8 +1826,9 @@ begin
 end;
 
 // A guard's except part's start (System.Runtime's RaiseTaken): the hardware fault kind
-// its filter took (PlatformCatch), 0 when it took a raise (a caught stack overflow's
-// guard page is LX4c's)
+// its filter took (PlatformCatch), 0 when it took a raise. A caught stack overflow needs
+// nothing made again: the stack's guard (the kernel's gap below a main thread's stack,
+// pthread's guard page, a coroutine's) stays, so the next overflow faults the same way
 public func PlatformFaultTaken(): int32;
 var
   LKind: int32;
@@ -1784,14 +1836,6 @@ begin
   LKind := GFaultPending;
   GFaultPending := 0;
   return LKind;
-end;
-
-// AHandler called with the fault kind (ADAM_PLATFORM_FAULT_*) of a hardware fault no guard
-// took, on the faulting thread with nothing unwound; it reports the fault and ends the
-// process, never returning. Kept here; the signal handlers that call it are LX4c's
-public func PlatformAtFault(const AHandler: func(const AKind: int32));
-begin
-  GFaultHandler := AHandler;
 end;
 
 // Writes the ACount bytes at AText to stderr in one system call, no stdio (its lock may be
@@ -1860,6 +1904,11 @@ begin
   GThreadEnd := AHandler;
 end;
 
+// The calling thread's fault state made ready and given back (the hardware faults'
+// section below: DoFaultThreadReady, DoFaultThreadEnd)
+forward func DoFaultThreadReady();
+forward func DoFaultThreadEnd();
+
 // A thread's end handed on (AReason ADAM_PLATFORM_THREAD_END; the other reasons ask
 // nothing): the registered thread end (PlatformAtThreadEnd) runs once per thread. Its
 // caller on this target is the thread key's destructor LX4d registers
@@ -1877,6 +1926,7 @@ begin
     LEnd();
   end;
   DoCoroutineThreadEnd();
+  DoFaultThreadEnd();
 end;
 
 // The base (the high end) of the stack the calling code runs on: the thread's own
@@ -2087,7 +2137,8 @@ end;
 // The OS's start of a thread PlatformThreadStart made (pthread_create's start routine):
 // AParameter is its two-word block from the C heap (the run routine, then its block), freed
 // here before the run routine is called on this thread; the thread key marked first, so the
-// thread's end (DoThreadKeyEnd) runs however the thread ends; the thread's result is nil
+// thread's end (DoThreadKeyEnd) runs however the thread ends, then its fault state made
+// ready (DoFaultThreadReady: a stack overflow is caught on it too); the thread's result is nil
 func DoThreadProc(AParameter: ptr): ptr;
 var
   LSlots: ptr to ptr;
@@ -2099,6 +2150,7 @@ begin
   LBlock := LSlots[1];
   free(AParameter);
   pthread_setspecific(GThreadKey, ptr(ADAM_PLATFORM_THREAD_MARK));
+  DoFaultThreadReady();
   LRun(LBlock);
   return nil;
 end;
@@ -2351,6 +2403,512 @@ begin
     munmap(LCoroutine^.Map, LCoroutine^.MapSize);
   end;
   free(ACoroutine);
+end;
+
+// ---- Hardware faults (plan H2): SIGSEGV / SIGBUS / SIGFPE / SIGILL and stack overflow
+
+// glibc: a signal's action, the thread's alternate signal stack, a signal sent to a thread
+func sigaction(const ASignal: int32; const AAction: ptr; const AOld: ptr): int32; external "c";
+func sigaltstack(const AStack: ptr; const AOld: ptr): int32; external "c";
+func pthread_kill(const AThread: uint64; const ASignal: int32): int32; external "c";
+
+type
+  // struct sigaction (x86_64 glibc, 152 bytes): its tag shares sigaction's name, so the
+  // record is the runtime's; its fields keep the header's names (the handler's union as
+  // sa_sigaction, the int's padding as pad0)
+  PlatformSigaction = record
+    sa_sigaction: ptr;
+    sa_mask: array[0..15] of uint64;
+    sa_flags: int32;
+    pad0: int32;
+    sa_restorer: ptr;
+  end;
+  // stack_t (x86_64, 24 bytes): an alternate signal stack
+  stack_t = record
+    ss_sp: ptr;
+    ss_flags: int32;
+    pad0: int32;
+    ss_size: uint64;
+  end;
+  // A signal handler as SA_SIGINFO calls it: the signal, its siginfo_t, its ucontext_t
+  PlatformSignalHandler = func(ASignal: int32; AInfo: ptr; AContext: ptr);
+
+const
+  // signal.h (x86_64): the hardware fault signals, sigaction's flags, sigaltstack's off
+  SIGILL: int32 = 4;
+  SIGBUS: int32 = 7;
+  SIGFPE: int32 = 8;
+  SIGSEGV: int32 = 11;
+  SA_SIGINFO: int32 = 4;
+  SA_ONSTACK: int32 = 0x08000000;
+  SS_DISABLE: int32 = 2;
+  // siginfo_t's si_code of a SIGFPE: integer divide (by zero, or a quotient past its
+  // width: x86's #DE gives both), integer overflow, float divide by zero, overflow, underflow
+  FPE_INTDIV: int32 = 1;
+  FPE_INTOVF: int32 = 2;
+  FPE_FLTDIV: int32 = 3;
+  FPE_FLTOVF: int32 = 4;
+  FPE_FLTUND: int32 = 5;
+  // sys/ucontext.h (x86_64): gregs' indices of rsp and rip
+  REG_RSP: int64 = 15;
+  REG_RIP: int64 = 16;
+  // sys/mman.h: no swap space reserved for a mapping
+  MAP_NORESERVE: int32 = 0x4000;
+  // The signals the fault handler takes, in GFaultBefore's order
+  ADAM_PLATFORM_FAULT_SIGNALS: array[0..3] of int32 = [11, 7, 8, 4];
+  ADAM_PLATFORM_FAULT_SIGNAL_COUNT: int64 = 4;
+  // gregs' index of each register by its unwind number (PlatformRegisters' order: rax rcx
+  // rdx rbx rsp rbp rsi rdi r8 .. r15 are REG_RAX 13, REG_RCX 14, REG_RDX 12, REG_RBX 11,
+  // REG_RSP 15, REG_RBP 10, REG_RSI 9, REG_RDI 8, REG_R8 .. REG_R15 0 .. 7)
+  ADAM_PLATFORM_GREG_OF: array[0..15] of int64 = [13, 14, 12, 11, 15, 10, 9, 8, 0, 1, 2, 3,
+    4, 5, 6, 7];
+  // Byte offsets: siginfo_t's si_code and si_addr, ucontext_t's uc_mcontext.gregs
+  ADAM_PLATFORM_SI_CODE: uint64 = 8;
+  ADAM_PLATFORM_SI_ADDR: uint64 = 16;
+  ADAM_PLATFORM_UC_GREGS: uint64 = 40;
+  // A thread's alternate signal stack: the handler runs there, and so does the dispatch of
+  // a stack overflow (DoFaultSignal: its frames' finally parts with it); virtual memory only
+  // until it is touched (MAP_NORESERVE), a guard page below it
+  ADAM_PLATFORM_SIGNAL_STACK: uint64 = 262144;
+  // The x86_64 ABI's red zone below a frame's rsp, which a leaf may use: the dispatch's
+  // frames start below it
+  ADAM_PLATFORM_RED_ZONE: uint64 = 128;
+  // The stack a fault's dispatch needs left on the faulting stack, or it runs on the
+  // alternate signal stack
+  ADAM_PLATFORM_FAULT_ROOM: uint64 = 65536;
+  // How far below a stack's low end an access fault still counts as running off its end
+  // (a stack overflow): the kernel's guard gap below a main thread's stack (256 pages)
+  ADAM_PLATFORM_STACK_GAP: uint64 = 1048576;
+
+var
+  // True once the fault handler is installed (PlatformAtFault), with the page size it uses
+  // and the actions it replaced, by ADAM_PLATFORM_FAULT_SIGNALS' order (put back for a
+  // signal that is no fault: DoFaultPassOn)
+  GFaultReady: bool;
+  GFaultPage: uint64;
+  GFaultBefore: array[0..3] of PlatformSigaction;
+
+threadstatic
+  // This thread's alternate signal stack (DoFaultThreadReady: GSignalMap the whole
+  // mapping, a guard page at its low end; nil when it has none) and the bounds it runs in;
+  // the thread's own stack's low end (0: unknown, no fault counts as a stack overflow)
+  GSignalMap: ptr;
+  GSignalLow: uint64;
+  GSignalHigh: uint64;
+  GStackLow: uint64;
+
+// The calling thread's fault state made ready (its start's, DoThreadProc; the main
+// thread's at PlatformAtFault): its stack's low end kept, its alternate signal stack mapped
+// and given to the kernel, so a fault is handled even with the thread's stack spent; once
+func DoFaultThreadReady();
+var
+  LLow: uint64;
+  LHigh: uint64;
+  LMap: ptr;
+  LStack: stack_t;
+begin
+  if (not GFaultReady) or (GSignalMap <> nil) then
+    return;
+  end;
+  LLow := 0;
+  LHigh := 0;
+  if DoThreadStack(LLow, LHigh) then
+    GStackLow := LLow;
+  end;
+  LMap := mmap(nil, ADAM_PLATFORM_SIGNAL_STACK + GFaultPage, PROT_READ | PROT_WRITE,
+    MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK | MAP_NORESERVE, -1, 0);
+  if uint64(LMap) = ADAM_PLATFORM_MAP_FAILED then
+    return;
+  end;
+  if mprotect(LMap, GFaultPage, PROT_NONE) <> 0 then
+    munmap(LMap, ADAM_PLATFORM_SIGNAL_STACK + GFaultPage);
+    return;
+  end;
+  LStack.ss_sp := ptr(uint64(LMap) + GFaultPage);
+  LStack.ss_flags := 0;
+  LStack.pad0 := 0;
+  LStack.ss_size := ADAM_PLATFORM_SIGNAL_STACK;
+  if sigaltstack(ptr(addr of LStack), nil) <> 0 then
+    munmap(LMap, ADAM_PLATFORM_SIGNAL_STACK + GFaultPage);
+    return;
+  end;
+  GSignalMap := LMap;
+  GSignalLow := uint64(LMap) + GFaultPage;
+  GSignalHigh := GSignalLow + ADAM_PLATFORM_SIGNAL_STACK;
+end;
+
+// The calling thread's fault state given back as it ends (PlatformThreadCallback): its
+// alternate signal stack taken from the kernel, then unmapped
+func DoFaultThreadEnd();
+var
+  LStack: stack_t;
+begin
+  if GSignalMap = nil then
+    return;
+  end;
+  LStack.ss_sp := nil;
+  LStack.ss_flags := SS_DISABLE;
+  LStack.pad0 := 0;
+  LStack.ss_size := 0;
+  sigaltstack(ptr(addr of LStack), nil);
+  munmap(GSignalMap, ADAM_PLATFORM_SIGNAL_STACK + GFaultPage);
+  GSignalMap := nil;
+  GSignalLow := 0;
+  GSignalHigh := 0;
+end;
+
+// The low end of the stack the faulting code ran on: a coroutine's own (PlatformCoroutineNew's,
+// above its guard page), else the thread's (GStackLow); 0 when unknown
+func DoFaultStackLow(): uint64;
+begin
+  if (GCoroutineCurrent <> nil) and (GCoroutineCurrent^.Map <> nil) then
+    return GCoroutineCurrent^.StackLow;
+  end;
+  return GStackLow;
+end;
+
+// True when an access fault at AAddress with the stack pointer at ARsp ran off the stack's
+// end: rsp below the stack's first page, or the address in that page or the guard gap
+// below it (ADAM_PLATFORM_STACK_GAP)
+func DoIsStackFault(const AAddress: uint64; const ARsp: uint64): bool;
+var
+  LLow: uint64;
+begin
+  LLow := DoFaultStackLow();
+  if LLow = 0 then
+    return false;
+  end;
+  if ARsp < LLow + GFaultPage then
+    return true;
+  end;
+  return (AAddress < LLow + GFaultPage) and (AAddress + ADAM_PLATFORM_STACK_GAP >= LLow);
+end;
+
+// The value of the general register ANumber (an unwind number, 0 .. 15) of ARegs, as the
+// operand an instruction names (its width masked by the caller), AHighByte: ah / ch / dh /
+// bh (a byte operand 4 .. 7 with no REX prefix: bits 8 .. 15 of rax .. rbx)
+func DoRegisterOperand(const ARegs: PlatformRegisters; const ANumber: uint64;
+  const AHighByte: bool): uint64;
+begin
+  if AHighByte then
+    return (ARegs.Regs[ANumber - 4] shr 8) & 0xFF;
+  end;
+  return ARegs.Regs[ANumber];
+end;
+
+// True when AByte is an instruction prefix the divisor's decode passes over (lock, rep,
+// the segment overrides that add nothing in 64-bit mode); the operand size and address size
+// prefixes are read by the decode itself
+func DoIsPassedPrefix(const AByte: uint64): bool;
+begin
+  return (AByte = 0xF0) or (AByte = 0xF2) or (AByte = 0xF3) or (AByte = 0x2E) or
+    (AByte = 0x36) or (AByte = 0x3E) or (AByte = 0x26);
+end;
+
+// The signed value of the AWidth-byte (1 or 4) displacement at AAddress
+func DoDisplacement(const AAddress: uint64; const AWidth: uint64): uint64;
+var
+  LValue: uint64;
+begin
+  if AWidth = 1 then
+    LValue := DoByteAt(AAddress);
+    if LValue >= 0x80 then
+      return LValue | 0xFFFFFFFFFFFFFF00;
+    end;
+    return LValue;
+  end;
+  LValue := DoLongAt(AAddress);
+  if LValue >= 0x80000000 then
+    return LValue | 0xFFFFFFFF00000000;
+  end;
+  return LValue;
+end;
+
+// True when the integer divide that faulted at ARegs.Pc (a SIGFPE FPE_INTDIV: x86's #DE,
+// which the kernel gives for a zero divisor and for a quotient past its width alike) has a
+// zero divisor: its div / idiv (F6 / F7 /6, /7) decoded, the divisor read from its
+// register or memory operand (prefixes, REX, ModRM, SIB, disp8 / disp32, rip-relative).
+// An fs / gs operand or an instruction that is no divide counts as a zero divisor (the
+// kernel's own reading of #DE)
+func DoDivisorZero(const ARegs: PlatformRegisters): bool;
+var
+  LAt: uint64;
+  LByte: uint64;
+  LRex: uint64;
+  LOperand16: bool;
+  LAddress32: bool;
+  LWidth: uint64;
+  LModrm: uint64;
+  LMod: uint64;
+  LRm: uint64;
+  LSib: uint64;
+  LIndex: uint64;
+  LBase: uint64;
+  LAddress: uint64;
+  LDisplacement: uint64;
+  LValue: uint64;
+begin
+  LAt := ARegs.Pc;
+  LOperand16 := false;
+  LAddress32 := false;
+  LByte := DoByteAt(LAt);
+  while DoIsPassedPrefix(LByte) or (LByte = 0x66) or (LByte = 0x67) or (LByte = 0x64) or
+    (LByte = 0x65) do
+    if (LByte = 0x64) or (LByte = 0x65) then
+      return true;
+    end;
+    if LByte = 0x66 then
+      LOperand16 := true;
+    end;
+    if LByte = 0x67 then
+      LAddress32 := true;
+    end;
+    LAt := LAt + 1;
+    LByte := DoByteAt(LAt);
+  end;
+  LRex := 0;
+  if (LByte & 0xF0) = 0x40 then
+    LRex := LByte;
+    LAt := LAt + 1;
+    LByte := DoByteAt(LAt);
+  end;
+  if (LByte <> 0xF6) and (LByte <> 0xF7) then
+    return true;
+  end;
+  // the operand's width: F6 a byte, F7 by REX.W / the operand size prefix
+  LWidth := 4;
+  if LByte = 0xF6 then
+    LWidth := 1;
+  end;
+  if (LByte = 0xF7) and LOperand16 then
+    LWidth := 2;
+  end;
+  if (LByte = 0xF7) and ((LRex & 8) <> 0) then
+    LWidth := 8;
+  end;
+  LModrm := DoByteAt(LAt + 1);
+  LAt := LAt + 2;
+  LMod := LModrm shr 6;
+  LRm := LModrm & 7;
+  if LMod = 3 then
+    // a register divisor (REX.B extends it; a byte one with no REX: ah .. bh for 4 .. 7)
+    LValue := DoRegisterOperand(ARegs, LRm + ((LRex & 1) shl 3),
+      (LWidth = 1) and (LRex = 0) and (LRm >= 4));
+  else
+    // a memory divisor: base + index * scale + displacement, or rip-relative
+    LAddress := 0;
+    LDisplacement := 0;
+    if LRm = 4 then
+      LSib := DoByteAt(LAt);
+      LAt := LAt + 1;
+      LIndex := ((LSib shr 3) & 7) + (((LRex shr 1) & 1) shl 3);
+      LBase := (LSib & 7) + ((LRex & 1) shl 3);
+      // index 4 with no REX.X is none
+      if LIndex <> 4 then
+        LAddress := ARegs.Regs[LIndex] shl (LSib shr 6);
+      end;
+      if ((LSib & 7) = 5) and (LMod = 0) then
+        // no base: a disp32 alone
+        LDisplacement := DoDisplacement(LAt, 4);
+        LAt := LAt + 4;
+      else
+        LAddress := LAddress + ARegs.Regs[LBase];
+      end;
+    else
+      if (LRm = 5) and (LMod = 0) then
+        // rip-relative: the next instruction's address (a div has no immediate) + disp32
+        LDisplacement := DoDisplacement(LAt, 4);
+        LAt := LAt + 4;
+        LAddress := LAt;
+      else
+        LAddress := ARegs.Regs[LRm + ((LRex & 1) shl 3)];
+      end;
+    end;
+    if LMod = 1 then
+      LDisplacement := DoDisplacement(LAt, 1);
+    end;
+    if LMod = 2 then
+      LDisplacement := DoDisplacement(LAt, 4);
+    end;
+    LAddress := LAddress + LDisplacement;
+    if LAddress32 then
+      LAddress := LAddress & 0xFFFFFFFF;
+    end;
+    // the divide read its operand before it faulted: the memory is there
+    LValue := DoWordAt(LAddress);
+  end;
+  if LWidth = 1 then
+    LValue := LValue & 0xFF;
+  end;
+  if LWidth = 2 then
+    LValue := LValue & 0xFFFF;
+  end;
+  if LWidth = 4 then
+    LValue := LValue & 0xFFFFFFFF;
+  end;
+  return LValue = 0;
+end;
+
+// The hardware fault kind (ADAM_PLATFORM_FAULT_*) of the signal ASignal with siginfo_t's
+// si_code ACode and si_addr AAddress, the faulting frame's registers ARegs (System.Runtime.Win64's
+// DoFaultKind's kinds for the same faults)
+func DoSignalKind(const ASignal: int32; const ACode: int32; const AAddress: uint64;
+  const ARegs: PlatformRegisters): int32;
+begin
+  if ASignal = SIGSEGV then
+    if DoIsStackFault(AAddress, ARegs.Regs[ADAM_PLATFORM_UNWIND_RSP]) then
+      return ADAM_PLATFORM_FAULT_STACK;
+    end;
+    return ADAM_PLATFORM_FAULT_ACCESS;
+  end;
+  if ASignal = SIGBUS then
+    return ADAM_PLATFORM_FAULT_BUS;
+  end;
+  if ASignal = SIGILL then
+    return ADAM_PLATFORM_FAULT_INSTRUCTION;
+  end;
+  if ACode = FPE_INTDIV then
+    if DoDivisorZero(ARegs) then
+      return ADAM_PLATFORM_FAULT_DIVIDE;
+    end;
+    return ADAM_PLATFORM_FAULT_OVERFLOW;
+  end;
+  if ACode = FPE_FLTDIV then
+    return ADAM_PLATFORM_FAULT_DIVIDE;
+  end;
+  if (ACode = FPE_INTOVF) or (ACode = FPE_FLTOVF) or (ACode = FPE_FLTUND) then
+    return ADAM_PLATFORM_FAULT_OVERFLOW;
+  end;
+  return ADAM_PLATFORM_FAULT_OTHER;
+end;
+
+// A fault's dispatch, where the signal handler (DoFaultSignal) returned to (the signal's
+// mask given back by the kernel's sigreturn), on the faulting stack below the faulting
+// frame or on the alternate signal stack: the frames from the faulting one are searched and
+// unwound to the guard that takes it (DoTryDispatch, never returning); none takes it: the
+// fault handler (PlatformAtFault) reports it with nothing unwound and ends the process
+func DoFaultRaise();
+var
+  LStart: PlatformRegisters;
+  LKind: int32;
+  LHandler: func(const AKind: int32);
+begin
+  LStart := GFaultStart;
+  LKind := GFaultKind;
+  DoTryDispatch(LStart, ADAM_PLATFORM_FAULT_CODE, LKind, true);
+  LHandler := GFaultHandler;
+  if ptr(LHandler) <> nil then
+    LHandler(LKind);
+  end;
+  DoNoCatch(ptr to const char("a hardware fault no guard takes"));
+end;
+
+// A signal of ADAM_PLATFORM_FAULT_SIGNALS that is no hardware fault (sent by kill /
+// tgkill / sigqueue: si_code 0 or below): the action the fault handler replaced is put back
+// and the signal sent to this thread again, pending until the handler returns (the signal
+// is blocked in it), then taken as it would have been
+func DoFaultPassOn(const ASignal: int32);
+var
+  LI: int64;
+begin
+  for LI := 0 to ADAM_PLATFORM_FAULT_SIGNAL_COUNT - 1 do
+    if ADAM_PLATFORM_FAULT_SIGNALS[LI] = ASignal then
+      sigaction(ASignal, ptr(addr of GFaultBefore[LI]), nil);
+    end;
+  end;
+  pthread_kill(pthread_self(), ASignal);
+end;
+
+// The fault handler (SA_SIGINFO | SA_ONSTACK: on the thread's alternate signal stack): the
+// faulting frame's registers (the ucontext's gregs) and the fault's kind kept for its
+// dispatch (GFaultStart, GFaultKind), then the ucontext's rip set to DoFaultRaise and its
+// rsp below the faulting frame (past the red zone), or at the alternate signal stack's top
+// for a stack overflow or a stack with too little left (not when the fault ran on the
+// alternate stack already: a fault in an overflow's dispatch goes on below it); a nil
+// return address above, the walk's start being the kept registers. The dispatch then runs
+// as ordinary code once the handler returns, so no handler frame lies between it and the
+// faulting frame. A fault while a dispatch searches (the unwinder's own) is reported at
+// once, as one no guard took
+func DoFaultSignal(ASignal: int32; AInfo: ptr; AContext: ptr);
+var
+  LCode: int32;
+  LAddress: uint64;
+  LGregs: ptr to uint64;
+  LKind: int32;
+  LRsp: uint64;
+  LTop: uint64;
+  LLow: uint64;
+  LOnSignalStack: bool;
+  LHandler: func(const AKind: int32);
+  LRaise: func();
+  LSlot: ptr to uint64;
+  LI: int64;
+begin
+  LCode := (ptr to int32(uint64(AInfo) + ADAM_PLATFORM_SI_CODE))^;
+  if LCode <= 0 then
+    DoFaultPassOn(ASignal);
+    return;
+  end;
+  LAddress := (ptr to uint64(uint64(AInfo) + ADAM_PLATFORM_SI_ADDR))^;
+  LGregs := ptr to uint64(uint64(AContext) + ADAM_PLATFORM_UC_GREGS);
+  for LI := 0 to 15 do
+    GFaultStart.Regs[LI] := LGregs[ADAM_PLATFORM_GREG_OF[LI]];
+  end;
+  GFaultStart.Pc := LGregs[REG_RIP];
+  LKind := DoSignalKind(ASignal, LCode, LAddress, GFaultStart);
+  if GFaultSearching then
+    LHandler := GFaultHandler;
+    LHandler(LKind);
+  end;
+  GFaultKind := LKind;
+  LRsp := GFaultStart.Regs[ADAM_PLATFORM_UNWIND_RSP];
+  LOnSignalStack := (LRsp >= GSignalLow) and (LRsp < GSignalHigh);
+  LTop := LRsp - ADAM_PLATFORM_RED_ZONE;
+  if (GSignalMap <> nil) and not LOnSignalStack then
+    LLow := DoFaultStackLow();
+    if (LKind = ADAM_PLATFORM_FAULT_STACK) or
+      ((LLow <> 0) and (LTop < LLow + ADAM_PLATFORM_FAULT_ROOM)) then
+      LTop := GSignalHigh;
+    end;
+  end;
+  // as at a function's entry: rsp 8 past a 16-byte boundary, the return address slot
+  LTop := (LTop & 0xFFFFFFFFFFFFFFF0) - 8;
+  LSlot := ptr to uint64(LTop);
+  LSlot[0] := 0;
+  LRaise := DoFaultRaise;
+  LGregs[REG_RSP] := LTop;
+  LGregs[REG_RIP] := uint64(ptr(LRaise));
+end;
+
+// AHandler called with the fault kind (ADAM_PLATFORM_FAULT_*) of a hardware fault no guard
+// took, on the faulting thread with nothing unwound (DoFaultRaise); it reports the fault and
+// ends the process, never returning. The fault handler (DoFaultSignal) installed for SIGSEGV,
+// SIGBUS, SIGFPE and SIGILL and the main thread's fault state made ready (a thread
+// PlatformThreadStart makes gets its own at its start)
+public func PlatformAtFault(const AHandler: func(const AKind: int32));
+var
+  LAction: PlatformSigaction;
+  LSignal: PlatformSignalHandler;
+  LI: int64;
+begin
+  GFaultHandler := AHandler;
+  if GFaultReady then
+    return;
+  end;
+  GFaultPage := ADAM_PLATFORM_PAGE_DEFAULT;
+  if sysconf(_SC_PAGESIZE) > 0 then
+    GFaultPage := uint64(sysconf(_SC_PAGESIZE));
+  end;
+  GFaultReady := true;
+  DoFaultThreadReady();
+  memset(ptr(addr of LAction), 0, uint64(size(PlatformSigaction)));
+  LSignal := DoFaultSignal;
+  LAction.sa_sigaction := ptr(LSignal);
+  LAction.sa_flags := SA_SIGINFO | SA_ONSTACK;
+  for LI := 0 to ADAM_PLATFORM_FAULT_SIGNAL_COUNT - 1 do
+    sigaction(ADAM_PLATFORM_FAULT_SIGNALS[LI], ptr(addr of LAction),
+      ptr(addr of GFaultBefore[LI]));
+  end;
 end;
 
 // ASize bytes of zeroed memory that may be written and run (System.Runtime's C callback
