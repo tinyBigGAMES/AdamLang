@@ -1,0 +1,296 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  std_hookabi_rt_linux.adam - System.HookABI's run-time level on
+  x86_64-linux-gnu (PLAN-LINUX64 LX4f: GOT slot patching, std_hookabi_rt's
+  linux twin): a replacement of glibc's getenv answers "hooked" for
+  STD_HOOKABI_RT and passes every other name to the record's Original (the
+  program's own getenv slot); a counting replacement of strlen shows whether
+  a library's own strlen slot is hooked: glibc's libresolv.so.2, loaded by
+  dlopen, whose __dn_count_labels calls strlen through its slot.
+
+  Covered: the refusals (nil name, empty name, nil replacement, a name no
+  object defines, the same record twice, a second record for the same name,
+  uninstalling what is not installed); an install while the library is
+  loaded and closed around it (dlclose drops its slots, nothing is written
+  into the gone object); an install before the library loads (dlopen patches
+  it as it returns), the program's own getenv hooked, then uninstalled, both
+  real again; and an install after the load.
+
+  Each row prints ok or FAIL with its name; the last is `done <failures>`.
+*******************************************************************************/
+
+/*
+@@test
+  kind run
+  targets x86_64-linux-gnu
+  exitcode 0
+  | ok set real
+  | ok refuse nil name
+  | ok refuse empty name
+  | ok refuse nil replacement
+  | ok refuse unknown name
+  | ok refuse uninstall not installed
+  | ok install for twice
+  | ok refuse same record twice
+  | ok refuse second record same name
+  | ok uninstall for twice
+  | ok unloaded install
+  | ok unloaded library call hooked
+  | ok unloaded close
+  | ok unloaded uninstall
+  | ok unloaded reload real
+  | ok unloaded reload close
+  | ok before install
+  | ok before own call hooked
+  | ok before strlen install
+  | ok before load
+  | ok before library call hooked
+  | ok before uninstall
+  | ok before strlen uninstall
+  | ok before library call real
+  | ok before own call real
+  | ok before uninstall twice refused
+  | ok before close
+  | ok after load
+  | ok after library call real first
+  | ok after install
+  | ok after library call hooked
+  | ok after uninstall
+  | ok after library call real
+  | ok after close
+  | done 0
+  | [Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+@@end
+*/
+
+@ifndef TARGET_X86_64_LINUX_GNU
+@message error "std_hookabi_rt_linux runs on x86_64-linux-gnu only (win64: std_hookabi_rt)";
+@endif
+
+module exe std_hookabi_rt_linux;
+
+import System.HookABI;
+
+type
+  // getenv's and strlen's C signatures, and the library's label counter
+  GetenvFn = func(const AName: ptr to const char): ptr to const char;
+  StrlenFn = func(const AText: ptr to const char): uint64;
+  CountFn = func(const AName: ptr to const char): int32;
+
+// glibc: the environment read and set, a library opened, an export found, a library closed
+func getenv(const AName: ptr to const char): ptr to const char; external "c";
+func setenv(const AName: ptr to const char; const AValue: ptr to const char;
+  const AReplace: int32): int32; external "c";
+func strcmp(const ALeft: ptr to const char; const ARight: ptr to const char): int32;
+  external "c";
+func dlopen(const AFile: ptr to const char; const AMode: int32): ptr; external "c";
+func dlsym(const AHandle: ptr; const AName: ptr to const char): ptr; external "c";
+func dlclose(const AHandle: ptr): int32; external "c";
+
+const
+  // dlfcn.h: every symbol bound at the load
+  RTLD_NOW: int32 = 2;
+
+var
+  // The real getenv / strlen the replacements call (the records' Original), the strlen
+  // calls the counting replacement saw, and the failures seen
+  GOriginal: ptr;
+  GStrlenOriginal: ptr;
+  GReplacement: GetenvFn;
+  GStrlenReplacement: StrlenFn;
+  GStrlenCalls: int64;
+  GFails: int64;
+
+// The replacement: "hooked" for STD_HOOKABI_RT, else the real getenv (never getenv itself,
+// which would reach the replacement again)
+func HookGetenv(const AName: ptr to const char): ptr to const char;
+var
+  LReal: GetenvFn;
+begin
+  if (AName <> nil) and (strcmp(AName, ptr to const char("STD_HOOKABI_RT")) = 0) then
+    return ptr to const char("hooked");
+  end;
+  if GOriginal = nil then
+    return nil;
+  end;
+  LReal := GetenvFn(GOriginal);
+  return LReal(AName);
+end;
+
+// The counting replacement of strlen: a call counted, the real strlen's answer
+func HookStrlen(const AText: ptr to const char): uint64;
+var
+  LReal: StrlenFn;
+begin
+  GStrlenCalls := GStrlenCalls + 1;
+  LReal := StrlenFn(GStrlenOriginal);
+  return LReal(AText);
+end;
+
+// ALabel printed as ok or FAIL (a failure counted)
+func Check(const AName: string; const AOk: bool);
+begin
+  if AOk then
+    println("ok {}", AName);
+  else
+    println("FAIL {}", AName);
+    GFails := GFails + 1;
+  end;
+end;
+
+// True when the C string AValue equals AWant (never nil)
+func EnvEquals(const AValue: ptr to const char; const AWant: ptr to const char): bool;
+begin
+  return (AValue <> nil) and (strcmp(AValue, AWant) = 0);
+end;
+
+// The program's own getenv of STD_HOOKABI_RT
+func OwnEnv(): ptr to const char;
+begin
+  return getenv(ptr to const char("STD_HOOKABI_RT"));
+end;
+
+// glibc's libresolv opened (nil when it cannot be)
+func LoadLib(): ptr;
+begin
+  return dlopen(ptr to const char("libresolv.so.2"), RTLD_NOW);
+end;
+
+// True when the library AHandle's __dn_count_labels counts 3 labels in "a.b.c" and its
+// strlen went through the counting replacement (AHooked) or not
+func CallLib(const AHandle: ptr; const AHooked: bool): bool;
+var
+  LCount: CountFn;
+  LProc: ptr;
+  LBefore: int64;
+  LLabels: int32;
+begin
+  if AHandle = nil then
+    return false;
+  end;
+  LProc := dlsym(AHandle, ptr to const char("__dn_count_labels"));
+  if LProc = nil then
+    return false;
+  end;
+  LCount := CountFn(LProc);
+  LBefore := GStrlenCalls;
+  LLabels := LCount(ptr to const char("a.b.c"));
+  return (LLabels = 3) and ((GStrlenCalls > LBefore) = AHooked);
+end;
+
+// Every refusal: nothing is installed by any of them
+func TestRefused();
+var
+  LHook: Hook;
+  LOther: Hook;
+begin
+  Check("refuse nil name", (not HookInstall(LHook, nil, ptr(GReplacement))) and
+    (HookErrno() = ADAM_HOOK_EINVAL) and (LHook.State = nil));
+  Check("refuse empty name", (not HookInstall(LHook, ptr to const char(""),
+    ptr(GReplacement))) and (HookErrno() = ADAM_HOOK_EINVAL));
+  Check("refuse nil replacement", (not HookInstall(LHook, ptr to const char("getenv"),
+    nil)) and (HookErrno() = ADAM_HOOK_EINVAL));
+  Check("refuse unknown name", (not HookInstall(LHook,
+    ptr to const char("adam_no_such_function"), ptr(GReplacement))) and
+    (HookErrno() = ADAM_HOOK_ENOENT) and (LHook.State = nil));
+  Check("refuse uninstall not installed", (not HookUninstall(LHook)) and
+    (HookErrno() = ADAM_HOOK_EINVAL));
+
+  Check("install for twice", HookInstall(LHook, ptr to const char("getenv"),
+    ptr(GReplacement)));
+  Check("refuse same record twice", (not HookInstall(LHook, ptr to const char("getenv"),
+    ptr(GReplacement))) and (HookErrno() = ADAM_HOOK_EEXIST));
+  Check("refuse second record same name", (not HookInstall(LOther,
+    ptr to const char("getenv"), ptr(GReplacement))) and
+    (HookErrno() = ADAM_HOOK_EEXIST) and (LOther.State = nil));
+  Check("uninstall for twice", HookUninstall(LHook) and (LHook.State = nil));
+end;
+
+// The library closes while installed: the uninstall writes nothing into it
+func TestUnloaded();
+var
+  LHook: Hook;
+  LLibrary: ptr;
+begin
+  LLibrary := LoadLib();
+  Check("unloaded install", (LLibrary <> nil) and
+    HookInstall(LHook, ptr to const char("strlen"), ptr(GStrlenReplacement)));
+  GStrlenOriginal := LHook.Original;
+  Check("unloaded library call hooked", CallLib(LLibrary, true));
+  Check("unloaded close", dlclose(LLibrary) = 0);
+  Check("unloaded uninstall", HookUninstall(LHook) and (LHook.State = nil));
+  LLibrary := LoadLib();
+  Check("unloaded reload real", CallLib(LLibrary, false));
+  Check("unloaded reload close", dlclose(LLibrary) = 0);
+end;
+
+// Installed before the library loads: dlopen patches it as it returns
+func TestBeforeLoad();
+var
+  LHook: Hook;
+  LStrlen: Hook;
+  LLibrary: ptr;
+begin
+  Check("before install", HookInstall(LHook, ptr to const char("getenv"),
+    ptr(GReplacement)) and (LHook.State <> nil));
+  GOriginal := LHook.Original;
+  Check("before own call hooked", EnvEquals(OwnEnv(), ptr to const char("hooked")));
+  Check("before strlen install", HookInstall(LStrlen, ptr to const char("strlen"),
+    ptr(GStrlenReplacement)));
+  GStrlenOriginal := LStrlen.Original;
+  LLibrary := LoadLib();
+  Check("before load", LLibrary <> nil);
+  Check("before library call hooked", CallLib(LLibrary, true));
+  Check("before uninstall", HookUninstall(LHook) and (LHook.State = nil));
+  Check("before strlen uninstall", HookUninstall(LStrlen) and (LStrlen.State = nil));
+  Check("before library call real", CallLib(LLibrary, false));
+  Check("before own call real", EnvEquals(OwnEnv(), ptr to const char("real")));
+  Check("before uninstall twice refused", (not HookUninstall(LHook)) and
+    (HookErrno() = ADAM_HOOK_EINVAL));
+  Check("before close", dlclose(LLibrary) = 0);
+end;
+
+// Installed after the load: the uninstall gives the library's slot back what it held
+func TestAfterLoad();
+var
+  LHook: Hook;
+  LLibrary: ptr;
+begin
+  LLibrary := LoadLib();
+  Check("after load", LLibrary <> nil);
+  Check("after library call real first", CallLib(LLibrary, false));
+  Check("after install", HookInstall(LHook, ptr to const char("strlen"),
+    ptr(GStrlenReplacement)));
+  GStrlenOriginal := LHook.Original;
+  Check("after library call hooked", CallLib(LLibrary, true));
+  Check("after uninstall", HookUninstall(LHook) and (LHook.State = nil));
+  Check("after library call real", CallLib(LLibrary, false));
+  Check("after close", dlclose(LLibrary) = 0);
+end;
+
+begin
+  GFails := 0;
+  GStrlenCalls := 0;
+  GReplacement := HookGetenv;
+  GStrlenReplacement := HookStrlen;
+  Check("set real", setenv(ptr to const char("STD_HOOKABI_RT"), ptr to const char("real"),
+    1) = 0);
+  TestRefused();
+  TestUnloaded();
+  TestBeforeLoad();
+  TestAfterLoad();
+  println("done {}", GFails);
+end.

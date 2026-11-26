@@ -3707,18 +3707,832 @@ begin
   DoSetErrno(AValue);
 end;
 
-// A run-time hook of the C name AName installed (LX4f: the image's GOT slots, the IAT
-// patch's linux form)
-public func PlatformHookInstall(const AName: ptr to const char; const AReplacement: ptr;
-  var AOriginal: ptr; var AState: ptr): int32;
+// The run-time hooks (PlatformHookInstall / PlatformHookUninstall, PaskalCPP's HookABI run-time
+// level; LX4f, the win64 import-table patch's linux form): a hook writes its replacement into
+// every GOT slot of its C name (a R_X86_64_JUMP_SLOT or R_X86_64_GLOB_DAT relocation naming
+// it) in every loaded object, records each slot and what it held, and puts exactly that back
+// into every recorded slot whose object is still loaded. A slot in the object's RELRO range
+// is made writable for its store and read-only again after it. glibc has no load
+// notification (win64's loader DLL notification): the first install hooks dlopen and dlclose
+// themselves (internal hooks, the same GOT patch), so an object loaded through dlopen gets
+// every hook written into it as its dlopen returns, and an unload through dlclose drops its
+// slots. An object glibc loads on its own (NSS, gconv) is not patched (his OK 2026-11-25).
+// Calls that do not go through a slot (inside the defining object, a link-time hook's own
+// symbol) are the link-time level's. Every walk of the objects runs under the table lock and
+// inside dl_iterate_phdr, whose loader lock keeps a visited object mapped (no pin needed).
+
+const
+  // elf.h: the dynamic tags read, the program header kinds, the relocation kinds that are
+  // import slots, an Elf64_Dyn's / Elf64_Rela's / Elf64_Sym's bytes
+  DT_NULL: int64 = 0;
+  DT_PLTRELSZ: int64 = 2;
+  DT_STRTAB: int64 = 5;
+  DT_SYMTAB: int64 = 6;
+  DT_RELA: int64 = 7;
+  DT_RELASZ: int64 = 8;
+  DT_JMPREL: int64 = 23;
+  PT_DYNAMIC: uint32 = 2;
+  PT_GNU_RELRO: uint32 = 0x6474E552;
+  R_X86_64_GLOB_DAT: uint64 = 6;
+  R_X86_64_JUMP_SLOT: uint64 = 7;
+  ADAM_PLATFORM_DYN_BYTES: uint64 = 16;
+  ADAM_PLATFORM_RELA_BYTES: uint64 = 24;
+  ADAM_PLATFORM_SYM_BYTES: uint64 = 24;
+  // A pointer's bytes
+  ADAM_PLATFORM_ADDRESS_SIZE: uint64 = 8;
+
+type
+  // One GOT slot a run-time hook wrote: the slot, what it held, the object it is in (its
+  // .dynamic's loaded address: one per loaded object, never 0); Keep: a walk's mark
+  // (DoHookPrune: its object was seen; DoHookRestoreLocked: it could not go back)
+  PlatformHookSlot = record
+    Address: ptr to uint64;
+    Old: uint64;
+    Base: uint64;
+    Keep: bool;
+  end;
+
+  // A run-time hook: its C name (a copy, NUL-terminated), the replacement, every slot it
+  // wrote (Slots: SlotCount of SlotCapacity used); Removing: its slots are being put back, an
+  // object loaded now is not patched with it; Internal: dlopen's / dlclose's own (DoHookLoads),
+  // never a user's, never uninstalled
+  PlatformHookEntry = record
+    Name: ptr to char;
+    Replacement: uint64;
+    Slots: ptr to PlatformHookSlot;
+    SlotCount: int64;
+    SlotCapacity: int64;
+    Removing: bool;
+    Internal: bool;
+  end;
+
+  // A loaded object's import tables (DoHookObjectOf): its id (its .dynamic's address), load
+  // bias, string and symbol tables, its .rela.dyn and .rela.plt (address, bytes), its RELRO
+  // range (Low .. High: none when equal)
+  PlatformHookObject = record
+    Id: uint64;
+    Bias: uint64;
+    StrTab: uint64;
+    SymTab: uint64;
+    Rela: uint64;
+    RelaSize: uint64;
+    JmpRel: uint64;
+    JmpRelSize: uint64;
+    RelroLow: uint64;
+    RelroHigh: uint64;
+  end;
+
+  // A walk of the objects (dl_iterate_phdr's data): the hook it is for (nil: every hook that
+  // is not being removed), the first failure (0, or C's errno value), the original's search
+  // (Name: the C name, Found: the first slot's value)
+  PlatformHookWalk = record
+    Entry: ptr to PlatformHookEntry;
+    Code: int32;
+    Name: ptr to const char;
+    Found: uint64;
+  end;
+
+  // glibc's dlopen and dlclose as the internal hooks call them
+  PlatformDlopen = func(AFile: ptr to const char; AMode: int32): ptr;
+  PlatformDlclose = func(AHandle: ptr): int32;
+
+var
+  // The run-time hooks: the run lock makes installs and uninstalls run one at a time; the
+  // table lock (taken first, then the loader's in dl_iterate_phdr: always in that order)
+  // guards the list and every hook's slots; GHookEntries: GHookEntryCount entry addresses of
+  // GHookEntryCapacity, the internal hooks first; GHookLoadsReady once dlopen / dlclose are
+  // hooked, GHookDlopen / GHookDlclose what they reached (glibc's)
+  GHookRunLock: array[0..4] of uint64;
+  GHookTableLock: array[0..4] of uint64;
+  GHookEntries: ptr to uint64;
+  GHookEntryCount: int64;
+  GHookEntryCapacity: int64;
+  GHookLoadsReady: bool;
+  GHookDlopen: PlatformDlopen;
+  GHookDlclose: PlatformDlclose;
+
+// A d_ptr of .dynamic: glibc rewrites it to an address as it loads an object (the vDSO's,
+// read-only, stays relative to ABias)
+func DoHookDynamicPointer(const AValue: uint64; const ABias: uint64): uint64;
 begin
-  DoPending(ptr to const char("PlatformHookInstall"), ptr to const char("LX4f"));
+  if AValue < ABias then
+    return AValue + ABias;
+  end;
+  return AValue;
 end;
 
-// A run-time hook (PlatformHookInstall's AState) uninstalled (LX4f)
-public func PlatformHookUninstall(var AState: ptr): int32;
+// The import tables of the loaded object dl_iterate_phdr hands as AInfo into AObject;
+// false when it has no .dynamic or no symbol / string table (nothing it imports by name)
+func DoHookObjectOf(const AInfo: ptr; var AObject: PlatformHookObject): bool;
+var
+  LPhdrs: uint64;
+  LCount: uint64;
+  LPhdr: uint64;
+  LKind: uint32;
+  LDynamic: uint64;
+  LTag: int64;
+  LValue: uint64;
+  LI: uint64;
 begin
-  DoPending(ptr to const char("PlatformHookUninstall"), ptr to const char("LX4f"));
+  memset(ptr(addr of AObject), 0, uint64(size(PlatformHookObject)));
+  AObject.Bias := DoWordAt(uint64(AInfo) + ADAM_PLATFORM_PHDR_INFO_ADDR);
+  LPhdrs := DoWordAt(uint64(AInfo) + ADAM_PLATFORM_PHDR_INFO_PHDR);
+  LCount := DoHalfAt(uint64(AInfo) + ADAM_PLATFORM_PHDR_INFO_PHNUM);
+  LDynamic := 0;
+  for LI := 0 to LCount - 1 do
+    LPhdr := LPhdrs + LI * ADAM_PLATFORM_PHDR_BYTES;
+    LKind := uint32(DoLongAt(LPhdr));
+    if LKind = PT_DYNAMIC then
+      LDynamic := AObject.Bias + DoWordAt(LPhdr + ADAM_PLATFORM_PHDR_VADDR);
+    end;
+    if LKind = PT_GNU_RELRO then
+      AObject.RelroLow := AObject.Bias + DoWordAt(LPhdr + ADAM_PLATFORM_PHDR_VADDR);
+      AObject.RelroHigh := AObject.RelroLow + DoWordAt(LPhdr + ADAM_PLATFORM_PHDR_MEMSZ);
+    end;
+  end;
+  if (LCount = 0) or (LDynamic = 0) then
+    return false;
+  end;
+  AObject.Id := LDynamic;
+  LTag := int64(DoWordAt(LDynamic));
+  while LTag <> DT_NULL do
+    LValue := DoWordAt(LDynamic + 8);
+    if LTag = DT_STRTAB then
+      AObject.StrTab := DoHookDynamicPointer(LValue, AObject.Bias);
+    end;
+    if LTag = DT_SYMTAB then
+      AObject.SymTab := DoHookDynamicPointer(LValue, AObject.Bias);
+    end;
+    if LTag = DT_RELA then
+      AObject.Rela := DoHookDynamicPointer(LValue, AObject.Bias);
+    end;
+    if LTag = DT_RELASZ then
+      AObject.RelaSize := LValue;
+    end;
+    if LTag = DT_JMPREL then
+      AObject.JmpRel := DoHookDynamicPointer(LValue, AObject.Bias);
+    end;
+    if LTag = DT_PLTRELSZ then
+      AObject.JmpRelSize := LValue;
+    end;
+    LDynamic := LDynamic + ADAM_PLATFORM_DYN_BYTES;
+    LTag := int64(DoWordAt(LDynamic));
+  end;
+  return (AObject.StrTab <> 0) and (AObject.SymTab <> 0);
+end;
+
+// The import slot number AIndex (from 0) of the C name AName in the object AObject, counted
+// over its .rela.plt then its .rela.dyn (JUMP_SLOT and GLOB_DAT relocations whose symbol is
+// named AName, a versioned one by its base name); nil when it has fewer. Only the
+// relocations are read, so a slot written never changes what a later call finds
+func DoHookImportSlot(const AObject: PlatformHookObject; const AName: ptr to const char;
+  const AIndex: int64): ptr to uint64;
+var
+  LTable: uint64;
+  LSize: uint64;
+  LAt: uint64;
+  LInfo: uint64;
+  LKind: uint64;
+  LSymbol: uint64;
+  LNameAt: uint64;
+  LSeen: int64;
+  LPass: int64;
+begin
+  LSeen := 0;
+  for LPass := 0 to 1 do
+    LTable := AObject.JmpRel;
+    LSize := AObject.JmpRelSize;
+    if LPass = 1 then
+      LTable := AObject.Rela;
+      LSize := AObject.RelaSize;
+    end;
+    LAt := 0;
+    while (LTable <> 0) and (LAt + ADAM_PLATFORM_RELA_BYTES <= LSize) do
+      LInfo := DoWordAt(LTable + LAt + 8);
+      LKind := LInfo & 0xFFFFFFFF;
+      LSymbol := LInfo shr 32;
+      if ((LKind = R_X86_64_JUMP_SLOT) or (LKind = R_X86_64_GLOB_DAT)) and (LSymbol <> 0) then
+        LNameAt := AObject.StrTab + DoLongAt(AObject.SymTab + LSymbol * ADAM_PLATFORM_SYM_BYTES);
+        if strcmp(ptr to const char(LNameAt), AName) = 0 then
+          if LSeen = AIndex then
+            return ptr to uint64(AObject.Bias + DoWordAt(LTable + LAt));
+          end;
+          LSeen := LSeen + 1;
+        end;
+      end;
+      LAt := LAt + ADAM_PLATFORM_RELA_BYTES;
+    end;
+  end;
+  return nil;
+end;
+
+// AValue stored in the slot ASlot of the object AObject: a slot in its RELRO range has its
+// page made writable for the store and read-only again after it (one aligned 8-byte store: a
+// thread calling through the slot meanwhile reads the old or the new value, never a mix);
+// false when the protection cannot be changed (nothing written then)
+func DoHookWriteSlot(const AObject: PlatformHookObject; const ASlot: ptr to uint64;
+  const AValue: uint64): bool;
+var
+  LPage: uint64;
+  LRelro: bool;
+begin
+  LRelro := (uint64(ASlot) >= AObject.RelroLow) and (uint64(ASlot) < AObject.RelroHigh);
+  if not LRelro then
+    ASlot^ := AValue;
+    return true;
+  end;
+  LPage := uint64(ASlot) - (uint64(ASlot) mod GFaultPage);
+  if mprotect(ptr(LPage), GFaultPage, PROT_READ | PROT_WRITE) <> 0 then
+    return false;
+  end;
+  ASlot^ := AValue;
+  mprotect(ptr(LPage), GFaultPage, PROT_READ);
+  return true;
+end;
+
+// Where the hook AEntry recorded the slot at the address ASlot; -1 when it did not
+func DoHookSlotIndex(const AEntry: ptr to PlatformHookEntry; const ASlot: uint64): int64;
+var
+  LI: int64;
+begin
+  for LI := 0 to AEntry^.SlotCount - 1 do
+    if uint64(AEntry^.Slots[LI].Address) = ASlot then
+      return LI;
+    end;
+  end;
+  return -1;
+end;
+
+// The slot ASlot of the object ABase, holding AOld, recorded for the hook AEntry; false when
+// its list cannot grow
+func DoHookAddSlot(const AEntry: ptr to PlatformHookEntry; const ASlot: ptr to uint64;
+  const AOld: uint64; const ABase: uint64): bool;
+var
+  LRoom: int64;
+  LSlots: ptr to PlatformHookSlot;
+begin
+  if AEntry^.SlotCount = AEntry^.SlotCapacity then
+    LRoom := (AEntry^.SlotCapacity * 2) + 4;
+    LSlots := ptr to PlatformHookSlot(realloc(ptr(AEntry^.Slots),
+      uint64(LRoom) * uint64(size(PlatformHookSlot))));
+    if LSlots = nil then
+      return false;
+    end;
+    AEntry^.Slots := LSlots;
+    AEntry^.SlotCapacity := LRoom;
+  end;
+  AEntry^.Slots[AEntry^.SlotCount].Address := ASlot;
+  AEntry^.Slots[AEntry^.SlotCount].Old := AOld;
+  AEntry^.Slots[AEntry^.SlotCount].Base := ABase;
+  AEntry^.Slots[AEntry^.SlotCount].Keep := true;
+  AEntry^.SlotCount := AEntry^.SlotCount + 1;
+  return true;
+end;
+
+// The hook AEntry's slots not marked Keep dropped (the others keep their order)
+func DoHookDropUnkept(const AEntry: ptr to PlatformHookEntry);
+var
+  LI: int64;
+  LOut: int64;
+begin
+  LOut := 0;
+  for LI := 0 to AEntry^.SlotCount - 1 do
+    if AEntry^.Slots[LI].Keep then
+      AEntry^.Slots[LOut] := AEntry^.Slots[LI];
+      LOut := LOut + 1;
+    end;
+  end;
+  AEntry^.SlotCount := LOut;
+end;
+
+// The hook AEntry written into every slot of its name in the object AObject not recorded
+// yet: 0, or ENOMEM / EACCES when one could not be recorded / written (the ones that were
+// stay recorded). Nothing for a hook being removed
+func DoHookPatchObject(const AEntry: ptr to PlatformHookEntry;
+  const AObject: PlatformHookObject): int32;
+var
+  LIndex: int64;
+  LSlot: ptr to uint64;
+begin
+  if AEntry^.Removing then
+    return 0;
+  end;
+  LIndex := 0;
+  LSlot := DoHookImportSlot(AObject, AEntry^.Name, LIndex);
+  while LSlot <> nil do
+    if DoHookSlotIndex(AEntry, uint64(LSlot)) < 0 then
+      if not DoHookAddSlot(AEntry, LSlot, LSlot^, AObject.Id) then
+        return ADAM_PLATFORM_ENOMEM;
+      end;
+      if not DoHookWriteSlot(AObject, LSlot, AEntry^.Replacement) then
+        AEntry^.SlotCount := AEntry^.SlotCount - 1;
+        return ADAM_PLATFORM_EACCES;
+      end;
+    end;
+    LIndex := LIndex + 1;
+    LSlot := DoHookImportSlot(AObject, AEntry^.Name, LIndex);
+  end;
+  return 0;
+end;
+
+// dl_iterate_phdr's visitor writing hooks into the object AInfo: the walk's hook, or every
+// hook (its Entry nil), in the list's order; the walk's first failure kept, the walk goes on
+// (a failed object keeps what it holds)
+func DoHookPatchVisit(const AInfo: ptr; const ASize: uint64; const AData: ptr): int32;
+var
+  LWalk: ptr to PlatformHookWalk;
+  LObject: PlatformHookObject;
+  LCode: int32;
+  LI: int64;
+begin
+  LWalk := ptr to PlatformHookWalk(AData);
+  if not DoHookObjectOf(AInfo, LObject) then
+    return 0;
+  end;
+  if LWalk^.Entry <> nil then
+    LCode := DoHookPatchObject(LWalk^.Entry, LObject);
+    if (LCode <> 0) and (LWalk^.Code = 0) then
+      LWalk^.Code := LCode;
+    end;
+    return 0;
+  end;
+  for LI := 0 to GHookEntryCount - 1 do
+    DoHookPatchObject(ptr to PlatformHookEntry(GHookEntries[LI]), LObject);
+  end;
+  return 0;
+end;
+
+// dl_iterate_phdr's visitor marking every recorded slot of the object AInfo kept
+// (DoHookPrune)
+func DoHookSeeVisit(const AInfo: ptr; const ASize: uint64; const AData: ptr): int32;
+var
+  LObject: PlatformHookObject;
+  LEntry: ptr to PlatformHookEntry;
+  LI: int64;
+  LJ: int64;
+begin
+  if not DoHookObjectOf(AInfo, LObject) then
+    return 0;
+  end;
+  for LI := 0 to GHookEntryCount - 1 do
+    LEntry := ptr to PlatformHookEntry(GHookEntries[LI]);
+    for LJ := 0 to LEntry^.SlotCount - 1 do
+      if LEntry^.Slots[LJ].Base = LObject.Id then
+        LEntry^.Slots[LJ].Keep := true;
+      end;
+    end;
+  end;
+  return 0;
+end;
+
+// The slots of objects no longer loaded dropped from every hook (nothing is written into a
+// gone object). The caller holds the table lock
+func DoHookPrune();
+var
+  LEntry: ptr to PlatformHookEntry;
+  LI: int64;
+  LJ: int64;
+begin
+  for LI := 0 to GHookEntryCount - 1 do
+    LEntry := ptr to PlatformHookEntry(GHookEntries[LI]);
+    for LJ := 0 to LEntry^.SlotCount - 1 do
+      LEntry^.Slots[LJ].Keep := false;
+    end;
+  end;
+  dl_iterate_phdr(DoHookSeeVisit, nil);
+  for LI := 0 to GHookEntryCount - 1 do
+    DoHookDropUnkept(ptr to PlatformHookEntry(GHookEntries[LI]));
+  end;
+end;
+
+// dl_iterate_phdr's visitor putting the walk's hook's slots in the object AInfo back: a slot
+// that cannot go back stays marked kept
+func DoHookRestoreVisit(const AInfo: ptr; const ASize: uint64; const AData: ptr): int32;
+var
+  LWalk: ptr to PlatformHookWalk;
+  LObject: PlatformHookObject;
+  LEntry: ptr to PlatformHookEntry;
+  LJ: int64;
+begin
+  LWalk := ptr to PlatformHookWalk(AData);
+  if not DoHookObjectOf(AInfo, LObject) then
+    return 0;
+  end;
+  LEntry := LWalk^.Entry;
+  for LJ := 0 to LEntry^.SlotCount - 1 do
+    if LEntry^.Slots[LJ].Base = LObject.Id then
+      LEntry^.Slots[LJ].Keep := not DoHookWriteSlot(LObject, LEntry^.Slots[LJ].Address,
+        LEntry^.Slots[LJ].Old);
+    end;
+  end;
+  return 0;
+end;
+
+// Every slot of the hook AEntry whose object is still loaded given back what it held; those
+// that went back and those of gone objects dropped: 0 when none is left, EACCES when one
+// could not go back. The caller holds the table lock
+func DoHookRestoreLocked(const AEntry: ptr to PlatformHookEntry): int32;
+var
+  LWalk: PlatformHookWalk;
+  LJ: int64;
+begin
+  for LJ := 0 to AEntry^.SlotCount - 1 do
+    AEntry^.Slots[LJ].Keep := false;
+  end;
+  memset(ptr(addr of LWalk), 0, uint64(size(PlatformHookWalk)));
+  LWalk.Entry := AEntry;
+  dl_iterate_phdr(DoHookRestoreVisit, ptr(addr of LWalk));
+  DoHookDropUnkept(AEntry);
+  if AEntry^.SlotCount > 0 then
+    return ADAM_PLATFORM_EACCES;
+  end;
+  return 0;
+end;
+
+// dl_iterate_phdr's visitor of the original's search: the first object (load order) with
+// a slot of the walk's name gives that slot's value (1: the walk stops)
+func DoHookFindVisit(const AInfo: ptr; const ASize: uint64; const AData: ptr): int32;
+var
+  LWalk: ptr to PlatformHookWalk;
+  LObject: PlatformHookObject;
+  LSlot: ptr to uint64;
+begin
+  LWalk := ptr to PlatformHookWalk(AData);
+  if not DoHookObjectOf(AInfo, LObject) then
+    return 0;
+  end;
+  LSlot := DoHookImportSlot(LObject, LWalk^.Name, 0);
+  if LSlot = nil then
+    return 0;
+  end;
+  LWalk^.Found := LSlot^;
+  return 1;
+end;
+
+// What the C name AName's slots reach: the value of its first slot in load order; when no
+// object imports it yet, the first object's definition of it (dlsym, RTLD_DEFAULT); 0 when
+// none has it. The caller holds the table lock
+func DoHookOriginal(const AName: ptr to const char): uint64;
+var
+  LWalk: PlatformHookWalk;
+begin
+  memset(ptr(addr of LWalk), 0, uint64(size(PlatformHookWalk)));
+  LWalk.Name := AName;
+  dl_iterate_phdr(DoHookFindVisit, ptr(addr of LWalk));
+  if LWalk.Found = 0 then
+    LWalk.Found := uint64(dlsym(nil, AName));
+  end;
+  return LWalk.Found;
+end;
+
+// The hook AEntry written into every loaded object: 0, or ENOMEM / EACCES (the first
+// failure; what was written stays recorded). The caller holds the table lock
+func DoHookApplyLocked(const AEntry: ptr to PlatformHookEntry): int32;
+var
+  LWalk: PlatformHookWalk;
+begin
+  memset(ptr(addr of LWalk), 0, uint64(size(PlatformHookWalk)));
+  LWalk.Entry := AEntry;
+  dl_iterate_phdr(DoHookPatchVisit, ptr(addr of LWalk));
+  return LWalk.Code;
+end;
+
+// The internal hook of dlopen: glibc's dlopen, then (it loaded something) the slots of
+// unloaded objects dropped and every hook written into every object (a new one gets them
+// all; what is recorded is not written again); C's errno kept as dlopen left it
+func DoHookDlopenHook(AFile: ptr to const char; AMode: int32): ptr;
+var
+  LHandle: ptr;
+  LErrno: int32;
+  LWalk: PlatformHookWalk;
+begin
+  LHandle := GHookDlopen(AFile, AMode);
+  if LHandle = nil then
+    return nil;
+  end;
+  LErrno := DoErrno();
+  pthread_mutex_lock(ptr(addr of GHookTableLock));
+  DoHookPrune();
+  memset(ptr(addr of LWalk), 0, uint64(size(PlatformHookWalk)));
+  dl_iterate_phdr(DoHookPatchVisit, ptr(addr of LWalk));
+  pthread_mutex_unlock(ptr(addr of GHookTableLock));
+  DoSetErrno(LErrno);
+  return LHandle;
+end;
+
+// The internal hook of dlclose: glibc's dlclose, then the slots of the objects it unloaded
+// dropped; C's errno kept as dlclose left it
+func DoHookDlcloseHook(AHandle: ptr): int32;
+var
+  LResult: int32;
+  LErrno: int32;
+begin
+  LResult := GHookDlclose(AHandle);
+  LErrno := DoErrno();
+  pthread_mutex_lock(ptr(addr of GHookTableLock));
+  DoHookPrune();
+  pthread_mutex_unlock(ptr(addr of GHookTableLock));
+  DoSetErrno(LErrno);
+  return LResult;
+end;
+
+// Where the hook whose record is at the address AEntry is among the hooks; -1 when it is
+// not one (the caller holds the table lock)
+func DoHookEntryIndex(const AEntry: uint64): int64;
+var
+  LI: int64;
+begin
+  for LI := 0 to GHookEntryCount - 1 do
+    if GHookEntries[LI] = AEntry then
+      return LI;
+    end;
+  end;
+  return -1;
+end;
+
+// Where a user's hook (never an internal one) of the C name AName is among the hooks; -1
+// when none has it (the caller holds the table lock)
+func DoHookNameIndex(const AName: ptr to const char): int64;
+var
+  LI: int64;
+  LEntry: ptr to PlatformHookEntry;
+begin
+  for LI := 0 to GHookEntryCount - 1 do
+    LEntry := ptr to PlatformHookEntry(GHookEntries[LI]);
+    if (not LEntry^.Internal) and (strcmp(LEntry^.Name, AName) = 0) then
+      return LI;
+    end;
+  end;
+  return -1;
+end;
+
+// The hook AEntry added to the hooks; false when their list cannot grow (the caller holds
+// the table lock)
+func DoHookJoin(const AEntry: ptr to PlatformHookEntry): bool;
+var
+  LRoom: int64;
+  LEntries: ptr to uint64;
+begin
+  if GHookEntryCount = GHookEntryCapacity then
+    LRoom := (GHookEntryCapacity * 2) + 4;
+    LEntries := ptr to uint64(realloc(ptr(GHookEntries),
+      uint64(LRoom) * ADAM_PLATFORM_ADDRESS_SIZE));
+    if LEntries = nil then
+      return false;
+    end;
+    GHookEntries := LEntries;
+    GHookEntryCapacity := LRoom;
+  end;
+  GHookEntries[GHookEntryCount] := uint64(AEntry);
+  GHookEntryCount := GHookEntryCount + 1;
+  return true;
+end;
+
+// The hook AEntry taken out of the hooks (the others keep their order; the caller holds the
+// table lock)
+func DoHookLeave(const AEntry: ptr to PlatformHookEntry);
+var
+  LAt: int64;
+  LI: int64;
+begin
+  LAt := DoHookEntryIndex(uint64(AEntry));
+  if LAt < 0 then
+    return;
+  end;
+  for LI := LAt to GHookEntryCount - 2 do
+    GHookEntries[LI] := GHookEntries[LI + 1];
+  end;
+  GHookEntryCount := GHookEntryCount - 1;
+end;
+
+// A new hook record of the C name AName (copied) and AReplacement, with no slot; nil when
+// out of memory
+func DoHookNewEntry(const AName: ptr to const char; const AReplacement: ptr;
+  const AInternal: bool): ptr to PlatformHookEntry;
+var
+  LLength: uint64;
+  LName: ptr to char;
+  LEntry: ptr to PlatformHookEntry;
+begin
+  LLength := strlen(AName);
+  LName := ptr to char(malloc(LLength + 1));
+  if LName = nil then
+    return nil;
+  end;
+  // the name's bytes and its NUL
+  memcpy(ptr(LName), ptr(AName), LLength + 1);
+  LEntry := ptr to PlatformHookEntry(malloc(uint64(size(PlatformHookEntry))));
+  if LEntry = nil then
+    free(ptr(LName));
+    return nil;
+  end;
+  LEntry^.Name := LName;
+  LEntry^.Replacement := uint64(AReplacement);
+  LEntry^.Slots := nil;
+  LEntry^.SlotCount := 0;
+  LEntry^.SlotCapacity := 0;
+  LEntry^.Removing := false;
+  LEntry^.Internal := AInternal;
+  return LEntry;
+end;
+
+// The hook record AEntry freed with its name and its slot list
+func DoHookFreeEntry(const AEntry: ptr to PlatformHookEntry);
+begin
+  free(ptr(AEntry^.Name));
+  free(ptr(AEntry^.Slots));
+  free(ptr(AEntry));
+end;
+
+// A new hook of AName by AReplacement joined and written everywhere (AOriginal: what its
+// slots reached); 0 with AEntry set, else C's errno value with nothing installed (every slot
+// written put back). The caller holds the table lock
+func DoHookAddLocked(const AName: ptr to const char; const AReplacement: ptr;
+  const AInternal: bool; var AOriginal: uint64; var AEntry: ptr to PlatformHookEntry): int32;
+var
+  LCode: int32;
+begin
+  AEntry := nil;
+  AOriginal := DoHookOriginal(AName);
+  if AOriginal = 0 then
+    return ADAM_PLATFORM_ENOENT;
+  end;
+  AEntry := DoHookNewEntry(AName, AReplacement, AInternal);
+  if AEntry = nil then
+    return ADAM_PLATFORM_ENOMEM;
+  end;
+  if not DoHookJoin(AEntry) then
+    DoHookFreeEntry(AEntry);
+    AEntry := nil;
+    return ADAM_PLATFORM_ENOMEM;
+  end;
+  LCode := DoHookApplyLocked(AEntry);
+  if LCode <> 0 then
+    // undone: what cannot go back keeps the replacement
+    AEntry^.Removing := true;
+    DoHookRestoreLocked(AEntry);
+    DoHookLeave(AEntry);
+    DoHookFreeEntry(AEntry);
+    AEntry := nil;
+  end;
+  return LCode;
+end;
+
+// dlopen and dlclose hooked once (the first install), so objects loaded later get the hooks
+// and unloaded ones drop their slots; false leaves a hook to patch only the objects loaded
+// now. The caller holds the table lock
+func DoHookLoads(): bool;
+var
+  LOpen: uint64;
+  LClose: uint64;
+  LOpenEntry: ptr to PlatformHookEntry;
+  LCloseEntry: ptr to PlatformHookEntry;
+  LOpenHook: PlatformDlopen;
+  LCloseHook: PlatformDlclose;
+begin
+  if GHookLoadsReady then
+    return true;
+  end;
+  LOpenHook := DoHookDlopenHook;
+  LCloseHook := DoHookDlcloseHook;
+  LOpen := DoHookOriginal(ptr to const char("dlopen"));
+  LClose := DoHookOriginal(ptr to const char("dlclose"));
+  if (LOpen = 0) or (LClose = 0) then
+    return false;
+  end;
+  // the originals are set before any slot reaches the hooks
+  GHookDlopen := PlatformDlopen(ptr(LOpen));
+  GHookDlclose := PlatformDlclose(ptr(LClose));
+  if DoHookAddLocked(ptr to const char("dlopen"), ptr(LOpenHook), true, LOpen,
+    LOpenEntry) <> 0 then
+    return false;
+  end;
+  if DoHookAddLocked(ptr to const char("dlclose"), ptr(LCloseHook), true, LClose,
+    LCloseEntry) <> 0 then
+    LOpenEntry^.Removing := true;
+    DoHookRestoreLocked(LOpenEntry);
+    DoHookLeave(LOpenEntry);
+    DoHookFreeEntry(LOpenEntry);
+    return false;
+  end;
+  GHookLoadsReady := true;
+  return true;
+end;
+
+// PlatformHookInstall's work under the run lock: AOriginal and AEntry set when it returns 0
+func DoHookInstallLocked(const AName: ptr to const char; const AReplacement: ptr;
+  var AOriginal: uint64; var AEntry: ptr to PlatformHookEntry): int32;
+var
+  LCode: int32;
+begin
+  pthread_mutex_lock(ptr(addr of GHookTableLock));
+  if DoHookNameIndex(AName) >= 0 then
+    pthread_mutex_unlock(ptr(addr of GHookTableLock));
+    return ADAM_PLATFORM_EEXIST;
+  end;
+  if DoHookOriginal(AName) = 0 then
+    pthread_mutex_unlock(ptr(addr of GHookTableLock));
+    return ADAM_PLATFORM_ENOENT;
+  end;
+  // dlopen / dlclose hooked before the hook joins: an object loaded after it joins is
+  // patched by the dlopen hook, never missed
+  DoHookLoads();
+  LCode := DoHookAddLocked(AName, AReplacement, false, AOriginal, AEntry);
+  pthread_mutex_unlock(ptr(addr of GHookTableLock));
+  return LCode;
+end;
+
+// A run-time hook installed (System.Runtime's InstallHook): the C name AName's GOT slot in
+// every loaded object takes AReplacement, and so does every object loaded later through
+// dlopen. 0 with AOriginal (what the slots reached) and AState (the hook's record) set; else
+// C's errno value of the failure, nothing installed: EINVAL (nil or empty AName, nil
+// AReplacement), EEXIST (AState is set, or AName is hooked already), ENOENT (no loaded object
+// imports or defines AName), EACCES (a slot could not be written: every slot written is put
+// back), ENOMEM. Installs and uninstalls run one at a time.
+public func PlatformHookInstall(const AName: ptr to const char; const AReplacement: ptr;
+  var AOriginal: ptr; var AState: ptr): int32;
+var
+  LOriginal: uint64;
+  LEntry: ptr to PlatformHookEntry;
+  LCode: int32;
+begin
+  if (AName = nil) or (AReplacement = nil) then
+    return ADAM_PLATFORM_EINVAL;
+  end;
+  if strlen(AName) = 0 then
+    return ADAM_PLATFORM_EINVAL;
+  end;
+  if AState <> nil then
+    return ADAM_PLATFORM_EEXIST;
+  end;
+  if GFaultPage = 0 then
+    GFaultPage := ADAM_PLATFORM_PAGE_DEFAULT;
+    if sysconf(_SC_PAGESIZE) > 0 then
+      GFaultPage := uint64(sysconf(_SC_PAGESIZE));
+    end;
+  end;
+  LOriginal := 0;
+  LEntry := nil;
+  pthread_mutex_lock(ptr(addr of GHookRunLock));
+  LCode := DoHookInstallLocked(AName, AReplacement, LOriginal, LEntry);
+  pthread_mutex_unlock(ptr(addr of GHookRunLock));
+  if LCode <> 0 then
+    return LCode;
+  end;
+  AOriginal := ptr(LOriginal);
+  AState := ptr(LEntry);
+  return 0;
+end;
+
+// PlatformHookUninstall's work under the run lock
+func DoHookUninstallLocked(const AState: ptr): int32;
+var
+  LEntry: ptr to PlatformHookEntry;
+  LCode: int32;
+begin
+  pthread_mutex_lock(ptr(addr of GHookTableLock));
+  if DoHookEntryIndex(uint64(AState)) < 0 then
+    pthread_mutex_unlock(ptr(addr of GHookTableLock));
+    return ADAM_PLATFORM_EINVAL;
+  end;
+  LEntry := ptr to PlatformHookEntry(AState);
+  if LEntry^.Internal then
+    pthread_mutex_unlock(ptr(addr of GHookTableLock));
+    return ADAM_PLATFORM_EINVAL;
+  end;
+  // Removing: an object loaded now is not patched with it while its slots go back
+  LEntry^.Removing := true;
+  LCode := DoHookRestoreLocked(LEntry);
+  if LCode <> 0 then
+    // still installed: a later uninstall (or this one again) finishes it
+    LEntry^.Removing := false;
+    pthread_mutex_unlock(ptr(addr of GHookTableLock));
+    return LCode;
+  end;
+  DoHookLeave(LEntry);
+  pthread_mutex_unlock(ptr(addr of GHookTableLock));
+  DoHookFreeEntry(LEntry);
+  return 0;
+end;
+
+// A run-time hook uninstalled (System.Runtime's UninstallHook): every slot it wrote whose
+// object is still loaded gets back exactly what it held; nothing else is written. 0 with
+// AState nil; else C's errno value: EINVAL (AState is no installed hook), EACCES (a slot
+// could not be written back: the hook stays installed, the slots that went back stay back)
+public func PlatformHookUninstall(var AState: ptr): int32;
+var
+  LCode: int32;
+begin
+  if AState = nil then
+    return ADAM_PLATFORM_EINVAL;
+  end;
+  pthread_mutex_lock(ptr(addr of GHookRunLock));
+  LCode := DoHookUninstallLocked(AState);
+  pthread_mutex_unlock(ptr(addr of GHookRunLock));
+  if LCode = 0 then
+    AState := nil;
+  end;
+  return LCode;
 end;
 
 end.
