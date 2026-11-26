@@ -31,7 +31,9 @@
 :: code generation has settled), else nothing is installed. Then B builds    ::
 :: adamtest (projects\adamtest), and B and that adamtest replace adam.exe    ::
 :: and adamtest.exe here; the adam.exe they replace is kept as               ::
-:: adam-prev.exe (the last good compiler, to fall back to). Last, the new    ::
+:: adam-prev.exe (the last good compiler, to fall back to). B also builds    ::
+:: adam and adamtest for x86_64-linux-gnu, installed beside them as adam     ::
+:: and adamtest (no ending: one bin\ and res\ for both hosts). Last, the new ::
 :: adam.exe prebuilds the shared compiled-unit cache (res\acu here: every    ::
 :: std unit and the runtime, at every level) for a release. Stage files      ::
 :: land in projects\*\output (ignored by git).                               ::
@@ -53,8 +55,11 @@ set TRIPLE=x86_64-windows-gnu
 set SELFOPT=fast
 set REL=bin\%TRIPLE%\release_%SELFOPT%
 set DBG=bin\%TRIPLE%\debug
+set LTRIPLE=x86_64-linux-gnu
+set LREL=bin\%LTRIPLE%\release_%SELFOPT%
+set LDBG=bin\%LTRIPLE%\debug
 
-echo [0/6] snapshot: the build's inputs copied
+echo [0/7] snapshot: the build's inputs copied
 call :snap "%BIN%..\src" "%SNAP%\src"
 if errorlevel 1 (echo BUILD FAILED - snapshot & exit /b 1)
 call :snap "%BIN%..\projects\adam" "%SNAP%\projects\adam" /XD output
@@ -76,7 +81,7 @@ cd /d "%SNAP%\bin"
 :: Stage A is a plain (debug) build: <output>\bin\<triple>\debug; the installed adam.exe
 :: may predate that and write it to <output>\bin (SU1), so the old copies go first and A
 :: is taken from whichever place the build wrote
-echo [1/6] stage A: adam.exe builds adam
+echo [1/7] stage A: adam.exe builds adam
 del /q "%OUT%\stageA\%DBG%\adam.exe" "%OUT%\stageA\bin\adam.exe" 2>nul
 adam.exe build %MAIN% -o "%OUT%\stageA"
 if errorlevel 1 (echo BUILD FAILED - stage A & exit /b 1)
@@ -85,35 +90,47 @@ if errorlevel 1 (echo BUILD FAILED - stage A not found & exit /b 1)
 
 :: B and C are the compiler's own build (--adam-self-build: a release one, no leak tracker);
 :: A is built plainly, since the installed adam.exe may predate the switch
-echo [2/6] stage B: A builds adam
+echo [2/7] stage B: A builds adam
 adam-stageA.exe build %MAIN% -o "%OUT%\stageB" --adam-self-build -opt %SELFOPT%
 if errorlevel 1 (echo BUILD FAILED - stage B & goto :failed)
 copy /y "%OUT%\stageB\%REL%\adam.exe" adam-stageB.exe >nul
 if errorlevel 1 (echo BUILD FAILED - stage B not found & goto :failed)
 
-echo [3/6] stage C: B builds adam
+echo [3/7] stage C: B builds adam
 adam-stageB.exe build %MAIN% -o "%OUT%\stageC" --adam-self-build -opt %SELFOPT%
 if errorlevel 1 (echo BUILD FAILED - stage C & goto :failed)
 
-echo [4/6] B and C compared
+echo [4/7] B and C compared
 fc /b "%OUT%\stageB\%REL%\adam.exe" "%OUT%\stageC\%REL%\adam.exe" >nul
 if errorlevel 1 (echo BUILD FAILED - stage B and stage C differ & goto :failed)
 
-echo [5/6] adamtest: B builds adamtest
+echo [5/7] adamtest: B builds adamtest
 adam-stageB.exe build ..\projects\adamtest\src\adamtest.adam -o "%BIN%..\projects\adamtest\output"
 if errorlevel 1 (echo BUILD FAILED - adamtest & goto :failed)
+
+:: The Linux host's pair, built by B as the Windows pair is: adam as the compiler's own build
+:: (release), adamtest a plain one
+echo [6/7] linux: B builds adam and adamtest for %LTRIPLE%
+adam-stageB.exe build %MAIN% -o "%OUT%\stageL" -t %LTRIPLE% --adam-self-build -opt %SELFOPT%
+if errorlevel 1 (echo BUILD FAILED - linux adam & goto :failed)
+adam-stageB.exe build ..\projects\adamtest\src\adamtest.adam -o "%BIN%..\projects\adamtest\output" -t %LTRIPLE%
+if errorlevel 1 (echo BUILD FAILED - linux adamtest & goto :failed)
 
 copy /y "%BIN%adam.exe" "%BIN%adam-prev.exe" >nul
 copy /y "%OUT%\stageB\%REL%\adam.exe" "%BIN%adam.exe" >nul
 if errorlevel 1 (echo BUILD FAILED - adam.exe not installed & goto :failed)
 copy /y "%BIN%..\projects\adamtest\output\%DBG%\adamtest.exe" "%BIN%adamtest.exe" >nul
 if errorlevel 1 (echo BUILD FAILED - adamtest.exe not installed & goto :failed)
+copy /y "%OUT%\stageL\%LREL%\adam" "%BIN%adam" >nul
+if errorlevel 1 (echo BUILD FAILED - linux adam not installed & goto :failed)
+copy /y "%BIN%..\projects\adamtest\output\%LDBG%\adamtest" "%BIN%adamtest" >nul
+if errorlevel 1 (echo BUILD FAILED - linux adamtest not installed & goto :failed)
 
 :: The shared compiled-unit cache (res\acu beside adam.exe) prebuilt for a release: the
 :: installed adam.exe builds a program importing every std unit (the runtime comes with
 :: it; each target's platform units under its @ifdef) for every target triple at every
 :: optimization level (debug, then -opt safe / fast / small), into its own stage folder
-echo [6/6] prebuild: the std and the runtime compiled into res\acu, every level
+echo [7/7] prebuild: the std and the runtime compiled into res\acu, every level
 set PRE=%OUT%\prebuild
 if not exist "%PRE%" mkdir "%PRE%"
 call :prebuild_source "%PRE%\adam_prebuild.adam"
