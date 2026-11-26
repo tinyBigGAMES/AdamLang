@@ -265,6 +265,7 @@ public const
   ADAM_PLATFORM_ENOENT: int32 = 2;
   ADAM_PLATFORM_EIO: int32 = 5;
   ADAM_PLATFORM_EBADF: int32 = 9;
+  ADAM_PLATFORM_EAGAIN: int32 = 11;
   ADAM_PLATFORM_ENOSPC: int32 = 28;
   ADAM_PLATFORM_ENOSYS: int32 = 38;
   ADAM_PLATFORM_ENOMEM: int32 = 12;
@@ -1909,6 +1910,10 @@ end;
 forward func DoFaultThreadReady();
 forward func DoFaultThreadEnd();
 
+// pthread_create hooked at the runtime's start (PlatformAtFault; the run-time hooks'
+// section below), so a thread C code starts gets its fault state too
+forward func DoHookThreads();
+
 // A thread's end handed on (AReason ADAM_PLATFORM_THREAD_END; the other reasons ask
 // nothing): the registered thread end (PlatformAtThreadEnd) runs once per thread. Its
 // caller on this target is the thread key's destructor LX4d registers
@@ -2109,8 +2114,9 @@ func pthread_setspecific(const AKey: uint32; const AValue: ptr): int32; external
 func pthread_once(const AOnce: ptr; const AInit: func()): int32; external "c";
 
 const
-  // The thread key's value a thread PlatformThreadStart made holds: not nil, so the key's
-  // destructor (DoThreadKeyEnd) runs at its end
+  // The thread key's value every thread the runtime started holds (PlatformThreadStart's,
+  // and one C code started through the pthread_create hook, DoHookThreadProc): not nil, so
+  // the key's destructor (DoThreadKeyEnd) runs at its end
   ADAM_PLATFORM_THREAD_MARK: uint64 = 1;
 
 var
@@ -2120,9 +2126,10 @@ var
   GThreadKey: uint32;
   GThreadKeyReady: bool;
 
-// The thread key's destructor: a thread PlatformThreadStart made is ending (its run routine
-// returned, or it called pthread_exit), on that thread with its threadstatics there: the
-// thread end handed on (PlatformThreadCallback), as win64's loader does at DLL_THREAD_DETACH
+// The thread key's destructor: a thread holding the key's mark is ending (PlatformThreadStart's
+// or one C code started; its run routine returned, or it called pthread_exit), on that thread
+// with its threadstatics there: the thread end handed on (PlatformThreadCallback), as win64's
+// loader does at DLL_THREAD_DETACH for every thread, whoever started it
 func DoThreadKeyEnd(AValue: ptr);
 begin
   PlatformThreadCallback(nil, ADAM_PLATFORM_THREAD_END, nil);
@@ -2884,7 +2891,8 @@ end;
 // took, on the faulting thread with nothing unwound (DoFaultRaise); it reports the fault and
 // ends the process, never returning. The fault handler (DoFaultSignal) installed for SIGSEGV,
 // SIGBUS, SIGFPE and SIGILL and the main thread's fault state made ready (a thread
-// PlatformThreadStart makes gets its own at its start)
+// PlatformThreadStart makes gets its own at its start, and so does one C code starts:
+// pthread_create hooked here, DoHookThreads)
 public func PlatformAtFault(const AHandler: func(const AKind: int32));
 var
   LAction: PlatformSigaction;
@@ -2909,6 +2917,7 @@ begin
     sigaction(ADAM_PLATFORM_FAULT_SIGNALS[LI], ptr(addr of LAction),
       ptr(addr of GFaultBefore[LI]));
   end;
+  DoHookThreads();
 end;
 
 // ASize bytes of zeroed memory that may be written and run (System.Runtime's C callback
@@ -3780,8 +3789,9 @@ type
 
   // A run-time hook: its C name (a copy, NUL-terminated), the replacement, every slot it
   // wrote (Slots: SlotCount of SlotCapacity used); Removing: its slots are being put back, an
-  // object loaded now is not patched with it; Internal: dlopen's / dlclose's own (DoHookLoads),
-  // never a user's, never uninstalled
+  // object loaded now is not patched with it; Internal: the runtime's own (dlopen's /
+  // dlclose's, DoHookLoads; pthread_create's, DoHookThreads), never a user's, never
+  // uninstalled
   PlatformHookEntry = record
     Name: ptr to char;
     Replacement: uint64;
@@ -3821,13 +3831,19 @@ type
   // glibc's dlopen and dlclose as the internal hooks call them
   PlatformDlopen = func(AFile: ptr to const char; AMode: int32): ptr;
   PlatformDlclose = func(AHandle: ptr): int32;
+  // A thread's start routine as pthread_create takes it, and glibc's pthread_create as its
+  // internal hook calls it (AThread: where the new pthread_t goes)
+  PlatformThreadEntry = func(AArgument: ptr): ptr;
+  PlatformThreadCreate = func(AThread: ptr to uint64; AAttributes: ptr;
+    AStart: PlatformThreadEntry; AArgument: ptr): int32;
 
 var
   // The run-time hooks: the run lock makes installs and uninstalls run one at a time; the
   // table lock (taken first, then the loader's in dl_iterate_phdr: always in that order)
   // guards the list and every hook's slots; GHookEntries: GHookEntryCount entry addresses of
   // GHookEntryCapacity, the internal hooks first; GHookLoadsReady once dlopen / dlclose are
-  // hooked, GHookDlopen / GHookDlclose what they reached (glibc's)
+  // hooked, GHookDlopen / GHookDlclose what they reached (glibc's); GHookPthreadCreate what
+  // pthread_create's slots reached when DoHookThreads hooked it (nil before)
   GHookRunLock: array[0..4] of uint64;
   GHookTableLock: array[0..4] of uint64;
   GHookEntries: ptr to uint64;
@@ -3836,6 +3852,7 @@ var
   GHookLoadsReady: bool;
   GHookDlopen: PlatformDlopen;
   GHookDlclose: PlatformDlclose;
+  GHookPthreadCreate: PlatformThreadCreate;
 
 // A d_ptr of .dynamic: glibc rewrites it to an address as it loads an object (the vDSO's,
 // read-only, stays relative to ABias)
@@ -4443,6 +4460,86 @@ begin
   end;
   GHookLoadsReady := true;
   return true;
+end;
+
+// The start of a thread C code started (the pthread_create hook's, DoHookThreadCreate):
+// AParameter is its two-word block from the C heap (C's start routine, then its argument),
+// freed here; the thread key marked so the thread's end is handed on however it ends
+// (DoThreadKeyEnd: its threadstatics released, its fault state given back), its fault state
+// made ready (a stack overflow in it is caught), then C's start routine run: its result is
+// the thread's. With no thread key (pthread_key_create refused) it runs with no fault state,
+// which nothing would give back
+func DoHookThreadProc(AParameter: ptr): ptr;
+var
+  LSlots: ptr to ptr;
+  LStart: PlatformThreadEntry;
+  LArgument: ptr;
+begin
+  LSlots := ptr to ptr(AParameter);
+  LStart := PlatformThreadEntry(LSlots[0]);
+  LArgument := LSlots[1];
+  free(AParameter);
+  pthread_once(ptr(addr of GThreadKeyOnce), DoThreadKeyMake);
+  if GThreadKeyReady then
+    pthread_setspecific(GThreadKey, ptr(ADAM_PLATFORM_THREAD_MARK));
+    DoFaultThreadReady();
+  end;
+  return LStart(LArgument);
+end;
+
+// The internal hook of pthread_create: the thread starts through DoHookThreadProc with C's
+// start routine and argument; one PlatformThreadStart makes (DoThreadProc, which readies its
+// own) goes straight on. glibc's result: 0, else its error number (EAGAIN: no room for the
+// start's block), nothing started
+func DoHookThreadCreate(AThread: ptr to uint64; AAttributes: ptr; AStart: PlatformThreadEntry;
+  AArgument: ptr): int32;
+var
+  LOwn: PlatformThreadEntry;
+  LSlots: ptr to ptr;
+  LCode: int32;
+begin
+  LOwn := DoThreadProc;
+  if ptr(AStart) = ptr(LOwn) then
+    return GHookPthreadCreate(AThread, AAttributes, AStart, AArgument);
+  end;
+  LSlots := ptr to ptr(malloc(16));
+  if LSlots = nil then
+    return ADAM_PLATFORM_EAGAIN;
+  end;
+  LSlots[0] := ptr(AStart);
+  LSlots[1] := AArgument;
+  LOwn := DoHookThreadProc;
+  LCode := GHookPthreadCreate(AThread, AAttributes, LOwn, ptr(LSlots));
+  if LCode <> 0 then
+    free(ptr(LSlots));
+  end;
+  return LCode;
+end;
+
+// pthread_create hooked once, at the runtime's start (PlatformAtFault; an internal hook as
+// dlopen's / dlclose's, which it needs so a C library loaded later is patched too): every
+// thread C code starts through a slot runs DoHookThreadProc first. A user's hook of
+// pthread_create chains onto it (its original is this hook). A call that reaches no slot
+// (inside glibc itself) is not seen
+func DoHookThreads();
+var
+  LCreate: uint64;
+  LHook: PlatformThreadCreate;
+  LEntry: ptr to PlatformHookEntry;
+begin
+  LHook := DoHookThreadCreate;
+  LEntry := nil;
+  pthread_mutex_lock(ptr(addr of GHookRunLock));
+  pthread_mutex_lock(ptr(addr of GHookTableLock));
+  DoHookLoads();
+  LCreate := DoHookOriginal(ptr to const char("pthread_create"));
+  if LCreate <> 0 then
+    // the original is set before any slot reaches the hook
+    GHookPthreadCreate := PlatformThreadCreate(ptr(LCreate));
+    DoHookAddLocked(ptr to const char("pthread_create"), ptr(LHook), true, LCreate, LEntry);
+  end;
+  pthread_mutex_unlock(ptr(addr of GHookTableLock));
+  pthread_mutex_unlock(ptr(addr of GHookRunLock));
 end;
 
 // PlatformHookInstall's work under the run lock: AOriginal and AEntry set when it returns 0
