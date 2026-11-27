@@ -27,7 +27,7 @@ Adam is a Pascal and Oberon inspired, general purpose systems programming langua
 
 Adam's syntax follows Pascal and Oberon: blocks open and close with words, assignment is `:=` and equality is `=`, every control-flow construct carries its own `end`, every statement ends with `;`, and names are declared before they are used.
 
-The compiler reads each module through its own lexer, parser and semantic checker into one syntax tree, lowers it to an SSA form, optimizes it, selects x86_64 instructions, allocates registers, encodes the machine code and writes COFF objects, which its own linker turns into a Windows x64 executable. One source builds an executable (`module exe`). Win64 (x86_64-windows-gnu) is the first target; x86_64-linux-gnu comes next, and every part of the compiler is written with more targets in mind.
+The compiler reads each module through its own lexer, parser and semantic checker into one syntax tree, lowers it to an SSA form, optimizes it, selects x86_64 instructions, allocates registers, encodes the machine code and writes COFF objects, which its own linker turns into a Windows x64 executable. One source builds an executable (`module exe`). Its targets are x86_64-windows-gnu and x86_64-linux-gnu (ELF executables and shared libraries, its own linker too); each host builds for both, and every part of the compiler is written with more targets in mind.
 
 C is reached by declaration, never by include: a routine declared `external` (with C or C++ linkage) is called like any Adam routine, and vendored C static libraries link through Adam's own linker.
 
