@@ -1,0 +1,1030 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.Sign.adam - digital signatures in Adam: Ed25519 (RFC 8032) and
+  minisign's key and signature files over it.
+
+  Ed25519: a 32-byte secret seed gives a 32-byte public key; a signature is
+  64 bytes over any message; Ed25519Verify checks one against the public
+  key (and refuses a non-canonical S, RFC 8032 sec 5.1.7). The arithmetic
+  is the TweetNaCl form (field elements in sixteen 16-bit limbs of int64,
+  a constant-time ladder); its constants are computed values (d, 2d, the
+  base point, sqrt(-1), the group order L), checked by RFC 8032's vectors.
+
+  Minisign (https://jedisct1.github.io/minisign/): a MinisignKey holds a
+  key id, the public key and, for signing, the seed. SignFile writes
+  <file>.minisig in minisign's prehashed form (an Ed25519 signature over
+  the file's BLAKE2b-512 digest, then a global signature over that
+  signature and the trusted comment); VerifyFile checks one (the legacy
+  non-prehashed form too). Public key files and .minisig files are stock
+  minisign's; a secret key file is the unencrypted form StdApp's packer
+  writes ("T1", key id, seed and public key), never minisign's encrypted
+  one. Files are UTF-8 with LF line ends, no BOM.
+
+  Target-neutral (PROJECT AT.3): pure Adam over System.Hash, System.Base64,
+  System.IO and System.CustomIO; the same bytes on every target.
+*******************************************************************************/
+
+module unit System.Sign;
+
+import System.SysUtils, System.IO, System.CustomIO, System.Hash, System.Base64;
+
+type
+  // A field element mod 2^255 - 19: sixteen 16-bit limbs, each held in an int64 so sums and
+  // differences may run past 16 bits until a carry pass (DoCarry) brings them back
+  Field = array[0..15] of int64;
+  // A point in extended coordinates (X, Y, Z, T), x = X / Z, y = Y / Z, x * y = T / Z
+  Point = array[0..3] of Field;
+  // The 64-byte work area of a reduction mod L (each entry a signed byte-sized digit)
+  Wide = array[0..63] of int64;
+
+const
+  // d = -121665 / 121666 mod p, the curve's constant (RFC 8032 sec 5.1)
+  ADAM_SIGN_D: Field = [
+    0x78A3, 0x1359, 0x4DCA, 0x75EB, 0xD8AB, 0x4141, 0x0A4D, 0x0070,
+    0xE898, 0x7779, 0x4079, 0x8CC7, 0xFE73, 0x2B6F, 0x6CEE, 0x5203
+  ];
+  // 2d
+  ADAM_SIGN_D2: Field = [
+    0xF159, 0x26B2, 0x9B94, 0xEBD6, 0xB156, 0x8283, 0x149A, 0x00E0,
+    0xD130, 0xEEF3, 0x80F2, 0x198E, 0xFCE7, 0x56DF, 0xD9DC, 0x2406
+  ];
+  // The base point's x and y (y = 4 / 5)
+  ADAM_SIGN_X: Field = [
+    0xD51A, 0x8F25, 0x2D60, 0xC956, 0xA7B2, 0x9525, 0xC760, 0x692C,
+    0xDC5C, 0xFDD6, 0xE231, 0xC0A4, 0x53FE, 0xCD6E, 0x36D3, 0x2169
+  ];
+  ADAM_SIGN_Y: Field = [
+    0x6658, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666,
+    0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666
+  ];
+  // sqrt(-1) mod p = 2^((p - 1) / 4)
+  ADAM_SIGN_I: Field = [
+    0xA0B0, 0x4A0E, 0x1B27, 0xC4EE, 0xE478, 0xAD2F, 0x1806, 0x2F43,
+    0xD7A7, 0x3DFB, 0x0099, 0x2B4D, 0xDF0B, 0x4FC1, 0x2480, 0x2B83
+  ];
+  // The group order L = 2^252 + 27742317777372353535851937790883648493, little-endian bytes
+  ADAM_SIGN_L: array[0..31] of int64 = [
+    0xED, 0xD3, 0xF5, 0x5C, 0x1A, 0x63, 0x12, 0x58,
+    0xD6, 0x9C, 0xF7, 0xA2, 0xDE, 0xF9, 0xDE, 0x14,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10
+  ];
+  // Sizes: a seed, a public key, a signature (bytes)
+  ADAM_SIGN_SEED_SIZE: int64 = 32;
+  ADAM_SIGN_KEY_SIZE: int64 = 32;
+  ADAM_SIGN_SIGNATURE_SIZE: int64 = 64;
+  // minisign's blobs: a 2-byte tag, an 8-byte key id, then the key or signature
+  ADAM_SIGN_KEY_ID_SIZE: int64 = 8;
+  ADAM_SIGN_PUBLIC_TAG: string = "Ed";
+  ADAM_SIGN_SECRET_TAG: string = "T1";
+  ADAM_SIGN_PREHASHED_TAG: string = "ED";
+  ADAM_SIGN_LEGACY_TAG: string = "Ed";
+  ADAM_SIGN_UNTRUSTED: string = "untrusted comment: ";
+  ADAM_SIGN_TRUSTED: string = "trusted comment: ";
+  // How much of a file is read at a time while it is hashed
+  ADAM_SIGN_READ_SIZE: int64 = 65536;
+
+// ---------------------------------------------------------------------------------------------
+// Bytes
+// ---------------------------------------------------------------------------------------------
+
+// AFirst followed by ASecond
+func DoJoin(const AFirst: ByteArray; const ASecond: ByteArray): ByteArray;
+var
+  LOut: ByteArray;
+  LI: int64;
+begin
+  setlength(LOut, len(AFirst) + len(ASecond));
+  for LI := 0 to len(AFirst) - 1 do
+    LOut[LI] := AFirst[LI];
+  end;
+  for LI := 0 to len(ASecond) - 1 do
+    LOut[len(AFirst) + LI] := ASecond[LI];
+  end;
+  return LOut;
+end;
+
+// ACount bytes of ABytes from AFrom on
+func DoSlice(const ABytes: ByteArray; const AFrom: int64; const ACount: int64): ByteArray;
+var
+  LOut: ByteArray;
+  LI: int64;
+begin
+  setlength(LOut, ACount);
+  for LI := 0 to ACount - 1 do
+    LOut[LI] := ABytes[AFrom + LI];
+  end;
+  return LOut;
+end;
+
+// The UTF-8 bytes of AText
+func DoTextBytes(const AText: string): ByteArray;
+var
+  LOut: ByteArray;
+  LI: int64;
+begin
+  setlength(LOut, len(AText));
+  for LI := 0 to len(AText) - 1 do
+    LOut[LI] := uint8(AText[LI]);
+  end;
+  return LOut;
+end;
+
+// AFirst and ASecond hold the same bytes, compared in constant time (no early exit)
+func DoSame(const AFirst: ByteArray; const ASecond: ByteArray): bool;
+var
+  LDiff: int32;
+  LI: int64;
+begin
+  if len(AFirst) <> len(ASecond) then
+    return false;
+  end;
+  LDiff := 0;
+  for LI := 0 to len(AFirst) - 1 do
+    LDiff := LDiff | (int32(AFirst[LI]) xor int32(ASecond[LI]));
+  end;
+  return LDiff = 0;
+end;
+
+// ---------------------------------------------------------------------------------------------
+// The field mod p = 2^255 - 19
+// ---------------------------------------------------------------------------------------------
+
+// The element AValue (0 or 1)
+func DoFieldOf(const AValue: int64): Field;
+var
+  LOut: Field;
+  LI: int64;
+begin
+  for LI := 0 to 15 do
+    LOut[LI] := 0;
+  end;
+  LOut[0] := AValue;
+  return LOut;
+end;
+
+// One carry pass: every limb back to 16 bits, the top limb's carry folded into the bottom one
+// times 38 (2^256 = 38 mod p); a limb may be negative going in (the shifts are arithmetic)
+func DoCarry(var AO: Field);
+var
+  LCarry: int64;
+  LI: int64;
+begin
+  for LI := 0 to 15 do
+    AO[LI] := AO[LI] + 65536;
+    LCarry := AO[LI] shr 16;
+    if LI < 15 then
+      AO[LI + 1] := AO[LI + 1] + LCarry - 1;
+    else
+      AO[0] := AO[0] + 38 * (LCarry - 1);
+    end;
+    AO[LI] := AO[LI] - (LCarry shl 16);
+  end;
+end;
+
+// AP and AQ swapped when ABit is 1, kept when 0, with no branch on ABit (constant time)
+func DoSelect(var AP: Field; var AQ: Field; const ABit: int64);
+var
+  LMask: int64;
+  LT: int64;
+  LI: int64;
+begin
+  LMask := ~(ABit - 1);
+  for LI := 0 to 15 do
+    LT := LMask & (AP[LI] xor AQ[LI]);
+    AP[LI] := AP[LI] xor LT;
+    AQ[LI] := AQ[LI] xor LT;
+  end;
+end;
+
+// AN's canonical 32 bytes (fully reduced mod p, little-endian)
+func DoPackField(const AN: Field): ByteArray;
+var
+  LT: Field;
+  LM: Field;
+  LBit: int64;
+  LOut: ByteArray;
+  LI: int64;
+  LJ: int64;
+begin
+  LT := AN;
+  DoCarry(LT);
+  DoCarry(LT);
+  DoCarry(LT);
+  // subtract p twice where it fits: LM = LT - p, kept when it did not borrow
+  for LJ := 0 to 1 do
+    LM[0] := LT[0] - 0xFFED;
+    for LI := 1 to 14 do
+      LM[LI] := LT[LI] - 0xFFFF - ((LM[LI - 1] shr 16) & 1);
+      LM[LI - 1] := LM[LI - 1] & 0xFFFF;
+    end;
+    LM[15] := LT[15] - 0x7FFF - ((LM[14] shr 16) & 1);
+    LBit := (LM[15] shr 16) & 1;
+    LM[14] := LM[14] & 0xFFFF;
+    DoSelect(LT, LM, 1 - LBit);
+  end;
+  setlength(LOut, 32);
+  for LI := 0 to 15 do
+    LOut[2 * LI] := uint8(LT[LI] & 0xFF);
+    LOut[2 * LI + 1] := uint8((LT[LI] shr 8) & 0xFF);
+  end;
+  return LOut;
+end;
+
+// AFirst and ASecond are different elements
+func DoFieldsDiffer(const AFirst: Field; const ASecond: Field): bool;
+begin
+  return not DoSame(DoPackField(AFirst), DoPackField(ASecond));
+end;
+
+// AN's low bit once reduced (the sign of x in a packed point)
+func DoParity(const AN: Field): int64;
+var
+  LBytes: ByteArray;
+begin
+  LBytes := DoPackField(AN);
+  return int64(LBytes[0]) & 1;
+end;
+
+// The element in 32 little-endian bytes from AFrom in ABytes (the top bit dropped)
+func DoUnpackField(const ABytes: ByteArray; const AFrom: int64): Field;
+var
+  LOut: Field;
+  LI: int64;
+begin
+  for LI := 0 to 15 do
+    LOut[LI] := int64(ABytes[AFrom + 2 * LI]) + (int64(ABytes[AFrom + 2 * LI + 1]) shl 8);
+  end;
+  LOut[15] := LOut[15] & 0x7FFF;
+  return LOut;
+end;
+
+// AA + AB (limbs not carried)
+func DoFieldAdd(const AA: Field; const AB: Field): Field;
+var
+  LOut: Field;
+  LI: int64;
+begin
+  for LI := 0 to 15 do
+    LOut[LI] := AA[LI] + AB[LI];
+  end;
+  return LOut;
+end;
+
+// AA - AB (limbs not carried)
+func DoFieldSub(const AA: Field; const AB: Field): Field;
+var
+  LOut: Field;
+  LI: int64;
+begin
+  for LI := 0 to 15 do
+    LOut[LI] := AA[LI] - AB[LI];
+  end;
+  return LOut;
+end;
+
+// AA * AB: the schoolbook product in 31 limbs, the upper 15 folded down times 38, two carries
+func DoFieldMul(const AA: Field; const AB: Field): Field;
+var
+  LT: array[0..30] of int64;
+  LOut: Field;
+  LI: int64;
+  LJ: int64;
+begin
+  for LI := 0 to 30 do
+    LT[LI] := 0;
+  end;
+  for LI := 0 to 15 do
+    for LJ := 0 to 15 do
+      LT[LI + LJ] := LT[LI + LJ] + AA[LI] * AB[LJ];
+    end;
+  end;
+  for LI := 0 to 14 do
+    LT[LI] := LT[LI] + 38 * LT[LI + 16];
+  end;
+  for LI := 0 to 15 do
+    LOut[LI] := LT[LI];
+  end;
+  DoCarry(LOut);
+  DoCarry(LOut);
+  return LOut;
+end;
+
+// AA squared
+func DoFieldSquare(const AA: Field): Field;
+begin
+  return DoFieldMul(AA, AA);
+end;
+
+// 1 / AI = AI^(p - 2), by square-and-multiply over p - 2's bits
+func DoFieldInvert(const AI: Field): Field;
+var
+  LC: Field;
+  LA: int64;
+begin
+  LC := AI;
+  for LA := 253 downto 0 do
+    LC := DoFieldSquare(LC);
+    if (LA <> 2) and (LA <> 4) then
+      LC := DoFieldMul(LC, AI);
+    end;
+  end;
+  return LC;
+end;
+
+// AI^((p - 5) / 8), the square root step of point decoding
+func DoFieldPow2523(const AI: Field): Field;
+var
+  LC: Field;
+  LA: int64;
+begin
+  LC := AI;
+  for LA := 250 downto 0 do
+    LC := DoFieldSquare(LC);
+    if LA <> 1 then
+      LC := DoFieldMul(LC, AI);
+    end;
+  end;
+  return LC;
+end;
+
+// ---------------------------------------------------------------------------------------------
+// The curve -x^2 + y^2 = 1 + d x^2 y^2
+// ---------------------------------------------------------------------------------------------
+
+// AP + AQ (the unified addition: also doubles, AP = AQ)
+func DoPointAdd(const AP: Point; const AQ: Point): Point;
+var
+  LA: Field;
+  LB: Field;
+  LC: Field;
+  LD: Field;
+  LE: Field;
+  LF: Field;
+  LG: Field;
+  LH: Field;
+  LOut: Point;
+begin
+  LA := DoFieldMul(DoFieldSub(AP[1], AP[0]), DoFieldSub(AQ[1], AQ[0]));
+  LB := DoFieldMul(DoFieldAdd(AP[0], AP[1]), DoFieldAdd(AQ[0], AQ[1]));
+  LC := DoFieldMul(DoFieldMul(AP[3], AQ[3]), ADAM_SIGN_D2);
+  LD := DoFieldMul(AP[2], AQ[2]);
+  LD := DoFieldAdd(LD, LD);
+  LE := DoFieldSub(LB, LA);
+  LF := DoFieldSub(LD, LC);
+  LG := DoFieldAdd(LD, LC);
+  LH := DoFieldAdd(LB, LA);
+  LOut[0] := DoFieldMul(LE, LF);
+  LOut[1] := DoFieldMul(LH, LG);
+  LOut[2] := DoFieldMul(LG, LF);
+  LOut[3] := DoFieldMul(LE, LH);
+  return LOut;
+end;
+
+// AP and AQ swapped when ABit is 1 (constant time)
+func DoPointSwap(var AP: Point; var AQ: Point; const ABit: int64);
+var
+  LI: int64;
+begin
+  for LI := 0 to 3 do
+    DoSelect(AP[LI], AQ[LI], ABit);
+  end;
+end;
+
+// AP's 32 bytes: y, with x's sign in the top bit
+func DoPackPoint(const AP: Point): ByteArray;
+var
+  LZ: Field;
+  LX: Field;
+  LY: Field;
+  LOut: ByteArray;
+begin
+  LZ := DoFieldInvert(AP[2]);
+  LX := DoFieldMul(AP[0], LZ);
+  LY := DoFieldMul(AP[1], LZ);
+  LOut := DoPackField(LY);
+  LOut[31] := uint8(int64(LOut[31]) xor (DoParity(LX) shl 7));
+  return LOut;
+end;
+
+// AScalar (32 little-endian bytes) times AQ, by a constant-time ladder over its 256 bits
+func DoScalarMult(const AQ: Point; const AScalar: ByteArray): Point;
+var
+  LP: Point;
+  LQ: Point;
+  LBit: int64;
+  LI: int64;
+begin
+  LP[0] := DoFieldOf(0);
+  LP[1] := DoFieldOf(1);
+  LP[2] := DoFieldOf(1);
+  LP[3] := DoFieldOf(0);
+  LQ := AQ;
+  for LI := 255 downto 0 do
+    LBit := (int64(AScalar[LI div 8]) shr (LI & 7)) & 1;
+    DoPointSwap(LP, LQ, LBit);
+    LQ := DoPointAdd(LQ, LP);
+    LP := DoPointAdd(LP, LP);
+    DoPointSwap(LP, LQ, LBit);
+  end;
+  return LP;
+end;
+
+// AScalar times the base point
+func DoScalarBase(const AScalar: ByteArray): Point;
+var
+  LB: Point;
+begin
+  LB[0] := ADAM_SIGN_X;
+  LB[1] := ADAM_SIGN_Y;
+  LB[2] := DoFieldOf(1);
+  LB[3] := DoFieldMul(ADAM_SIGN_X, ADAM_SIGN_Y);
+  return DoScalarMult(LB, AScalar);
+end;
+
+// The point packed in 32 bytes, negated (verification adds -A), into AOut: false when the
+// bytes are no point of the curve
+func DoUnpackNegative(const ABytes: ByteArray; var AOut: Point): bool;
+var
+  LR: Point;
+  LNum: Field;
+  LDen: Field;
+  LDen2: Field;
+  LDen4: Field;
+  LDen6: Field;
+  LT: Field;
+  LCheck: Field;
+begin
+  LR[2] := DoFieldOf(1);
+  LR[1] := DoUnpackField(ABytes, 0);
+  // x^2 = (y^2 - 1) / (d y^2 + 1); x = num den^3 (num den^7)^((p - 5) / 8)
+  LNum := DoFieldSquare(LR[1]);
+  LDen := DoFieldMul(LNum, ADAM_SIGN_D);
+  LNum := DoFieldSub(LNum, LR[2]);
+  LDen := DoFieldAdd(LR[2], LDen);
+  LDen2 := DoFieldSquare(LDen);
+  LDen4 := DoFieldSquare(LDen2);
+  LDen6 := DoFieldMul(LDen4, LDen2);
+  LT := DoFieldMul(LDen6, LNum);
+  LT := DoFieldMul(LT, LDen);
+  LT := DoFieldPow2523(LT);
+  LT := DoFieldMul(LT, LNum);
+  LT := DoFieldMul(LT, LDen);
+  LT := DoFieldMul(LT, LDen);
+  LR[0] := DoFieldMul(LT, LDen);
+  // the root found, or sqrt(-1) times it, or none
+  LCheck := DoFieldMul(DoFieldSquare(LR[0]), LDen);
+  if DoFieldsDiffer(LCheck, LNum) then
+    LR[0] := DoFieldMul(LR[0], ADAM_SIGN_I);
+  end;
+  LCheck := DoFieldMul(DoFieldSquare(LR[0]), LDen);
+  if DoFieldsDiffer(LCheck, LNum) then
+    return false;
+  end;
+  // the x whose sign the top bit does NOT give (the negated point)
+  if DoParity(LR[0]) = (int64(ABytes[31]) shr 7) then
+    LR[0] := DoFieldSub(DoFieldOf(0), LR[0]);
+  end;
+  LR[3] := DoFieldMul(LR[0], LR[1]);
+  AOut := LR;
+  return true;
+end;
+
+// ---------------------------------------------------------------------------------------------
+// Scalars mod L
+// ---------------------------------------------------------------------------------------------
+
+// AX (64 signed digits) reduced mod L, as 32 bytes
+func DoModL(var AX: Wide): ByteArray;
+var
+  LCarry: int64;
+  LOut: ByteArray;
+  LI: int64;
+  LJ: int64;
+begin
+  // fold each top digit down: digit i is worth digit i - 32 times 2^256 = -16 L' (mod L)
+  for LI := 63 downto 32 do
+    LCarry := 0;
+    LJ := LI - 32;
+    while LJ < LI - 12 do
+      AX[LJ] := AX[LJ] + LCarry - 16 * AX[LI] * ADAM_SIGN_L[LJ - (LI - 32)];
+      LCarry := (AX[LJ] + 128) shr 8;
+      AX[LJ] := AX[LJ] - (LCarry shl 8);
+      LJ := LJ + 1;
+    end;
+    AX[LJ] := AX[LJ] + LCarry;
+    AX[LI] := 0;
+  end;
+  // the top nibble of digit 31 taken off as multiples of L, then the borrow put back
+  LCarry := 0;
+  for LJ := 0 to 31 do
+    AX[LJ] := AX[LJ] + LCarry - (AX[31] shr 4) * ADAM_SIGN_L[LJ];
+    LCarry := AX[LJ] shr 8;
+    AX[LJ] := AX[LJ] & 255;
+  end;
+  for LJ := 0 to 31 do
+    AX[LJ] := AX[LJ] - LCarry * ADAM_SIGN_L[LJ];
+  end;
+  setlength(LOut, 32);
+  for LI := 0 to 31 do
+    AX[LI + 1] := AX[LI + 1] + (AX[LI] shr 8);
+    LOut[LI] := uint8(AX[LI] & 255);
+  end;
+  return LOut;
+end;
+
+// A 64-byte digest reduced mod L
+func DoReduce(const ADigest: ByteArray): ByteArray;
+var
+  LX: Wide;
+  LI: int64;
+begin
+  for LI := 0 to 63 do
+    LX[LI] := int64(ADigest[LI]);
+  end;
+  return DoModL(LX);
+end;
+
+// The 32 bytes AS are below L (RFC 8032 sec 5.1.7: a signature's S must be)
+func DoBelowL(const AS: ByteArray): bool;
+var
+  LI: int64;
+begin
+  for LI := 31 downto 0 do
+    if int64(AS[LI]) < ADAM_SIGN_L[LI] then
+      return true;
+    end;
+    if int64(AS[LI]) > ADAM_SIGN_L[LI] then
+      return false;
+    end;
+  end;
+  return false;
+end;
+
+// SHA-512 of the seed with the scalar's bits set as RFC 8032 sec 5.1.5 asks: bytes 0..31 the
+// secret scalar, 32..63 the prefix that makes the nonce
+func DoExpandSeed(const ASeed: ByteArray): ByteArray;
+var
+  LD: ByteArray;
+begin
+  LD := ComputeHash(HashKind.SHA512, ASeed);
+  LD[0] := uint8(int32(LD[0]) & 248);
+  LD[31] := uint8((int32(LD[31]) & 127) | 64);
+  return LD;
+end;
+
+// ---------------------------------------------------------------------------------------------
+// Ed25519
+// ---------------------------------------------------------------------------------------------
+
+/// The Ed25519 public key of a secret seed (RFC 8032 sec 5.1.5).
+/// @param ASeed the 32-byte secret seed (e.g. from `SecureRandomBytes(32, LSeed)`)
+/// @returns the 32-byte public key; empty when the seed is not 32 bytes
+/// @example `LPublic := Ed25519PublicKey(LSeed);`
+public func cpplink Ed25519PublicKey(const ASeed: ByteArray): ByteArray;
+var
+  LEmpty: ByteArray;
+begin
+  if len(ASeed) <> ADAM_SIGN_SEED_SIZE then
+    return LEmpty;
+  end;
+  return DoPackPoint(DoScalarBase(DoSlice(DoExpandSeed(ASeed), 0, 32)));
+end;
+
+/// The Ed25519 signature of a message (RFC 8032 sec 5.1.6): deterministic, the same seed and
+/// message always give the same 64 bytes.
+/// @param AMessage the bytes signed (any length)
+/// @param ASeed the 32-byte secret seed
+/// @returns the 64-byte signature (R then S); empty when the seed is not 32 bytes
+/// @example `LSignature := Ed25519Sign(LMessage, LSeed);`
+public func cpplink Ed25519Sign(const AMessage: ByteArray; const ASeed: ByteArray): ByteArray;
+var
+  LEmpty: ByteArray;
+  LD: ByteArray;
+  LPublic: ByteArray;
+  LNonce: ByteArray;
+  LR: ByteArray;
+  LH: ByteArray;
+  LX: Wide;
+  LI: int64;
+  LJ: int64;
+begin
+  if len(ASeed) <> ADAM_SIGN_SEED_SIZE then
+    return LEmpty;
+  end;
+  LD := DoExpandSeed(ASeed);
+  LPublic := DoPackPoint(DoScalarBase(DoSlice(LD, 0, 32)));
+  // r = H(prefix || M) mod L, R = r B
+  LNonce := DoReduce(ComputeHash(HashKind.SHA512, DoJoin(DoSlice(LD, 32, 32), AMessage)));
+  LR := DoPackPoint(DoScalarBase(LNonce));
+  // k = H(R || A || M) mod L, S = r + k s mod L
+  LH := DoReduce(ComputeHash(HashKind.SHA512, DoJoin(DoJoin(LR, LPublic), AMessage)));
+  for LI := 0 to 63 do
+    LX[LI] := 0;
+  end;
+  for LI := 0 to 31 do
+    LX[LI] := int64(LNonce[LI]);
+  end;
+  for LI := 0 to 31 do
+    for LJ := 0 to 31 do
+      LX[LI + LJ] := LX[LI + LJ] + int64(LH[LI]) * int64(LD[LJ]);
+    end;
+  end;
+  return DoJoin(LR, DoModL(LX));
+end;
+
+/// Checks an Ed25519 signature (RFC 8032 sec 5.1.7): true only for a signature the public
+/// key's seed made over exactly these bytes; a malformed key or signature, or an S not below
+/// the group order, is false.
+/// @param AMessage the bytes that were signed
+/// @param ASignature the 64-byte signature
+/// @param APublicKey the signer's 32-byte public key
+/// @returns the signature is good
+/// @example `if Ed25519Verify(LMessage, LSignature, LPublic) then println("good"); end;`
+public func cpplink Ed25519Verify(const AMessage: ByteArray; const ASignature: ByteArray;
+  const APublicKey: ByteArray): bool;
+var
+  LNegA: Point;
+  LP: Point;
+  LH: ByteArray;
+  LR: ByteArray;
+begin
+  if (len(ASignature) <> ADAM_SIGN_SIGNATURE_SIZE) or (len(APublicKey) <> ADAM_SIGN_KEY_SIZE) then
+    return false;
+  end;
+  if not DoBelowL(DoSlice(ASignature, 32, 32)) then
+    return false;
+  end;
+  if not DoUnpackNegative(APublicKey, LNegA) then
+    return false;
+  end;
+  // S B - k A must be R
+  LR := DoSlice(ASignature, 0, 32);
+  LH := DoReduce(ComputeHash(HashKind.SHA512, DoJoin(DoJoin(LR, APublicKey), AMessage)));
+  LP := DoPointAdd(DoScalarMult(LNegA, LH), DoScalarBase(DoSlice(ASignature, 32, 32)));
+  return DoSame(DoPackPoint(LP), LR);
+end;
+
+// ---------------------------------------------------------------------------------------------
+// minisign
+// ---------------------------------------------------------------------------------------------
+
+// The BLAKE2b-512 digest of the file at APath into ADigest, read in blocks (a release zip is
+// hundreds of MB): false when it cannot be opened or read
+func DoFileDigest(const APath: string; var ADigest: ByteArray): bool;
+var
+  LIO: IO;
+  LHash: Hasher;
+  LBuffer: ByteArray;
+  LGot: int64;
+begin
+  LIO := CreateFileIO(APath, FileMode.Read);
+  if LIO = nil then
+    return false;
+  end;
+  LHash := Hasher(HashKind.BLAKE2B512);
+  setlength(LBuffer, ADAM_SIGN_READ_SIZE);
+  while true do
+    LGot := IORead(LIO, addr of LBuffer[0], ADAM_SIGN_READ_SIZE);
+    if LGot < 0 then
+      IOClose(LIO);
+      return false;
+    end;
+    if LGot = 0 then
+      leave;
+    end;
+    LHash.Update(addr of LBuffer[0], LGot);
+  end;
+  IOClose(LIO);
+  ADigest := LHash.Final();
+  return true;
+end;
+
+// The first line of AText that is neither empty nor a comment, decoded from Base64 into
+// ABlob (a key file's one blob line)
+func DoKeyBlob(const AText: string; var ABlob: ByteArray): bool;
+var
+  LLines: StringArray;
+  LLine: string;
+  LI: int64;
+begin
+  LLines := SplitString(AText, "\n");
+  for LI := 0 to len(LLines) - 1 do
+    LLine := Trim(LLines[LI]);
+    if (LLine <> "") and not StartsStr(ADAM_SIGN_UNTRUSTED, LLine) then
+      return Base64Decode(LLine, ABlob);
+    end;
+  end;
+  return false;
+end;
+
+// ABlob starts with the two-byte tag ATag
+func DoHasTag(const ABlob: ByteArray; const ATag: string): bool;
+begin
+  return (len(ABlob) >= 2) and (ABlob[0] = uint8(ATag[0])) and (ABlob[1] = uint8(ATag[1]));
+end;
+
+public type
+  /// A minisign key: its 8-byte id, its Ed25519 public key and, for signing, its secret seed.
+  /// Make one with `Generate`, or load one (`LoadSecretKey` gives both halves, `LoadPublicKey`
+  /// / `FromPublicKeyText` the public half to verify with). Public key and `.minisig` files are
+  /// stock minisign's (`minisign -V` checks what `SignFile` writes); a secret key file is the
+  /// unencrypted packer form (`T1`, never minisign's encrypted one): keep it private.
+  /// @example `LKey.LoadSecretKey("release.key"); LKey.SignFile("app.zip", "app 1.0", "");`
+  MinisignKey = object
+    // The key id (8 bytes), the public key (32) and the seed (32; empty for a public key alone)
+    hidden Id: ByteArray;
+    hidden PublicBytes: ByteArray;
+    hidden Seed: ByteArray;
+
+    // The blob of tag ATag, the key id, then APayload
+    hidden const method DoBlob(const ATag: string; const APayload: ByteArray): ByteArray;
+    begin
+      return DoJoin(DoJoin(DoTextBytes(ATag), self.Id), APayload);
+    end;
+
+    /// A new key: a random seed and key id from the system's secure generator.
+    /// @returns false when the generator gives no bytes (the key is then empty)
+    method Generate(): bool;
+    var
+      LSeed: ByteArray;
+      LId: ByteArray;
+    begin
+      self.Clear();
+      if not SecureRandomBytes(ADAM_SIGN_SEED_SIZE, LSeed) then
+        return false;
+      end;
+      if not SecureRandomBytes(ADAM_SIGN_KEY_ID_SIZE, LId) then
+        return false;
+      end;
+      self.Id := LId;
+      self.Seed := LSeed;
+      self.PublicBytes := Ed25519PublicKey(LSeed);
+      return true;
+    end;
+
+    /// Forgets the key (no id, no halves).
+    method Clear();
+    var
+      LEmpty: ByteArray;
+    begin
+      self.Id := LEmpty;
+      self.PublicBytes := LEmpty;
+      self.Seed := LEmpty;
+    end;
+
+    /// The key can sign (its secret seed is held).
+    /// @returns a seed is held
+    const method HasSecret(): bool;
+    begin
+      return len(self.Seed) = ADAM_SIGN_SEED_SIZE;
+    end;
+
+    /// The key can verify (its public key is held).
+    /// @returns a public key is held
+    const method HasPublic(): bool;
+    begin
+      return (len(self.PublicBytes) = ADAM_SIGN_KEY_SIZE) and
+        (len(self.Id) = ADAM_SIGN_KEY_ID_SIZE);
+    end;
+
+    /// The key id as minisign prints it: 16 uppercase hex digits, byte by byte.
+    /// @returns the id's text ("" for no key)
+    const method KeyIdText(): string;
+    var
+      LText: string;
+      LI: int64;
+    begin
+      LText := "";
+      for LI := 0 to len(self.Id) - 1 do
+        LText := LText + IntToHex(uint64(self.Id[LI]), 2);
+      end;
+      return UpperCase(LText);
+    end;
+
+    /// The public key as one Base64 line, the form `minisign -P` takes.
+    /// @returns the line ("" when no public key is held)
+    const method PublicKeyText(): string;
+    begin
+      if not self.HasPublic() then
+        return "";
+      end;
+      return Base64Encode(self.DoBlob(ADAM_SIGN_PUBLIC_TAG, self.PublicBytes));
+    end;
+
+    /// Takes the public half from its Base64 line (`PublicKeyText`'s form); the seed is dropped.
+    /// @param AText the line
+    /// @returns false (the key cleared) when the text is no minisign public key
+    method FromPublicKeyText(const AText: string): bool;
+    var
+      LBlob: ByteArray;
+    begin
+      self.Clear();
+      if not Base64Decode(Trim(AText), LBlob) then
+        return false;
+      end;
+      if (len(LBlob) <> 42) or not DoHasTag(LBlob, ADAM_SIGN_PUBLIC_TAG) then
+        return false;
+      end;
+      self.Id := DoSlice(LBlob, 2, 8);
+      self.PublicBytes := DoSlice(LBlob, 10, 32);
+      return true;
+    end;
+
+    /// Writes the public key file (minisign's: an untrusted comment line, the Base64 line).
+    /// @param APath the file (e.g. `release.pub`)
+    /// @returns false when no public key is held or the file cannot be written
+    const method SavePublicKey(const APath: string): bool;
+    begin
+      if not self.HasPublic() then
+        return false;
+      end;
+      return WriteAllText(APath, ADAM_SIGN_UNTRUSTED + "minisign public key " + self.KeyIdText() +
+        "\n" + self.PublicKeyText() + "\n");
+    end;
+
+    /// Reads a public key file (minisign's form).
+    /// @param APath the file
+    /// @returns false (the key cleared) when it cannot be read or holds no public key
+    method LoadPublicKey(const APath: string): bool;
+    var
+      LText: string;
+      LBlob: ByteArray;
+    begin
+      self.Clear();
+      if not ReadAllText(APath, LText) then
+        return false;
+      end;
+      if not DoKeyBlob(LText, LBlob) then
+        return false;
+      end;
+      return self.FromPublicKeyText(Base64Encode(LBlob));
+    end;
+
+    /// Writes the secret key file: `T1`, the key id, the seed and the public key in one
+    /// Base64 line under a comment. It is NOT encrypted: keep the file private.
+    /// @param APath the file (e.g. `release.key`)
+    /// @returns false when no secret is held or the file cannot be written
+    const method SaveSecretKey(const APath: string): bool;
+    var
+      LBlob: ByteArray;
+    begin
+      if not self.HasSecret() then
+        return false;
+      end;
+      LBlob := self.DoBlob(ADAM_SIGN_SECRET_TAG, DoJoin(self.Seed, self.PublicBytes));
+      return WriteAllText(APath, ADAM_SIGN_UNTRUSTED + "minisign secret key " + self.KeyIdText() +
+        "\n" + Base64Encode(LBlob) + "\n");
+    end;
+
+    /// Reads a secret key file (`SaveSecretKey`'s form, StdApp's packer's too): both halves.
+    /// @param APath the file
+    /// @returns false (the key cleared) when it cannot be read, is no such key, or its public
+    /// half is not its seed's
+    method LoadSecretKey(const APath: string): bool;
+    var
+      LText: string;
+      LBlob: ByteArray;
+    begin
+      self.Clear();
+      if not ReadAllText(APath, LText) then
+        return false;
+      end;
+      if not DoKeyBlob(LText, LBlob) then
+        return false;
+      end;
+      if (len(LBlob) <> 74) or not DoHasTag(LBlob, ADAM_SIGN_SECRET_TAG) then
+        return false;
+      end;
+      self.Id := DoSlice(LBlob, 2, 8);
+      self.Seed := DoSlice(LBlob, 10, 32);
+      self.PublicBytes := DoSlice(LBlob, 42, 32);
+      if not DoSame(Ed25519PublicKey(self.Seed), self.PublicBytes) then
+        self.Clear();
+        return false;
+      end;
+      return true;
+    end;
+
+    /// Signs a file: writes `<APath>.minisig` in minisign's prehashed form (the file's
+    /// BLAKE2b-512 digest signed, then a global signature over that signature and the trusted
+    /// comment), the file read in blocks.
+    /// @param APath the file signed
+    /// @param ATrustedComment the signed comment ("" gives `file:<name>` and `hashed`, tab apart)
+    /// @param AUntrustedComment the unsigned first line ("" gives minisign's own wording)
+    /// @returns false when no secret is held, or the file cannot be read or the signature written
+    const method SignFile(const APath: string; const ATrustedComment: string;
+      const AUntrustedComment: string): bool;
+    var
+      LDigest: ByteArray;
+      LSignature: ByteArray;
+      LGlobal: ByteArray;
+      LTrusted: string;
+      LUntrusted: string;
+    begin
+      if not self.HasSecret() then
+        return false;
+      end;
+      if not DoFileDigest(APath, LDigest) then
+        return false;
+      end;
+      LSignature := Ed25519Sign(LDigest, self.Seed);
+      LTrusted := ATrustedComment;
+      if LTrusted = "" then
+        LTrusted := "file:" + ExtractFileName(APath) + "\thashed";
+      end;
+      LUntrusted := AUntrustedComment;
+      if LUntrusted = "" then
+        LUntrusted := "signature from minisign secret key";
+      end;
+      LGlobal := Ed25519Sign(DoJoin(LSignature, DoTextBytes(LTrusted)), self.Seed);
+      return WriteAllText(APath + ".minisig", ADAM_SIGN_UNTRUSTED + LUntrusted + "\n" +
+        Base64Encode(self.DoBlob(ADAM_SIGN_PREHASHED_TAG, LSignature)) + "\n" +
+        ADAM_SIGN_TRUSTED + LTrusted + "\n" + Base64Encode(LGlobal) + "\n");
+    end;
+
+    /// Checks a file against its minisign signature (prehashed `ED`, or the legacy `Ed` form
+    /// over the whole file): the key id must be this key's, both the signature and the global
+    /// signature over the trusted comment must be good.
+    /// @param APath the file
+    /// @param ASignaturePath its signature file ("" means `<APath>.minisig`)
+    /// @returns the file is exactly what this key signed
+    const method VerifyFile(const APath: string; const ASignaturePath: string): bool;
+    var
+      LPath: string;
+      LText: string;
+      LLines: StringArray;
+      LBlob: ByteArray;
+      LGlobal: ByteArray;
+      LSignature: ByteArray;
+      LMessage: ByteArray;
+      LTrusted: string;
+    begin
+      if not self.HasPublic() then
+        return false;
+      end;
+      LPath := ASignaturePath;
+      if LPath = "" then
+        LPath := APath + ".minisig";
+      end;
+      if not ReadAllText(LPath, LText) then
+        return false;
+      end;
+      // untrusted comment, signature blob, trusted comment, global signature
+      LLines := SplitString(ReplaceStr(LText, "\r\n", "\n"), "\n");
+      if len(LLines) < 4 then
+        return false;
+      end;
+      if not StartsStr(ADAM_SIGN_UNTRUSTED, LLines[0]) or
+        not StartsStr(ADAM_SIGN_TRUSTED, LLines[2]) then
+        return false;
+      end;
+      if not Base64Decode(Trim(LLines[1]), LBlob) or
+        not Base64Decode(Trim(LLines[3]), LGlobal) then
+        return false;
+      end;
+      if len(LBlob) <> 74 then
+        return false;
+      end;
+      if not DoSame(DoSlice(LBlob, 2, 8), self.Id) then
+        return false;
+      end;
+      LSignature := DoSlice(LBlob, 10, 64);
+      if DoHasTag(LBlob, ADAM_SIGN_PREHASHED_TAG) then
+        if not DoFileDigest(APath, LMessage) then
+          return false;
+        end;
+      else
+        if not DoHasTag(LBlob, ADAM_SIGN_LEGACY_TAG) then
+          return false;
+        end;
+        if not ReadAllBytes(APath, LMessage) then
+          return false;
+        end;
+      end;
+      if not Ed25519Verify(LMessage, LSignature, self.PublicBytes) then
+        return false;
+      end;
+      LTrusted := Substring(LLines[2], len(ADAM_SIGN_TRUSTED),
+        len(LLines[2]) - len(ADAM_SIGN_TRUSTED));
+      return Ed25519Verify(DoJoin(LSignature, DoTextBytes(LTrusted)), LGlobal, self.PublicBytes);
+    end;
+  end;
+
+end.
