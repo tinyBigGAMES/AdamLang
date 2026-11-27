@@ -16,16 +16,17 @@
   This file is covered by the Adam Runtime Exception
   (RUNTIME-EXCEPTION.md).
 -------------------------------------------------------------------------------
-  System.Hash.adam - message digests: MD5 (RFC 1321), SHA-1 (FIPS 180-4)
-  and SHA-256 (FIPS 180-4), written in Adam.
+  System.Hash.adam - message digests: MD5 (RFC 1321), SHA-1 (FIPS 180-4),
+  SHA-256 (FIPS 180-4) and BLAKE2b-512 (RFC 7693), written in Adam.
 
   A Hasher takes its input in pieces (Update, as often as it comes: a file
   read in blocks, a stream) and gives the digest at Final; ComputeHash is
   the one-call form for bytes or text already in hand. A digest is its raw
-  bytes (16 / 20 / 32); DigestToHex writes it the way tools print it.
+  bytes (16 / 20 / 32 / 64); DigestToHex writes it the way tools print it.
   MD5 and SHA-1 are broken for security (collisions are made at will): use
   them to check data against a known digest or to key a cache, SHA-256 for
-  anything an attacker could choose. CRC-32 is System.Zlib.Ext's ZlibCRC32.
+  anything an attacker could choose (BLAKE2b-512 as well: minisign's
+  signatures sign it, System.Sign). CRC-32 is System.Zlib.Ext's ZlibCRC32.
 
   Target-neutral (PROJECT AT.3): pure Adam over no OS and no C library, so
   every target gives the same digest for the same bytes.
@@ -40,11 +41,38 @@ public type
   /// - `MD5`: 16 bytes (RFC 1321): file checks and cache keys only, never security.
   /// - `SHA1`: 20 bytes (FIPS 180-4): the same caution as MD5 (git's object names use it).
   /// - `SHA256`: 32 bytes (FIPS 180-4): the one to pick when in doubt.
-  HashKind = choices(MD5, SHA1, SHA256);
+  /// - `BLAKE2B512`: 64 bytes (RFC 7693, unkeyed): fast and secure; the digest minisign signs.
+  HashKind = choices(MD5, SHA1, SHA256, BLAKE2B512);
 
 const
-  // Every kind works on 64-byte blocks, the last one padded with its bit length in 8 bytes
+  // MD5 / SHA-1 / SHA-256 work on 64-byte blocks, the last one padded with its bit length in
+  // 8 bytes
   ADAM_HASH_BLOCK_SIZE: int64 = 64;
+  // BLAKE2b works on 128-byte blocks, the last one zero-filled and flagged (RFC 7693 sec 3.3)
+  ADAM_HASH_BLAKE2B_BLOCK_SIZE: int64 = 128;
+  // BLAKE2b's 12 rounds
+  ADAM_HASH_BLAKE2B_ROUNDS: int64 = 12;
+  // BLAKE2b's start state: SHA-512's (RFC 7693 sec 2.6)
+  ADAM_HASH_BLAKE2B_IV: array[0..7] of uint64 = [
+    0x6A09E667F3BCC908, 0xBB67AE8584CAA73B, 0x3C6EF372FE94F82B, 0xA54FF53A5F1D36F1,
+    0x510E527FADE682D1, 0x9B05688C2B3E6C1F, 0x1F83D9ABFB41BD6B, 0x5BE0CD19137E2179
+  ];
+  // The parameter block's first word for an unkeyed 64-byte digest: digest length 64, key
+  // length 0, fanout 1, depth 1 (RFC 7693 sec 2.5), XORed into the first state word
+  ADAM_HASH_BLAKE2B_PARAM: uint64 = 0x01010040;
+  // BLAKE2b's message schedule, 10 rows of 16 (round R uses row R mod 10; RFC 7693 sec 2.7)
+  ADAM_HASH_BLAKE2B_SIGMA: array[0..159] of uint8 = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3,
+    11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4,
+    7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8,
+    9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13,
+    2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9,
+    12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11,
+    13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10,
+    6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5,
+    10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0
+  ];
   ADAM_HASH_LENGTH_AT: int64 = 56;
   // MD5's round constants: floor(abs(sin(i + 1)) * 2^32) (RFC 1321 sec 3.4)
   ADAM_HASH_MD5_K: array[0..63] of uint32 = [
@@ -101,6 +129,26 @@ begin
   return (AValue shr ACount) | (AValue shl (uint32(32) - ACount));
 end;
 
+// AValue rotated right by ACount bits (0 < ACount < 64)
+func DoRotr64(const AValue: uint64; const ACount: uint64): uint64;
+begin
+  return (AValue shr ACount) | (AValue shl (uint64(64) - ACount));
+end;
+
+// BLAKE2b's G (RFC 7693 sec 3.1): mixes AV[AA], AV[AB], AV[AC], AV[AD] with words AX, AY
+func DoBlake2bMix(var AV: array[0..15] of uint64; const AA: int64; const AB: int64;
+  const AC: int64; const AD: int64; const AX: uint64; const AY: uint64);
+begin
+  AV[AA] := AV[AA] + AV[AB] + AX;
+  AV[AD] := DoRotr64(AV[AD] xor AV[AA], 32);
+  AV[AC] := AV[AC] + AV[AD];
+  AV[AB] := DoRotr64(AV[AB] xor AV[AC], 24);
+  AV[AA] := AV[AA] + AV[AB] + AY;
+  AV[AD] := DoRotr64(AV[AD] xor AV[AA], 16);
+  AV[AC] := AV[AC] + AV[AD];
+  AV[AB] := DoRotr64(AV[AB] xor AV[AC], 63);
+end;
+
 public type
   /// A digest made from input given in pieces: make one for a kind, `Update` it with each
   /// piece in order, then `Final` gives the digest and makes it fresh again, ready for the
@@ -112,8 +160,13 @@ public type
     hidden Algorithm: HashKind;
     // The chaining state: MD5 4 words, SHA-1 5, SHA-256 8
     hidden State: array[0..7] of uint32;
-    // The block being filled
-    hidden Block: array[0..63] of uint8;
+    // BLAKE2b's chaining state (its words are 64 bits)
+    hidden Wide: array[0..7] of uint64;
+    // BLAKE2b's byte counter t, low and high words (RFC 7693 sec 3.2: 128 bits)
+    hidden Counter: uint64;
+    hidden CounterHigh: uint64;
+    // The block being filled (64 bytes used by MD5 / SHA, 128 by BLAKE2b)
+    hidden Block: array[0..127] of uint8;
     // The bytes of Block filled so far (below ADAM_HASH_BLOCK_SIZE between calls)
     hidden Filled: int64;
     // The bytes taken since the start (the padding's length field counts them in bits)
@@ -266,6 +319,59 @@ public type
       end;
     end;
 
+    // BLAKE2b's compression F (RFC 7693 sec 3.2) over Block, ACount of its bytes being input
+    // (the counter grows by them); ALast flags the final block
+    hidden method DoBlake2b(const ACount: int64; const ALast: bool);
+    var
+      LM: array[0..15] of uint64;
+      LV: array[0..15] of uint64;
+      // the round's 16 message words in its schedule's order
+      LW: array[0..15] of uint64;
+      LRow: int64;
+      LRound: int64;
+      LI: int64;
+      LB: int64;
+    begin
+      // the 128-bit counter: a carry into the high word when the low one wraps
+      self.Counter := self.Counter + uint64(ACount);
+      if self.Counter < uint64(ACount) then
+        self.CounterHigh := self.CounterHigh + 1;
+      end;
+      // the block's 16 words, little-endian
+      for LI := 0 to 15 do
+        LM[LI] := 0;
+        for LB := 7 downto 0 do
+          LM[LI] := (LM[LI] shl 8) | uint64(self.Block[LI * 8 + LB]);
+        end;
+      end;
+      for LI := 0 to 7 do
+        LV[LI] := self.Wide[LI];
+        LV[LI + 8] := ADAM_HASH_BLAKE2B_IV[LI];
+      end;
+      LV[12] := LV[12] xor self.Counter;
+      LV[13] := LV[13] xor self.CounterHigh;
+      if ALast then
+        LV[14] := ~LV[14];
+      end;
+      for LRound := 0 to ADAM_HASH_BLAKE2B_ROUNDS - 1 do
+        LRow := (LRound mod 10) * 16;
+        for LI := 0 to 15 do
+          LW[LI] := LM[ADAM_HASH_BLAKE2B_SIGMA[LRow + LI]];
+        end;
+        DoBlake2bMix(LV, 0, 4, 8, 12, LW[0], LW[1]);
+        DoBlake2bMix(LV, 1, 5, 9, 13, LW[2], LW[3]);
+        DoBlake2bMix(LV, 2, 6, 10, 14, LW[4], LW[5]);
+        DoBlake2bMix(LV, 3, 7, 11, 15, LW[6], LW[7]);
+        DoBlake2bMix(LV, 0, 5, 10, 15, LW[8], LW[9]);
+        DoBlake2bMix(LV, 1, 6, 11, 12, LW[10], LW[11]);
+        DoBlake2bMix(LV, 2, 7, 8, 13, LW[12], LW[13]);
+        DoBlake2bMix(LV, 3, 4, 9, 14, LW[14], LW[15]);
+      end;
+      for LI := 0 to 7 do
+        self.Wide[LI] := self.Wide[LI] xor LV[LI] xor LV[LI + 8];
+      end;
+    end;
+
     // The full Block through this kind's compression
     hidden method DoCompress();
     begin
@@ -284,12 +390,25 @@ public type
     var
       LI: int64;
     begin
-      for LI := 0 to ACount - 1 do
-        self.Block[self.Filled] := AData[LI];
-        self.Filled := self.Filled + 1;
-        if self.Filled = ADAM_HASH_BLOCK_SIZE then
-          self.DoCompress();
-          self.Filled := 0;
+      if self.Algorithm = HashKind.BLAKE2B512 then
+        // BLAKE2b flags its last block, so a full block is compressed only once more input
+        // comes: Final always finds the last one (full or not) still in Block
+        for LI := 0 to ACount - 1 do
+          if self.Filled = ADAM_HASH_BLAKE2B_BLOCK_SIZE then
+            self.DoBlake2b(ADAM_HASH_BLAKE2B_BLOCK_SIZE, false);
+            self.Filled := 0;
+          end;
+          self.Block[self.Filled] := AData[LI];
+          self.Filled := self.Filled + 1;
+        end;
+      else
+        for LI := 0 to ACount - 1 do
+          self.Block[self.Filled] := AData[LI];
+          self.Filled := self.Filled + 1;
+          if self.Filled = ADAM_HASH_BLOCK_SIZE then
+            self.DoCompress();
+            self.Filled := 0;
+          end;
         end;
       end;
       self.Total := self.Total + uint64(ACount);
@@ -314,7 +433,11 @@ public type
     begin
       for LK := 0 to 7 do
         self.State[LK] := 0;
+        self.Wide[LK] := ADAM_HASH_BLAKE2B_IV[LK];
       end;
+      self.Wide[0] := self.Wide[0] xor ADAM_HASH_BLAKE2B_PARAM;
+      self.Counter := 0;
+      self.CounterHigh := 0;
       match self.Algorithm of
         HashKind.MD5, HashKind.SHA1:
           self.State[0] := 0x67452301;
@@ -385,14 +508,30 @@ public type
     end;
 
     /// The digest of all the input so far; the hasher then starts over (same kind).
-    /// @returns the digest's bytes: 16 for MD5, 20 for SHA-1, 32 for SHA-256
+    /// @returns the digest's bytes: 16 for MD5, 20 for SHA-1, 32 for SHA-256, 64 for BLAKE2b-512
     method Final(): ByteArray;
     var
       LBits: uint64;
       LDigest: ByteArray;
       LWords: int64;
+      LCount: int64;
       LI: int64;
     begin
+      if self.Algorithm = HashKind.BLAKE2B512 then
+        // the last block zero-filled (the zeros never counted) and flagged; the digest is the
+        // state little-endian
+        LCount := self.Filled;
+        for LI := LCount to ADAM_HASH_BLAKE2B_BLOCK_SIZE - 1 do
+          self.Block[LI] := 0;
+        end;
+        self.DoBlake2b(LCount, true);
+        setlength(LDigest, 64);
+        for LI := 0 to 63 do
+          LDigest[LI] := uint8((self.Wide[LI div 8] shr uint64(8 * (LI mod 8))) & 0xFF);
+        end;
+        self.Reset();
+        return LDigest;
+      end;
       LBits := self.Total * 8;
       // 0x80, zeros up to the length field, then the bit length in 8 bytes (MD5 little-endian,
       // SHA big-endian): the length field always ends a block
