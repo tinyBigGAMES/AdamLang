@@ -50,7 +50,13 @@
   reading from the start again. CreateZipFileIO opens one entry of an
   archive; GetZipEntryInfo reads an entry's size and CRC-32 without opening
   it. minizip (System.Minizip.C) reads the archive through the IO, zlib
-  (System.Zlib.C) inflates in place, ZipCrypto is decrypted here.
+  (System.Zlib.C) inflates in place, ZipCrypto is decrypted here. ZipTest
+  tests a whole archive as `unzip -t` does.
+
+  The write side: a ZipWriter writes an archive entry by entry (Open,
+  AddFile with its method (deflated or stored), a Unix mode (made by Unix,
+  the mode in the external attributes) and a ZipCrypto password, Close);
+  ZipDirectoryContents packs a whole folder through it.
 
   Target-neutral: files and folders through System.Runtime's file-handle and
   path routines, no OS named. Outside the compiler's dependency path (not in
@@ -199,6 +205,14 @@ const
   ADAM_CUSTOMIO_ZIP_WRITE_CHUNK: int64 = 65536;
   ADAM_CUSTOMIO_ZIP_UTF8_FLAG: uint32 = 2048;
   ADAM_CUSTOMIO_ZIP64_LIMIT: int64 = 4294967295;
+  // An entry given a Unix mode is made by Unix (APPNOTE 4.4.2: the high byte 3) to zip
+  // spec 2.0 (the low byte 20), its external attributes' high 16 bits the file's st_mode:
+  // ADAM_CUSTOMIO_ZIP_UNIX_FILE (a regular file, S_IFREG's value) with the permission bits
+  // under ADAM_CUSTOMIO_ZIP_UNIX_MODE_MASK (octal 7777: rwx for all three, setuid, setgid,
+  // sticky), as Info-ZIP's zip writes them
+  ADAM_CUSTOMIO_ZIP_UNIX_MADE_BY: uint32 = 0x0314;
+  ADAM_CUSTOMIO_ZIP_UNIX_FILE: uint32 = 0x8000;
+  ADAM_CUSTOMIO_ZIP_UNIX_MODE_MASK: uint32 = 0x0FFF;
   // CP437's characters 0x80 .. 0xFF as Unicode code points, indexed by the byte (a name
   // without the UTF-8 flag is CP437, APPNOTE appendix D; the values are Python's cp437 codec)
   ADAM_CUSTOMIO_ZIP_CP437: array[128..255] of uint32 = [
@@ -3336,8 +3350,9 @@ public type
   ZipProgress = func(const AUserData: ptr; const AEntry: string; const APercent: int32;
     const ANewFile: bool);
 
-var
-  // Why the last ZipDirectoryContents failed ("" when it succeeded): its step and the path
+threadstatic
+  // Why the last ZipDirectoryContents or ZipTest on this thread failed ("" when it
+  // succeeded): its step and the path; per thread, so threads zipping at once never mix them
   GZipLastError: string;
 
 // Records AText as the reason the zip write failed; false, for `return DoZipWriteFail(...)`
@@ -3557,11 +3572,19 @@ begin
   end;
 end;
 
+// Records AText in AError as why a zip write or test failed; false, for
+// `return DoZipFail(AError, ...)`
+func DoZipFail(var AError: string; const AText: string): bool;
+begin
+  AError := AText;
+  return false;
+end;
+
 // AIO's CRC-32 and size, read through from its start in ABuffer's chunks, then AIO set back
-// to its start (the password header needs the CRC before the data); false (the reason
-// recorded) when the file APath cannot be read
+// to its start (the password header needs the CRC before the data); false (the reason in
+// AError) when the file APath cannot be read
 func DoZipFileCRC(const AIO: IO; const APath: string; const ABuffer: ptr to uint8;
-  var ACRC: uint32; var ASize: int64): bool;
+  var ACRC: uint32; var ASize: int64; var AError: string): bool;
 var
   LGot: int64;
 begin
@@ -3577,25 +3600,37 @@ begin
   end;
   // The last read stopped short: at the end (EOF) or on an error
   if IOStatus(AIO) = IOState.Error then
-    return DoZipWriteFail("cannot read " + APath);
+    return DoZipFail(AError, "cannot read " + APath);
   end;
   if IOSeek(AIO, 0, SeekOrigin.FromStart) <> 0 then
-    return DoZipWriteFail("cannot read " + APath + " again");
+    return DoZipFail(AError, "cannot read " + APath + " again");
   end;
   return true;
 end;
 
-// Begins the entry AName for the file APath in AZip: deflated at the best level, its file's
-// date, ZipCrypto with APassword ("" for none) over ACRC, bit 11 for a name that is
-// not ASCII, ZIP64 for ASize bytes past the 32-bit sizes. False (the reason recorded) when
-// minizip refuses it
+public type
+  /// How a `ZipWriter` stores an entry's bytes: `Deflate` (deflated at the best level) or
+  /// `Store` (as they are: for files that are compressed already, such as `.png` or `.ogg`).
+  ZipEntryMethod = choices(Deflate, Store);
+
+// Begins the entry AName for the file APath in AZip: by AMethod, its file's date, ZipCrypto
+// with APassword ("" for none) over ACRC, bit 11 for a name that is not ASCII, ZIP64 for
+// ASize bytes past the 32-bit sizes. AUnixMode 0 leaves the entry made by MS-DOS (minizip's
+// default, no attributes); any other value makes it made by Unix with a regular file of those
+// permission bits in the high half of its external attributes, as Info-ZIP writes it, so
+// unzip on Linux gives the file that mode. False (the reason in AError) when minizip refuses
+// it
 func DoZipOpenEntry(const AZip: zipFile; const APath: string; const AName: string;
-  const APassword: string; const ACRC: uint32; const ASize: int64): bool;
+  const AMethod: ZipEntryMethod; const AUnixMode: uint32; const APassword: string;
+  const ACRC: uint32; const ASize: int64; var AError: string): bool;
 var
   LPassword: CString;
   LInfo: zip_fileinfo;
   LFlags: uint32;
   LZip64: int32;
+  LMadeBy: uint32;
+  LMethod: int32;
+  LLevel: int32;
   LResult: int32;
 begin
   DoZero(ptr to uint8(ptr(addr of LInfo)), size(zip_fileinfo));
@@ -3608,24 +3643,36 @@ begin
   if ASize >= ADAM_CUSTOMIO_ZIP64_LIMIT then
     LZip64 := 1;
   end;
+  LMadeBy := 0;
+  if AUnixMode <> 0 then
+    LMadeBy := ADAM_CUSTOMIO_ZIP_UNIX_MADE_BY;
+    LInfo.external_fa := uLong((ADAM_CUSTOMIO_ZIP_UNIX_FILE |
+      (AUnixMode & ADAM_CUSTOMIO_ZIP_UNIX_MODE_MASK)) shl 16);
+  end;
+  LMethod := Z_DEFLATED;
+  LLevel := Z_BEST_COMPRESSION;
+  if AMethod = ZipEntryMethod.Store then
+    LMethod := 0;
+    LLevel := 0;
+  end;
   // minizip takes nil for no password
   LPassword := CString(APassword);
   LResult := zipOpenNewFileInZip4_64(AZip, AName, addr of LInfo, nil, 0,
-    nil, 0, nil, Z_DEFLATED, Z_BEST_COMPRESSION, 0, -MAX_WBITS, DEF_MEM_LEVEL,
-    Z_DEFAULT_STRATEGY, LPassword.OrNil, uLong(ACRC), 0, uLong(LFlags), LZip64);
+    nil, 0, nil, LMethod, LLevel, 0, -MAX_WBITS, DEF_MEM_LEVEL,
+    Z_DEFAULT_STRATEGY, LPassword.OrNil, uLong(ACRC), uLong(LMadeBy), uLong(LFlags), LZip64);
   if LResult <> ZIP_OK then
-    return DoZipWriteFail("cannot start the entry " + AName + " in the archive");
+    return DoZipFail(AError, "cannot start the entry " + AName + " in the archive");
   end;
   return true;
 end;
 
 // AIO's bytes (ASize of them, its CRC taken already) written into the entry AName begun in
 // AZip, the progress reported before the first byte and after each chunk. False (the reason
-// recorded) when a write fails, the file APath cannot be read, or it is no longer ASize
+// in AError) when a write fails, the file APath cannot be read, or it is no longer ASize
 // bytes long (it changed between the two reads)
 func DoZipEntryData(const AZip: zipFile; const AIO: IO; const APath: string;
   const AName: string; const ABuffer: ptr to uint8; const ASize: int64;
-  const AProgress: ZipProgress; const AUserData: ptr): bool;
+  const AProgress: ZipProgress; const AUserData: ptr; var AError: string): bool;
 var
   LGot: int64;
   LDone: int64;
@@ -3637,22 +3684,22 @@ begin
     LGot := IOReadFull(AIO, ptr(ABuffer), ADAM_CUSTOMIO_ZIP_WRITE_CHUNK);
     if LGot > 0 then
       if zipWriteInFileInZip(AZip, ptr(ABuffer), uint32(LGot)) <> ZIP_OK then
-        return DoZipWriteFail("cannot write the entry " + AName + " into the archive");
+        return DoZipFail(AError, "cannot write the entry " + AName + " into the archive");
       end;
       LDone := LDone + LGot;
       // Past ASize the file grew: it is no longer the file whose CRC was taken
       if LDone > ASize then
-        return DoZipWriteFail(APath + " changed while it was packed");
+        return DoZipFail(AError, APath + " changed while it was packed");
       end;
       // ASize > 0 here: LDone is above 0 and at most ASize
       DoZipReport(AProgress, AUserData, AName, int32((LDone * 100) div ASize), false);
     end;
   end;
   if IOStatus(AIO) = IOState.Error then
-    return DoZipWriteFail("cannot read " + APath);
+    return DoZipFail(AError, "cannot read " + APath);
   end;
   if LDone <> ASize then
-    return DoZipWriteFail(APath + " changed while it was packed");
+    return DoZipFail(AError, APath + " changed while it was packed");
   end;
   if ASize = 0 then
     DoZipReport(AProgress, AUserData, AName, 100, false);
@@ -3660,33 +3707,35 @@ begin
   return true;
 end;
 
-// Writes the file APath as the entry AName: its CRC read in a first pass, then the entry
-// begun and its bytes written, the entry always closed once begun. False (the reason
-// recorded) when the file cannot be read, changed between the passes, or the entry cannot
-// be written
+// Writes the file APath as the entry AName (AMethod, AUnixMode, APassword as DoZipOpenEntry
+// takes them): its CRC read in a first pass, then the entry begun and its bytes written, the
+// entry always closed once begun; its CRC and size in ACRC / ASize. False (the reason in
+// AError) when the file cannot be read, changed between the passes, or the entry cannot be
+// written
 func DoZipAddFile(const AZip: zipFile; const APath: string; const AName: string;
-  const APassword: string; const ABuffer: ptr to uint8; const AProgress: ZipProgress;
-  const AUserData: ptr): bool;
+  const AMethod: ZipEntryMethod; const AUnixMode: uint32; const APassword: string;
+  const ABuffer: ptr to uint8; const AProgress: ZipProgress; const AUserData: ptr;
+  var ACRC: uint32; var ASize: int64; var AError: string): bool;
 var
   LIO: IO;
-  LCRC: uint32;
-  LSize: int64;
   LOk: bool;
   LClosed: int32;
 begin
   LIO := DoOpenFile(APath, FileMode.Read);
   if LIO = nil then
-    return DoZipWriteFail("cannot open " + APath);
+    return DoZipFail(AError, "cannot open " + APath);
   end;
-  LOk := DoZipFileCRC(LIO, APath, ABuffer, LCRC, LSize);
+  LOk := DoZipFileCRC(LIO, APath, ABuffer, ACRC, ASize, AError);
   if LOk then
-    LOk := DoZipOpenEntry(AZip, APath, AName, APassword, LCRC, LSize);
+    LOk := DoZipOpenEntry(AZip, APath, AName, AMethod, AUnixMode, APassword, ACRC, ASize,
+      AError);
     if LOk then
-      LOk := DoZipEntryData(AZip, LIO, APath, AName, ABuffer, LSize, AProgress, AUserData);
+      LOk := DoZipEntryData(AZip, LIO, APath, AName, ABuffer, ASize, AProgress, AUserData,
+        AError);
       // Called whatever the writes gave: a begun entry is always closed
       LClosed := zipCloseFileInZip(AZip);
       if (LClosed <> ZIP_OK) and LOk then
-        LOk := DoZipWriteFail("cannot finish the entry " + AName + " in the archive");
+        LOk := DoZipFail(AError, "cannot finish the entry " + AName + " in the archive");
       end;
     end;
   end;
@@ -3694,98 +3743,238 @@ begin
   return LOk;
 end;
 
-// Every file of AFiles (full paths, each starting with the root's APrefixCount-byte prefix,
-// which the entry's name drops) added to AZip in order; false (the reason recorded) at the
-// first that fails
-func DoZipWriteEntries(const AZip: zipFile; const AFiles: StringArray;
-  const APrefixCount: int64; const APassword: string; const ABuffer: ptr to uint8;
-  const AProgress: ZipProgress; const AUserData: ptr): bool;
+type
+  // An open ZipWriter's state, on the heap (minizip's stream and opaque pointers point into
+  // it, so it never moves): the bridge's archive record (this writer's own, Owned false:
+  // the file IO is closed here), the bridge, minizip's file table and handle, the chunk buffer
+  ZipWriterData = record
+    Archive: ZipArchiveData;
+    Bridge: ZipBridgeData;
+    Funcs: zlib_filefunc64_def;
+    Stream: IO;
+    Zip: zipFile;
+    Buffer: ptr to uint8;
+  end;
+
+// Closes and frees an open writer's state: minizip's archive (its central directory written),
+// the file IO, the buffer. AData is nil after; false (the reason in AError, APath the
+// archive's path) when the directory or the file could not be finished
+func DoZipWriterFree(var AData: ptr to ZipWriterData; const APath: string;
+  var AError: string): bool;
 var
+  LOk: bool;
+begin
+  LOk := true;
+  if AData->Zip <> nil then
+    if zipClose(AData->Zip, nil) <> ZIP_OK then
+      LOk := DoZipFail(AError, "cannot finish the archive " + APath + " (its directory)");
+    end;
+  end;
+  if not IOClose(AData->Stream) and LOk then
+    LOk := DoZipFail(AError, "cannot finish the archive " + APath);
+  end;
+  if AData->Buffer <> nil then
+    freemem(AData->Buffer);
+  end;
+  destroy(AData);
+  return LOk;
+end;
+
+public type
+  /// A zip archive written entry by entry (the one zip writer of the std: `ZipDirectoryContents`
+  /// and System.Pack write through it). `Open` makes a new archive (an existing one is
+  /// replaced), each `AddFile` adds a file as a named entry, `Close` writes the central
+  /// directory. Every entry gets its file's modification time; a name that is not ASCII is
+  /// stored as UTF-8 (general purpose bit 11), a file of 4 GB or more as ZIP64. Paths are UTF-8
+  /// as `CreateFileIO` takes them (`$P:`, `$D:`, `$S:`). An archive still open when the writer
+  /// goes is closed then (its result lost: call `Close` to know it).
+  /// @example `LZip.Open("out.zip"); LZip.AddFile("bin/adam", "bin/adam", ZipEntryMethod.Deflate, 0x1ED, "", nil, nil); LZip.Close();`
+  ZipWriter = object
+    // The open archive's state (nil when none is open), its path as given, why the last call
+    // failed, the last entry's CRC-32 and size
+    hidden Data: ptr to ZipWriterData;
+    hidden Path: string;
+    hidden LastError: string;
+    hidden LastCRC: uint32;
+    hidden LastSize: int64;
+
+    init();
+    begin
+      self.Data := nil;
+      self.Path := "";
+      self.LastError := "";
+      self.LastCRC := 0;
+      self.LastSize := 0;
+    end;
+
+    /// Begins a new archive at `APath`, replacing a file there; its folder must exist.
+    /// @param APath the archive's path
+    /// @returns false (the reason in `ErrorText`) when an archive is open already, the file
+    /// cannot be created or there is no room
+    method Open(const APath: string): bool;
+    var
+      LIO: IO;
+      LData: ptr to ZipWriterData;
+    begin
+      self.LastError := "";
+      if self.Data <> nil then
+        return DoZipFail(self.LastError, "an archive is open already: " + self.Path);
+      end;
+      LIO := DoOpenFile(APath, FileMode.Write);
+      if LIO = nil then
+        return DoZipFail(self.LastError, "cannot create the archive " + APath);
+      end;
+      // create zeroes it: every field nil, 0 or false until set
+      create(LData);
+      if LData = nil then
+        IOClose(LIO);
+        return DoZipFail(self.LastError, "out of memory");
+      end;
+      LData->Stream := LIO;
+      LData->Buffer := ptr to uint8(getmem(ADAM_CUSTOMIO_ZIP_WRITE_CHUNK));
+      if LData->Buffer = nil then
+        DoZipWriterFree(LData, APath, self.LastError);
+        return DoZipFail(self.LastError, "out of memory");
+      end;
+      // The bridge's archive record is the writer's own: nothing else holds it, so it is
+      // never let go through DoZipLetGo, and the IO is closed by DoZipWriterFree
+      LData->Archive.Stream := LIO;
+      LData->Archive.Owned := false;
+      LData->Archive.Refs := 1;
+      LData->Bridge.Archive := addr of LData->Archive;
+      LData->Bridge.Failed := false;
+      LData->Funcs.zopen64_file := ZipBridgeOpen;
+      LData->Funcs.zread_file := ZipBridgeRead;
+      LData->Funcs.zwrite_file := ZipBridgeWrite;
+      LData->Funcs.ztell64_file := ZipBridgeTell;
+      LData->Funcs.zseek64_file := ZipBridgeSeek;
+      LData->Funcs.zclose_file := ZipBridgeClose;
+      LData->Funcs.zerror_file := ZipBridgeError;
+      LData->Funcs.opaque := ptr(addr of LData->Bridge);
+      // The path is unused: the bridge's open hands back the open archive
+      LData->Zip := zipOpen2_64(ptr to const char(""), APPEND_STATUS_CREATE, nil,
+        addr of LData->Funcs);
+      if LData->Zip = nil then
+        DoZipWriterFree(LData, APath, self.LastError);
+        return DoZipFail(self.LastError, "cannot create the archive " + APath);
+      end;
+      self.Data := LData;
+      self.Path := APath;
+      return true;
+    end;
+
+    /// Adds the file `APath` as the entry `AName`: its CRC read in a first pass, then its bytes.
+    /// @param APath the file
+    /// @param AName the entry's name in the archive (UTF-8, `/` between folders)
+    /// @param AMethod `Deflate` or `Store`
+    /// @param AUnixMode 0: an entry made by MS-DOS with no attributes; else the Unix permission
+    ///   bits of a regular file (`0x1ED` = octal 755; at most `0xFFF` = octal 7777), the entry
+    ///   made by Unix, so unzip on Linux gives the file that mode
+    /// @param APassword ZipCrypto's password ("" for none)
+    /// @param AProgress called for the entry's progress (`ZipProgress`), nil for none
+    /// @param AUserData handed to `AProgress`
+    /// @returns false (the reason in `ErrorText`) when no archive is open, the file cannot be
+    ///   read, changed between the passes, or the entry cannot be written (the archive stays
+    ///   open, incomplete: `Close` it)
+    method AddFile(const APath: string; const AName: string; const AMethod: ZipEntryMethod;
+      const AUnixMode: uint32; const APassword: string; const AProgress: ZipProgress;
+      const AUserData: ptr): bool;
+    begin
+      self.LastError := "";
+      self.LastCRC := 0;
+      self.LastSize := 0;
+      if self.Data = nil then
+        return DoZipFail(self.LastError, "no archive is open");
+      end;
+      return DoZipAddFile(self.Data->Zip, APath, AName, AMethod, AUnixMode, APassword,
+        self.Data->Buffer, AProgress, AUserData, self.LastCRC, self.LastSize, self.LastError);
+    end;
+
+    /// Adds the file `APath` as the entry `AName`, deflated, no mode, no password, no progress.
+    /// @param APath the file
+    /// @param AName the entry's name in the archive
+    /// @returns false (the reason in `ErrorText`) as the full `AddFile`
+    method AddFile(const APath: string; const AName: string): bool;
+    begin
+      return self.AddFile(APath, AName, ZipEntryMethod.Deflate, 0, "", nil, nil);
+    end;
+
+    /// Finishes the open archive: its central directory written, the file closed.
+    /// @returns false (the reason in `ErrorText`) when no archive is open, or the directory or
+    ///   the file cannot be finished (the archive is then incomplete); the writer is closed
+    ///   either way
+    method Close(): bool;
+    begin
+      self.LastError := "";
+      if self.Data = nil then
+        return DoZipFail(self.LastError, "no archive is open");
+      end;
+      return DoZipWriterFree(self.Data, self.Path, self.LastError);
+    end;
+
+    done;
+    begin
+      if self.Data <> nil then
+        self.Close();
+      end;
+    end;
+
+    /// True while an archive is open (between a good `Open` and `Close`).
+    const method IsOpen(): bool;
+    begin
+      return self.Data <> nil;
+    end;
+
+    /// Why the last `Open`, `AddFile` or `Close` failed: the step and the path; "" after a
+    /// success.
+    const method ErrorText(): string;
+    begin
+      return self.LastError;
+    end;
+
+    /// The CRC-32 of the file the last good `AddFile` wrote (0 before any).
+    const method EntryCRC(): uint32;
+    begin
+      return self.LastCRC;
+    end;
+
+    /// The size in bytes of the file the last good `AddFile` wrote (0 before any).
+    const method EntrySize(): int64;
+    begin
+      return self.LastSize;
+    end;
+  end;
+
+// The listed AFiles written into AArchive (full paths; ARoot the full root, whose prefix the
+// entry names drop) through a ZipWriter, deflated with APassword; false (the reason in
+// GZipLastError) at the first step that fails, the archive closed either way
+func DoZipWrite(const AArchive: string; const ARoot: string; const AFiles: StringArray;
+  const APassword: string; const AProgress: ZipProgress; const AUserData: ptr): bool;
+var
+  LWriter: ZipWriter;
+  LPrefix: int64;
   LI: int64;
   LPath: string;
   LName: string;
 begin
+  if not LWriter.Open(AArchive) then
+    return DoZipWriteFail(LWriter.ErrorText());
+  end;
+  LPrefix := len(DoZipFolderPrefix(ARoot));
   for LI := 0 to len(AFiles) - 1 do
     LPath := AFiles[LI];
-    LName := Substring(LPath, APrefixCount, len(LPath) - APrefixCount);
-    if not DoZipAddFile(AZip, LPath, LName, APassword, ABuffer, AProgress, AUserData) then
+    LName := Substring(LPath, LPrefix, len(LPath) - LPrefix);
+    if not LWriter.AddFile(LPath, LName, ZipEntryMethod.Deflate, 0, APassword, AProgress,
+      AUserData) then
+      DoZipWriteFail(LWriter.ErrorText());
+      LWriter.Close();
       return false;
     end;
   end;
+  if not LWriter.Close() then
+    return DoZipWriteFail(LWriter.ErrorText());
+  end;
   return true;
-end;
-
-// The archive AArchive (a full path) written new with AFiles' entries through minizip's zip
-// side over a file IO and the bridge; the archive is always closed once begun. False (the
-// reason recorded) when it cannot be created, an entry fails, or its directory cannot be
-// written (an archive begun is then incomplete)
-func DoZipWriteArchive(const AArchive: string; const AFiles: StringArray;
-  const APrefixCount: int64; const APassword: string; const ABuffer: ptr to uint8;
-  const AProgress: ZipProgress; const AUserData: ptr): bool;
-var
-  LIO: IO;
-  LArchive: ZipArchiveData;
-  LBridge: ZipBridgeData;
-  LFuncs: zlib_filefunc64_def;
-  LZip: zipFile;
-  LOk: bool;
-  LClosed: int32;
-begin
-  LIO := DoOpenFile(AArchive, FileMode.Write);
-  if LIO = nil then
-    return DoZipWriteFail("cannot create the archive " + AArchive);
-  end;
-  // The bridge's archive record is this routine's own: nothing else holds it, so it is
-  // never let go through DoZipLetGo, and the IO is closed here
-  LArchive.Stream := LIO;
-  LArchive.Owned := false;
-  LArchive.Refs := 1;
-  LBridge.Archive := addr of LArchive;
-  LBridge.Failed := false;
-  DoZero(ptr to uint8(ptr(addr of LFuncs)), size(zlib_filefunc64_def));
-  LFuncs.zopen64_file := ZipBridgeOpen;
-  LFuncs.zread_file := ZipBridgeRead;
-  LFuncs.zwrite_file := ZipBridgeWrite;
-  LFuncs.ztell64_file := ZipBridgeTell;
-  LFuncs.zseek64_file := ZipBridgeSeek;
-  LFuncs.zclose_file := ZipBridgeClose;
-  LFuncs.zerror_file := ZipBridgeError;
-  LFuncs.opaque := ptr(addr of LBridge);
-  // The path is unused: the bridge's open hands back the open archive
-  LZip := zipOpen2_64(ptr to const char(""), APPEND_STATUS_CREATE, nil, addr of LFuncs);
-  if LZip = nil then
-    IOClose(LIO);
-    return DoZipWriteFail("cannot create the archive " + AArchive);
-  end;
-  LOk := DoZipWriteEntries(LZip, AFiles, APrefixCount, APassword, ABuffer, AProgress,
-    AUserData);
-  // Called whatever the entries gave: the archive is always closed
-  LClosed := zipClose(LZip, nil);
-  if (LClosed <> ZIP_OK) and LOk then
-    LOk := DoZipWriteFail("cannot finish the archive " + AArchive + " (its directory)");
-  end;
-  if not IOClose(LIO) and LOk then
-    LOk := DoZipWriteFail("cannot finish the archive " + AArchive);
-  end;
-  return LOk;
-end;
-
-// The listed AFiles written into AArchive (full paths; ARoot the full root, whose prefix the
-// entry names drop), with the chunk buffer made here and freed again
-func DoZipWrite(const AArchive: string; const ARoot: string; const AFiles: StringArray;
-  const APassword: string; const AProgress: ZipProgress; const AUserData: ptr): bool;
-var
-  LBuffer: ptr to uint8;
-  LOk: bool;
-begin
-  LBuffer := ptr to uint8(getmem(ADAM_CUSTOMIO_ZIP_WRITE_CHUNK));
-  if LBuffer = nil then
-    return DoZipWriteFail("out of memory");
-  end;
-  LOk := DoZipWriteArchive(AArchive, AFiles, len(DoZipFolderPrefix(ARoot)), APassword,
-    LBuffer, AProgress, AUserData);
-  freemem(LBuffer);
-  return LOk;
 end;
 
 // Writes every file under a folder (its subfolders too) into a new zip archive (Delphi's
@@ -3861,12 +4050,109 @@ begin
   return ZipDirectoryContents(AArchive, AFolder, "", "", nil, nil);
 end;
 
-// Why the last ZipDirectoryContents failed: the step and the path ("cannot create the
-// archive ...", "... is not a folder", "... changed while it was packed"); "" when it
-// succeeded. The runtime reports no system error text, so a reason names the step only
+// Why the last ZipDirectoryContents or ZipTest on this thread failed: the step and the path
+// ("cannot create the archive ...", "... is not a folder", "... changed while it was
+// packed", "the entry ... is damaged"); "" when it succeeded. The runtime reports no system
+// error text, so a reason names the step only
 public func cpplink ZipLastError(): string;
 begin
   return GZipLastError;
+end;
+
+// Reads the entry at AEntry of ATable's archive through to its end into ABuffer's chunks
+// (ADAM_CUSTOMIO_ZIP_WRITE_CHUNK bytes): true when it decodes (decrypted with the table's
+// password when it is encrypted), gives exactly the size the directory records and minizip
+// finds its CRC-32 right at the end (unzCloseCurrentFile's UNZ_CRCERROR otherwise)
+func DoZipTestEntry(const ATable: ptr to ZipTableData; const AEntry: ptr to ZipEntryData;
+  const ABuffer: ptr to uint8): bool;
+var
+  LText: CString;
+  LPassword: ptr to const char;
+  LMethod: int32;
+  LLevel: int32;
+  LDone: int64;
+  LGot: int32;
+  LClosed: int32;
+begin
+  if unzGoToFilePos64(ATable->Handle, addr of AEntry->Position) <> UNZ_OK then
+    return false;
+  end;
+  // minizip takes nil for no password: the text shared through a CString while it reads
+  LText := CString(ATable->Password);
+  LPassword := nil;
+  if (AEntry->Flags & 0x0001) <> 0 then
+    LPassword := LText.Ptr;
+  end;
+  LMethod := 0;
+  LLevel := 0;
+  if unzOpenCurrentFile3(ATable->Handle, addr of LMethod, addr of LLevel, 0, LPassword) <> UNZ_OK then
+    return false;
+  end;
+  LDone := 0;
+  LGot := 1;
+  while LGot > 0 do
+    LGot := unzReadCurrentFile(ATable->Handle, ptr(ABuffer), uint32(ADAM_CUSTOMIO_ZIP_WRITE_CHUNK));
+    if LGot > 0 then
+      LDone := LDone + LGot;
+    end;
+  end;
+  LClosed := unzCloseCurrentFile(ATable->Handle);
+  return (LGot = 0) and (LDone = AEntry->Uncompressed) and (LClosed = UNZ_OK) and
+    not ATable->Bridge.Failed;
+end;
+
+/// Tests a zip archive as `unzip -t` does: its central directory read, then every entry
+/// decoded to its end (decrypted with `APassword` where it is encrypted) and its size and
+/// CRC-32 checked against the directory. The archive is opened as `CreateZipIOSource` opens
+/// it and closed again before the call returns.
+/// @param APath the archive (UTF-8, as `CreateFileIO` takes it)
+/// @param APassword ZipCrypto's password ("" for none)
+/// @param ANames every entry's name, in the archive's order (empty on a failure)
+/// @returns false (the reason in `ZipLastError`) when the file cannot be opened, is no valid
+///   zip, or an entry is damaged (cut short, a wrong CRC, a wrong password)
+/// @example `if not ZipTest("release.zip", "", LNames) then println(ZipLastError()); end;`
+public func cpplink ZipTest(const APath: string; const APassword: string;
+  var ANames: StringArray): bool;
+var
+  LIO: IO;
+  LTable: ptr to ZipTableData;
+  LBuffer: ptr to uint8;
+  LI: int64;
+  LOk: bool;
+begin
+  GZipLastError := "";
+  setlength(ANames, 0);
+  LIO := DoOpenFile(APath, FileMode.Read);
+  if LIO = nil then
+    return DoZipWriteFail("cannot open the archive " + APath);
+  end;
+  // The table owns the IO from here: closed with it, or here when it cannot be made
+  LTable := DoZipCreate(LIO, true, APassword);
+  if LTable = nil then
+    return DoZipWriteFail(APath + " is not a valid zip archive");
+  end;
+  LBuffer := ptr to uint8(getmem(ADAM_CUSTOMIO_ZIP_WRITE_CHUNK));
+  if LBuffer = nil then
+    DoZipFree(LTable);
+    return DoZipWriteFail("out of memory");
+  end;
+  LOk := true;
+  setlength(ANames, LTable->EntryCount);
+  for LI := 0 to LTable->EntryCount - 1 do
+    ANames[LI] := LTable->Entries[LI].EntryName;
+    if LOk and not DoZipTestEntry(LTable, addr of LTable->Entries[LI], LBuffer) then
+      LOk := DoZipWriteFail("the entry " + LTable->Entries[LI].EntryName + " in " + APath +
+        " is damaged (its bytes, size or CRC)");
+    end;
+  end;
+  freemem(LBuffer);
+  if not DoZipFree(LTable) and LOk then
+    LOk := DoZipWriteFail("cannot close the archive " + APath);
+  end;
+  if not LOk then
+    setlength(ANames, 0);
+  end;
+  return LOk;
 end;
 
 end.

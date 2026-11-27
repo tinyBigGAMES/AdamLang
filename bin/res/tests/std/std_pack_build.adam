@@ -1,0 +1,317 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+-------------------------------------------------------------------------------
+  std_pack_build.adam - System.Pack's Packer.Build end to end: a file tree
+  made in the row's own folder (README.md, notes.txt, bin/tool, bin/tool.sh,
+  res/a.adam, res/sub/b.adam, res/img.png, res/x.bak, res/cache/c.acu,
+  extra/e.txt), a minisign key generated in keys/, and a spec beside them
+  with two archives. Archive 1 (flat form: root tree, include the top's .md
+  files, bin's files and all of res; exclude the res/cache folder (never
+  walked) and every .bak file; unix_mode bin/tool 0o755, then any file in
+  bin 0o644 (the first match wins); checksum; signed):
+  Discover's entries in byte order of their names with their methods (the
+  .png stored by the default store globs) and modes; the zip read back
+  through minizip (method, made-by, external attributes' high half, bytes
+  the file's); its .sha256 the file's SHA-256 in sha256sum's form; its
+  .minisig verified with the key's public half, the trusted comment with
+  {name} {version} {file} put in. Archive 2 (three sources: prefixes res and
+  more/stuff, the second res source's a.adam given by the first already):
+  three entries. The progress routine is called once per entry (its user
+  pointer, archive, index, count). An archive packing its own folder
+  leaves out its own output on a second build. Failure paths: the signing
+  key inside an archive, a missing source folder, no file matching, an
+  output in a folder that cannot be made (a file in its way). Everything
+  removed at the end. Both targets.
+*******************************************************************************/
+
+/*
+@@test
+  kind run
+  targets x86_64-windows-gnu x86_64-linux-gnu
+  exitcode 0
+  | key saved true
+  | loaded true archives 2
+  | discover true 6
+  | README.md deflate 0
+  | bin/tool deflate 755
+  | bin/tool.sh deflate 644
+  | res/a.adam deflate 0
+  | res/img.png store 0
+  | res/sub/b.adam deflate 0
+  | build true
+  | progress calls 9 user true first T-1.0.zip 0 6 last two.zip 2 3
+  | written 6 3
+  | zip README.md method 8 madeby 0 attr 0 same true
+  | zip bin/tool method 8 madeby 3 attr 81ED same true
+  | zip bin/tool.sh method 8 madeby 3 attr 81A4 same true
+  | zip res/a.adam method 8 madeby 0 attr 0 same true
+  | zip res/img.png method 0 madeby 0 attr 0 same true
+  | zip res/sub/b.adam method 8 madeby 0 attr 0 same true
+  | sha256 line true
+  | minisig verified true
+  | minisig trusted comment: T 1.0 T-1.0.zip
+  | two minisig verified true
+  | two sha256 absent true
+  | zip more/stuff/e.txt method 8 madeby 0 attr 0 same true
+  | zip res/a.adam method 8 madeby 0 attr 0 same true
+  | zip res/sub/b.adam method 8 madeby 0 attr 0 same true
+  | self first true 1
+  | self second true 1
+  | self leaves itself out true
+  | key inside false true
+  | missing source false true
+  | no files false true
+  | folder in the way false true
+  | removed true
+  | [Heap] Allocs: <NUM>, Frees: <NUM>, Leaked: 0
+@@end
+*/
+
+module exe std_pack_build;
+
+import System.SysUtils, System.IO, System.Hash, System.Sign, System.Zlib.C, System.Minizip.C,
+  System.CustomIO, System.Pack;
+
+var
+  GDir: string;
+  GPacker: Packer;
+  GEntries: PackEntries;
+  GKey: MinisignKey;
+  GText: string;
+  GLines: StringArray;
+  GBytes: ByteArray;
+  GOk: bool;
+  GI: int64;
+  GCalls: int64;
+  GUserOk: bool;
+  GFirst: string;
+  GLast: string;
+  GMarker: int64;
+
+// The progress routine: counts its calls, checks its user pointer, keeps the first and last
+func OnEntry(const AUserData: ptr; const AArchive: string; const AEntry: string;
+  const AIndex: int64; const ACount: int64);
+begin
+  GCalls := GCalls + 1;
+  if AUserData <> ptr(addr of GMarker) then
+    GUserOk := false;
+  end;
+  if GCalls = 1 then
+    GFirst := ExtractFileName(AArchive) + " " + IntToStr(AIndex) + " " + IntToStr(ACount);
+  end;
+  GLast := ExtractFileName(AArchive) + " " + IntToStr(AIndex) + " " + IntToStr(ACount);
+end;
+
+// A spec text (`|` between lines) written as the row's spec file APath
+func Spec(const APath: string; const ALines: string);
+begin
+  WriteAllText(APath, ReplaceStr(ALines, "|", "\n"));
+end;
+
+// The NUL-terminated text at AText as a string
+func CText(const AText: ptr to const char): string;
+var
+  LText: string;
+  LAt: int64;
+begin
+  LText := "";
+  LAt := 0;
+  while int32(AText[LAt]) <> 0 do
+    LText := LText + AText[LAt];
+    LAt := LAt + 1;
+  end;
+  return LText;
+end;
+
+// Every entry of the zip at APath through minizip's own file layer: name, method, made-by's
+// high byte, the external attributes' high half in hex, and whether its bytes are its file's:
+// the file below ATree at the entry's name, a name starting with AFrom read with ATo there
+func ListZip(const APath: string; const ATree: string; const AFrom: string; const ATo: string);
+var
+  LPath: CString;
+  LUnzip: unzFile;
+  LInfo: unz_file_info64;
+  LName: array[0..255] of char;
+  LBuffer: array[0..1023] of uint8;
+  LGot: int32;
+  LRead: string;
+  LFile: string;
+  LEntry: string;
+  LStatus: int32;
+  LJ: int64;
+begin
+  LPath := CString(APath);
+  LUnzip := unzOpen64(LPath.Ptr);
+  LStatus := unzGoToFirstFile(LUnzip);
+  while LStatus = UNZ_OK do
+    unzGetCurrentFileInfo64(LUnzip, addr of LInfo, addr of LName[0], 256, nil, 0, nil, 0);
+    LRead := "";
+    if unzOpenCurrentFile(LUnzip) = UNZ_OK then
+      LGot := unzReadCurrentFile(LUnzip, ptr(addr of LBuffer[0]), 1024);
+      while LGot > 0 do
+        for LJ := 0 to int64(LGot) - 1 do
+          LRead := LRead + char(LBuffer[LJ]);
+        end;
+        LGot := unzReadCurrentFile(LUnzip, ptr(addr of LBuffer[0]), 1024);
+      end;
+      unzCloseCurrentFile(LUnzip);
+    end;
+    // The entry's file: its name with the prefix AFrom read as the folder ATo
+    LEntry := CText(addr of LName[0]);
+    LFile := ATree + "/" + LEntry;
+    if (AFrom <> "") and StartsStr(AFrom, LEntry) then
+      LFile := ATree + "/" + ATo + Substring(LEntry, len(AFrom), len(LEntry) - len(AFrom));
+    end;
+    GText := "";
+    ReadAllText(LFile, GText);
+    println("zip {} method {} madeby {} attr {} same {}", LEntry, LInfo.compression_method,
+      uint64(LInfo.version) shr 8, IntToHex(uint64(LInfo.external_fa) shr 16, 1),
+      LRead = GText);
+    LStatus := unzGoToNextFile(LUnzip);
+  end;
+  unzClose(LUnzip);
+end;
+
+// The method's word
+func MethodText(const AMethod: ZipEntryMethod): string;
+begin
+  if AMethod = ZipEntryMethod.Store then
+    return "store";
+  end;
+  return "deflate";
+end;
+
+// A Unix mode as its three octal digits (0 when none)
+func OctalText(const AMode: uint32): string;
+begin
+  if AMode = 0 then
+    return "0";
+  end;
+  return IntToStr(int64((AMode shr 6) & 7)) + IntToStr(int64((AMode shr 3) & 7)) +
+    IntToStr(int64(AMode & 7));
+end;
+
+// True when the zip at APath has an entry named AName
+func HasEntry(const APath: string; const AName: string): bool;
+var
+  LNames: StringArray;
+  LI: int64;
+begin
+  if not ZipTest(APath, "", LNames) then
+    return false;
+  end;
+  for LI := 0 to len(LNames) - 1 do
+    if LNames[LI] = AName then
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+var
+  GTree: string;
+  GSpecPath: string;
+  GZip: string;
+  GHex: string;
+
+begin
+  GDir := ExeDir() + "/std_pack_build_files";
+  RemoveDir(GDir, true);
+  GTree := GDir + "/tree";
+  ForceDirectories(GTree + "/bin");
+  ForceDirectories(GTree + "/res/sub");
+  ForceDirectories(GTree + "/res/cache");
+  ForceDirectories(GTree + "/extra");
+  ForceDirectories(GDir + "/keys");
+  WriteAllText(GTree + "/README.md", "# T\n");
+  WriteAllText(GTree + "/notes.txt", "notes\n");
+  WriteAllText(GTree + "/bin/tool", "#!/bin/sh\necho tool\n");
+  WriteAllText(GTree + "/bin/tool.sh", "echo sh\n");
+  WriteAllText(GTree + "/res/a.adam", "module unit a;\nend.\n");
+  WriteAllText(GTree + "/res/sub/b.adam", "module unit b;\nend.\n");
+  WriteAllText(GTree + "/res/img.png", "not really a png, stored all the same");
+  WriteAllText(GTree + "/res/x.bak", "old");
+  WriteAllText(GTree + "/res/cache/c.acu", "cache");
+  WriteAllText(GTree + "/extra/e.txt", "extra\n");
+  GKey.Generate();
+  println("key saved {}", GKey.SaveSecretKey(GDir + "/keys/t.key"));
+
+  GSpecPath := GDir + "/pack.toml";
+  Spec(GSpecPath, "name = \"T\"|version = \"1.0\"|[sign]|seckey = \"keys/t.key\"|" +
+    "trusted_comment = \"{name} {version} {file}\"|" +
+    "[[archive]]|output = \"out/{name}-{version}.zip\"|root = \"tree\"|" +
+    "include = [\"*.md\", \"bin/*\", \"res/**\"]|exclude = [\"res/cache/**\", \"**/*.bak\"]|" +
+    "checksum = true|unix_mode = { \"bin/tool\" = 0o755, \"bin/*\" = 0o644 }|" +
+    "[[archive]]|output = \"out/two.zip\"|exclude = [\"**/*.bak\"]|" +
+    "[[archive.source]]|path = \"tree/res\"|prefix = \"res\"|include = [\"**/*.adam\"]|" +
+    "[[archive.source]]|path = \"tree/extra\"|prefix = \"more/stuff\"|include = [\"*\"]|" +
+    "[[archive.source]]|path = \"tree/res\"|prefix = \"res\"|include = [\"a.adam\"]");
+  println("loaded {} archives {}", GPacker.LoadSpec(GSpecPath), GPacker.ArchiveCount());
+  println("discover {} {}", GPacker.Discover(0, GEntries), len(GEntries));
+  for GI := 0 to len(GEntries) - 1 do
+    println("{} {} {}", GEntries[GI].ArchiveName, MethodText(GEntries[GI].Method),
+      OctalText(GEntries[GI].UnixMode));
+  end;
+  GCalls := 0;
+  GUserOk := true;
+  println("build {}", GPacker.Build(OnEntry, ptr(addr of GMarker)));
+  println("progress calls {} user {} first {} last {}", GCalls, GUserOk, GFirst, GLast);
+  println("written {} {}", GPacker.EntryCount(0), GPacker.EntryCount(1));
+
+  GZip := GDir + "/out/T-1.0.zip";
+  ListZip(GZip, GTree, "", "");
+  ReadAllBytes(GZip, GBytes);
+  GHex := DigestToHex(ComputeHash(HashKind.SHA256, GBytes));
+  ReadAllText(GZip + ".sha256", GText);
+  println("sha256 line {}", GText = GHex + "  T-1.0.zip\n");
+  println("minisig verified {}", GKey.VerifyFile(GZip, ""));
+  ReadAllText(GZip + ".minisig", GText);
+  GLines := SplitString(GText, "\n");
+  println("minisig {}", GLines[2]);
+  println("two minisig verified {}", GKey.VerifyFile(GDir + "/out/two.zip", ""));
+  println("two sha256 absent {}", not FileExists(GDir + "/out/two.zip.sha256"));
+  ListZip(GDir + "/out/two.zip", GTree, "more/stuff/", "extra/");
+
+  // An archive inside the folder it packs: the second build leaves the first's output out
+  Spec(GDir + "/self.toml", "[[archive]]|output = \"tree/extra/self.zip\"|root = \"tree/extra\"|" +
+    "include = [\"**\"]");
+  GOk := GPacker.LoadSpec(GDir + "/self.toml") and GPacker.Build(nil, nil);
+  println("self first {} {}", GOk, GPacker.EntryCount(0));
+  GOk := GPacker.LoadSpec(GDir + "/self.toml") and GPacker.Build(nil, nil);
+  println("self second {} {}", GOk, GPacker.EntryCount(0));
+  println("self leaves itself out {}", not HasEntry(GTree + "/extra/self.zip", "self.zip"));
+
+  Spec(GDir + "/inside.toml", "[sign]|seckey = \"keys/t.key\"|[[archive]]|output = \"in.zip\"|" +
+    "include = [\"keys/*\"]");
+  GOk := GPacker.LoadSpec(GDir + "/inside.toml") and GPacker.Build(nil, nil);
+  println("key inside {} {}", GOk, IndexOf("the signing key would be packed", GPacker.ErrorText(),
+    0) >= 0);
+  Spec(GDir + "/nosource.toml", "[[archive]]|output = \"n.zip\"|root = \"nowhere\"|" +
+    "include = [\"**\"]");
+  GOk := GPacker.LoadSpec(GDir + "/nosource.toml") and GPacker.Build(nil, nil);
+  println("missing source {} {}", GOk, StartsStr("the source folder is missing",
+    GPacker.ErrorText()));
+  Spec(GDir + "/nofiles.toml", "[[archive]]|output = \"n.zip\"|root = \"tree\"|" +
+    "include = [\"**/*.none\"]");
+  GOk := GPacker.LoadSpec(GDir + "/nofiles.toml") and GPacker.Build(nil, nil);
+  println("no files {} {}", GOk, EndsStr("no file matches the spec", GPacker.ErrorText()));
+  Spec(GDir + "/inway.toml", "[[archive]]|output = \"tree/README.md/x.zip\"|root = \"tree\"|" +
+    "include = [\"*.md\"]");
+  GOk := GPacker.LoadSpec(GDir + "/inway.toml") and GPacker.Build(nil, nil);
+  println("folder in the way {} {}", GOk, StartsStr("cannot make the folder",
+    GPacker.ErrorText()));
+
+  println("removed {}", RemoveDir(GDir, true));
+end.

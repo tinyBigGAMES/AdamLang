@@ -1,0 +1,1021 @@
+/*******************************************************************************
+  Adam™ Programming Language
+
+  Copyright © 2026-present tinyBigGAMES™ LLC
+  All Rights Reserved.
+
+  https://adamlang.org
+
+  SPDX-License-Identifier: MPL-2.0 WITH AdditionRef-Adam-Runtime-Exception
+
+  This Source Code Form is subject to the terms of the
+  Mozilla Public License, v. 2.0. If a copy of the MPL
+  was not distributed with this file, You can obtain one
+  at https://mozilla.org/MPL/2.0/.
+
+  This file is covered by the Adam Runtime Exception
+  (RUNTIME-EXCEPTION.md).
+-------------------------------------------------------------------------------
+  System.Pack.adam - release and backup zips from a TOML pack spec, for any
+  Adam developer (what StdApp's AppPacker did, in Adam, with Unix modes).
+
+  A spec names the pack (name, version: {name} / {version} in its paths
+  and comments), an optional [sign] table (seckey, trusted_comment,
+  untrusted_comment; {file} the zip's name in the comments) and one
+  [[archive]] table per zip it writes (output, root, prefix, include,
+  exclude, store, checksum, unix_mode = { glob = mode }; Packer's doc shows
+  one whole).
+
+  Every relative path (output, root, a source's path, seckey) is taken from
+  the SPEC FILE's folder, never the working folder. An archive's files come
+  from its root (root / prefix / include) or from several [[archive.source]]
+  tables (path, prefix, include, exclude) instead. Globs are
+  MatchesPathGlob's (`**` any folders, `*` / `?` within one part, case-
+  sensitive: the same archive on every host): include and exclude match a
+  file's path below its source's folder, store and unix_mode its name in the
+  archive. A folder an exclude covers whole (the exclude ending in a `**`
+  part) is never walked; a folder link is never entered. The entries are in byte order of their
+  names (the same archive whatever order the system lists files in); the
+  first source to give a name keeps it. An archive's own output (and its
+  .sha256 / .minisig) is left out; the signing key in an archive is refused.
+
+  Each archive is written through System.CustomIO's ZipWriter (deflated, or
+  stored where a store glob matches; made by Unix with the mode in its
+  external attributes where a unix_mode glob matches, so unzip on Linux keeps
+  it executable), then tested whole (ZipTest: every entry decoded, its CRC
+  checked, the names as written), then optionally given <zip>.sha256
+  (sha256sum's `<hex>  <name>` line) and <zip>.minisig (System.Sign).
+
+  Target-neutral (PROJECT AT.3): pure Adam over System.TOML.Ext, System.IO,
+  System.CustomIO, System.Hash and System.Sign; no OS named.
+*******************************************************************************/
+
+module unit System.Pack;
+
+import System.SysUtils, System.IO, System.CustomIO, System.Collections, System.Hash,
+  System.Sign, System.TOML.C, System.TOML.Ext;
+
+public type
+  /// One file a pack puts in an archive (`Packer.Discover` lists them in the archive's order).
+  PackEntry = record
+    /// The file's full path, `/` between folders
+    SourcePath: string;
+    /// Its entry name in the archive: its path below its source's folder, `/` between
+    /// folders, the source's prefix first
+    ArchiveName: string;
+    /// `Store` when a `store` glob matches its name, else `Deflate`
+    Method: ZipEntryMethod;
+    /// The permission bits the first matching `unix_mode` glob gives it, 0 when none matches
+    UnixMode: uint32;
+  end;
+
+  /// The files of one archive, in its order
+  PackEntries = array of PackEntry;
+
+  /// Called by `Packer.Build` / `BuildArchive` before each entry is written: `AArchive` the
+  /// archive's full path, `AEntry` the entry's name, `AIndex` its place (0-based) among
+  /// `ACount`; `AUserData` the pointer the build was given
+  PackProgress = func(const AUserData: ptr; const AArchive: string; const AEntry: string;
+    const AIndex: int64; const ACount: int64);
+
+type
+  // One source tree of an archive: its full folder, the entry prefix ("" or "a/b"), its
+  // include globs and its own exclude globs (the archive's apply too)
+  PackSource = record
+    Folder: string;
+    Prefix: string;
+    Include: StringArray;
+    Exclude: StringArray;
+  end;
+
+  // One [[archive]] of the spec, resolved: its full output path, sources, the excludes every
+  // source takes, the store globs, the unix_mode globs and their modes (in the spec's order:
+  // the first match wins), whether a .sha256 is written
+  PackArchive = record
+    Output: string;
+    Sources: array of PackSource;
+    Exclude: StringArray;
+    Store: StringArray;
+    ModeGlobs: StringArray;
+    Modes: array of uint32;
+    Checksum: bool;
+  end;
+
+const
+  // The store globs an archive takes when its spec names none (StdApp's packer's list: files
+  // that are compressed already)
+  ADAM_PACK_STORE_DEFAULT: array[0..6] of string = ["**/*.png", "**/*.jpg", "**/*.jpeg",
+    "**/*.zip", "**/*.ogg", "**/*.mp3", "**/*.mp4"];
+  // The highest unix_mode (octal 7777: rwx for all three, setuid, setgid, sticky)
+  ADAM_PACK_MODE_MAX: int64 = 4095;
+  // The bytes a file is read in to hash it (a release zip is hundreds of MB)
+  ADAM_PACK_READ_SIZE: int64 = 1048576;
+  // The keys each table of a spec may hold (comma separated)
+  ADAM_PACK_TOP_KEYS: string = "name,version,sign,archive";
+  ADAM_PACK_SIGN_KEYS: string = "seckey,trusted_comment,untrusted_comment";
+  ADAM_PACK_ARCHIVE_KEYS: string = "output,root,prefix,include,exclude,store,checksum,unix_mode,source";
+  ADAM_PACK_SOURCE_KEYS: string = "path,prefix,include,exclude";
+  // The errors a Packer reports (ErrorText)
+  ADAM_PACK_MSG_UNKNOWN_KEY: string = "unknown key ";
+  ADAM_PACK_MSG_NOT_TABLE: string = " is not a table";
+  ADAM_PACK_MSG_NOT_ARRAY: string = " is not an array";
+  ADAM_PACK_MSG_NO_ARCHIVE: string = "the spec has no [[archive]]";
+  ADAM_PACK_MSG_NO_OUTPUT: string = " has no output";
+  ADAM_PACK_MSG_NO_INCLUDE: string = " has no include";
+  ADAM_PACK_MSG_NO_SECKEY: string = "[sign] has no seckey";
+  ADAM_PACK_MSG_BOTH_FORMS: string = " has both source tables and root / prefix / include";
+  ADAM_PACK_MSG_BAD_GLOB: string = "bad glob ";
+  ADAM_PACK_MSG_BAD_PREFIX: string = "bad prefix ";
+  ADAM_PACK_MSG_BAD_MODE: string = " is no unix mode (1 .. 0o7777)";
+  ADAM_PACK_MSG_NO_SPEC: string = "no spec is loaded";
+  ADAM_PACK_MSG_NO_SUCH_ARCHIVE: string = "no archive ";
+  ADAM_PACK_MSG_NO_SOURCE: string = "the source folder is missing: ";
+  ADAM_PACK_MSG_NO_LIST: string = "cannot list the folder ";
+  ADAM_PACK_MSG_NO_FILES: string = ": no file matches the spec";
+  ADAM_PACK_MSG_SECKEY_IN: string = ": the signing key would be packed: ";
+  ADAM_PACK_MSG_NO_FOLDER: string = "cannot make the folder ";
+  ADAM_PACK_MSG_READ_BACK: string = ": the archive does not read back as written";
+  ADAM_PACK_MSG_NO_CHECKSUM: string = "cannot write the checksum ";
+  ADAM_PACK_MSG_NO_KEY: string = "cannot load the secret key ";
+  ADAM_PACK_MSG_NO_SIGNATURE: string = "cannot sign ";
+
+// AText with the spec's {name} and {version} put in
+func DoExpand(const AText: string; const AName: string; const AVersion: string): string;
+begin
+  return ReplaceStr(ReplaceStr(AText, "{name}", AName), "{version}", AVersion);
+end;
+
+// APath made full against the folder ABase (ResolvePath: $P: / $D: / $S:, an absolute path
+// as it is), `/` between folders, no `/` at the end but a root's; "" when it resolves to
+// nothing
+func DoFullPath(const APath: string; const ABase: string): string;
+var
+  LFull: string;
+begin
+  LFull := ReplaceStr(ResolvePath(APath, ABase), "\\", "/");
+  while (len(LFull) > 1) and EndsStr("/", LFull) and
+    not ((len(LFull) = 3) and (LFull[1] = ':')) do
+    LFull := Substring(LFull, 0, len(LFull) - 1);
+  end;
+  return LFull;
+end;
+
+// ARel and AName joined with a `/` between ("" + a = a)
+func DoJoin(const ARel: string; const AName: string): string;
+begin
+  if ARel = "" then
+    return AName;
+  end;
+  return ARel + "/" + AName;
+end;
+
+// True when the glob part APart holds no wildcard ('*' or '?')
+func DoIsLiteral(const APart: string): bool;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(APart) - 1 do
+    if (APart[LI] = '*') or (APart[LI] = '?') then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// True when the relative path AText is one a spec may name: not empty, not absolute (no
+// leading `/`, no drive `:`), no empty part and no `.` / `..` part (`\` read as `/`)
+func DoIsRelative(const AText: string): bool;
+var
+  LParts: StringArray;
+  LI: int64;
+begin
+  if (AText = "") or (IndexOf(":", AText, 0) >= 0) then
+    return false;
+  end;
+  LParts := SplitString(ReplaceStr(AText, "\\", "/"), "/");
+  for LI := 0 to len(LParts) - 1 do
+    if (LParts[LI] = "") or (LParts[LI] = ".") or (LParts[LI] = "..") then
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// True when AText matches one of AGlobs (MatchesPathGlob)
+func DoMatchesAny(const AText: string; const AGlobs: StringArray): bool;
+var
+  LI: int64;
+begin
+  for LI := 0 to len(AGlobs) - 1 do
+    if MatchesPathGlob(AText, AGlobs[LI]) then
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+// True when the folder ARel (a path below a source's folder) is covered whole by one of
+// AGlobs: a glob ending in `/**` whose part before it matches ARel. Such a folder is never
+// walked
+func DoFolderExcluded(const ARel: string; const AGlobs: StringArray): bool;
+var
+  LI: int64;
+  LGlob: string;
+begin
+  for LI := 0 to len(AGlobs) - 1 do
+    LGlob := ReplaceStr(AGlobs[LI], "\\", "/");
+    if EndsStr("/**", LGlob) and
+      MatchesPathGlob(ARel, Substring(LGlob, 0, len(LGlob) - 3)) then
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+// ARel appended to AFound at ACount (grown by doubling)
+func DoAppend(var AFound: StringArray; var ACount: int64; const ARel: string);
+begin
+  if ACount = len(AFound) then
+    setlength(AFound, ACount * 2 + 64);
+  end;
+  AFound[ACount] := ARel;
+  ACount := ACount + 1;
+end;
+
+// The files below the full folder AFolder (ARel its path below the source's folder, "" for
+// the folder itself) whose path matches AInclude and none of AExclude / AArchiveExclude,
+// appended to AFound at ACount as paths below the source's folder; every folder below walked
+// but an excluded one or a link. False (the reason in AError) when a folder cannot be listed
+func DoWalk(const AFolder: string; const ARel: string; const AInclude: string;
+  const AExclude: StringArray; const AArchiveExclude: StringArray; var AFound: StringArray;
+  var ACount: int64; var AError: string): bool;
+var
+  LNames: StringArray;
+  LRel: string;
+  LFull: string;
+  LI: int64;
+begin
+  if not GetFiles(AFolder, LNames) then
+    AError := ADAM_PACK_MSG_NO_LIST + AFolder;
+    return false;
+  end;
+  for LI := 0 to len(LNames) - 1 do
+    LRel := DoJoin(ARel, LNames[LI]);
+    if MatchesPathGlob(LRel, AInclude) and not DoMatchesAny(LRel, AExclude) and
+      not DoMatchesAny(LRel, AArchiveExclude) then
+      DoAppend(AFound, ACount, LRel);
+    end;
+  end;
+  if not GetDirectories(AFolder, LNames) then
+    AError := ADAM_PACK_MSG_NO_LIST + AFolder;
+    return false;
+  end;
+  for LI := 0 to len(LNames) - 1 do
+    LRel := DoJoin(ARel, LNames[LI]);
+    LFull := AFolder + "/" + LNames[LI];
+    // A folder link is never entered: one that points above itself would never end
+    if not PathIsLink(LFull) and not DoFolderExcluded(LRel, AExclude) and
+      not DoFolderExcluded(LRel, AArchiveExclude) then
+      if not DoWalk(LFull, LRel, AInclude, AExclude, AArchiveExclude, AFound, ACount,
+        AError) then
+        return false;
+      end;
+    end;
+  end;
+  return true;
+end;
+
+// The files of ASource that the include glob AGlob takes (and no exclude drops), appended to
+// AFound at ACount as paths below its folder. The walk starts at the glob's literal leading
+// folders (`bin/res/**` walks bin/res alone); a glob whose last part is its only wildcard
+// part and is no `**` lists that one folder (`*.md` the top, `bin/adam` bin's files). A
+// start folder that does not exist matches nothing. False (the reason in AError) when a
+// folder cannot be listed
+func DoCollect(const ASource: PackSource; const AGlob: string; const AArchiveExclude: StringArray;
+  var AFound: StringArray; var ACount: int64; var AError: string): bool;
+var
+  LParts: StringArray;
+  LHead: string;
+  LFolder: string;
+  LNames: StringArray;
+  LRel: string;
+  LAt: int64;
+  LI: int64;
+begin
+  LParts := SplitString(ReplaceStr(AGlob, "\\", "/"), "/");
+  LHead := "";
+  LAt := 0;
+  while (LAt < len(LParts) - 1) and DoIsLiteral(LParts[LAt]) and (LParts[LAt] <> "**") do
+    LHead := DoJoin(LHead, LParts[LAt]);
+    LAt := LAt + 1;
+  end;
+  LFolder := ASource.Folder;
+  if LHead <> "" then
+    LFolder := LFolder + "/" + LHead;
+    if DoFolderExcluded(LHead, ASource.Exclude) or DoFolderExcluded(LHead, AArchiveExclude) then
+      return true;
+    end;
+  end;
+  if not DirectoryExists(LFolder) then
+    return true;
+  end;
+  if (LAt < len(LParts) - 1) or (LParts[LAt] = "**") then
+    return DoWalk(LFolder, LHead, AGlob, ASource.Exclude, AArchiveExclude, AFound, ACount,
+      AError);
+  end;
+  // One folder's files: the last part matched to each name
+  if not GetFiles(LFolder, LNames) then
+    AError := ADAM_PACK_MSG_NO_LIST + LFolder;
+    return false;
+  end;
+  for LI := 0 to len(LNames) - 1 do
+    LRel := DoJoin(LHead, LNames[LI]);
+    if MatchesGlob(LNames[LI], LParts[LAt]) and not DoMatchesAny(LRel, ASource.Exclude) and
+      not DoMatchesAny(LRel, AArchiveExclude) then
+      DoAppend(AFound, ACount, LRel);
+    end;
+  end;
+  return true;
+end;
+
+// True when the full path APath is the archive AOutput or its .sha256 / .minisig
+func DoIsOwnOutput(const APath: string; const AOutput: string): bool;
+begin
+  return SamePath(APath, AOutput) or SamePath(APath, AOutput + ".sha256") or
+    SamePath(APath, AOutput + ".minisig");
+end;
+
+// The SHA-256 digest of the file APath in lowercase hex into AHex, read in blocks; false
+// when it cannot be opened or read
+func DoFileSHA256(const APath: string; var AHex: string): bool;
+var
+  LIO: IO;
+  LHash: Hasher;
+  LBuffer: ByteArray;
+  LGot: int64;
+begin
+  LIO := CreateFileIO(APath, FileMode.Read);
+  if LIO = nil then
+    return false;
+  end;
+  LHash := Hasher(HashKind.SHA256);
+  setlength(LBuffer, ADAM_PACK_READ_SIZE);
+  while true do
+    LGot := IORead(LIO, addr of LBuffer[0], ADAM_PACK_READ_SIZE);
+    if LGot < 0 then
+      IOClose(LIO);
+      return false;
+    end;
+    if LGot = 0 then
+      leave;
+    end;
+    LHash.Update(addr of LBuffer[0], LGot);
+  end;
+  IOClose(LIO);
+  AHex := DigestToHex(LHash.Final());
+  return true;
+end;
+
+// The path of the key AKey in the table at APath ("" the document's top table)
+func DoChild(const APath: string; const AKey: string): string;
+begin
+  if APath = "" then
+    return TOMLQuoteKey(AKey);
+  end;
+  return APath + "." + TOMLQuoteKey(AKey);
+end;
+
+// The path of item AIndex of the array at APath
+func DoItem(const APath: string; const AIndex: int64): string;
+begin
+  return APath + "[" + IntToStr(AIndex) + "]";
+end;
+
+// The value at APath as an error names it ("the spec" for the top table)
+func DoWhere(const APath: string): string;
+begin
+  if APath = "" then
+    return "the spec";
+  end;
+  return APath;
+end;
+
+public type
+  /// Writes the zips a TOML pack spec describes (see the unit's description for the rules):
+  /// `LoadSpec`, then `Build` (every archive) or `Discover` / `BuildArchive` one at a time.
+  /// Each archive is written, tested whole, then given its `.sha256` (`checksum = true`) and
+  /// `.minisig` (a `[sign]` table) when its spec asks. A spec:
+  ///
+  /// ```toml
+  /// name = "Adam"
+  /// version = "0.1.0"
+  ///
+  /// [sign]
+  /// seckey = 'C:\keys\release.key'
+  /// trusted_comment = "{name} {version} {file}"
+  ///
+  /// [[archive]]
+  /// output = "distro/{name}-{version}-x86_64-linux.zip"
+  /// root = "repo"
+  /// include = ["bin/res/**", "bin/adam", "README.md"]
+  /// exclude = ["bin/output/**", "**/*.bak"]
+  /// store = ["**/*.png", "**/*.ogg"]
+  /// checksum = true
+  /// unix_mode = { "bin/adam" = 0o755 }
+  /// ```
+  ///
+  /// @example `if not LPacker.LoadSpec("distro.toml") or not LPacker.Build(nil, nil) then println(LPacker.ErrorText()); end;`
+  Packer = object
+    // The spec: its full path, {name} / {version}, the signing key's full path ("" when
+    // the spec signs nothing) and comments, the archives; the entries each last build wrote;
+    // why the last call failed
+    hidden SpecPath: string;
+    hidden PackName: string;
+    hidden PackVersion: string;
+    hidden SignKey: string;
+    hidden Trusted: string;
+    hidden Untrusted: string;
+    hidden Archives: array of PackArchive;
+    hidden Written: Int64Array;
+    hidden LastError: string;
+
+    init();
+    begin
+      self.SpecPath := "";
+      self.PackName := "";
+      self.PackVersion := "";
+      self.SignKey := "";
+      self.Trusted := "";
+      self.Untrusted := "";
+      self.LastError := "";
+    end;
+
+    // AText as the last error; false, for `return self.DoFail(..)`
+    hidden method DoFail(const AText: string): bool;
+    begin
+      self.LastError := AText;
+      return false;
+    end;
+
+    // AText as the last error, placed at the spec value APath's line and column; false
+    hidden method DoFailAt(var ADoc: TOMLDocument; const APath: string; const AText: string): bool;
+    var
+      LDatum: toml_datum_t;
+    begin
+      if ADoc.Find(APath, LDatum) then
+        ADoc.Fail(int64(LDatum.lineno), int64(LDatum.colno), AText);
+      else
+        ADoc.Fail(0, 0, AText);
+      end;
+      return self.DoFail(ADoc.ErrorText());
+    end;
+
+    // The document's last error (a getter's) as the last error; false
+    hidden method DoDocFail(var ADoc: TOMLDocument): bool;
+    begin
+      return self.DoFail(ADoc.ErrorText());
+    end;
+
+    // True when the table at APath holds only keys of AKnown (comma separated), else the
+    // first other key's error at its place
+    hidden method DoKnownKeys(var ADoc: TOMLDocument; const APath: string;
+      const AKnown: string): bool;
+    var
+      LKnown: StringArray;
+      LCount: int64;
+      LKey: string;
+      LI: int64;
+      LK: int64;
+      LFound: bool;
+    begin
+      if ADoc.KindOf(APath) <> TOMLKind.Table then
+        return self.DoFailAt(ADoc, APath, DoWhere(APath) + ADAM_PACK_MSG_NOT_TABLE);
+      end;
+      LKnown := SplitString(AKnown, ",");
+      if not ADoc.Count(APath, LCount) then
+        return self.DoDocFail(ADoc);
+      end;
+      for LI := 0 to LCount - 1 do
+        if not ADoc.KeyAt(APath, LI, LKey) then
+          return self.DoDocFail(ADoc);
+        end;
+        LFound := false;
+        for LK := 0 to len(LKnown) - 1 do
+          if LKnown[LK] = LKey then
+            LFound := true;
+          end;
+        end;
+        if not LFound then
+          return self.DoFailAt(ADoc, DoChild(APath, LKey), ADAM_PACK_MSG_UNKNOWN_KEY + LKey);
+        end;
+      end;
+      return true;
+    end;
+
+    // The string at APath into AValue, ADefault when the spec has none there
+    hidden method DoString(var ADoc: TOMLDocument; const APath: string; const ADefault: string;
+      var AValue: string): bool;
+    begin
+      AValue := ADefault;
+      if not ADoc.Has(APath) then
+        return true;
+      end;
+      if not ADoc.GetString(APath, AValue) then
+        return self.DoDocFail(ADoc);
+      end;
+      return true;
+    end;
+
+    // The array of strings at APath into AList (empty when the spec has none there), each a
+    // relative glob when AGlobs (DoIsRelative: no absolute path, no `.` / `..` part)
+    hidden method DoStrings(var ADoc: TOMLDocument; const APath: string; const AGlobs: bool;
+      var AList: StringArray): bool;
+    var
+      LCount: int64;
+      LI: int64;
+    begin
+      setlength(AList, 0);
+      if not ADoc.Has(APath) then
+        return true;
+      end;
+      if ADoc.KindOf(APath) <> TOMLKind.Array then
+        return self.DoFailAt(ADoc, APath, DoWhere(APath) + ADAM_PACK_MSG_NOT_ARRAY);
+      end;
+      if not ADoc.Count(APath, LCount) then
+        return self.DoDocFail(ADoc);
+      end;
+      setlength(AList, LCount);
+      for LI := 0 to LCount - 1 do
+        if not ADoc.GetString(DoItem(APath, LI), AList[LI]) then
+          return self.DoDocFail(ADoc);
+        end;
+        if AGlobs and not DoIsRelative(AList[LI]) then
+          return self.DoFailAt(ADoc, DoItem(APath, LI), ADAM_PACK_MSG_BAD_GLOB + AList[LI]);
+        end;
+      end;
+      return true;
+    end;
+
+    // The prefix at APath into APrefix ("" when none), `\` read as `/`, no `/` at either end;
+    // false when what is left is not a relative path
+    hidden method DoPrefix(var ADoc: TOMLDocument; const APath: string;
+      var APrefix: string): bool;
+    begin
+      if not self.DoString(ADoc, APath, "", APrefix) then
+        return false;
+      end;
+      APrefix := ReplaceStr(APrefix, "\\", "/");
+      while StartsStr("/", APrefix) do
+        APrefix := Substring(APrefix, 1, len(APrefix) - 1);
+      end;
+      while EndsStr("/", APrefix) do
+        APrefix := Substring(APrefix, 0, len(APrefix) - 1);
+      end;
+      if (APrefix <> "") and not DoIsRelative(APrefix) then
+        return self.DoFailAt(ADoc, APath, ADAM_PACK_MSG_BAD_PREFIX + APrefix);
+      end;
+      return true;
+    end;
+
+    // The source at APath (an [[archive.source]] table, or the archive's own table when
+    // AFlat: root / prefix / include, AFolderKey "root") into ASource, its folder made full
+    // against the spec's folder ADir
+    hidden method DoSource(var ADoc: TOMLDocument; const APath: string; const AFolderKey: string;
+      const ADir: string; const AExcludes: bool; var ASource: PackSource): bool;
+    var
+      LFolder: string;
+    begin
+      if not self.DoString(ADoc, DoChild(APath, AFolderKey), ".", LFolder) then
+        return false;
+      end;
+      ASource.Folder := DoFullPath(DoExpand(LFolder, self.PackName, self.PackVersion), ADir);
+      if not self.DoPrefix(ADoc, DoChild(APath, "prefix"), ASource.Prefix) then
+        return false;
+      end;
+      ASource.Prefix := DoExpand(ASource.Prefix, self.PackName, self.PackVersion);
+      if not self.DoStrings(ADoc, DoChild(APath, "include"), true, ASource.Include) then
+        return false;
+      end;
+      if len(ASource.Include) = 0 then
+        return self.DoFailAt(ADoc, APath, DoWhere(APath) + ADAM_PACK_MSG_NO_INCLUDE);
+      end;
+      setlength(ASource.Exclude, 0);
+      if AExcludes then
+        if not self.DoStrings(ADoc, DoChild(APath, "exclude"), true, ASource.Exclude) then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    // The [[archive]] at APath into AArchive, its paths made full against the spec's folder
+    // ADir
+    hidden method DoArchive(var ADoc: TOMLDocument; const APath: string; const ADir: string;
+      var AArchive: PackArchive): bool;
+    var
+      LOutput: string;
+      LSources: string;
+      LCount: int64;
+      LGlob: string;
+      LMode: int64;
+      LI: int64;
+    begin
+      if not self.DoKnownKeys(ADoc, APath, ADAM_PACK_ARCHIVE_KEYS) then
+        return false;
+      end;
+      if not ADoc.Has(DoChild(APath, "output")) then
+        return self.DoFailAt(ADoc, APath, DoWhere(APath) + ADAM_PACK_MSG_NO_OUTPUT);
+      end;
+      if not self.DoString(ADoc, DoChild(APath, "output"), "", LOutput) then
+        return false;
+      end;
+      AArchive.Output := DoFullPath(DoExpand(LOutput, self.PackName, self.PackVersion), ADir);
+      // The sources: [[archive.source]] tables, or the archive's own root / prefix / include
+      LSources := DoChild(APath, "source");
+      if ADoc.Has(LSources) then
+        if ADoc.Has(DoChild(APath, "root")) or ADoc.Has(DoChild(APath, "prefix")) or
+          ADoc.Has(DoChild(APath, "include")) then
+          return self.DoFailAt(ADoc, APath, DoWhere(APath) + ADAM_PACK_MSG_BOTH_FORMS);
+        end;
+        if ADoc.KindOf(LSources) <> TOMLKind.Array then
+          return self.DoFailAt(ADoc, LSources, DoWhere(LSources) + ADAM_PACK_MSG_NOT_ARRAY);
+        end;
+        if not ADoc.Count(LSources, LCount) then
+          return self.DoDocFail(ADoc);
+        end;
+        setlength(AArchive.Sources, LCount);
+        for LI := 0 to LCount - 1 do
+          if not self.DoKnownKeys(ADoc, DoItem(LSources, LI), ADAM_PACK_SOURCE_KEYS) then
+            return false;
+          end;
+          if not self.DoSource(ADoc, DoItem(LSources, LI), "path", ADir, true,
+            AArchive.Sources[LI]) then
+            return false;
+          end;
+        end;
+      else
+        setlength(AArchive.Sources, 1);
+        if not self.DoSource(ADoc, APath, "root", ADir, false, AArchive.Sources[0]) then
+          return false;
+        end;
+      end;
+      if not self.DoStrings(ADoc, DoChild(APath, "exclude"), true, AArchive.Exclude) then
+        return false;
+      end;
+      if ADoc.Has(DoChild(APath, "store")) then
+        if not self.DoStrings(ADoc, DoChild(APath, "store"), true, AArchive.Store) then
+          return false;
+        end;
+      else
+        setlength(AArchive.Store, len(ADAM_PACK_STORE_DEFAULT));
+        for LI := 0 to len(ADAM_PACK_STORE_DEFAULT) - 1 do
+          AArchive.Store[LI] := ADAM_PACK_STORE_DEFAULT[LI];
+        end;
+      end;
+      AArchive.Checksum := false;
+      if ADoc.Has(DoChild(APath, "checksum")) then
+        if not ADoc.GetBool(DoChild(APath, "checksum"), AArchive.Checksum) then
+          return self.DoDocFail(ADoc);
+        end;
+      end;
+      // unix_mode: glob = mode, in the spec's order
+      setlength(AArchive.ModeGlobs, 0);
+      setlength(AArchive.Modes, 0);
+      if ADoc.Has(DoChild(APath, "unix_mode")) then
+        if ADoc.KindOf(DoChild(APath, "unix_mode")) <> TOMLKind.Table then
+          return self.DoFailAt(ADoc, DoChild(APath, "unix_mode"),
+            DoWhere(DoChild(APath, "unix_mode")) + ADAM_PACK_MSG_NOT_TABLE);
+        end;
+        if not ADoc.Count(DoChild(APath, "unix_mode"), LCount) then
+          return self.DoDocFail(ADoc);
+        end;
+        setlength(AArchive.ModeGlobs, LCount);
+        setlength(AArchive.Modes, LCount);
+        for LI := 0 to LCount - 1 do
+          if not ADoc.KeyAt(DoChild(APath, "unix_mode"), LI, LGlob) then
+            return self.DoDocFail(ADoc);
+          end;
+          if not DoIsRelative(LGlob) then
+            return self.DoFailAt(ADoc, DoChild(DoChild(APath, "unix_mode"), LGlob),
+              ADAM_PACK_MSG_BAD_GLOB + LGlob);
+          end;
+          if not ADoc.GetInt64(DoChild(DoChild(APath, "unix_mode"), LGlob), LMode) then
+            return self.DoDocFail(ADoc);
+          end;
+          if (LMode < 1) or (LMode > ADAM_PACK_MODE_MAX) then
+            return self.DoFailAt(ADoc, DoChild(DoChild(APath, "unix_mode"), LGlob),
+              IntToStr(LMode) + ADAM_PACK_MSG_BAD_MODE);
+          end;
+          AArchive.ModeGlobs[LI] := LGlob;
+          AArchive.Modes[LI] := uint32(LMode);
+        end;
+      end;
+      return true;
+    end;
+
+    /// Reads and checks a pack spec: every key known, every value of its kind, every glob and
+    /// prefix a relative path; the outputs, roots, source paths and the signing key made full
+    /// against the spec file's folder, `{name}` / `{version}` put in. Nothing is written.
+    /// @param APath the spec file (`.toml`)
+    /// @returns false (the reason in `ErrorText`, at the spec's line and column) when it cannot
+    ///   be read or is no valid spec; no spec is held then
+    method LoadSpec(const APath: string): bool;
+    var
+      LDoc: TOMLDocument;
+      LFull: string;
+      LDir: string;
+      LKey: string;
+      LCount: int64;
+      LI: int64;
+    begin
+      self.SpecPath := "";
+      setlength(self.Archives, 0);
+      setlength(self.Written, 0);
+      self.SignKey := "";
+      self.Trusted := "";
+      self.Untrusted := "";
+      self.LastError := "";
+      LFull := DoFullPath(APath, "");
+      if not LDoc.ParseFile(LFull) then
+        return self.DoDocFail(LDoc);
+      end;
+      LDir := ExtractFileDir(LFull);
+      if not self.DoKnownKeys(LDoc, "", ADAM_PACK_TOP_KEYS) then
+        return false;
+      end;
+      if not self.DoString(LDoc, "name", "", self.PackName) then
+        return false;
+      end;
+      if not self.DoString(LDoc, "version", "", self.PackVersion) then
+        return false;
+      end;
+      if LDoc.Has("sign") then
+        if not self.DoKnownKeys(LDoc, "sign", ADAM_PACK_SIGN_KEYS) then
+          return false;
+        end;
+        if not LDoc.Has("sign.seckey") then
+          return self.DoFailAt(LDoc, "sign", ADAM_PACK_MSG_NO_SECKEY);
+        end;
+        if not self.DoString(LDoc, "sign.seckey", "", LKey) then
+          return false;
+        end;
+        self.SignKey := DoFullPath(DoExpand(LKey, self.PackName, self.PackVersion), LDir);
+        if not self.DoString(LDoc, "sign.trusted_comment", "", self.Trusted) then
+          return false;
+        end;
+        if not self.DoString(LDoc, "sign.untrusted_comment", "", self.Untrusted) then
+          return false;
+        end;
+      end;
+      if not LDoc.Has("archive") then
+        return self.DoFailAt(LDoc, "", ADAM_PACK_MSG_NO_ARCHIVE);
+      end;
+      if LDoc.KindOf("archive") <> TOMLKind.Array then
+        return self.DoFailAt(LDoc, "archive", DoWhere("archive") + ADAM_PACK_MSG_NOT_ARRAY);
+      end;
+      if not LDoc.Count("archive", LCount) then
+        return self.DoDocFail(LDoc);
+      end;
+      if LCount = 0 then
+        return self.DoFailAt(LDoc, "archive", ADAM_PACK_MSG_NO_ARCHIVE);
+      end;
+      setlength(self.Archives, LCount);
+      for LI := 0 to LCount - 1 do
+        if not self.DoArchive(LDoc, DoItem("archive", LI), LDir, self.Archives[LI]) then
+          setlength(self.Archives, 0);
+          return false;
+        end;
+      end;
+      setlength(self.Written, LCount);
+      self.SpecPath := LFull;
+      return true;
+    end;
+
+    /// The number of archives the loaded spec writes (0 when none is loaded).
+    const method ArchiveCount(): int64;
+    begin
+      return len(self.Archives);
+    end;
+
+    /// The full path of archive `AIndex` (0-based); "" when there is no such archive.
+    const method ArchiveOutput(const AIndex: int64): string;
+    begin
+      if (AIndex < 0) or (AIndex >= len(self.Archives)) then
+        return "";
+      end;
+      return self.Archives[AIndex].Output;
+    end;
+
+    /// The spec's `name` and `version` ("" for one it leaves out).
+    const method SpecName(): string;
+    begin
+      return self.PackName;
+    end;
+
+    /// The spec's `version` ("" when it has none).
+    const method SpecVersion(): string;
+    begin
+      return self.PackVersion;
+    end;
+
+    /// The files archive `AIndex` takes, in its order (byte order of the entry names), each
+    /// with its method and Unix mode; nothing is written.
+    /// @param AIndex the archive (0-based)
+    /// @param AEntries the files (empty on a failure)
+    /// @returns false (the reason in `ErrorText`) when no spec is loaded, there is no such
+    ///   archive, a source folder is missing or cannot be listed, no file matches, or the
+    ///   signing key would be packed
+    method Discover(const AIndex: int64; var AEntries: PackEntries): bool;
+    var
+      LMap: Map<string, string>;
+      LFound: StringArray;
+      LNames: StringArray;
+      LCount: int64;
+      LName: string;
+      LFull: string;
+      LError: string;
+      LS: int64;
+      LG: int64;
+      LI: int64;
+      LK: int64;
+    begin
+      setlength(AEntries, 0);
+      self.LastError := "";
+      if self.SpecPath = "" then
+        return self.DoFail(ADAM_PACK_MSG_NO_SPEC);
+      end;
+      if (AIndex < 0) or (AIndex >= len(self.Archives)) then
+        return self.DoFail(ADAM_PACK_MSG_NO_SUCH_ARCHIVE + IntToStr(AIndex));
+      end;
+      for LS := 0 to len(self.Archives[AIndex].Sources) - 1 do
+        if not DirectoryExists(self.Archives[AIndex].Sources[LS].Folder) then
+          return self.DoFail(ADAM_PACK_MSG_NO_SOURCE + self.Archives[AIndex].Sources[LS].Folder);
+        end;
+        setlength(LFound, 0);
+        LCount := 0;
+        LError := "";
+        for LG := 0 to len(self.Archives[AIndex].Sources[LS].Include) - 1 do
+          if not DoCollect(self.Archives[AIndex].Sources[LS],
+            self.Archives[AIndex].Sources[LS].Include[LG], self.Archives[AIndex].Exclude,
+            LFound, LCount, LError) then
+            return self.DoFail(LError);
+          end;
+        end;
+        // The first source (and include) to give a name keeps it
+        for LI := 0 to LCount - 1 do
+          LName := DoJoin(self.Archives[AIndex].Sources[LS].Prefix, LFound[LI]);
+          LFull := self.Archives[AIndex].Sources[LS].Folder + "/" + LFound[LI];
+          if not DoIsOwnOutput(LFull, self.Archives[AIndex].Output) and not LMap.Has(LName) then
+            LMap.Put(LName, LFull);
+          end;
+        end;
+      end;
+      LNames := LMap.Keys();
+      if len(LNames) = 0 then
+        return self.DoFail(self.Archives[AIndex].Output + ADAM_PACK_MSG_NO_FILES);
+      end;
+      SortStrings(LNames);
+      setlength(AEntries, len(LNames));
+      for LI := 0 to len(LNames) - 1 do
+        AEntries[LI].ArchiveName := LNames[LI];
+        AEntries[LI].SourcePath := LMap.Get(LNames[LI]);
+        if (self.SignKey <> "") and SamePath(AEntries[LI].SourcePath, self.SignKey) then
+          setlength(AEntries, 0);
+          return self.DoFail(self.Archives[AIndex].Output + ADAM_PACK_MSG_SECKEY_IN +
+            self.SignKey);
+        end;
+        AEntries[LI].Method := ZipEntryMethod.Deflate;
+        if DoMatchesAny(LNames[LI], self.Archives[AIndex].Store) then
+          AEntries[LI].Method := ZipEntryMethod.Store;
+        end;
+        AEntries[LI].UnixMode := 0;
+        for LK := 0 to len(self.Archives[AIndex].ModeGlobs) - 1 do
+          if (AEntries[LI].UnixMode = 0) and
+            MatchesPathGlob(LNames[LI], self.Archives[AIndex].ModeGlobs[LK]) then
+            AEntries[LI].UnixMode := self.Archives[AIndex].Modes[LK];
+          end;
+        end;
+      end;
+      return true;
+    end;
+
+    /// Writes archive `AIndex`: its files found (`Discover`), its folder made, every entry
+    /// written (an existing archive replaced), the archive tested whole (`ZipTest`: every
+    /// entry decoded and its CRC checked, the names as written), then its `.sha256` when the
+    /// spec asks and its `.minisig` when the spec has a `[sign]` table.
+    /// @param AIndex the archive (0-based)
+    /// @param AProgress called before each entry (`PackProgress`), nil for none
+    /// @param AUserData handed to `AProgress`
+    /// @returns false (the reason in `ErrorText`) at the first step that fails
+    method BuildArchive(const AIndex: int64; const AProgress: PackProgress;
+      const AUserData: ptr): bool;
+    var
+      LEntries: PackEntries;
+      LWriter: ZipWriter;
+      LNames: StringArray;
+      LOutput: string;
+      LHex: string;
+      LKey: MinisignKey;
+      LFile: string;
+      LProgress: PackProgress;
+      LI: int64;
+    begin
+      if not self.Discover(AIndex, LEntries) then
+        return false;
+      end;
+      LOutput := self.Archives[AIndex].Output;
+      self.Written[AIndex] := 0;
+      if not ForceDirectories(ExtractFileDir(LOutput)) then
+        return self.DoFail(ADAM_PACK_MSG_NO_FOLDER + ExtractFileDir(LOutput));
+      end;
+      if not LWriter.Open(LOutput) then
+        return self.DoFail(LWriter.ErrorText());
+      end;
+      LProgress := AProgress;
+      for LI := 0 to len(LEntries) - 1 do
+        if LProgress <> nil then
+          LProgress(AUserData, LOutput, LEntries[LI].ArchiveName, LI, len(LEntries));
+        end;
+        if not LWriter.AddFile(LEntries[LI].SourcePath, LEntries[LI].ArchiveName,
+          LEntries[LI].Method, LEntries[LI].UnixMode, "", nil, nil) then
+          self.DoFail(LWriter.ErrorText());
+          LWriter.Close();
+          return false;
+        end;
+      end;
+      if not LWriter.Close() then
+        return self.DoFail(LWriter.ErrorText());
+      end;
+      // Tested as unzip -t does, then the names read back must be the ones written
+      if not ZipTest(LOutput, "", LNames) then
+        return self.DoFail(ZipLastError());
+      end;
+      if len(LNames) <> len(LEntries) then
+        return self.DoFail(LOutput + ADAM_PACK_MSG_READ_BACK);
+      end;
+      for LI := 0 to len(LNames) - 1 do
+        if LNames[LI] <> LEntries[LI].ArchiveName then
+          return self.DoFail(LOutput + ADAM_PACK_MSG_READ_BACK);
+        end;
+      end;
+      LFile := ExtractFileName(LOutput);
+      if self.Archives[AIndex].Checksum then
+        // sha256sum's form: the digest, two spaces, the file's name, LF
+        if not DoFileSHA256(LOutput, LHex) or
+          not WriteAllText(LOutput + ".sha256", LHex + "  " + LFile + "\n") then
+          return self.DoFail(ADAM_PACK_MSG_NO_CHECKSUM + LOutput + ".sha256");
+        end;
+      end;
+      if self.SignKey <> "" then
+        if not LKey.LoadSecretKey(self.SignKey) then
+          return self.DoFail(ADAM_PACK_MSG_NO_KEY + self.SignKey);
+        end;
+        if not LKey.SignFile(LOutput,
+          ReplaceStr(DoExpand(self.Trusted, self.PackName, self.PackVersion), "{file}", LFile),
+          ReplaceStr(DoExpand(self.Untrusted, self.PackName, self.PackVersion), "{file}",
+          LFile)) then
+          return self.DoFail(ADAM_PACK_MSG_NO_SIGNATURE + LOutput);
+        end;
+      end;
+      self.Written[AIndex] := len(LEntries);
+      return true;
+    end;
+
+    /// Writes every archive of the loaded spec in its order (`BuildArchive` for each).
+    /// @param AProgress called before each entry (`PackProgress`), nil for none
+    /// @param AUserData handed to `AProgress`
+    /// @returns false (the reason in `ErrorText`) at the first archive that fails
+    method Build(const AProgress: PackProgress; const AUserData: ptr): bool;
+    var
+      LI: int64;
+    begin
+      if self.SpecPath = "" then
+        return self.DoFail(ADAM_PACK_MSG_NO_SPEC);
+      end;
+      for LI := 0 to len(self.Archives) - 1 do
+        if not self.BuildArchive(LI, AProgress, AUserData) then
+          return false;
+        end;
+      end;
+      return true;
+    end;
+
+    /// The entries the last good build of archive `AIndex` wrote (0 before one, or for no such
+    /// archive).
+    const method EntryCount(const AIndex: int64): int64;
+    begin
+      if (AIndex < 0) or (AIndex >= len(self.Written)) then
+        return 0;
+      end;
+      return self.Written[AIndex];
+    end;
+
+    /// Why the last call failed: a spec error as `file(line,col): message`, a build error
+    /// naming the step and the path; "" after a success.
+    const method ErrorText(): string;
+    begin
+      return self.LastError;
+    end;
+  end;
+
+end.
