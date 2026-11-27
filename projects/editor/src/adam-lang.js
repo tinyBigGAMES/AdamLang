@@ -18,18 +18,20 @@
   Adam Editor - Adam for Monaco (Monarch tokenizer).
 
   The word lists are not written here: adam --dev-editor writes Adam's
-  keywords and builtin types (the Lexer's own table) into the packed
-  package.json `words`, main.js hands them over with app:info and the
+  keywords, builtin types and context words (the Lexer's own tables) into
+  the packed package.json `words`, main.js hands them over with app:info and the
   renderer passes them to setWords. Adam is case-sensitive. The literal and
   comment rules follow BNF sec 9 (C++'s literal forms, no string prefixes,
   raw strings, block comments do not nest, line splices). This tokenizer
-  gives instant colouring; the LSP's semantic tokens (M11b) refine it.
+  gives instant colouring; the LSP's semantic tokens (M11b) refine it: a
+  context word is coloured a keyword here, and the LSP gives one used as a
+  name the name's colour.
 */
 'use strict';
 
 var AdamLang = (function () {
   // Empty until the editor's words arrive (setWords)
-  var WORDS = { keywords: [], types: [] };
+  var WORDS = { keywords: [], types: [], contextWords: [] };
   // The monaco register() was given: setWords re-sets the tokenizer with it
   var gMonaco = null;
 
@@ -45,6 +47,7 @@ var AdamLang = (function () {
     ignoreCase: false,
     keywords: WORDS.keywords,
     types: WORDS.types,
+    contextWords: WORDS.contextWords,
 
     tokenizer: {
       root: [
@@ -59,6 +62,7 @@ var AdamLang = (function () {
           cases: {
             '@keywords': 'keyword',
             '@types': 'type',
+            '@contextWords': 'keyword',
             '@default': 'identifier'
           }
         }],
@@ -204,16 +208,22 @@ var AdamLang = (function () {
     AMonaco.editor.defineTheme('adam-dark', THEME);
   }
 
-  // Adam's keyword and builtin type lists ({ keywords, types }); a missing
-  // or malformed list leaves the current one. Setting the tokenizer again
-  // makes Monaco re-colour every open adam model
+  // Adam's keyword, builtin type and context word lists ({ keywords, types,
+  // contextWords }); a missing or malformed keyword or type list leaves the
+  // current ones, no context word list (an older package) means none.
+  // Setting the tokenizer again makes Monaco re-colour every open adam model
   function setWords(AWords) {
     if (!AWords || !Array.isArray(AWords.keywords) || !Array.isArray(AWords.types)) {
       return;
     }
-    WORDS = { keywords: AWords.keywords.slice(), types: AWords.types.slice() };
+    WORDS = {
+      keywords: AWords.keywords.slice(),
+      types: AWords.types.slice(),
+      contextWords: Array.isArray(AWords.contextWords) ? AWords.contextWords.slice() : []
+    };
     MONARCH.keywords = WORDS.keywords;
     MONARCH.types = WORDS.types;
+    MONARCH.contextWords = WORDS.contextWords;
     if (gMonaco) {
       gMonaco.languages.setMonarchTokensProvider('adam', MONARCH);
     }

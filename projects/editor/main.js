@@ -1746,7 +1746,7 @@ function appPackage() {
   }
 }
 
-// About box, and the highlighter's words ({ keywords, types }; null when
+// About box, and the highlighter's words ({ keywords, types, contextWords }; null when
 // the package carries none: an unpacked run)
 ipcMain.handle('app:info', async () => {
   const LPkg = appPackage();

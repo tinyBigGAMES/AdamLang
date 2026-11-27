@@ -1834,7 +1834,7 @@ var AdamEditor = (function () {
     window.host.onMenu(onMenu);
     window.host.onBuildOutput(onBuildOutput);
     window.host.onBuildExit(onBuildExit);
-    // The highlighter's words: Adam's keywords and types, packed into
+    // The highlighter's words: Adam's keywords, types and context words, packed into
     // package.json by adam --dev-editor (main.js app:info)
     AdamLang.setWords((await window.host.appInfo()).words);
     // Subscribe first, then ask: no state change can fall between the two
