@@ -71,8 +71,15 @@
   documents' files left out: one client/registerCapability of
   workspace/didChangeWatchedFiles, a watcher per path (its globPattern the
   path itself), sent again whenever the set changes (the new one before the
-  old one's client/unregisterCapability). didChangeWatchedFiles marks every
-  open document, checked again at the next idle.
+  old one's client/unregisterCapability). Each kept check keeps a stamp of
+  those paths (a file's write time and size, a folder's files, an open
+  document's file as its buffer), taken against the time the check began
+  (NowNanos): a path written while it ran, or in the 2 s before it began
+  (ADAM_LSP_STAMP_RACY_NS: a file system's coarser clock), leaves the stamp
+  unknown.
+  didChangeWatchedFiles marks for the next idle only the open documents
+  whose stamp is unknown or differs now; a refresh with nothing changed
+  (the client's one as each watcher starts) re-checks nothing.
 
   hover / definition (Adam.LSP.Find, Adam.LSP.Hover; checked first as
   semanticTokens): the name at the position in the last check's tree; a
@@ -228,6 +235,19 @@ public const
   ADAM_LSP_WATCH_ID: string = "adam-watch-";
   ADAM_LSP_WATCH_REGISTER_ID: string = "adam-watch-reg-";
   ADAM_LSP_WATCH_UNREGISTER_ID: string = "adam-watch-unreg-";
+  // A disk stamp's first line (DoDiskStamp): "" is no stamp (unknown), so even a check that
+  // read no path has a stamp that is not ""; then one line per path, its kind's word after it
+  ADAM_LSP_STAMP_HEAD: string = "stamp";
+  ADAM_LSP_STAMP_BUFFER: string = "|buffer";
+  ADAM_LSP_STAMP_FILE: string = "|file|";
+  ADAM_LSP_STAMP_FOLDER: string = "|folder";
+  ADAM_LSP_STAMP_UNREADABLE: string = "|unreadable";
+  ADAM_LSP_STAMP_NONE: string = "|none";
+  // The window before a check's start in which a path's write time leaves its stamp unknown
+  // (git's "racily clean"): a file system stamps a write from a coarser or another host's
+  // clock (a timer tick, FAT's 2 s, a WSL or network drive), so a write the check may have
+  // missed can show a time a little before the check began
+  ADAM_LSP_STAMP_RACY_NS: int64 = 2000000000;
 
 type
   // Where the session is: before initialize, serving, after shutdown
@@ -496,6 +516,9 @@ type
     // Each checked document's last check, by URI (its tree for the requests on positions)
     hidden FCheckUris: StringArray;
     hidden FChecks: array of ref Compiler;
+    // Each kept check's disk stamp, taken as it was kept (DoDiskStamp; "" = unknown: a path
+    // was written while the check ran), by the same index as FCheckUris
+    hidden FCheckStamps: StringArray;
     hidden FExitWanted: bool;
     hidden FExitCode: int32;
     // The watched files: the client takes registrations (initialize), the set registered
@@ -1119,9 +1142,6 @@ type
 
     // -- Watched files
 
-    // workspace/didChangeWatchedFiles: a file a check read changed on the disk, so every
-    // open document is checked again at the next idle (each check replaces what it
-    // published before)
     // The target at APath of AParams (see the header) taken; true when it changed. No key there:
     // unchanged; no string, or a triple Adam has no target for: told (AMethod's bad params),
     // unchanged
@@ -1162,13 +1182,90 @@ type
       end;
     end;
 
+    // workspace/didChangeWatchedFiles: something a check read may have changed on the disk.
+    // An open document is checked again at the next idle (each check replaces what it
+    // published before) only when what its last check rests on is not as it was then: no
+    // kept check, an unknown stamp, or its paths' stamp now differs (DoDiskStamp). The
+    // client sends one whenever a watched path starts (its first stat) with no change named,
+    // so an unchanged disk re-checks nothing
     hidden method DoDidChangeWatched();
     var
+      LAt: int64;
       LI: int64;
     begin
       for LI := 0 to len(self.FDocuments) - 1 do
-        self.DoMarkDirty(self.FDocuments[LI].URI);
+        LAt := DoIndexOf(self.FCheckUris, self.FDocuments[LI].URI);
+        if (LAt < 0) or (self.FCheckStamps[LAt] = "") or
+          (self.DoDiskStamp(self.FChecks[LAt].DiskPaths(), -1) <> self.FCheckStamps[LAt]) then
+          self.DoMarkDirty(self.FDocuments[LI].URI);
+        end;
       end;
+    end;
+
+    // One path's line of a disk stamp (DoDiskStamp) into ALine: an open document's file is
+    // its buffer (a check reads the buffer, not the disk); a file its write time and size; a
+    // folder its files' names and write times; else none. False when a file there was written
+    // within ADAM_LSP_STAMP_RACY_NS before AStart or after it (AStart < 0: no such guard), so
+    // the check may not have seen it
+    hidden const method DoPathStamp(const APath: string; const AStart: int64;
+      var ALine: string): bool;
+    var
+      LNames: StringArray;
+      LTime: int64;
+      LRacy: int64;
+      LI: int64;
+    begin
+      LRacy := AStart - ADAM_LSP_STAMP_RACY_NS;
+      if self.DoOpenFor(APath) <> nil then
+        ALine := APath + ADAM_LSP_STAMP_BUFFER;
+        return true;
+      end;
+      if FileExists(APath) then
+        LTime := FileWriteTime(APath);
+        if (AStart >= 0) and (LTime >= LRacy) then
+          return false;
+        end;
+        ALine := APath + ADAM_LSP_STAMP_FILE + IntToStr(LTime) + "|" + IntToStr(FileSize(APath));
+        return true;
+      end;
+      if DirectoryExists(APath) then
+        if not GetFiles(APath, LNames) then
+          ALine := APath + ADAM_LSP_STAMP_UNREADABLE;
+          return true;
+        end;
+        ALine := APath + ADAM_LSP_STAMP_FOLDER;
+        for LI := 0 to len(LNames) - 1 do
+          LTime := FileWriteTime(APath + "/" + LNames[LI]);
+          if (AStart >= 0) and (LTime >= LRacy) then
+            return false;
+          end;
+          ALine := ALine + "|" + LNames[LI] + ":" + IntToStr(LTime);
+        end;
+        return true;
+      end;
+      ALine := APath + ADAM_LSP_STAMP_NONE;
+      return true;
+    end;
+
+    // The disk stamp of APaths (a check's DiskPaths): ADAM_LSP_STAMP_HEAD, then each path's
+    // line (DoPathStamp); "" (unknown) when one was written around or after AStart, the time
+    // the check began (NowNanos, FileWriteTime's clock; AStart < 0: no such guard). Two stamps of
+    // the same paths are the same text exactly when nothing they name changed
+    hidden const method DoDiskStamp(const APaths: StringArray; const AStart: int64): string;
+    var
+      LText: string;
+      LLine: string;
+      LI: int64;
+    begin
+      LText := ADAM_LSP_STAMP_HEAD;
+      for LI := 0 to len(APaths) - 1 do
+        LLine := "";
+        if not self.DoPathStamp(APaths[LI], AStart, LLine) then
+          return "";
+        end;
+        LText := LText + "\n" + LLine;
+      end;
+      return LText;
     end;
 
     // The watched set: every kept check's DiskPaths once (SamePath), the open documents'
@@ -1300,7 +1397,10 @@ type
       LI: int64;
       LJ: int64;
       LGroup: int64;
+      LStart: int64;
     begin
+      // Before anything is read: a path written from here on may be one this check missed
+      LStart := NowNanos();
       LCompiler := ref Compiler();
       setlength(LMain, 0);
       setlength(LGroups, 0);
@@ -1377,24 +1477,30 @@ type
       end;
       // The tree a document that names a file got: the requests on it read this one
       if ADocument.Path <> "" then
-        self.DoKeepCheck(ADocument.URI, LCompiler);
+        self.DoKeepCheck(ADocument.URI, LCompiler, LStart);
       end;
     end;
 
     // -- The kept checks
 
-    // ACompiler kept as the last check of AURI (one before it dropped)
-    hidden method DoKeepCheck(const AURI: string; const ACompiler: ref Compiler);
+    // ACompiler kept as the last check of AURI (one before it dropped), with the disk stamp of
+    // what it read (DoDiskStamp, guarded by AStart: the time the check began)
+    hidden method DoKeepCheck(const AURI: string; const ACompiler: ref Compiler;
+      const AStart: int64);
     var
       LAt: int64;
       LCount: int64;
+      LStamp: string;
     begin
+      LStamp := self.DoDiskStamp(ACompiler.DiskPaths(), AStart);
       LAt := DoIndexOf(self.FCheckUris, AURI);
       if LAt >= 0 then
         self.FChecks[LAt] := ACompiler;
+        self.FCheckStamps[LAt] := LStamp;
         return;
       end;
       DoAppend(self.FCheckUris, AURI);
+      DoAppend(self.FCheckStamps, LStamp);
       LCount := len(self.FChecks);
       setlength(self.FChecks, LCount + 1);
       self.FChecks[LCount] := ACompiler;
@@ -1423,6 +1529,7 @@ type
         return;
       end;
       DoRemoveAt(self.FCheckUris, LAt);
+      DoRemoveAt(self.FCheckStamps, LAt);
       for LI := LAt to len(self.FChecks) - 2 do
         self.FChecks[LI] := self.FChecks[LI + 1];
       end;
