@@ -86,6 +86,38 @@ function createFramer(AOnMessage) {
   };
 }
 
+// Dev trace: when ADAM_LSP_TRACE names a file, one line per message in each direction is
+// appended to it (ms since the host started, direction, id, method, the document URI or
+// result size); a normal run has no such variable and writes nothing
+const ADAM_LSP_TRACE = process.env.ADAM_LSP_TRACE || '';
+const gTraceStart = Date.now();
+
+function traceMessage(ADirection, AMsg) {
+  let LUri;
+  let LLine;
+
+  if (ADAM_LSP_TRACE === '' || !AMsg) {
+    return;
+  }
+  LUri = (AMsg.params && AMsg.params.textDocument && AMsg.params.textDocument.uri) || '';
+  LLine = (Date.now() - gTraceStart) + ' ' + ADirection + ' id=' +
+    (AMsg.id !== undefined ? AMsg.id : '-') + ' ' + (AMsg.method || 'response');
+  if (LUri !== '') {
+    LLine += ' ' + LUri;
+  }
+  if (AMsg.params && AMsg.params.changes) {
+    LLine += ' changes=' + AMsg.params.changes.length;
+  }
+  if (!AMsg.method) {
+    LLine += ' bytes=' + JSON.stringify(AMsg.result === undefined ? AMsg.error : AMsg.result).length;
+  }
+  try {
+    fs.appendFileSync(ADAM_LSP_TRACE, LLine + '\n');
+  } catch (AError) {
+    // A trace that cannot be written never stops the editor
+  }
+}
+
 // One outgoing frame; Content-Length counts UTF-8 bytes, not characters
 function frameMessage(AMsg) {
   const LBody = Buffer.from(JSON.stringify(AMsg), 'utf8');
@@ -132,7 +164,10 @@ function createLspHost(AOpts) {
       return;
     }
     LProc = LNew;
-    const LFramer = createFramer(AOpts.onMessage);
+    const LFramer = createFramer((AMsg) => {
+      traceMessage('<-', AMsg);
+      AOpts.onMessage(AMsg);
+    });
     LNew.stdout.on('data', (AChunk) => LFramer.push(AChunk));
     // A write racing the server's death (EPIPE); 'exit' does the recovery
     LNew.stdin.on('error', () => {});
@@ -177,6 +212,7 @@ function createLspHost(AOpts) {
     if (!LProc || LStopping) {
       return false;
     }
+    traceMessage('->', AMsg);
     try {
       LProc.stdin.write(frameMessage(AMsg));
     } catch (AError) {
