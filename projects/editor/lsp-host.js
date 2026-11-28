@@ -124,7 +124,7 @@ function createLspHost(AOpts) {
       LNew = spawn(LExe, ADAM_LSP_COMMAND, {
         cwd: AOpts.binDir,
         windowsHide: true,
-        // stderr is not part of the protocol; `--log` is the trace channel
+        // stderr is not part of the protocol: not read
         stdio: ['pipe', 'pipe', 'ignore']
       });
     } catch (AError) {
